@@ -41,7 +41,7 @@ extension PlayerView {
                     return
                 }
                 if viewModel.currentErrorDiagnostic != nil {
-                    onBack()
+                    onRemoteBack()
                     return
                 }
                 if viewModel.isScrubbing {
@@ -63,7 +63,7 @@ extension PlayerView {
                        viewModel.status != .ended {
                         viewModel.returnToPlayerFromPostPlay()
                     } else {
-                        onBack()
+                        onRemoteBack()
                     }
                     return
                 }
@@ -84,7 +84,7 @@ extension PlayerView {
                     viewModel.hideControls()
                     return
                 }
-                onBack()
+                onRemoteBack()
             }
     }
 }

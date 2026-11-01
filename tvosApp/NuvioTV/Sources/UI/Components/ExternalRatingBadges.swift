@@ -247,7 +247,7 @@ struct TvHeroRatingsRow: View {
                 HStack(spacing: 7) {
                     TvRatingIcon(visual: badge.visual, height: iconHeight)
                     Text(badge.formattedValue)
-                        .font(.custom("Inter-SemiBold", size: fontSize))
+                        .font(.appFont(size: fontSize, weight: .semibold))
                         .foregroundColor(.white.opacity(0.82))
                         .lineLimit(1)
                         .fixedSize()

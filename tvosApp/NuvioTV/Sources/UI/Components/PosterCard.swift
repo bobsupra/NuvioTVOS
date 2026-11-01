@@ -579,7 +579,7 @@ struct PosterCard: View {
 
     private var fallbackTitle: some View {
         Text(meta.name)
-            .font(.custom("Inter-Bold", size: 34))
+            .font(.appFont(size: 34, weight: .bold))
             .foregroundColor(.white)
             .lineLimit(2)
     }
@@ -1351,30 +1351,17 @@ struct TrailerPreviewPlayer: View {
             reportPlaybackUnavailable()
             return
         }
-        guard let url = URL(string: playbackSource.videoUrl) else {
+        guard !Task.isCancelled else { return }
+
+        currentPlaybackSource = playbackSource
+
+        guard let item = await playbackSource.makePlayerItem(preferredForwardBufferDuration: 2.0) else {
             guard !Task.isCancelled else { return }
             reportPlaybackUnavailable()
             return
         }
-        guard !Task.isCancelled else {
-            return
-        }
+        guard !Task.isCancelled else { return }
 
-        currentPlaybackSource = playbackSource
-
-        let asset: AVURLAsset
-        if let userAgent = playbackSource.requestHeaders["User-Agent"], !userAgent.isEmpty {
-            asset = AVURLAsset(
-                url: url,
-                options: [AVURLAssetHTTPUserAgentKey: userAgent]
-            )
-        } else {
-            asset = AVURLAsset(url: url)
-        }
-        let item = AVPlayerItem(asset: asset)
-        item.preferredForwardBufferDuration = 2.0
-        item.preferredPeakBitRate = 0
-        item.preferredMaximumResolution = .zero
         player.replaceCurrentItem(with: item)
         observePlaybackFailure(for: item)
         applySoundPreference(trailerPreviewSound)

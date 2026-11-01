@@ -209,7 +209,7 @@ extension PlayerView {
                            viewModel.status != .ended {
                             viewModel.returnToPlayerFromPostPlay()
                         } else {
-                            onBack()
+                            onRemoteBack()
                         }
                     }
                 }
@@ -619,7 +619,7 @@ extension PlayerView {
                         focusNextEpisode(allowWhenControlsVisible: true)
                     } else {
                         skipSegmentFocused = false
-                        requestedControlFocus = .pip
+                        requestedControlFocus = .firstTransportButton
                     }
                 default:
                     break
@@ -627,7 +627,7 @@ extension PlayerView {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             .padding(.leading, 60)
-            .padding(.bottom, viewModel.showControls ? 208 : 54)
+            .padding(.bottom, viewModel.showControls ? 252 : 54)
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(3)
         }
@@ -757,7 +757,7 @@ extension PlayerView {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
             .padding(.trailing, 60)
-            .padding(.bottom, viewModel.showControls ? 208 : 54)
+            .padding(.bottom, viewModel.showControls ? 252 : 54)
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(3)
         }

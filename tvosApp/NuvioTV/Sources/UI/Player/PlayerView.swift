@@ -70,6 +70,7 @@ struct PlayerView: View {
     var onPlayRecommendation: ((_ meta: NuvioMeta, _ playManually: Bool) -> Void)? = nil
     var onOpenRecommendationDetails: ((_ meta: NuvioMeta) -> Void)? = nil
     var onBack: () -> Void
+    var onRemoteBack: () -> Void
     let partyPlayback: WatchPartyPlayerMount?
     let partyPlaybackIdentity: UUID?
     let watchPartyOwner: WatchPartyAppOwner?
@@ -122,7 +123,8 @@ struct PlayerView: View {
         watchPartyOwner: WatchPartyAppOwner? = nil,
         isCurrentPlayerSurface: @escaping @MainActor () -> Bool = { true },
         onOpenWatchPartyLobby: @escaping () -> Void = {},
-        onBack: @escaping () -> Void
+        onBack: @escaping () -> Void,
+        onRemoteBack: (() -> Void)? = nil
     ) {
         _viewModel = StateObject(wrappedValue: partyPlayback?.viewModel ?? viewModel ?? PlayerViewModel())
         self.partyPlayback = partyPlayback
@@ -166,6 +168,7 @@ struct PlayerView: View {
         self.onPlayRecommendation = onPlayRecommendation
         self.onOpenRecommendationDetails = onOpenRecommendationDetails
         self.onBack = onBack
+        self.onRemoteBack = onRemoteBack ?? onBack
     }
 
     @State var didHandleFinished = false

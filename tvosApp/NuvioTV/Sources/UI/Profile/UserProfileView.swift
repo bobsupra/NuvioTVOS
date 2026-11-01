@@ -37,19 +37,19 @@ public struct UserProfileView: View {
                 Spacer().frame(height: 162)
 
                 Text(L10n.string("profile_selection_title", fallback: "Who's watching?"))
-                    .font(.custom("Inter-Bold", size: 62))
+                    .font(.appFont(size: 62, weight: .bold))
                     .foregroundColor(.white)
 
                 Spacer().frame(height: 14)
 
                 Text(L10n.string("profile_selection_subtitle", fallback: "Select a profile to continue"))
-                    .font(.custom("Inter-Regular", size: 28))
+                    .font(.appFont(size: 28, weight: .regular))
                     .foregroundColor(.white.opacity(0.6))
 
                 if let profileCreationError = viewModel.profileCreationError {
                     Spacer().frame(height: 18)
                     Text(profileCreationError)
-                        .font(.custom("Inter-Regular", size: 20))
+                        .font(.appFont(size: 20, weight: .regular))
                         .foregroundColor(.red.opacity(0.9))
                         .lineLimit(2)
                         .frame(maxWidth: 900)
@@ -60,7 +60,7 @@ public struct UserProfileView: View {
                     HStack(spacing: 18) {
                         VStack(alignment: .leading, spacing: 6) {
                             Text(accountSyncError)
-                                .font(.custom("Inter-Regular", size: 20))
+                                .font(.appFont(size: 20, weight: .regular))
                                 .foregroundColor(.orange.opacity(0.9))
                                 .fixedSize(horizontal: false, vertical: true)
 
@@ -68,7 +68,7 @@ public struct UserProfileView: View {
                                 "profile_account_sync_compatibility_message",
                                 fallback: "Update all Nuvio clients to their latest versions, then select Retry. Older clients cannot sync account data."
                             ))
-                                .font(.custom("Inter-Regular", size: 16))
+                                .font(.appFont(size: 16, weight: .regular))
                                 .foregroundColor(.white.opacity(0.72))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
@@ -312,13 +312,13 @@ struct ProfileCard: View {
 
                 VStack(spacing: 4) {
                     Text(profile.name)
-                        .font(.custom("Inter-Bold", size: 28))
+                        .font(.appFont(size: 28, weight: .bold))
                         .foregroundColor(isFocused ? .white : Color.white.opacity(0.6))
                         .lineLimit(1)
 
                     if profile.isAdmin {
                         Text(L10n.string("profile_selection_primary_badge", fallback: "PRIMARY"))
-                            .font(.custom("Inter-Bold", size: 16))
+                            .font(.appFont(size: 16, weight: .bold))
                             .tracking(1.5)
                             .foregroundColor(ProfileAvatarStyle.accent)
                     }
@@ -374,7 +374,7 @@ struct AddProfileButton: View {
                     )
 
                 Text(L10n.string("profile_add", fallback: "Add Profile"))
-                    .font(.custom("Inter-Bold", size: 28))
+                    .font(.appFont(size: 28, weight: .bold))
                     .foregroundColor(isFocused ? .white : Color.white.opacity(0.6))
             }
             .scaleEffect(isFocused ? 1.12 : 1.0)

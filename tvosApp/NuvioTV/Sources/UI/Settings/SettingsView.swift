@@ -8655,7 +8655,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
     @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
-    @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = true
+    @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = false
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
@@ -8819,6 +8819,19 @@ private struct PlaybackSettingsView: View {
 
                 SettingsToggleRow(
                     title: L10n.string(
+                        "tvos_settings_lossless_audio_bridge",
+                        fallback: "Lossless Audio Bridge (eARC / AVR)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_lossless_audio_bridge_subtitle",
+                        fallback: "AetherEngine only. Transcodes non-streamable surround audio (TrueHD, DTS-HD MA, Opus) to 24-bit 7.1 LPCM for AVRs and eARC soundbars. Off uses 5.1 Dolby Digital Plus for ARC compatibility."
+                    ),
+                    isOn: $losslessAudioBridge,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
                         "tvos_settings_prefer_dual_layer_dolby_vision",
                         fallback: "Full Dolby Vision P7 FEL (Experimental)"
                     ),
@@ -8840,19 +8853,6 @@ private struct PlaybackSettingsView: View {
                         fallback: "AetherEngine only. Uses on-device Neural Engine super-resolution and MetalFX to upscale sub-1080p SDR content (480p, 576p, 720p) to native 4K. Applies next playback."
                     ),
                     isOn: $lowResUpscaling,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string(
-                        "tvos_settings_lossless_audio_bridge",
-                        fallback: "Lossless Audio Bridge (eARC / AVR)"
-                    ),
-                    subtitle: L10n.string(
-                        "tvos_settings_lossless_audio_bridge_subtitle",
-                        fallback: "AetherEngine only. Transcodes non-streamable surround audio (TrueHD, DTS-HD MA, Opus) to 24-bit 7.1 LPCM for AVRs and eARC soundbars. Off uses 5.1 Dolby Digital Plus for ARC compatibility."
-                    ),
-                    isOn: $losslessAudioBridge,
                     accentColor: accentColor
                 )
 
@@ -8966,26 +8966,17 @@ private struct PlaybackSettingsView: View {
                 title: L10n.string("tvos_settings_seekr_title", fallback: "Seekr"),
                 subtitle: L10n.string(
                     "tvos_settings_seekr_subtitle",
-                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series. With your own key, previews appear instantly and the player reads nothing from the video for them. Titles Seekr doesn't have keep the player's own previews. Anyone can sign up for a key at seekr.tv/join. During the public beta, each key covers 20 movies and 70 episodes a day. If Seekr works well for you, consider supporting its running costs at buymeacoffee.com/seekrtvdev."
+                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series."
                 )
             ) {
-                HStack(spacing: 48) {
-                    SettingsQRCodeCard(
-                        title: L10n.string("tvos_settings_seekr_join", fallback: "Get a key"),
-                        link: "https://seekr.tv/join"
-                    )
-                    SettingsQRCodeCard(
-                        title: L10n.string("tvos_settings_seekr_support", fallback: "Support Seekr"),
-                        link: "https://buymeacoffee.com/seekrtvdev"
-                    )
-                    Spacer(minLength: 0)
-                }
-                .padding(20)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .settingsGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous), isProminent: false)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_seekr_join", fallback: "Get a key"),
+                    value: "seekr.tv/join"
+                )
+
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_seekr_support", fallback: "Support Seekr"),
+                    value: "buymeacoffee.com/seekrtvdev"
                 )
 
                 SettingsToggleRow(
@@ -9018,44 +9009,28 @@ private struct PlaybackSettingsView: View {
                 }
             }
 
-            SettingsGroup(
-                title: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
-                subtitle: L10n.string(
-                    "tvos_playback_player_buttons_subtitle",
-                    fallback: "Customize which control buttons appear in the video player"
-                )
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
+                status: settingsCountSummary(visiblePlayerButtonCount, singular: "active player button", plural: "active player buttons"),
+                actionSubtitle: L10n.string(
+                    "tvos_settings_player_buttons_manage_subtitle",
+                    fallback: "Choose which player buttons appear and arrange their left-to-right order"
+                ),
+                accentColor: accentColor
             ) {
-                SettingsFeatureSummaryCard(
-                    featureName: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
-                    status: settingsCountSummary(visiblePlayerButtonCount, singular: "active player button", plural: "active player buttons"),
-                    actionSubtitle: L10n.string(
-                        "tvos_settings_player_buttons_manage_subtitle",
-                        fallback: "Choose which player buttons appear and arrange their left-to-right order"
-                    ),
-                    accentColor: accentColor
-                ) {
-                    showingPlayerButtonSettings = true
-                }
+                showingPlayerButtonSettings = true
             }
 
-            SettingsGroup(
-                title: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
-                subtitle: L10n.string(
-                    "tvos_settings_insight_sections_subtitle",
-                    fallback: "Choose which InSight panel tabs appear and set their order"
-                )
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
+                status: settingsCountSummary(inSightSectionsEnabledCount, singular: "section enabled", plural: "sections enabled"),
+                actionSubtitle: L10n.string(
+                    "tvos_settings_insight_sections_manage_subtitle",
+                    fallback: "Enable InSight, choose its tabs, and arrange them in the panel"
+                ),
+                accentColor: accentColor
             ) {
-                SettingsFeatureSummaryCard(
-                    featureName: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
-                    status: settingsCountSummary(inSightSectionsEnabledCount, singular: "section enabled", plural: "sections enabled"),
-                    actionSubtitle: L10n.string(
-                        "tvos_settings_insight_sections_manage_subtitle",
-                        fallback: "Enable InSight, choose its tabs, and arrange them in the panel"
-                    ),
-                    accentColor: accentColor
-                ) {
-                    showingInSightSectionsSettings = true
-                }
+                showingInSightSectionsSettings = true
             }
 
             SettingsGroup(

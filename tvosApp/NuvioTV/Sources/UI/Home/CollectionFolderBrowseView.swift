@@ -53,6 +53,7 @@ struct CollectionFolderBrowseView: View {
     @State private var focusRestoreGeneration = 0
     @State private var cachedCollectionMetadata: [String: NuvioMeta] = [:]
     @State private var collectionEnrichmentTask: Task<Void, Never>?
+    @State private var backgroundEnrichmentTasks: [Task<Void, Never>] = []
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -140,6 +141,8 @@ struct CollectionFolderBrowseView: View {
             TVHomeDebugTrace.log("collectionFolder.disappear id=\(folder.id)")
             collectionEnrichmentTask?.cancel()
             collectionEnrichmentTask = nil
+            backgroundEnrichmentTasks.forEach { $0.cancel() }
+            backgroundEnrichmentTasks.removeAll()
         }
         .task {
             async let addonCatalogNames: Void = loadAddonCatalogNames()
@@ -348,11 +351,11 @@ struct CollectionFolderBrowseView: View {
         HStack(alignment: .bottom, spacing: 50) {
             VStack(alignment: .leading, spacing: 12) {
                 Text(cinematicCategoryLabel)
-                    .font(.system(size: 32, weight: .medium))
+                    .font(.appFont(size: 32, weight: .medium))
                     .foregroundColor(.white.opacity(0.72))
 
                 Text(folder.title)
-                    .font(.system(size: 64, weight: .bold))
+                    .font(.appFont(size: 64, weight: .bold))
                     .foregroundColor(.white)
                     .lineLimit(2)
 
@@ -361,7 +364,7 @@ struct CollectionFolderBrowseView: View {
                     fallback: "Movies and series • %d catalogs",
                     folder.sources.count
                 ))
-                    .font(.system(size: 28, weight: .regular))
+                    .font(.appFont(size: 28, weight: .regular))
                     .foregroundColor(.white.opacity(0.68))
             }
 
@@ -376,7 +379,7 @@ struct CollectionFolderBrowseView: View {
                             .scaledToFit()
                     } else {
                         Text(folder.title)
-                            .font(.system(size: 30, weight: .semibold))
+                            .font(.appFont(size: 30, weight: .semibold))
                             .foregroundColor(.white)
                     }
                 }
@@ -398,10 +401,10 @@ struct CollectionFolderBrowseView: View {
         HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 6) {
                 Text(heading)
-                    .font(.system(size: 42, weight: .bold))
+                    .font(.appFont(size: 42, weight: .bold))
                     .foregroundColor(.white)
                 Text(subtitleLine)
-                    .font(.system(size: 20, weight: .medium))
+                    .font(.appFont(size: 20, weight: .medium))
                     .foregroundColor(.white.opacity(0.55))
             }
             Spacer()
@@ -541,17 +544,14 @@ struct CollectionFolderBrowseView: View {
             return
         }
 
-        // Always load per-source so Rows mode (and Tabs without All) can split.
-        var rows: [CollectionFolderCatalogRow] = []
-        var all: [NuvioMeta] = []
-        var seen = Set<String>()
+        // Load all sources concurrently without blocking the main actor.
+        var sourceRows = Array<CollectionFolderCatalogRow?>(repeating: nil, count: sources.count)
         var firstFailureMessage: String?
-        let loadedSources = await withTaskGroup(
-            of: CollectionFolderSourceLoad.self,
-            returning: [CollectionFolderSourceLoad].self
-        ) { group in
+        var didPublishFirstContent = false
+
+        await withTaskGroup(of: CollectionFolderSourceLoad.self) { group in
             for (index, source) in sources.enumerated() {
-                group.addTask { @MainActor [repository] in
+                group.addTask { [repository] in
                     do {
                         let page = try await CollectionSourceResolver(repository: repository)
                             .browse(source)
@@ -572,58 +572,88 @@ struct CollectionFolderBrowseView: View {
                 }
             }
 
-            var results: [CollectionFolderSourceLoad] = []
             for await result in group {
-                results.append(result)
-            }
-            return results.sorted { $0.index < $1.index }
-        }
-
-        for result in loadedSources {
-            let source = result.source
-            guard let page = result.page else {
-                if firstFailureMessage == nil {
-                    firstFailureMessage = result.errorMessage
+                let index = result.index
+                let source = result.source
+                guard let page = result.page else {
+                    if firstFailureMessage == nil {
+                        firstFailureMessage = result.errorMessage
+                    }
+                    continue
                 }
-                continue
-            }
-            let pagination = Self.calculatePagination(
-                page: page,
-                source: source,
-                requestedCursor: 0,
-                pageSize: pageSize
-            )
-            let rawBatch = pagination.displayItems
-            let batch = await TmdbDetailsService.localizedMetadata(for: rawBatch)
-            var sourceIds = Set<String>()
-            let resolved = batch.filter { sourceIds.insert($0.id).inserted }
-            rows.append(
-                CollectionFolderCatalogRow(
+                let pagination = Self.calculatePagination(
+                    page: page,
+                    source: source,
+                    requestedCursor: 0,
+                    pageSize: pageSize
+                )
+                let rawBatch = pagination.displayItems
+                var sourceIds = Set<String>()
+                let resolved = rawBatch.filter { sourceIds.insert($0.id).inserted }
+                let row = CollectionFolderCatalogRow(
                     id: Self.sourceKey(source),
                     source: source,
                     items: resolved,
                     nextSkip: pagination.nextCursor,
                     hasMore: pagination.hasMore
                 )
-            )
-            for meta in resolved where seen.insert(meta.id).inserted {
-                all.append(meta)
+                sourceRows[index] = row
+
+                // Progressive publish: As soon as a row with items arrives,
+                // update catalogRows and items so the user immediately sees titles.
+                let currentRows = sourceRows.compactMap { $0 }
+                if usesRows {
+                    catalogRows = currentRows.filter { !$0.items.isEmpty }
+                } else {
+                    catalogRows = currentRows
+                }
+                var seen = Set<String>()
+                var combinedItems: [NuvioMeta] = []
+                for r in currentRows {
+                    for meta in r.items where seen.insert(meta.id).inserted {
+                        combinedItems.append(meta)
+                    }
+                }
+                items = combinedItems
+
+                if !didPublishFirstContent && !combinedItems.isEmpty {
+                    didPublishFirstContent = true
+                    isLoading = false
+                    if focusedItemID == nil {
+                        focusedItemID = firstFocusID
+                    }
+                }
+
+                // If TMDB enrichment is enabled and source is an add-on, enrich visible items in background
+                if TmdbDetailsService.useHomeEnrichment,
+                   source.normalizedProvider == "addon" {
+                    enrichInitialSliceInBackground(rowId: row.id, items: Array(resolved.prefix(12)))
+                }
             }
         }
-        // Tabs must retain their source-to-row mapping even when one source is
-        // empty. Rows mode can omit empty strips.
-        catalogRows = usesRows ? rows.filter { !$0.items.isEmpty } : rows
-        items = all
+
+        // Finalize rows once all tasks complete
+        let finalRows = sourceRows.compactMap { $0 }
+        catalogRows = usesRows ? finalRows.filter { !$0.items.isEmpty } : finalRows
+        var seen = Set<String>()
+        var combinedItems: [NuvioMeta] = []
+        for r in finalRows {
+            for meta in r.items where seen.insert(meta.id).inserted {
+                combinedItems.append(meta)
+            }
+        }
+        items = combinedItems
+
         if items.isEmpty, let firstFailureMessage {
             errorMessage = firstFailureMessage
         }
         isLoading = false
 
-        // The first card does not exist during the loading render, so the
-        // default-focus modifier cannot select it by itself. Re-arm focus once
-        // the catalog has been inserted into the view hierarchy.
-        await Task.yield()
-        focusedItemID = firstFocusID
+        // Re-arm focus once the catalog has been inserted into the view hierarchy
+        if focusedItemID == nil {
+            await Task.yield()
+            focusedItemID = firstFocusID
+        }
     }
 
     @MainActor
@@ -699,9 +729,8 @@ struct CollectionFolderBrowseView: View {
                     pageSize: pageSize
                 )
                 let rawBatch = pagination.displayItems
-                let batch = await TmdbDetailsService.localizedMetadata(for: rawBatch)
                 var existingRowIds = Set(catalogRows[latestIndex].items.map(\.id))
-                let newItems = batch.filter { existingRowIds.insert($0.id).inserted }
+                let newItems = rawBatch.filter { existingRowIds.insert($0.id).inserted }
                 catalogRows[latestIndex].items.append(contentsOf: newItems)
                 catalogRows[latestIndex].nextSkip = pagination.nextCursor
                 catalogRows[latestIndex].hasMore = pagination.hasMore
@@ -709,11 +738,30 @@ struct CollectionFolderBrowseView: View {
 
                 var existingAllIds = Set(items.map(\.id))
                 items.append(contentsOf: newItems.filter { existingAllIds.insert($0.id).inserted })
+
+                if TmdbDetailsService.useHomeEnrichment,
+                   source.normalizedProvider == "addon" {
+                    enrichInitialSliceInBackground(rowId: rowId, items: Array(newItems.prefix(12)))
+                }
             } catch {
                 guard let latestIndex = catalogRows.firstIndex(where: { $0.id == rowId }) else { return }
                 catalogRows[latestIndex].isLoadingMore = false
             }
         }
+    }
+
+    private func enrichInitialSliceInBackground(rowId: String, items toEnrich: [NuvioMeta]) {
+        guard !toEnrich.isEmpty else { return }
+        let task = Task { @MainActor in
+            let enriched = await TmdbDetailsService.localizedMetadata(for: toEnrich)
+            guard !Task.isCancelled else { return }
+            let byId = Dictionary(uniqueKeysWithValues: enriched.map { ($0.id, $0) })
+            if let rowIndex = catalogRows.firstIndex(where: { $0.id == rowId }) {
+                catalogRows[rowIndex].items = catalogRows[rowIndex].items.map { byId[$0.id] ?? $0 }
+            }
+            items = items.map { byId[$0.id] ?? $0 }
+        }
+        backgroundEnrichmentTasks.append(task)
     }
 
     /// Collections use the same focus-driven catalog enrichment as Home. This
@@ -844,7 +892,7 @@ private struct CollectionFolderHomeStyleRow: View {
                 )
 
                 Text(title)
-                    .font(.custom("Inter-Bold", size: 30))
+                    .font(.appFont(size: 30, weight: .bold))
                     .foregroundColor(.white)
                     .padding(.leading, localLeading)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)

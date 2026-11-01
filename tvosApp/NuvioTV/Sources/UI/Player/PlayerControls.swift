@@ -10,6 +10,19 @@ enum PlayerControlFocus: Hashable {
     case audio
     case settings
     case timeline
+    case firstTransportButton
+}
+
+private extension TVPlayerButton {
+    var focusKey: PlayerControlFocus {
+        switch self {
+        case .pip: return .pip
+        case .episodes: return .episodes
+        case .sources: return .sources
+        case .subtitles: return .subtitles
+        case .audio: return .audio
+        }
+    }
 }
 
 struct PlayerControls: View {
@@ -22,6 +35,7 @@ struct PlayerControls: View {
     var onFocusNextEpisode: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
+    @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
 
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
@@ -42,7 +56,14 @@ struct PlayerControls: View {
         .onChange(of: requestedFocus) { _, target in
             guard let target, viewModel.showControls, !viewModel.controlsAutoHideSuspended else { return }
             DispatchQueue.main.async {
-                let resolvedTarget: PlayerControlFocus = target == .timeline && !didReportPlaybackStarted ? .settings : target
+                let resolvedTarget: PlayerControlFocus
+                if target == .firstTransportButton {
+                    resolvedTarget = transportFocusOrder.first ?? .settings
+                } else if target == .timeline && !didReportPlaybackStarted {
+                    resolvedTarget = .settings
+                } else {
+                    resolvedTarget = target
+                }
                 if resolvedTarget == .timeline {
                     focusedControl = .timeline
                 } else {
@@ -56,7 +77,17 @@ struct PlayerControls: View {
                 DispatchQueue.main.async { focusedControl = .settings }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: TVPlayerButtonOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+            reloadPlayerButtonOrder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            reloadPlayerButtonOrder()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            reloadPlayerButtonOrder()
+        }
         .onAppear {
+            reloadPlayerButtonOrder()
             if (viewModel.showControls || viewModel.isScrubbing),
                !viewModel.showPauseOverlay,
                !viewModel.postPlayState.isVisible,
@@ -281,14 +312,30 @@ struct PlayerControls: View {
 
     /// Left-to-right order of currently visible transport buttons.
     private var transportFocusOrder: [PlayerControlFocus] {
-        var order: [PlayerControlFocus] = []
-        if didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP { order.append(.pip) }
-        if viewModel.canShowEpisodesPanel && playerShowEpisodes { order.append(.episodes) }
-        if viewModel.canShowSourcesPanel && playerShowSources { order.append(.sources) }
-        if didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles { order.append(.subtitles) }
-        if didReportPlaybackStarted && canShowAudioPicker && playerShowAudio { order.append(.audio) }
-        order.append(.settings)
-        return order
+        availableTransportButtons.map(\.focusKey) + [.settings]
+    }
+
+    private var availableTransportButtons: [TVPlayerButton] {
+        playerButtonOrder.filter { button in
+            switch button {
+            case .pip:
+                return didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP
+            case .episodes:
+                return viewModel.canShowEpisodesPanel && playerShowEpisodes
+            case .sources:
+                return viewModel.canShowSourcesPanel && playerShowSources
+            case .subtitles:
+                return didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles
+            case .audio:
+                return didReportPlaybackStarted && canShowAudioPicker && playerShowAudio
+            }
+        }
+    }
+
+    private func reloadPlayerButtonOrder() {
+        let order = TVPlayerButtonOrder.currentOrder()
+        guard playerButtonOrder != order else { return }
+        playerButtonOrder = order
     }
 
     private var canShowSubtitlePicker: Bool {
@@ -364,6 +411,8 @@ struct PlayerControls: View {
                 }
             } else if viewModel.showNextEpisodeCard {
                 onFocusNextEpisode()
+            } else if viewModel.showSkipSegmentCard {
+                onFocusSkipSegment()
             } else {
                 moveFocus(to: origin)
             }
@@ -450,94 +499,8 @@ struct PlayerControls: View {
 
     private var transportRow: some View {
         HStack(spacing: 18) {
-            if didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .pip,
-                    isFocused: focusedControl == .pip
-                ) {
-                    viewModel.togglePictureInPicture()
-                } icon: {
-                    Image(systemName: "pip.enter")
-                }
-                .id("pip_button")
-            }
-
-            if viewModel.canShowEpisodesPanel && playerShowEpisodes {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .episodes,
-                    isFocused: focusedControl == .episodes
-                ) {
-                    viewModel.openSidePanel(.episodes)
-                } icon: {
-                    Image(systemName: "list.bullet")
-                }
-                .id("episodes_button")
-            }
-
-            if viewModel.canShowSourcesPanel && playerShowSources {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .sources,
-                    isFocused: focusedControl == .sources
-                ) {
-                    viewModel.openSidePanel(.sources)
-                } icon: {
-                    Image(systemName: "square.stack.3d.up")
-                }
-                .id("sources_button")
-            }
-
-            if didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles {
-                PlayerSubtitleMenuButton(
-                    noneOption: subtitleNoneOption,
-                    languageGroups: subtitleLanguageGroups,
-                    isFocused: focusedControl == .subtitles,
-                    onSelect: { selectSubtitlePickerOption($0) }
-                )
-                .equatable()
-                .focused($focusedControl, equals: .subtitles)
-                .disabled(!isTransportButtonFocusable(.subtitles))
-                .onExitCommand(perform: handleExit)
-                .onMoveCommand { direction in
-                    handleMove(direction, from: .subtitles)
-                }
-            }
-
-            if didReportPlaybackStarted && canShowAudioPicker && playerShowAudio {
-                PlayerAudioMenuButton(
-                    orderedTracks: orderedAudioTracks,
-                    supportsAudioProcessing: viewModel.supportsAudioProcessing,
-                    enhanceDialogueMode: viewModel.supportsAudioProcessing ? viewModel.enhanceDialogueMode : .off,
-                    isReduceLoudSoundsActive: viewModel.supportsAudioProcessing && viewModel.isReduceLoudSoundsActive,
-                    isFocused: focusedControl == .audio,
-                    onSelectTrack: { track in
-                        viewModel.selectAudio(track)
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    },
-                    onSetEnhanceDialogueMode: { mode in
-                        viewModel.setEnhanceDialogueMode(mode)
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    },
-                    onToggleReduceLoudSounds: {
-                        viewModel.toggleReduceLoudSounds()
-                        viewModel.setControlsAutoHideSuspended(false)
-                        viewModel.scheduleControlsHide(after: 10.0)
-                    }
-                )
-                .equatable()
-                .focused($focusedControl, equals: .audio)
-                .disabled(!isTransportButtonFocusable(.audio))
-                .onExitCommand(perform: handleExit)
-                .onMoveCommand { direction in
-                    handleMove(direction, from: .audio)
-                }
+            ForEach(availableTransportButtons) { button in
+                transportButton(button)
             }
 
             glassIconButton(
@@ -551,6 +514,97 @@ struct PlayerControls: View {
                 Image(systemName: "ellipsis")
             }
             .id("settings_button")
+        }
+    }
+
+    @ViewBuilder
+    private func transportButton(_ button: TVPlayerButton) -> some View {
+        switch button {
+        case .pip:
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .pip,
+                isFocused: focusedControl == .pip
+            ) {
+                viewModel.togglePictureInPicture()
+            } icon: {
+                Image(systemName: "pip.enter")
+            }
+            .id("pip_button")
+
+        case .episodes:
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .episodes,
+                isFocused: focusedControl == .episodes
+            ) {
+                viewModel.openSidePanel(.episodes)
+            } icon: {
+                Image(systemName: "list.bullet")
+            }
+            .id("episodes_button")
+
+        case .sources:
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .sources,
+                isFocused: focusedControl == .sources
+            ) {
+                viewModel.openSidePanel(.sources)
+            } icon: {
+                Image(systemName: "square.stack.3d.up")
+            }
+            .id("sources_button")
+
+        case .subtitles:
+            PlayerSubtitleMenuButton(
+                noneOption: subtitleNoneOption,
+                languageGroups: subtitleLanguageGroups,
+                isFocused: focusedControl == .subtitles,
+                onSelect: { selectSubtitlePickerOption($0) }
+            )
+            .equatable()
+            .focused($focusedControl, equals: .subtitles)
+            .disabled(!isTransportButtonFocusable(.subtitles))
+            .onExitCommand(perform: handleExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .subtitles)
+            }
+
+        case .audio:
+            PlayerAudioMenuButton(
+                orderedTracks: orderedAudioTracks,
+                supportsAudioProcessing: viewModel.supportsAudioProcessing,
+                enhanceDialogueMode: viewModel.supportsAudioProcessing ? viewModel.enhanceDialogueMode : .off,
+                isReduceLoudSoundsActive: viewModel.supportsAudioProcessing && viewModel.isReduceLoudSoundsActive,
+                isFocused: focusedControl == .audio,
+                onSelectTrack: { track in
+                    viewModel.selectAudio(track)
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onSetEnhanceDialogueMode: { mode in
+                    viewModel.setEnhanceDialogueMode(mode)
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onToggleReduceLoudSounds: {
+                    viewModel.toggleReduceLoudSounds()
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                }
+            )
+            .equatable()
+            .focused($focusedControl, equals: .audio)
+            .disabled(!isTransportButtonFocusable(.audio))
+            .onExitCommand(perform: handleExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .audio)
+            }
+
         }
     }
 

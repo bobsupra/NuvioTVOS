@@ -451,6 +451,8 @@ struct ContentView: View {
     @State private var playbackCurrentEpisode: NuvioVideo?
     @State private var playbackIsActionPlaybackSession = false
     @State private var playbackOrigin: PlaybackOrigin = .main
+    @State private var playerDismissalHandoffGeneration: UInt = 0
+    @State private var playerDismissalHandoffTarget: TVScreen?
     @State private var playbackLibraryWatchedContext: LibraryWatchedContext?
     @State private var playbackFilename: String?
     @State private var playbackSourceID: String?
@@ -660,6 +662,7 @@ struct ContentView: View {
         .appliesAppLocale()
         .onChange(of: profileViewModel.activeProfile?.id) { _, newID in
             AppLocaleManager.shared.reloadFromProfileStore()
+            AppFontManager.shared.reloadFromProfileStore()
             if newID != nil, activeScreen == .main {
                 libraryViewModel.loadLibrary()
                 Task { @MainActor in
@@ -716,7 +719,9 @@ struct ContentView: View {
         // so this only kicks in for the in-between frames.
         .onExitCommand(perform: visibleAppNotice != nil
             ? dismissVisibleAppNotice
-            : (isOverlayPresented ? dismissOverlay : nil))
+            : (playerDismissalHandoffTarget == activeScreen
+                ? ignorePlayerDismissalHandoffExit
+                : (isOverlayPresented ? dismissOverlay : nil)))
         .sheet(item: $presentedAppNoticeDetails, onDismiss: {
             appNoticeFocusRequestGeneration &+= 1
         }) {
@@ -849,6 +854,9 @@ struct ContentView: View {
                 if backgroundedAt != nil {
                     releaseUpdateService.beginForegroundSession()
                     announcementService.beginForegroundSession()
+                    Task(priority: .utility) {
+                        await JellyfinSessionManager.shared.handleForegroundSession()
+                    }
                 }
                 Task { await releaseUpdateService.checkIfNeeded() }
                 Task { await announcementService.checkIfNeeded() }
@@ -1071,7 +1079,7 @@ struct ContentView: View {
         case .details:
             leaveDetails()
         case let .player(_, meta, subtitle, _, _, _):
-            dismissPlayer(meta: meta, subtitle: subtitle)
+            dismissPlayer(meta: meta, subtitle: subtitle, protectsBackHandoff: true)
         case .cloudLibrary, .collectionFolder:
             withAnimation(.easeInOut(duration: 0.24)) {
                 activeScreen = .main
@@ -1102,6 +1110,8 @@ struct ContentView: View {
             break
         }
     }
+
+    private func ignorePlayerDismissalHandoffExit() {}
 
     /// Backs out of Details to the title it was opened from (a "More like this"
     /// chain), or to the screen that opened the root Details.
@@ -2773,7 +2783,7 @@ struct ContentView: View {
 
             if isResolvingContinueWatchingStream, let item = resolvingContinueWatchingItem {
                 PlayerLoadingOverlay(
-                    backdropUrl: item.meta.backgroundUrl ?? item.meta.posterUrl,
+                    backdropUrl: item.meta.backgroundUrl ?? item.meta.landscapePosterUrl ?? item.meta.posterUrl,
                     logoUrl: item.meta.logoUrl,
                     title: item.meta.name,
                     message: continueWatchingLoadingMessage,
@@ -3811,7 +3821,8 @@ struct ContentView: View {
                 selectedTab = .party
                 activeScreen = .main
             },
-            onBack: { dismissPlayer(meta: meta, subtitle: subtitle) }
+            onBack: { dismissPlayer(meta: meta, subtitle: subtitle) },
+            onRemoteBack: { dismissPlayer(meta: meta, subtitle: subtitle, protectsBackHandoff: true) }
         )
         .id(playerSurfaceID.uuidString)
         }
@@ -3855,7 +3866,39 @@ struct ContentView: View {
         }
     }
 
-    private func dismissPlayer(meta: NuvioMeta, subtitle: String) {
+    private func dismissPlayer(
+        meta: NuvioMeta,
+        subtitle: String,
+        protectsBackHandoff: Bool = false
+    ) {
+        let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        let isActionPlaybackSession = playbackIsActionPlaybackSession
+        if protectsBackHandoff {
+            let dismissalTarget: TVScreen
+            if playbackPartyID != nil {
+                dismissalTarget = .main
+            } else {
+                switch playbackOrigin {
+                case .details:
+                    dismissalTarget = .details(id: meta.id, type: meta.type)
+                case .cloudLibrary:
+                    dismissalTarget = .cloudLibrary
+                case .main:
+                    dismissalTarget = (isTrailer || isActionPlaybackSession || meta.isSeries)
+                        ? .details(id: meta.id, type: meta.type)
+                        : .main
+                }
+            }
+
+            playerDismissalHandoffGeneration &+= 1
+            let handoffGeneration = playerDismissalHandoffGeneration
+            playerDismissalHandoffTarget = dismissalTarget
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                guard self.playerDismissalHandoffGeneration == handoffGeneration else { return }
+                self.playerDismissalHandoffTarget = nil
+            }
+        }
+
         if playbackPartyID != nil {
             let pip = PictureInPictureManager.shared
             let keepsPiP = watchPartyOwner.owns(pip.activeCoordinator)
@@ -3865,8 +3908,6 @@ struct ContentView: View {
             activeScreen = .main
             return
         }
-        let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
-        let isActionPlaybackSession = playbackIsActionPlaybackSession
         withAnimation(.easeInOut(duration: 0.24)) {
             switch playbackOrigin {
             case .details:
@@ -3935,14 +3976,14 @@ private struct AccountSyncWaitView: View {
                 .scaleEffect(1.6)
 
             Text(L10n.string("account_sync_loading", fallback: "Syncing your account"))
-                .font(.custom("Inter-Bold", size: 44))
+                .font(.appFont(size: 44, weight: .bold))
                 .foregroundColor(.white)
 
             Text(L10n.string(
                 "account_sync_loading_subtitle",
                 fallback: "Hang tight while we import your profiles and watch history."
             ))
-                .font(.custom("Inter-Regular", size: 28))
+                .font(.appFont(size: 28, weight: .regular))
                 .foregroundColor(.white.opacity(0.6))
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -10703,6 +10744,197 @@ enum TVDetailsSectionOrder {
     }
 }
 
+/// Reorderable transport buttons shown in the player controls row.
+enum TVPlayerButton: String, CaseIterable, Identifiable {
+    case pip
+    case episodes
+    case sources
+    case subtitles
+    case audio
+
+    var id: String { rawValue }
+
+    init?(caseInsensitive rawValue: String) {
+        switch rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "pip": self = .pip
+        case "episodes": self = .episodes
+        case "sources": self = .sources
+        case "subtitles": self = .subtitles
+        case "audio": self = .audio
+        default: return nil
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .pip:
+            return L10n.string("tvos_settings_player_pip", fallback: "Picture in Picture")
+        case .episodes:
+            return L10n.string("tvos_settings_player_episodes", fallback: "Episodes Button")
+        case .sources:
+            return L10n.string("tvos_settings_player_sources", fallback: "Streams & Sources Button")
+        case .subtitles:
+            return L10n.string("tvos_settings_player_subtitles", fallback: "Subtitles Button")
+        case .audio:
+            return L10n.string("tvos_settings_player_audio", fallback: "Audio & Sound Button")
+        }
+    }
+}
+
+/// Profile-scoped ordering for the player controls row.
+enum TVPlayerButtonOrder {
+    static let changedNotification = Notification.Name("nuvio.tv.playerButtonOrder.changed")
+    static let defaultOrder: [TVPlayerButton] = [.pip, .episodes, .sources, .subtitles, .audio]
+
+    static func currentOrder(in settings: UserDefaults = ProfileSettings.current) -> [TVPlayerButton] {
+        var result: [TVPlayerButton] = []
+        var seen = Set<TVPlayerButton>()
+
+        if let data = settings.data(forKey: SettingsKey.playerButtonOrder),
+           let rawKeys = try? JSONDecoder().decode([String].self, from: data) {
+            for raw in rawKeys {
+                if let button = TVPlayerButton(caseInsensitive: raw), seen.insert(button).inserted {
+                    result.append(button)
+                }
+            }
+        }
+
+        for button in defaultOrder where seen.insert(button).inserted {
+            result.append(button)
+        }
+        return result
+    }
+
+    static func saveOrder(_ order: [TVPlayerButton], in settings: UserDefaults = ProfileSettings.current) {
+        var seen = Set<TVPlayerButton>()
+        var normalized: [TVPlayerButton] = []
+        for button in order where seen.insert(button).inserted {
+            normalized.append(button)
+        }
+        for button in defaultOrder where seen.insert(button).inserted {
+            normalized.append(button)
+        }
+        if let data = try? JSONEncoder().encode(normalized.map(\.rawValue)) {
+            settings.set(data, forKey: SettingsKey.playerButtonOrder)
+        }
+        notifyChange()
+    }
+
+    static func resetToDefaults(in settings: UserDefaults = ProfileSettings.current) {
+        saveOrder(defaultOrder, in: settings)
+    }
+
+    private static func notifyChange() {
+        ProfileSettings.notifySettingsChanged()
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+}
+
+/// Profile-scoped order and visibility for InSight panel tabs.
+enum TVSceneTabOrder {
+    static let changedNotification = Notification.Name("nuvio.tv.sceneTabOrder.changed")
+    static let defaultOrder: [SceneTab] = [.scene, .info, .upNext, .watchParty]
+
+    static func stableID(for tab: SceneTab) -> String {
+        switch tab {
+        case .scene: return "scene"
+        case .info: return "info"
+        case .upNext: return "up_next"
+        case .watchParty: return "watch_party"
+        }
+    }
+
+    static func currentOrder(in settings: UserDefaults = ProfileSettings.current) -> [SceneTab] {
+        var result: [SceneTab] = []
+        var seen = Set<SceneTab>()
+
+        if let data = settings.data(forKey: SettingsKey.sceneTabOrder),
+           let rawIDs = try? JSONDecoder().decode([String].self, from: data) {
+            for rawID in rawIDs {
+                if let tab = sceneTab(for: rawID), seen.insert(tab).inserted {
+                    result.append(tab)
+                }
+            }
+        }
+
+        for tab in defaultOrder where seen.insert(tab).inserted {
+            result.append(tab)
+        }
+        return result
+    }
+
+    static func disabledTabs(in settings: UserDefaults = ProfileSettings.current) -> Set<SceneTab> {
+        guard let data = settings.data(forKey: SettingsKey.sceneTabDisabled),
+              let rawIDs = try? JSONDecoder().decode([String].self, from: data) else {
+            return []
+        }
+        return Set(rawIDs.compactMap { sceneTab(for: $0) })
+    }
+
+    static func enabledTabs(in settings: UserDefaults = ProfileSettings.current) -> [SceneTab] {
+        let disabled = disabledTabs(in: settings)
+        return currentOrder(in: settings).filter { !disabled.contains($0) }
+    }
+
+    static func enabledTabCount(in settings: UserDefaults = ProfileSettings.current) -> Int {
+        enabledTabs(in: settings).count
+    }
+
+    static func setTabEnabled(_ tab: SceneTab, isEnabled: Bool, in settings: UserDefaults = ProfileSettings.current) {
+        var disabled = disabledTabs(in: settings)
+        if isEnabled {
+            disabled.remove(tab)
+        } else {
+            disabled.insert(tab)
+        }
+        let rawIDs = defaultOrder.filter { disabled.contains($0) }.map { stableID(for: $0) }
+        if let data = try? JSONEncoder().encode(rawIDs) {
+            settings.set(data, forKey: SettingsKey.sceneTabDisabled)
+        }
+        notifyChange()
+    }
+
+    static func saveOrder(_ order: [SceneTab], in settings: UserDefaults = ProfileSettings.current) {
+        var seen = Set<SceneTab>()
+        var normalized: [SceneTab] = []
+        for tab in order where seen.insert(tab).inserted {
+            normalized.append(tab)
+        }
+        for tab in defaultOrder where seen.insert(tab).inserted {
+            normalized.append(tab)
+        }
+        if let data = try? JSONEncoder().encode(normalized.map { stableID(for: $0) }) {
+            settings.set(data, forKey: SettingsKey.sceneTabOrder)
+        }
+        notifyChange()
+    }
+
+    static func resetToDefaults(in settings: UserDefaults = ProfileSettings.current) {
+        if let orderData = try? JSONEncoder().encode(defaultOrder.map { stableID(for: $0) }),
+           let disabledData = try? JSONEncoder().encode([String]()) {
+            settings.set(orderData, forKey: SettingsKey.sceneTabOrder)
+            settings.set(disabledData, forKey: SettingsKey.sceneTabDisabled)
+        }
+        settings.set(true, forKey: SettingsKey.sceneFeatureEnabled)
+        notifyChange()
+    }
+
+    private static func sceneTab(for rawID: String) -> SceneTab? {
+        switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "scene", "insight", "in_sight": return .scene
+        case "info": return .info
+        case "up_next", "up next", "upnext": return .upNext
+        case "watch_party", "watch party", "watchparty": return .watchParty
+        default: return nil
+        }
+    }
+
+    private static func notifyChange() {
+        ProfileSettings.notifySettingsChanged()
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+}
+
 /// Keeps catalogs used only inside synced collection folders out of top-level
 /// Home rows. Inputs are explicit so the matching rule remains deterministic.
 enum CatalogHomeVisibilityResolver {
@@ -11068,7 +11300,7 @@ private struct TVCollectionFolderHeroView: View, Equatable {
                         }
 
                         Text(displayTitle)
-                            .font(.custom("Inter-Bold", size: 48))
+                            .font(.appFont(size: 48, weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(2)
                             .minimumScaleFactor(0.7)
@@ -11105,7 +11337,7 @@ private struct TVHeroView: View {
                 CachedHeroLogo(url: logoUrl, title: meta.name)
             } else {
                 Text(meta.name)
-                    .font(.custom("Inter-Bold", size: 54))
+                    .font(.appFont(size: 54, weight: .bold))
                     .lineLimit(2)
                     .foregroundColor(.white)
             }
@@ -11114,13 +11346,13 @@ private struct TVHeroView: View {
 
             if let continueItem {
                 Text(continueItem.isUpNextEntry ? continueItem.upNextBadgeText : continueItem.remainingText.uppercased())
-                    .font(.custom("Inter-SemiBold", size: 22))
+                    .font(.appFont(size: 22, weight: .semibold))
                     .foregroundColor(.white.opacity(0.66))
             }
 
             if let description = heroDescription {
                 Text(description.wrappedEveryNWords(9))
-                    .font(.custom("Inter-Regular", size: 24))
+                    .font(.appFont(size: 24, weight: .regular))
                     .foregroundColor(.white)
                     .lineSpacing(3)
                     .lineLimit(4)
@@ -12082,7 +12314,7 @@ private struct TVGridHeroSlideshowView: View {
                         .frame(maxWidth: 540, maxHeight: 110, alignment: .bottomLeading)
                 } else {
                     Text(item.name)
-                        .font(.custom("Inter-Bold", size: 48))
+                        .font(.appFont(size: 48, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(2)
                         .shadow(color: .black.opacity(0.6), radius: 6, y: 3)
@@ -12107,7 +12339,7 @@ private struct TVGridHeroSlideshowView: View {
             // 3. Description (2 lines, clean Apple TV typography)
             if let description = item.description, !description.isEmpty {
                 Text(description)
-                    .font(.custom("Inter-Regular", size: 21))
+                    .font(.appFont(size: 21, weight: .regular))
                     .foregroundColor(.white.opacity(0.82))
                     .lineLimit(2)
                     .lineSpacing(4)
@@ -12158,7 +12390,7 @@ private struct TVGridHeroSlideshowView: View {
             // 5. Subtitle info under primary button
             if let subtitle = heroSubtitleText(item) {
                 Text(subtitle)
-                    .font(.custom("Inter-Medium", size: 15))
+                    .font(.appFont(size: 15, weight: .medium))
                     .foregroundColor(.white.opacity(0.58))
                     .padding(.top, 2)
                     .shadow(color: .black.opacity(0.6), radius: 3, y: 1)
@@ -12205,7 +12437,7 @@ private struct TVGridHeroSlideshowView: View {
                 .foregroundColor(.white.opacity(0.9))
 
             Text(metadataItems.joined(separator: "  •  "))
-                .font(.custom("Inter-SemiBold", size: 19))
+                .font(.appFont(size: 19, weight: .semibold))
                 .foregroundColor(.white.opacity(0.85))
 
             if let cert = item.certification, !cert.isEmpty {
@@ -12228,7 +12460,7 @@ private struct TVGridHeroSlideshowView: View {
     @ViewBuilder
     private func heroBadge(_ text: String) -> some View {
         Text(text)
-            .font(.custom("Inter-Bold", size: 13))
+            .font(.appFont(size: 13, weight: .bold))
             .foregroundColor(.white.opacity(0.95))
             .padding(.horizontal, 6)
             .padding(.vertical, 2)
@@ -12252,7 +12484,7 @@ private struct TVGridHeroSlideshowView: View {
                         .accessibilityHidden(true)
 
                     Text(playTarget?.label ?? L10n.string("action_play", fallback: "Play"))
-                        .font(.system(size: 32, weight: .medium))
+                        .font(.appFont(size: 32, weight: .medium))
                         .lineLimit(1)
                         .accessibilityHidden(true)
                 }
@@ -12458,7 +12690,7 @@ private struct CachedHeroLogo: View {
                 .frame(maxWidth: 520, maxHeight: 136, alignment: .bottomLeading)
             } else {
                 Text(title)
-                    .font(.custom("Inter-Bold", size: 54))
+                    .font(.appFont(size: 54, weight: .bold))
                     .lineLimit(2)
                     .foregroundColor(.white)
             }
@@ -12555,7 +12787,7 @@ private struct TVHeroMetaLine: View {
                 VStack(alignment: .leading, spacing: 10) {
                     if hasPrimary {
                         Text(primaryValues.joined(separator: "  •  "))
-                            .font(.custom("Inter-SemiBold", size: 22))
+                            .font(.appFont(size: 22, weight: .semibold))
                             .foregroundColor(.white.opacity(0.66))
                             .lineLimit(1)
                     }
@@ -12566,7 +12798,7 @@ private struct TVHeroMetaLine: View {
                         HStack(spacing: 14) {
                             if let badge {
                                 Text(badge)
-                                    .font(.custom("Inter-SemiBold", size: 17))
+                                    .font(.appFont(size: 17, weight: .semibold))
                                     .foregroundColor(.white.opacity(0.88))
                                     .padding(.horizontal, 10)
                                     .padding(.vertical, 4)
@@ -12580,7 +12812,7 @@ private struct TVHeroMetaLine: View {
                                 TvHeroRatingsRow(badges: ratingBadges, iconHeight: 26, fontSize: 22)
                             } else if let rating {
                                 Text(badge != nil ? "•  \(rating)" : rating)
-                                    .font(.custom("Inter-SemiBold", size: 22))
+                                    .font(.appFont(size: 22, weight: .semibold))
                                     .foregroundColor(.white.opacity(0.66))
                                     .lineLimit(1)
                             }

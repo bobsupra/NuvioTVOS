@@ -183,6 +183,7 @@ final class ICloudSettingsSyncManager: ObservableObject {
 
             // Notify UI to refresh appearance, layout, integrations
             AppLocaleManager.shared.reloadFromProfileStore()
+            AppFontManager.shared.reloadFromProfileStore()
             NotificationCenter.default.post(name: Self.iCloudSettingsDidSyncNotification, object: nil)
             NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: nil)
         }

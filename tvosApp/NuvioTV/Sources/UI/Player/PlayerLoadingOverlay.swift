@@ -290,8 +290,47 @@ struct PlayerLoadingOverlay: View {
     @State private var isPulsing = false
     @State private var logoLoadFailed = false
     @State private var mountedDate = Date()
+    @State private var backdropImage: UIImage?
     @ObservedObject private var torrentManager = TorrentEngineManager.shared
     @ObservedObject private var usenetManager = UsenetEngineManager.shared
+
+    private var targetArtworkURL: URL? {
+        guard let backdropUrl, !backdropUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        return URL(string: backdropUrl.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    init(
+        backdropUrl: String?,
+        logoUrl: String?,
+        title: String?,
+        message: String = L10n.string("player_status_starting_stream", fallback: "Starting stream"),
+        startTime: Date? = nil,
+        showTimer: Bool = true,
+        onDismiss: (() -> Void)? = nil,
+        focusEnabled: Bool = true,
+        onSelect: (() -> Void)? = nil,
+        onMove: ((MoveCommandDirection) -> Void)? = nil
+    ) {
+        self.backdropUrl = backdropUrl
+        self.logoUrl = logoUrl
+        self.title = title
+        self.message = message
+        self.startTime = startTime
+        self.showTimer = showTimer
+        self.onDismiss = onDismiss
+        self.focusEnabled = focusEnabled
+        self.onSelect = onSelect
+        self.onMove = onMove
+
+        let initialImage: UIImage?
+        if let backdropUrl,
+           let url = URL(string: backdropUrl.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            initialImage = BackdropImageCache.shared.cachedImage(for: url)
+        } else {
+            initialImage = nil
+        }
+        _backdropImage = State(initialValue: initialImage)
+    }
 
     private var effectiveStartTime: Date {
         startTime ?? mountedDate
@@ -321,19 +360,12 @@ struct PlayerLoadingOverlay: View {
             Color.black.ignoresSafeArea()
 
             // 2. Fullscreen Backdrop Image
-            if let backdrop = backdropUrl, let url = URL(string: backdrop) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .ignoresSafeArea()
-                    default:
-                        Color.clear
-                    }
-                }
+            if let backdropImage {
+                Image(uiImage: backdropImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .ignoresSafeArea()
             }
 
             // 3. Cinematic Vignette Gradient Overlays (matching Android TV)
@@ -567,6 +599,18 @@ struct PlayerLoadingOverlay: View {
             }
         }
         #endif
+        .task(id: targetArtworkURL) {
+            guard let url = targetArtworkURL else {
+                backdropImage = nil
+                return
+            }
+            if let cached = BackdropImageCache.shared.cachedImage(for: url) {
+                backdropImage = cached
+            } else if let loaded = await BackdropImageCache.shared.image(for: url) {
+                guard !Task.isCancelled else { return }
+                backdropImage = loaded
+            }
+        }
     }
 
     @ViewBuilder

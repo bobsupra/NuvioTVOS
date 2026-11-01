@@ -95,7 +95,8 @@ extension PlayerView {
                 },
                 onClose: {
                     onBack()
-                }
+                },
+                onRemoteBack: onRemoteBack
             )
             .transition(.opacity)
         } else {
@@ -103,12 +104,12 @@ extension PlayerView {
             case .buffering, .idle:
                 if isLoadingOverlayVisible {
                     PlayerLoadingOverlay(
-                        backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                        backdropUrl: meta.backgroundUrl ?? meta.landscapePosterUrl ?? meta.posterUrl,
                         logoUrl: meta.logoUrl,
                         title: meta.name,
                         message: viewModel.loadingStepMessage,
                         startTime: PlaybackStartupTiming.requestDate(for: viewModel.startupBenchmarkToken),
-                        onDismiss: onBack,
+                        onDismiss: onRemoteBack,
                         focusEnabled: loadingOverlayFocusEnabled,
                         onSelect: { revealControlsAndFocusSettings() },
                         onMove: handleLoadingOverlayMove
@@ -125,12 +126,12 @@ extension PlayerView {
             case .playing, .paused:
                 if isLoadingOverlayVisible {
                     PlayerLoadingOverlay(
-                        backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                        backdropUrl: meta.backgroundUrl ?? meta.landscapePosterUrl ?? meta.posterUrl,
                         logoUrl: meta.logoUrl,
                         title: meta.name,
                         message: viewModel.loadingStepMessage,
                         startTime: PlaybackStartupTiming.requestDate(for: viewModel.startupBenchmarkToken),
-                        onDismiss: onBack,
+                        onDismiss: onRemoteBack,
                         focusEnabled: loadingOverlayFocusEnabled,
                         onSelect: { revealControlsAndFocusSettings() },
                         onMove: handleLoadingOverlayMove
@@ -151,6 +152,7 @@ struct PlaybackErrorOverlayView: View {
     let onSources: () -> Void
     let onRetry: () -> Void
     let onClose: () -> Void
+    let onRemoteBack: () -> Void
 
     enum FocusItem: Hashable {
         case sources
@@ -281,7 +283,7 @@ struct PlaybackErrorOverlayView: View {
         .glassRoundedRect(cornerRadius: 28)
         .shadow(color: .black.opacity(0.7), radius: 24, y: 8)
         .focusSection()
-        .onExitCommand(perform: onClose)
+        .onExitCommand(perform: onRemoteBack)
         .onAppear {
             if !didInitializeFocus {
                 didInitializeFocus = true

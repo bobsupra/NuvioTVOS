@@ -273,12 +273,12 @@ struct TVLoadingCatalogRow: View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .center, spacing: 14) {
                 Text(title)
-                    .font(.custom("Inter-Bold", size: 30))
+                    .font(.appFont(size: 30, weight: .bold))
                     .foregroundColor(.white)
 
                 if showAddonName, let addonName = addonName, !addonName.isEmpty {
                     Text(addonName)
-                        .font(.custom("Inter-SemiBold", size: 16))
+                        .font(.appFont(size: 16, weight: .semibold))
                         .foregroundColor(SettingsAccent.color(for: theme))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
@@ -523,12 +523,12 @@ struct TVCatalogRow: View {
                 VStack(alignment: .leading, spacing: 10) {
                     HStack(alignment: .center, spacing: 14) {
                         Text(title)
-                            .font(.custom("Inter-Bold", size: 30))
+                            .font(.appFont(size: 30, weight: .bold))
                             .foregroundColor(.white)
 
                         if showAddonName, let addonName = addonName, !addonName.isEmpty {
                             Text(addonName)
-                                .font(.custom("Inter-SemiBold", size: 16))
+                                .font(.appFont(size: 16, weight: .semibold))
                                 .foregroundColor(SettingsAccent.color(for: theme))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 4)
@@ -873,12 +873,12 @@ struct TVHomeCatalogGridSection: View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(alignment: .center, spacing: 14) {
                 Text(section.title)
-                    .font(.custom("Inter-Bold", size: 30))
+                    .font(.appFont(size: 30, weight: .bold))
                     .foregroundColor(.white)
 
                 if showAddonName, let addonName = section.addonName, !addonName.isEmpty {
                     Text(addonName)
-                        .font(.custom("Inter-SemiBold", size: 16))
+                        .font(.appFont(size: 16, weight: .semibold))
                         .foregroundColor(SettingsAccent.color(for: theme))
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
@@ -1418,7 +1418,7 @@ struct TVCollectionFolderRow: View {
             if showsSectionTitle {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(title)
-                        .font(.custom("Inter-Bold", size: 30))
+                        .font(.appFont(size: 30, weight: .bold))
                         .foregroundColor(.white)
                         .padding(.leading, TVLayout.rowLeading)
                         .offset(y: 8)

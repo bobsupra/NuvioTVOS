@@ -242,6 +242,7 @@ final class AppLocaleManager: ObservableObject {
     /// Call as early as possible at process start.
     static func bootstrap() {
         _ = shared
+        _ = AppFontManager.shared
     }
 
     private func applyToProcess(_ language: AppLanguage, bumpRevision: Bool) {
@@ -471,13 +472,14 @@ extension View {
 
 private struct AppLocaleViewModifier: ViewModifier {
     @ObservedObject private var manager = AppLocaleManager.shared
+    @ObservedObject private var fontManager = AppFontManager.shared
 
     func body(content: Content) -> some View {
         content
             .environment(\.locale, manager.locale)
             .environment(\.layoutDirection, layoutDirection(for: manager.language))
             .environment(\.appLocale, manager.locale)
-            .id(manager.revision)
+            .id("\(manager.revision)-\(fontManager.revision)")
     }
 
     private func layoutDirection(for language: AppLanguage) -> LayoutDirection {
@@ -491,5 +493,104 @@ private struct AppLocaleViewModifier: ViewModifier {
         default:
             return .leftToRight
         }
+    }
+}
+
+// MARK: - AppFont
+
+/// Typefaces available for the app UI, matching Android TV font selection plus native options.
+enum AppFont: String, CaseIterable, Identifiable, Hashable {
+    case inter = "Inter"
+    case system = "System"
+    case rounded = "Rounded"
+
+    var id: String { rawValue }
+
+    var displayName: String {
+        switch self {
+        case .inter: return "Inter"
+        case .system: return "System (San Francisco)"
+        case .rounded: return "System (Rounded)"
+        }
+    }
+
+    static func fromStored(_ value: String?) -> AppFont {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return .inter
+        }
+        return AppFont(rawValue: value) ?? (value.caseInsensitiveCompare("system") == .orderedSame ? .system : .inter)
+    }
+}
+
+final class AppFontManager: ObservableObject {
+    static let shared = AppFontManager()
+    static let storageKey = SettingsKey.font
+
+    @Published private(set) var currentFont: AppFont
+    @Published private(set) var revision: UInt = 0
+
+    private init() {
+        let stored = ProfileSettings.current.string(forKey: Self.storageKey)
+            ?? UserDefaults.standard.string(forKey: Self.storageKey)
+        currentFont = AppFont.fromStored(stored)
+    }
+
+    func setFont(_ next: AppFont, persist: Bool = true) {
+        let previous = currentFont
+        if persist {
+            ProfileSettings.current.set(next.rawValue, forKey: Self.storageKey)
+            UserDefaults.standard.set(next.rawValue, forKey: Self.storageKey)
+            ProfileSettings.notifySettingsChanged()
+        }
+        guard next != previous || persist else { return }
+        currentFont = next
+        revision &+= 1
+    }
+
+    func reloadFromProfileStore() {
+        let stored = ProfileSettings.current.string(forKey: Self.storageKey)
+        setFont(AppFont.fromStored(stored), persist: false)
+    }
+
+    func font(size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> Font {
+        switch currentFont {
+        case .inter:
+            let fontName = Self.interFontName(for: weight)
+            return .custom(fontName, size: size)
+        case .system:
+            return .system(size: size, weight: weight, design: design == .default ? .default : design)
+        case .rounded:
+            return .system(size: size, weight: weight, design: .rounded)
+        }
+    }
+
+    private static func interFontName(for weight: Font.Weight) -> String {
+        switch weight {
+        case .bold, .heavy, .black:
+            return "Inter-Bold"
+        case .semibold:
+            return "Inter-SemiBold"
+        case .medium:
+            return "Inter-Medium"
+        default:
+            return "Inter-Regular"
+        }
+    }
+}
+
+extension Font {
+    static func appFont(size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> Font {
+        AppFontManager.shared.font(size: size, weight: weight, design: design)
+    }
+
+    static func appFont(_ weightName: String, size: CGFloat) -> Font {
+        let weight: Font.Weight
+        switch weightName.lowercased() {
+        case "bold", "heavy", "black": weight = .bold
+        case "semibold", "semi-bold": weight = .semibold
+        case "medium": weight = .medium
+        default: weight = .regular
+        }
+        return AppFontManager.shared.font(size: size, weight: weight)
     }
 }
