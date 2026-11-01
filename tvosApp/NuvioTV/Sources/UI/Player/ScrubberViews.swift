@@ -233,6 +233,9 @@ struct SeekPreviewCard: View {
     let image: CGImage?
     var width: CGFloat = 480
     var naturalSize: CGSize = CGSize(width: 16, height: 9)
+    /// The still belongs to a passed position while the target's own is on its way: dimmed, so
+    /// it does not read as the preview of where the remote rests.
+    var isStale: Bool = false
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
 
@@ -252,6 +255,8 @@ struct SeekPreviewCard: View {
                     .aspectRatio(contentMode: .fill)
                     .frame(width: cardSize.width, height: cardSize.height)
                     .clipped()
+                    .blur(radius: isStale ? 8 : 0)
+                    .opacity(isStale ? 0.35 : 1)
             } else {
                 ZStack {
                     RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)

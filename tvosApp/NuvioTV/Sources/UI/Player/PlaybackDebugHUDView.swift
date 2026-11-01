@@ -222,6 +222,31 @@ struct PlaybackDebugHUDView: View {
                     hasDot: true,
                     dotColor: info.stallsCount > 1 ? .red : (info.stallsCount == 1 ? .yellow : .green)
                 )
+                let seekr = SeekPreviewDiagnostics.shared.seekrLine
+                if !seekr.isEmpty {
+                    hudRow(
+                        label: "Seekr",
+                        value: seekr,
+                        hasDot: true,
+                        dotColor: seekr.hasPrefix("found") ? .green
+                            : (seekr.contains("401") || seekr.contains("limit") ? .red : (seekr.hasSuffix("…") ? .yellow : .gray))
+                    )
+                }
+                let previews = SeekPreviewDiagnostics.shared.line
+                if !previews.isEmpty {
+                    hudRow(
+                        label: "Previews",
+                        value: previews,
+                        hasDot: true,
+                        dotColor: previews.hasPrefix("stopped") ? .red : (previews.hasPrefix("net on") ? .green : .gray)
+                    )
+                }
+                // The last stills the preview card showed, newest first: target, path←origin,
+                // and how far the frame is from the target.
+                let shownStills = SeekPreviewDiagnostics.shared.shown
+                ForEach(Array(shownStills.enumerated()), id: \.offset) { index, still in
+                    hudRow(label: index == 0 ? "Shown" : "", value: still)
+                }
             }
         }
     }

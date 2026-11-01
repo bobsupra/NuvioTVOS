@@ -714,6 +714,7 @@ struct PlayerControls: View {
                 isHoldingSeek: viewModel.isHoldingSeek,
                 pendingSeekDelta: viewModel.pendingSeekDelta,
                 image: ((viewModel.isHoldingSeek || viewModel.isScrubbing) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
+                isStale: viewModel.scrubThumbnailIsStale,
                 naturalSize: viewModel.videoNaturalSize,
                 speedMultiplier: viewModel.seekSpeedMultiplier,
                 wheelEngaged: viewModel.wheelEngaged
@@ -1025,6 +1026,7 @@ private struct SeekPreviewTimelineCard: View {
     var isHoldingSeek: Bool = false
     let pendingSeekDelta: Double
     let image: CGImage?
+    var isStale: Bool = false
     var naturalSize: CGSize = CGSize(width: 16, height: 9)
     var speedMultiplier: Int? = nil
     var wheelEngaged: Bool = false
@@ -1051,7 +1053,7 @@ private struct SeekPreviewTimelineCard: View {
             let cardX = min(max(targetX, cardHalfW + 16), geo.size.width - cardHalfW - 16)
 
             if isScrubbing || isHoldingSeek {
-                SeekPreviewCard(image: image, width: width, naturalSize: naturalSize)
+                SeekPreviewCard(image: image, width: width, naturalSize: naturalSize, isStale: isStale)
                     .position(x: cardX, y: 270 - cardSize.height / 2)
             }
         }

@@ -8,6 +8,21 @@ protocol ScrubThumbnailProviding: AnyObject {
     var supportsScrubThumbnails: Bool { get }
     func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage?
     func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage?
+    /// The closest still already held within `maxDistance`, shown when the target has none yet.
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage?
+    /// True when `prefetchScrubThumbnails` runs in the background without retiring the
+    /// foreground request (the seek preview lane); false keeps the speculative requests.
+    var prefetchesScrubThumbnailsInBackground: Bool { get }
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double)
+    /// Seconds until previews may read the source, when only a just-started pause holds them back.
+    func pendingScrubThumbnailDelay() -> TimeInterval?
+}
+
+extension ScrubThumbnailProviding {
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? { nil }
+    var prefetchesScrubThumbnailsInBackground: Bool { false }
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {}
+    func pendingScrubThumbnailDelay() -> TimeInterval? { nil }
 }
 
 struct LiveStreamFailoverPolicy {
@@ -229,6 +244,9 @@ class PlayerViewModel: ObservableObject {
     /// Cache-backed Aether still for the current scrub target. Nil means the
     /// time-only HUD remains visible while a still is unavailable.
     @Published private(set) var scrubThumbnail: CGImage?
+    /// The card shows a still from somewhere else than where the remote rests (a position it
+    /// passed on the way), while the target's own still is on its way: the card dims it.
+    @Published private(set) var scrubThumbnailIsStale = false
     /// Accumulated D-pad skip preview (seconds). Zero when idle.
     @Published var pendingSeekDelta: Double = 0
     /// True while holding down D-pad Left/Right for continuous fast-seeking with live preview.
@@ -580,8 +598,24 @@ class PlayerViewModel: ObservableObject {
     private var pendingScrubThumbnailSeconds: Double?
     private var scrubThumbnailGeneration: UInt64 = 0
     private var scrubThumbnailInteractionToken: UInt64 = 0
-    private var scrubThumbnailTargetSeconds: Double?
+    private var scrubThumbnailTargetSeconds: Double? {
+        didSet { updateStaleScrubThumbnail() }
+    }
+    /// A still this far from the target belongs to another moment (more than a preview cell).
+    private static let staleScrubThumbnailDistance = 3.0
+    private var staleScrubThumbnailCheck: Task<Void, Never>?
+    /// How far from the target a held still may stand in while the target has none.
+    static let nearestScrubThumbnailDistance: Double = 30
     private var lastScrubTargetSeconds: Double?
+    /// When the requested target last moved. A superseded frame is shown as feedback only
+    /// while the remote keeps moving.
+    private var lastScrubTargetChange = Date.distantPast
+    /// Requests closer than this ask for the same still: the end of a touch gesture repeats the
+    /// last published target.
+    private static let sameScrubTargetTolerance = 0.05
+    /// Targets change every 33 ms while swiping and every 100 ms while holding: a longer gap
+    /// means the remote rests.
+    private static let scrubMovingWindow: TimeInterval = 0.25
     private var speculativePrefetchTask: Task<Void, Never>?
     private var scrubLastDx: CGFloat = 0
     private var scrubEngagedThisStroke = false
@@ -1234,6 +1268,7 @@ class PlayerViewModel: ObservableObject {
             season: activeEpisodeNumbers?.season,
             episode: activeEpisodeNumbers?.episode,
             duration: expectedDurationSeconds,
+            fileIdentity: (cacheFileIdentity ?? activeCacheFileIdentity)?.cacheKey ?? filename,
             fallbackURL: url.absoluteString
         )
         let isAnime = activeMeta?.isAnime == true
@@ -1286,6 +1321,7 @@ class PlayerViewModel: ObservableObject {
         let sNum = activeEpisodeNumbers?.season
         let eNum = activeEpisodeNumbers?.episode
         let expDur = expectedDurationSeconds
+        SeekPreviewDiagnostics.shared.updateSeekr("")
         trickplayResolveTask = Task { [weak self, activeGen = self.sessionCoordinator.loadGeneration] in
             let provider = await TrickplayResolver.shared.resolve(
                 contentId: contentId,
@@ -1294,11 +1330,27 @@ class PlayerViewModel: ObservableObject {
                 duration: expDur,
                 directTrickplayURL: directTPURL
             )
-            guard let self, let provider, !Task.isCancelled else { return }
-            await MainActor.run {
-                guard self.sessionCoordinator.loadGeneration == activeGen else { return }
-                self.sessionCoordinator.setExternalTrickplayProvider(provider)
+            guard let self, !Task.isCancelled else { return }
+            if let provider {
+                await MainActor.run {
+                    guard self.sessionCoordinator.loadGeneration == activeGen else { return }
+                    self.sessionCoordinator.setExternalTrickplayProvider(provider)
+                }
+                return
             }
+            // Seekr, with the profile's key; titles it doesn't have keep the player's previews.
+            guard await SeekrTrickplay.isEnabled(), self.isSeekPreviewEnabled, !self.isLiveStream else { return }
+            SeekPreviewDiagnostics.shared.updateSeekr("waiting for the file's length…")
+            guard let duration = await self.playingFileDuration(generation: activeGen) else { return }
+            let seekr = await SeekrTrickplay.shared.provider(
+                contentId: contentId,
+                season: sNum,
+                episode: eNum,
+                durationSeconds: duration
+            )
+            guard let seekr, !Task.isCancelled,
+                  self.sessionCoordinator.loadGeneration == activeGen else { return }
+            self.sessionCoordinator.setExternalTrickplayProvider(seekr)
         }
         // The coordinator owns initial seek and subtitle registration on both
         // backends; later progressive subtitle results still flow through the
@@ -4766,6 +4818,20 @@ class PlayerViewModel: ObservableObject {
         status == .playing || status == .paused || time.duration > 0 || clock.duration > 0
     }
 
+    /// The playing file's length once it plays (Seekr picks its sprites by it), or nil when
+    /// this load is replaced or it doesn't play within two minutes.
+    private func playingFileDuration(generation: UInt64) async -> Double? {
+        for _ in 0..<240 {
+            guard !Task.isCancelled, sessionCoordinator.loadGeneration == generation else { return nil }
+            let duration = playbackDuration
+            if status == .playing || status == .paused, duration.isFinite, duration > 0 {
+                return duration
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return nil
+    }
+
     private var playbackPosition: Double {
         clock.duration > 0 ? clock.position : time.current
     }
@@ -4894,12 +4960,19 @@ class PlayerViewModel: ObservableObject {
 
     private func scheduleSpeculativePrefetch(from seconds: Double, direction: Double, duration: Double) {
         speculativePrefetchTask?.cancel()
-        guard isSeekPreviewEnabled, activeEngineKind == .aether, duration > 0 else { return }
+        guard isSeekPreviewEnabled, duration > 0,
+              let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
+        if provider.prefetchesScrubThumbnailsInBackground {
+            // The preview lane queues neighbours behind the foreground decode instead of
+            // issuing requests that would retire it.
+            provider.prefetchScrubThumbnails(around: seconds, direction: direction, duration: duration)
+            return
+        }
+        guard activeEngineKind == .aether else { return }
         let step = 15.0 * (direction >= 0 ? 1.0 : -1.0)
         let targets = [seconds + step, seconds + step * 2]
             .filter { $0 >= 0 && $0 <= duration }
         guard !targets.isEmpty else { return }
-        guard let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
         speculativePrefetchTask = Task(priority: .utility) { [weak provider] in
             for target in targets {
                 guard !Task.isCancelled else { break }
@@ -4924,6 +4997,19 @@ class PlayerViewModel: ObservableObject {
             scrubThumbnail = nil
             scrubThumbnailTargetSeconds = nil
             return
+        }
+        let isSameTarget = lastScrubTargetSeconds.map {
+            abs($0 - seconds) < Self.sameScrubTargetTolerance
+        } ?? false
+        // The repeat at the end of a gesture asks again for the still the card already shows;
+        // another decode could only swap it for a different one.
+        if isSameTarget, scrubThumbnailTask == nil, scrubThumbnail != nil,
+           let shown = scrubThumbnailTargetSeconds, abs(shown - seconds) < Self.sameScrubTargetTolerance {
+            return
+        }
+        if !isSameTarget {
+            lastScrubTargetChange = Date()
+            scheduleStaleScrubThumbnailCheck()
         }
         // Keep the last still visible while the next frame is decoded. Remote
         // input routinely advances faster than a network decoder can finish.
@@ -4960,12 +5046,14 @@ class PlayerViewModel: ObservableObject {
             }
             var lastAttemptTarget: Double?
             var failedAttempts = 0
+            var usedDeferredRetry = false
             var lastDecodeTime = Date.distantPast
             while !Task.isCancelled {
                 guard let target = self.pendingScrubThumbnailSeconds else { break }
                 self.pendingScrubThumbnailSeconds = nil
                 if lastAttemptTarget != target {
                     failedAttempts = 0
+                    usedDeferredRetry = false
                     lastAttemptTarget = target
                 }
                 let cached = await selectedProvider.cachedScrubThumbnail(
@@ -4985,10 +5073,11 @@ class PlayerViewModel: ObservableObject {
                 if let cached {
                     self.scrubThumbnail = cached
                     self.scrubThumbnailTargetSeconds = target
+                    SeekPreviewDiagnostics.shared.noteShown(cached, target: target, path: "cache")
                 }
 
                 // If newer remote input arrived while querying cache, prioritize moving to it
-                if self.pendingScrubThumbnailSeconds != nil {
+                if self.hasNewScrubTarget(besides: target) {
                     continue
                 }
 
@@ -4996,10 +5085,10 @@ class PlayerViewModel: ObservableObject {
                 if image == nil {
                     // Throttle fast in-flight decodes while moving (~180ms)
                     let elapsed = Date().timeIntervalSince(lastDecodeTime)
-                    if elapsed < 0.18 {
+                    if elapsed < 0.18, !self.isScrubRemoteResting {
                         try? await Task.sleep(nanoseconds: UInt64((0.18 - elapsed) * 1_000_000_000))
                         guard !Task.isCancelled else { return }
-                        if self.pendingScrubThumbnailSeconds != nil {
+                        if self.hasNewScrubTarget(besides: target) {
                             continue
                         }
                     }
@@ -5020,21 +5109,33 @@ class PlayerViewModel: ObservableObject {
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
 
-                // Completed fast frames provide progressive feedback
-                if let image {
-                    self.scrubThumbnail = image
-                    self.scrubThumbnailTargetSeconds = target
-                } else if abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
+                if image == nil, abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
                     self.scrubThumbnail = nil
                     self.scrubThumbnailTargetSeconds = nil
                 }
 
-                if self.pendingScrubThumbnailSeconds != nil { continue }
+                // A fast frame can be the keyframe seconds before the target, often another shot.
+                // It is feedback only while the remote keeps moving: a settled target waits for
+                // its exact still, so the card never shows a nearby picture and then swaps it.
+                if self.hasNewScrubTarget(besides: target) {
+                    self.showMovingScrubThumbnail(image, for: target)
+                    continue
+                }
 
-                // Give new input a chance to arrive before paying for exact decode.
-                try? await Task.sleep(nanoseconds: 160_000_000)
-                guard !Task.isCancelled else { return }
-                if self.pendingScrubThumbnailSeconds != nil { continue }
+                // Give new input a chance to arrive before paying for exact decode; a resting
+                // remote sends none.
+                if !self.isScrubRemoteResting {
+                    try? await Task.sleep(nanoseconds: 160_000_000)
+                    guard !Task.isCancelled else { return }
+                }
+                if self.hasNewScrubTarget(besides: target) {
+                    if self.isCurrentScrubThumbnailWork(
+                        generation: generation, interactionToken: interactionToken,
+                        provider: selectedProvider, backend: selectedBackend) {
+                        self.showMovingScrubThumbnail(image, for: target)
+                    }
+                    continue
+                }
                 let refined = await selectedProvider.scrubThumbnail(
                     atSeconds: target, maxWidth: 480, precise: true
                 )
@@ -5047,11 +5148,32 @@ class PlayerViewModel: ObservableObject {
                       self.isSeekPreviewEnabled,
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
-                if self.pendingScrubThumbnailSeconds != nil { continue }
-                if let refined {
-                    self.scrubThumbnail = refined
+                if self.hasNewScrubTarget(besides: target) {
+                    self.showMovingScrubThumbnail(refined ?? image, for: target)
+                    continue
+                }
+                if let still = refined ?? image {
+                    // The exact still; the fast frame only when no exact one came.
+                    self.scrubThumbnail = still
                     self.scrubThumbnailTargetSeconds = target
-                } else if image == nil, failedAttempts < 2 {
+                    SeekPreviewDiagnostics.shared.noteShown(still, target: target, path: refined != nil ? "exact" : "fast")
+                } else if !usedDeferredRetry,
+                          let delay = selectedProvider.pendingScrubThumbnailDelay(), delay > 0, delay < 6 {
+                    // A pause has not yet released the playback connection (option off): try the
+                    // settled target once more when it has, without another remote press. The
+                    // previous still stays meanwhile rather than a nearby one that would be swapped.
+                    usedDeferredRetry = true
+                    let deadline = Date().addingTimeInterval(delay + 0.2)
+                    // Sliced, so a new target moves on at once instead of after the wait.
+                    while Date() < deadline, !self.hasNewScrubTarget(besides: target) {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                        guard !Task.isCancelled else { return }
+                    }
+                    if self.pendingScrubThumbnailSeconds == nil,
+                       (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
+                        self.pendingScrubThumbnailSeconds = target
+                    }
+                } else if failedAttempts < 2 {
                     // A transient cache miss/yield must recover even after the
                     // user stops moving, without requiring another remote press.
                     failedAttempts += 1
@@ -5061,9 +5183,102 @@ class PlayerViewModel: ObservableObject {
                        (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
                         self.pendingScrubThumbnailSeconds = target
                     }
+                } else {
+                    // Nothing for the target will come (outside the buffer, no network for
+                    // previews): the closest held still keeps the card showing a picture.
+                    await self.showNearestScrubThumbnail(
+                        for: target, provider: selectedProvider, backend: selectedBackend,
+                        generation: generation, interactionToken: interactionToken)
                 }
             }
         }
+    }
+
+    /// A frame finished for a target the remote has already moved past: feedback while it keeps
+    /// moving. Once it rests, the next still the card shows is the final target's own.
+    private func showMovingScrubThumbnail(_ image: CGImage?, for target: Double) {
+        guard let image,
+              Date().timeIntervalSince(lastScrubTargetChange) < Self.scrubMovingWindow else { return }
+        scrubThumbnail = image
+        scrubThumbnailTargetSeconds = target
+        SeekPreviewDiagnostics.shared.noteShown(image, target: target, path: "moving")
+    }
+
+    /// The remote has not moved the target for a moment: it rests.
+    private var isScrubRemoteResting: Bool {
+        Date().timeIntervalSince(lastScrubTargetChange) >= Self.scrubMovingWindow
+    }
+
+    /// Once the remote rests, a still from a passed position stops looking like the preview.
+    private func scheduleStaleScrubThumbnailCheck() {
+        staleScrubThumbnailCheck?.cancel()
+        staleScrubThumbnailCheck = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.scrubMovingWindow * 1_000_000_000) + 10_000_000)
+            guard !Task.isCancelled else { return }
+            self?.updateStaleScrubThumbnail()
+        }
+    }
+
+    private func updateStaleScrubThumbnail() {
+        var stale = false
+        if scrubThumbnail != nil, isScrubRemoteResting,
+           let shown = scrubThumbnailTargetSeconds, let target = lastScrubTargetSeconds {
+            stale = abs(shown - target) > Self.staleScrubThumbnailDistance
+        }
+        if stale != scrubThumbnailIsStale { scrubThumbnailIsStale = stale }
+    }
+
+    /// Whether the remote asked for another target than `target`. A repeat of `target` itself
+    /// (the end of a touch gesture) is dropped: it is no movement.
+    private func hasNewScrubTarget(besides target: Double) -> Bool {
+        guard let pending = pendingScrubThumbnailSeconds else { return false }
+        if abs(pending - target) < Self.sameScrubTargetTolerance {
+            pendingScrubThumbnailSeconds = nil
+            return false
+        }
+        return true
+    }
+
+    private func isCurrentScrubThumbnailWork(
+        generation: UInt64,
+        interactionToken: UInt64,
+        provider: any ScrubThumbnailProviding,
+        backend: PlayerEngineKind
+    ) -> Bool {
+        scrubThumbnailGeneration == generation
+            && scrubThumbnailTaskInteractionToken == interactionToken
+            && (isScrubbing || isHoldingSeek || pendingSeekDelta != 0 || isTimelineFocused)
+            && activeEngineKind == backend
+            && sessionCoordinator.activeBackend == backend
+            && isSeekPreviewEnabled
+            && scrubThumbnailProvider === provider
+            && provider.supportsScrubThumbnails
+    }
+
+    /// Only when the target gets no still of its own: shown after its requests came back empty,
+    /// never before, so the card does not swap a nearby picture for the right one.
+    private func showNearestScrubThumbnail(
+        for target: Double,
+        provider: any ScrubThumbnailProviding,
+        backend: PlayerEngineKind,
+        generation: UInt64,
+        interactionToken: UInt64
+    ) async {
+        guard self.pendingScrubThumbnailSeconds == nil,
+              let nearest = await provider.nearestScrubThumbnail(
+                atSeconds: target, maxDistance: Self.nearestScrubThumbnailDistance),
+              !Task.isCancelled,
+              self.pendingScrubThumbnailSeconds == nil,
+              self.scrubThumbnailGeneration == generation,
+              self.scrubThumbnailTaskInteractionToken == interactionToken,
+              (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused),
+              self.activeEngineKind == backend,
+              self.sessionCoordinator.activeBackend == backend,
+              self.isSeekPreviewEnabled,
+              self.scrubThumbnailProvider === provider else { return }
+        self.scrubThumbnail = nearest
+        self.scrubThumbnailTargetSeconds = target
+        SeekPreviewDiagnostics.shared.noteShown(nearest, target: target, path: "nearest")
     }
 
     private func restartScrubTimeout() {

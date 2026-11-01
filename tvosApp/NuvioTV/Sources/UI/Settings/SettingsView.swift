@@ -344,6 +344,11 @@ enum SettingsKey {
     static let playerShowSubtitles = "nuvio.tv.settings.playback.showSubtitles"
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
     static let seekPreviewEnabled = "nuvio.tv.settings.playback.seekPreviewEnabled"
+    static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
+    /// Seekr (seekr.tv) API key for seek previews; kept in the Nuvio account like the other settings.
+    static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
+    /// Whether Seekr is asked at all (on by default); the key stays saved while it is off.
+    static let seekrEnabled = "nuvio.tv.settings.playback.seekrEnabled"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -413,7 +418,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -8609,6 +8614,11 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamAutoPlayPreferBingeGroup) private var streamAutoPlayPreferBingeGroup = true
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
+    @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
+    @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
+    @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = true
+    @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
+    @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -8649,6 +8659,57 @@ private struct PlaybackSettingsView: View {
     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
     private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
+
+    private enum SeekrKeyCheck {
+        case unchecked, checking, valid, invalid, unreachable
+    }
+
+    /// The key's check after "Saved in your Nuvio account.", colored: green accepted, red not.
+    private var seekrKeyStatus: (text: String, color: Color)? {
+        switch seekrKeyCheck {
+        case .unchecked:
+            return nil
+        case .checking:
+            return (L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…"),
+                    .white.opacity(0.56))
+        case .valid:
+            return ("✓ " + L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key."),
+                    Color(red: 0.30, green: 0.85, blue: 0.45))
+        case .invalid:
+            return ("✕ " + L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key."),
+                    Color(red: 1.0, green: 0.42, blue: 0.40))
+        case .unreachable:
+            return (L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key."),
+                    Color(red: 1.0, green: 0.78, blue: 0.30))
+        }
+    }
+
+    private func commitSeekrApiKey() {
+        let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key != seekrApiKey { seekrApiKey = key }
+        checkSeekrApiKey()
+    }
+
+    /// Asks Seekr whether it accepts the key: when the settings open, on Done, and a moment
+    /// after any other change (the iPhone keyboard, the account sync). No preview lookup.
+    private func checkSeekrApiKey(afterNanoseconds delay: UInt64 = 0) {
+        seekrKeyCheckTask?.cancel()
+        let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            seekrKeyCheckTask = nil
+            seekrKeyCheck = .unchecked
+            return
+        }
+        seekrKeyCheckTask = Task { @MainActor in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard !Task.isCancelled else { return }
+            seekrKeyCheck = .checking
+            let valid = await SeekrTrickplay.validate(apiKey: key)
+            guard !Task.isCancelled,
+                  seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
+            seekrKeyCheck = valid.map { $0 ? SeekrKeyCheck.valid : SeekrKeyCheck.invalid } ?? .unreachable
+        }
+    }
 
     private func lastLinkCacheLabel(for hours: Int) -> String {
         switch hours {
@@ -8765,6 +8826,17 @@ private struct PlaybackSettingsView: View {
                 )
 
                 SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seeking_preview_beyond_buffer", fallback: "Previews Beyond the Buffer"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seeking_preview_beyond_buffer_subtitle",
+                        fallback: "Also load previews from the server during playback, over a separate connection, while the buffer is healthy. Off: only while paused."
+                    ),
+                    isOn: $seekPreviewBeyondBuffer,
+                    accentColor: accentColor
+                )
+                .disabled(!seekPreviewEnabled)
+
+                SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
                     subtitle: L10n.string(
                         "playback_show_loading_status_sub",
@@ -8819,6 +8891,62 @@ private struct PlaybackSettingsView: View {
                         options: diskCacheLimitOptions,
                         accentColor: accentColor
                     )
+                }
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_seekr_title", fallback: "Seekr"),
+                subtitle: L10n.string(
+                    "tvos_settings_seekr_subtitle",
+                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series. With your own key, previews appear instantly and the player reads nothing from the video for them. Titles Seekr doesn't have keep the player's own previews. Anyone can sign up for a key at seekr.tv/join. During the public beta, each key covers 20 movies and 70 episodes a day. If Seekr works well for you, consider supporting its running costs at buymeacoffee.com/seekrtvdev."
+                )
+            ) {
+                HStack(spacing: 48) {
+                    SettingsQRCodeCard(
+                        title: L10n.string("tvos_settings_seekr_join", fallback: "Get a key"),
+                        link: "https://seekr.tv/join"
+                    )
+                    SettingsQRCodeCard(
+                        title: L10n.string("tvos_settings_seekr_support", fallback: "Support Seekr"),
+                        link: "https://buymeacoffee.com/seekrtvdev"
+                    )
+                    Spacer(minLength: 0)
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .settingsGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous), isProminent: false)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seekr_enabled", fallback: "Use Seekr"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seekr_enabled_subtitle",
+                        fallback: "Off: the player makes its own previews; the key stays saved."
+                    ),
+                    isOn: $seekrEnabled,
+                    accentColor: accentColor
+                )
+                .disabled(!seekPreviewEnabled)
+
+                SettingsNativeTextFieldRow(
+                    title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
+                    subtitle: L10n.string("tvos_settings_seekr_api_key_subtitle", fallback: "Saved in your Nuvio account."),
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $seekrApiKey,
+                    isSecure: true,
+                    status: seekrKeyStatus?.text,
+                    statusColor: seekrKeyStatus?.color ?? .white.opacity(0.56),
+                    onCommit: commitSeekrApiKey
+                )
+                .disabled(!seekPreviewEnabled)
+                .onAppear {
+                    if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
+                }
+                .onChange(of: seekrApiKey) { _, _ in
+                    checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
                 }
             }
 
@@ -16307,13 +16435,15 @@ private struct SettingsNativeTextFieldRow: View {
     @Binding var text: String
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
+    var status: String? = nil
+    var statusColor: Color = .white.opacity(0.56)
     var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
 
     var body: some View {
         SettingsRowShell(isFocused: isFocused, accentColor: .white) {
-            SettingsRowText(title: title, subtitle: subtitle)
+            SettingsRowText(title: title, subtitle: subtitle, status: status, statusColor: statusColor)
 
             Spacer(minLength: 24)
 
@@ -16668,6 +16798,9 @@ private struct SettingsRowShell<Content: View>: View {
 private struct SettingsRowText: View {
     let title: String
     let subtitle: String
+    /// A status after the subtitle in its own color (a key's check, say).
+    var status: String? = nil
+    var statusColor: Color = .white.opacity(0.56)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -16677,12 +16810,17 @@ private struct SettingsRowText: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
 
-            Text(subtitle)
+            subtitleText
                 .font(.system(size: 17, weight: .medium))
-                .foregroundColor(.white.opacity(0.56))
                 .lineLimit(2)
                 .minimumScaleFactor(0.82)
         }
+    }
+
+    private var subtitleText: Text {
+        let base = Text(subtitle).foregroundColor(.white.opacity(0.56))
+        guard let status, !status.isEmpty else { return base }
+        return base + Text(" " + status).foregroundColor(statusColor)
     }
 }
 

@@ -1652,23 +1652,228 @@ extension PlayerControlsSettingsTests {
         )
         model.pendingSeekDelta = 1
         let fast = makeTestImage()
-        let published = expectation(description: "Fast frame visible")
+        let decoded = expectation(description: "Fast frame decoded")
         var preciseCalls = 0
         provider.decode = { _, precise in
-            if precise { preciseCalls += 1 }
+            if precise {
+                preciseCalls += 1
+            } else {
+                decoded.fulfill()
+            }
             return fast
         }
-        let subscription = model.$scrubThumbnail.sink { image in
-            if image === fast { published.fulfill() }
-        }
-        defer { subscription.cancel() }
         model.requestScrubThumbnail(at: 10)
-        await fulfillment(of: [published], timeout: 2)
+        await fulfillment(of: [decoded], timeout: 2)
         model.pendingSeekDelta = 0
         model.setTimelineFocused(false)
         try? await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(preciseCalls, 0)
         XCTAssertNil(model.scrubThumbnail)
+    }
+
+    @MainActor
+    func testSettledTargetShowsOnlyItsExactStill() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        // The fast frame stands for the keyframe seconds before the target.
+        let keyframe = makeTestImage()
+        let exact = makeTestImage()
+        provider.decode = { _, precise in precise ? exact : keyframe }
+        var shown: [CGImage] = []
+        let refined = expectation(description: "The exact still is shown")
+        let subscription = model.$scrubThumbnail.sink { image in
+            guard let image else { return }
+            shown.append(image)
+            if image === exact { refined.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 1_365)
+        await fulfillment(of: [refined], timeout: 2)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(shown.count, 1, "a settled target must not show a nearby frame first")
+        XCTAssertTrue(shown.first === exact)
+    }
+
+    @MainActor
+    func testFastFrameStandsWhenNoExactStillComes() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        let keyframe = makeTestImage()
+        var preciseCalls = 0
+        provider.decode = { _, precise in
+            guard precise else { return keyframe }
+            preciseCalls += 1
+            return nil
+        }
+        let published = expectation(description: "The fast frame is shown once the exact one fails")
+        let subscription = model.$scrubThumbnail.sink { image in
+            if image === keyframe { published.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 600)
+        await fulfillment(of: [published], timeout: 2)
+        XCTAssertEqual(preciseCalls, 1, "shown only after the exact request came back empty")
+    }
+
+    @MainActor
+    func testGestureEndRepeatingTheTargetIsNoMovement() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        let keyframe = makeTestImage()
+        let exact = makeTestImage()
+        let started = expectation(description: "Fast decode in flight")
+        var fastContinuation: CheckedContinuation<CGImage?, Never>?
+        var decodes = 0
+        provider.decode = { _, precise in
+            decodes += 1
+            if precise { return exact }
+            return await withCheckedContinuation { continuation in
+                fastContinuation = continuation
+                started.fulfill()
+            }
+        }
+        var shown: [CGImage] = []
+        let refined = expectation(description: "The exact still is shown")
+        let subscription = model.$scrubThumbnail.sink { image in
+            guard let image else { return }
+            shown.append(image)
+            if image === exact { refined.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 1_365)
+        await fulfillment(of: [started], timeout: 2)
+        // The finger lifts: the gesture's end asks for the same target again.
+        model.requestScrubThumbnail(at: 1_365)
+        fastContinuation?.resume(returning: keyframe)
+        await fulfillment(of: [refined], timeout: 2)
+        // And once more after the still is up: nothing decodes again.
+        let decodesBefore = decodes
+        model.requestScrubThumbnail(at: 1_365)
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertEqual(shown.count, 1, "the repeat must not show the fast frame first")
+        XCTAssertTrue(shown.first === exact)
+        XCTAssertEqual(decodes, decodesBefore, "the still on the card is the target's own")
+    }
+
+    @MainActor
+    func testStillFromAnotherPositionDimsOnceTheRemoteRests() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        let first = makeTestImage()
+        let second = makeTestImage()
+        let firstShown = expectation(description: "The first target's still is shown")
+        let secondShown = expectation(description: "The second target's still is shown")
+        let secondStarted = expectation(description: "The second target's decode is in flight")
+        var secondContinuation: CheckedContinuation<CGImage?, Never>?
+        provider.decode = { seconds, _ in
+            if seconds == 10 { return first }
+            return await withCheckedContinuation { continuation in
+                if secondContinuation == nil {
+                    secondContinuation = continuation
+                    secondStarted.fulfill()
+                } else {
+                    continuation.resume(returning: second)
+                }
+            }
+        }
+        let subscription = model.$scrubThumbnail.sink { image in
+            if image === first { firstShown.fulfill() }
+            if image === second { secondShown.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 10)
+        await fulfillment(of: [firstShown], timeout: 2)
+        XCTAssertFalse(model.scrubThumbnailIsStale)
+        model.requestScrubThumbnail(at: 300)
+        await fulfillment(of: [secondStarted], timeout: 2)
+        XCTAssertFalse(model.scrubThumbnailIsStale, "not while the remote may still be moving")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertTrue(model.scrubThumbnailIsStale, "the still for 10 s is not the preview of 300 s")
+        secondContinuation?.resume(returning: second)
+        await fulfillment(of: [secondShown], timeout: 2)
+        XCTAssertFalse(model.scrubThumbnailIsStale)
+    }
+
+    @MainActor
+    func testFrameForAPassedTargetIsNotShownOnceTheRemoteRests() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        let passed = makeTestImage()
+        let exact = makeTestImage()
+        let started = expectation(description: "Decode for the passed target in flight")
+        var passedContinuation: CheckedContinuation<CGImage?, Never>?
+        provider.decode = { seconds, precise in
+            if seconds == 10 {
+                return await withCheckedContinuation { continuation in
+                    passedContinuation = continuation
+                    started.fulfill()
+                }
+            }
+            return precise ? exact : passed
+        }
+        var shown: [CGImage] = []
+        let refined = expectation(description: "The final target's still is shown")
+        let subscription = model.$scrubThumbnail.sink { image in
+            guard let image else { return }
+            shown.append(image)
+            if image === exact { refined.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 10)
+        await fulfillment(of: [started], timeout: 2)
+        model.requestScrubThumbnail(at: 100)
+        // The remote rests on 100 before the passed target's frame comes back.
+        try? await Task.sleep(nanoseconds: 350_000_000)
+        passedContinuation?.resume(returning: passed)
+        await fulfillment(of: [refined], timeout: 2)
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(shown.count, 1, "a frame for a passed target must not show after the remote rests")
+        XCTAssertTrue(shown.first === exact)
     }
 
     func testTrickplayDiskCacheStoreAndLookup() async {
