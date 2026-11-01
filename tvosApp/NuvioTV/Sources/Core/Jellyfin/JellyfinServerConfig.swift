@@ -42,6 +42,9 @@ struct JellyfinServerConfig: Codable, Identifiable, Equatable {
     var lastSyncDate: Date?
     /// Matched-title count from the last completed sync.
     var lastSyncTitleCount: Int?
+    /// Whether to refresh selected libraries automatically in the background
+    /// on cold launch, profile switch, and return to foreground.
+    var syncAutomatically: Bool
 
     init(
         id: String = UUID().uuidString,
@@ -52,7 +55,8 @@ struct JellyfinServerConfig: Codable, Identifiable, Equatable {
         userId: String = "",
         selectedLibraryIDs: [String] = [],
         lastSyncDate: Date? = nil,
-        lastSyncTitleCount: Int? = nil
+        lastSyncTitleCount: Int? = nil,
+        syncAutomatically: Bool = true
     ) {
         self.id = id
         self.displayName = displayName
@@ -63,6 +67,39 @@ struct JellyfinServerConfig: Codable, Identifiable, Equatable {
         self.selectedLibraryIDs = selectedLibraryIDs
         self.lastSyncDate = lastSyncDate
         self.lastSyncTitleCount = lastSyncTitleCount
+        self.syncAutomatically = syncAutomatically
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, displayName, baseURLString, authKind, username, userId, selectedLibraryIDs, lastSyncDate, lastSyncTitleCount, syncAutomatically
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        baseURLString = try container.decode(String.self, forKey: .baseURLString)
+        authKind = try container.decode(JellyfinAuthKind.self, forKey: .authKind)
+        username = try container.decode(String.self, forKey: .username)
+        userId = try container.decode(String.self, forKey: .userId)
+        selectedLibraryIDs = try container.decode([String].self, forKey: .selectedLibraryIDs)
+        lastSyncDate = try container.decodeIfPresent(Date.self, forKey: .lastSyncDate)
+        lastSyncTitleCount = try container.decodeIfPresent(Int.self, forKey: .lastSyncTitleCount)
+        syncAutomatically = try container.decodeIfPresent(Bool.self, forKey: .syncAutomatically) ?? true
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encode(baseURLString, forKey: .baseURLString)
+        try container.encode(authKind, forKey: .authKind)
+        try container.encode(username, forKey: .username)
+        try container.encode(userId, forKey: .userId)
+        try container.encode(selectedLibraryIDs, forKey: .selectedLibraryIDs)
+        try container.encodeIfPresent(lastSyncDate, forKey: .lastSyncDate)
+        try container.encodeIfPresent(lastSyncTitleCount, forKey: .lastSyncTitleCount)
+        try container.encode(syncAutomatically, forKey: .syncAutomatically)
     }
 
     var baseURL: URL? {

@@ -39,6 +39,9 @@ struct JellyfinSyncReport: Equatable {
 final class JellyfinSessionManager: ObservableObject {
     static let shared = JellyfinSessionManager()
 
+    nonisolated static let foregroundAutoSyncInterval: TimeInterval = 6 * 3600
+    nonisolated static let launchAutoSyncCooldown: TimeInterval = 60
+
     @Published private(set) var connectionStates: [String: JellyfinConnectionState] = [:]
     @Published private(set) var syncStates: [String: JellyfinSyncState] = [:]
 
@@ -61,8 +64,9 @@ final class JellyfinSessionManager: ObservableObject {
     /// Best-effort connect to every configured server, run once at cold
     /// launch (and again on profile switch) so Home doesn't require a
     /// manual "Connect" tap in Settings first. Mirrors
-    /// `SMBSessionManager.connectAll()`.
-    func connectAll() async {
+    /// `SMBSessionManager.connectAll()`. If `autoSync` is true, automatically
+    /// triggers a background refresh for eligible servers.
+    func connectAll(autoSync: Bool = true) async {
         await withTaskGroup(of: Void.self) { group in
             for server in JellyfinServerStore.shared.servers {
                 switch connectionState(for: server.id) {
@@ -74,6 +78,41 @@ final class JellyfinSessionManager: ObservableObject {
                     }
                 }
             }
+        }
+        if autoSync, NSClassFromString("XCTestCase") == nil {
+            autoSyncConnectedServers(minimumInterval: Self.launchAutoSyncCooldown)
+        }
+    }
+
+    /// Called when the app returns to the foreground. Re-connects any dropped
+    /// servers and runs background sync for any server whose lastSyncDate is
+    /// older than `minimumInterval` (default 6 hours).
+    func handleForegroundSession(minimumInterval: TimeInterval = foregroundAutoSyncInterval) async {
+        await connectAll(autoSync: false)
+        if NSClassFromString("XCTestCase") == nil {
+            autoSyncConnectedServers(minimumInterval: minimumInterval)
+        }
+    }
+
+    /// Evaluates configured connected servers for automatic background sync.
+    /// Skips servers where `syncAutomatically` is false, libraries are not selected,
+    /// a sync is already in flight, or `lastSyncDate` is fresher than `minimumInterval`.
+    func autoSyncConnectedServers(minimumInterval: TimeInterval? = nil) {
+        for server in JellyfinServerStore.shared.servers {
+            guard server.syncAutomatically,
+                  !server.selectedLibraryIDs.isEmpty,
+                  connectionState(for: server.id).isConnected else {
+                continue
+            }
+            if case .syncing = syncState(for: server.id) {
+                continue
+            }
+            if let lastSync = server.lastSyncDate, let minimumInterval {
+                guard Date().timeIntervalSince(lastSync) >= minimumInterval else {
+                    continue
+                }
+            }
+            sync(server)
         }
     }
 
@@ -128,6 +167,7 @@ final class JellyfinSessionManager: ObservableObject {
     /// elsewhere. Only meaningful once connected. Cancels a prior in-flight
     /// sync for the same server.
     func sync(_ server: JellyfinServerConfig) {
+        guard !server.selectedLibraryIDs.isEmpty else { return }
         guard let client = clients[server.id] else { return }
         syncTasks[server.id]?.cancel()
         syncStates[server.id] = .syncing(found: 0, currentLibrary: "")
@@ -181,7 +221,7 @@ final class JellyfinSessionManager: ObservableObject {
 
                 JellyfinLibraryIndex.shared.replace(titles: resolution.titles, forServerID: server.id)
 
-                var updatedServer = server
+                var updatedServer = JellyfinServerStore.shared.server(id: server.id) ?? server
                 updatedServer.lastSyncDate = resolution.completedAt
                 updatedServer.lastSyncTitleCount = resolution.titles.count
                 JellyfinServerStore.shared.upsert(updatedServer)
@@ -204,6 +244,14 @@ final class JellyfinSessionManager: ObservableObject {
     func cancelSync(forServerID serverID: String) {
         syncTasks[serverID]?.cancel()
         syncTasks[serverID] = nil
+    }
+
+    func setClientForTesting(_ client: JellyfinClient, forServerID serverID: String) {
+        clients[serverID] = client
+    }
+
+    func setConnectionStateForTesting(_ state: JellyfinConnectionState, forServerID serverID: String) {
+        connectionStates[serverID] = state
     }
 
     // MARK: - Login
