@@ -5595,17 +5595,20 @@ class PlayerViewModel: ObservableObject {
         restartScrubTimeout()
     }
 
-    /// The swipe seek's edges: chapter starts, and the opening's and the ending's while they
-    /// show on the timeline. Nil when snapping is off or there is nothing to stop on.
+    /// The swipe seek's edges: its starting position, chapter starts, and opening/ending edges
+    /// while they show on the timeline. Nil when the duration is too short.
     private func makeScrubSnap(from position: Double) -> PlaybackChapters.SnappingSeek? {
         let settings = ProfileSettings.current
         guard PlaybackChapters.snapsWhileSeeking(in: settings) else { return nil }
         let duration = playbackDuration
-        let edges = PlaybackChapters.snapEdges(
+        guard duration > 2, position.isFinite else { return nil }
+        var edges = PlaybackChapters.snapEdges(
             chapters: chapters,
             segments: PlaybackChapters.showsSegmentsOnTimeline(in: settings) ? skipSegments : [],
             duration: duration
         )
+        edges.append(min(max(position, 0), duration - 1))
+        edges = Array(Set(edges)).sorted()
         guard !edges.isEmpty else { return nil }
         return PlaybackChapters.SnappingSeek(
             from: position,

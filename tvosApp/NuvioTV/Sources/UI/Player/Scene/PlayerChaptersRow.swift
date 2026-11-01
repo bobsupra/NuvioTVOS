@@ -187,7 +187,6 @@ struct PlayerChaptersRow: View {
                 isFocused ? Color.white : (isCurrent ? Color.white.opacity(0.35) : Color.clear),
                 lineWidth: isFocused ? 4 : 2)
         )
-        .shadow(color: .black.opacity(isFocused ? 0.45 : 0.2), radius: isFocused ? 16 : 6, y: isFocused ? 8 : 3)
         .scaleEffect(isFocused ? 1.07 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .animation(.easeOut(duration: 0.2), value: image != nil)

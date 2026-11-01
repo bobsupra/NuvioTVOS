@@ -213,14 +213,14 @@ enum PlaybackChapters {
         3 * snapRadius(duration: duration)
     }
 
-    /// Whether the opening and the ending are colored on the timeline (Settings → Player).
+    /// Whether the opening and the ending are colored on the timeline (off by default).
     static func showsSegmentsOnTimeline(in settings: UserDefaults) -> Bool {
-        settings.object(forKey: SettingsKey.timelineSegmentsEnabled) as? Bool ?? true
+        settings.object(forKey: SettingsKey.timelineSegmentsEnabled) as? Bool ?? false
     }
 
-    /// Whether a swipe seek stops on edges (Settings → Player).
-    static func snapsWhileSeeking(in settings: UserDefaults) -> Bool {
-        settings.object(forKey: SettingsKey.timelineSnapEnabled) as? Bool ?? true
+    /// Seeking snap is always enabled; ignore the legacy profile preference.
+    static func snapsWhileSeeking(in _: UserDefaults) -> Bool {
+        true
     }
 
     /// A swipe seek that stops on edges. It takes the swipe's steps (seconds, after the swipe's

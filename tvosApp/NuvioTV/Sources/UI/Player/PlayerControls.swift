@@ -1174,10 +1174,10 @@ private struct PlayerTimelineBar: View {
                 let targetX = min(max(w * progress, 0), w)
                 let trackHeight: CGFloat = 10
                 let h: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? trackHeight + 2 : trackHeight
-                // The seek needle reaches a little below the track, so it reads over the played part.
-                let needleHeight: CGFloat = 32
-                let needleOverhang: CGFloat = 4
+                let needleHeight: CGFloat = 22
                 let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
+                let originalX = min(max(w * originalProgress, 0), w)
+                let bottomOfTrack = geo.size.height / 2 + h / 2
                 let markers = PlaybackChapters.markers(chapters, duration: clock.duration)
                 // The opening and the ending, colored unless that is off in Settings → Player.
                 let segments = PlaybackChapters.showsSegmentsOnTimeline(in: ProfileSettings.current)
@@ -1185,12 +1185,6 @@ private struct PlayerTimelineBar: View {
                         PlayerTrackSegment(start: $0.start, end: $0.end, color: $0.kind.color)
                     }
                     : []
-                // The needle stands on the piece it points at, which is the lifted one.
-                let isCut = !PlaybackChapters.timelinePieces(
-                    markers: markers,
-                    segments: segments.map { (start: $0.start, end: $0.end) }
-                ).isEmpty
-                let bottomOfTrack = geo.size.height / 2 + (h + (isCut ? PlayerProgressTrack.currentPieceLift : 0)) / 2
 
                 ZStack(alignment: .leading) {
                     PlayerProgressTrack(
@@ -1201,22 +1195,23 @@ private struct PlayerTimelineBar: View {
                         emphasized: isTimelineFocused || isSeekingOrScrubbing,
                         glassTrack: true,
                         markers: markers,
-                        segments: segments,
-                        playedOpacity: 0.45,
-                        // Red: where playback is, also while the seek heads elsewhere.
-                        position: Double(originalProgress)
+                        segments: segments
                     )
 
-                    if isSeekingOrScrubbing {
-                        // Seek needle: white with a dark edge, from just below the track up toward
-                        // the preview card. Also for single left / right presses, where the red mark
-                        // stays where playback is and the needle shows where the seek lands.
+                    if isScrubbing || isHoldingSeek {
+                        // Ghost tick: original paused playback position flush within track
+                        if abs(targetX - originalX) > 3 {
+                            Rectangle()
+                                .fill(Color.white)
+                                .frame(width: 2, height: h)
+                                .position(x: originalX, y: geo.size.height / 2)
+                        }
+
+                        // Active scrub/seek needle: extends upwards toward preview card and is flush at bottom of track
                         Rectangle()
                             .fill(Color.white)
-                            .frame(width: 4, height: needleHeight)
-                            .background(Rectangle().fill(Color.black.opacity(0.8)).padding(-1.5))
-                            .shadow(color: .black.opacity(0.55), radius: 3)
-                            .position(x: targetX, y: bottomOfTrack + needleOverhang - needleHeight / 2)
+                            .frame(width: 2, height: needleHeight)
+                            .position(x: targetX, y: bottomOfTrack - needleHeight / 2)
                     }
                 }
             }
@@ -1227,14 +1222,24 @@ private struct PlayerTimelineBar: View {
                 GeometryReader { geo in
                     let w = geo.size.width
                     let targetChapter = chapterName(at: targetPosition)
-                    let margin: CGFloat = targetChapter == nil ? 60 : 240
-                    let targetX = min(max(w * progress, margin), max(margin, w - margin))
+                    let timeText = PlayerTime.formatted(time: targetPosition)
+                    let chapterText = targetChapter.map { "· " + $0 }
+                    let timeWidth = CGFloat(timeText.count) * 13
+                    let chapterWidth = chapterText.map { min(CGFloat($0.count) * 12, 320) } ?? 0
+                    let seekAccessoryWidth: CGFloat = (isHoldingSeek || speedMultiplier != nil)
+                        ? 34 + (speedMultiplier.map { CGFloat(String($0).count) * 14 + 8 } ?? 0)
+                        : (pendingSeekDelta != 0 ? 28 : 0)
+                    let labelWidth = timeWidth
+                        + (chapterWidth > 0 ? chapterWidth + 8 : 0)
+                        + seekAccessoryWidth
+                    let edgeInset = labelWidth / 2 + 8
+                    let targetX = min(max(w * progress, edgeInset), max(edgeInset, w - edgeInset))
                     HStack(spacing: 8) {
-                        Text(PlayerTime.formatted(time: targetPosition))
+                        Text(timeText)
                             .font(.system(size: 22, weight: .bold).monospacedDigit())
                             .foregroundColor(.white)
-                        if let targetChapter {
-                            Text("· " + targetChapter)
+                        if let chapterText {
+                            Text(chapterText)
                                 .font(.system(size: 22, weight: .semibold))
                                 .foregroundColor(.white.opacity(0.85))
                                 .lineLimit(1)

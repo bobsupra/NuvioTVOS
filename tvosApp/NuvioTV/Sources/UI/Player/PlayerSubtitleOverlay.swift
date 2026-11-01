@@ -2,8 +2,8 @@ import SwiftUI
 import AetherEngine
 
 enum PlayerSubtitleLayoutMetrics {
-    // Keeps the same subtitle-to-first-tab gap as InSight above the controls row.
-    static let controlsVisibleLiftPoints: CGFloat = 252
+    // Adds a little more clearance above the controls than the InSight tab gap.
+    static let controlsVisibleLiftPoints: CGFloat = 272
 }
 
 /// Host-rendered subtitle layer for Aether sessions.

@@ -360,9 +360,9 @@ enum SettingsKey {
     /// The opening's and the ending's color on the timeline ("#RRGGBB", see `PlaybackChapters.colorChoices`).
     static let timelineOpeningColor = "nuvio.tv.settings.playback.timelineOpeningColor"
     static let timelineEndingColor = "nuvio.tv.settings.playback.timelineEndingColor"
-    /// Whether the opening and the ending are colored on the timeline (on by default).
+    /// Whether the opening and the ending are colored on the timeline (off by default).
     static let timelineSegmentsEnabled = "nuvio.tv.settings.playback.timelineSegmentsEnabled"
-    /// Whether a swipe seek stops for a moment on chapter and opening / ending edges (on by default).
+    /// Legacy preference retained for compatibility; seeking snap is always enabled.
     static let timelineSnapEnabled = "nuvio.tv.settings.playback.timelineSnapEnabled"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
@@ -8666,8 +8666,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = false
     @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
     @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
-    @AppStorage(SettingsKey.timelineSegmentsEnabled) private var timelineSegmentsEnabled = true
-    @AppStorage(SettingsKey.timelineSnapEnabled) private var timelineSnapEnabled = true
+    @AppStorage(SettingsKey.timelineSegmentsEnabled) private var timelineSegmentsEnabled = false
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
@@ -8799,10 +8798,10 @@ private struct PlaybackSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(
-                title: L10n.string("tvos_playback_player", fallback: "Player"),
+                title: L10n.string("tvos_settings_player_audio_video", fallback: "Player & Audio/Video"),
                 subtitle: L10n.string(
-                    "tvos_playback_player_subtitle",
-                    fallback: "Playback engine and episode flow"
+                    "tvos_settings_player_audio_video_subtitle",
+                    fallback: "Engine, audio, and video output"
                 )
             ) {
                 SettingsOptionRow(
@@ -8888,16 +8887,62 @@ private struct PlaybackSettingsView: View {
                 .opacity(externalPlayer == ExternalPlayer.builtIn.rawValue ? 0.46 : 1)
                 .disabled(externalPlayer == ExternalPlayer.builtIn.rawValue)
 
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
-                    subtitle: L10n.string(
-                        "tvos_settings_post_play_recommendations_subtitle",
-                        fallback: "Show paged recommendations with trailer previews and quick play when reaching the end of movies or series."
-                    ),
-                    isOn: $postPlayRecommendationsEnabled,
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_frame_rate_matching", fallback: "Frame Rate Matching"),
+                    subtitle: L10n.string("tvos_settings_match_display_refresh_to_video_apple_tv__eb667d81", fallback: "Match display refresh to video; Apple TV Match Content must also be enabled"),
+                    selection: $frameRateMatching,
+                    options: frameRateModes,
                     accentColor: accentColor
                 )
 
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_buffer_profile", fallback: "Buffer Profile"),
+                    subtitle: L10n.string(
+                        "tvos_settings_buffer_profile_aether",
+                        fallback: "Aether stores stream segments on disk; MPV caches packet payloads on disk. Hybrid Disk Cache adds a persistent origin cache."
+                    ),
+                    selection: $networkCache,
+                    options: cacheModes,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_hybrid_disk_cache", fallback: "Hybrid Disk Cache"),
+                    subtitle: L10n.string(
+                        "tvos_settings_hybrid_disk_cache_subtitle",
+                        fallback: "Cache stream segments to disk storage for large forward buffering and instant seeking."
+                    ),
+                    isOn: $hybridDiskCacheEnabled,
+                    accentColor: accentColor
+                )
+
+                if hybridDiskCacheEnabled {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_disk_cache_limit", fallback: "Disk Cache Limit"),
+                        subtitle: L10n.string(
+                            "tvos_settings_disk_cache_limit_subtitle",
+                            fallback: "Maximum storage allocated for stream disk cache. Older titles are pruned automatically."
+                        ),
+                        selection: Binding(
+                            get: { "\(hybridDiskCacheLimitGB) GB" },
+                            set: { newValue in
+                                hybridDiskCacheLimitGB = Int(newValue.replacingOccurrences(of: " GB", with: "")) ?? 20
+                            }
+                        ),
+                        options: diskCacheLimitOptions,
+                        accentColor: accentColor
+                    )
+                }
+
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_seeking_previews", fallback: "Seeking Previews"),
+                subtitle: L10n.string(
+                    "tvos_settings_seeking_previews_subtitle",
+                    fallback: "Thumbnail previews and Seekr setup"
+                )
+            ) {
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_seeking_preview", fallback: "Seeking Preview"),
                     subtitle: L10n.string("tvos_settings_seeking_preview_subtitle", fallback: "Show thumbnail previews while scrubbing through video"),
@@ -8949,104 +8994,23 @@ private struct PlaybackSettingsView: View {
                 )
 
                 SettingsToggleRow(
-                    title: L10n.string("tvos_settings_timeline_snap", fallback: "Snap While Seeking"),
-                    subtitle: L10n.string(
-                        "tvos_settings_timeline_snap_subtitle",
-                        fallback: "A swipe stops for a moment at chapter starts and at the opening's and the ending's edges"
-                    ),
-                    isOn: $timelineSnapEnabled,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
-                    subtitle: L10n.string(
-                        "playback_show_loading_status_sub",
-                        fallback: "Display step-by-step progress while the player is initializing."
-                    ),
-                    isOn: $showLoadingStatus,
-                    accentColor: accentColor
-                )
-
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_frame_rate_matching", fallback: "Frame Rate Matching"),
-                    subtitle: L10n.string("tvos_settings_match_display_refresh_to_video_apple_tv__eb667d81", fallback: "Match display refresh to video; Apple TV Match Content must also be enabled"),
-                    selection: $frameRateMatching,
-                    options: frameRateModes,
-                    accentColor: accentColor
-                )
-
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_buffer_profile", fallback: "Buffer Profile"),
-                    subtitle: L10n.string(
-                        "tvos_settings_buffer_profile_aether",
-                        fallback: "Aether stores stream segments on disk; MPV caches packet payloads on disk. Hybrid Disk Cache adds a persistent origin cache."
-                    ),
-                    selection: $networkCache,
-                    options: cacheModes,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_hybrid_disk_cache", fallback: "Hybrid Disk Cache"),
-                    subtitle: L10n.string(
-                        "tvos_settings_hybrid_disk_cache_subtitle",
-                        fallback: "Cache stream segments to disk storage for large forward buffering and instant seeking."
-                    ),
-                    isOn: $hybridDiskCacheEnabled,
-                    accentColor: accentColor
-                )
-
-                if hybridDiskCacheEnabled {
-                    SettingsOptionRow(
-                        title: L10n.string("tvos_settings_disk_cache_limit", fallback: "Disk Cache Limit"),
-                        subtitle: L10n.string(
-                            "tvos_settings_disk_cache_limit_subtitle",
-                            fallback: "Maximum storage allocated for stream disk cache. Older titles are pruned automatically."
-                        ),
-                        selection: Binding(
-                            get: { "\(hybridDiskCacheLimitGB) GB" },
-                            set: { newValue in
-                                hybridDiskCacheLimitGB = Int(newValue.replacingOccurrences(of: " GB", with: "")) ?? 20
-                            }
-                        ),
-                        options: diskCacheLimitOptions,
-                        accentColor: accentColor
-                    )
-                }
-            }
-
-            SettingsGroup(
-                title: L10n.string("tvos_settings_seekr_title", fallback: "Seekr"),
-                subtitle: L10n.string(
-                    "tvos_settings_seekr_subtitle",
-                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series."
-                )
-            ) {
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_seekr_join", fallback: "Get a key"),
-                    value: "seekr.tv/join"
-                )
-
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_seekr_support", fallback: "Support Seekr"),
-                    value: "buymeacoffee.com/seekrtvdev"
-                )
-
-                SettingsToggleRow(
                     title: L10n.string("tvos_settings_seekr_enabled", fallback: "Use Seekr"),
                     subtitle: L10n.string(
                         "tvos_settings_seekr_enabled_subtitle",
-                        fallback: "Off: the player makes its own previews; the key stays saved."
+                        fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series."
                     ),
                     isOn: $seekrEnabled,
-                    accentColor: accentColor
+                    accentColor: accentColor,
+                    isAvailable: !seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
                 .disabled(!seekPreviewEnabled)
 
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
-                    subtitle: L10n.string("tvos_settings_seekr_api_key_subtitle", fallback: "Saved in your Nuvio account."),
+                    subtitle: L10n.string(
+                        "tvos_settings_seekr_api_key_subtitle",
+                        fallback: "Get your API key at seekr.tv/join. Saved in your Nuvio account."
+                    ),
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                     text: $seekrApiKey,
                     isSecure: true,
@@ -9088,12 +9052,32 @@ private struct PlaybackSettingsView: View {
             }
 
             SettingsGroup(
-                title: L10n.string("playback_auto_skip_segments", fallback: "Automatic Skipping"),
+                title: L10n.string("tvos_settings_playback_behavior", fallback: "Playback Behavior"),
                 subtitle: L10n.string(
-                    "playback_auto_skip_segments_sub",
-                    fallback: "Choose which segments skip automatically"
+                    "tvos_settings_playback_behavior_subtitle",
+                    fallback: "Automatic playback and segment controls"
                 )
             ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
+                    subtitle: L10n.string(
+                        "tvos_settings_post_play_recommendations_subtitle",
+                        fallback: "Show paged recommendations with trailer previews and quick play when reaching the end of movies or series."
+                    ),
+                    isOn: $postPlayRecommendationsEnabled,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
+                    subtitle: L10n.string(
+                        "playback_show_loading_status_sub",
+                        fallback: "Display step-by-step progress while the player is initializing."
+                    ),
+                    isOn: $showLoadingStatus,
+                    accentColor: accentColor
+                )
+
                 SettingsToggleRow(
                     title: L10n.string("auto_skip_intro", fallback: "Intro / Opening"),
                     subtitle: L10n.string(
@@ -9143,6 +9127,43 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoPlayNext,
                     accentColor: accentColor
                 )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_autoplay_trailers", fallback: "Autoplay Trailers"),
+                    subtitle: L10n.string("tvos_settings_start_previews_after_focus_settles", fallback: "Start previews after focus settles"),
+                    isOn: $trailersEnabled,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
+                    subtitle: L10n.string("tvos_settings_background_trailers_subtitle", fallback: "Play automatic trailers in the background on detail pages"),
+                    isOn: $backgroundTrailersEnabled,
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
+                    subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
+                    isOn: $trailerPreviewSound,
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
+
+                SettingsStepperRow(
+                    title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
+                    subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
+                    value: $trailerDelay,
+                    range: 0...15,
+                    step: 1,
+                    suffix: "s",
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
             }
 
             SettingsGroup(title: L10n.string("tvos_settings_smart_playback", fallback: "Smart Playback"), subtitle: L10n.string("tvos_settings_automatically_choose_streams_and_matchin_9ca69e9f", fallback: "Automatically choose streams and matching subtitles")) {
@@ -9279,7 +9300,15 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
-            streamBadgesSettings
+            SettingsGroup(
+                title: L10n.string("tvos_settings_stream_badges", fallback: "Stream Badges"),
+                subtitle: L10n.string(
+                    "tvos_settings_stream_badges_subtitle",
+                    fallback: "Show the same stream badge packs and source details as Android TV"
+                )
+            ) {
+                streamBadgeSettingsRows
+            }
 
             SettingsGroup(
                 title: L10n.string("tvos_playback_audio_subtitles", fallback: "Audio & Subtitle Languages"),
@@ -9334,45 +9363,6 @@ private struct PlaybackSettingsView: View {
                     options: assModes,
                     accentColor: accentColor
                 )
-            }
-
-            SettingsGroup(title: L10n.string("tmdb_trailers_title", fallback: "Trailers"), subtitle: L10n.string("tvos_settings_preview_playback_on_details_and_focused_posters", fallback: "Preview playback on details and focused posters")) {
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_autoplay_trailers", fallback: "Autoplay Trailers"),
-                    subtitle: L10n.string("tvos_settings_start_previews_after_focus_settles", fallback: "Start previews after focus settles"),
-                    isOn: $trailersEnabled,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
-                    subtitle: L10n.string("tvos_settings_background_trailers_subtitle", fallback: "Play automatic trailers in the background on detail pages"),
-                    isOn: $backgroundTrailersEnabled,
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
-                    subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
-                    isOn: $trailerPreviewSound,
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
-
-                SettingsStepperRow(
-                    title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
-                    subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
-                    value: $trailerDelay,
-                    range: 0...15,
-                    step: 1,
-                    suffix: "s",
-                    accentColor: accentColor
-                )
-                .opacity(trailersEnabled ? 1 : 0.46)
-                .disabled(!trailersEnabled)
             }
 
         }
@@ -9461,11 +9451,12 @@ private struct PlaybackSettingsView: View {
         return "\(ordered[0]), \(ordered[1]) +\(ordered.count - 2)"
     }
 
-    private var streamBadgesSettings: some View {
+    @ViewBuilder
+    private var streamBadgeSettingsRows: some View {
         // Keep the view dependent on badge-store updates, but do not replace its
         // identity: replacing it after a placement change sends tvOS focus back
         // to the first row in the group.
-        _ = streamBadgeSettingsRevision
+        let _ = streamBadgeSettingsRevision
         let importedRules = StreamBadgeSettingsStore.snapshot.rules
         let placementBinding = Binding<String>(
             get: { streamBadgePlacement == StreamBadgePlacement.top.rawValue ? "Top" : "Bottom" },
@@ -9476,79 +9467,71 @@ private struct PlaybackSettingsView: View {
             }
         )
 
-        return SettingsGroup(
-            title: L10n.string("tvos_settings_stream_badges", fallback: "Stream Badges"),
-            subtitle: L10n.string(
-                "tvos_settings_stream_badges_subtitle",
-                fallback: "Show the same stream badge packs and source details as Android TV"
-            )
-        ) {
-            SettingsToggleRow(
-                title: L10n.string("tvos_settings_file_size_badges", fallback: "File Size Badges"),
-                subtitle: L10n.string("tvos_settings_file_size_badges_subtitle", fallback: "Show the stream file size when the add-on provides it"),
-                isOn: $showFileSizeBadges,
-                accentColor: accentColor
-            )
+        SettingsToggleRow(
+            title: L10n.string("tvos_settings_file_size_badges", fallback: "File Size Badges"),
+            subtitle: L10n.string("tvos_settings_file_size_badges_subtitle", fallback: "Show the stream file size when the add-on provides it"),
+            isOn: $showFileSizeBadges,
+            accentColor: accentColor
+        )
 
-            SettingsOptionRow(
-                title: L10n.string("tvos_settings_badge_placement", fallback: "Badge Placement"),
-                subtitle: L10n.string("tvos_settings_badge_placement_subtitle", fallback: "Place imported badges and file sizes above or below the stream details"),
-                selection: placementBinding,
-                options: ["Top", "Bottom"],
-                accentColor: accentColor
-            )
+        SettingsOptionRow(
+            title: L10n.string("tvos_settings_badge_placement", fallback: "Badge Placement"),
+            subtitle: L10n.string("tvos_settings_badge_placement_subtitle", fallback: "Place imported badges and file sizes above or below the stream details"),
+            selection: placementBinding,
+            options: ["Top", "Bottom"],
+            accentColor: accentColor
+        )
 
-            SettingsToggleRow(
-                title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
-                subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
-                isOn: $showAddonLogo,
-                accentColor: accentColor
-            )
+        SettingsToggleRow(
+            title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
+            subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
+            isOn: $showAddonLogo,
+            accentColor: accentColor
+        )
 
-            SettingsActionRow(
-                title: L10n.string("tvos_settings_install_gold_badge_pack", fallback: "Install Gold Badge Pack"),
-                subtitle: L10n.string("tvos_settings_install_gold_badge_pack_subtitle", fallback: "Install the Android TV Gold pack without entering a URL"),
-                value: isImportingStreamBadges
-                    ? L10n.string("tvos_settings_installing", fallback: "Installing…")
-                    : L10n.string("action_install", fallback: "Install"),
-                accentColor: accentColor,
-                action: importGoldBadgePack
-            )
-            .opacity(isImportingStreamBadges ? 0.55 : 1)
-            .disabled(isImportingStreamBadges)
+        SettingsActionRow(
+            title: L10n.string("tvos_settings_install_gold_badge_pack", fallback: "Install Gold Badge Pack"),
+            subtitle: L10n.string("tvos_settings_install_gold_badge_pack_subtitle", fallback: "Install the Android TV Gold pack without entering a URL"),
+            value: isImportingStreamBadges
+                ? L10n.string("tvos_settings_installing", fallback: "Installing…")
+                : L10n.string("action_install", fallback: "Install"),
+            accentColor: accentColor,
+            action: importGoldBadgePack
+        )
+        .opacity(isImportingStreamBadges ? 0.55 : 1)
+        .disabled(isImportingStreamBadges)
 
-            SettingsNativeTextFieldRow(
-                title: L10n.string("tvos_settings_badge_pack_url", fallback: "Badge Pack URL"),
-                subtitle: streamBadgeImportError ?? L10n.string("tvos_settings_badge_pack_url_subtitle", fallback: "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)"),
-                placeholder: "https://…",
-                text: $streamBadgeURL,
-                fieldWidth: 520,
-                onCommit: importStreamBadgePack
-            )
-            .opacity(isImportingStreamBadges ? 0.55 : 1)
-            .disabled(isImportingStreamBadges)
+        SettingsNativeTextFieldRow(
+            title: L10n.string("tvos_settings_badge_pack_url", fallback: "Badge Pack URL"),
+            subtitle: streamBadgeImportError ?? L10n.string("tvos_settings_badge_pack_url_subtitle", fallback: "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)"),
+            placeholder: "https://…",
+            text: $streamBadgeURL,
+            fieldWidth: 520,
+            onCommit: importStreamBadgePack
+        )
+        .opacity(isImportingStreamBadges ? 0.55 : 1)
+        .disabled(isImportingStreamBadges)
 
-            if importedRules.imports.isEmpty {
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_imported_packs", fallback: "Imported Packs"),
-                    value: L10n.string("action_none", fallback: "None")
+        if importedRules.imports.isEmpty {
+            SettingsInfoRow(
+                title: L10n.string("tvos_settings_imported_packs", fallback: "Imported Packs"),
+                value: L10n.string("action_none", fallback: "None")
+            )
+        } else {
+            ForEach(importedRules.imports) { imported in
+                StreamBadgePackSettingsRow(
+                    badgePack: imported,
+                    accentColor: accentColor,
+                    onEnabledChange: { isEnabled in
+                        StreamBadgeSettingsStore.setSourceEnabled(
+                            imported.sourceUrl,
+                            isEnabled: isEnabled
+                        )
+                    },
+                    onDelete: {
+                        StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
+                    }
                 )
-            } else {
-                ForEach(importedRules.imports) { imported in
-                    StreamBadgePackSettingsRow(
-                        badgePack: imported,
-                        accentColor: accentColor,
-                        onEnabledChange: { isEnabled in
-                            StreamBadgeSettingsStore.setSourceEnabled(
-                                imported.sourceUrl,
-                                isEnabled: isEnabled
-                            )
-                        },
-                        onDelete: {
-                            StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
-                        }
-                    )
-                }
             }
         }
     }

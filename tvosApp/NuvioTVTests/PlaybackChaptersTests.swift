@@ -298,16 +298,16 @@ final class PlaybackChaptersTests: XCTestCase {
         XCTAssertEqual(end.move(by: 50, upTo: 1439), 1439)
     }
 
-    func testTimelineSwitchesAreOnUntilTurnedOff() throws {
+    func testTimelineSegmentsDefaultOffAndSeekingSnapStaysOn() throws {
         let suite = "PlaybackChaptersTests.switches"
         let settings = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { settings.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(PlaybackChapters.showsSegmentsOnTimeline(in: settings))
+        XCTAssertTrue(PlaybackChapters.snapsWhileSeeking(in: settings))
+        settings.set(true, forKey: SettingsKey.timelineSegmentsEnabled)
+        settings.set(false, forKey: SettingsKey.timelineSnapEnabled)
         XCTAssertTrue(PlaybackChapters.showsSegmentsOnTimeline(in: settings))
         XCTAssertTrue(PlaybackChapters.snapsWhileSeeking(in: settings))
-        settings.set(false, forKey: SettingsKey.timelineSegmentsEnabled)
-        settings.set(false, forKey: SettingsKey.timelineSnapEnabled)
-        XCTAssertFalse(PlaybackChapters.showsSegmentsOnTimeline(in: settings))
-        XCTAssertFalse(PlaybackChapters.snapsWhileSeeking(in: settings))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.timelineSegmentsEnabled))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.timelineSnapEnabled))
     }

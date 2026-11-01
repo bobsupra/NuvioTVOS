@@ -6544,8 +6544,8 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
                         // Ghost tick: original paused playback position flush within track
                         if abs(targetX - originalX) > 3 {
                             Rectangle()
-                                .fill(Color.white.opacity(0.4))
-                                .frame(width: 1.5, height: h)
+                                .fill(Color.white)
+                                .frame(width: 2, height: h)
                                 .position(x: originalX, y: geo.size.height / 2)
                         }
 
