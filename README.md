@@ -48,20 +48,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.4.8** is the latest tvOS release.
+**Beta 3.4.9** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.8/NuvioTV-3.4.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.9/NuvioTV-3.4.9-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.9) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.4.8
+### New in Beta 3.4.9
 
-- **Native Usenet & NNTP Streaming Playback:** Stream video directly from NZB URLs (`nzbUrl`) from Stremio addons with up to 100 parallel connections, a 4-second near-playhead priority window separate from the read-ahead cache, and non-thrashing seeks.
-- **Dedicated Calendar Tab & Follows:** New **Calendar** tab (`TVTab.calendar`) displaying upcoming episodes and releases with merged manual and automatic follows, plus a dynamic **Today** shelf row on Home.
-- **Smart Credit Skipping & Enhanced Player Controls:** Optionally skip closing credits when marker data is available while preserving mid-credit and post-credit scenes, with expanded on-screen player controls, smooth outline subtitle rendering, and prewarmed stream handoffs from Details.
-- **Home, Details & Top Shelf Polish:** Configurable Details section ordering and visibility, unified "All" hero rating source, redesigned Apple TV Top Shelf with four 16:9 rows, fast addon search with linear keyboard sizing, and MDBList request caching.
-- **AetherEngine 7.51.0 & Audio Shaping:** Upgraded core playback engine to version 7.51.0 with dynamic audio shaping (channel fold-down, night mode compression, +12 dB dialogue lift with peak limiting), Apple required-reason privacy manifests (`PrivacyInfo.xcprivacy`), packetized streaming drainage for sidecar bitmap subtitles (`.sup`), and HLS session lifecycle cleanup.
+- **Lossless Audio Bridge (eARC / AVR):** Transcode non-streamable surround audio (TrueHD, DTS-HD MA, Opus) directly to uncompressed 24-bit 7.1 LPCM for AVRs and eARC soundbars in AetherEngine.
+- **Metal Video Upscaling:** Real-time Metal-accelerated frame upscaling (`FrameUpscaler`) for low-res and SD content on 4K Apple TV displays, paired with dynamic audio shaping and dialogue lift.
+- **File Chapters & Segmented Timeline:** Container MKV/MP4 chapters across both players, a dedicated Chapters shelf in InSight, piece-by-piece timeline with elevated active chapters, Intro/Ending skip fallbacks, and seek snapping.
+- **Seekr Integration & Out-of-Buffer Previews:** External trickplay storyboards via Seekr API keys, out-of-buffer preview scrub streams (Seekr or dedicated NNTP preview lines), and preview stabilization.
+- **Redesigned Top Shelf & 4K Carousel:** Interactive full-bleed 4K carousel with background trailers, instant resume Play button, mixed shelf catalog sources, and preserved App Group entitlements in unsigned IPAs.
+- **In-Player Subtitle Height Adjustment:** Granular vertical position adjustments on screen directly from the in-player subtitle menu in 4 pt steps.
+- **Usenet Cloud Sync & Jellyfin Auto-Sync:** Backup Usenet servers and passwords to Nuvio accounts, dropped connection recovery, and background auto-sync for Jellyfin libraries.
 
 ### Built-in Player
 
