@@ -1339,7 +1339,7 @@ class PlayerViewModel: ObservableObject {
                 return
             }
             // Seekr, with the profile's key; titles it doesn't have keep the player's previews.
-            guard await SeekrTrickplay.hasAPIKey(), self.isSeekPreviewEnabled, !self.isLiveStream else { return }
+            guard await SeekrTrickplay.isEnabled(), self.isSeekPreviewEnabled, !self.isLiveStream else { return }
             SeekPreviewDiagnostics.shared.updateSeekr("waiting for the file's length…")
             guard let duration = await self.playingFileDuration(generation: activeGen) else { return }
             let seekr = await SeekrTrickplay.shared.provider(

@@ -164,6 +164,18 @@ actor SeekrTrickplay {
         await !apiKey().isEmpty
     }
 
+    /// Whether the player asks Seekr: the switch in Settings is on (the default) and a key is set.
+    static func isEnabled() async -> Bool {
+        let switchedOn = await MainActor.run { isSwitchedOn(in: ProfileSettings.current) }
+        guard switchedOn else { return false }
+        return await hasAPIKey()
+    }
+
+    /// The "Use Seekr" switch; on while never set.
+    static func isSwitchedOn(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.seekrEnabled) as? Bool ?? true
+    }
+
     private static func apiKey() async -> String {
         await MainActor.run {
             ProfileSettings.current.string(forKey: SettingsKey.seekrApiKey)?

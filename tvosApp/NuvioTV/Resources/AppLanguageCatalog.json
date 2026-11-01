@@ -8939,7 +8939,9 @@
     "tvos_settings_seekr_checking": "Ověřuji klíč u Seekru…",
     "tvos_settings_seekr_valid": "Seekr klíč přijal.",
     "tvos_settings_seekr_invalid": "Seekr tento klíč nepřijal.",
-    "tvos_settings_seekr_unreachable": "Seekr se nepodařilo kontaktovat kvůli ověření klíče."
+    "tvos_settings_seekr_unreachable": "Seekr se nepodařilo kontaktovat kvůli ověření klíče.",
+    "tvos_settings_seekr_enabled": "Používat Seekr",
+    "tvos_settings_seekr_enabled_subtitle": "Vypnuto: náhledy si přehrávač dělá sám, klíč zůstane uložený."
   },
   "da": {
     "sidebar_genres_title": "Genrer",
@@ -17877,7 +17879,9 @@
     "tvos_settings_seekr_checking": "Checking the key with Seekr…",
     "tvos_settings_seekr_valid": "Seekr accepts the key.",
     "tvos_settings_seekr_invalid": "Seekr doesn't accept this key.",
-    "tvos_settings_seekr_unreachable": "Seekr couldn't be reached to check the key."
+    "tvos_settings_seekr_unreachable": "Seekr couldn't be reached to check the key.",
+    "tvos_settings_seekr_enabled": "Use Seekr",
+    "tvos_settings_seekr_enabled_subtitle": "Off: the player makes its own previews; the key stays saved."
   },
   "es": {
     "sidebar_genres_title": "Géneros",

@@ -347,6 +347,8 @@ enum SettingsKey {
     static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
     /// Seekr (seekr.tv) API key for seek previews; kept in the Nuvio account like the other settings.
     static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
+    /// Whether Seekr is asked at all (on by default); the key stays saved while it is off.
+    static let seekrEnabled = "nuvio.tv.settings.playback.seekrEnabled"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -416,7 +418,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -8614,6 +8616,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
     @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
+    @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = true
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
@@ -8916,6 +8919,17 @@ private struct PlaybackSettingsView: View {
                     RoundedRectangle(cornerRadius: 24, style: .continuous)
                         .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
                 )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seekr_enabled", fallback: "Use Seekr"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seekr_enabled_subtitle",
+                        fallback: "Off: the player makes its own previews; the key stays saved."
+                    ),
+                    isOn: $seekrEnabled,
+                    accentColor: accentColor
+                )
+                .disabled(!seekPreviewEnabled)
 
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),

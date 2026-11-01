@@ -95,4 +95,14 @@ final class SeekrTrickplayTests: XCTestCase {
         XCTAssertEqual(SettingsQRCode.displayText(for: "https://buymeacoffee.com/seekrtvdev"), "buymeacoffee.com/seekrtvdev")
         XCTAssertEqual(SettingsQRCode.displayText(for: "https://seekr.tv/join/"), "seekr.tv/join")
     }
+
+    func testTheSwitchIsOnUntilTurnedOff() throws {
+        let suite = "SeekrTrickplayTests.switch"
+        let settings = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { settings.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(SeekrTrickplay.isSwitchedOn(in: settings))
+        settings.set(false, forKey: SettingsKey.seekrEnabled)
+        XCTAssertFalse(SeekrTrickplay.isSwitchedOn(in: settings))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.seekrEnabled), "kept in the Nuvio account")
+    }
 }
