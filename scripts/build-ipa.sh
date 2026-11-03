@@ -6,7 +6,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 export XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.tuist_state}"
 TVOS_WORKSPACE="$ROOT_DIR/tvosApp/NuvioTV.xcworkspace"
 TVOS_SCHEME="NuvioTV"
-OUTPUT_DIR="$ROOT_DIR/build-ipa"
+OUTPUT_DIR="${NUVIO_IPA_OUTPUT_DIR:-$ROOT_DIR/build-ipa}"
 ARCHIVE_DIR="$(mktemp -d)/NuvioTV.xcarchive"
 
 cleanup() {
@@ -66,12 +66,22 @@ APP_GROUP=$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.application-gr
   "$ROOT_DIR/tvosApp/TopShelf/TopShelf.entitlements" 2>/dev/null || true)
 if [[ -z "$APP_GROUP" ]]; then
   echo "warning: no App Group in TopShelf.entitlements; the Top Shelf will stay empty after sideloading." >&2
-elif ! command -v ldid >/dev/null 2>&1; then
-  echo "warning: ldid not found (brew install ldid); the IPA has no App Group, so the Top Shelf will stay empty after sideloading." >&2
 else
-  echo "==> Embedding App Group ${APP_GROUP} (Top Shelf)..."
-  GROUP_ENTITLEMENTS="$(dirname "$ARCHIVE_DIR")/app-group.entitlements"
-  cat > "$GROUP_ENTITLEMENTS" <<PLIST
+  if command -v ldid >/dev/null 2>&1; then
+    SIGNING_METHOD="ldid"
+  elif command -v codesign >/dev/null 2>&1; then
+    # Apple's ad-hoc CodeDirectory also carries an entitlement blob that
+    # sideloaders can read before they re-sign the app for the target device.
+    SIGNING_METHOD="codesign"
+  else
+    SIGNING_METHOD=""
+    echo "warning: neither ldid nor codesign is available; the IPA has no App Group, so the Top Shelf will stay empty after sideloading." >&2
+  fi
+
+  if [[ -n "$SIGNING_METHOD" ]]; then
+    echo "==> Embedding App Group ${APP_GROUP} (Top Shelf) via ${SIGNING_METHOD}..."
+    GROUP_ENTITLEMENTS="$(dirname "$ARCHIVE_DIR")/app-group.entitlements"
+    cat > "$GROUP_ENTITLEMENTS" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -83,13 +93,18 @@ else
 </dict>
 </plist>
 PLIST
-  PAYLOAD_APP="$OUTPUT_DIR/Payload/NuvioTV.app"
-  # Extensions first: signing the app seals what it contains.
-  for BUNDLE in "$PAYLOAD_APP"/PlugIns/*.appex "$PAYLOAD_APP"; do
-    [[ -d "$BUNDLE" ]] || continue
-    EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$BUNDLE/Info.plist")
-    ldid -S"$GROUP_ENTITLEMENTS" "$BUNDLE/$EXECUTABLE"
-  done
+    PAYLOAD_APP="$OUTPUT_DIR/Payload/NuvioTV.app"
+    # Extensions first: signing the app seals what it contains.
+    for BUNDLE in "$PAYLOAD_APP"/PlugIns/*.appex "$PAYLOAD_APP"; do
+      [[ -d "$BUNDLE" ]] || continue
+      EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$BUNDLE/Info.plist")
+      if [[ "$SIGNING_METHOD" == "ldid" ]]; then
+        ldid -S"$GROUP_ENTITLEMENTS" "$BUNDLE/$EXECUTABLE"
+      else
+        codesign --force --sign - --entitlements "$GROUP_ENTITLEMENTS" "$BUNDLE/$EXECUTABLE"
+      fi
+    done
+  fi
 fi
 
 (

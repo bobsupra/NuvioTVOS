@@ -15,18 +15,81 @@ import TVServices
 //
 // The tvOS counterpart of the Android app's `TvRecommendationManager`.
 
-/// App Group shared between the app and the Top Shelf extension. Must match the
-/// `com.apple.security.application-groups` entitlement on both targets.
-/// The companion extension uses the main app's bundle identifier plus the
-/// `.TopShelf` suffix. Derive the shared container from that base identifier
-/// so locally signed builds with a different bundle ID keep their shelf feed.
+/// App Group shared between the app and the Top Shelf extension. Prefer the
+/// host app's conventional group, then use an accessible group declared in the
+/// app's metadata or provisioning profile. Profile parsing is best-effort
+/// because `embedded.mobileprovision` is CMS-wrapped.
 public let topShelfAppGroupID: String = {
-    let bundleID = Bundle.main.bundleIdentifier ?? "com.nuvio.app.tv"
-    let mainAppBundleID = bundleID.hasSuffix(".TopShelf")
-        ? String(bundleID.dropLast(".TopShelf".count))
-        : bundleID
-    return "group.\(mainAppBundleID)"
+    let appBundleURL = topShelfContainingAppBundleURL()
+    let preferredGroupID = "group.\(topShelfHostBundleIdentifier(at: appBundleURL))"
+    let declaredGroupIDs = topShelfInfoPlistGroupIdentifiers(at: appBundleURL)
+        + topShelfProvisioningProfileGroupIdentifiers(at: appBundleURL)
+    let candidates = Set(declaredGroupIDs.filter { !$0.isEmpty })
+        .subtracting([preferredGroupID])
+        .sorted()
+
+    let fileManager = FileManager.default
+    if fileManager.containerURL(forSecurityApplicationGroupIdentifier: preferredGroupID) != nil {
+        return preferredGroupID
+    }
+    for groupID in candidates {
+        if fileManager.containerURL(forSecurityApplicationGroupIdentifier: groupID) != nil {
+            return groupID
+        }
+    }
+
+    // Preserve the conventional identifier as a fallback so callers retain
+    // their existing no-container behavior and diagnostics.
+    return preferredGroupID
 }()
+
+private func topShelfContainingAppBundleURL() -> URL {
+    let mainBundleURL = Bundle.main.bundleURL
+    guard mainBundleURL.pathExtension == "appex" else { return mainBundleURL }
+    return mainBundleURL
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+}
+
+private func topShelfHostBundleIdentifier(at appBundleURL: URL) -> String {
+    if let hostBundleID = Bundle(url: appBundleURL)?.bundleIdentifier {
+        return hostBundleID
+    }
+
+    let mainBundleID = Bundle.main.bundleIdentifier ?? "com.nuvio.app.tv"
+    return mainBundleID.hasSuffix(".TopShelf")
+        ? String(mainBundleID.dropLast(".TopShelf".count))
+        : mainBundleID
+}
+
+private func topShelfInfoPlistGroupIdentifiers(at appBundleURL: URL) -> [String] {
+    Bundle(url: appBundleURL)?.infoDictionary?["ALTAppGroups"] as? [String] ?? []
+}
+
+private func topShelfProvisioningProfileGroupIdentifiers(at appBundleURL: URL) -> [String] {
+    let profileURL = appBundleURL.appendingPathComponent("embedded.mobileprovision")
+    guard let profileData = try? Data(contentsOf: profileURL),
+          let xmlStart = profileData.range(of: Data("<?xml".utf8)),
+          let plistEnd = profileData.range(
+            of: Data("</plist>".utf8),
+            in: xmlStart.lowerBound..<profileData.endIndex
+          ) else {
+        return []
+    }
+
+    let plistData = profileData.subdata(in: xmlStart.lowerBound..<plistEnd.upperBound)
+    guard let plistObject = try? PropertyListSerialization.propertyList(
+        from: plistData,
+        options: [],
+        format: nil
+    ),
+    let profile = plistObject as? [String: Any],
+    let entitlements = profile["Entitlements"] as? [String: Any],
+    let groupIDs = entitlements["com.apple.security.application-groups"] as? [String] else {
+        return []
+    }
+    return groupIDs
+}
 
 /// One Top Shelf row. Each section is mirrored to its own file so the stores
 /// that own them (Continue Watching, Library, Home) write independently.
