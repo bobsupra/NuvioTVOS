@@ -1795,7 +1795,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     private(set) var isSeekingForWatchParty = false
 
-    private func seekToMs(_ ms: Int64, exact: Bool) {
+    func seekToMs(_ ms: Int64, exact: Bool) {
         guard mpv != nil else { return }
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         memoryWatchdog.record(event: "seek")

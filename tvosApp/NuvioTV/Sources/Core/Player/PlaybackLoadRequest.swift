@@ -64,6 +64,8 @@ struct PlaybackLoadRequest: Equatable {
     /// request so cache preparation and delayed backend dispatch cannot adopt a
     /// newer playback request's global benchmark token.
     var startupBenchmarkToken: UUID?
+    /// Force sequential origin without byte range seeking (used to recover from origins that fabricate ranges).
+    var forceSequentialOrigin: Bool = false
 
     init(
         videoURL: URL,
@@ -94,7 +96,8 @@ struct PlaybackLoadRequest: Equatable {
         artworkURL: URL? = nil,
         nowPlayingTitle: String? = nil,
         nowPlayingSubtitle: String? = nil,
-        startupBenchmarkToken: UUID? = nil
+        startupBenchmarkToken: UUID? = nil,
+        forceSequentialOrigin: Bool = false
     ) {
         self.videoURL = videoURL
         self.audioURL = audioURL
@@ -125,6 +128,7 @@ struct PlaybackLoadRequest: Equatable {
         self.nowPlayingTitle = nowPlayingTitle
         self.nowPlayingSubtitle = nowPlayingSubtitle
         self.startupBenchmarkToken = startupBenchmarkToken
+        self.forceSequentialOrigin = forceSequentialOrigin
     }
 }
 

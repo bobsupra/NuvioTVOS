@@ -78,7 +78,7 @@ struct SessionCachePublicContractTests {
     }
 }
 
-@Suite("Session cache lifecycle and pressure contract", .offCooperativePool, .timeLimit(.minutes(1)))
+@Suite("Session cache lifecycle and pressure contract", .offCooperativePool, .timeLimit(.minutes(3)))
 struct SessionCacheLifecycleContractTests {
     private func makeRoot() throws -> URL {
         let root = FileManager.default.temporaryDirectory
@@ -255,7 +255,7 @@ struct SessionCacheBudgetCompatibilityTests {
 }
 
 @MainActor
-@Suite(.timeLimit(.minutes(1)))
+@Suite(.timeLimit(.minutes(3)))
 struct SessionCachePublicationTests {
     @Test func oldCallbackCannotReplaceNewSessionOrStoppedState() throws {
         let engine = try AetherEngine()

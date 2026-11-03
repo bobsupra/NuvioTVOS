@@ -968,6 +968,9 @@ if first == "play" {
     // AE#587: LoadOptions.preserveASSMarkup, documented as ASS/SSA only. The report that it leaks
     // into SubRip could only be argued from the source because no harness set the flag at all.
     let preserveASSMarkup = takeFlag("--preserve-ass-markup", from: &rest)
+    // AE#956: LoadOptions.skipsContainerAttachments. Pair it with a throttled origin and an MKV that
+    // carries fonts to see the open stop paying for them.
+    let skipAttachments = takeFlag("--skip-attachments", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -1103,6 +1106,7 @@ if first == "play" {
                  deinterlaceFieldRate: playFieldRate,
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
+                 skipAttachments: skipAttachments,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
                  upscalesLowResolutionVideo: playUpscale,

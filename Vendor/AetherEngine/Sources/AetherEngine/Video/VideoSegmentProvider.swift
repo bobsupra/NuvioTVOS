@@ -885,7 +885,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let decidesForwardWaitByMarchRate: Bool
     /// How long a restart decision for a burst press waits for a newer target before it fires, so the
     /// presses after the first restart once, at the last one. Longer than a remote's repeat gap.
-    private let marchRateSettleSeconds: TimeInterval
+    /// Read per press, so a test can hold the earlier presses of a burst without a deadline and
+    /// settle only the last one. Guarded by stateLock.
+    private var _marchRateSettleSeconds: TimeInterval
     /// A jump this soon after a jump to another index is a burst press, and only such a jump settles.
     /// A lone jump restarts at once: settling every restart cost 0.4 to 0.9 s per +10 min seek.
     private let marchRateBurstWindowSeconds: TimeInterval
@@ -1040,6 +1042,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#443: the window-clamp line is a statement about the session, so it is made once.
     private var _loggedLiveWindowClamp = false
     private static let liveRecentDurationSampleCount = 20
+    /// AE#936: where the cutter is reading inside the open live segment. Guarded by stateLock.
+    private var _liveReadHead = LiveReadHead()
     /// One-shot latch for `noteWindowSlideRelativeToConsumer`. Guarded by stateLock.
     private var _liveConsumerOutsideWindowLatched = false
 
@@ -1163,7 +1167,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.producerFinished = producerFinished
         self.sourceBytesFetched = sourceBytesFetched
         self.decidesForwardWaitByMarchRate = decidesForwardWaitByMarchRate
-        self.marchRateSettleSeconds = marchRateSettleSeconds
+        self._marchRateSettleSeconds = marchRateSettleSeconds
         self.marchRateBurstWindowSeconds = marchRateBurstWindowSeconds
         self._lastRestartIndex = initialRestartIndex
         self.repositionWaitSlice = repositionWaitSlice
@@ -2105,6 +2109,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Restart budget before a restart cost has been measured in this session.
     static let marchRateDefaultBudgetSeconds = 3.0
 
+    func setMarchRateSettleSecondsForTesting(_ seconds: TimeInterval) {
+        stateLock.lock(); _marchRateSettleSeconds = seconds; stateLock.unlock()
+    }
+
     /// `time` is uptime seconds; tests pass their own to shape a march without sleeping.
     func recordMarchStore(index: Int, bytes: Int, parkedBefore: Bool = false, time: Double? = nil) {
         let now = time ?? Double(DispatchTime.now().uptimeNanoseconds) / 1e9
@@ -2124,7 +2132,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return (eta > budgetSeconds, eta)
     }
 
-    /// The march-rate decision; a restart for a burst press is first held for `marchRateSettleSeconds`. The
+    /// The march-rate decision; a restart for a burst press is first held for `_marchRateSettleSeconds`. The
     /// segment arriving meanwhile is served; a newer target arriving meanwhile cancels the restart, so
     /// a burst of presses fires once, for the press that stayed the newest.
     private func marchRateDecision(index: Int, front: Int, branch: String)
@@ -2149,12 +2157,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.lock()
         let previous = _lastJump
         if previous?.index != index { _lastJump = (index, now) }
+        let settle = _marchRateSettleSeconds
         stateLock.unlock()
         guard let previous, previous.index != index, now - previous.time <= marchRateBurstWindowSeconds else {
             return (true, nil)
         }
-        if let source = cache.fetchSource(index: index, timeout: marchRateSettleSeconds,
-                                          progressive: fetchesProgressively) {
+        if let source = cache.fetchSource(index: index, timeout: settle,
+                                          progressive: fetchesProgressively, whileTarget: true) {
             EngineLog.emit("[HLSVideoEngine] seg\(index): march-rate arrived while settling branch=\(branch)", category: .session)
             return (false, source)
         }
@@ -3064,7 +3073,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 degradedGrace = grace
                 degradedDeadline = Date().addingTimeInterval(grace)
             }
+            // AE#936: after a burst on a long GOP the next keyframe is further off than the grace, so
+            // waiting it out serves the same window later.
+            if let degradedDeadline, let degradedGrace,
+               hasBoundedStartupMedia(snap),
+               fastZapGraceIsFutile(remainingSeconds: degradedDeadline.timeIntervalSinceNow) {
+                let sealed = sealLiveTargetDuration(target)
+                let spentGrace = degradedGrace - max(0, degradedDeadline.timeIntervalSinceNow)
+                accountForFirstServe(
+                    since: enteredAt, snapshot: snap, targetDuration: sealed,
+                    note: "fastZap bounded start, \(LiveEdgePolicy.seconds(degradedGrace))s grace ended after "
+                        + "\(LiveEdgePolicy.seconds(spentGrace))s: next keyframe out of reach"
+                )
+                return true
+            }
             var effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            if degradedDeadline != nil {
+                effectiveDeadline = min(effectiveDeadline, Date().addingTimeInterval(Self.graceReadHeadPollSeconds))
+            }
             // AE#684: a join becomes spent when the cutter parks on an empty reader, which is no
             // event this condition hears. While that is still to come, look again shortly.
             if spent == false {
@@ -3123,6 +3149,36 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// How often the gate asks an ingest whether its join is spent. Well under a frame of start latency.
     static let joinSpentPollSeconds: TimeInterval = 0.025
+    /// AE#936: how often a running fastZap grace re-reads the read head, which signals no condition.
+    static let graceReadHeadPollSeconds: TimeInterval = 0.05
+
+    /// AE#936: the cutter read a video packet at `ptsSeconds` (the axis `appendLiveSegment` starts use).
+    func noteLiveReadHead(ptsSeconds: Double) {
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        stateLock.lock()
+        _liveReadHead.note(ptsSeconds: ptsSeconds, at: now)
+        stateLock.unlock()
+    }
+
+    /// AE#936: whether the rest of a running fastZap grace can still finalize a segment.
+    private func fastZapGraceIsFutile(remainingSeconds: TimeInterval) -> Bool {
+        let now = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let last = segments.last,
+              let head = _liveReadHead.latestPtsSeconds,
+              let shortest = segments.map(\.durationSeconds).min() else { return false }
+        return LiveEdgePolicy.fastZapGraceIsFutile(
+            openSegmentSeconds: head - (last.startSeconds + last.durationSeconds),
+            shortestSegmentSeconds: shortest,
+            deliveryRate: _liveReadHead.deliveryRate(
+                now: now,
+                window: LiveEdgePolicy.graceRateWindowSeconds,
+                minimumSpan: LiveEdgePolicy.graceRateMinimumSpanSeconds
+            ),
+            remainingGraceSeconds: remainingSeconds
+        )
+    }
 
     /// AE#374: one account per live session, emitted at whichever exit ends the first-serve gate.
     ///

@@ -49,6 +49,7 @@ private final class PlayerControlsTestEngine: PlaybackEngineControlling {
     func playPlayback() {}
     func pausePlayback() {}
     func seekToMs(_ ms: Int64) {}
+    func seekToMs(_ ms: Int64, exact: Bool) {}
     func setSpeed(_ speed: Float) {}
     func setAspectMode(_ mode: PlayerAspectMode) {}
     func setSubtitleDelay(_ seconds: Double) {}

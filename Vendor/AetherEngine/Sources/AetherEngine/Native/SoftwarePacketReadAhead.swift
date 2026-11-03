@@ -43,7 +43,11 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         let cacheSeekHits: UInt64
         let cacheSeekMisses: UInt64
     }
-    enum ReadError: Error { case interrupted, closed, corruptFIFO }
+    enum ReadError: Error {
+        case interrupted, closed, corruptFIFO
+        /// The optional wait expired without consuming a packet; the source is still open.
+        case idle
+    }
 
     private let condition = NSCondition()
     /// Never acquired by a main-thread API. Serializes reset with append/pop, including the
@@ -56,6 +60,8 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private let audio: Stream?
     private let byteBudget: Int
     private let forwardSeconds: Double
+    /// Live forwarding keeps only reservoir timing, without seek anchors or retained coverage.
+    private let forwardOnly: Bool
     /// Producer thread only. See `start()` for why this is a class the producer moves itself.
     private var producerQoS: qos_class_t = QOS_CLASS_USER_INITIATED
     /// Mirror of `producerQoS` for the consumer's diagnostics, under `condition`.
@@ -71,6 +77,13 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         return producerParked
     }
     private var consumerWaitEvents: UInt64 = 0
+    #if DEBUG
+    /// Captures active waits and completed wakeups under the source condition for idle-loop tests.
+    var consumerWaitStateForTesting: (waiting: Int, completed: UInt64) {
+        condition.lock(); defer { condition.unlock() }
+        return (waitingConsumers, consumerWaitEvents)
+    }
+    #endif
     private var consumerBlockedSeconds: Double = 0
     private var lastStarvationLog: DispatchTime?
     private var generation: UInt64 = 0
@@ -118,6 +131,12 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
     private var timingResidency = SoftwarePacketResidency()
     private let cacheTiming: (any SoftwarePacketCacheTimingSource)?
     private var cacheTimingInvalid = false
+    /// AV1 through dav1d (`SWKeyframeSnap`): a hit restores to the last retained keyframe at or before
+    /// the target, not to the one before it. An AV1 keyframe opens on its own (no leading pictures, and
+    /// a forward key frame is flagged only when it refreshes every reference, #931), so the earlier
+    /// keyframe only made dav1d decode a whole GOP more: on an Apple TV 4K (A15) a hit onto a
+    /// keyframe of 4K AV1 held the clock 1.8 to 2.5 s, and 0.13 to 0.18 s restored to that keyframe.
+    private let anchorsOnLastKeyframe: Bool
     private var calibrationPressure = false
 
     /// Construct only off-main: creating the FIFO touches the temporary volume.
@@ -126,9 +145,13 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
          videoReorderDepth: Int? = nil,
          cacheTiming: (any SoftwarePacketCacheTimingSource)? = nil,
          coverageRangeCap: Int = 4096,
+         anchorsOnLastKeyframe: Bool = false,
+         forwardOnly: Bool = false,
          beforeConsumerOperation: (@Sendable () -> Void)? = nil,
          readSource: @escaping @Sendable (@Sendable () -> Bool) throws -> SoftwareStoredPacket?) {
-        self.cacheTiming = cacheTiming
+        self.cacheTiming = forwardOnly ? nil : cacheTiming
+        self.forwardOnly = forwardOnly
+        self.anchorsOnLastKeyframe = anchorsOnLastKeyframe
         self.video = video
         self.audio = audio
         self.byteBudget = max(1, byteBudget)
@@ -139,7 +162,7 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         self.audioCoverage = SoftwareAudioPacketCoverage(
             timeBaseNumerator: audio?.numerator ?? 1, timeBaseDenominator: audio?.denominator ?? 1,
             timing: audio?.audioTiming, maximumRangeCount: coverageRangeCap)
-        self.presentationCoverage = videoReorderDepth.map {
+        self.presentationCoverage = (forwardOnly ? nil : videoReorderDepth).map {
             SoftwareVideoPacketCoverage(timeBaseNumerator: video.numerator,
                 timeBaseDenominator: video.denominator, reorderDepth: $0,
                 maximumRangeCount: coverageRangeCap)
@@ -174,6 +197,13 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                         generation: generation, seeking: seeking, sourceEnded: ended,
                         sourceEpoch: sourceEpoch, cacheSeekHits: cacheSeekHits,
                         cacheSeekMisses: cacheSeekMisses)
+    }
+
+    /// The retained video keyframes in source seconds, from the packets' own keyframe flags: where a
+    /// cached seek can start (`SWKeyframeSnap`). Copied under the short state lock, like `snapshot`.
+    var retainedKeyframeSeconds: [Double] {
+        condition.lock(); defer { condition.unlock() }
+        return keyframes.map(\.seconds)
     }
 
     /// Called only by a background sampler. Copy bounded metadata under the short state lock;
@@ -288,8 +318,10 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             && seconds.isFinite && (frontierLocked(at: seconds).map { $0 > seconds } ?? false)
         let candidates = hasCoverage ? keyframes.filter { $0.seconds <= seconds }
             .sorted { $0.seconds < $1.seconds } : []
-        // A previous recovery/key picture supplies open-GOP/audio preroll when still retained.
-        let anchor = candidates.isEmpty ? nil : candidates[max(0, candidates.count - 2)]
+        // A previous recovery/key picture supplies open-GOP/audio preroll when still retained, except
+        // where a keyframe needs none (`anchorsOnLastKeyframe`).
+        let anchor = candidates.isEmpty ? nil
+            : candidates[max(0, candidates.count - (anchorsOnLastKeyframe ? 1 : 2))]
         condition.unlock()
 
         if let anchor {
@@ -411,12 +443,23 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
         if needsCleanup { DispatchQueue.global(qos: .utility).async { try? self.fifo.close() } }
     }
 
-    /// Consumer thread only. nil means true EOF; a seek wake is explicitly different from EOF.
-    func read(isCurrent: @Sendable () -> Bool = { true }) throws -> SoftwareStoredPacket? {
+    /// Consumes one packet on the consumer thread; only source EOF returns nil.
+    ///
+    /// - Parameters:
+    ///   - isCurrent: Admission for the host generation that requested this packet.
+    ///   - maximumWait: Optional empty-queue wait in seconds. Zero polls without waiting.
+    /// - Throws: `ReadError.idle` when the wait expires before a packet arrives, without popping
+    ///   the FIFO. Cancellation, seeks, closure and source failures remain distinct from idle.
+    func read(
+        isCurrent: @Sendable () -> Bool = { true },
+        maximumWait: TimeInterval? = nil
+    ) throws -> SoftwareStoredPacket? {
         condition.lock()
         let token = generation
         var waitStart: DispatchTime?
         var starvationLine: String?
+        let deadline = maximumWait.map { Date(timeIntervalSinceNow: max(0, $0)) }
+        var waitExpired = false
         while count == 0, !ended, failure == nil, !closed, !seeking,
               token == generation, isCurrent() {
             if waitStart == nil {
@@ -425,7 +468,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                 // Wake a parked producer so it can see the waiter at its next retune point.
                 condition.broadcast()
             }
-            condition.wait()
+            if let deadline {
+                if !condition.wait(until: deadline) {
+                    waitExpired = true
+                    break
+                }
+            } else {
+                condition.wait()
+            }
         }
         if let waitStart {
             waitingConsumers -= 1
@@ -435,6 +485,14 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
             starvationLine = starvationLineLocked()
         }
         if closed { condition.unlock(); throw ReadError.closed }
+        // Decide idle while holding the state lock. A readiness change after this point cannot
+        // consume a packet: the consumer has not entered a FIFO operation yet.
+        if waitExpired, count == 0, !ended, failure == nil, !seeking,
+           token == generation, isCurrent() {
+            condition.unlock()
+            if let starvationLine { EngineLog.emit(starvationLine, category: .swPlayback) }
+            throw ReadError.idle
+        }
         let hadPackets = count > 0
         condition.unlock()
         if let starvationLine { EngineLog.emit(starvationLine, category: .swPlayback) }
@@ -632,36 +690,42 @@ final class SoftwarePacketReadAhead: @unchecked Sendable {
                     condition.lock()
                     if token == sourceEpoch, !closed, !sourceRepositioning {
                         copyDiskStateLocked(state)
-                        if (packet.streamIndex == video.index && cacheTiming == nil) || packet.streamIndex == audio?.index {
-                            let stream = packet.streamIndex == video.index ? video : audio!
-                            residency.insert(chunkID: cursor.chunkID, pts: packet.pts,
-                                duration: packet.duration, numerator: stream.numerator,
-                                denominator: stream.denominator, isVideo: packet.streamIndex == video.index)
-                        }
-                        if packet.streamIndex == video.index, cacheTiming == nil {
-                            if presentationCoverage != nil {
-                                if presentationCoverage?.isFull == true, let tick = playheadTick(video) {
-                                    presentationCoverage?.prune(before: tick)
-                                }
-                                presentationCoverage?.insert(pts: packet.pts)
-                            } else {
-                                if videoCoverage.isFull, let tick = playheadTick(video) {
-                                    videoCoverage.prune(before: tick)
-                                }
-                                videoCoverage.insert(pts: packet.pts, duration: packet.duration)
+                        if forwardOnly {
+                            if packet.streamIndex == video.index, let seconds = videoSeconds(pts: packet.pts) {
+                                storedVideoSeconds = seconds
                             }
-                            if let seconds = videoSeconds(pts: packet.pts) { storedVideoSeconds = seconds }
-                            if packet.flags & 1 != 0, let seconds = videoSeconds(pts: packet.pts) {
-                                keyframes.append(Keyframe(seconds: seconds, cursor: cursor))
-                                if keyframes.count > maximumKeyframes {
-                                    keyframes.removeFirst(min(1024, keyframes.count))
+                        } else {
+                            if (packet.streamIndex == video.index && cacheTiming == nil) || packet.streamIndex == audio?.index {
+                                let stream = packet.streamIndex == video.index ? video : audio!
+                                residency.insert(chunkID: cursor.chunkID, pts: packet.pts,
+                                    duration: packet.duration, numerator: stream.numerator,
+                                    denominator: stream.denominator, isVideo: packet.streamIndex == video.index)
+                            }
+                            if packet.streamIndex == video.index, cacheTiming == nil {
+                                if presentationCoverage != nil {
+                                    if presentationCoverage?.isFull == true, let tick = playheadTick(video) {
+                                        presentationCoverage?.prune(before: tick)
+                                    }
+                                    presentationCoverage?.insert(pts: packet.pts)
+                                } else {
+                                    if videoCoverage.isFull, let tick = playheadTick(video) {
+                                        videoCoverage.prune(before: tick)
+                                    }
+                                    videoCoverage.insert(pts: packet.pts, duration: packet.duration)
                                 }
+                                if let seconds = videoSeconds(pts: packet.pts) { storedVideoSeconds = seconds }
+                                if packet.flags & 1 != 0, let seconds = videoSeconds(pts: packet.pts) {
+                                    keyframes.append(Keyframe(seconds: seconds, cursor: cursor))
+                                    if keyframes.count > maximumKeyframes {
+                                        keyframes.removeFirst(min(1024, keyframes.count))
+                                    }
+                                }
+                            } else if let audio, packet.streamIndex == audio.index {
+                                if audioCoverage.isFull, let tick = playheadTick(audio) {
+                                    audioCoverage.prune(before: tick)
+                                }
+                                audioCoverage.insert(pts: packet.pts, duration: packet.duration, byteCount: packet.bytes.count)
                             }
-                        } else if let audio, packet.streamIndex == audio.index {
-                            if audioCoverage.isFull, let tick = playheadTick(audio) {
-                                audioCoverage.prune(before: tick)
-                            }
-                            audioCoverage.insert(pts: packet.pts, duration: packet.duration, byteCount: packet.bytes.count)
                         }
                     }
                     applyCacheTimingLocked()

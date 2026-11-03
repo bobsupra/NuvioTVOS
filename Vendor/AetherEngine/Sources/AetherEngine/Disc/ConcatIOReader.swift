@@ -9,13 +9,17 @@ final class ConcatIOReader: IOReader, @unchecked Sendable {
     struct Extent { let offset: Int64; let length: Int64 }
 
     private let base: IOReader
+    /// The original concat wrapper borrows its base from the engine; forked wrappers own the
+    /// independent base cursor they created and must close it with the wrapper.
+    private let ownsBase: Bool
     private let extents: [Extent]
     private let totalLength: Int64
     private var position: Int64 = 0
     private let lock = NSLock()
 
-    init(base: IOReader, extents: [(offset: Int64, length: Int64)]) {
+    init(base: IOReader, extents: [(offset: Int64, length: Int64)], ownsBase: Bool = false) {
         self.base = base
+        self.ownsBase = ownsBase
         self.extents = extents.map { Extent(offset: $0.offset, length: $0.length) }
         self.totalLength = self.extents.reduce(0) { $0 + $1.length }
     }
@@ -42,13 +46,24 @@ final class ConcatIOReader: IOReader, @unchecked Sendable {
             let want = min(toRead - totalGot, avail)
             let absolute = ext.offset + intra
             guard base.seek(offset: absolute, whence: SEEK_SET) >= 0 else {
-                return totalGot > 0 ? Int32(totalGot) : -1
+                if totalGot > 0 {
+                    position += totalGot
+                    return Int32(totalGot)
+                }
+                return -1
             }
             var got: Int64 = 0
             while got < want {
                 let n = base.read(buffer.advanced(by: Int(totalGot + got)), size: Int32(want - got))
                 if n == 0 { break }
-                if n < 0 { return totalGot > 0 ? Int32(totalGot) : -1 }
+                if n < 0 {
+                    let progress = totalGot + got
+                    if progress > 0 {
+                        position += progress
+                        return Int32(progress)
+                    }
+                    return -1
+                }
                 got += Int64(n)
             }
             totalGot += got
@@ -75,7 +90,9 @@ final class ConcatIOReader: IOReader, @unchecked Sendable {
         return position
     }
 
-    func close() {}  // base reader is owned by the engine lifecycle
+    func close() {
+        if ownsBase { base.close() }
+    }
 
     // Forward cancel to the base (mirrors makeIndependentReader) so teardown unblocks a
     // read parked inside base.read() on a network source; close() being a no-op does not.
@@ -87,7 +104,8 @@ final class ConcatIOReader: IOReader, @unchecked Sendable {
     func makeIndependentReader() -> IOReader? {
         guard let forked = base.makeIndependentReader() else { return nil }
         return ConcatIOReader(base: forked,
-                              extents: extents.map { (offset: $0.offset, length: $0.length) })
+                              extents: extents.map { (offset: $0.offset, length: $0.length) },
+                              ownsBase: true)
     }
 }
 

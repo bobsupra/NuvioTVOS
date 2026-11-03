@@ -3,7 +3,7 @@ import Foundation
 
 /// Sparse scrub stills for the parts of a VOD title nothing resident covers (StreamX, 7.48.0). While
 /// the link is idle, one keyframe per rung is read off the source, on the same per-origin request
-/// budget the pump uses, so a plan that allows one connection never sees two at once. A scrub miss
+/// budget the pump uses. A one-request origin gets no ladder (AE#937). A scrub miss
 /// then answers with the nearest rung instead of nothing.
 ///
 /// Pure: the session owns the reader and the cache, this decides which rung comes next and whether
@@ -64,6 +64,8 @@ enum KeyframeStillLadder {
         var originInflight: Int
         var originWaiting: Int
         var originPaced: Bool
+        /// The origin's limit was declared or learned to be one request (AE#937).
+        var originSerial: Bool
         var secondsSinceOriginRefusal: Double?
         var secondsSinceSessionStart: Double
         var secondsSinceLastRung: Double?
@@ -79,10 +81,12 @@ enum KeyframeStillLadder {
     static let rungSpacingSeconds: Double = 2
 
     /// True when one rung read may go out now. It requires the origin to have NOTHING in flight and
-    /// nobody queued, not merely a free slot: on a one-connection plan that is the gap between two
-    /// pump ranges, and on an origin whose limit nobody has learned yet it still keeps the ladder from
-    /// ever being the second concurrent request.
+    /// nobody queued, not merely a free slot, so on an origin whose limit nobody has learned yet the
+    /// ladder is never the second concurrent request. A one-request origin is never read at all
+    /// (AE#937): the gap between two pump ranges does not hold a side reader's open plus its ranges,
+    /// and a panel guarding one slot blocked the client's address over them.
     static func linkIsIdle(_ s: LinkState) -> Bool {
+        guard !s.originSerial else { return false }
         guard !s.restartInFlight, !s.seeking else { return false }
         guard s.forwardBufferSeconds >= minimumForwardBufferSeconds else { return false }
         guard s.secondsSinceSessionStart >= startupGraceSeconds else { return false }

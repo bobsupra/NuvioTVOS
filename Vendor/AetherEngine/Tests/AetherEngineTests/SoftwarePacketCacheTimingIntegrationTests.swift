@@ -2,7 +2,7 @@ import Foundation
 import Testing
 @testable import AetherEngine
 
-@Suite("Qualified cache timing integration", .offCooperativePool, .timeLimit(.minutes(1)))
+@Suite("Qualified cache timing integration", .offCooperativePool, .timeLimit(.minutes(3)))
 struct SoftwarePacketCacheTimingIntegrationTests {
     private final class Timing: SoftwarePacketCacheTimingSource, @unchecked Sendable {
         let lock = NSLock()

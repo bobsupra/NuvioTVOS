@@ -2670,6 +2670,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var coarseThumbnailComplete = false
     private var isRemoteStream = false
     private var isLocalPlaybackCache = false
+    private var activePlaybackRequest: PlaybackLoadRequest?
+    private var didRecoverWithSequentialOrigin = false
 
     // MARK: PlaybackEngineControlling surface
 
@@ -4527,6 +4529,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerEnded = true
             isAtEndOfFile = true
         case .error(let message):
+            if engine.errorInfo?.kind == .sourceFabricatesRanges,
+               !didRecoverWithSequentialOrigin,
+               let activeRequest = activePlaybackRequest {
+                didRecoverWithSequentialOrigin = true
+                screensaverDebugLog("[ScreensaverDebug][AetherController] Origin answers byte ranges with fabricated data; recovering with sequentialOrigin: true")
+                let resumePos = (lastKnownPositionMs > 0 ? Double(lastKnownPositionMs) / 1000.0 : nil) ?? activeRequest.resumePositionSeconds
+                var recoveryRequest = activeRequest
+                recoveryRequest.resumePositionSeconds = resumePos
+                recoveryRequest.forceSequentialOrigin = true
+                load(recoveryRequest, generation: loadGeneration, forceSequentialOrigin: true)
+                break
+            }
+
             if needsForegroundReload || foregroundReloadTask != nil {
                 // Aether may briefly report an error while its lifecycle
                 // reload is being canceled or reopened. The reload task owns
@@ -4865,7 +4880,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     // MARK: Load
 
-    func load(_ request: PlaybackLoadRequest, generation: UInt64) {
+    func load(_ request: PlaybackLoadRequest, generation: UInt64, forceSequentialOrigin: Bool = false) {
+        activePlaybackRequest = request
+        if !forceSequentialOrigin {
+            didRecoverWithSequentialOrigin = false
+        }
         cancelScrubThumbnailWork()
         thumbnailSourceContext = nil
         seekPreviewLaneHost.reset()
@@ -5032,6 +5051,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let isRemoteVOD = (isRemote || isLocalPlaybackCache || isUsenetStream) && !isLive
         let probeBudgetBytes: Int64? = isRemoteVOD ? 15 * 1024 * 1024 : nil
         let maxAnalyzeDurationMicroseconds: Int64? = isRemoteVOD ? 10 * 1_000_000 : nil
+        // Skip embedded container font attachments on non-anime streams (and on anime when ASS styling is stripped),
+        // preventing multi-megabyte font downloads during container open over remote connections.
+        let skipsContainerAttachments = !request.isAnime || request.assMode == .strip
 
         let options = LoadOptions(
             httpHeaders: request.httpHeaders,
@@ -5056,10 +5078,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             // subtitle decoders keep their normal styled/plain cue path.
             preserveASSMarkup: true,
             prepareNativeSubtitles: false,
+            sequentialOrigin: forceSequentialOrigin || request.forceSequentialOrigin,
             maxConcurrentSourceRequests: isRemote || isUsenetStream ? 1 : nil,
             heldSourceConnection: isLocalPlaybackCache || isRemote || isUsenetStream,
+            declaredDurationSeconds: (forceSequentialOrigin || request.forceSequentialOrigin)
+                ? (durationMs > 0 ? Double(durationMs) / 1000.0 : (lastKnownDurationMs > 0 ? Double(lastKnownDurationMs) / 1000.0 : nil))
+                : nil,
             probesize: probeBudgetBytes,
             maxAnalyzeDuration: maxAnalyzeDurationMicroseconds,
+            skipsContainerAttachments: skipsContainerAttachments,
             preferredAudioLanguages: request.preferredAudioLanguages,
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
             externalSubtitles: externalRegistration.tracks,
@@ -5178,10 +5205,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func seekToMs(_ ms: Int64) {
-        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
+        seekToMs(ms, exact: false)
+    }
+
+    func seekToMs(_ ms: Int64, exact: Bool) {
+        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms), exact=\(exact)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
         lastKnownPositionMs = max(0, ms)
         Task { @MainActor in
-            await engine.seek(to: Double(ms) / 1000.0)
+            await engine.seek(to: Double(ms) / 1000.0, exact: exact)
         }
     }
 

@@ -248,6 +248,7 @@ protocol PlaybackEngineControlling: AnyObject {
     func playPlayback()
     func pausePlayback()
     func seekToMs(_ ms: Int64)
+    func seekToMs(_ ms: Int64, exact: Bool)
     func setSpeed(_ speed: Float)
     func setAspectMode(_ mode: PlayerAspectMode)
     func setSubtitleDelay(_ seconds: Double)
@@ -272,6 +273,7 @@ extension PlaybackEngineControlling {
     var supportsAudioProcessing: Bool { false }
     var discTitles: [PlaybackDiscTitleInfo] { [] }
     var selectedDiscTitleId: Int? { nil }
+    func seekToMs(_ ms: Int64, exact: Bool) { seekToMs(ms) }
     func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {}
     func selectDiscTitle(_ id: Int) {}
 }

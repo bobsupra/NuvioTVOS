@@ -13,7 +13,7 @@ import AetherLibavutil
 /// with the encoder's 2048 frames of priming counted in, so the first packet takes the anchor and
 /// the first content frame plays there. These drive the bridge with a synthetic decoder that
 /// behaves like the real one on exactly those points.
-@Suite("TrueHD Atmos spatial bridge", .timeLimit(.minutes(2)))
+@Suite("TrueHD Atmos spatial bridge", .offCooperativePoolOneLane, .timeLimit(.minutes(5)))
 struct SpatialAudioBridgeTests {
     #if TrueHDObjectAudio || DTSXObjectAudio
 

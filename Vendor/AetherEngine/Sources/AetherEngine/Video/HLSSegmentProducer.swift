@@ -238,6 +238,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// AE#684: the sound a finalized live segment carries (index, first and last audio packet on the
     /// output axis, seconds). Fired just before `onLiveSegmentFinalized` for the same index.
     var onLiveSegmentSound: (@Sendable (Int, Double, Double) -> Void)?
+    /// AE#936: the presentation time of every live video packet read, on the `onLiveSegmentFinalized`
+    /// start axis, so the first-serve gate can tell a drained burst from one still arriving.
+    var onLiveReadHead: (@Sendable (Double) -> Void)?
     /// Keyed by segment index; a nil value is a segment cut with no audio packet in it.
     private var liveSegmentSoundByIndex: [Int: (first: Double, last: Double)?] = [:]
     /// AE#684: set for the length of one merged read, so a second reader thread trips the assertion there.
@@ -1725,6 +1728,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             liveSegmentDiscontinuousByIndex[liveCurrentSegmentIndex] = pendingDiscontinuityFlag
             pendingDiscontinuityFlag = false
         }
+        onLiveReadHead?(ptsSeconds)
         return liveCurrentSegmentIndex
     }
 
@@ -2473,6 +2477,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // the NEW producer's position. Cutting on it would adopt this pump's partial segment under
         // its full index; the teardown rule decides what happens to the in-flight segment instead.
         if checkShouldStop() { return nil }
+        // AE#962: a video packet held for its successor's dts goes out with the segment it was routed
+        // to. After the last video packet of a title nothing but audio follows, so the successor never
+        // comes, and the EOF flush put the final picture into the last segment of an audio-only tail,
+        // a minute of item time after it; a session joining that tail placed its whole item by that
+        // one sample. Its duration falls back to one frame, as the EOF flush's always did. A video
+        // packet that opens a later segment itself is routed past this muxer and stays held.
+        if !isLive, let pending = pendingVideoPkt, pendingVideoSegIndex <= currentMuxerSegmentIndex {
+            pendingVideoPkt = nil
+            if (pending.pointee.flags & AV_PKT_FLAG_KEY) != 0,
+               firstSyncItemPtsBySegment[currentMuxerSegmentIndex] == nil {
+                firstSyncItemPtsBySegment[currentMuxerSegmentIndex] =
+                    planBoundaryAxis.timestamp(dts: pending.pointee.dts, pts: pending.pointee.pts)
+            }
+            finalizeAndWriteVideo(pending, nextDts: nil, muxer: muxer)
+            bumpPacketsWritten()
+        }
         switch muxer.cutFragmentForNextSegment(newIdx) {
         case .completed(let path, let bytesWritten):
             EngineLog.emit(

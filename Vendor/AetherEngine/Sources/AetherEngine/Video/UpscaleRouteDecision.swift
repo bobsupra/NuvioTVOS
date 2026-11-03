@@ -1,4 +1,5 @@
 import CoreGraphics
+import Foundation
 import AetherLibavutil
 
 /// Coded picture size plus sample aspect ratio, the geometry the upscale decision works from.
@@ -16,7 +17,7 @@ struct SourceGeometry: Equatable {
 
 /// What the upscale stage does for one source: an optional ML pass (coded size times `mlScale`), then
 /// MetalFX up to the target, which is the display aspect fitted into the display box.
-struct UpscalePlan: Equatable, Sendable {
+struct UpscalePlan: Hashable, Sendable {
     var sourceWidth: Int
     var sourceHeight: Int
     /// nil = MetalFX only.
@@ -49,15 +50,17 @@ enum UpscaleRouteDecision: Equatable {
         case geometryUnknown
         case notBelow1080p
         case displayNotLarger
-        case airPlayVideoReceiver
+        case wirelessAirPlayRoute
         case demuxedAudioLive
+        case stageFailedEarlier
     }
 
     static func decide(
         preference: Bool, osSupportsStage: Bool, metalFXSupported: Bool,
         source: SourceGeometry, isSDR: Bool, isDolbyVision: Bool, isEightBit420: Bool,
-        display: CGSize, airPlayVideoReceiver: Bool, demuxedAudioLive: Bool,
-        mlScaleFactors: (Int, Int) -> [Float]
+        display: CGSize, wirelessAirPlayRoute: Bool, demuxedAudioLive: Bool,
+        mlScaleFactors: (Int, Int) -> [Float],
+        stageFailedEarlier: (UpscalePlan) -> Bool = { _ in false }
     ) -> UpscaleRouteDecision {
         guard preference else { return .notTaken(.preferenceOff) }
         guard osSupportsStage else { return .notTaken(.unsupportedOS) }
@@ -69,8 +72,11 @@ enum UpscaleRouteDecision: Equatable {
         guard let plan = makePlan(source: source, display: display, mlScaleFactors: mlScaleFactors),
               plan.targetWidth > source.width || plan.targetHeight > source.height
         else { return .notTaken(.displayNotLarger) }
-        guard !airPlayVideoReceiver else { return .notTaken(.airPlayVideoReceiver) }
+        // Any wireless AirPlay route, not only a receiver that shows video: the stage moves a session the
+        // native path would play onto the software path, and there the sound goes to the speakers alone.
+        guard !wirelessAirPlayRoute else { return .notTaken(.wirelessAirPlayRoute) }
         guard !demuxedAudioLive else { return .notTaken(.demuxedAudioLive) }
+        guard !stageFailedEarlier(plan) else { return .notTaken(.stageFailedEarlier) }
         return .taken(plan)
     }
 
@@ -179,8 +185,41 @@ extension UpscaleRouteDecision.Reason {
         case .geometryUnknown: return "source size unknown"
         case .notBelow1080p: return "source is not below 1080p"
         case .displayNotLarger: return "display is not larger than the source"
-        case .airPlayVideoReceiver: return "AirPlay video receiver"
+        case .wirelessAirPlayRoute: return "a wireless AirPlay receiver holds the audio route"
         case .demuxedAudioLive: return "live stream with demuxed audio"
+        case .stageFailedEarlier: return "the stage disabled itself for this plan earlier in this process"
         }
+    }
+}
+
+/// The plans whose stage disabled itself, remembered for the process so a reload or a later title with the
+/// same geometry stays on the route it would have taken without the stage. Keyed with the frame rate, like
+/// `MetalFXCostMemory`: a stage that gave up at one rate blocks the same plan at that rate or faster, not
+/// a slower title it might have kept up with. An unknown rate on either side counts as a match.
+enum UpscaleFailureMemory {
+    private struct Entry: Hashable {
+        let plan: UpscalePlan
+        let frameRate: Double?
+    }
+
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var failed: Set<Entry> = []
+
+    static func record(_ plan: UpscalePlan, frameRate: Double?) {
+        lock.lock(); failed.insert(Entry(plan: plan, frameRate: frameRate)); lock.unlock()
+    }
+
+    /// 1% slack, so 23.976 counts as at least as fast as 24.
+    static func contains(_ plan: UpscalePlan, frameRate: Double?) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return failed.contains { entry in
+            guard entry.plan == plan else { return false }
+            guard let failedAt = entry.frameRate, let frameRate else { return true }
+            return frameRate >= failedAt * 0.99
+        }
+    }
+
+    static func reset() {
+        lock.lock(); failed.removeAll(); lock.unlock()
     }
 }

@@ -53,10 +53,11 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        let headCount = await Self.offPool { Self.readPacket(reader) }
+        // Into segment 2's body, so the seek lands mid-body rather than before its response head.
+        let lead = await Self.offPool { Self.readBytes(reader, count: 7 * 188) }
 
-        XCTAssertEqual(headCount, 188)
-        try await waitUntil { server.requests.contains { $0.path == "/seg2.ts" } }
+        XCTAssertEqual(lead.count, 7 * 188)
+        XCTAssertEqual(lead[6 * 188 + Self.markerOffset], 2, "the seventh packet is segment 2's first")
 
         let sought = await Self.offPool { reader.seek(to: 26) }
 
@@ -192,16 +193,32 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         XCTAssertEqual(server.connectionCount, 2)
     }
 
+    func testHeadReadsAreClampedToTheDeadline() {
+        XCTAssertEqual(PersistentHTTP1Connection.headReadTimeout(left: 40, readTimeout: 30, lateReadSpent: false), 30)
+        XCTAssertEqual(PersistentHTTP1Connection.headReadTimeout(left: 2, readTimeout: 30, lateReadSpent: false), 2)
+    }
+
+    func testADeadlineSpentWaitingForAThreadStillReadsTheSocketOnce() {
+        // A pool that held this task past the deadline (CI: a 70 s stall) must not refuse a head that
+        // arrived in time. One short read, then the deadline holds.
+        XCTAssertEqual(PersistentHTTP1Connection.headReadTimeout(left: -20, readTimeout: 30, lateReadSpent: false),
+                       PersistentHTTP1Connection.lateHeadReadTimeout)
+        XCTAssertNil(PersistentHTTP1Connection.headReadTimeout(left: -20, readTimeout: 30, lateReadSpent: true))
+        XCTAssertNil(PersistentHTTP1Connection.headReadTimeout(left: 0, readTimeout: 30, lateReadSpent: true))
+    }
+
     func testDrainPastItsDeadlineClosesAndTheNextRequestGoesAhead() async throws {
         let server = try XCTUnwrap(KeepAliveOrigin())
         defer { server.stop() }
         let segments = (0..<5).map { "seg\($0).ts" }
-        // Fast enough to look drainable, then silent: only the drain deadline ends it.
+        // One packet short, then silent: drainable at any rate the seek could measure, however late
+        // a loaded runner gets to it, so only the drain deadline ends it. A larger remainder turns
+        // undrainable once the seek comes more than a few hundred ms after the body began.
         server.route = { path in
             if path == "/vod.m3u8" { return .init(body: Self.mediaPlaylist(segments)) }
             guard let index = segments.firstIndex(where: { "/" + $0 == path }) else { return .init(status: 404) }
             return index == 1
-                ? .init(body: Self.transportStream(marker: 1, packets: 1_000), stallAfter: 188 * 100)
+                ? .init(body: Self.transportStream(marker: 1, packets: 101), stallAfter: 188 * 100)
                 : .init(body: Self.transportStream(marker: UInt8(index)))
         }
         let made = try await HLSVODIngestReader.makeIfHEVCMPEGTS(
@@ -209,10 +226,12 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        let headCount = await Self.offPool { Self.readPacket(reader) }
+        // Read into segment 1, not just until the server saw its request: a seek that lands before the
+        // client has the response head closes the connection at once instead of draining it (CI: 0.002 s).
+        let lead = await Self.offPool { Self.readBytes(reader, count: 4 * 188) }
 
-        XCTAssertEqual(headCount, 188)
-        try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
+        XCTAssertEqual(lead.count, 4 * 188)
+        XCTAssertEqual(lead[3 * 188 + Self.markerOffset], 1, "the fourth packet is segment 1's first")
         let seekStarted = Date()
         let sought = await Self.offPool { reader.seek(to: 20) }
         XCTAssertTrue(sought)
@@ -558,6 +577,18 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         return head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }
     }
 
+    private static func readBytes(_ reader: HLSVODIngestReader, count: Int) -> [UInt8] {
+        var out: [UInt8] = []
+        var buffer = [UInt8](repeating: 0, count: 188)
+        while out.count < count {
+            let want = Int32(min(buffer.count, count - out.count))
+            let got = buffer.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: want) }
+            if got <= 0 { return out }
+            out += buffer[0..<Int(got)]
+        }
+        return out
+    }
+
     private static func drain(_ reader: HLSVODIngestReader) -> [UInt8] {
         var out: [UInt8] = []
         var buffer = [UInt8](repeating: 0, count: 4096)
@@ -773,7 +804,7 @@ final class KeepAliveOrigin: @unchecked Sendable {
     }
 }
 
-@Suite("Persistent HLS segment-boundary admission", .serialized, .timeLimit(.minutes(1)))
+@Suite("Persistent HLS segment-boundary admission", .serialized, .timeLimit(.minutes(3)))
 struct PersistentHLSSegmentAdmissionTests {
     enum Exit: String, CaseIterable, Sendable { case consume, seek, close, cancel }
 
@@ -812,13 +843,15 @@ struct PersistentHLSSegmentAdmissionTests {
             return .init(body: encryptedFrom.map { index >= $0 } == true
                 ? Issue732PersistentHTTP1Tests.aes128CBC(clear, key: key) : clear)
         }
-        // The factory turns a probe error into nil and only logs it. CI declined once under load
-        // (main d6c46ee6) and nothing said why, so a failure carries the logged reason.
+        // The factory turns a probe error into nil and only logs it. CI declined under load (main
+        // d6c46ee6, deeed435) and nothing said why, so a failure carries the logged reason. The capture
+        // is process-wide, so it filters on the factory's own decline line: the [HLSVODIngest] prefix
+        // alone came back as six "resolved" lines from other tests. No line means a non-HEVC verdict.
         let log = EngineLogCapture()
         defer { log.end() }
         let reader = try #require(try await HLSVODIngestReader.makeIfHEVCMPEGTS(
             playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true),
-            "declined: \(log.matching("[HLSVODIngest]").suffix(6))")
+            "declined: \(log.matching("carriage probe inconclusive"))")
         defer { reader.close() }
         let firstRead = ProbeTestJob { () -> Int32 in
             var bytes = [UInt8](repeating: 0, count: 188)

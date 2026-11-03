@@ -1181,7 +1181,7 @@ extension HeavyDualLayerSuites {
             let group = DispatchGroup()
             for i in 0..<frames {
                 group.enter()
-                DispatchQueue.global().async {
+                DispatchQueue.global().async { // hygiene: allow non-blocking fan-out, real parallelism is the point
                     // Alternate arrival order per pair to hit both pairing paths.
                     if i % 2 == 0 {
                         decoder.handleBaseLayerFrame(baseBuffer: bl[i].value, pts: Self.pts(Int64(i)), hdr10Data: nil)
@@ -1194,7 +1194,7 @@ extension HeavyDualLayerSuites {
                 }
                 // Control-plane churn on the same shared state the VT threads touch.
                 group.enter()
-                DispatchQueue.global().async {
+                DispatchQueue.global().async { // hygiene: allow non-blocking fan-out, real parallelism is the point
                     decoder.skipUntilPTS = Self.pts(Int64(i))
                     _ = decoder.skipUntilPTS
                     _ = decoder.streamClassificationForTesting
@@ -1255,7 +1255,7 @@ extension HeavyDualLayerSuites {
             let teardown = DispatchGroup()
             for i in frames..<(frames + 8) {
                 teardown.enter()
-                DispatchQueue.global().async {
+                DispatchQueue.global().async { // hygiene: allow non-blocking fan-out, real parallelism is the point
                     if let b = Self.baseLayer(), let e = Self.enhancementLayer() {
                         decoder.handleBaseLayerFrame(baseBuffer: b, pts: Self.pts(Int64(i)), hdr10Data: nil)
                         decoder.handleEnhancementLayerFrame(elBuffer: e, pts: Self.pts(Int64(i)))
@@ -1264,7 +1264,7 @@ extension HeavyDualLayerSuites {
                 }
             }
             teardown.enter()
-            DispatchQueue.global().async {
+            DispatchQueue.global().async { // hygiene: allow non-blocking teardown racing the fan-out
                 decoder.flush()
                 decoder.close()
                 teardown.leave()

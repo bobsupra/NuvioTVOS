@@ -56,7 +56,9 @@ struct HTTPDiscIOReaderTests {
     // MARK: - Read / seek over a mock range server
 
     private func makeReader(_ bytes: [UInt8], base: Int = 4096, maxChunk: Int = 4096,
-                            failFirst: Int = 0) -> HTTPDiscIOReader? {
+                            failFirst: Int = 0, maxRetries: Int = 3,
+                            progressiveReads: Bool = false,
+                            rangeCompletionGraceForTesting: TimeInterval? = nil) -> HTTPDiscIOReader? {
         let url = URL(string: "http://disc.test/test.iso")!
         MockRangeURLProtocol.reset()
         MockRangeURLProtocol.bytesByURL[url.absoluteString] = Data(bytes)
@@ -64,7 +66,9 @@ struct HTTPDiscIOReaderTests {
         let config = URLSessionConfiguration.ephemeral
         config.protocolClasses = [MockRangeURLProtocol.self]
         return HTTPDiscIOReader(url: url, baseChunkSize: base, maxChunkSize: maxChunk,
-                                requestTimeout: 5, sessionConfiguration: config)
+                                maxRetries: maxRetries, requestTimeout: 5, sessionConfiguration: config,
+                                progressiveReads: progressiveReads,
+                                rangeCompletionGraceForTesting: rangeCompletionGraceForTesting)
     }
 
     private func readAt(_ reader: HTTPDiscIOReader, offset: Int64, count: Int) -> [UInt8]? {
@@ -86,6 +90,24 @@ struct HTTPDiscIOReaderTests {
 
     private func dataRequestCount(for url: String) -> Int {
         MockRangeURLProtocol.rangeRequests(for: url).filter { $0 != "bytes=0-0" }.count
+    }
+
+    private func waitForFetchedBytes(_ reader: HTTPDiscIOReader, count: Int64,
+                                    timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while reader.sourceBytesFetched < count, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        return reader.sourceBytesFetched >= count
+    }
+
+    private func waitUntilRangeCompletionWaiter(_ reader: HTTPDiscIOReader,
+                                               timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        while !reader.hasRangeCompletionWaiterForTesting, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        return reader.hasRangeCompletionWaiterForTesting
     }
 
     @Test("AVSEEK_SIZE returns the total size from the range probe")
@@ -110,6 +132,347 @@ struct HTTPDiscIOReaderTests {
         let n2 = out2.withUnsafeMutableBufferPointer { r.read($0.baseAddress, size: 100) }
         #expect(n2 == 100)
         #expect(Array(out2[0..<100]) == Array(src[8192..<8292]))
+    }
+
+    @Test("Concat reads validated bytes before an adaptive range completes")
+    func progressiveConcatRead() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 10 * 1024 * 1024)
+        let reader = try #require(makeReader(src, base: 8 * 1024 * 1024, maxChunk: 8 * 1024 * 1024,
+                                             progressiveReads: true))
+        let concat = ConcatIOReader(base: reader, extents: [(offset: 0, length: Int64(src.count))])
+        defer { reader.close() }
+
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 256 * 1024)
+        let pending = AsyncReaderRead(reader: concat, size: 256 * 1024)
+        pending.start()
+
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+        #expect(pending.wait(timeout: 3))
+        #expect(pending.result == 256 * 1024)
+        #expect(pending.bytes == Array(src.prefix(256 * 1024)))
+        #expect(dataRequestCount(for: url) == 1)
+        #expect(MockRangeURLProtocol.maximumConcurrentRangeRequests(for: url) == 1)
+
+        MockRangeURLProtocol.releaseRangeResponse(for: url)
+        let followingSize = 512 * 1024
+        var following = [UInt8](repeating: 0, count: followingSize)
+        let followingCount = following.withUnsafeMutableBufferPointer {
+            concat.read($0.baseAddress, size: Int32(followingSize))
+        }
+        #expect(followingCount == followingSize)
+        #expect(following == Array(src[256 * 1024..<(768 * 1024)]))
+        #expect(dataRequestCount(for: url) == 1)
+    }
+
+    @Test("Cancel wakes a blocked read and returns its validated prefix")
+    func cancelDuringBlockedRead() throws {
+        let url = "http://disc.test/test.iso"
+        let reader = try #require(makeReader(nonperiodicBytes(count: 2 * 1024 * 1024),
+                                             base: 512 * 1024, maxChunk: 512 * 1024,
+                                             progressiveReads: true))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 64 * 1024)
+        let pending = AsyncReaderRead(reader: reader, size: 128 * 1024)
+        pending.start()
+
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+        #expect(pending.waitUntilStarted(timeout: 2))
+        #expect(!pending.wait(timeout: 0.1))
+        reader.cancel()
+        #expect(pending.wait(timeout: 2))
+        #expect(pending.result == 64 * 1024)
+        #expect(pending.bytes == Array(nonperiodicBytes(count: 2 * 1024 * 1024).prefix(64 * 1024)))
+    }
+
+    @Test("Close cancels an active progressive task and wakes its blocked read")
+    func closeDuringBlockedRead() throws {
+        let url = "http://disc.test/test.iso"
+        let reader = try #require(makeReader(nonperiodicBytes(count: 2 * 1024 * 1024),
+                                             base: 512 * 1024, maxChunk: 512 * 1024,
+                                             progressiveReads: true))
+        defer { MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 0)
+        let pending = AsyncReaderRead(reader: reader, size: 4096)
+        pending.start()
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+
+        reader.close()
+        #expect(pending.wait(timeout: 2))
+        #expect(pending.result == -1)
+    }
+
+    @Test("A random seek cancels and finishes the old request before opening another")
+    func randomSeekCancelsInFlightRange() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 3 * 1024 * 1024)
+        let reader = try #require(makeReader(src, base: 512 * 1024, maxChunk: 512 * 1024,
+                                             progressiveReads: true))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 64 * 1024)
+
+        let prefixSize = 64 * 1024
+        var prefix = [UInt8](repeating: 0, count: prefixSize)
+        let prefixCount = prefix.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(prefixSize))
+        }
+        #expect(prefixCount == prefixSize)
+        #expect(prefix == Array(src.prefix(prefixSize)))
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+
+        #expect(reader.seek(offset: 2 * 1024 * 1024, whence: SEEK_SET) == 2 * 1024 * 1024)
+        let randomSize = 4096
+        var random = [UInt8](repeating: 0, count: randomSize)
+        let randomCount = random.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(randomSize))
+        }
+        #expect(randomCount == randomSize)
+        #expect(random == Array(src[(2 * 1024 * 1024)..<(2 * 1024 * 1024 + 4096)]))
+        #expect(MockRangeURLProtocol.maximumConcurrentRangeRequests(for: url) == 1)
+    }
+
+    @Test("An in-window seek wakes the old read and serves the new cursor from the same task")
+    func inWindowSeekWakesBlockedRead() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 2 * 1024 * 1024)
+        let reader = try #require(makeReader(src, base: 512 * 1024, maxChunk: 512 * 1024,
+                                             progressiveReads: true))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 64 * 1024)
+
+        let prefixSize = 64 * 1024
+        var prefix = [UInt8](repeating: 0, count: prefixSize)
+        let prefixCount = prefix.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(prefixSize))
+        }
+        #expect(prefixCount == prefixSize)
+        #expect(prefix == Array(src.prefix(prefixSize)))
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+
+        let pending = AsyncReaderRead(reader: reader, size: 128 * 1024)
+        pending.start()
+        #expect(pending.waitUntilStarted(timeout: 2))
+        #expect(!pending.wait(timeout: 0.1))
+        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)
+        #expect(pending.wait(timeout: 2))
+        #expect(pending.result == -1)
+
+        var reread = [UInt8](repeating: 0, count: prefixSize)
+        let rereadCount = reread.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(prefixSize))
+        }
+        #expect(rereadCount == prefixSize)
+        #expect(reread == Array(src.prefix(prefixSize)))
+        #expect(dataRequestCount(for: url) == 1)
+    }
+
+    @Test("A same-position seek does not wait for an exact range's completion")
+    func noOpSeekDoesNotWaitForRangeCompletion() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 256 * 1024)
+        let window = 64 * 1024
+        let reader = try #require(makeReader(src, base: window, maxChunk: 4 * window,
+                                             progressiveReads: true))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: window)
+
+        var output = [UInt8](repeating: 0, count: window)
+        let count = output.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(window))
+        }
+        #expect(count == window)
+        #expect(output == Array(src.prefix(window)))
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+
+        let pendingSeek = AsyncReaderSeek(reader: reader, offset: Int64(window))
+        pendingSeek.start()
+        #expect(pendingSeek.wait(timeout: 1))
+        #expect(pendingSeek.result == Int64(window))
+        #expect(dataRequestCount(for: url) == 1)
+        #expect(MockRangeURLProtocol.activeRangeRequestCount(for: url) == 1)
+
+        let followingSize = 4096
+        let following = AsyncReaderRead(reader: reader, size: followingSize)
+        following.start()
+        #expect(following.wait(timeout: 2))
+        #expect(following.result == followingSize)
+        #expect(following.bytes == Array(src[window..<(window + followingSize)]))
+        #expect(MockRangeURLProtocol.rangeRequests(for: url).filter { $0 != "bytes=0-0" } == [
+            "bytes=0-65535", "bytes=65536-196607",
+        ])
+        #expect(MockRangeURLProtocol.maximumConcurrentRangeRequests(for: url) == 1)
+
+        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)
+        var cached = [UInt8](repeating: 0, count: followingSize)
+        let cachedCount = cached.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(followingSize))
+        }
+        #expect(cachedCount == followingSize)
+        #expect(cached == Array(src.prefix(followingSize)))
+        #expect(dataRequestCount(for: url) == 2)
+    }
+
+    @Test("A seek during exact-window retirement cannot let the old read consume the new cursor")
+    func seekInterruptsExactWindowRetirement() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 256 * 1024)
+        let window = 64 * 1024
+        let reader = try #require(makeReader(src, base: window, maxChunk: window,
+                                             progressiveReads: true,
+                                             // Hold retirement long enough to force seek into the wait.
+                                             rangeCompletionGraceForTesting: 5))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: window)
+
+        var first = [UInt8](repeating: 0, count: window)
+        let firstCount = first.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(window))
+        }
+        #expect(firstCount == window)
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+
+        let staleRead = AsyncReaderRead(reader: reader, size: 4096)
+        staleRead.start()
+        #expect(staleRead.waitUntilStarted(timeout: 2))
+        #expect(waitUntilRangeCompletionWaiter(reader, timeout: 2))
+        #expect(reader.seek(offset: 0, whence: SEEK_SET) == 0)
+        #expect(staleRead.wait(timeout: 2))
+        #expect(staleRead.result == -1)
+
+        let rereadSize = 4096
+        var reread = [UInt8](repeating: 0, count: rereadSize)
+        let rereadCount = reread.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(rereadSize))
+        }
+        #expect(rereadCount == rereadSize)
+        #expect(reread == Array(src.prefix(rereadSize)))
+        #expect(dataRequestCount(for: url) == 1)
+    }
+
+    @Test("A read waiting at a clean short response resumes from its first missing byte")
+    func cleanShortResponseResumesWaitingRead() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 2 * 1024 * 1024)
+        let reader = try #require(makeReader(src, base: 512 * 1024, maxChunk: 512 * 1024,
+                                             progressiveReads: true))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.shortenRangeOnce(for: url, toBytes: 128 * 1024)
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 128 * 1024)
+
+        let firstSize = 128 * 1024
+        var first = [UInt8](repeating: 0, count: firstSize)
+        let firstCount = first.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(firstSize))
+        }
+        #expect(firstCount == firstSize)
+        #expect(first == Array(src.prefix(firstSize)))
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+
+        let followingSize = 512 * 1024
+        let following = AsyncReaderRead(reader: reader, size: followingSize)
+        following.start()
+        #expect(following.waitUntilStarted(timeout: 2))
+        #expect(!following.wait(timeout: 0.1))
+        MockRangeURLProtocol.releaseRangeResponse(for: url)
+
+        #expect(following.wait(timeout: 3))
+        #expect(following.result == followingSize)
+        #expect(following.bytes == Array(src[firstSize..<(firstSize + followingSize)]))
+        #expect(MockRangeURLProtocol.rangeRequests(for: url).filter { $0 != "bytes=0-0" } == [
+            "bytes=0-524287", "bytes=131072-655359",
+        ])
+        #expect(MockRangeURLProtocol.maximumConcurrentRangeRequests(for: url) == 1)
+    }
+
+    @Test("A 206 without Content-Range exposes no bytes")
+    func missingContentRangeIsRefusedBeforeBody() throws {
+        let url = "http://disc.test/test.iso"
+        let reader = try #require(makeReader(nonperiodicBytes(count: 256 * 1024), maxRetries: 0,
+                                             progressiveReads: true))
+        defer { reader.close() }
+        MockRangeURLProtocol.missingContentRangeFor.insert(url)
+        #expect(reader.seek(offset: 1024, whence: SEEK_SET) == 1024)
+        let outputSize = 128
+        var output = [UInt8](repeating: 0xA5, count: outputSize)
+        let count = output.withUnsafeMutableBufferPointer {
+            reader.read($0.baseAddress, size: Int32(outputSize))
+        }
+        #expect(count == -1)
+        #expect(output == [UInt8](repeating: 0xA5, count: outputSize))
+    }
+
+    @Test("ISO recognition waits for all five signature bytes as they trickle in")
+    func isoSignatureTrickleIsNotMisclassified() throws {
+        let url = "http://disc.test/test.iso"
+        var src = nonperiodicBytes(count: 256 * 1024)
+        src.replaceSubrange(0x8001..<(0x8001 + 5), with: Array("CD001".utf8))
+        let reader = try #require(makeReader(src, base: 64 * 1024, maxChunk: 64 * 1024,
+                                             progressiveReads: true))
+        defer { reader.close(); MockRangeURLProtocol.releaseRangeResponse(for: url) }
+        MockRangeURLProtocol.holdRangeResponse(for: url, afterBytes: 1, trickleRemainder: true)
+
+        let check = AsyncISORecognition(reader: reader)
+        check.start()
+        #expect(MockRangeURLProtocol.waitUntilRangeIsHeld(for: url, timeout: 3))
+        #expect(!check.wait(timeout: 0.1))
+
+        for byteCount in 2...5 {
+            MockRangeURLProtocol.releaseNextByte(for: url)
+            #expect(MockRangeURLProtocol.waitUntilDeliveredBytes(byteCount, for: url, timeout: 2))
+            if byteCount < 5 { #expect(!check.wait(timeout: 0.05)) }
+        }
+        #expect(check.wait(timeout: 2))
+        #expect(check.result == true)
+    }
+
+    @Test("A mid-body disconnect retries from the first missing byte")
+    func midBodyFailureResumesWithoutDuplicatingBytes() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 2 * 1024 * 1024)
+        let reader = try #require(makeReader(src, base: 512 * 1024, maxChunk: 512 * 1024,
+                                             progressiveReads: true))
+        defer { reader.close() }
+        let concat = ConcatIOReader(base: reader, extents: [(offset: 0, length: 512 * 1024)])
+        MockRangeURLProtocol.failBodyOnce(for: url, afterBytes: 128 * 1024)
+
+        let outputSize = 512 * 1024
+        let pending = AsyncReaderRead(reader: concat, size: outputSize)
+        defer { MockRangeURLProtocol.releaseBodyFailure(for: url) }
+        pending.start()
+        #expect(MockRangeURLProtocol.waitUntilBodyFailureIsHeld(for: url, timeout: 3))
+        #expect(waitForFetchedBytes(reader, count: 128 * 1024, timeout: 3))
+        MockRangeURLProtocol.releaseBodyFailure(for: url)
+        #expect(pending.wait(timeout: 5))
+        #expect(pending.result == outputSize)
+        #expect(pending.bytes == Array(src.prefix(outputSize)))
+        #expect(MockRangeURLProtocol.rangeRequests(for: url).filter { $0 != "bytes=0-0" } == [
+            "bytes=0-524287", "bytes=131072-524287",
+        ])
+        #expect(MockRangeURLProtocol.maximumConcurrentRangeRequests(for: url) == 1)
+    }
+
+    @Test("Legacy range callers still return a validated nonempty short body after disconnect")
+    func legacyMidBodyFailureKeepsPartialResponse() throws {
+        let url = "http://disc.test/test.iso"
+        let src = nonperiodicBytes(count: 2 * 1024 * 1024)
+        let reader = try #require(makeReader(src, base: 512 * 1024, maxChunk: 512 * 1024,
+                                             maxRetries: 0))
+        defer { reader.close() }
+        MockRangeURLProtocol.failBodyOnce(for: url, afterBytes: 128 * 1024)
+
+        let outputSize = 512 * 1024
+        let pending = AsyncReaderRead(reader: reader, size: outputSize)
+        defer { MockRangeURLProtocol.releaseBodyFailure(for: url) }
+        pending.start()
+        #expect(MockRangeURLProtocol.waitUntilBodyFailureIsHeld(for: url, timeout: 3))
+        #expect(waitForFetchedBytes(reader, count: 128 * 1024, timeout: 3))
+        MockRangeURLProtocol.releaseBodyFailure(for: url)
+        #expect(pending.wait(timeout: 3))
+        #expect(pending.result == 128 * 1024)
+        #expect(Array(pending.bytes.prefix(128 * 1024)) == Array(src.prefix(128 * 1024)))
+        #expect(dataRequestCount(for: url) == 1)
+        #expect(reader.sourceBytesFetched == 128 * 1024)
+        #expect(MockRangeURLProtocol.rangeRequests(for: url).filter { $0 != "bytes=0-0" } == ["bytes=0-524287"])
     }
 
     @Test("Alternating small reads reuse two prior UDF-like windows")
@@ -409,13 +772,52 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
     /// audit NET-9: any request at a non-zero offset gets a full 200 instead of a 206 (a
     /// Range-ignoring proxy or a cache-miss fallback), body starting at byte 0 of the source.
     nonisolated(unsafe) static var plain200AfterProbeFor: Set<String> = []
+    nonisolated(unsafe) static var missingContentRangeFor: Set<String> = []
     private static let rangeRequestLock = NSLock()
     nonisolated(unsafe) private static var rangeRequestsByURL: [String: [String]] = [:]
+    nonisolated(unsafe) private static var activeRangeRequestsByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var maximumActiveRangeRequestsByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var bodyFailureAfterBytesByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var bodyFailureAlreadyUsed: Set<String> = []
+    nonisolated(unsafe) private static var shortRangeLengthByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var shortRangeAlreadyUsed: Set<String> = []
+    private static let gateCondition = NSCondition()
+    nonisolated(unsafe) private static var gatedPrefixByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var trickleRemainderForURL: Set<String> = []
+    nonisolated(unsafe) private static var byteReleaseLimitByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var deliveredByteCountByURL: [String: Int] = [:]
+    nonisolated(unsafe) private static var waitingBodyFailures: Set<String> = []
+    nonisolated(unsafe) private static var releasedBodyFailures: Set<String> = []
+    nonisolated(unsafe) private static var releasedGates: Set<String> = []
+    nonisolated(unsafe) private static var waitingGates: Set<String> = []
+
+    private let loadingLock = NSLock()
+    private var stopped = false
+    private var hasActiveRangeRequest = false
 
     static func reset() {
         bytesByURL = [:]; disableRangeFor = []; failFirstForURL = [:]
-        misrangedFor = []; plain200AfterProbeFor = []
-        rangeRequestLock.lock(); rangeRequestsByURL = [:]; rangeRequestLock.unlock()
+        misrangedFor = []; plain200AfterProbeFor = []; missingContentRangeFor = []
+        rangeRequestLock.lock()
+        rangeRequestsByURL = [:]
+        activeRangeRequestsByURL = [:]
+        maximumActiveRangeRequestsByURL = [:]
+        bodyFailureAfterBytesByURL = [:]
+        bodyFailureAlreadyUsed = []
+        shortRangeLengthByURL = [:]
+        shortRangeAlreadyUsed = []
+        rangeRequestLock.unlock()
+        gateCondition.lock()
+        gatedPrefixByURL = [:]
+        trickleRemainderForURL = []
+        byteReleaseLimitByURL = [:]
+        deliveredByteCountByURL = [:]
+        waitingBodyFailures = []
+        releasedBodyFailures = []
+        releasedGates = []
+        waitingGates = []
+        gateCondition.broadcast()
+        gateCondition.unlock()
     }
 
     static func rangeRequests(for url: String) -> [String] {
@@ -423,14 +825,197 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
         return rangeRequestsByURL[url] ?? []
     }
 
+    static func maximumConcurrentRangeRequests(for url: String) -> Int {
+        rangeRequestLock.lock(); defer { rangeRequestLock.unlock() }
+        return maximumActiveRangeRequestsByURL[url] ?? 0
+    }
+
+    static func activeRangeRequestCount(for url: String) -> Int {
+        rangeRequestLock.lock(); defer { rangeRequestLock.unlock() }
+        return activeRangeRequestsByURL[url] ?? 0
+    }
+
+    static func holdRangeResponse(for url: String, afterBytes count: Int, trickleRemainder: Bool = false) {
+        gateCondition.lock()
+        gatedPrefixByURL[url] = max(0, count)
+        byteReleaseLimitByURL[url] = max(0, count)
+        deliveredByteCountByURL[url] = 0
+        if trickleRemainder { trickleRemainderForURL.insert(url) }
+        else { trickleRemainderForURL.remove(url) }
+        releasedGates.remove(url)
+        waitingGates.remove(url)
+        gateCondition.unlock()
+    }
+
+    static func waitUntilRangeIsHeld(for url: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        gateCondition.lock()
+        while !waitingGates.contains(url), Date() < deadline {
+            _ = gateCondition.wait(until: deadline)
+        }
+        let held = waitingGates.contains(url)
+        gateCondition.unlock()
+        return held
+    }
+
+    static func releaseRangeResponse(for url: String) {
+        gateCondition.lock()
+        releasedGates.insert(url)
+        gateCondition.broadcast()
+        gateCondition.unlock()
+    }
+
+    static func releaseNextByte(for url: String) {
+        gateCondition.lock()
+        byteReleaseLimitByURL[url, default: 0] += 1
+        gateCondition.broadcast()
+        gateCondition.unlock()
+    }
+
+    static func waitUntilDeliveredBytes(_ count: Int, for url: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        gateCondition.lock()
+        while (deliveredByteCountByURL[url] ?? 0) < count, Date() < deadline {
+            _ = gateCondition.wait(until: deadline)
+        }
+        let delivered = (deliveredByteCountByURL[url] ?? 0) >= count
+        gateCondition.unlock()
+        return delivered
+    }
+
+    static func failBodyOnce(for url: String, afterBytes count: Int) {
+        rangeRequestLock.lock()
+        bodyFailureAfterBytesByURL[url] = max(0, count)
+        bodyFailureAlreadyUsed.remove(url)
+        rangeRequestLock.unlock()
+        gateCondition.lock()
+        waitingBodyFailures.remove(url)
+        releasedBodyFailures.remove(url)
+        gateCondition.unlock()
+    }
+
+    static func shortenRangeOnce(for url: String, toBytes count: Int) {
+        rangeRequestLock.lock()
+        shortRangeLengthByURL[url] = max(1, count)
+        shortRangeAlreadyUsed.remove(url)
+        rangeRequestLock.unlock()
+    }
+
+    static func waitUntilBodyFailureIsHeld(for url: String, timeout: TimeInterval) -> Bool {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        gateCondition.lock()
+        while !waitingBodyFailures.contains(url), Date() < deadline {
+            _ = gateCondition.wait(until: deadline)
+        }
+        let held = waitingBodyFailures.contains(url)
+        gateCondition.unlock()
+        return held
+    }
+
+    static func releaseBodyFailure(for url: String) {
+        gateCondition.lock()
+        releasedBodyFailures.insert(url)
+        gateCondition.broadcast()
+        gateCondition.unlock()
+    }
+
+    private static func waitAtBodyFailure(for url: String, isStopped: () -> Bool) -> Bool {
+        gateCondition.lock()
+        waitingBodyFailures.insert(url)
+        gateCondition.broadcast()
+        while !releasedBodyFailures.contains(url), !isStopped() {
+            _ = gateCondition.wait(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        let released = releasedBodyFailures.contains(url) && !isStopped()
+        waitingBodyFailures.remove(url)
+        gateCondition.unlock()
+        return released
+    }
+
     private static func recordRangeRequest(_ range: String, for url: String) {
         rangeRequestLock.lock(); defer { rangeRequestLock.unlock() }
         rangeRequestsByURL[url, default: []].append(range)
+        activeRangeRequestsByURL[url, default: 0] += 1
+        maximumActiveRangeRequestsByURL[url] = max(
+            maximumActiveRangeRequestsByURL[url] ?? 0, activeRangeRequestsByURL[url] ?? 0)
+    }
+
+    private static func finishRangeRequest(for url: String) {
+        rangeRequestLock.lock(); defer { rangeRequestLock.unlock() }
+        activeRangeRequestsByURL[url] = max(0, (activeRangeRequestsByURL[url] ?? 1) - 1)
+    }
+
+    private static func gatePrefix(for url: String) -> Int? {
+        gateCondition.lock(); defer { gateCondition.unlock() }
+        return gatedPrefixByURL[url]
+    }
+
+    private static func waitAtGate(for url: String, isStopped: () -> Bool) -> Bool {
+        gateCondition.lock()
+        waitingGates.insert(url)
+        gateCondition.broadcast()
+        while !releasedGates.contains(url), !isStopped() {
+            _ = gateCondition.wait(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        let released = releasedGates.contains(url) && !isStopped()
+        waitingGates.remove(url)
+        gateCondition.unlock()
+        return released
+    }
+
+    private static func waitForNextByte(for url: String, after deliveredCount: Int,
+                                        isStopped: () -> Bool) -> Bool {
+        gateCondition.lock()
+        waitingGates.insert(url)
+        gateCondition.broadcast()
+        while !releasedGates.contains(url), (byteReleaseLimitByURL[url] ?? 0) <= deliveredCount,
+              !isStopped() {
+            _ = gateCondition.wait(until: Date(timeIntervalSinceNow: 0.1))
+        }
+        let allowed = releasedGates.contains(url)
+            || (byteReleaseLimitByURL[url] ?? 0) > deliveredCount
+        let shouldContinue = allowed && !isStopped()
+        if !shouldContinue { waitingGates.remove(url) }
+        gateCondition.unlock()
+        return shouldContinue
+    }
+
+    private static func noteDelivered(_ count: Int, for url: String) {
+        gateCondition.lock()
+        deliveredByteCountByURL[url] = count
+        gateCondition.broadcast()
+        gateCondition.unlock()
+    }
+
+    private func trackRangeRequest(_ range: String, url: String) {
+        loadingLock.lock()
+        if !hasActiveRangeRequest {
+            hasActiveRangeRequest = true
+            Self.recordRangeRequest(range, for: url)
+        }
+        loadingLock.unlock()
+    }
+
+    private func finishTrackedRangeRequest(for url: String) {
+        loadingLock.lock()
+        let shouldFinish = hasActiveRangeRequest
+        hasActiveRangeRequest = false
+        loadingLock.unlock()
+        if shouldFinish { Self.finishRangeRequest(for: url) }
+    }
+
+    private var isStopped: Bool {
+        loadingLock.lock(); defer { loadingLock.unlock() }
+        return stopped
     }
 
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
-    override func stopLoading() {}
+    override func stopLoading() {
+        loadingLock.lock(); stopped = true; loadingLock.unlock()
+        Self.gateCondition.lock(); Self.gateCondition.broadcast(); Self.gateCondition.unlock()
+        if let url = request.url { finishTrackedRangeRequest(for: url.absoluteString) }
+    }
 
     override func startLoading() {
         guard let url = request.url, let data = Self.bytesByURL[url.absoluteString] else {
@@ -438,7 +1023,7 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
             return
         }
         if let range = request.value(forHTTPHeaderField: "Range") {
-            Self.recordRangeRequest(range, for: url.absoluteString)
+            trackRangeRequest(range, url: url.absoluteString)
         }
         if let remaining = Self.failFirstForURL[url.absoluteString], remaining > 0 {
             Self.failFirstForURL[url.absoluteString] = remaining - 1
@@ -448,6 +1033,7 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
                                        headerFields: ["Content-Length": "0"])!
             client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
             client?.urlProtocolDidFinishLoading(self)
+            finishTrackedRangeRequest(for: url.absoluteString)
             return
         }
         let total = data.count
@@ -460,8 +1046,19 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
             lower = Int(parts.first ?? "0") ?? 0
             upper = (parts.count > 1 ? Int(parts[1]) : nil) ?? (total - 1)
             upper = min(upper, total - 1)
+            let shortLength: Int? = {
+                Self.rangeRequestLock.lock(); defer { Self.rangeRequestLock.unlock() }
+                guard let length = Self.shortRangeLengthByURL[url.absoluteString],
+                      !Self.shortRangeAlreadyUsed.contains(url.absoluteString) else { return nil }
+                Self.shortRangeAlreadyUsed.insert(url.absoluteString)
+                return length
+            }()
+            if let shortLength { upper = min(upper, lower + shortLength - 1) }
             status = 206
             headers["Content-Range"] = "bytes \(lower)-\(upper)/\(total)"
+        }
+        if status == 206, Self.missingContentRangeFor.contains(url.absoluteString) {
+            headers["Content-Range"] = nil
         }
         var slice = (lower <= upper && lower < total) ? data.subdata(in: lower..<(upper + 1)) : Data()
         if lower > 0, status == 206, Self.misrangedFor.contains(url.absoluteString) {
@@ -476,7 +1073,175 @@ final class MockRangeURLProtocol: URLProtocol, @unchecked Sendable {
         headers["Content-Length"] = String(slice.count)
         let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         client?.urlProtocol(self, didReceive: resp, cacheStoragePolicy: .notAllowed)
+
+        let bodyFailurePrefix: Int? = {
+            Self.rangeRequestLock.lock(); defer { Self.rangeRequestLock.unlock() }
+            guard let prefix = Self.bodyFailureAfterBytesByURL[url.absoluteString],
+                  !Self.bodyFailureAlreadyUsed.contains(url.absoluteString), slice.count > prefix else {
+                return nil
+            }
+            Self.bodyFailureAlreadyUsed.insert(url.absoluteString)
+            return prefix
+        }()
+        if let bodyFailurePrefix {
+            if bodyFailurePrefix > 0 { client?.urlProtocol(self, didLoad: slice.prefix(bodyFailurePrefix)) }
+            DispatchQueue.global().async { [weak self] in
+                guard let self else { return }
+                guard Self.waitAtBodyFailure(for: url.absoluteString, isStopped: { self.isStopped }) else {
+                    self.finishTrackedRangeRequest(for: url.absoluteString)
+                    return
+                }
+                self.client?.urlProtocol(self, didFailWithError: URLError(.networkConnectionLost))
+                self.finishTrackedRangeRequest(for: url.absoluteString)
+            }
+            return
+        }
+
+        if let gatePrefix = Self.gatePrefix(for: url.absoluteString) {
+            let prefixCount = min(gatePrefix, slice.count)
+            if prefixCount > 0 { client?.urlProtocol(self, didLoad: slice.prefix(prefixCount)) }
+            Self.noteDelivered(prefixCount, for: url.absoluteString)
+            let gatedBody = slice
+            DispatchQueue.global().async { [weak self] in
+                guard let self else { return }
+                if Self.trickleRemainderForURL.contains(url.absoluteString) {
+                    var delivered = prefixCount
+                    while delivered < gatedBody.count {
+                        guard Self.waitForNextByte(for: url.absoluteString, after: delivered,
+                                                   isStopped: { self.isStopped }) else {
+                            self.finishTrackedRangeRequest(for: url.absoluteString)
+                            return
+                        }
+                        self.client?.urlProtocol(self, didLoad: gatedBody.subdata(in: delivered..<(delivered + 1)))
+                        delivered += 1
+                        Self.noteDelivered(delivered, for: url.absoluteString)
+                    }
+                    self.client?.urlProtocolDidFinishLoading(self)
+                    Self.gateCondition.lock()
+                    Self.waitingGates.remove(url.absoluteString)
+                    Self.gateCondition.unlock()
+                    self.finishTrackedRangeRequest(for: url.absoluteString)
+                    return
+                }
+                guard Self.waitAtGate(for: url.absoluteString, isStopped: { self.isStopped }) else {
+                    self.finishTrackedRangeRequest(for: url.absoluteString)
+                    return
+                }
+                guard !self.isStopped else {
+                    self.finishTrackedRangeRequest(for: url.absoluteString)
+                    return
+                }
+                if prefixCount < gatedBody.count {
+                    self.client?.urlProtocol(self, didLoad: gatedBody.suffix(from: prefixCount))
+                }
+                self.client?.urlProtocolDidFinishLoading(self)
+                self.finishTrackedRangeRequest(for: url.absoluteString)
+            }
+            return
+        }
         client?.urlProtocol(self, didLoad: slice)
         client?.urlProtocolDidFinishLoading(self)
+        finishTrackedRangeRequest(for: url.absoluteString)
+    }
+}
+
+private final class AsyncReaderRead: @unchecked Sendable {
+    private let reader: IOReader
+    private let size: Int
+    private let finished = DispatchSemaphore(value: 0)
+    private let started = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var storedResult: Int32 = -999
+    let buffer: UnsafeMutablePointer<UInt8>
+
+    init(reader: IOReader, size: Int) {
+        self.reader = reader
+        self.size = size
+        self.buffer = .allocate(capacity: size)
+    }
+
+    deinit { buffer.deallocate() }
+
+    var result: Int32 {
+        lock.lock(); defer { lock.unlock() }
+        return storedResult
+    }
+
+    var bytes: [UInt8] {
+        let count = max(0, min(size, Int(result)))
+        return Array(UnsafeBufferPointer(start: buffer, count: count))
+    }
+
+    func start() {
+        Thread.detachNewThread { [self] in
+            started.signal()
+            let result = reader.read(buffer, size: Int32(size))
+            lock.lock(); storedResult = result; lock.unlock()
+            finished.signal()
+        }
+    }
+
+    func wait(timeout: TimeInterval) -> Bool {
+        finished.wait(timeout: .now() + timeout) == .success
+    }
+
+    func waitUntilStarted(timeout: TimeInterval) -> Bool {
+        started.wait(timeout: .now() + timeout) == .success
+    }
+}
+
+private final class AsyncISORecognition: @unchecked Sendable {
+    private let reader: IOReader
+    private let finished = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var storedResult: Bool?
+
+    init(reader: IOReader) { self.reader = reader }
+
+    var result: Bool? {
+        lock.lock(); defer { lock.unlock() }
+        return storedResult
+    }
+
+    func start() {
+        Thread.detachNewThread { [self] in
+            let result = DiscReader.looksLikeISO9660(reader)
+            lock.lock(); storedResult = result; lock.unlock()
+            finished.signal()
+        }
+    }
+
+    func wait(timeout: TimeInterval) -> Bool {
+        finished.wait(timeout: .now() + timeout) == .success
+    }
+}
+
+private final class AsyncReaderSeek: @unchecked Sendable {
+    private let reader: IOReader
+    private let offset: Int64
+    private let finished = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var storedResult: Int64 = -999
+
+    init(reader: IOReader, offset: Int64) {
+        self.reader = reader
+        self.offset = offset
+    }
+
+    var result: Int64 {
+        lock.lock(); defer { lock.unlock() }
+        return storedResult
+    }
+
+    func start() {
+        Thread.detachNewThread { [self] in
+            let result = reader.seek(offset: offset, whence: SEEK_SET)
+            lock.lock(); storedResult = result; lock.unlock()
+            finished.signal()
+        }
+    }
+
+    func wait(timeout: TimeInterval) -> Bool {
+        finished.wait(timeout: .now() + timeout) == .success
     }
 }

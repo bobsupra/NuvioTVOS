@@ -1,8 +1,8 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.53.1)
+## AetherEngine (pin 7.55.0)
 
-Local pin of [AetherEngine 7.53.1](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.53.1), upstream commit `0839aeee18dd0818c5c307a3c5ecba8ea3161b22`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.53.1 upgrade brings MetalFX/CoreML upscaling gating for tvOS 27.1 / Xcode 27.2 (#846), remote-HLS buffered position publishing (#935), forward seek march rate optimization (#932), AV1 Delayed RAP keyframe seek fix (#931), HLS ingest sub-range support (#928), HTTP probe range growth (#927), and libavfilter audio shaping (#923). Nuvio's custom remote playback startup patches, frame extraction, and local traits are preserved.
+Local pin of [AetherEngine 7.55.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.55.0), upstream commit `0947e2951475aece20a9a973a5a87265fe002444`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.55.0 upgrade incorporates exact seeks (`seek(to:exact:)`), AV1 dav1d keyframe snapping (`SWKeyframeSnap`), Matroska attachment skipping on open (`skipsContainerAttachments`), direct live audio read-ahead under video pressure (`DirectLiveAudioReadAhead`), 4:4:4 chroma site optimizations for Dolby Vision FEL, Profile 5 preview reshaping, AirPlay seek audio/bitmap subtitle fixes, and network trickle protection. Nuvio's custom remote playback startup patches, frame extraction, and local traits are preserved.
 
 Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests. The patch is merged with the 7.40 bed-split renderer and its telemetry reporting.
 

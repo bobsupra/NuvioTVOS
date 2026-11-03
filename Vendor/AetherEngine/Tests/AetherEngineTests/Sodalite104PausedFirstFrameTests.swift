@@ -59,7 +59,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("clock-arm reconciliation cannot restart the clock halfway through pause()", .timeLimit(.minutes(1)))
+    @Test("clock-arm reconciliation cannot restart the clock halfway through pause()", .timeLimit(.minutes(3)))
     func clockArmDuringPause() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -100,7 +100,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("an arm reconciles a pause that preceded the armed latch", .timeLimit(.minutes(1)))
+    @Test("an arm reconciles a pause that preceded the armed latch", .timeLimit(.minutes(3)))
     func pauseBeforeClockArm() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -120,7 +120,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm uses the current playback intent and speed", .timeLimit(.minutes(1)))
+    @Test("a queued arm uses the current playback intent and speed", .timeLimit(.minutes(3)))
     func clockArmUsesLatestPlaybackIntent() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -134,7 +134,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm cannot restart an output after stop was requested", .timeLimit(.minutes(1)))
+    @Test("a queued arm cannot restart an output after stop was requested", .timeLimit(.minutes(3)))
     func clockArmAfterStopRequest() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -148,7 +148,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm cannot change an output replaced by another session", .timeLimit(.minutes(1)))
+    @Test("a queued arm cannot change an output replaced by another session", .timeLimit(.minutes(3)))
     func clockArmAfterOutputReplacement() async throws {
         let host = SoftwarePlaybackHost()
         let oldOutput = AudioOutput()
@@ -165,7 +165,7 @@ struct Sodalite104PausedFirstFrameTests {
 
     @MainActor
     @Test("an arm under pause cancels a pending preroll start even while the clock reads zero",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func pausedClockArmCancelsPreroll() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -181,7 +181,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm leaves the running audio tail to the end-of-media park", .timeLimit(.minutes(1)))
+    @Test("a queued arm leaves the running audio tail to the end-of-media park", .timeLimit(.minutes(3)))
     func clockArmAfterEndOfMedia() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -197,7 +197,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("EOF cannot discard an explicit pause that preceded the armed latch", .timeLimit(.minutes(1)))
+    @Test("EOF cannot discard an explicit pause that preceded the armed latch", .timeLimit(.minutes(3)))
     func pausedClockArmAfterEndOfMedia() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -214,7 +214,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm cannot undo a feeder's rebuffer pause", .timeLimit(.minutes(1)))
+    @Test("a queued arm cannot undo a feeder's rebuffer pause", .timeLimit(.minutes(3)))
     func clockArmAfterFeederPause() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -231,7 +231,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm cannot overwrite a newer seek", .timeLimit(.minutes(1)))
+    @Test("a queued arm cannot overwrite a newer seek", .timeLimit(.minutes(3)))
     func clockArmAfterNewerSeek() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -247,7 +247,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm cannot overwrite a newer speed", .timeLimit(.minutes(1)))
+    @Test("a queued arm cannot overwrite a newer speed", .timeLimit(.minutes(3)))
     func clockArmAfterNewerRate() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -261,7 +261,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @MainActor
-    @Test("a queued arm cannot overwrite a newer pending preroll speed", .timeLimit(.minutes(1)))
+    @Test("a queued arm cannot overwrite a newer pending preroll speed", .timeLimit(.minutes(3)))
     func clockArmAfterNewerPrerollRate() async throws {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()
@@ -277,7 +277,7 @@ struct Sodalite104PausedFirstFrameTests {
     }
 
     @Test("a correction rechecks its revision after the preroll preflight",
-          .timeLimit(.minutes(1)), arguments: [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true])
     func clockCorrectionAfterPreflightPause(usesPreroll: Bool) {
         let output = AudioOutput()
         defer { output.videoPrerollSatisfied = nil; output.stop() }
@@ -297,7 +297,7 @@ struct Sodalite104PausedFirstFrameTests {
 
     @MainActor
     @Test("play before the armed latch preserves the feeder's pending rate correction",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func playBetweenRevisionReadAndArmedLatch() {
         let host = SoftwarePlaybackHost()
         let output = AudioOutput()

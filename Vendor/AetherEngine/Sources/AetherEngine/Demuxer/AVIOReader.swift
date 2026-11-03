@@ -728,6 +728,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // CDN stall threshold: no bytes for this long triggers reconnect. Instance-captured (see
     // `connStallTimeout`) so tests can shorten it; the shipped value is this one.
     private static let connStallTimeoutDefault: TimeInterval = 20
+    /// Trickle floor at `connStallTimeoutDefault`: fewer bytes than this over one stall period
+    /// while a read waits is a connection that is not carrying playback. 2 MiB per 20 s is about
+    /// 0.8 Mbit/s, far below any video bitrate and far above the field case's 256 KB per 40-100 s.
+    /// A reader with a shorter `connStallTimeout` scales it by the same ratio (see the init).
+    static let trickleFloorBytesDefault: Int64 = 2 * 1024 * 1024
     /// #450: fraction of the stall threshold at which a generation that has seen no first byte is
     /// REPORTED. Derived from the threshold rather than set beside it so the invariant holds at
     /// every value of the threshold, the shortened ones tests run with included: the witness speaks
@@ -894,6 +899,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         window.count - max(0, Int(position - winStart))
     }
 
+    /// How many generations the trickle watchdog has ended on this reader.
+    var trickleEndCountForTesting: Int {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return trickleEnds
+    }
+
+    /// How many generations the delivery-gap watchdog has ended on this reader.
+    var deliveryGapEndCountForTesting: Int {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return deliveryGapEnds
+    }
+
     /// The delivery gap the watchdog would judge right now. A test reads it to state the invariant
     /// the field case turns on: a stretch with no read outstanding does not accumulate against the
     /// read that follows it.
@@ -998,6 +1017,25 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// persistent request runs with `timeoutInterval = 0` on purpose. winCond-guarded.
     private var lastDeliveryAt = DispatchTime.now()
 
+    /// Trickle watchdog inputs, winCond-guarded. `genDeliveredBytes` counts what the current
+    /// generation appended; `trickleSamples` are (time, count) marks taken at each watchdog tick so
+    /// the tick can read the volume of the last `connStallTimeout`. Both reset with the generation.
+    private var genDeliveredBytes: Int64 = 0
+    private var trickleSamples: [(at: DispatchTime, bytes: Int64)] = []
+    /// Starved-since clock: when the consumer first blocked in the forward wait, and at which
+    /// offset. It survives consecutive reads, because FFmpeg reads at most one AVIO buffer
+    /// (256 KB) at a time, and a drip of 256 KB every 15 s finishes every read inside
+    /// `connStallTimeout`: a per-read clock restarts with each one and never reaches the verdict.
+    /// Cleared when a read is served without waiting (the window had the bytes), when a
+    /// generation starts (a seek, a refill, a replacement), and on a full window.
+    private var forwardWaitSince: DispatchTime?
+    private var forwardWaitOffset: Int64 = 0
+    /// True only while a read is blocked in the forward wait right now, so a consumer that has
+    /// stopped reading (a paused player) is never judged on a clock it left running.
+    private var forwardWaitActive = false
+    private var trickleEnds = 0
+    private var deliveryGapEnds = 0
+
     /// #309: earliest time the read loop may replace a FAULTED connection from the serve path.
     /// The failure ladder there cannot sleep (see `chargeFaultedRunwayRefill`), so its backoff is
     /// a timestamp instead. `.distantPast` = attempt now, `.distantFuture` = the bounded give-up
@@ -1034,6 +1072,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// did, and the checks that need the REQUESTED offset (a 200 that ignored Range, the size
     /// derived from a from-zero response) must not read the window's start instead. winCond-guarded.
     private var connRequestedOffset: Int64 = 0
+    /// AE#958: the overlap check riding on the current generation, when its request was moved into
+    /// bytes already held (see `RangeHonestyProbe`). winCond-guarded.
+    private var rangeProbe: RangeHonestyProbe?
+    /// AE#958: latched once a ranged answer carried bytes other than the ones it claimed. Every
+    /// read fails from there: nothing this origin sends past byte 0 can be placed. winCond-guarded.
+    private var rangeAnswersFabricated = false
+    /// AE#958: how much of a ranged reconnect is spent re-reading bytes already held.
+    static let rangeCheckBytes = 4096
     /// #331: latched once a live origin answers 416 to a nonzero offset, i.e. proves it has no
     /// byte addresses to resume at. From there every live request is the join shape (`bytes=0-`).
     /// Latched rather than unconditional because the two live origin shapes want opposite things:
@@ -1130,6 +1176,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// seek time, because `trimWindowLocked` has dropped the head long before a seek asks for it.
     /// winCond-guarded.
     private var headSpan: Data = Data()
+    /// AE#958: the last `rangeCheckBytes` of the head, kept when the head itself is dropped, so the
+    /// reconnect at its end can still be checked. winCond-guarded.
+    private var headSpanCheckTail: ResidentSpan?
 
     /// Speculative tail bytes fetched alongside `open()`. winCond-guarded: the fetch completes on a
     /// URLSession queue while the demux thread reads.
@@ -1254,6 +1303,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// load. It is not a `LoadOptions` field either: #272 measured that a shorter threshold is worse
     /// under CPU starvation, and that conclusion is unchanged.
     private let connStallTimeout: TimeInterval
+    /// Bytes per `connStallTimeout` below which a connection a read is waiting on is ended as a
+    /// trickle. `trickleFloorBytesDefault` scaled to this reader's stall threshold unless a caller
+    /// overrides it.
+    private let trickleFloorBytes: Int64
     /// #450: when this reader reports a generation that is on the link with nothing delivered.
     private var firstByteWitnessDelay: TimeInterval {
         min(Self.firstByteWitnessMaxSeconds, connStallTimeout * Self.firstByteWitnessFraction)
@@ -1288,7 +1341,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#927: grows a controlled probe's sequential ranges. Demux thread only, like `position`.
     private var probeRangeGrowth: ProbeRangeGrowth?
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false) {
         self.diagnosticContext = diagnosticContext
         self.routesDiscMediaType = routesDiscMediaType
         self.sourceOpenPolicy = sourceOpenPolicy
@@ -1314,6 +1367,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.pinIdleSeconds = pinIdleSeconds
         self.liveRefusalRetryBudgetSeconds = liveRefusalRetryBudget
         self.connStallTimeout = max(0.05, connStallTimeout)
+        self.trickleFloorBytes = max(1, trickleFloorBytes ?? Int64(
+            Double(Self.trickleFloorBytesDefault) * self.connStallTimeout / Self.connStallTimeoutDefault))
         self.winHighWater = max(1, windowHighWater
             ?? (isLive ? Self.liveWinHighWaterDefault : Self.winHighWaterDefault))
         self.streamHighWater = max(1, streamHighWater ?? Self.streamHighWaterDefault)
@@ -2202,6 +2257,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #281: both spans hold real bytes (up to headSpanMaxBytes + tailPrefetchBytes), so they
         // are released with the window rather than living until the reader is deallocated.
         headSpan = Data()
+        headSpanCheckTail = nil
         tailSpan = nil
         openPhaseActive = false
         let tailTask = tailPrefetchTask
@@ -2468,6 +2524,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         let diagGenAtStart = connGeneration
         let diagDropsAtStart = staleGenDroppedBytes
         winCond.unlock()
+        var enteredForwardWait = false
+        defer {
+            winCond.lock()
+            forwardWaitActive = false
+            if !enteredForwardWait { forwardWaitSince = nil }
+            winCond.unlock()
+        }
         defer {
             let elapsedMs = msSince(readStart)
             if elapsedMs >= diag.thresholdMs {
@@ -2500,6 +2563,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             let lockWaitStart = DispatchTime.now()
             winCond.lock()
             diag.recordLockWait(ms: msSince(lockWaitStart))
+            if rangeAnswersFabricated {
+                winCond.unlock()
+                return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eio
+            }
 
             // #281: bytes already in hand beat every network path below, so this is checked before
             // any of them, and before the reconnect decision that a dead connection would force.
@@ -2518,6 +2585,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // playback asks for exactly those bytes.
             if !openPhaseActive, !indexPassActive, !headSpan.isEmpty,
                spanPos < 0 || spanPos >= Int64(headSpan.count) {
+                // AE#958: the read that drops the head is usually the one about to reconnect at its
+                // end, the first request that can show a fabricated range. Its last bytes stay.
+                let n = min(Self.rangeCheckBytes, headSpan.count)
+                headSpanCheckTail = ResidentSpan(start: Int64(headSpan.count - n),
+                                                 data: Data(headSpan.suffix(n)))
                 headSpan = Data()
             }
             if !windowCanServe, !headSpan.isEmpty || tailSpan != nil,
@@ -2834,6 +2906,15 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // Wait for the live connection to fill forward. A false return
                 // means connStallTimeout elapsed with no data (socket stall).
                 let waitStart = DispatchTime.now()
+                if forwardWaitSince == nil {
+                    forwardWaitSince = waitStart
+                    forwardWaitOffset = curPosition
+                    // No mark from before the starvation began may be judged: one taken ahead of a
+                    // full-window park would fold the park's zero delivery into the span.
+                    trickleSamples = [(waitStart, genDeliveredBytes)]
+                }
+                enteredForwardWait = true
+                forwardWaitActive = true
                 let signaled = winCond.wait(until: min(Date(timeIntervalSinceNow: connStallTimeout), readDeadline))
                 winCond.unlock()
                 diag.recordStallWait(ms: msSince(waitStart), signaled: signaled)
@@ -3599,16 +3680,67 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return nil
     }
 
+    /// AE#958: where the fabricated body really came from, when the retained head holds it, which
+    /// turns "these are other bytes" into the origin's actual chunk offset for a report. Caller holds
+    /// `winCond`.
+    private func fabricatedBodyNoteLocked(_ received: Data) -> String {
+        let needle = received.prefix(256)
+        guard needle.count == 256, let hit = headSpan.range(of: needle) else { return "" }
+        return " (the body is byte \(hit.lowerBound - headSpan.startIndex) of the source)"
+    }
+
+    /// AE#958: `count` bytes from `start` out of whatever still holds them whole (the window, the
+    /// retained head, the tail prefetch), or nil. Caller holds `winCond`.
+    private func heldBytesLocked(from start: Int64, count: Int) -> Data? {
+        guard count > 0, start >= 0 else { return nil }
+        let end = start + Int64(count)
+        if start >= winStart, end <= winStart + Int64(window.count) {
+            var bytes = Data(count: count)
+            bytes.withUnsafeMutableBytes { raw in
+                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    window.copyBytes(to: base, from: Int(start - winStart), count: count)
+                }
+            }
+            return bytes
+        }
+        if end <= Int64(headSpan.count) {
+            let from = headSpan.startIndex + Int(start)
+            return headSpan.subdata(in: from..<(from + count))
+        }
+        if let kept = headSpanCheckTail, start >= kept.start, end <= kept.end {
+            let from = kept.data.startIndex + Int(start - kept.start)
+            return kept.data.subdata(in: from..<(from + count))
+        }
+        if let tail = tailSpan, start >= tail.start, end <= tail.end {
+            let from = tail.data.startIndex + Int(start - tail.start)
+            return tail.data.subdata(in: from..<(from + count))
+        }
+        return nil
+    }
+
     // MARK: - Persistent Connection (lifecycle + delegate callbacks)
 
     /// Open a fresh Range: bytes=<offset>- connection (live: always `bytes=0-`, see the
     /// request construction below). Bumps generation so late callbacks from the old
     /// connection are ignored.
-    private func startPersistentConnection(at offset: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
+    private func startPersistentConnection(at target: Int64, boundedTo: Int64? = nil, openEnded: Bool = false) {
         winCond.lock()
         connGeneration &+= 1
         let generation = connGeneration
         connHeaderRevision = requestHeaderStore?.revision ?? 0
+        // AE#958: ask a few KB early when those KB are already held, so the answer can be checked
+        // against them before any of it is kept. Live is exempt: its offsets are bookkeeping.
+        var offset = target
+        rangeProbe = nil
+        // Never down to byte 0: that is the one offset every origin answers truthfully, so it would
+        // check nothing and turn a forward request into a restart from the head.
+        if !isLive, target > Int64(Self.rangeCheckBytes), !rangeAnswersFabricated {
+            let n = Self.rangeCheckBytes
+            if let held = heldBytesLocked(from: target - Int64(n), count: n) {
+                offset = target - Int64(n)
+                rangeProbe = RangeHonestyProbe(generation: generation, start: offset, expected: held)
+            }
+        }
         // #220: VOD asks for a fixed amount at a time, and anything an origin delivers past it is
         // dropped at the append (audit DMX-1), so the window is bounded by the ask. Two
         // cases keep the open-ended form: live, where the material is produced in real time so
@@ -3644,11 +3776,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // The truncating case is the narrow race where the old connection appended past the
         // frontier the read loop computed before it unlocked; those bytes are re-delivered by the
         // new range, which is correct if slightly wasteful, and never leaves a hole.
-        if offset >= winStart, offset <= winStart + Int64(window.count) {
-            let keep = Int(offset - winStart)
+        // AE#958: on the TARGET, not on the request: the overlap a checked request re-reads is
+        // dropped once it matched, so the window is laid out as if the request had started there.
+        if target >= winStart, target <= winStart + Int64(window.count) {
+            let keep = Int(target - winStart)
             if keep < window.count { window.truncate(to: keep) }
         } else {
-            winStart = offset
+            winStart = target
             window.removeAll()
         }
         connRequestedOffset = offset
@@ -3659,7 +3793,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         postEndDeliveryBytes = 0
         postEndOvershootLogged = false
         let skippedConnStarts = connStartLogGate.admit(
-            continuesPrevious: connRangeEnd.map { offset == $0 + 1 } ?? false,
+            continuesPrevious: connRangeEnd.map { target == $0 + 1 } ?? false,
             now: TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000)
         connRangeEnd = resolvedBound.map { offset + $0 - 1 }
         connStatus = 0
@@ -3670,6 +3804,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
         connFirstDataSeen = false
         lastDeliveryAt = connStartedAt       // #309: the gap is measured from here until data lands
+        genDeliveredBytes = 0
+        trickleSamples = [(connStartedAt, 0)]
+        forwardWaitSince = nil
         // `nextFaultedRefillAt` is deliberately NOT reset here. The faulted-refill ladder sets it
         // just before authorising this very reconnect, so a reset on connection start erased the
         // pacing it had just announced — every "next attempt in Ns" fired as fast as the consumer
@@ -3772,7 +3909,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // hundred milliseconds, so contiguous ranges are summarised (see ConnStartLogGate).
         guard let skippedConnStarts else { return }
         EngineLog.emit(
-            "[AVIOReader] \(label) conn start gen=\(generation) offset=\(offset)"
+            "[AVIOReader] \(label) conn start gen=\(generation) offset=\(target)"
+            + (offset < target ? " check=\(target - offset)B" : "")
             + (resolvedBound.map { " len=\($0 / 1024 / 1024)MB" } ?? " open-ended")
             + " reader=\(openDiagnosticID) slot_ms=\(Int(ticket?.waitedMs ?? 0))"
             + (heldConnectionEnabled ? " held" : "")
@@ -3880,11 +4018,20 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // what is left of one, because once the gap has outgrown the timeout that remainder is
             // 20 ms and this would re-arm at 50 Hz for the length of the park.
             lastDeliveryAt = DispatchTime.now()
+            // Same for the trickle marks: a park is not a slow stretch.
+            trickleSamples = [(lastDeliveryAt, genDeliveredBytes)]
+            forwardWaitSince = nil   // a full window is not a starved consumer
             winCond.unlock()
             armDeliveryGapWatchdog(generation: generation, after: connStallTimeout)
             return
         }
         if gap < connStallTimeout {
+            // Live is never judged: a raw live source arrives at its own bitrate, so the read waits
+            // on forward data by design, and a radio or SD channel sits below the floor for good.
+            if !isLive, let trickle = trickleVerdictLocked() {
+                endTrickleLocked(generation: generation, transfer: transfer, verdict: trickle)
+                return
+            }
             winCond.unlock()
             // Data landed since this closure was scheduled; wait out what is left of the window.
             armDeliveryGapWatchdog(generation: generation, after: max(0.02, connStallTimeout - gap))
@@ -3892,6 +4039,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         connEnded = true
         activeTransfer = nil
+        deliveryGapEnds += 1
         let frontier = winStart + Int64(window.count)
         let ahead = window.count - max(0, Int(position - winStart))
         let sawData = connFirstDataSeen
@@ -3905,6 +4053,65 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             "[AVIOReader] \(label) gen=\(generation) no delivery for \(String(format: "%.1f", gap))s"
             + " at offset \(frontier) (\(ahead / 1024)KB read-ahead held,"
             + " \(sawData ? "had delivered" : "never delivered") data); ending it",
+            category: .demux)
+    }
+
+    /// What `checkDeliveryGap` logs when it ends a trickling generation.
+    private struct TrickleVerdict {
+        let bytes: Int64
+        let span: Double
+        let waited: Double
+        let offset: Int64
+    }
+
+    /// The gap watchdog measures only the time since the LAST delivery, so a drip defeats it: in the
+    /// field (4K HDR over a debrid origin, held connection) a fresh generation delivered 256 KB every
+    /// 40 to 100 s, each drip reset `lastDeliveryAt`, and for three minutes one read after another
+    /// waited while no `no delivery` line ever fired and the forward buffer drained into a 25 s
+    /// AVPlayer stall. The read loop's forward wait has the same blind spot (every drip signals it).
+    /// This judges VOLUME instead: a consumer starved on forward data for `connStallTimeout` (across
+    /// as many AVIO-sized reads as that takes), with a read blocked now and fewer than
+    /// `trickleFloorBytes` delivered over the last `connStallTimeout`, ends the generation.
+    /// Caller holds `winCond`; records this tick's mark either way.
+    private func trickleVerdictLocked() -> TrickleVerdict? {
+        let now = DispatchTime.now()
+        let bytes = genDeliveredBytes
+        trickleSamples.append((now, bytes))
+        func seconds(since t: DispatchTime) -> Double {
+            Double(now.uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000_000
+        }
+        // Keep the newest mark that is at least one period old, and everything after it.
+        if let keep = trickleSamples.lastIndex(where: { seconds(since: $0.at) >= connStallTimeout }), keep > 0 {
+            trickleSamples.removeFirst(keep)
+        }
+        guard forwardWaitActive, let since = forwardWaitSince, seconds(since: since) >= connStallTimeout,
+              let mark = trickleSamples.first, mark.at.uptimeNanoseconds >= since.uptimeNanoseconds,
+              seconds(since: mark.at) >= connStallTimeout else {
+            return nil
+        }
+        let span = seconds(since: mark.at)
+        let delivered = bytes - mark.bytes
+        // Normalised to one period, so a mark older than a period cannot pass a trickle as healthy.
+        guard Double(delivered) * connStallTimeout / span < Double(trickleFloorBytes) else { return nil }
+        return TrickleVerdict(bytes: delivered, span: span, waited: seconds(since: since),
+                              offset: forwardWaitOffset)
+    }
+
+    /// Ends a trickling generation exactly as the gap path ends a silent one: the read loop then
+    /// replaces it through its ordinary ended-connection handling. Called with `winCond` held,
+    /// returns with it released.
+    private func endTrickleLocked(generation: Int, transfer: any PersistentTransfer, verdict: TrickleVerdict) {
+        connEnded = true
+        activeTransfer = nil
+        trickleEnds += 1
+        winCond.broadcast()
+        winCond.unlock()
+        transfer.cancelTransfer()
+        transfer.releaseOriginTicket()   // #377: a trickling connection must not hold the slot
+        EngineLog.emit(
+            "[AVIOReader] \(label) gen=\(generation) trickle: \(verdict.bytes / 1024) KB in "
+            + "\(String(format: "%.1f", verdict.span))s while a read waited "
+            + "\(String(format: "%.1f", verdict.waited))s at offset \(verdict.offset); ending it",
             category: .demux)
     }
 
@@ -3935,12 +4142,45 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             settleTextNotice(held, generation: generation)
             return
         }
+        // AE#958: nothing of a checked generation is kept until its first bytes matched the held ones.
+        var incoming = delivered
+        if var probe = rangeProbe, probe.generation == generation {
+            switch probe.absorb(delivered) {
+            case .pending:
+                rangeProbe = probe
+                lastDeliveryAt = DispatchTime.now()
+                winCond.unlock()
+                return
+            case .honoured(let released):
+                rangeProbe = nil
+                incoming = released
+            case .fabricated(let received):
+                rangeProbe = nil
+                rangeAnswersFabricated = true
+                connEnded = true
+                let transfer = activeTransfer
+                activeTransfer = nil
+                let note = fabricatedBodyNoteLocked(received)
+                winCond.broadcast()
+                winCond.unlock()
+                transfer?.cancelTransfer()
+                transfer?.releaseOriginTicket()
+                FabricatedRangeOrigins.record(url)
+                EngineLog.emit(
+                    "[AVIOReader] \(label) gen=\(generation) the 206 for bytes=\(probe.start)- carries other "
+                    + "bytes than the \(probe.expected.count) B already held there\(note); this origin "
+                    + "fabricates ranges, only byte 0 is addressable. Failing reads; the host should "
+                    + "load it with LoadOptions.sequentialOrigin (AE#958)",
+                    category: .demux)
+                return
+            }
+        }
         // Audit DMX-1: the range is the bound only if bytes past its end are refused. A 200 that
         // ignored Range at offset 0, or a 206 wider than asked, otherwise kept appending under
         // `connEnded`, which also disarms the high-water end below, so the rest of the file
         // streamed into the window. The excess is dropped and the transfer ended; the frontier
         // refill asks for it properly.
-        var data = delivered
+        var data = incoming
         var overDelivered = false
         if let end = connRangeEnd {
             let room = end + 1 - (winStart + Int64(window.count))
@@ -3950,6 +4190,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
         }
         lastDeliveryAt = DispatchTime.now()   // #309: the delivery-gap watchdog's only input
+        genDeliveredBytes += Int64(data.count)
         var firstDataMs: Double? = nil
         if !connFirstDataSeen {
             connFirstDataSeen = true
@@ -4145,6 +4386,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 "[AVIOReader] \(label) the warm said \(adopted)B, this connection says \(total)B; "
                 + "dropping the prewarmed bytes (#551)", category: .demux)
             headSpan = Data()
+            headSpanCheckTail = nil
             tailSpan = nil
             fileSize = 0
             adoptedWarmSize = nil
@@ -5368,14 +5610,16 @@ private func redirectPreservingHeaders(
     // origin it was budgeted against. Every fetch the reader makes passes through here, so it is
     // the one place that sees the whole chain, including the hops no response ever pins (a target
     // that answers the very first request with a 509 is never recorded as resolved).
-    if let from = task.originalRequest?.url, let to = request.url {
-        OriginRequestBudget.shared.noteRedirect(from: from, to: to)
-    }
-    return RedirectHeaderPolicy.redirectRequest(
+    // Noted after the policy so an https-upgraded hop (#954) books the origin it actually reaches.
+    let next = RedirectHeaderPolicy.redirectRequest(
         request,
         originalURL: task.originalRequest?.url,
         originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
         extraHeaders: extraHeaders)
+    if let from = task.originalRequest?.url, let to = next.url {
+        OriginRequestBudget.shared.noteRedirect(from: from, to: to)
+    }
+    return next
 }
 
 // MARK: - Persistent Read Delegate

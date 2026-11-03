@@ -9,7 +9,7 @@ struct KeyframeStillLadderTests {
 
     private func idle() -> KeyframeStillLadder.LinkState {
         .init(restartInFlight: false, seeking: false, forwardBufferSeconds: 120,
-              originInflight: 0, originWaiting: 0, originPaced: false,
+              originInflight: 0, originWaiting: 0, originPaced: false, originSerial: false,
               secondsSinceOriginRefusal: nil, secondsSinceSessionStart: 60, secondsSinceLastRung: nil)
     }
 
@@ -81,6 +81,14 @@ struct KeyframeStillLadderTests {
         s = idle(); s.secondsSinceOriginRefusal = 200
         #expect(KeyframeStillLadder.linkIsIdle(s))
         s = idle(); s.secondsSinceLastRung = 1
+        #expect(!KeyframeStillLadder.linkIsIdle(s))
+    }
+
+    @Test("a one-request origin is never read, however idle the link looks (AE#937)")
+    func serialOriginNeverRead() {
+        var s = idle(); s.originSerial = true
+        #expect(!KeyframeStillLadder.linkIsIdle(s))
+        s.secondsSinceSessionStart = 3600; s.forwardBufferSeconds = 600
         #expect(!KeyframeStillLadder.linkIsIdle(s))
     }
 

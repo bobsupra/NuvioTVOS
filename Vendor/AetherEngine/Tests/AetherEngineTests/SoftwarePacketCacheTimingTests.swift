@@ -4,7 +4,7 @@ import AetherLibavcodec
 import AetherLibavutil
 @testable import AetherEngine
 
-@Suite("AVI MPEG-4 cache presentation timing", .offCooperativePool, .timeLimit(.minutes(1)))
+@Suite("AVI MPEG-4 cache presentation timing", .offCooperativePool, .timeLimit(.minutes(3)))
 struct SoftwarePacketCacheTimingTests {
     private func packet(_ i: Int, shift: Int64 = 0) -> SoftwareStoredPacket {
         let (dts, key, encoded) = MPEG4CacheTimingFixture.packets[i]

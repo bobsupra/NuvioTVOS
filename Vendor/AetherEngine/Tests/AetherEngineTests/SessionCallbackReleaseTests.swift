@@ -37,7 +37,7 @@ struct SessionCallbackReleaseTests {
     }
 
     @Test("a refusal on the current session's store still reaches the host, a replaced store's does not",
-          .timeLimit(.minutes(1)))
+          .timeLimit(.minutes(3)))
     func refusalStillReachesTheHost() async throws {
         let engine = try AetherEngine()
         var received: [Int] = []

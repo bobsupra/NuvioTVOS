@@ -198,6 +198,9 @@ class PlayerViewModel: ObservableObject {
 
     @Published var status: PlayerStatus = .idle {
         didSet {
+            if status == .playing {
+                tryPresentContentWarningsIfReady()
+            }
             if case .error = status, oldValue != status {
                 PlaybackTimelineRecorder.record(.playbackError, engine: activeEngineKind)
             }
@@ -304,6 +307,8 @@ class PlayerViewModel: ObservableObject {
     /// Live channels use a sliding timeline rather than a finite media duration.
     /// Expose that distinction so transport chrome can avoid a misleading scrubber.
     @Published private(set) var isLiveStream = false
+    @Published private(set) var contentWarnings: [PlayerContentWarning] = []
+    @Published private(set) var showContentWarnings = false
     /// Every external subtitle the stream offered (all languages), browsable in
     /// the player's subtitle panel and loaded into mpv on demand.
     @Published var availableExternalSubtitles: [NuvioSubtitle] = []
@@ -439,8 +444,8 @@ class PlayerViewModel: ObservableObject {
     let postPlayController = PostPlayRecommendationController()
 
     var isNextEpisodeMetadataResolved: Bool {
-        guard let meta = activeMeta, meta.isSeries else { return true }
-        return !seriesEpisodes.isEmpty || currentEpisodeVideo != nil
+        guard let meta = activeMeta, meta.isSeries, !isStandalonePlaybackSession else { return true }
+        return !seriesEpisodes.isEmpty
     }
     private var isAdvanceInFlight: Bool = false
     private var advanceGeneration: UInt64 = 0
@@ -516,6 +521,11 @@ class PlayerViewModel: ObservableObject {
 
     private var pollTimer: Timer?
     private var controlsHideTimer: Timer?
+    private var contentWarningsTask: Task<Void, Never>?
+    private var contentWarningsIdentity: String?
+    private var contentWarningsCandidateSignature: String?
+    private var contentWarningsGeneration: UInt64 = 0
+    private var didPresentContentWarningsForIdentity = false
     private var hasLoaded = false
     private var didShutdown = false
     private(set) var watchPartyPlayerBridge: WatchPartyPlayerBridge?
@@ -911,6 +921,7 @@ class PlayerViewModel: ObservableObject {
                     }
                 }
                 self.tick()
+                self.tryPresentContentWarningsIfReady()
             }
         }
         playerController.onPlaybackSuspended = suspend
@@ -1650,6 +1661,7 @@ class PlayerViewModel: ObservableObject {
         } else if !meta.isSeries {
             self.currentEpisodeVideo = nil
         }
+        reconcileContentWarningsForCurrentItem()
         if !isStandalonePlaybackSession {
             let completionIdentity = playbackCompletionIdentity(for: meta)
             if beginsNewPlaybackCompletionSession {
@@ -1935,6 +1947,182 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    private func reconcileContentWarningsForCurrentItem() {
+        guard !didShutdown, let meta = activeMeta else {
+            contentWarningsGeneration &+= 1
+            contentWarningsTask?.cancel()
+            contentWarningsTask = nil
+            contentWarningsIdentity = nil
+            contentWarningsCandidateSignature = nil
+            contentWarnings = []
+            showContentWarnings = false
+            didPresentContentWarningsForIdentity = false
+            return
+        }
+
+        let parentIdentity = Self.imdbID(in: meta.imdbId) ?? meta.id
+        let episodeIdentity: String
+        if meta.isSeries {
+            if let episode = currentEpisodeVideo, episode.season > 0, episode.episode > 0 {
+                episodeIdentity = "s\(episode.season)e\(episode.episode)"
+            } else if let numbers = activeEpisodeNumbers, numbers.season > 0, numbers.episode > 0 {
+                episodeIdentity = "s\(numbers.season)e\(numbers.episode)"
+            } else {
+                episodeIdentity = currentEpisodeVideo?.id ?? "unknown-episode"
+            }
+        } else {
+            episodeIdentity = "movie"
+        }
+        let identity = "\(parentIdentity.lowercased())|\(episodeIdentity.lowercased())"
+        let episodeID = currentEpisodeVideo?.id
+        let directIMDbIDs = Self.directContentWarningsIMDbIDs(for: meta, episodeID: episodeID)
+        let tmdbIDs = Self.contentWarningsTMDBIDs(for: meta, episodeID: episodeID)
+        let candidateSignature = "imdb:\(directIMDbIDs.joined(separator: ","))|tmdb:\(tmdbIDs.map(String.init).joined(separator: ","))"
+        let identityChanged = identity != contentWarningsIdentity
+        let candidatesChanged = candidateSignature != contentWarningsCandidateSignature
+
+        guard identityChanged || candidatesChanged else {
+            tryPresentContentWarningsIfReady()
+            return
+        }
+        if !identityChanged, didPresentContentWarningsForIdentity {
+            contentWarningsCandidateSignature = candidateSignature
+            return
+        }
+
+        contentWarningsGeneration &+= 1
+        let generation = contentWarningsGeneration
+        contentWarningsTask?.cancel()
+        contentWarningsTask = nil
+        contentWarningsIdentity = identity
+        contentWarningsCandidateSignature = candidateSignature
+        contentWarnings = []
+        showContentWarnings = false
+        if identityChanged {
+            didPresentContentWarningsForIdentity = false
+        }
+
+        contentWarningsTask = Task { [weak self] in
+            guard let self else { return }
+            var triedIMDbIDs = Set<String>()
+
+            for imdbID in directIMDbIDs {
+                guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                guard triedIMDbIDs.insert(imdbID).inserted else { continue }
+                let warnings = await ContentWarningsRepository.shared.warnings(for: imdbID)
+                guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                guard !warnings.isEmpty else { continue }
+                self.contentWarnings = warnings
+                self.contentWarningsTask = nil
+                self.tryPresentContentWarningsIfReady()
+                return
+            }
+
+            guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+            if let apiKey = TmdbDetailsService.currentApiKey {
+                let client = CalendarTmdb.Client(apiKey: apiKey)
+                for tmdbID in tmdbIDs {
+                    guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                    do {
+                        let resolved = try await client.imdbId(
+                            tmdbId: tmdbID,
+                            kind: meta.isSeries ? .series : .movie
+                        )
+                        guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                        guard let imdbID = Self.imdbID(in: resolved), triedIMDbIDs.insert(imdbID).inserted else {
+                            continue
+                        }
+
+                        let warnings = await ContentWarningsRepository.shared.warnings(for: imdbID)
+                        guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                        guard !warnings.isEmpty else { continue }
+                        self.contentWarnings = warnings
+                        self.contentWarningsTask = nil
+                        self.tryPresentContentWarningsIfReady()
+                        return
+                    } catch {
+                        guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+                    }
+                }
+            }
+
+            guard self.isCurrentContentWarningsRequest(identity: identity, generation: generation) else { return }
+            self.contentWarningsTask = nil
+        }
+    }
+
+    private static func directContentWarningsIMDbIDs(for meta: NuvioMeta, episodeID: String?) -> [String] {
+        var seen = Set<String>()
+        return [imdbID(in: meta.imdbId), imdbID(in: meta.id), imdbID(in: episodeID)]
+            .compactMap { $0 }
+            .filter { seen.insert($0).inserted }
+    }
+
+    private static func contentWarningsTMDBIDs(for meta: NuvioMeta, episodeID: String?) -> [Int] {
+        var ids: [Int] = []
+        if let parentID = meta.tmdbId {
+            ids.append(parentID)
+        }
+        if let parentID = tmdbID(in: meta.id), !ids.contains(parentID) {
+            ids.append(parentID)
+        }
+        if let episodeID = episodeID.flatMap(tmdbID(in:)), !ids.contains(episodeID) {
+            ids.append(episodeID)
+        }
+        return ids
+    }
+
+    private func isCurrentContentWarningsRequest(identity: String, generation: UInt64) -> Bool {
+        !Task.isCancelled
+            && !didShutdown
+            && contentWarningsIdentity == identity
+            && contentWarningsGeneration == generation
+    }
+
+    private func tryPresentContentWarningsIfReady() {
+        guard !didShutdown,
+              !didPresentContentWarningsForIdentity,
+              !contentWarnings.isEmpty,
+              status == .playing,
+              !showSettingsPanel,
+              !showScenePanel,
+              !isSceneDetailVisible,
+              sidePanel == nil,
+              hasRenderedFirstFrame || (isLiveStream && livePlaybackHasStarted) else { return }
+
+        didPresentContentWarningsForIdentity = true
+        showControls = true
+        cancelControlsHideTimer()
+        showContentWarnings = true
+    }
+
+    func contentWarningsDidDismiss() {
+        guard showContentWarnings else { return }
+        showContentWarnings = false
+        if status == .playing, showControls {
+            scheduleControlsHide()
+        }
+    }
+
+    private static func imdbID(in value: String?) -> String? {
+        guard let value,
+              let range = value.range(of: #"tt\d+"#, options: [.regularExpression, .caseInsensitive]) else {
+            return nil
+        }
+        return value[range].lowercased()
+    }
+
+    private static func tmdbID(in value: String) -> Int? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.allSatisfy(\.isNumber) { return Int(trimmed) }
+        guard let range = trimmed.range(
+            of: #"tmdb[:/|](\d+)"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) else { return nil }
+        let token = String(trimmed[range])
+        return token.split(whereSeparator: { !$0.isNumber }).last.flatMap { Int($0) }
+    }
+
     // MARK: - Next episode
 
     /// Supplies the series context and the resolver that turns a next episode
@@ -1960,13 +2148,30 @@ class PlayerViewModel: ObservableObject {
             self.allowsManualEpisodeSelection = false
             nextEpisode = nil
             clearNextEpisodeCard()
+            reconcileContentWarningsForCurrentItem()
             return
         }
         seriesEpisodes = episodes
-        if currentEpisodeVideo?.id != current?.id {
+        let resolvedCurrentEpisode: NuvioVideo?
+        if let current {
+            resolvedCurrentEpisode = current
+        } else if activeMeta?.isSeries == true, let existingEpisode = currentEpisodeVideo {
+            if let numbers = activeEpisodeNumbers,
+               existingEpisode.season != numbers.season || existingEpisode.episode != numbers.episode {
+                resolvedCurrentEpisode = nil
+            } else {
+                // Keep the episode inferred from the active stream when the
+                // playlist configuration has no current-item value.
+                resolvedCurrentEpisode = existingEpisode
+            }
+        } else {
+            resolvedCurrentEpisode = nil
+        }
+        if currentEpisodeVideo?.id != resolvedCurrentEpisode?.id {
             lastAdvancedEpisodeId = nil
         }
-        currentEpisodeVideo = current
+        currentEpisodeVideo = resolvedCurrentEpisode
+        reconcileContentWarningsForCurrentItem()
         autoPlayNextEnabled = autoPlayEnabled
         autoPlayNextCountdownSeconds = max(1, autoPlayCountdownSeconds)
         resolveNextStream = resolver
@@ -1980,7 +2185,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
         isAutoPlayCancelled = false
-        nextEpisode = Self.nextEpisode(after: current, in: episodes)
+        nextEpisode = Self.nextEpisode(after: resolvedCurrentEpisode, in: episodes)
 
         if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
             let context = ActivePlaybackContext(
@@ -1993,7 +2198,7 @@ class PlayerViewModel: ObservableObject {
                 externalSubtitles: pendingExternalSubtitles,
                 resumeFrom: pendingResumeSeconds,
                 episodes: episodes,
-                currentEpisode: current,
+                currentEpisode: resolvedCurrentEpisode,
                 autoPlayNextEnabled: autoPlayEnabled,
                 autoPlayNextCountdownSeconds: autoPlayCountdownSeconds,
                 playbackOrigin: activePlaybackOrigin,
@@ -3730,6 +3935,7 @@ class PlayerViewModel: ObservableObject {
             isAdvancingEpisode = false
             markLoadStarted()
         }
+        tryPresentContentWarningsIfReady()
 
         let engineStatus: PlayerStatus
         if isFailingOver || isReloadingStream || isSwitchingSource {
@@ -4297,7 +4503,7 @@ class PlayerViewModel: ObservableObject {
             switch self.activeEngineKind {
             case .aether:
                 guard let controller = self.aetherController else { throw WatchPartyPlayerBridgeError.notReady }
-                await controller.engine.seek(to: Double(target) / 1000)
+                await controller.engine.seek(to: Double(target) / 1000, exact: true)
             case .mpv:
                 try self.playerController.beginWatchPartySeek(target)
             }
@@ -4537,6 +4743,14 @@ class PlayerViewModel: ObservableObject {
         cancelPendingAdvanceResolution()
         didShutdown = true
         resetAudioSync()
+        contentWarningsGeneration &+= 1
+        contentWarningsTask?.cancel()
+        contentWarningsTask = nil
+        contentWarningsIdentity = nil
+        contentWarningsCandidateSignature = nil
+        contentWarnings = []
+        showContentWarnings = false
+        didPresentContentWarningsForIdentity = false
         PlaybackTimelineRecorder.record(.playbackStopRequested, engine: activeEngineKind)
         pollTimer?.invalidate()
         pollTimer = nil
@@ -4645,7 +4859,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func seekToChapter(_ chapter: PlaybackChapter) {
-        seek(to: chapter.startSeconds)
+        seek(to: chapter.startSeconds, exact: true)
     }
 
     /// Whether the Chapters panel shows stills: seek previews are on and the player can make
@@ -4795,7 +5009,7 @@ class PlayerViewModel: ObservableObject {
         SeekPreviewDiagnostics.shared.updateChapters("")
     }
 
-    func seek(to seconds: Double) {
+    func seek(to seconds: Double, exact: Bool = false) {
         guard !isLiveStream, seconds.isFinite else { return }
         recordWatchPartyTransportIntent()
         if watchPartyPlayerBridge != nil {
@@ -4808,9 +5022,9 @@ class PlayerViewModel: ObservableObject {
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
         let prevCurrent = time.current
-        seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s)")
-        screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
-        engine.seekToMs(Int64(target * 1000))
+        seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s, exact: \(exact))")
+        screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds), exact: \(exact)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
+        engine.seekToMs(Int64(target * 1000), exact: exact)
         recordCommittedSeek(to: target, previous: prevCurrent, duration: duration)
     }
 
@@ -4903,7 +5117,7 @@ class PlayerViewModel: ObservableObject {
             postPlayController.showImmediately()
         }
         let targetTime = postCredits?.startTime ?? interval.endTime
-        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)))
+        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)), exact: true)
         showControls = false
         scheduleControlsHide()
     }
@@ -7089,6 +7303,10 @@ class PlayerViewModel: ObservableObject {
     // MARK: - Controls visibility
 
     func scheduleControlsHide(after interval: TimeInterval? = nil) {
+        guard !showContentWarnings else {
+            cancelControlsHideTimer()
+            return
+        }
         guard status == .playing else {
             cancelControlsHideTimer()
             return
@@ -7099,6 +7317,7 @@ class PlayerViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard self.status == .playing else { return }
+                guard !self.showContentWarnings else { return }
                 guard !self.controlsAutoHideSuspended else { return }
                 guard !self.isHoldingSeek else { return }
                 guard !self.showSettingsPanel, !self.showScenePanel, !self.isSceneDetailVisible else { return }
@@ -7967,7 +8186,7 @@ class PlayerViewModel: ObservableObject {
         let target = isTrailerPlaybackSession
             ? min(pendingResumeSeconds, max(time.duration - 1, 0))
             : min(pendingResumeSeconds, max(time.duration - 5, 0))
-        seek(to: target)
+        seek(to: target, exact: true)
     }
 
     private func rememberManualSourceIfReady() {

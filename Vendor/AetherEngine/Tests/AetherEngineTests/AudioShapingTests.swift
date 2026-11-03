@@ -12,7 +12,7 @@ import AetherLibavutil
 /// The end-to-end checks drive a 5.1 fixture that puts a 1 kHz tone on the front centre only and a
 /// 250 Hz tone on every other channel, so "the dialogue got louder" is a measured ratio between two
 /// frequencies rather than a level that a fold or a limiter could also have moved.
-@Suite("AE#923 audio shaping", .serialized)
+@Suite("AE#923 audio shaping", .serialized, .offCooperativePoolOneLane)
 struct AudioShapingTests {
 
     // MARK: - The value

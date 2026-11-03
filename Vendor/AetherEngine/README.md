@@ -391,7 +391,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.55.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -644,10 +644,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.55.0")
 ```
 
-Pin to `.upToNextMinor(from: "7.53.1")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.55.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -661,7 +661,9 @@ Pin to `.upToNextMinor(from: "7.53.1")` for stricter teams that prefer to opt in
 | Xcode | 27.0 |
 
 The Swift and Xcode rows are the supported toolchain CI builds and tests with (GitHub's
-`xcode-27` image). Older toolchains are not supported; the deployment floor above
+`xcode-27` image): every change runs the tests on macOS and builds the test target for the iOS and
+tvOS Simulator, and a nightly job (`ci-extended.yml`, also run before each release) builds Release,
+visionOS and the device SDKs with every optional component. Older toolchains are not supported; the deployment floor above
 stays iOS / tvOS 18 and macOS 15, with newer calls behind `#available`. A weekly best-effort job
 (`xcode26-compat.yml`, also run before each release) builds the package for tvOS and iOS with
 Xcode 26.3 (Swift 6.2), so a break there is known before a release ships, but it does not block one.
@@ -696,7 +698,7 @@ These components may be subject to third-party patent licensing. Integrators who
 To enable them, list the traits on the package dependency:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.53.1",
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.55.0",
          traits: ["TrueHDObjectAudio", "DTSXObjectAudio", "DualLayerDolbyVision", "DolbyVisionStillReshaping"])
 ```
 

@@ -375,20 +375,23 @@ public enum LiveJoinProfile: Sendable, Equatable {
     /// Channel-zapping profile: cut live segments at every keyframe past 0.5s, so TARGETDURATION and
     /// holdback collapse to the source keyframe cadence. The first playlist prefers the full holdback,
     /// but after two finalized segments a strict-realtime source gets one observed-segment grace,
-    /// clamped to 0.5...2.0s, before a shallow first window is served. That bounded start can produce
-    /// one early -16832 warning or a short rebuffer.
+    /// clamped to 0.5...2.0s, before a shallow first window is served. The grace ends early once the
+    /// source reads at 1x and the open segment cannot reach its keyframe within it (AE#936). That
+    /// bounded start can produce one early -16832 warning or a short rebuffer.
     case fastZap
 }
 
 /// Options for `AetherEngine.load(url:options:)`. All flags default to safe values.
-/// Which playback host serves a session's video (#461). See `LoadOptions.preferredDecodePath`.
+/// Which playback host serves a session's video (#461), or an audio-only session's audio. See
+/// `LoadOptions.preferredDecodePath`.
 public enum DecodePath: String, Sendable, Equatable, CaseIterable {
     /// The engine routes: codec support, the VideoToolbox capability probe, declared interlace,
     /// source seekability. The default, and right for every session that does not have evidence
     /// the engine cannot have.
     case automatic
-    /// Serve this source through `SoftwarePlaybackHost`, whatever the routing concluded. Scoped to
-    /// the session; it does not touch any other session on the shared engine.
+    /// Serve this source through `SoftwarePlaybackHost` (`AudioPlaybackHost` on an `audioOnly`
+    /// session), whatever the routing concluded. Scoped to the session; it does not touch any other
+    /// session on the shared engine.
     case software
 }
 
@@ -816,7 +819,10 @@ public struct LoadOptions: Sendable, Equatable {
     /// chunk boundary rather than byte X (IPTV timeshift/catch-up archives are the motivating
     /// case; a device trace showed ~1.9 s of content lost at every 32 MB range rotation, heard
     /// as a once-a-minute audio desync). Headers cannot expose the lie, so this is a caller
-    /// declaration, not a probe. Only byte 0 is addressable: the reader runs its forward-only
+    /// declaration. Undeclared, the bytes expose it: the first ranged reconnect that starts inside
+    /// bytes the reader holds re-reads 4 KB of them, and a mismatch fails the session as
+    /// `PlaybackErrorKind.sourceFabricatesRanges`, which asks for a load with this set (AE#958).
+    /// Only byte 0 is addressable: the reader runs its forward-only
     /// streaming mode on one long-lived unranged GET - no bounded-range windowing, no
     /// suffix/tail probes, no detour fills, no byte-offset reconnects - and the demuxer's pb is
     /// non-seekable, so byte seeking is unavailable and a dropped connection surfaces as a read
@@ -900,6 +906,20 @@ public struct LoadOptions: Sendable, Equatable {
 
     /// Caller-bounded demux probe budget in microseconds, mapped to `AVFormatContext.max_analyze_duration` for the main playback open. nil keeps the engine default (60 s). Pass a positive value to set an explicit cap; do NOT pass `0` expecting "no cap": FFmpeg maps `0` to a container-dependent heuristic (~5-7 s for MPEG-TS, longer elsewhere) that is SHORTER than the engine's 60 s default. Same scope and fail-open trade-off as `probesize`. Default nil (#68).
     public var maxAnalyzeDuration: Int64?
+
+    /// Open a Matroska source without reading its attached files (AE#956). Matroska carries the fonts
+    /// of its ASS subtitles as attachments, tens of megabytes on anime releases, and the demuxer reads
+    /// every byte of them while the file opens, before the first packet; over a slow origin that is
+    /// most of the startup. With this on the open passes over them: `fontAttachments` stays empty and
+    /// a Matroska cover image is not reported in `metadata`. Tracks, their indices and every packet
+    /// are unchanged. For a host that renders text subtitles itself or does without the embedded
+    /// fonts; one that renders ASS with them leaves it off. Other containers are unaffected.
+    /// Default false.
+    ///
+    /// Only the session's first open reads attachments either way: the engine's side readers
+    /// (embedded subtitles, scrub stills, I-frames, the Atmos and Dolby Vision passes) and its
+    /// reopens of the same source always pass over them, since nothing reads them there.
+    public var skipsContainerAttachments: Bool = false
 
     /// Ordered audio-language preference (ISO 639-1 / 639-2 codes or English names, e.g. `["en", "de"]`). When non-empty and no explicit `audioSourceStreamIndex` is passed to `load`, the engine resolves the first-frame audio track from its single internal probe: the first track whose language matches an entry (preferences scanned in order, case-insensitive, ISO 639-1/2 B+T and English-name synonyms), falling back to the container default when none match. This lets a host honor a saved language preference on the first frame from one open, instead of probing separately or reloading via `selectAudioTrack` after load (#72). An explicit `audioSourceStreamIndex` still wins. Default empty.
     public var preferredAudioLanguages: [String]
@@ -1040,6 +1060,9 @@ public struct LoadOptions: Sendable, Equatable {
     /// green/purple, and a demuxed-audio live source still fails rather than playing silent.
     /// `nativeRemoteHLS` is a different route entirely (AVPlayer plays the remote playlist, nothing
     /// is demuxed), so this has nothing to act on there and the engine says so in the log.
+    ///
+    /// On an `audioOnly` session `.software` sends a codec AVPlayer could play to the FFmpeg host
+    /// (`AudioPlaybackHost`) instead of `AudioAVPlayerHost`.
     public var preferredDecodePath: DecodePath = .automatic
 
     /// Whether a native session AVPlayer refuses on its merits may be rebuilt on the software path
@@ -1111,6 +1134,7 @@ public struct LoadOptions: Sendable, Equatable {
         declaredDurationSeconds: Double? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
+        skipsContainerAttachments: Bool = false,
         preferredAudioLanguages: [String] = [],
         preferredSubtitleLanguages: [String] = [],
         externalSubtitles: [ExternalSubtitleTrack] = [],
@@ -1174,6 +1198,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.declaredDurationSeconds = declaredDurationSeconds
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
+        self.skipsContainerAttachments = skipsContainerAttachments
         self.preferredAudioLanguages = preferredAudioLanguages
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.externalSubtitles = externalSubtitles
