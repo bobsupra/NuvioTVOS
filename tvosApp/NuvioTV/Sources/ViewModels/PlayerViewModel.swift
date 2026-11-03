@@ -307,6 +307,23 @@ class PlayerViewModel: ObservableObject {
     /// Every external subtitle the stream offered (all languages), browsable in
     /// the player's subtitle panel and loaded into mpv on demand.
     @Published var availableExternalSubtitles: [NuvioSubtitle] = []
+    /// AutoSubSync per add-on subtitle URL (see `SubtitleAutoSync`).
+    @Published private(set) var subtitleAutoSyncStates: [String: SubtitleAutoSyncState] = [:]
+    /// What the last Auto Sync run of each add-on subtitle looked at (the Auto Sync tab).
+    @Published private(set) var subtitleAutoSyncReports: [String: SubtitleAutoSyncReport] = [:]
+    /// Add-on subtitles the viewer switched back to their own timing.
+    @Published private(set) var subtitleAutoSyncOriginals: Set<String> = []
+    /// Synced copy URL → the add-on subtitle URL it was made from.
+    private var subtitleAutoSyncCopies: [String: String] = [:]
+    /// The playing file as Auto Sync reads it, resolved per load.
+    private var subtitleAutoSyncSourceTask: Task<SubtitleAutoSyncSource?, Never>?
+    private var subtitleAutoSyncPlayback: (url: URL, headers: [String: String], fileKey: String, isLive: Bool)?
+    private var subtitleAutoSyncTasks: [String: Task<Void, Never>] = [:]
+    /// Sync by Audio: what it is doing, the run, and the audio heard in this
+    /// playback (kept for a restart).
+    @Published var audioSyncStatus: AudioSyncStatus?
+    var audioSyncRun: AudioSyncRun?
+    var audioSyncHeard: (generation: UInt64, listener: AudioSyncListener)?
     /// True while installed subtitle add-ons are still returning results.
     @Published var isLoadingExternalSubtitles: Bool = false
     /// Current mpv `sub-delay`, in milliseconds. Per-session, not persisted.
@@ -1381,6 +1398,11 @@ class PlayerViewModel: ObservableObject {
         sessionCoordinator.load(
             request,
             requiresMPVAudioControls: audioAmplificationDb > 0
+        )
+        prepareSubtitleAutoSync(
+            url: url,
+            headers: httpHeaders,
+            fileKey: canonicalKey + "|" + (filename ?? url.lastPathComponent)
         )
 
         // Launch asynchronous storyboard resolver (direct URL or community trickplay)
@@ -3977,6 +3999,8 @@ class PlayerViewModel: ObservableObject {
                 isNativelyRenderedSubtitle: track.isNativelyRenderedSubtitle
             )
         }
+        subs = SubtitleAutoSyncTracks.present(
+            subs, copies: subtitleAutoSyncCopies, originals: subtitleAutoSyncOriginals)
         if let selectedURL = pendingSelectedExternalSubtitleURL,
            let selectedTrack = subs.first(where: { $0.externalFilename == selectedURL }) {
             subs = subs.map { var t = $0; t.isSelected = (t.id == selectedTrack.id); return t }
@@ -4512,6 +4536,7 @@ class PlayerViewModel: ObservableObject {
         detachWatchPartyPlayerBridge()
         cancelPendingAdvanceResolution()
         didShutdown = true
+        resetAudioSync()
         PlaybackTimelineRecorder.record(.playbackStopRequested, engine: activeEngineKind)
         pollTimer?.invalidate()
         pollTimer = nil
@@ -6207,6 +6232,159 @@ class PlayerViewModel: ObservableObject {
         engine.setAudioProcessing(dialogue: enhanceDialogueMode, reduceLoud: isReduceLoudSoundsActive)
     }
 
+    // MARK: - AutoSubSync
+
+    /// A new file: forget the last one's Auto Sync, and start reading this one's subtitle index
+    /// when Auto Sync is on (the Auto Sync tab resolves it on demand otherwise).
+    private func prepareSubtitleAutoSync(url: URL, headers: [String: String], fileKey: String) {
+        subtitleAutoSyncSourceTask?.cancel()
+        subtitleAutoSyncSourceTask = nil
+        subtitleAutoSyncTasks.values.forEach { $0.cancel() }
+        subtitleAutoSyncTasks = [:]
+        subtitleAutoSyncStates = [:]
+        subtitleAutoSyncReports = [:]
+        subtitleAutoSyncOriginals = []
+        subtitleAutoSyncCopies = [:]
+        resetAudioSync()
+        SeekPreviewDiagnostics.shared.updateSync("")
+        guard !isTrailerPlaybackSession else {
+            subtitleAutoSyncPlayback = nil
+            return
+        }
+        subtitleAutoSyncPlayback = (url, headers, fileKey, isLiveStream)
+        if SubtitleAutoSyncSettings.isEnabled(in: ProfileSettings.current) {
+            _ = subtitleAutoSyncSource(prefetch: true)
+        }
+    }
+
+    private func subtitleAutoSyncSource(prefetch: Bool) -> Task<SubtitleAutoSyncSource?, Never>? {
+        if let task = subtitleAutoSyncSourceTask { return task }
+        guard let playback = subtitleAutoSyncPlayback else { return nil }
+        let task = Task<SubtitleAutoSyncSource?, Never> {
+            let source = await SubtitleAutoSync.source(
+                playbackURL: playback.url, headers: playback.headers,
+                fileKey: playback.fileKey, isLive: playback.isLive)
+            if prefetch, let source { await SubtitleAutoSync.shared.prefetchIndex(for: source) }
+            return source
+        }
+        subtitleAutoSyncSourceTask = task
+        return task
+    }
+
+    /// Lines the add-on subtitle up once per file, when AutoSubSync is on. `force` (the
+    /// AutoSubSync tab's button) runs it anyway; pressed again, without the remembered answer.
+    private func startSubtitleAutoSyncIfNeeded(for subtitle: NuvioSubtitle, force: Bool = false) {
+        guard subtitleAutoSyncCopies[subtitle.url] == nil, !subtitle.url.hasPrefix("file:") else { return }
+        if !force {
+            guard SubtitleAutoSyncSettings.isEnabled(in: ProfileSettings.current),
+                  subtitleAutoSyncStates[subtitle.url] == nil else { return }
+        }
+        guard let sourceTask = subtitleAutoSyncSource(prefetch: false) else { return }
+        // Sync Now always checks again (a remembered answer has no details to show).
+        let useCache = !force
+        subtitleAutoSyncTasks[subtitle.url]?.cancel()
+        subtitleAutoSyncStates[subtitle.url] = .checking
+        let generation = sessionCoordinator.loadGeneration
+        let tolerance = SubtitleAutoSyncSettings.toleranceMs(in: ProfileSettings.current)
+        subtitleAutoSyncTasks[subtitle.url] = Task { @MainActor [weak self] in
+            let run: SubtitleAutoSyncRun
+            if let source = await sourceTask.value {
+                run = await SubtitleAutoSync.shared.sync(
+                    subtitle: subtitle, source: source, toleranceMs: tolerance, useCache: useCache, force: force)
+            } else {
+                run = SubtitleAutoSyncRun(
+                    outcome: .kept(.unsupportedSource),
+                    report: SubtitleAutoSyncReport(result: SubtitleAutoSyncIssue.unsupportedSource.message))
+                SeekPreviewDiagnostics.shared.updateSync("kept: unsupportedSource")
+            }
+            guard !Task.isCancelled, let self, self.sessionCoordinator.loadGeneration == generation else { return }
+            self.finishSubtitleAutoSync(subtitle, run: run, announce: force)
+        }
+    }
+
+    private func finishSubtitleAutoSync(_ subtitle: NuvioSubtitle, run: SubtitleAutoSyncRun, announce: Bool) {
+        subtitleAutoSyncTasks[subtitle.url] = nil
+        subtitleAutoSyncReports[subtitle.url] = run.report
+        switch run.outcome {
+        case .synced(let fileURL, let result):
+            subtitleAutoSyncStates[subtitle.url] = .synced(result)
+            let copy = NuvioSubtitle(
+                url: fileURL.absoluteString, language: subtitle.language,
+                label: subtitle.label, source: subtitle.source)
+            let isSelected = isExternalSubtitleSelected(subtitle)
+            // A copy from an earlier run of this subtitle steps aside for the new one.
+            subtitleAutoSyncCopies = subtitleAutoSyncCopies.filter { $0.value != subtitle.url }
+            subtitleAutoSyncCopies[copy.url] = subtitle.url
+            subtitleAutoSyncOriginals.remove(subtitle.url)
+            if let loaded = engine.subtitleTracks.first(where: { $0.externalFilename == copy.url }) {
+                if isSelected { engine.selectSubtitle(loaded.id) }
+            } else {
+                engine.addSubtitle(copy, select: isSelected)
+                addedExternalSubtitleURLs.insert(copy.url)
+            }
+            syncTracks()
+            if announce {
+                showPlayerToast(L10n.format(
+                    "subtitle_autosync_synced_toast", fallback: "Subtitles synced (%@)", result.shortLabel))
+            }
+        case .kept(let issue):
+            subtitleAutoSyncStates[subtitle.url] = .kept(issue)
+            if announce || (issue != .inSync && issue != .unsupportedSource) {
+                showPlayerToast("AutoSubSync: " + issue.message)
+            }
+        }
+    }
+
+    /// The add-on subtitle that is playing, if any.
+    var activeAddonSubtitle: NuvioSubtitle? {
+        guard let selected = subtitles.first(where: { $0.isSelected && !$0.externalFilename.isEmpty }) else { return nil }
+        return availableExternalSubtitles.first { $0.url == selected.externalFilename }
+    }
+
+    /// The Auto Sync tab's button: line the playing add-on subtitle up now.
+    func runSubtitleAutoSyncNow() {
+        guard let subtitle = activeAddonSubtitle else { return }
+        startSubtitleAutoSyncIfNeeded(for: subtitle, force: true)
+    }
+
+    /// Switches the playing add-on subtitle between its synced copy and its own timing.
+    func toggleSubtitleAutoSyncTiming() {
+        guard let subtitle = activeAddonSubtitle,
+              case .synced? = subtitleAutoSyncStates[subtitle.url],
+              let copyURL = subtitleAutoSyncCopies.first(where: { $0.value == subtitle.url })?.key else { return }
+        let toOriginal = !subtitleAutoSyncOriginals.contains(subtitle.url)
+        if toOriginal {
+            subtitleAutoSyncOriginals.insert(subtitle.url)
+        } else {
+            subtitleAutoSyncOriginals.remove(subtitle.url)
+        }
+        let target = toOriginal ? subtitle.url : copyURL
+        if let track = engine.subtitleTracks.first(where: { $0.externalFilename == target }) {
+            engine.selectSubtitle(track.id)
+        }
+        syncTracks()
+    }
+
+    func isSubtitleAutoSyncUsingOriginal(_ url: String) -> Bool {
+        subtitleAutoSyncOriginals.contains(url)
+    }
+
+    /// The note after an add-on subtitle in the subtitle list.
+    func subtitleAutoSyncNote(for url: String) -> String? {
+        switch subtitleAutoSyncStates[url] {
+        case .checking:
+            return "↻ …"
+        case .synced(let result):
+            return subtitleAutoSyncOriginals.contains(url)
+                ? "↻ " + L10n.string("player_subtitle_autosync_original", fallback: "Original timing")
+                : "↻ " + result.shortLabel
+        case .kept(.inSync):
+            return "✓ " + L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In sync")
+        case .kept, nil:
+            return nil
+        }
+    }
+
     // MARK: - Track selection
 
     func selectSubtitle(_ track: SubtitleTrack, persist: Bool = true) {
@@ -6219,6 +6397,10 @@ class PlayerViewModel: ObservableObject {
         }
         PlaybackTimelineRecorder.record(.subtitleSelectionReturned, engine: activeEngineKind)
         subtitles = subtitles.map { var t = $0; t.isSelected = (t.id == track.id); return t }
+        if !track.externalFilename.isEmpty,
+           let subtitle = availableExternalSubtitles.first(where: { $0.url == track.externalFilename }) {
+            startSubtitleAutoSyncIfNeeded(for: subtitle)
+        }
         if persist {
             saveSubtitleSelection(track)
             didApplySavedSubtitleSelection = true
@@ -6255,6 +6437,7 @@ class PlayerViewModel: ObservableObject {
     /// otherwise `sub-add` it now and explicitly select that requested track.
     func selectExternalSubtitle(_ subtitle: NuvioSubtitle) {
         PlaybackTimelineRecorder.record(.externalSubtitleRequested, engine: activeEngineKind)
+        startSubtitleAutoSyncIfNeeded(for: subtitle)
         if let track = subtitles.first(where: { $0.externalFilename == subtitle.url }) {
             selectSubtitle(track)
         } else {
@@ -6322,11 +6505,10 @@ class PlayerViewModel: ObservableObject {
             subtitlesToAdd.append(selected)
         }
         subtitlesToAdd.forEach { subtitle in
-            engine.addSubtitle(
-                subtitle,
-                select: subtitle.url == pendingSelectedExternalSubtitleURL
-            )
+            let selects = subtitle.url == pendingSelectedExternalSubtitleURL
+            engine.addSubtitle(subtitle, select: selects)
             addedExternalSubtitleURLs.insert(subtitle.url)
+            if selects { startSubtitleAutoSyncIfNeeded(for: subtitle) }
         }
         didAddExternalSubtitles = true
     }
@@ -7747,7 +7929,8 @@ class PlayerViewModel: ObservableObject {
             runtime: activeMeta?.runtime,
             nextEpisode: nextEpisode,
             playbackInfo: playbackInfo,
-            hasChapters: !chapters.isEmpty
+            hasChapters: !chapters.isEmpty,
+            hasAutoSync: !availableExternalSubtitles.isEmpty && !isLiveStream && !isTrailerPlaybackSession
         )
         sceneViewModel.open()
     }

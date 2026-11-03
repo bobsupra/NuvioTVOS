@@ -1654,7 +1654,7 @@ struct SubtitleLanguageGroup: Identifiable, Equatable {
 
 /// Maps raw track/addon language values ("en", "eng", "English") onto one
 /// display name so both kinds group into a single Languages entry.
-private enum SubtitleLanguageDisplay {
+enum SubtitleLanguageDisplay {
     static func name(for raw: String) -> String {
         let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return "Unknown" }
@@ -1778,9 +1778,11 @@ private func subtitlePanelOptions(for viewModel: PlayerViewModel) -> [SubtitlePa
     for subtitle in viewModel.availableExternalSubtitles {
         let language = SubtitleLanguageDisplay.name(for: subtitle.language)
         let loadedTrack = viewModel.subtitles.first { $0.externalFilename == subtitle.url }
-        let detail = subtitle.label.flatMap { label in
+        let label = subtitle.label.flatMap { label in
             label.caseInsensitiveCompare(language) == .orderedSame ? nil : label
         }
+        let notes = [label, viewModel.subtitleAutoSyncNote(for: subtitle.url)].compactMap { $0 }
+        let detail = notes.isEmpty ? nil : notes.joined(separator: " · ")
         options.append(SubtitlePanelOption(
             id: "ext-\(subtitle.url)",
             kind: .external(subtitle),
@@ -1812,6 +1814,7 @@ struct PlayerSettingsPanel: View {
 
     private enum StyleControl: Hashable {
         case delayMinus, delayPlus
+        case autoSync
         case aiTranslation
         case font
         case sizeMinus, sizePlus
@@ -2374,6 +2377,23 @@ struct PlayerSettingsPanel: View {
 
     // MARK: Subtitle style column
 
+    /// The Auto Sync row's value: the correction (press for the original timing and back), or
+    /// what kept the subtitle as it is (press to try again).
+    private func autoSyncValue(_ state: SubtitleAutoSyncState, usingOriginal: Bool) -> String {
+        switch state {
+        case .checking:
+            return L10n.string("player_subtitle_autosync_checking", fallback: "Checking…")
+        case .synced(let result):
+            return usingOriginal
+                ? L10n.string("player_subtitle_autosync_original", fallback: "Original timing")
+                : result.shortLabel
+        case .kept(.inSync):
+            return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In sync")
+        case .kept:
+            return L10n.string("player_subtitle_autosync_not_synced", fallback: "Not synced")
+        }
+    }
+
     private var styleColumn: some View {
         VStack(alignment: .leading, spacing: 18) {
             columnHeader(L10n.string("subtitle_style_title", fallback: "Subtitle Style"))
@@ -2387,6 +2407,21 @@ struct PlayerSettingsPanel: View {
                         onMinus: { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs - 50) },
                         onPlus: { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs + 50) }
                     )
+
+                    if let subtitle = viewModel.activeAddonSubtitle,
+                       let state = viewModel.subtitleAutoSyncStates[subtitle.url] {
+                        cycleRow(
+                            title: L10n.string("player_subtitle_autosync", fallback: "AutoSubSync"),
+                            value: autoSyncValue(state, usingOriginal: viewModel.isSubtitleAutoSyncUsingOriginal(subtitle.url)),
+                            focusKey: .autoSync
+                        ) {
+                            if case .synced = state {
+                                viewModel.toggleSubtitleAutoSyncTiming()
+                            } else {
+                                viewModel.runSubtitleAutoSyncNow()
+                            }
+                        }
+                    }
 
                     if viewModel.canManuallyToggleAISubtitleTranslation {
                         toggleRow(

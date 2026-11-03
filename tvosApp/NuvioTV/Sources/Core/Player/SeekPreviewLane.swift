@@ -750,6 +750,8 @@ final class SeekPreviewDiagnostics {
     private(set) var chapterLine = ""
     /// What Seekr answered for the playing title, empty without a Seekr key.
     private(set) var seekrLine = ""
+    /// What AutoSubSync did with the chosen subtitle, empty while it is off.
+    private(set) var syncLine = ""
     /// The last stills the preview card showed, newest first: target, how the loop got it,
     /// where it came from and how far its frame is from the target.
     private(set) var shown: [String] = []
@@ -758,6 +760,7 @@ final class SeekPreviewDiagnostics {
     func clear() { line = "" }
     func updateChapters(_ line: String) { chapterLine = line }
     func updateSeekr(_ line: String) { seekrLine = line }
+    func updateSync(_ line: String) { syncLine = line }
 
     func noteShown(_ image: CGImage, target: Double, path: String) {
         let origin = SeekPreviewOriginTags.shared.tag(of: image)

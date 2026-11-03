@@ -319,7 +319,7 @@ final class PlaybackChaptersTests: XCTestCase {
         // First by default; after the others in an order saved before Chapters was a section.
         XCTAssertEqual(TVSceneTabOrder.currentOrder(in: settings).first, .chapters)
         settings.set(try JSONEncoder().encode(["info", "scene"]), forKey: SettingsKey.sceneTabOrder)
-        XCTAssertEqual(TVSceneTabOrder.currentOrder(in: settings), [.info, .scene, .chapters, .upNext, .watchParty])
+        XCTAssertEqual(TVSceneTabOrder.currentOrder(in: settings), [.info, .scene, .chapters, .autoSync, .upNext, .watchParty])
         // Switched off and on, and moved, like the other sections.
         TVSceneTabOrder.setTabEnabled(.chapters, isEnabled: false, in: settings)
         XCTAssertTrue(TVSceneTabOrder.disabledTabs(in: settings).contains(.chapters))
