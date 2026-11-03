@@ -217,6 +217,8 @@ struct PlayerView: View {
         guard !viewModel.postPlayState.isVisible, viewModel.currentErrorDiagnostic == nil else { return }
         DispatchQueue.main.async {
             guard viewModel.currentErrorDiagnostic == nil else { return }
+            // The gesture layer holds the remote: the sink stays out of its way.
+            guard !isGestureCaptureActive else { return }
             remoteInputFocused = true
         }
     }

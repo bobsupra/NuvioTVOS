@@ -245,6 +245,27 @@ class PlayerViewModel: ObservableObject {
     @Published var discTitles: [PlaybackDiscTitleInfo] = []
     @Published var selectedDiscTitleId: Int? = nil
     @Published var playbackSpeed: PlaybackSpeed = .normal
+    /// Remote gestures: switched on in the player's Gestures tab.
+    @Published var areGesturesEnabled = PlayerGestureSettings.isEnabled()
+    /// Expert mode: one's own gestures, shapes and sensitivity (off: the ready-made gestures).
+    @Published var isGestureExpert = PlayerGestureSettings.isExpert()
+    /// The recognizer's settings from the Gestures tab's sensitivity.
+    @Published var gestureTuning = PlayerGestureSettings.activeSensitivity().tuning
+    /// Shapes of one's own, made in the Gestures tab (none with Expert mode off).
+    @Published var customGestureShapes = PlayerGestureSettings.activeShapes()
+    /// The gesture layer holds the remote (playing, controls hidden): the touch taps and edge
+    /// clicks below leave it to that layer, which plays the built-in ones itself.
+    var isGestureCaptureActive = false
+    /// Where the gesture layers (the player's, and the recorder in the Gestures tab) get the
+    /// pad's absolute positions, by name.
+    var gesturePadObservers: [String: (Double, Double) -> Void] = [:]
+    /// With the controls shown: the sides whose touch tap waits for a bound double tap (the gesture
+    /// layer seeks for it).
+    var passiveGestureTapSides: Set<PadSide> = []
+    /// The button of a hold seek a gesture started, ended when that button is released.
+    var gestureHoldSeekButton: RemoteButton?
+    /// The subtitle a gesture switched off, switched back on by the same gesture.
+    var gestureLastSubtitleID: String?
     @Published var seekStepSeconds: Int = PlayerSeekSettings.current
     @Published var qualities: [QualityOption] = [.auto]
     @Published var currentQuality: QualityOption = .auto
@@ -5776,6 +5797,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func dpadSample(x: Double, y: Double) {
+        for observer in gesturePadObservers.values { observer(x, y) }
         guard !showScenePanel, !isSceneDetailVisible else { return }
         if isScrubbing {
             wheelSample(x: x, y: y)
@@ -5797,11 +5819,11 @@ class PlayerViewModel: ObservableObject {
             gcTouchDown = false
             let dur = Date().timeIntervalSince(gcTouchStartTime)
             let lastX = gcLastTouchX ?? gcTouchStartX
-            if dur < 0.5, !gcPanFiredThisTouch, !gcDidHandlePressAsSeek, !gcButtonAPressed {
+            if dur < 0.5, !gcPanFiredThisTouch, !gcDidHandlePressAsSeek, !gcButtonAPressed, !isGestureCaptureActive {
                 if canPerformDiscreteSeek, lastX < -0.45 {
-                    handleMoveSeek(direction: .left)
+                    if !passiveGestureTapSides.contains(.left) { handleMoveSeek(direction: .left) }
                 } else if canPerformDiscreteSeek, lastX > 0.45 {
-                    handleMoveSeek(direction: .right)
+                    if !passiveGestureTapSides.contains(.right) { handleMoveSeek(direction: .right) }
                 } else {
                     remoteTapped()
                 }
@@ -5819,7 +5841,7 @@ class PlayerViewModel: ObservableObject {
             gcButtonAPressedStartTime = Date()
             gcButtonAPressX = currentTouchX
 
-            if canPerformDiscreteSeek, abs(currentTouchX) > 0.35 {
+            if canPerformDiscreteSeek, abs(currentTouchX) > 0.35, !isGestureCaptureActive {
                 gcHoldSeekTimer?.invalidate()
                 let direction: MoveCommandDirection = currentTouchX < 0 ? .left : .right
                 let timer = Timer(timeInterval: 0.35, repeats: false) { [weak self] _ in
@@ -5841,7 +5863,7 @@ class PlayerViewModel: ObservableObject {
             gcHoldSeekTimer?.invalidate()
             gcHoldSeekTimer = nil
 
-            if isHoldingSeek {
+            if isHoldingSeek, !isGestureCaptureActive {
                 stopRepeatingSkip()
                 gcDidHandlePressAsSeek = true
                 Task { @MainActor in
@@ -5852,7 +5874,7 @@ class PlayerViewModel: ObservableObject {
             }
 
             let pressX = gcButtonAPressX ?? currentTouchX
-            if canPerformDiscreteSeek, abs(pressX) > 0.35 {
+            if canPerformDiscreteSeek, abs(pressX) > 0.35, !isGestureCaptureActive {
                 if !gcDidHandlePressAsSeek {
                     gcDidHandlePressAsSeek = true
                     if pressX < -0.35 {

@@ -1806,6 +1806,7 @@ struct PlayerSettingsPanel: View {
         case audio = "Audio"
         case speed = "Speed"
         case picture = "Picture"
+        case gestures = "Gestures"
         case logs = "Logs"
     }
 
@@ -1847,6 +1848,15 @@ struct PlayerSettingsPanel: View {
         case debugOverlay
         case aspect(String)
         case style(StyleControl)
+        case gesturesSwitch
+        case gestureReset
+        case gestureAction(String)
+        case gestureClear(String)
+        case gestureGallery
+        case gestureSensitivity(String)
+        case gestureNewCustom
+        case gestureCustomDelete(String)
+        case gestureExpert
     }
 
     /// Swatches shown in the Text Color row (white, gray, yellow, blue, red, green).
@@ -1854,6 +1864,13 @@ struct PlayerSettingsPanel: View {
     private static let backgroundPalette = ["#000000", "#303030", "#FFFFFF", "#1F3A5F", "#5A1F2B", "#214D35"]
 
     @State private var tab: Tab = .subtitles
+    /// Gestures tab: the bindings, the action being recorded, and what the last change did.
+    @State private var gestureBindings = PlayerGestureSettings.bindings()
+    @State private var recordingGestureAction: PlayerGestureAction?
+    @State private var gestureNote: String?
+    @State private var isShowingGestureGallery = false
+    @State private var isMakingCustomGesture = false
+    @State private var gestureSensitivity = PlayerGestureSettings.sensitivity()
     @State private var selectedLanguage: String?
     @State private var style = SubtitleStyle.current
     @FocusState private var focus: Focus?
@@ -1864,7 +1881,7 @@ struct PlayerSettingsPanel: View {
         if !viewModel.discTitles.isEmpty {
             tabs.append(.titles)
         }
-        tabs.append(contentsOf: [.subtitles, .audio, .speed, .picture, .logs])
+        tabs.append(contentsOf: [.subtitles, .audio, .speed, .picture, .gestures, .logs])
         return tabs
     }
 
@@ -1890,6 +1907,7 @@ struct PlayerSettingsPanel: View {
                 case .audio: audioPage
                 case .speed: speedPage
                 case .picture: picturePage
+                case .gestures: gesturesPage
                 case .logs: PlaybackLogsPage()
                 }
             }
@@ -1897,6 +1915,51 @@ struct PlayerSettingsPanel: View {
             .padding(.top, 64)
             .padding(.bottom, 44)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            // Recording or the overview: nothing behind can take the focus (a swipe moved it there).
+            .disabled(recordingGestureAction != nil || isShowingGestureGallery || isMakingCustomGesture)
+
+            if let action = recordingGestureAction {
+                PlayerGestureRecorderView(
+                    action: action,
+                    bindings: gestureBindings,
+                    tuning: gestureSensitivity.tuning,
+                    setPadObserver: { observer in
+                        viewModel.gesturePadObservers["recorder"] = observer
+                    },
+                    onSave: { gesture in finishRecording(gesture, for: action) },
+                    onCancel: { endRecording(action) },
+                    customShapes: viewModel.customGestureShapes
+                )
+            }
+
+            if isMakingCustomGesture {
+                PlayerCustomGestureMakerView(
+                    existing: viewModel.customGestureShapes,
+                    tuning: gestureSensitivity.tuning,
+                    setPadObserver: { observer in
+                        viewModel.gesturePadObservers["recorder"] = observer
+                    },
+                    onSave: { shape in
+                        viewModel.setCustomGestureShapes(viewModel.customGestureShapes + [shape])
+                        isMakingCustomGesture = false
+                        gestureNote = "\(shape.name) saved: pick an action on the right and draw it"
+                        DispatchQueue.main.async {
+                            focus = .gestureAction(PlayerGestureAction.allCases[0].rawValue)
+                        }
+                    },
+                    onCancel: {
+                        isMakingCustomGesture = false
+                        DispatchQueue.main.async { focus = .gestureNewCustom }
+                    }
+                )
+            }
+
+            if isShowingGestureGallery {
+                PlayerGestureGalleryView(bindings: viewModel.isGestureExpert ? gestureBindings : .defaults) {
+                    isShowingGestureGallery = false
+                    DispatchQueue.main.async { focus = .gestureGallery }
+                }
+            }
         }
         .onAppear {
             style = SubtitleStyle.current
@@ -1927,6 +1990,9 @@ struct PlayerSettingsPanel: View {
                 focus = .audioControl(.delayMinus)
             } else if newTab == .titles, let first = viewModel.discTitles.first {
                 focus = .discTitle(viewModel.selectedDiscTitleId ?? first.id)
+            } else if newTab == .gestures {
+                gestureBindings = PlayerGestureSettings.bindings()
+                gestureSensitivity = PlayerGestureSettings.sensitivity()
             }
         }
         .onChange(of: didReportPlaybackStarted) { _, isReady in
@@ -2958,6 +3024,288 @@ struct PlayerSettingsPanel: View {
             .frame(width: 420, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    // MARK: Gestures
+
+    private var gesturesPage: some View {
+        HStack(alignment: .top, spacing: 56) {
+            VStack(alignment: .leading, spacing: 18) {
+                columnHeader("Remote gestures")
+                ScrollView(showsIndicators: false) {
+                    VStack(alignment: .leading, spacing: 12) {
+                        toggleRow(
+                            title: "Gestures during playback",
+                            isOn: viewModel.areGesturesEnabled,
+                            focusKey: .gesturesSwitch
+                        ) {
+                            viewModel.setGesturesEnabled(!viewModel.areGesturesEnabled)
+                        }
+
+                        toggleRow(
+                            title: "Expert mode",
+                            isOn: viewModel.isGestureExpert,
+                            focusKey: .gestureExpert
+                        ) {
+                            gestureNote = nil
+                            viewModel.setGestureExpert(!viewModel.isGestureExpert)
+                        }
+
+                        simpleRow(title: "Gesture overview", isSelected: false, focusKey: .gestureGallery) {
+                            isShowingGestureGallery = true
+                        }
+
+                        if viewModel.isGestureExpert {
+                            simpleRow(title: "New custom gesture", isSelected: false, focusKey: .gestureNewCustom) {
+                                gestureNote = nil
+                                isMakingCustomGesture = true
+                            }
+
+                            ForEach(viewModel.customGestureShapes) { shape in
+                                customShapeRow(shape)
+                            }
+
+                            simpleRow(title: "Reset to defaults", isSelected: false, focusKey: .gestureReset) {
+                                gestureBindings = .defaults
+                                PlayerGestureSettings.save(.defaults)
+                                gestureSensitivity = PlayerGestureSensitivity()
+                                viewModel.setGestureSensitivity(gestureSensitivity)
+                                gestureNote = "The ready-made gestures and the default sensitivity"
+                            }
+                        }
+
+                        Text(viewModel.isGestureExpert
+                             ? "With the controls hidden, a gesture with an action replaces what the player does with it (like click right = seek). With the controls shown or paused, a gesture with an action does it on top of what the controls do. With a double click or tap set, a single one waits to see whether a second one follows."
+                             : "Ready-made gestures that keep clear of what the player does itself. Turn on Expert mode to change them, draw your own and tune the sensitivity.")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.5))
+                            .fixedSize(horizontal: false, vertical: true)
+                            .padding(.top, 8)
+
+                        if let gestureNote {
+                            Text(gestureNote)
+                                .font(.system(size: 20, weight: .semibold))
+                                .foregroundColor(Color(red: 1.0, green: 0.82, blue: 0.55))
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if viewModel.isGestureExpert {
+                            Text("Sensitivity")
+                                .font(.system(size: 22, weight: .bold))
+                                .foregroundColor(.white.opacity(0.55))
+                                .padding(.top, 14)
+
+                            ForEach(PlayerGestureSensitivityKnob.allCases) { knob in
+                                gestureSensitivityRow(knob)
+                            }
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+                .focusSection()
+            }
+            .frame(width: 520, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 18) {
+                if viewModel.isGestureExpert {
+                    columnHeader("Actions · press to record a gesture")
+                    ScrollView(showsIndicators: false) {
+                        VStack(spacing: 12) {
+                            ForEach(PlayerGestureAction.allCases) { action in
+                                gestureActionRow(action)
+                            }
+                        }
+                        .padding(.vertical, 6)
+                    }
+                    .focusSection()
+                } else {
+                    columnHeader("Ready-made gestures")
+                    VStack(spacing: 12) {
+                        ForEach(PlayerGestureBindings.defaults.bindings, id: \.action) { binding in
+                            readyMadeGestureRow(binding)
+                        }
+                    }
+                    .padding(.vertical, 6)
+                    Text("The player's own clicks, taps and swipes stay as they are: click or tap a side = ±10 s, hold a side = rewind / fast forward, swipe up = controls, swipe down = InSight.")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(width: 900, alignment: .leading)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A ready-made gesture (Expert mode off): what it does and how it goes; not to be changed.
+    private func readyMadeGestureRow(_ binding: PlayerGestureBinding) -> some View {
+        HStack(spacing: 16) {
+            AnimatedGesturePad(gesture: binding.gesture)
+                .frame(width: 44, height: 44 * RemotePadCanvas.aspect)
+            Text(binding.action.title)
+                .font(.system(size: 25, weight: .semibold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+            Spacer(minLength: 8)
+            Text(binding.gesture.title)
+                .font(.system(size: 21, weight: .bold))
+                .foregroundColor(.white.opacity(0.75))
+                .lineLimit(1)
+        }
+        .padding(.leading, 18)
+        .padding(.trailing, 26)
+        .frame(height: 62)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.07))
+        )
+    }
+
+    /// A shape of one's own: what it does, and a button that deletes it (and what it did).
+    private func customShapeRow(_ shape: CustomGestureShape) -> some View {
+        let key = Focus.gestureCustomDelete(shape.id)
+        let isFocused = focus == key
+        let meaning = PlayerGestureMeaning(of: .custom(shape.id), in: gestureBindings)
+        return Button {
+            var shapes = viewModel.customGestureShapes
+            shapes.removeAll { $0.id == shape.id }
+            viewModel.setCustomGestureShapes(shapes)
+            gestureBindings.unbind(gesture: .custom(shape.id))
+            PlayerGestureSettings.save(gestureBindings)
+            gestureNote = "\(shape.name) deleted"
+            DispatchQueue.main.async { focus = .gestureNewCustom }
+        } label: {
+            HStack(spacing: 12) {
+                if let drawing = shape.drawings.first {
+                    RemotePadCanvas(frame: GestureAnimation.still(drawing))
+                        .frame(width: 40, height: 40 * RemotePadCanvas.aspect)
+                }
+                Text(shape.name)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(isFocused ? .black : .white)
+                    .lineLimit(1)
+                Text(meaning.title)
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(isFocused ? .black.opacity(0.6) : .white.opacity(0.5))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer(minLength: 8)
+                Image(systemName: "trash")
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(isFocused ? .black : .white.opacity(0.6))
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 64)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: key)
+        .focusEffectDisabledIfAvailable()
+    }
+
+    /// A press moves to the next step; it applies at once (and the recorder shows the zones).
+    private func gestureSensitivityRow(_ knob: PlayerGestureSensitivityKnob) -> some View {
+        let key = Focus.gestureSensitivity(knob.rawValue)
+        let isFocused = focus == key
+        return Button {
+            gestureSensitivity.cycle(knob)
+            viewModel.setGestureSensitivity(gestureSensitivity)
+        } label: {
+            HStack(spacing: 12) {
+                Text(knob.title)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(isFocused ? .black : .white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                Spacer(minLength: 8)
+                Text(knob.steps[gestureSensitivity.step(knob)])
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(isFocused ? .black.opacity(0.75) : .white.opacity(0.7))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 22)
+            .frame(height: 58)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: key)
+        .focusEffectDisabledIfAvailable()
+    }
+
+    private func gestureActionRow(_ action: PlayerGestureAction) -> some View {
+        let isFocused = focus == .gestureAction(action.rawValue)
+        let gesture = gestureBindings.gesture(for: action)
+        let isClearFocused = focus == .gestureClear(action.rawValue)
+        return HStack(spacing: 12) {
+            Button {
+                gestureNote = nil
+                recordingGestureAction = action
+            } label: {
+                HStack(spacing: 14) {
+                    Text(action.title)
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    Text(gesture?.title ?? "—")
+                        .font(.system(size: 21, weight: .bold))
+                        .foregroundColor(isFocused ? .black.opacity(0.8) : .white.opacity(gesture == nil ? 0.35 : 0.75))
+                        .lineLimit(1)
+                }
+                .padding(.horizontal, 26)
+                .frame(height: 62)
+                .background(
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+                )
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($focus, equals: .gestureAction(action.rawValue))
+            .focusEffectDisabledIfAvailable()
+
+            Button {
+                gestureBindings.unbind(action)
+                PlayerGestureSettings.save(gestureBindings)
+                gestureNote = "\(action.title): no gesture"
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(isClearFocused ? .black : .white.opacity(gesture == nil ? 0.25 : 0.8))
+                    .frame(width: 62, height: 62)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(isClearFocused ? Color.white : Color.white.opacity(0.07))
+                    )
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($focus, equals: .gestureClear(action.rawValue))
+            .focusEffectDisabledIfAvailable()
+            .disabled(gesture == nil)
+        }
+    }
+
+    private func finishRecording(_ gesture: RemoteGesture, for action: PlayerGestureAction) {
+        let builtIn = PlayerBuiltInGesture.action(for: gesture)
+        let previous = gestureBindings.bind(gesture, to: action)
+        PlayerGestureSettings.save(gestureBindings)
+        var parts = ["\(gesture.title) → \(action.title)"]
+        if let previous { parts.append("\(previous.title) no longer has a gesture") }
+        if let builtIn { parts.append("replaces: \(builtIn.title)") }
+        gestureNote = parts.joined(separator: " · ")
+        endRecording(action)
+    }
+
+    private func endRecording(_ action: PlayerGestureAction) {
+        recordingGestureAction = nil
+        DispatchQueue.main.async {
+            focus = .gestureAction(action.rawValue)
+        }
     }
 
     private var picturePage: some View {
