@@ -710,15 +710,12 @@ struct NativeSearchView: View {
                 messageState(icon: "wifi.exclamationmark", title: error)
             }
         } else if visibleResults.isEmpty {
+            let reason = viewModel.emptyStateReason ?? .noResults
             centeredState {
                 messageState(
-                    icon: "magnifyingglass",
-                    title: L10n.string("search_no_results_title", fallback: "No Results"),
-                    subtitle: L10n.format(
-                        "tvos_search_no_results_for",
-                        fallback: "No results for \u{201C}%@\u{201D}",
-                        viewModel.searchText
-                    )
+                    icon: reason.icon,
+                    title: reason.title,
+                    subtitle: reason.subtitle(for: viewModel.searchText)
                 )
             }
         } else {

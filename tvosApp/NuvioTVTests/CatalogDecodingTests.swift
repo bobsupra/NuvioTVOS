@@ -918,9 +918,11 @@ final class CatalogDecodingTests: XCTestCase {
             (#"{"type":"movie","id":"no_extras"}"#, false),
             (#"{"type":"movie","id":"empty_extra","extra":[]}"#, false),
             (#"{"type":"movie","id":"genre","extra":[{"name":"genre","isRequired":false}]}"#, false),
-            (#"{"type":"movie","id":"legacy_supported","extra":[],"extraSupported":["search"]}"#, true),
-            (#"{"type":"movie","id":"legacy_required","extraRequired":["search"]}"#, true),
-            (#"{"type":"movie","id":"legacy_case","extra":[],"extraSupported":["SeArCh"]}"#, true),
+            (#"{"type":"movie","id":"legacy_supported","extra":[],"extraSupported":["search"]}"#, false),
+            (#"{"type":"movie","id":"legacy_required","extraRequired":["search"]}"#, false),
+            (#"{"type":"movie","id":"legacy_case","extra":[],"extraSupported":["SeArCh"]}"#, false),
+            (#"{"type":"movie","id":"structured_case","extra":[{"name":"Search","isRequired":true}]}"#, false),
+            (#"{"type":"movie","id":"malformed_extraSupported","extraSupported":{"search":true}}"#, false),
             (#"{"type":"movie","id":"required_genre","extraSupported":["search"],"extraRequired":["genre"]}"#, false),
             (#"{"type":"movie","id":"required_actor","extraSupported":["search"],"extraRequired":["actor"]}"#, false)
         ]

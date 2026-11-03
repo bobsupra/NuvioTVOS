@@ -6,6 +6,101 @@
 //
 
 import Foundation
+import OSLog
+
+enum CatalogSearchReason: Equatable {
+    case noActiveAddons
+    case noSearchCatalogs
+    case noResults
+    case requestFailed
+
+    var icon: String {
+        switch self {
+        case .noActiveAddons: return "square.stack.3d.up"
+        case .noSearchCatalogs: return "text.magnifyingglass"
+        case .noResults: return "magnifyingglass"
+        case .requestFailed: return "wifi.exclamationmark"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .noActiveAddons:
+            return L10n.string("tvos_search_no_active_addons_title", fallback: "No active add-ons")
+        case .noSearchCatalogs:
+            return L10n.string(
+                "tvos_search_no_search_catalogs_title",
+                fallback: "No searchable catalogs in active add-ons"
+            )
+        case .noResults:
+            return L10n.string("search_no_results_title", fallback: "No Results")
+        case .requestFailed:
+            return L10n.string(
+                "search_error_network",
+                fallback: "Couldn’t complete search. Check your connection and try again."
+            )
+        }
+    }
+
+    func subtitle(for query: String) -> String? {
+        switch self {
+        case .noActiveAddons:
+            return L10n.string(
+                "tvos_search_no_active_addons_subtitle",
+                fallback: "Install or enable an add-on, or turn on Cinemeta, to search."
+            )
+        case .noSearchCatalogs:
+            return L10n.string(
+                "tvos_search_no_catalogs_subtitle",
+                fallback: "Enable an add-on that provides a search catalog."
+            )
+        case .noResults:
+            return L10n.format(
+                "tvos_search_no_results_for",
+                fallback: "No results for “%@”",
+                query
+            )
+        case .requestFailed:
+            return nil
+        }
+    }
+}
+
+struct CatalogSearchOutcome {
+    let results: [NuvioMeta]
+    let isComplete: Bool
+    let reason: CatalogSearchReason?
+
+    init(results: [NuvioMeta], isComplete: Bool, reason: CatalogSearchReason? = nil) {
+        self.results = results
+        self.isComplete = isComplete
+        if let reason {
+            self.reason = reason
+        } else if results.isEmpty {
+            self.reason = isComplete ? .noResults : .requestFailed
+        } else {
+            self.reason = nil
+        }
+    }
+}
+
+private let catalogSearchLogger = Logger(subsystem: "com.pyksel.nuviotvos", category: "search")
+
+private func logCatalogSearchOutcome(
+    configuredManifests: Int,
+    decodedManifests: Int,
+    missingManifests: Int,
+    advertisedCatalogs: Int,
+    searchCapableCatalogs: Int,
+    selectedTargets: Int,
+    failedTargets: Int,
+    totalResults: Int,
+    isComplete: Bool
+) {
+    catalogSearchLogger.notice(
+        "search configured_manifests=\(configuredManifests, privacy: .public) decoded_manifests=\(decodedManifests, privacy: .public) missing_manifests=\(missingManifests, privacy: .public) advertised_catalogs=\(advertisedCatalogs, privacy: .public) search_capable_catalogs=\(searchCapableCatalogs, privacy: .public) selected_targets=\(selectedTargets, privacy: .public) failed_targets=\(failedTargets, privacy: .public) total_results=\(totalResults, privacy: .public) complete=\(isComplete, privacy: .public)"
+    )
+}
 
 /// Repository protocol for catalog operations
 protocol CatalogRepository {
@@ -65,6 +160,9 @@ protocol CatalogRepository {
 
     /// Search for content
     func search(query: String) async throws -> [NuvioMeta]
+
+    /// Search while preserving whether every configured source completed.
+    func searchWithOutcome(query: String) async throws -> CatalogSearchOutcome
 
     /// Browse catalog with pagination and filters
     func browseCatalog(
@@ -129,6 +227,10 @@ extension CatalogRepository {
     var homeCatalogFailureSignature: String? { nil }
 
     var homeCatalogInputSignature: String { "" }
+
+    func searchWithOutcome(query: String) async throws -> CatalogSearchOutcome {
+        CatalogSearchOutcome(results: try await search(query: query), isComplete: true)
+    }
 
     func getDiscoverSources() async -> [DiscoverCatalogOption] { [] }
 
@@ -221,14 +323,24 @@ extension CatalogRepository {
 /// One process-wide manifest response per URL. Personalized add-ons can rotate
 /// their catalog declarations on every manifest request; Settings and Home
 /// must decode the same response or their row identities immediately diverge.
+struct StremioManifestDataEntry: @unchecked Sendable {
+    let identity: UUID
+    let data: Data
+    let responseURL: URL?
+    let urlCache: URLCache?
+}
+
 actor StremioManifestDataCache {
     static let shared = StremioManifestDataCache()
     private static let tracker = SimpleCountTracker()
+    private static let manifestURLCache = URLCache.shared
     private static let manifestSession: URLSession = {
         let config = URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 10
         config.waitsForConnectivity = false
+        config.urlCache = manifestURLCache
+        config.requestCachePolicy = .useProtocolCachePolicy
         return URLSession(configuration: config)
     }()
 
@@ -236,46 +348,136 @@ actor StremioManifestDataCache {
         tracker.metrics
     }
 
-    private var cachedData: [URL: Data] = [:]
-    private var inFlight: [URL: Task<Data?, Never>] = [:]
+    private struct InFlightEntry {
+        let identity: UUID
+        let task: Task<FetchResult?, Never>
+        let urlCache: URLCache?
+    }
+
+    private struct FetchResult {
+        let data: Data
+        let responseURL: URL?
+    }
+
+    private var cachedData: [URL: StremioManifestDataEntry] = [:]
+    private var inFlight: [URL: InFlightEntry] = [:]
     private var session: URLSession
+    private var urlCache: URLCache?
 
     private init() {
         session = Self.manifestSession
+        urlCache = Self.manifestURLCache
     }
 
-    func setSessionForTesting(_ session: URLSession?) {
-        inFlight.values.forEach { $0.cancel() }
+    func setSessionForTesting(_ session: URLSession?, urlCache: URLCache? = nil) {
+        inFlight.values.forEach { $0.task.cancel() }
         inFlight.removeAll()
         cachedData.removeAll()
-        self.session = session ?? Self.manifestSession
+        Self.tracker.reset()
+        if let session {
+            self.session = session
+            self.urlCache = urlCache
+        } else {
+            self.session = Self.manifestSession
+            self.urlCache = Self.manifestURLCache
+        }
     }
 
     func data(for url: URL) async -> Data? {
-        if let data = cachedData[url] { return data }
-        if let task = inFlight[url] { return await task.value }
+        await dataEntry(for: url)?.data
+    }
 
-        let task = Task<Data?, Never> {
-            do {
-                var request = URLRequest(url: url)
-                request.timeoutInterval = 8
-                let (data, response) = try await session.data(for: request)
-                guard let http = response as? HTTPURLResponse,
-                      200..<300 ~= http.statusCode else { return nil }
-                return data
-            } catch {
-                return nil
+    func dataEntry(for url: URL) async -> StremioManifestDataEntry? {
+        if let entry = cachedData[url] { return entry }
+
+        let flight: InFlightEntry
+        if let current = inFlight[url] {
+            flight = current
+        } else {
+            let flightSession = session
+            let flightURLCache = urlCache
+            let newFlight = InFlightEntry(
+                identity: UUID(),
+                task: Task<FetchResult?, Never> {
+                    do {
+                        var request = URLRequest(url: url)
+                        request.timeoutInterval = 8
+                        let (data, response) = try await flightSession.data(for: request)
+                        guard let http = response as? HTTPURLResponse,
+                              200..<300 ~= http.statusCode else { return nil }
+                        return FetchResult(data: data, responseURL: http.url)
+                    } catch {
+                        return nil
+                    }
+                },
+                urlCache: flightURLCache
+            )
+            inFlight[url] = newFlight
+            flight = newFlight
+        }
+
+        let result = await flight.task.value
+        return publish(result, for: url, from: flight)
+    }
+
+    private func publish(
+        _ result: FetchResult?,
+        for url: URL,
+        from flight: InFlightEntry
+    ) -> StremioManifestDataEntry? {
+        guard let current = inFlight[url], current.identity == flight.identity else {
+            // Another waiter may have published this same flight first. Return
+            // only its matching cache entry, or the completed value to its
+            // existing waiter. Stale flights never republish cache state.
+            if let entry = cachedData[url], entry.identity == flight.identity {
+                return entry
+            }
+            guard let result else { return nil }
+            return StremioManifestDataEntry(
+                identity: flight.identity,
+                data: result.data,
+                responseURL: result.responseURL,
+                urlCache: flight.urlCache
+            )
+        }
+
+        inFlight.removeValue(forKey: url)
+        guard let result else { return nil }
+        let entry = StremioManifestDataEntry(
+            identity: flight.identity,
+            data: result.data,
+            responseURL: result.responseURL,
+            urlCache: flight.urlCache
+        )
+        cachedData[url] = entry
+        updateTelemetry()
+        return entry
+    }
+
+    func discardCachedData(for url: URL, matching failedEntry: StremioManifestDataEntry) {
+        if let entry = cachedData[url],
+           entry.identity == failedEntry.identity,
+           entry.data == failedEntry.data {
+            cachedData.removeValue(forKey: url)
+            updateTelemetry()
+        }
+
+        guard let urlCache = failedEntry.urlCache else { return }
+        var cacheURLs = [url]
+        if let responseURL = failedEntry.responseURL, responseURL != url {
+            cacheURLs.append(responseURL)
+        }
+        for cacheURL in cacheURLs {
+            let request = URLRequest(url: cacheURL)
+            if let response = urlCache.cachedResponse(for: request), response.data == failedEntry.data {
+                urlCache.removeCachedResponse(for: request)
             }
         }
-        inFlight[url] = task
-        let data = await task.value
-        inFlight[url] = nil
-        if let data {
-            cachedData[url] = data
-            let totalBytes = cachedData.values.reduce(0) { $0 + $1.count }
-            Self.tracker.set(count: cachedData.count, bytes: totalBytes)
-        }
-        return data
+    }
+
+    private func updateTelemetry() {
+        let totalBytes = cachedData.values.reduce(0) { $0 + $1.data.count }
+        Self.tracker.set(count: cachedData.count, bytes: totalBytes)
     }
 
     func clear() {
@@ -313,10 +515,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         [
             ProfileSettings.activeProfileID ?? "default",
             isCinemetaEnabled ? "1" : "0",
-            configuredStreamAddonManifestURLs.map(\.absoluteString).joined(separator: ","),
-            TVHomeCatalogOrder.disabledCatalogKeys().sorted().joined(separator: ","),
-            TVHomeCatalogOrder.disabledAddonIDs().sorted().joined(separator: ","),
-            TVHomeCatalogOrder.disabledAddonNames().sorted().joined(separator: ",")
+            configuredStreamAddonManifestURLs.map(\.absoluteString).joined(separator: ",")
         ].joined(separator: "|")
     }
 
@@ -1701,36 +1900,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
-    /// Home toggles are keyed by add-on, media type and catalog ID.
-    /// Dedicated search-only endpoints (`!catalog.eligibleForHome`) belong strictly
-    /// to Search, so they remain active as long as the add-on itself is enabled.
-    /// Home-eligible catalogs follow the user's Home visibility toggles.
-    static func shouldSearchCatalog(
-        _ catalog: AddonManifestCatalog,
-        in catalogs: [AddonManifestCatalog],
-        addonID: String,
-        addonName: String,
-        disabledKeys: Set<String>,
-        disabledAddonIDs: Set<String>,
-        disabledAddonNames: Set<String>
-    ) -> Bool {
-        guard !disabledAddonIDs.contains(addonID),
-              !disabledAddonNames.contains(TVHomeCatalogOrder.normalizedAddonSourceName(addonName)) else {
-            return false
-        }
-        // Dedicated search endpoints have no Home row; they are active if the add-on is enabled.
-        guard catalog.eligibleForHome else { return true }
-
-        let catalogKey = TVHomeCatalogOrder.catalogSettingsKey(
-            addonId: addonID, contentType: catalog.type, catalogId: catalog.id
-        )
-        return !disabledKeys.contains(catalogKey)
+    func search(query: String) async throws -> [NuvioMeta] {
+        try await searchWithOutcome(query: query).results
     }
 
-    func search(query: String) async throws -> [NuvioMeta] {
+    func searchWithOutcome(query: String) async throws -> CatalogSearchOutcome {
         let metadataContext = Self.metadataCacheContext
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return [] }
+        guard !trimmed.isEmpty else {
+            return CatalogSearchOutcome(results: [], isComplete: true)
+        }
 
         struct SearchTarget {
             let addonName: String
@@ -1741,47 +1920,42 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         var targets: [SearchTarget] = []
-        let disabledKeys = TVHomeCatalogOrder.disabledCatalogKeys()
-        let disabledAddonIDs = TVHomeCatalogOrder.disabledAddonIDs()
-        let disabledAddonNames = TVHomeCatalogOrder.disabledAddonNames()
+        let builtInCinemetaManifestURL = baseURL.appendingPathComponent("manifest.json")
+        let candidateURLs = Self.configuredStreamAddonManifestURLs.filter {
+            $0.absoluteString.caseInsensitiveCompare(builtInCinemetaManifestURL.absoluteString) != .orderedSame
+        }
+        let configuredManifestCount = candidateURLs.count
+        var decodedManifestCount = 0
+        var decodedAddonSourceCount = 0
+        var missingManifestCount = 0
+        var advertisedCatalogCount = 0
+        var searchCapableCatalogCount = 0
 
         // Cinemeta searches through /top, but that endpoint serves general
-        // search even when the Top Rated Home row is the one still enabled.
+        // search independently of Home catalog visibility.
         let cinemetaVisible = Self.isCinemetaEnabled
-            && !disabledAddonIDs.contains(Self.cinemetaAddonId)
-            && !disabledAddonNames.contains(
-                TVHomeCatalogOrder.normalizedAddonSourceName(Self.cinemetaDisplayName)
-            )
         if cinemetaVisible {
             for type in ["movie", "series"] {
-                let hasVisibleRow = ["top", "imdbRating"].contains { catalogID in
-                    !disabledKeys.contains(TVHomeCatalogOrder.catalogSettingsKey(
-                        addonId: Self.cinemetaAddonId, contentType: type, catalogId: catalogID
-                    ))
-                }
-                if hasVisibleRow {
-                    targets.append(SearchTarget(
-                        addonName: Self.cinemetaDisplayName,
-                        baseURL: baseURL,
-                        type: type,
-                        catalogId: "top",
-                        isAddon: false
-                    ))
-                }
+                targets.append(SearchTarget(
+                    addonName: Self.cinemetaDisplayName,
+                    baseURL: baseURL,
+                    type: type,
+                    catalogId: "top",
+                    isAddon: false
+                ))
             }
         }
 
         // 2. Discover search-capable targets from configured add-ons in parallel
         // with a short deadline (2.5s) so slow/offline add-on hosts never stall search.
-        let candidateURLs = Self.configuredStreamAddonManifestURLs
         if !candidateURLs.isEmpty {
             let manifests = await loadSearchManifestsWithinDeadline(urls: candidateURLs, seconds: 2.5)
+            decodedManifestCount = manifests.count
+            missingManifestCount = candidateURLs.filter { manifests[$0] == nil }.count
 
             for manifestURL in candidateURLs {
                 guard let manifest = manifests[manifestURL] else { continue }
-                let isCinemeta = manifest.id.caseInsensitiveCompare(Self.cinemetaAddonId) == .orderedSame
-                    || manifestURL.host?.contains("cinemeta") == true
-                guard !isCinemeta else { continue }
+                decodedAddonSourceCount += 1
 
                 let sourceBaseURL = manifestURL.lastPathComponent.lowercased() == "manifest.json"
                     ? manifestURL.deletingLastPathComponent()
@@ -1789,16 +1963,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
                 let addonName = manifest.displayName ?? Self.streamAddonName(for: manifestURL)
                 let catalogs = manifest.catalogs ?? []
+                advertisedCatalogCount += catalogs.count
                 for catalog in catalogs where catalog.supportsSearch {
-                    guard Self.shouldSearchCatalog(
-                        catalog,
-                        in: catalogs,
-                        addonID: manifest.id,
-                        addonName: addonName,
-                        disabledKeys: disabledKeys,
-                        disabledAddonIDs: disabledAddonIDs,
-                        disabledAddonNames: disabledAddonNames
-                    ) else { continue }
+                    searchCapableCatalogCount += 1
                     targets.append(
                         SearchTarget(
                             addonName: addonName,
@@ -1812,16 +1979,43 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
         }
 
-        // Do not silently re-enable Cinemeta when the user hid every source.
-        guard !targets.isEmpty else { return [] }
+        // Do not silently re-enable Cinemeta when the user explicitly disabled it.
+        guard !targets.isEmpty else {
+            let isComplete = missingManifestCount == 0
+            let reason: CatalogSearchReason
+            if missingManifestCount > 0 {
+                reason = .requestFailed
+            } else if decodedAddonSourceCount == 0 && !cinemetaVisible {
+                reason = .noActiveAddons
+            } else {
+                reason = .noSearchCatalogs
+            }
+            if !Task.isCancelled {
+                logCatalogSearchOutcome(
+                    configuredManifests: configuredManifestCount,
+                    decodedManifests: decodedManifestCount,
+                    missingManifests: missingManifestCount,
+                    advertisedCatalogs: advertisedCatalogCount,
+                    searchCapableCatalogs: searchCapableCatalogCount,
+                    selectedTargets: 0,
+                    failedTargets: 0,
+                    totalResults: 0,
+                    isComplete: isComplete
+                )
+            }
+            return CatalogSearchOutcome(results: [], isComplete: isComplete, reason: reason)
+        }
 
-        guard !Task.isCancelled else { return [] }
+        guard !Task.isCancelled else {
+            return CatalogSearchOutcome(results: [], isComplete: false)
+        }
 
         // 3. Query all targets concurrently with bounded timeout per target (5s)
-        let rawResults = await withTaskGroup(of: (Int, [NuvioMeta]).self, returning: [NuvioMeta].self) { group in
+        typealias TargetResult = (index: Int, items: [NuvioMeta], succeeded: Bool)
+        let targetResults = await withTaskGroup(of: TargetResult.self, returning: [TargetResult].self) { group in
             for (index, target) in targets.enumerated() {
                 group.addTask {
-                    guard !Task.isCancelled else { return (index, []) }
+                    guard !Task.isCancelled else { return (index, [], false) }
                     do {
                         let items: [NuvioMeta] = try await withThrowingTaskGroup(of: [NuvioMeta].self) { fetchGroup in
                             fetchGroup.addTask {
@@ -1844,33 +2038,43 @@ final class CinemetaCatalogRepository: CatalogRepository {
                             return first
                         }
                         let tagged = target.isAddon ? items.map { $0.withIsFromAddon(true) } : items
-                        return (index, tagged)
+                        return (index, tagged, true)
                     } catch {
-                        return (index, [])
+                        return (index, [], false)
                     }
                 }
             }
-            var indexed: [(Int, [NuvioMeta])] = []
+            var completed: [TargetResult] = []
             for await result in group {
-                indexed.append(result)
+                completed.append(result)
             }
-            indexed.sort { $0.0 < $1.0 }
-
-            var merged: [NuvioMeta] = []
-            for (_, items) in indexed {
-                merged.append(contentsOf: items)
-            }
-            return merged
+            return completed.sorted { $0.index < $1.index }
         }
 
-        guard !Task.isCancelled else { return [] }
+        guard !Task.isCancelled else {
+            return CatalogSearchOutcome(results: [], isComplete: false)
+        }
 
         // Return fast, deduplicated search results immediately.
         // Background enrichment (SearchResultEnrichment) handles artwork & TMDB localization
         // asynchronously for visible cards without blocking the search spinner.
+        let failedTargetCount = targetResults.filter { !$0.succeeded }.count
+        let rawResults = targetResults.flatMap { $0.items }
         let deduplicated = Self.deduplicatedSearchResults(rawResults)
         cacheMetadata(deduplicated, context: metadataContext)
-        return deduplicated
+        let isComplete = missingManifestCount == 0 && failedTargetCount == 0
+        logCatalogSearchOutcome(
+            configuredManifests: configuredManifestCount,
+            decodedManifests: decodedManifestCount,
+            missingManifests: missingManifestCount,
+            advertisedCatalogs: advertisedCatalogCount,
+            searchCapableCatalogs: searchCapableCatalogCount,
+            selectedTargets: targets.count,
+            failedTargets: failedTargetCount,
+            totalResults: deduplicated.count,
+            isComplete: isComplete
+        )
+        return CatalogSearchOutcome(results: deduplicated, isComplete: isComplete)
     }
 
     /// Search sources can identify the same title differently (for example,
@@ -2485,10 +2689,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func manifest(for url: URL) async -> AddonManifest? {
-        guard let data = await StremioManifestDataCache.shared.data(for: url) else {
+        guard let entry = await StremioManifestDataCache.shared.dataEntry(for: url) else {
             return nil
         }
-        return try? JSONDecoder().decode(AddonManifest.self, from: data)
+        do {
+            return try JSONDecoder().decode(AddonManifest.self, from: entry.data)
+        } catch {
+            await StremioManifestDataCache.shared.discardCachedData(for: url, matching: entry)
+            return nil
+        }
     }
 
     func getCollectionFolderItems(sources: [NuvioCollectionCatalogSource], limit: Int) async -> [NuvioMeta] {
@@ -2820,13 +3029,11 @@ struct AddonManifestCatalog: Decodable {
     let name: String?
     let showInHome: Bool?
     let extra: [AddonManifestCatalogExtra]?
-    /// Legacy manifest fields predating the structured `extra` array.
-    let extraSupported: [String]?
     let extraRequired: [String]?
     let posterShape: String?
 
     enum CodingKeys: String, CodingKey {
-        case type, id, name, showInHome, extra, extraSupported, extraRequired
+        case type, id, name, showInHome, extra, extraRequired
         case posterShape
         case poster_shape
     }
@@ -2838,7 +3045,6 @@ struct AddonManifestCatalog: Decodable {
         name = try container.decodeIfPresent(String.self, forKey: .name)
         showInHome = try container.decodeIfPresent(Bool.self, forKey: .showInHome)
         extra = try container.decodeIfPresent([AddonManifestCatalogExtra].self, forKey: .extra)
-        extraSupported = try container.decodeIfPresent([String].self, forKey: .extraSupported)
         extraRequired = try container.decodeIfPresent([String].self, forKey: .extraRequired)
         posterShape = try container.decodeIfPresent(String.self, forKey: .posterShape)
             ?? container.decodeIfPresent(String.self, forKey: .poster_shape)
@@ -2860,14 +3066,9 @@ struct AddonManifestCatalog: Decodable {
 
     /// Search requires a declared search extra, with no other required extras.
     var supportsSearch: Bool {
-        let extraNames = (extra ?? []).map { $0.name.lowercased() }
-        let supportedNames = (extraSupported ?? []).map { $0.lowercased() }
-        let required = requiredExtraNames
-        let hasSearchExtra = extraNames.contains("search")
-            || supportedNames.contains("search")
-            || required.contains("search")
-        let noBlockingRequired = required.allSatisfy { $0 == "search" }
-        return hasSearchExtra && noBlockingRequired
+        let extras = extra ?? []
+        return extras.contains { $0.name == "search" }
+            && extras.allSatisfy { $0.name == "search" || $0.isRequired != true }
     }
 
     /// Mirrors the Android app's `supportsDiscover()`
@@ -3405,6 +3606,10 @@ class MockCatalogRepository: CatalogRepository {
         let seriesResults = (1...5).map { generateMockMeta(id: "search_series_\($0)", type: "series") }
 
         return movieResults + seriesResults
+    }
+
+    func searchWithOutcome(query: String) async throws -> CatalogSearchOutcome {
+        CatalogSearchOutcome(results: try await search(query: query), isComplete: true)
     }
 
     func browseCatalog(

@@ -121,6 +121,8 @@ final class SearchHistoryTests: XCTestCase {
 
 private final class ControllableLifecycleRepository: MockCatalogRepository {
     var searchHandler: ((String) async throws -> [NuvioMeta])?
+    var searchOutcomeHandler: ((String) async throws -> CatalogSearchOutcome)?
+    var refreshMetadataHandler: ((String, String) async throws -> NuvioMeta)?
     var browseDiscoverHandler: ((DiscoverCatalogOption, Int, String?) async throws -> CatalogPage)?
 
     override func search(query: String) async throws -> [NuvioMeta] {
@@ -140,6 +142,20 @@ private final class ControllableLifecycleRepository: MockCatalogRepository {
                 year: 2024
             )
         ]
+    }
+
+    override func searchWithOutcome(query: String) async throws -> CatalogSearchOutcome {
+        if let searchOutcomeHandler {
+            return try await searchOutcomeHandler(query)
+        }
+        return try await super.searchWithOutcome(query: query)
+    }
+
+    override func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        if let refreshMetadataHandler {
+            return try await refreshMetadataHandler(id, type)
+        }
+        return try await super.refreshMetadata(id: id, type: type)
     }
 
     override func getDiscoverSources() async -> [DiscoverCatalogOption] {
@@ -215,6 +231,8 @@ private actor SearchRequestCounter {
         count += 1
         return count
     }
+
+    func current() -> Int { count }
 }
 
 final class SearchAndDiscoverLifecycleTests: XCTestCase {
@@ -232,6 +250,771 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
         try await assertRapidQueryChangeRecovers(
             NetflixSearchViewModel(repository: repo), repository: repo
         )
+    }
+
+    func testSearchRequestsMovieAndSeriesAddonSearchCatalogsWhenHomeRowsAreDisabled() async throws {
+        let defaults = ProfileSettings.current
+        let cinemetaManifestURL = "https://v3-cinemeta.strem.io/manifest.json"
+        let addonManifestURL = "https://aiometa-addon.invalid/manifest.json"
+        let disabledDuplicateManifestURL = "https://aiometa-disabled.invalid/manifest.json"
+        let addonMovieSearchURL = "https://aiometa-addon.invalid/catalog/movie/search.movie/search=Matrix.json"
+        let addonSeriesSearchURL = "https://aiometa-addon.invalid/catalog/series/search.series/search=Matrix.json"
+        let addonMoviePopularURL = "https://aiometa-addon.invalid/catalog/movie/popular/search=Matrix.json"
+        let addonSeriesPopularURL = "https://aiometa-addon.invalid/catalog/series/popular/search=Matrix.json"
+        let disabledBrowseCatalogKeys = [
+            TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: "aiometadata", contentType: "movie", catalogId: "popular"
+            ),
+            TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: "aiometadata", contentType: "series", catalogId: "popular"
+            ),
+            TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: CinemetaCatalogRepository.cinemetaAddonId, contentType: "movie", catalogId: "top"
+            ),
+            TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: CinemetaCatalogRepository.cinemetaAddonId, contentType: "movie", catalogId: "imdbRating"
+            ),
+            TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: CinemetaCatalogRepository.cinemetaAddonId, contentType: "series", catalogId: "top"
+            ),
+            TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: CinemetaCatalogRepository.cinemetaAddonId, contentType: "series", catalogId: "imdbRating"
+            )
+        ]
+
+        let previousAddonStates = defaults.object(forKey: SettingsKey.streamAddonManifestStates)
+        let previousAddonURLs = defaults.object(forKey: SettingsKey.streamAddonManifestURLs)
+        let previousSingleAddonURL = defaults.object(forKey: SettingsKey.streamAddonManifestURL)
+        let previousCinemetaDisabled = defaults.object(forKey: SettingsKey.cinemetaDisabled)
+        let previousDisabledAddonIDs = defaults.object(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
+        let previousDisabledAddonNames = defaults.object(forKey: SettingsKey.homeCatalogDisabledAddonNames)
+        let previousDisabledCatalogs = HomeCatalogPayloadStore.data(forKey: SettingsKey.homeCatalogDisabled)
+
+        let fixturePreferences = "[{\"url\":\"\(cinemetaManifestURL)\",\"enabled\":true},{\"url\":\"\(addonManifestURL)\",\"enabled\":true},{\"url\":\"\(disabledDuplicateManifestURL)\",\"enabled\":false}]"
+        let fixtureDisabledCatalogs = try JSONEncoder().encode(disabledBrowseCatalogKeys)
+        let fixtureSessionConfiguration = URLSessionConfiguration.ephemeral
+        fixtureSessionConfiguration.protocolClasses = [SearchManifestFixtureURLProtocol.self]
+        let fixtureSession = URLSession(configuration: fixtureSessionConfiguration)
+        let requestRecorder = SearchFixtureRequestRecorder()
+
+        func restore(_ key: String, to value: Any?) {
+            if let value {
+                defaults.set(value, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        func resetFixtureSession() async {
+            await StremioManifestDataCache.shared.setSessionForTesting(nil)
+            await StremioManifestDataCache.shared.clear()
+            CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
+            fixtureSession.invalidateAndCancel()
+        }
+
+        defer {
+            SearchManifestFixtureURLProtocol.reset()
+            CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
+            fixtureSession.invalidateAndCancel()
+            restore(SettingsKey.streamAddonManifestStates, to: previousAddonStates)
+            restore(SettingsKey.streamAddonManifestURLs, to: previousAddonURLs)
+            restore(SettingsKey.streamAddonManifestURL, to: previousSingleAddonURL)
+            restore(SettingsKey.cinemetaDisabled, to: previousCinemetaDisabled)
+            restore(SettingsKey.homeCatalogDisabledAddonIDs, to: previousDisabledAddonIDs)
+            restore(SettingsKey.homeCatalogDisabledAddonNames, to: previousDisabledAddonNames)
+            if let previousDisabledCatalogs {
+                _ = HomeCatalogPayloadStore.write(previousDisabledCatalogs, forKey: SettingsKey.homeCatalogDisabled)
+            } else {
+                HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogDisabled)
+            }
+        }
+
+        defaults.set(fixturePreferences, forKey: SettingsKey.streamAddonManifestStates)
+        defaults.set("\(cinemetaManifestURL)\n\(addonManifestURL)", forKey: SettingsKey.streamAddonManifestURLs)
+        defaults.set(cinemetaManifestURL, forKey: SettingsKey.streamAddonManifestURL)
+        defaults.set(false, forKey: SettingsKey.cinemetaDisabled)
+        defaults.set(Data("[\"com.linvo.cinemeta\",\"aiometadata\"]".utf8), forKey: SettingsKey.homeCatalogDisabledAddonIDs)
+        defaults.set(Data("[]".utf8), forKey: SettingsKey.homeCatalogDisabledAddonNames)
+        XCTAssertTrue(HomeCatalogPayloadStore.write(fixtureDisabledCatalogs, forKey: SettingsKey.homeCatalogDisabled))
+
+        let cinemetaManifest = Data(#"{"id":"com.linvo.cinemeta","name":"Cinemeta","types":["movie","series"],"catalogs":[]}"#.utf8)
+        let addonManifest = Data(#"{"id":"aiometadata","name":"AIO Metadata","types":["movie","series"],"catalogs":[{"type":"movie","id":"search.movie","extra":[{"name":"search","isRequired":true},{"name":"skip"}]},{"type":"series","id":"search.series","extra":[{"name":"search","isRequired":true},{"name":"skip"}]},{"type":"movie","id":"popular","name":"Popular Movies","extra":[{"name":"search","isRequired":false}]},{"type":"series","id":"popular","name":"Popular Series","extra":[{"name":"search","isRequired":false}]}]}"#.utf8)
+        let cinemetaMovie = Data(#"{"metas":[{"id":"tt8880001","name":"Cinemeta Movie Fixture","type":"movie"}]}"#.utf8)
+        let cinemetaSeries = Data(#"{"metas":[{"id":"tt8880002","name":"Cinemeta Series Fixture","type":"series"}]}"#.utf8)
+        let addonMovie = Data(#"{"metas":[{"id":"aiometa-movie-search-1","name":"AIO Movie Search Fixture","type":"movie"}]}"#.utf8)
+        let addonSeries = Data(#"{"metas":[{"id":"aiometa-series-search-1","name":"AIO Series Search Fixture","type":"series"}]}"#.utf8)
+
+        SearchManifestFixtureURLProtocol.install { request in
+            guard let url = request.url else { return nil }
+            requestRecorder.record(url)
+            switch (url.host, url.path) {
+            case ("v3-cinemeta.strem.io", "/manifest.json"):
+                return .init(statusCode: 200, data: cinemetaManifest)
+            case ("aiometa-addon.invalid", "/manifest.json"):
+                return .init(statusCode: 200, data: addonManifest)
+            case ("aiometa-disabled.invalid", "/manifest.json"):
+                return .init(statusCode: 200, data: addonManifest)
+            case ("v3-cinemeta.strem.io", "/catalog/movie/top/search=Matrix.json"):
+                return .init(statusCode: 200, data: cinemetaMovie)
+            case ("v3-cinemeta.strem.io", "/catalog/series/top/search=Matrix.json"):
+                return .init(statusCode: 200, data: cinemetaSeries)
+            case ("aiometa-addon.invalid", "/catalog/movie/search.movie/search=Matrix.json"):
+                return .init(statusCode: 200, data: addonMovie)
+            case ("aiometa-addon.invalid", "/catalog/series/search.series/search=Matrix.json"):
+                return .init(statusCode: 200, data: addonSeries)
+            case ("aiometa-addon.invalid", "/catalog/movie/popular/search=Matrix.json"),
+                 ("aiometa-addon.invalid", "/catalog/series/popular/search=Matrix.json"):
+                return .init(statusCode: 200, data: Data(#"{"metas":[]}"#.utf8))
+            default:
+                return .init(statusCode: 404, data: Data())
+            }
+        }
+
+        await StremioManifestDataCache.shared.clear()
+        await StremioManifestDataCache.shared.setSessionForTesting(fixtureSession)
+        CinemetaCatalogRepository.setNetworkSessionForTesting(fixtureSession)
+
+        XCTAssertTrue(CinemetaCatalogRepository.isCinemetaEnabled)
+        XCTAssertEqual(TVHomeCatalogOrder.disabledCatalogKeys(), Set(disabledBrowseCatalogKeys))
+
+        let repository = CinemetaCatalogRepository()
+        let idOnlyResults: [NuvioMeta]
+        let nameOnlyResults: [NuvioMeta]
+        let explicitlyDisabledCinemetaResults: [NuvioMeta]
+        do {
+            idOnlyResults = try await repository.search(query: "Matrix")
+
+            // A name-only stale Home snapshot must not suppress an enabled URL either.
+            defaults.set(Data("[]".utf8), forKey: SettingsKey.homeCatalogDisabledAddonIDs)
+            defaults.set(Data("[\"aiometadata\",\"cinemeta\"]".utf8), forKey: SettingsKey.homeCatalogDisabledAddonNames)
+            nameOnlyResults = try await repository.search(query: "Matrix")
+
+            // The explicit preference remains authoritative for Cinemeta.
+            CinemetaCatalogRepository.setCinemetaDisabled(true, in: defaults)
+            explicitlyDisabledCinemetaResults = try await repository.search(query: "Matrix")
+        } catch {
+            await resetFixtureSession()
+            throw error
+        }
+        await resetFixtureSession()
+
+        let requestedURLs = Set(requestRecorder.urls)
+        XCTAssertTrue(requestedURLs.contains(addonMovieSearchURL), "Missing add-on movie search request: \(requestedURLs)")
+        XCTAssertTrue(requestedURLs.contains(addonSeriesSearchURL), "Missing add-on series search request: \(requestedURLs)")
+        XCTAssertTrue(requestedURLs.contains(addonMoviePopularURL), "Home-disabled movie catalog was not searched: \(requestedURLs)")
+        XCTAssertTrue(requestedURLs.contains(addonSeriesPopularURL), "Home-disabled series catalog was not searched: \(requestedURLs)")
+        XCTAssertFalse(requestedURLs.contains(disabledDuplicateManifestURL))
+        for results in [idOnlyResults, nameOnlyResults] {
+            XCTAssertTrue(results.contains(where: { $0.id == "tt8880001" }))
+            XCTAssertTrue(results.contains(where: { $0.id == "tt8880002" }))
+            XCTAssertTrue(results.contains(where: { $0.id == "aiometa-movie-search-1" }))
+            XCTAssertTrue(results.contains(where: { $0.id == "aiometa-series-search-1" }))
+        }
+        XCTAssertTrue(explicitlyDisabledCinemetaResults.contains(where: { $0.id == "aiometa-movie-search-1" }))
+        XCTAssertTrue(explicitlyDisabledCinemetaResults.contains(where: { $0.id == "aiometa-series-search-1" }))
+        XCTAssertFalse(explicitlyDisabledCinemetaResults.contains(where: { $0.id == "tt8880001" }))
+        XCTAssertFalse(explicitlyDisabledCinemetaResults.contains(where: { $0.id == "tt8880002" }))
+    }
+
+    func testRepositorySearchOutcomeDistinguishesFailuresFromSuccessfulEmptyResults() async throws {
+        let defaults = ProfileSettings.current
+        let failedManifestURL = URL(string: "https://failed-manifest.invalid/manifest.json")!
+        let partialCatalogURL = URL(string: "https://partial-catalog.invalid/manifest.json")!
+        let emptyCatalogURL = URL(string: "https://empty-catalog.invalid/manifest.json")!
+        let retryManifestURL = URL(string: "https://retry-manifest.invalid/manifest.json")!
+        let previousAddonStates = defaults.object(forKey: SettingsKey.streamAddonManifestStates)
+        let previousAddonURLs = defaults.object(forKey: SettingsKey.streamAddonManifestURLs)
+        let previousSingleAddonURL = defaults.object(forKey: SettingsKey.streamAddonManifestURL)
+        let previousCinemetaDisabled = defaults.object(forKey: SettingsKey.cinemetaDisabled)
+        let fixtureSessionConfiguration = URLSessionConfiguration.ephemeral
+        fixtureSessionConfiguration.protocolClasses = [SearchManifestFixtureURLProtocol.self]
+        let fixtureSession = URLSession(configuration: fixtureSessionConfiguration)
+        let requestRecorder = SearchFixtureRequestRecorder()
+
+        func configure(_ manifestURL: URL) {
+            let json = "[{\"url\":\"\(manifestURL.absoluteString)\",\"enabled\":true}]"
+            defaults.set(json, forKey: SettingsKey.streamAddonManifestStates)
+            defaults.set(manifestURL.absoluteString, forKey: SettingsKey.streamAddonManifestURLs)
+            defaults.set(manifestURL.absoluteString, forKey: SettingsKey.streamAddonManifestURL)
+        }
+
+        func restore(_ key: String, to value: Any?) {
+            if let value {
+                defaults.set(value, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        func resetFixtureSession() async {
+            await StremioManifestDataCache.shared.setSessionForTesting(nil)
+            await StremioManifestDataCache.shared.clear()
+            CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
+            fixtureSession.invalidateAndCancel()
+        }
+
+        defer {
+            SearchManifestFixtureURLProtocol.reset()
+            CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
+            fixtureSession.invalidateAndCancel()
+            restore(SettingsKey.streamAddonManifestStates, to: previousAddonStates)
+            restore(SettingsKey.streamAddonManifestURLs, to: previousAddonURLs)
+            restore(SettingsKey.streamAddonManifestURL, to: previousSingleAddonURL)
+            restore(SettingsKey.cinemetaDisabled, to: previousCinemetaDisabled)
+        }
+
+        let partialManifest = Data(#"{"id":"partial.addon","name":"Partial Addon","types":["movie"],"catalogs":[{"type":"movie","id":"failed","extra":[{"name":"search","isRequired":true}]},{"type":"movie","id":"success","extra":[{"name":"search","isRequired":true}]}]}"#.utf8)
+        let emptyManifest = Data(#"{"id":"empty.addon","name":"Empty Addon","types":["movie"],"catalogs":[{"type":"movie","id":"empty","extra":[{"name":"search","isRequired":true}]}]}"#.utf8)
+        let partialCatalog = Data(#"{"metas":[{"id":"partial-search-result","name":"Partial Search Result","type":"movie"}]}"#.utf8)
+
+        SearchManifestFixtureURLProtocol.install { request in
+            guard let url = request.url else { return nil }
+            requestRecorder.record(url)
+            switch (url.host, url.path) {
+            case ("failed-manifest.invalid", "/manifest.json"):
+                return .init(statusCode: 503, data: Data())
+            case ("partial-catalog.invalid", "/manifest.json"):
+                return .init(statusCode: 200, data: partialManifest)
+            case ("partial-catalog.invalid", "/catalog/movie/failed/search=Matrix.json"):
+                return .init(statusCode: 500, data: Data())
+            case ("partial-catalog.invalid", "/catalog/movie/success/search=Matrix.json"):
+                return .init(statusCode: 200, data: partialCatalog)
+            case ("empty-catalog.invalid", "/manifest.json"):
+                return .init(statusCode: 200, data: emptyManifest)
+            case ("empty-catalog.invalid", "/catalog/movie/empty/search=Matrix.json"):
+                return .init(statusCode: 200, data: Data(#"{"metas":[]}"#.utf8))
+            default:
+                return .init(statusCode: 404, data: Data())
+            }
+        }
+
+        defaults.set(true, forKey: SettingsKey.cinemetaDisabled)
+        await StremioManifestDataCache.shared.setSessionForTesting(fixtureSession)
+        CinemetaCatalogRepository.setNetworkSessionForTesting(fixtureSession)
+
+        let repository = CinemetaCatalogRepository()
+        do {
+            configure(failedManifestURL)
+            let failedManifest = try await repository.searchWithOutcome(query: "Matrix")
+            XCTAssertFalse(failedManifest.isComplete)
+            XCTAssertTrue(failedManifest.results.isEmpty)
+
+            configure(partialCatalogURL)
+            let partialCatalogOutcome = try await repository.searchWithOutcome(query: "Matrix")
+            XCTAssertFalse(partialCatalogOutcome.isComplete)
+            XCTAssertEqual(partialCatalogOutcome.results.map(\.id), ["partial-search-result"])
+
+            configure(emptyCatalogURL)
+            let successfulEmpty = try await repository.searchWithOutcome(query: "Matrix")
+            XCTAssertTrue(successfulEmpty.isComplete)
+            XCTAssertTrue(successfulEmpty.results.isEmpty)
+
+            configure(retryManifestURL)
+            let malformedManifestStarted = expectation(description: "malformed manifest request started")
+            SearchManifestFixtureURLProtocol.install { request in
+                guard let url = request.url else { return nil }
+                requestRecorder.record(url)
+                guard url == retryManifestURL else { return .init(statusCode: 404, data: Data()) }
+                malformedManifestStarted.fulfill()
+                return .init(statusCode: 200, data: Data("not json".utf8), delay: 1.0)
+            }
+
+            async let firstMalformedRequest = repository.searchWithOutcome(query: "Matrix")
+            await fulfillment(of: [malformedManifestStarted], timeout: 2)
+            async let secondMalformedRequest = repository.searchWithOutcome(query: "Matrix")
+            let (firstMalformed, secondMalformed) = try await (firstMalformedRequest, secondMalformedRequest)
+            XCTAssertFalse(firstMalformed.isComplete)
+            XCTAssertFalse(secondMalformed.isComplete)
+            XCTAssertEqual(
+                requestRecorder.urls.filter { $0 == retryManifestURL.absoluteString }.count,
+                1,
+                "Concurrent callers should share the malformed manifest fetch"
+            )
+
+            let retryManifest = Data(#"{"id":"retry.addon","name":"Retry Addon","types":["movie"],"catalogs":[{"type":"movie","id":"search","extra":[{"name":"search","isRequired":true}]}]}"#.utf8)
+            let retryCatalog = Data(#"{"metas":[{"id":"recovered-after-malformed","name":"Recovered After Malformed Manifest","type":"movie"}]}"#.utf8)
+            SearchManifestFixtureURLProtocol.install { request in
+                guard let url = request.url else { return nil }
+                requestRecorder.record(url)
+                switch (url.host, url.path) {
+                case ("retry-manifest.invalid", "/manifest.json"):
+                    return .init(statusCode: 200, data: retryManifest)
+                case ("retry-manifest.invalid", "/catalog/movie/search/search=Matrix.json"):
+                    return .init(statusCode: 200, data: retryCatalog)
+                default:
+                    return .init(statusCode: 404, data: Data())
+                }
+            }
+
+            let recovered = try await repository.searchWithOutcome(query: "Matrix")
+            XCTAssertTrue(recovered.isComplete)
+            XCTAssertEqual(recovered.results.map(\.id), ["recovered-after-malformed"])
+            XCTAssertEqual(
+                requestRecorder.urls.filter { $0 == retryManifestURL.absoluteString }.count,
+                2,
+                "Retry should fetch the same URL again after undecodable bytes were evicted"
+            )
+        } catch {
+            await resetFixtureSession()
+            throw error
+        }
+        await resetFixtureSession()
+    }
+
+    func testMalformedCachedManifestIsEvictedWithoutRemovingUnrelatedOrNewerResponses() async throws {
+        let defaults = ProfileSettings.current
+        let manifestURL = URL(string: "https://urlcache-retry.invalid/manifest.json")!
+        let finalResponseURL = URL(string: "https://cdn-urlcache.invalid/manifests/manifest.json")!
+        let unrelatedURL = URL(string: "https://unrelated-urlcache.invalid/manifest.json")!
+        let malformedBytes = Data("not a manifest".utf8)
+        let unrelatedBytes = Data("unrelated response".utf8)
+        let previousAddonStates = defaults.object(forKey: SettingsKey.streamAddonManifestStates)
+        let previousAddonURLs = defaults.object(forKey: SettingsKey.streamAddonManifestURLs)
+        let previousSingleAddonURL = defaults.object(forKey: SettingsKey.streamAddonManifestURL)
+        let previousCinemetaDisabled = defaults.object(forKey: SettingsKey.cinemetaDisabled)
+
+        let fixtureURLCache = URLCache(memoryCapacity: 1_000_000, diskCapacity: 0, diskPath: nil)
+        let finalResponseRequest = URLRequest(url: finalResponseURL)
+        let unrelatedRequest = URLRequest(url: unrelatedURL)
+        let cacheableHeaders = [
+            "Content-Type": "application/json",
+            "Cache-Control": "public, max-age=3600"
+        ]
+        // Seed a cacheable 200 at the destination URL without depending on
+        // URLSession's custom-protocol redirect callback behavior.
+        let malformedResponse = HTTPURLResponse(
+            url: finalResponseURL,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: cacheableHeaders
+        )!
+        let unrelatedResponse = HTTPURLResponse(
+            url: unrelatedURL,
+            statusCode: 200,
+            httpVersion: "HTTP/1.1",
+            headerFields: cacheableHeaders
+        )!
+        fixtureURLCache.storeCachedResponse(
+            CachedURLResponse(response: malformedResponse, data: malformedBytes, storagePolicy: .allowed),
+            for: finalResponseRequest
+        )
+        fixtureURLCache.storeCachedResponse(
+            CachedURLResponse(response: unrelatedResponse, data: unrelatedBytes, storagePolicy: .allowed),
+            for: unrelatedRequest
+        )
+        XCTAssertEqual(
+            (fixtureURLCache.cachedResponse(for: finalResponseRequest)?.response as? HTTPURLResponse)?.statusCode,
+            200
+        )
+
+        let fixtureSessionConfiguration = URLSessionConfiguration.ephemeral
+        fixtureSessionConfiguration.protocolClasses = [SearchManifestFixtureURLProtocol.self]
+        fixtureSessionConfiguration.urlCache = fixtureURLCache
+        fixtureSessionConfiguration.requestCachePolicy = .useProtocolCachePolicy
+        let fixtureSession = URLSession(configuration: fixtureSessionConfiguration)
+        let requestRecorder = SearchFixtureRequestRecorder()
+
+        func restore(_ key: String, to value: Any?) {
+            if let value {
+                defaults.set(value, forKey: key)
+            } else {
+                defaults.removeObject(forKey: key)
+            }
+        }
+
+        func resetFixtureSession() async {
+            await StremioManifestDataCache.shared.setSessionForTesting(nil)
+            await StremioManifestDataCache.shared.clear()
+            CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
+            fixtureSession.invalidateAndCancel()
+        }
+
+        defer {
+            SearchManifestFixtureURLProtocol.reset()
+            CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
+            fixtureSession.invalidateAndCancel()
+            restore(SettingsKey.streamAddonManifestStates, to: previousAddonStates)
+            restore(SettingsKey.streamAddonManifestURLs, to: previousAddonURLs)
+            restore(SettingsKey.streamAddonManifestURL, to: previousSingleAddonURL)
+            restore(SettingsKey.cinemetaDisabled, to: previousCinemetaDisabled)
+        }
+
+        defaults.set("[{\"url\":\"\(manifestURL.absoluteString)\",\"enabled\":true}]", forKey: SettingsKey.streamAddonManifestStates)
+        defaults.set(manifestURL.absoluteString, forKey: SettingsKey.streamAddonManifestURLs)
+        defaults.set(manifestURL.absoluteString, forKey: SettingsKey.streamAddonManifestURL)
+        defaults.set(true, forKey: SettingsKey.cinemetaDisabled)
+
+        let validManifest = Data(#"{"id":"urlcache.retry","name":"URLCache Retry","types":["movie"],"catalogs":[{"type":"movie","id":"search","extra":[{"name":"search","isRequired":true}]}]}"#.utf8)
+        let catalogResponse = Data(#"{"metas":[{"id":"urlcache-recovered","name":"Recovered from URLCache","type":"movie"}]}"#.utf8)
+        let malformedResponseStarted = expectation(description: "malformed response started")
+        SearchManifestFixtureURLProtocol.install { request in
+            guard let url = request.url else { return nil }
+            requestRecorder.record(url)
+            if url == manifestURL {
+                malformedResponseStarted.fulfill()
+                return .init(statusCode: 200, data: malformedBytes, delay: 0.4, responseURL: finalResponseURL)
+            }
+            return .init(statusCode: 404, data: Data())
+        }
+
+        await StremioManifestDataCache.shared.setSessionForTesting(fixtureSession, urlCache: fixtureURLCache)
+        CinemetaCatalogRepository.setNetworkSessionForTesting(fixtureSession)
+
+        let repository = CinemetaCatalogRepository()
+        do {
+            async let malformedSearch = repository.searchWithOutcome(query: "Matrix")
+            await fulfillment(of: [malformedResponseStarted], timeout: 2)
+            await StremioManifestDataCache.shared.clear()
+            let malformedOutcome = try await malformedSearch
+            XCTAssertFalse(malformedOutcome.isComplete)
+            XCTAssertTrue(malformedOutcome.results.isEmpty)
+            XCTAssertNil(fixtureURLCache.cachedResponse(for: finalResponseRequest))
+            XCTAssertEqual(fixtureURLCache.cachedResponse(for: unrelatedRequest)?.data, unrelatedBytes)
+
+            let manifestRequestsBeforeRetry = requestRecorder.urls.filter { $0 == manifestURL.absoluteString }.count
+            SearchManifestFixtureURLProtocol.install { request in
+                guard let url = request.url else { return nil }
+                requestRecorder.record(url)
+                switch (url.host, url.path) {
+                case ("urlcache-retry.invalid", "/manifest.json"):
+                    return .init(statusCode: 200, data: validManifest, responseURL: finalResponseURL)
+                case ("urlcache-retry.invalid", "/catalog/movie/search/search=Matrix.json"):
+                    return .init(statusCode: 200, data: catalogResponse)
+                default:
+                    return .init(statusCode: 404, data: Data())
+                }
+            }
+
+            let recovered = try await repository.searchWithOutcome(query: "Matrix")
+            XCTAssertTrue(recovered.isComplete)
+            XCTAssertEqual(recovered.results.map(\.id), ["urlcache-recovered"])
+            XCTAssertEqual(
+                requestRecorder.urls.filter { $0 == manifestURL.absoluteString }.count,
+                manifestRequestsBeforeRetry + 1
+            )
+
+            let newerResponse = HTTPURLResponse(
+                url: finalResponseURL,
+                statusCode: 200,
+                httpVersion: "HTTP/1.1",
+                headerFields: cacheableHeaders
+            )!
+            fixtureURLCache.storeCachedResponse(
+                CachedURLResponse(response: newerResponse, data: validManifest, storagePolicy: .allowed),
+                for: finalResponseRequest
+            )
+            let staleMalformedEntry = StremioManifestDataEntry(
+                identity: UUID(),
+                data: malformedBytes,
+                responseURL: finalResponseURL,
+                urlCache: fixtureURLCache
+            )
+            await StremioManifestDataCache.shared.discardCachedData(for: manifestURL, matching: staleMalformedEntry)
+            XCTAssertEqual(fixtureURLCache.cachedResponse(for: finalResponseRequest)?.data, validManifest)
+            XCTAssertEqual(fixtureURLCache.cachedResponse(for: unrelatedRequest)?.data, unrelatedBytes)
+        } catch {
+            await resetFixtureSession()
+            throw error
+        }
+        await resetFixtureSession()
+    }
+
+    func testManifestCacheClearReturnsCompletedBytesWithoutRepublishing() async throws {
+        let manifestURL = URL(string: "https://clear-manifest.invalid/manifest.json")!
+        let firstBytes = Data("first response".utf8)
+        let secondBytes = Data("second response".utf8)
+        let requestRecorder = SearchFixtureRequestRecorder()
+        let firstRequestStarted = expectation(description: "first manifest request started")
+        let fixtureSessionConfiguration = URLSessionConfiguration.ephemeral
+        fixtureSessionConfiguration.protocolClasses = [SearchManifestFixtureURLProtocol.self]
+        let fixtureSession = URLSession(configuration: fixtureSessionConfiguration)
+
+        SearchManifestFixtureURLProtocol.install { request in
+            guard let url = request.url else { return nil }
+            requestRecorder.record(url)
+            guard url == manifestURL else { return .init(statusCode: 404, data: Data()) }
+            let count = requestRecorder.urls.filter { $0 == manifestURL.absoluteString }.count
+            if count == 1 {
+                firstRequestStarted.fulfill()
+                return .init(statusCode: 200, data: firstBytes, delay: 0.4)
+            }
+            return .init(statusCode: 200, data: secondBytes)
+        }
+
+        await StremioManifestDataCache.shared.setSessionForTesting(fixtureSession)
+        defer {
+            SearchManifestFixtureURLProtocol.reset()
+            fixtureSession.invalidateAndCancel()
+        }
+
+        async let oldWaiter = StremioManifestDataCache.shared.data(for: manifestURL)
+        await fulfillment(of: [firstRequestStarted], timeout: 2)
+        await StremioManifestDataCache.shared.clear()
+        let completedBytes = await oldWaiter
+        XCTAssertEqual(completedBytes, firstBytes)
+
+        let nextAccess = await StremioManifestDataCache.shared.data(for: manifestURL)
+        XCTAssertEqual(nextAccess, secondBytes)
+        XCTAssertEqual(requestRecorder.urls.filter { $0 == manifestURL.absoluteString }.count, 2)
+        await StremioManifestDataCache.shared.setSessionForTesting(nil)
+    }
+
+    func testOldManifestEntryCannotEvictNewIdenticalBytesAfterClear() async {
+        let manifestURL = URL(string: "https://identity-manifest.invalid/manifest.json")!
+        let identicalBytes = Data("same bytes from both flights".utf8)
+        let requestRecorder = SearchFixtureRequestRecorder()
+        let fixtureSessionConfiguration = URLSessionConfiguration.ephemeral
+        fixtureSessionConfiguration.protocolClasses = [SearchManifestFixtureURLProtocol.self]
+        let fixtureSession = URLSession(configuration: fixtureSessionConfiguration)
+
+        SearchManifestFixtureURLProtocol.install { request in
+            guard let url = request.url else { return nil }
+            requestRecorder.record(url)
+            guard url == manifestURL else { return .init(statusCode: 404, data: Data()) }
+            return .init(statusCode: 200, data: identicalBytes)
+        }
+
+        await StremioManifestDataCache.shared.setSessionForTesting(fixtureSession)
+        defer {
+            SearchManifestFixtureURLProtocol.reset()
+            fixtureSession.invalidateAndCancel()
+        }
+
+        guard let oldEntry = await StremioManifestDataCache.shared.dataEntry(for: manifestURL) else {
+            XCTFail("Old manifest request should return bytes")
+            await StremioManifestDataCache.shared.setSessionForTesting(nil)
+            return
+        }
+        await StremioManifestDataCache.shared.clear()
+
+        guard let newEntry = await StremioManifestDataCache.shared.dataEntry(for: manifestURL) else {
+            XCTFail("Replacement manifest request should return bytes")
+            await StremioManifestDataCache.shared.setSessionForTesting(nil)
+            return
+        }
+        XCTAssertEqual(newEntry.data, oldEntry.data)
+        XCTAssertNotEqual(newEntry.identity, oldEntry.identity)
+
+        await StremioManifestDataCache.shared.discardCachedData(for: manifestURL, matching: oldEntry)
+        let cachedEntryAfterStaleFailure = await StremioManifestDataCache.shared.dataEntry(for: manifestURL)
+        XCTAssertEqual(cachedEntryAfterStaleFailure?.identity, newEntry.identity)
+        XCTAssertEqual(requestRecorder.urls.filter { $0 == manifestURL.absoluteString }.count, 2)
+        await StremioManifestDataCache.shared.setSessionForTesting(nil)
+    }
+
+    @MainActor
+    func testSearchViewModelsRetryIncompleteEmptyOutcomes() async throws {
+        let previousRecentSearches = UserDefaults.standard.object(forKey: SearchHistoryStore.storageKey)
+        defer { restoreRecentSearches(previousRecentSearches) }
+
+        let searchRepository = ControllableLifecycleRepository()
+        try await assertIncompleteEmptyOutcomeRetries(
+            SearchViewModel(repository: searchRepository, searchTimeout: 3),
+            repository: searchRepository
+        )
+
+        let netflixRepository = ControllableLifecycleRepository()
+        try await assertIncompleteEmptyOutcomeRetries(
+            NetflixSearchViewModel(repository: netflixRepository, searchTimeout: 3),
+            repository: netflixRepository
+        )
+    }
+
+    @MainActor
+    func testSearchViewModelsDoNotCachePartialResultsAfterEnrichment() async throws {
+        let previousRecentSearches = UserDefaults.standard.object(forKey: SearchHistoryStore.storageKey)
+        defer { restoreRecentSearches(previousRecentSearches) }
+
+        let searchRepository = ControllableLifecycleRepository()
+        try await assertPartialOutcomeRetriesAfterEnrichment(
+            SearchViewModel(repository: searchRepository, searchTimeout: 3),
+            repository: searchRepository
+        )
+
+        let netflixRepository = ControllableLifecycleRepository()
+        try await assertPartialOutcomeRetriesAfterEnrichment(
+            NetflixSearchViewModel(repository: netflixRepository, searchTimeout: 3),
+            repository: netflixRepository
+        )
+    }
+
+    @MainActor
+    func testSearchViewModelsCacheSuccessfulEmptyOutcomes() async throws {
+        let previousRecentSearches = UserDefaults.standard.object(forKey: SearchHistoryStore.storageKey)
+        defer { restoreRecentSearches(previousRecentSearches) }
+
+        let searchRepository = ControllableLifecycleRepository()
+        try await assertCompleteEmptyOutcomeIsCached(
+            SearchViewModel(repository: searchRepository, searchTimeout: 3),
+            repository: searchRepository
+        )
+
+        let netflixRepository = ControllableLifecycleRepository()
+        try await assertCompleteEmptyOutcomeIsCached(
+            NetflixSearchViewModel(repository: netflixRepository, searchTimeout: 3),
+            repository: netflixRepository
+        )
+    }
+
+    @MainActor
+    private func assertIncompleteEmptyOutcomeRetries(
+        _ viewModel: any SearchLifecycleModel,
+        repository: ControllableLifecycleRepository
+    ) async throws {
+        let firstSearchStarted = expectation(description: "first incomplete search started")
+        let retryStarted = expectation(description: "incomplete search retried")
+        let counter = SearchRequestCounter()
+        repository.searchOutcomeHandler = { _ in
+            if await counter.next() == 1 {
+                firstSearchStarted.fulfill()
+                return CatalogSearchOutcome(results: [], isComplete: false)
+            }
+            retryStarted.fulfill()
+            return CatalogSearchOutcome(
+                results: [self.completeSearchMeta(id: "recovered", name: "Recovered", type: "movie")],
+                isComplete: true
+            )
+        }
+
+        viewModel.searchText = "Retry Empty"
+        await fulfillment(of: [firstSearchStarted], timeout: 3)
+        try await waitForSearchToFinish(viewModel)
+        XCTAssertTrue(viewModel.results.isEmpty)
+        XCTAssertEqual(
+            viewModel.error,
+            L10n.string(
+                "search_error_network",
+                fallback: "Couldn’t complete search. Check your connection and try again."
+            )
+        )
+
+        viewModel.performSearch(query: "Retry Empty")
+        await fulfillment(of: [retryStarted], timeout: 2)
+        try await waitForSearchToFinish(viewModel)
+        XCTAssertEqual(viewModel.results.map(\.id), ["recovered"])
+        XCTAssertNil(viewModel.error)
+        let searchCount = await counter.current()
+        XCTAssertEqual(searchCount, 2)
+    }
+
+    @MainActor
+    private func assertPartialOutcomeRetriesAfterEnrichment(
+        _ viewModel: any SearchLifecycleModel,
+        repository: ControllableLifecycleRepository
+    ) async throws {
+        let defaults = ProfileSettings.current
+        let previousTmdbHomeEnrichment = defaults.object(forKey: SettingsKey.tmdbApplyToHome)
+        defaults.set(false, forKey: SettingsKey.tmdbApplyToHome)
+        defer {
+            if let previousTmdbHomeEnrichment {
+                defaults.set(previousTmdbHomeEnrichment, forKey: SettingsKey.tmdbApplyToHome)
+            } else {
+                defaults.removeObject(forKey: SettingsKey.tmdbApplyToHome)
+            }
+        }
+
+        let firstSearchStarted = expectation(description: "first partial search started")
+        let firstEnrichmentStarted = expectation(description: "partial result enrichment started")
+        let retryStarted = expectation(description: "partial search retried")
+        let counter = SearchRequestCounter()
+        repository.searchOutcomeHandler = { _ in
+            if await counter.next() == 1 {
+                firstSearchStarted.fulfill()
+                return CatalogSearchOutcome(
+                    results: [NuvioMeta(id: "partial", name: "Partial", type: "movie")],
+                    isComplete: false
+                )
+            }
+            retryStarted.fulfill()
+            return CatalogSearchOutcome(
+                results: [self.completeSearchMeta(id: "recovered-partial", name: "Recovered", type: "movie")],
+                isComplete: true
+            )
+        }
+        repository.refreshMetadataHandler = { id, type in
+            firstEnrichmentStarted.fulfill()
+            return self.completeSearchMeta(id: id, name: "Enriched Partial", type: type)
+        }
+
+        viewModel.searchText = "Retry Partial"
+        await fulfillment(of: [firstSearchStarted], timeout: 3)
+        try await waitForSearchToFinish(viewModel)
+        XCTAssertEqual(viewModel.results.map(\.id), ["partial"])
+        XCTAssertNil(viewModel.error)
+
+        await fulfillment(of: [firstEnrichmentStarted], timeout: 2)
+        let enrichmentDeadline = Date().addingTimeInterval(2)
+        while viewModel.results.first?.posterUrl != "enriched-poster" && Date() < enrichmentDeadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(viewModel.results.first?.posterUrl, "enriched-poster")
+
+        viewModel.performSearch(query: "Retry Partial")
+        await fulfillment(of: [retryStarted], timeout: 2)
+        try await waitForSearchToFinish(viewModel)
+        XCTAssertEqual(viewModel.results.map(\.id), ["recovered-partial"])
+        let searchCount = await counter.current()
+        XCTAssertEqual(searchCount, 2)
+    }
+
+    @MainActor
+    private func assertCompleteEmptyOutcomeIsCached(
+        _ viewModel: any SearchLifecycleModel,
+        repository: ControllableLifecycleRepository
+    ) async throws {
+        let firstSearchStarted = expectation(description: "complete empty search started")
+        let counter = SearchRequestCounter()
+        repository.searchOutcomeHandler = { _ in
+            _ = await counter.next()
+            firstSearchStarted.fulfill()
+            return CatalogSearchOutcome(results: [], isComplete: true)
+        }
+
+        viewModel.searchText = "No Matches"
+        await fulfillment(of: [firstSearchStarted], timeout: 3)
+        try await waitForSearchToFinish(viewModel)
+        XCTAssertTrue(viewModel.results.isEmpty)
+        XCTAssertNil(viewModel.error)
+
+        viewModel.performSearch(query: "No Matches")
+        XCTAssertFalse(viewModel.isLoading)
+        let searchCount = await counter.current()
+        XCTAssertEqual(searchCount, 1)
+    }
+
+    @MainActor
+    private func waitForSearchToFinish(
+        _ viewModel: any SearchLifecycleModel,
+        timeout: TimeInterval = 2
+    ) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while viewModel.isLoading && Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertFalse(viewModel.isLoading)
+    }
+
+    private func completeSearchMeta(id: String, name: String, type: String) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: name,
+            posterUrl: "enriched-poster",
+            backgroundUrl: "enriched-backdrop",
+            logoUrl: "enriched-logo",
+            imdbId: "tt1234567",
+            tmdbId: 123,
+            type: type,
+            year: 2024,
+            runtime: "100 min"
+        )
+    }
+
+    private func restoreRecentSearches(_ value: Any?) {
+        if let value {
+            UserDefaults.standard.set(value, forKey: SearchHistoryStore.storageKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: SearchHistoryStore.storageKey)
+        }
     }
 
     @MainActor
@@ -283,23 +1066,15 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
     @MainActor
     func testDelayedSearchCannotOverwriteCachedResults() async throws {
         let repo = ControllableLifecycleRepository()
-        let viewModel = SearchViewModel(repository: repo)
-
-        // Fast search completes and is cached
-        viewModel.performSearch(query: "Fast")
-        let fastDeadline = Date().addingTimeInterval(1.0)
-        while viewModel.isLoading && Date() < fastDeadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
-        XCTAssertEqual(viewModel.results.first?.name, "Result for Fast")
-
-        // Slow search starts
+        let fastSearchStarted = expectation(description: "fast search started")
         let slowSearchStarted = expectation(description: "slow search started")
         let slowSearchCanFinish = expectation(description: "slow search can finish")
+        let slowSearchReturned = expectation(description: "stale slow search returned")
         repo.searchHandler = { query in
             if query == "Slow" {
                 slowSearchStarted.fulfill()
                 await self.fulfillment(of: [slowSearchCanFinish], timeout: 5.0)
+                slowSearchReturned.fulfill()
                 return [
                     NuvioMeta(
                         id: "slow_1",
@@ -314,6 +1089,7 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
                     )
                 ]
             }
+            fastSearchStarted.fulfill()
             return [
                 NuvioMeta(
                     id: "meta_\(query)",
@@ -329,17 +1105,27 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
             ]
         }
 
-        viewModel.performSearch(query: "Slow")
+        // Drive the same debounced path as the UI so its initial empty-query
+        // debounce cannot clear the directly-started result mid-test.
+        let viewModel = SearchViewModel(repository: repo)
+        viewModel.searchText = "Fast"
+        await fulfillment(of: [fastSearchStarted], timeout: 2.0)
+        try await waitForSearchToFinish(viewModel)
+        XCTAssertEqual(viewModel.results.first?.name, "Result for Fast")
+
+        // Slow search starts while the complete fast result remains cached.
+        viewModel.searchText = "Slow"
         await fulfillment(of: [slowSearchStarted], timeout: 2.0)
         XCTAssertTrue(viewModel.isLoading)
 
         // While slow is in-flight, user switches back to "Fast" (which is cached)
-        viewModel.performSearch(query: "Fast")
+        viewModel.searchText = "Fast"
         XCTAssertEqual(viewModel.results.first?.name, "Result for Fast")
         XCTAssertFalse(viewModel.isLoading)
 
         // Allow slow search to finally finish
         slowSearchCanFinish.fulfill()
+        await fulfillment(of: [slowSearchReturned], timeout: 1.0)
         try await Task.sleep(nanoseconds: 100_000_000)
 
         // Stale slow search must NOT overwrite the cached fast search
@@ -605,6 +1391,7 @@ private final class SearchManifestFixtureURLProtocol: URLProtocol, @unchecked Se
         let statusCode: Int
         let data: Data
         var delay: TimeInterval = 0
+        var responseURL: URL? = nil
     }
 
     private static let lock = NSLock()
@@ -661,7 +1448,7 @@ private final class SearchManifestFixtureURLProtocol: URLProtocol, @unchecked Se
         guard !isStopped,
               let url = request.url,
               let response = HTTPURLResponse(
-                url: url,
+                url: reply.responseURL ?? url,
                 statusCode: reply.statusCode,
                 httpVersion: "HTTP/1.1",
                 headerFields: ["Content-Type": "application/json"]
@@ -669,6 +1456,23 @@ private final class SearchManifestFixtureURLProtocol: URLProtocol, @unchecked Se
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: reply.data)
         client?.urlProtocolDidFinishLoading(self)
+    }
+}
+
+private final class SearchFixtureRequestRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recordedURLs: [String] = []
+
+    var urls: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return recordedURLs
+    }
+
+    func record(_ url: URL) {
+        lock.lock()
+        recordedURLs.append(url.absoluteString)
+        lock.unlock()
     }
 }
 

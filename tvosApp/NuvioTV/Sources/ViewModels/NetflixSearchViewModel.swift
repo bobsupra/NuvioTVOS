@@ -1,5 +1,8 @@
 import Foundation
 import Combine
+import OSLog
+
+private let netflixSearchLogger = Logger(subsystem: "com.pyksel.nuviotvos", category: "search")
 
 /// Netflix-style alternative to `SearchViewModel`. Same catalog search use
 /// case (`CatalogRepository.search(query:)`) and the same debounce/cache/
@@ -11,6 +14,7 @@ class NetflixSearchViewModel: ObservableObject {
     @Published var results: [NuvioMeta] = []
     @Published var isLoading = false
     @Published var error: String?
+    @Published var emptyStateReason: CatalogSearchReason?
     @Published var selectedType: SearchContentType = .all
     @Published var recentSearches: [String] = []
 
@@ -28,7 +32,7 @@ class NetflixSearchViewModel: ObservableObject {
     /// Small in-memory cache makes repeated queries (including backspacing)
     /// instantaneous without keeping stale search data on disk. Stores the
     /// enriched results once the background enrichment finishes.
-    private var cachedResults: [String: [NuvioMeta]] = [:]
+    private var cachedResults: [String: CatalogSearchOutcome] = [:]
     private var cacheOrder: [String] = []
     private var cachedSourceSignature = CinemetaCatalogRepository.searchSourceSignature
     private var sessionCommittedQuery: String?
@@ -57,9 +61,13 @@ class NetflixSearchViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Home toggles and incoming profile sync must invalidate in-memory
-        // search results rather than reusing posters from disabled catalogs.
-        for name in [TVHomeCatalogOrder.changedNotification, TVHomeCatalogOrder.snapshotChangedNotification] {
+        // Source changes alter the enabled search targets; Home-only visibility
+        // changes are harmless because Search does not filter by Home rows.
+        for name in [
+            TVHomeCatalogOrder.changedNotification,
+            TVHomeCatalogOrder.snapshotChangedNotification,
+            NuvioSyncManager.addonOrderChangedNotification
+        ] {
             NotificationCenter.default.publisher(for: name)
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] _ in self?.searchSourcesDidChange() }
@@ -83,6 +91,7 @@ class NetflixSearchViewModel: ObservableObject {
             allResults = []
             results = []
             error = nil
+            emptyStateReason = nil
             isLoading = false
             return
         }
@@ -93,9 +102,10 @@ class NetflixSearchViewModel: ObservableObject {
             searchTimeoutTask?.cancel()
             searchTask?.cancel()
             enrichmentTask?.cancel()
-            allResults = cached
+            allResults = cached.results
             applyFilter()
             error = nil
+            emptyStateReason = cached.results.isEmpty ? cached.reason : nil
             isLoading = false
             return
         }
@@ -108,6 +118,7 @@ class NetflixSearchViewModel: ObservableObject {
         enrichmentTask?.cancel()
         isLoading = true
         error = nil
+        emptyStateReason = nil
     }
 
     func performSearch(query: String) {
@@ -124,24 +135,30 @@ class NetflixSearchViewModel: ObservableObject {
             allResults = []
             results = []
             error = nil
+            emptyStateReason = nil
             isLoading = false
             return
         }
 
         if let cached = cachedResults[cacheKey] {
-            allResults = cached
+            netflixSearchLogger.notice(
+                "search cache_hit=\(true, privacy: .public) results=\(cached.results.count, privacy: .public) complete=\(true, privacy: .public)"
+            )
+            allResults = cached.results
             applyFilter()
             error = nil
+            emptyStateReason = cached.results.isEmpty ? cached.reason : nil
             isLoading = false
-            if !cached.isEmpty { commitRecentSearch(trimmed) }
-            if SearchResultEnrichment.hasIncompleteLeadingResults(cached) {
-                enrich(cached, cacheKey: cacheKey, generation: generation)
+            if !cached.results.isEmpty { commitRecentSearch(trimmed) }
+            if SearchResultEnrichment.hasIncompleteLeadingResults(cached.results) {
+                enrich(cached.results, cacheKey: cacheKey, generation: generation, cacheable: true)
             }
             return
         }
 
         isLoading = true
         error = nil
+        emptyStateReason = nil
 
         let timeoutSeconds = self.searchTimeout
         searchTimeoutTask = Task { [weak self] in
@@ -153,26 +170,43 @@ class NetflixSearchViewModel: ObservableObject {
         searchTask = Task { [weak self] in
             guard let self else { return }
             do {
-                let found = try await self.repository.search(query: trimmed)
+                let outcome = try await self.repository.searchWithOutcome(query: trimmed)
                 guard !Task.isCancelled, self.searchGeneration == generation else { return }
                 self.searchTimeoutTask?.cancel()
+                let found = outcome.results
                 self.allResults = found
-                self.cache(found, for: cacheKey)
+                if outcome.isComplete {
+                    self.cache(outcome, for: cacheKey)
+                }
                 self.applyFilter()
                 if !found.isEmpty { self.commitRecentSearch(trimmed) }
+                self.emptyStateReason = outcome.isComplete
+                    ? (found.isEmpty ? outcome.reason : nil)
+                    : .requestFailed
+                if self.emptyStateReason == .requestFailed && found.isEmpty {
+                    self.error = L10n.string(
+                        "search_error_network",
+                        fallback: "Couldn’t complete search. Check your connection and try again."
+                    )
+                } else {
+                    self.error = nil
+                }
                 self.isLoading = false
                 if SearchResultEnrichment.hasIncompleteLeadingResults(found) {
-                    self.enrich(found, cacheKey: cacheKey, generation: generation)
+                    self.enrich(
+                        found,
+                        cacheKey: cacheKey,
+                        generation: generation,
+                        cacheable: outcome.isComplete
+                    )
                 }
             } catch is CancellationError {
                 return
             } catch {
                 guard !Task.isCancelled, self.searchGeneration == generation else { return }
                 self.searchTimeoutTask?.cancel()
-                self.error = L10n.string(
-                    "search_error_network",
-                    fallback: "Couldn’t complete search. Check your connection and try again."
-                )
+                self.emptyStateReason = .requestFailed
+                self.error = CatalogSearchReason.requestFailed.title
                 self.isLoading = false
             }
         }
@@ -181,6 +215,7 @@ class NetflixSearchViewModel: ObservableObject {
     private func handleSearchTimeout(generation: UInt64) {
         guard self.searchGeneration == generation, self.isLoading else { return }
         self.searchTask?.cancel()
+        self.emptyStateReason = .requestFailed
         self.error = L10n.string(
             "search_error_timeout",
             fallback: "Search timed out. Check your connection and try again."
@@ -190,11 +225,11 @@ class NetflixSearchViewModel: ObservableObject {
 
     /// Refreshes the top raw results with their full `/meta` records without
     /// blocking the grid already on screen, then swaps them into `allResults`
-    /// (and the filter) and the query cache. Cancelled whenever the query
+    /// and the filter. Complete outcomes may also update the query cache. Cancelled whenever the query
     /// changes; the query-key guard is a second line of defense against a
     /// stale enrichment landing on a newer result list.
     @MainActor
-    private func enrich(_ found: [NuvioMeta], cacheKey: String, generation: UInt64) {
+    private func enrich(_ found: [NuvioMeta], cacheKey: String, generation: UInt64, cacheable: Bool) {
         enrichmentTask?.cancel()
         enrichmentTask = Task { [weak self] in
             guard let self else { return }
@@ -206,7 +241,9 @@ class NetflixSearchViewModel: ObservableObject {
                   self.searchGeneration == generation,
                   self.normalizedQuery() == cacheKey else { return }
             self.allResults = enriched
-            self.cache(enriched, for: cacheKey)
+            if cacheable {
+                self.cache(CatalogSearchOutcome(results: enriched, isComplete: true), for: cacheKey)
+            }
             self.applyFilter()
         }
     }
@@ -248,6 +285,7 @@ class NetflixSearchViewModel: ObservableObject {
 
     func clear() {
         sessionCommittedQuery = nil
+        emptyStateReason = nil
         searchText = ""
     }
 
@@ -287,14 +325,15 @@ class NetflixSearchViewModel: ObservableObject {
         allResults = []
         results = []
         error = nil
+        emptyStateReason = nil
         isLoading = false
         return true
     }
 
-    private func cache(_ results: [NuvioMeta], for key: String) {
+    private func cache(_ outcome: CatalogSearchOutcome, for key: String) {
         cacheOrder.removeAll { $0 == key }
         cacheOrder.append(key)
-        cachedResults[key] = results
+        cachedResults[key] = outcome
 
         while cacheOrder.count > 12 {
             cachedResults.removeValue(forKey: cacheOrder.removeFirst())
