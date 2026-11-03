@@ -241,6 +241,16 @@ struct PlaybackDebugHUDView: View {
                             : (seekr.contains("401") || seekr.contains("limit") ? .red : (seekr.hasSuffix("…") ? .yellow : .gray))
                     )
                 }
+                let sync = SeekPreviewDiagnostics.shared.syncLine
+                if !sync.isEmpty {
+                    hudRow(
+                        label: "AutoSubSync",
+                        value: sync,
+                        hasDot: true,
+                        dotColor: sync.hasPrefix("ok") || sync.hasPrefix("in sync") ? .green
+                            : (sync.hasSuffix("…") ? .yellow : .gray)
+                    )
+                }
                 let previews = SeekPreviewDiagnostics.shared.line
                 if !previews.isEmpty {
                     hudRow(

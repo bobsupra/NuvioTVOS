@@ -57,7 +57,8 @@ final class SceneViewModel: ObservableObject {
         runtime: String?,
         nextEpisode: NuvioVideo?,
         playbackInfo: ScenePlaybackInfo? = nil,
-        hasChapters: Bool = false
+        hasChapters: Bool = false,
+        hasAutoSync: Bool = false
     ) {
         self.infoTitle = title
         self.infoYear = year.map(String.init)
@@ -74,6 +75,10 @@ final class SceneViewModel: ObservableObject {
         
         // The file's chapters are a tab of their own (ordered with the others in InSight Sections).
         var tabs: [SceneTab] = hasChapters ? [.chapters, .scene, .info] : [.scene, .info]
+        // AutoSubSync, for add-on subtitles on a file it can read.
+        if hasAutoSync {
+            tabs.append(.autoSync)
+        }
         if nextEpisode != nil {
             tabs.append(.upNext)
         }

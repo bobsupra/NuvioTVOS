@@ -364,6 +364,10 @@ enum SettingsKey {
     static let timelineSegmentsEnabled = "nuvio.tv.settings.playback.timelineSegmentsEnabled"
     /// Legacy preference retained for compatibility; seeking snap is always enabled.
     static let timelineSnapEnabled = "nuvio.tv.settings.playback.timelineSnapEnabled"
+    /// AutoSubSync: line add-on subtitles up with the video's embedded subtitles (off by default).
+    static let subtitleAutoSync = "nuvio.tv.settings.playback.subtitleAutoSync"
+    /// Corrections up to this many milliseconds keep the subtitle's own timing.
+    static let subtitleAutoSyncToleranceMs = "nuvio.tv.settings.playback.subtitleAutoSyncToleranceMs"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -435,6 +439,7 @@ enum SettingsKey {
         externalPlayerForwardSubtitles, assOverrideMode,
         playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
+        subtitleAutoSync, subtitleAutoSyncToleranceMs,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled, sceneTabOrder, sceneTabDisabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -8667,6 +8672,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
     @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
     @AppStorage(SettingsKey.timelineSegmentsEnabled) private var timelineSegmentsEnabled = false
+    @AppStorage(SettingsKey.subtitleAutoSync) private var subtitleAutoSync = false
+    @AppStorage(SettingsKey.subtitleAutoSyncToleranceMs) private var subtitleAutoSyncToleranceMs = 0
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
@@ -9025,6 +9032,41 @@ private struct PlaybackSettingsView: View {
                 .onChange(of: seekrApiKey) { _, _ in
                     checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
                 }
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_subtitle_autosync_title", fallback: "AutoSubSync"),
+                subtitle: L10n.string(
+                    "tvos_settings_subtitle_autosync_subtitle",
+                    fallback: "Lines add-on subtitles up with the timing of the subtitles embedded in the video (MKV). Only the subtitle you play is checked; it switches to the synced copy within seconds. A different intro or a cut scene gets a shift of its own."
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_subtitle_autosync", fallback: "Use AutoSubSync"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_autosync_toggle_subtitle",
+                        fallback: "Debrid, Usenet and media servers. The original timing stays available in the player's subtitle settings."
+                    ),
+                    isOn: $subtitleAutoSync,
+                    accentColor: accentColor
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_subtitle_autosync_tolerance", fallback: "AutoSubSync Tolerance"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_autosync_tolerance_subtitle",
+                        fallback: "Keep the subtitle's own timing when the correction is this small or smaller."
+                    ),
+                    selection: Binding(
+                        get: { "\(subtitleAutoSyncToleranceMs) ms" },
+                        set: { value in
+                            subtitleAutoSyncToleranceMs = Int(value.replacingOccurrences(of: " ms", with: "")) ?? 0
+                        }
+                    ),
+                    options: SubtitleAutoSyncSettings.toleranceChoicesMs.map { "\($0) ms" },
+                    accentColor: accentColor
+                )
+                .disabled(!subtitleAutoSync)
             }
 
             SettingsFeatureSummaryCard(
@@ -9835,6 +9877,8 @@ private struct InSightSectionsSettingsSection: View {
         switch tab {
         case .chapters:
             return L10n.string("tvos_settings_insight_chapters_subtitle", fallback: "The file's chapters, with stills")
+        case .autoSync:
+            return L10n.string("tvos_settings_insight_autosync_subtitle", fallback: "Sync add-on subtitles by hand, with diagnostics")
         case .scene:
             return L10n.string("tvos_settings_insight_scene_subtitle", fallback: "Cast and song recognition")
         case .info:

@@ -549,7 +549,20 @@ extension PlayerView {
                     let chapters = viewModel.chapters
                     guard !chapters.isEmpty else { return "chapter-0" }
                     return PlayerChaptersRow.focusID(of: chapters[viewModel.currentChapterIndex ?? 0])
-                }()
+                }(),
+                autoSyncContent: viewModel.availableExternalSubtitles.isEmpty ? nil : { focus, focusContext in
+                    AnyView(PlayerAutoSyncPanel(
+                        viewModel: viewModel,
+                        focusedControlID: focus,
+                        focusContext: focusContext,
+                        onDismiss: {
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                focusRemoteInput()
+                            }
+                        }
+                    ))
+                }
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(21)
