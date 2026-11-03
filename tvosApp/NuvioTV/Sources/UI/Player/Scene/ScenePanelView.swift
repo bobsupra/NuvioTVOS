@@ -7,6 +7,7 @@ struct ScenePanelWatchPartyFocusContext {
     let onFocusChanged: (String?) -> Void
     let onMoveUpFromContent: () -> Void
     let focusTab: (SceneTab) -> Void
+    let dismissPanel: () -> Void
 }
 
 struct ScenePanelView: View {
@@ -350,7 +351,8 @@ struct ScenePanelView: View {
                         entryFallbackTarget: chaptersFocusTarget,
                         onFocusChanged: rememberChapterFocus,
                         onMoveUpFromContent: focusSelectedTabFromContent,
-                        focusTab: requestTabFocus
+                        focusTab: requestTabFocus,
+                        dismissPanel: onDismiss
                     )
                 )
             } else {
@@ -366,7 +368,8 @@ struct ScenePanelView: View {
                         entryFallbackTarget: autoSyncFocusTarget,
                         onFocusChanged: rememberAutoSyncFocus,
                         onMoveUpFromContent: focusSelectedTabFromContent,
-                        focusTab: requestTabFocus
+                        focusTab: requestTabFocus,
+                        dismissPanel: onDismiss
                     )
                 )
             } else {
@@ -388,7 +391,8 @@ struct ScenePanelView: View {
                         entryFallbackTarget: watchPartyFocusTarget,
                         onFocusChanged: rememberWatchPartyFocus,
                         onMoveUpFromContent: focusSelectedTabFromContent,
-                        focusTab: requestTabFocus
+                        focusTab: requestTabFocus,
+                        dismissPanel: onDismiss
                     )
                 )
             } else {

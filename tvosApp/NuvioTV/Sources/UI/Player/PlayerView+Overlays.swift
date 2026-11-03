@@ -1,6 +1,16 @@
 import SwiftUI
 
 extension PlayerView {
+    @ViewBuilder
+    var contentWarningsOverlayLayer: some View {
+        if viewModel.showContentWarnings, !viewModel.contentWarnings.isEmpty {
+            ContentWarningsOverlayView(warnings: viewModel.contentWarnings) {
+                viewModel.contentWarningsDidDismiss()
+            }
+            .transition(.opacity)
+        }
+    }
+
     var isLoadingOverlayVisible: Bool {
         viewModel.isSwitchingSource
             || viewModel.isReloadingStream
@@ -300,6 +310,113 @@ struct PlaybackErrorOverlayView: View {
         case .network: return Color(red: 1.0, green: 0.40, blue: 0.40)
         case .compatibility: return Color(red: 0.75, green: 0.65, blue: 1.0)
         case .playerEngine: return Color(red: 1.0, green: 0.85, blue: 0.3)
+        }
+    }
+}
+
+private struct ContentWarningsOverlayView: View {
+    let warnings: [PlayerContentWarning]
+    let onDismiss: () -> Void
+
+    @State private var isContainerVisible = false
+    @State private var isAccentExpanded = false
+    @State private var visibleRowCount = 0
+
+    private let rowHeight: CGFloat = 25
+    private let rowGap: CGFloat = 3
+
+    private var fullHeight: CGFloat {
+        CGFloat(warnings.count) * rowHeight + CGFloat(max(0, warnings.count - 1)) * rowGap
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 14) {
+            Capsule()
+                .fill(Color.accentColor)
+                .frame(width: 4, height: isAccentExpanded ? fullHeight : 0, alignment: .top)
+
+            VStack(alignment: .leading, spacing: rowGap) {
+                ForEach(Array(warnings.enumerated()), id: \.element.id) { index, warning in
+                    warningRow(warning)
+                        .frame(height: rowHeight, alignment: .leading)
+                        .opacity(index < visibleRowCount ? 1 : 0)
+                }
+            }
+        }
+        .opacity(isContainerVisible ? 1 : 0)
+        .padding(.leading, 64)
+        .padding(.top, 44)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .allowsHitTesting(false)
+        .task {
+            guard !warnings.isEmpty else {
+                onDismiss()
+                return
+            }
+
+            withAnimation(.easeOut(duration: 0.3)) {
+                isContainerVisible = true
+            }
+            guard await pause(nanoseconds: 300_000_000) else { return }
+            withAnimation(.easeInOut(duration: 0.4)) {
+                isAccentExpanded = true
+            }
+            guard await pause(nanoseconds: 400_000_000) else { return }
+
+            for index in warnings.indices {
+                guard await pause(nanoseconds: 80_000_000) else { return }
+                withAnimation(.easeOut(duration: 0.2)) {
+                    visibleRowCount = index + 1
+                }
+                guard await pause(nanoseconds: 200_000_000) else { return }
+            }
+
+            guard await pause(nanoseconds: 5_000_000_000) else { return }
+            for remainingRows in stride(from: warnings.count - 1, through: 0, by: -1) {
+                guard await pause(nanoseconds: 60_000_000) else { return }
+                withAnimation(.easeOut(duration: 0.15)) {
+                    visibleRowCount = remainingRows
+                }
+                guard await pause(nanoseconds: 150_000_000) else { return }
+            }
+
+            guard await pause(nanoseconds: 100_000_000) else { return }
+            withAnimation(.easeInOut(duration: 0.3)) {
+                isAccentExpanded = false
+            }
+            guard await pause(nanoseconds: 300_000_000) else { return }
+            guard await pause(nanoseconds: 200_000_000) else { return }
+            withAnimation(.easeOut(duration: 0.2)) {
+                isContainerVisible = false
+            }
+            guard await pause(nanoseconds: 200_000_000) else { return }
+            onDismiss()
+        }
+    }
+
+    private func warningRow(_ warning: PlayerContentWarning) -> some View {
+        HStack(spacing: 4) {
+            Text(L10n.string(warning.category.localizationKey, fallback: warning.category.fallbackLabel))
+                .font(.system(size: 18, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            Text("·")
+                .font(.system(size: 18))
+                .foregroundColor(.white.opacity(0.4))
+            Text(warning.severityLocalizationKey.map {
+                L10n.string($0, fallback: warning.severity.capitalized)
+            } ?? warning.severity.capitalized)
+                .font(.system(size: 18))
+                .foregroundColor(.white.opacity(0.5))
+        }
+        .fixedSize(horizontal: true, vertical: false)
+    }
+
+    private func pause(nanoseconds: UInt64) async -> Bool {
+        do {
+            try await Task.sleep(nanoseconds: nanoseconds)
+            return !Task.isCancelled
+        } catch {
+            return false
         }
     }
 }

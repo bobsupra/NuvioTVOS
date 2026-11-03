@@ -40,6 +40,7 @@ struct PlayerWatchPartyPanel: View {
         }
         .scrollClipDisabled()
         .focusSection()
+        .onExitCommand(perform: focusContext.dismissPanel)
         .onDisappear {
             pendingStreamShare = nil
             showingStreamWarning = false

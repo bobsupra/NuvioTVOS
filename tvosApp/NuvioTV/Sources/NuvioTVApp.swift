@@ -1269,12 +1269,26 @@ struct ContentView: View {
         // session still makes retries/idempotent duplicate callbacks harmless.
         guard !callback.isError else { return }
 
-        let duration = session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let callbackDuration = callback.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let duration = callbackDuration
+            ?? session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
         let progress = callback.progress ?? callback.position.flatMap { position in
             guard let duration, position.isFinite, position >= 0 else { return nil }
-            return position / duration
+            let normalizedProgress = position / duration
+            guard callbackDuration != nil,
+                  position > duration,
+                  position - duration <= 1 else {
+                return normalizedProgress
+            }
+            return 1
         }
         guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
+        // External callbacks can underreport EOF position; allow up to two minutes of grace,
+        // with an 80% floor, while built-in playback keeps its stream-timed threshold.
+        let callbackCompletionCutoff: (Double) -> Double = { completionFraction in
+            guard let duration else { return completionFraction }
+            return max(0.80, completionFraction - 120 / duration)
+        }
 
         let isEpisode = session.meta.isSeries && session.season != nil && session.episode != nil
         guard !session.meta.isSeries || isEpisode else { return }
@@ -1293,18 +1307,19 @@ struct ContentView: View {
             let completionFraction = TraktSettingsStore.watchProgressSource == .mdblist
                 ? MdbListProgressService.completionPercent / 100
                 : WatchProgressLedger.completionFraction
+            let isComplete = progress >= callbackCompletionCutoff(completionFraction)
             if progress > 0 {
                 let reportDuration = duration ?? 100
-                let reportPosition = duration.map { $0 * progress } ?? (100 * progress)
-                let action: TraktScrobbleAction = progress >= completionFraction
-                    ? .stop
-                    : .pause
+                let reportPosition = isComplete
+                    ? reportDuration
+                    : (duration.map { $0 * progress } ?? (100 * progress))
+                let action: TraktScrobbleAction = isComplete ? .stop : .pause
                 let store = ProfileSettings.current
-                if let duration {
+                if let localCheckpointDuration = duration ?? (isComplete ? reportDuration : nil) {
                     TraktProgressService.recordLocalPlayback(
                         meta: session.meta,
                         position: reportPosition,
-                        duration: duration,
+                        duration: localCheckpointDuration,
                         season: session.season,
                         episode: session.episode,
                         notify: action == .stop
@@ -1321,8 +1336,21 @@ struct ContentView: View {
                         store: store
                     )
                 }
+                if isComplete,
+                   RemoteTrackingState.shouldSaveNuvioSyncPlayback(
+                       usesRemoteProgress: true,
+                       in: store
+                   ),
+                   let duration {
+                    ContinueWatchingStore.markPlaybackCompleted(
+                        meta: session.meta,
+                        duration: duration,
+                        season: session.season,
+                        episode: session.episode
+                    )
+                }
             }
-            if progress >= completionFraction {
+            if isComplete {
                 _ = WatchedStore.markWatched(
                     session.meta,
                     season: session.season,
@@ -1332,7 +1360,7 @@ struct ContentView: View {
             return
         }
 
-        if progress >= WatchProgressLedger.completionFraction {
+        if progress >= callbackCompletionCutoff(WatchProgressLedger.completionFraction) {
             if let duration {
                 ContinueWatchingStore.markPlaybackCompleted(
                     meta: session.meta,

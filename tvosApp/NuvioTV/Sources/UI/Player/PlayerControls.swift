@@ -33,6 +33,7 @@ struct PlayerControls: View {
     @Binding var requestedFocus: PlayerControlFocus?
     var onFocusSkipSegment: () -> Void = {}
     var onFocusNextEpisode: () -> Void = {}
+    var onPlayPause: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
     @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
@@ -560,16 +561,78 @@ struct PlayerControls: View {
             .id("sources_button")
 
         case .subtitles:
+            let activeAddonSubtitle = viewModel.activeAddonSubtitle
+            let autoSyncState = activeAddonSubtitle.flatMap { viewModel.subtitleAutoSyncStates[$0.url] }
+            let isSubtitleAutoSyncUsingOriginal = activeAddonSubtitle.map {
+                viewModel.isSubtitleAutoSyncUsingOriginal($0.url)
+            } ?? false
+            let syncActionTitle: String = {
+                switch autoSyncState {
+                case .checking?:
+                    return L10n.string("player_autosync_running", fallback: "Checking…")
+                case .synced?:
+                    return L10n.string(
+                        isSubtitleAutoSyncUsingOriginal
+                            ? "player_subtitle_autosync_original"
+                            : "player_autosync_subtitle_synced",
+                        fallback: isSubtitleAutoSyncUsingOriginal ? "Original Timing" : "Subtitle Synced"
+                    )
+                case .kept(.inSync)?:
+                    return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In Sync")
+                default:
+                    return L10n.string("player_autosync_sync_subtitle", fallback: "Sync Subtitle")
+                }
+            }()
+            let audioSyncStatus = viewModel.audioSyncStatus.flatMap {
+                $0.subtitleURL == activeAddonSubtitle?.url ? $0 : nil
+            }
+            let isAudioSyncRunningForSelectedSubtitle = viewModel.isAudioSyncRunning
+                && audioSyncStatus?.isRunning == true
             PlayerSubtitleMenuButton(
                 noneOption: subtitleNoneOption,
                 languageGroups: subtitleLanguageGroups,
                 isFocused: focusedControl == .subtitles,
-                onSelect: { selectSubtitlePickerOption($0) }
+                autoSyncState: autoSyncState,
+                syncActionTitle: syncActionTitle,
+                isSubtitleAutoSyncUsingOriginal: isSubtitleAutoSyncUsingOriginal,
+                hasActiveAddonSubtitle: activeAddonSubtitle != nil,
+                isAudioSyncRunningForSelectedSubtitle: isAudioSyncRunningForSelectedSubtitle,
+                canToggleAudioSync: activeAddonSubtitle != nil
+                    && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether),
+                onSelect: { selectSubtitlePickerOption($0) },
+                onRunAutoSync: {
+                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle else { return }
+                    switch viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] {
+                    case .checking?, .synced?, .kept(.inSync)?:
+                        return
+                    default:
+                        viewModel.runSubtitleAutoSyncNow()
+                    }
+                },
+                onToggleSubtitleTiming: {
+                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle,
+                          case .synced? = viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] else {
+                        return
+                    }
+                    viewModel.toggleSubtitleAutoSyncTiming()
+                },
+                onToggleAudioSync: {
+                    if viewModel.isAudioSyncRunning,
+                       let activeAddonSubtitle,
+                       viewModel.audioSyncStatus?.subtitleURL != activeAddonSubtitle.url {
+                        viewModel.startAudioSync()
+                    } else {
+                        viewModel.toggleAudioSync()
+                    }
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                }
             )
             .equatable()
             .focused($focusedControl, equals: .subtitles)
             .disabled(!isTransportButtonFocusable(.subtitles))
             .onExitCommand(perform: handleExit)
+            .onPlayPauseCommand(perform: onPlayPause)
             .onMoveCommand { direction in
                 handleMove(direction, from: .subtitles)
             }
@@ -601,6 +664,7 @@ struct PlayerControls: View {
             .focused($focusedControl, equals: .audio)
             .disabled(!isTransportButtonFocusable(.audio))
             .onExitCommand(perform: handleExit)
+            .onPlayPauseCommand(perform: onPlayPause)
             .onMoveCommand { direction in
                 handleMove(direction, from: .audio)
             }
@@ -814,17 +878,97 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
     let noneOption: SubtitlePanelOption?
     let languageGroups: [SubtitleLanguageGroup]
     let isFocused: Bool
+    let autoSyncState: SubtitleAutoSyncState?
+    let syncActionTitle: String
+    let isSubtitleAutoSyncUsingOriginal: Bool
+    let hasActiveAddonSubtitle: Bool
+    let isAudioSyncRunningForSelectedSubtitle: Bool
+    let canToggleAudioSync: Bool
     let onSelect: (SubtitlePanelOption) -> Void
+    let onRunAutoSync: () -> Void
+    let onToggleSubtitleTiming: () -> Void
+    let onToggleAudioSync: () -> Void
 
     static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
         lhs.isFocused == rhs.isFocused
             && lhs.noneOption == rhs.noneOption
             && lhs.languageGroups == rhs.languageGroups
+            && lhs.autoSyncState == rhs.autoSyncState
+            && lhs.syncActionTitle == rhs.syncActionTitle
+            && lhs.isSubtitleAutoSyncUsingOriginal == rhs.isSubtitleAutoSyncUsingOriginal
+            && lhs.hasActiveAddonSubtitle == rhs.hasActiveAddonSubtitle
+            && lhs.isAudioSyncRunningForSelectedSubtitle == rhs.isAudioSyncRunningForSelectedSubtitle
+            && lhs.canToggleAudioSync == rhs.canToggleAudioSync
     }
 
     var body: some View {
         Menu {
             Section(L10n.string("playback_section_subtitles", fallback: "Subtitles")) {
+                switch autoSyncState {
+                case .synced?:
+                    Button {} label: {
+                        Label(
+                            syncActionTitle,
+                            systemImage: isSubtitleAutoSyncUsingOriginal ? "clock" : "checkmark.circle"
+                        )
+                    }
+                    .disabled(true)
+
+                    Button {
+                        onToggleSubtitleTiming()
+                    } label: {
+                        Label(
+                            L10n.string(
+                                isSubtitleAutoSyncUsingOriginal
+                                    ? "player_autosync_use_synced"
+                                    : "player_subtitle_autosync_original",
+                                fallback: isSubtitleAutoSyncUsingOriginal ? "Synced Timing" : "Original Timing"
+                            ),
+                            systemImage: isSubtitleAutoSyncUsingOriginal ? "checkmark.circle" : "arrow.uturn.backward"
+                        )
+                    }
+                    .menuActionDismissBehavior(.disabled)
+
+                case .kept(.inSync)?:
+                    Button {} label: {
+                        Label(syncActionTitle, systemImage: "checkmark.circle")
+                    }
+                    .disabled(true)
+
+                case .checking?, nil:
+                    Button {
+                        onRunAutoSync()
+                    } label: {
+                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .menuActionDismissBehavior(.disabled)
+                    .disabled(!hasActiveAddonSubtitle)
+
+                default:
+                    Button {
+                        onRunAutoSync()
+                    } label: {
+                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
+                    }
+                    .menuActionDismissBehavior(.disabled)
+                    .disabled(!hasActiveAddonSubtitle)
+                }
+
+                Button {
+                    onToggleAudioSync()
+                } label: {
+                    Label(
+                        L10n.string(
+                            isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
+                            fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
+                        ),
+                        systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform"
+                    )
+                }
+                .disabled(!canToggleAudioSync)
+
+                Divider()
+
                 if let none = noneOption {
                     Button {
                         onSelect(none)
@@ -894,6 +1038,7 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                     }
                 }
             }
+
         } label: {
             Image(systemName: "captions.bubble")
                 .font(.system(size: 28, weight: .semibold))
@@ -1809,7 +1954,6 @@ struct PlayerSettingsPanel: View {
         case speed = "Speed"
         case picture = "Picture"
         case gestures = "Gestures"
-        case logs = "Logs"
     }
 
     private enum StyleControl: Hashable {
@@ -1879,17 +2023,12 @@ struct PlayerSettingsPanel: View {
     @FocusState private var focus: Focus?
 
     private var visibleTabs: [Tab] {
-        guard didReportPlaybackStarted else { return [.logs] }
         var tabs: [Tab] = []
         if !viewModel.discTitles.isEmpty {
             tabs.append(.titles)
         }
-        tabs.append(contentsOf: [.subtitles, .audio, .speed, .picture, .gestures, .logs])
+        tabs.append(contentsOf: [.subtitles, .audio, .speed, .picture, .gestures])
         return tabs
-    }
-
-    private var activeTab: Tab {
-        didReportPlaybackStarted ? tab : .logs
     }
 
     var body: some View {
@@ -1904,14 +2043,13 @@ struct PlayerSettingsPanel: View {
             VStack(alignment: .leading, spacing: 38) {
                 tabBar
 
-                switch activeTab {
+                switch tab {
                 case .titles: titlesPage
                 case .subtitles: subtitlesPage
                 case .audio: audioPage
                 case .speed: speedPage
                 case .picture: picturePage
                 case .gestures: gesturesPage
-                case .logs: PlaybackLogsPage()
                 }
             }
             .padding(.horizontal, 90)
@@ -1968,10 +2106,7 @@ struct PlayerSettingsPanel: View {
             style = SubtitleStyle.current
             viewModel.setControlsAutoHideSuspended(true)
             DispatchQueue.main.async {
-                if !didReportPlaybackStarted {
-                    tab = .logs
-                    focus = .tab(.logs)
-                } else if let language = effectiveLanguage {
+                if let language = effectiveLanguage {
                     selectedLanguage = language
                     focus = .language(language)
                 } else {
@@ -1998,12 +2133,6 @@ struct PlayerSettingsPanel: View {
                 gestureSensitivity = PlayerGestureSettings.sensitivity()
             }
         }
-        .onChange(of: didReportPlaybackStarted) { _, isReady in
-            if !isReady {
-                tab = .logs
-                focus = .tab(.logs)
-            }
-        }
         .focusSection()
         .onExitCommand { onClose() }
     }
@@ -2014,13 +2143,8 @@ struct PlayerSettingsPanel: View {
         HStack(spacing: 22) {
             ForEach(visibleTabs, id: \.self) { item in
                 let isFocused = focus == .tab(item)
-                let isSelected = activeTab == item
+                let isSelected = tab == item
                 Button {
-                    guard didReportPlaybackStarted else {
-                        tab = .logs
-                        focus = .tab(.logs)
-                        return
-                    }
                     tab = item
                     if item == .audio && orderedAudioTracks.isEmpty {
                         focus = .audioControl(.delayMinus)

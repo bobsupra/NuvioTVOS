@@ -459,6 +459,7 @@ struct ExternalPlaybackCallback: Equatable {
     let isError: Bool
     let progress: Double?
     let position: Double?
+    let duration: Double?
 
     static func parse(_ url: URL) -> ExternalPlaybackCallback? {
         guard url.scheme?.lowercased() == "nuvio-tv",
@@ -484,7 +485,8 @@ struct ExternalPlaybackCallback: Equatable {
             id: id,
             isError: isError,
             progress: progress,
-            position: number("position")
+            position: number("position"),
+            duration: number("duration")
         )
     }
 }

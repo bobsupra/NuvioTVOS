@@ -41,6 +41,8 @@ extension PlayerView {
             remoteSeekPressCatcherLayer
             playerStatusOverlay
                 .zIndex(10)
+            contentWarningsOverlayLayer
+                .zIndex(11)
             playerToastLayer
                 .zIndex(22)
             focusSinkLayer
@@ -809,7 +811,8 @@ extension PlayerView {
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
-                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
+                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) },
+                onPlayPause: { handlePlayPauseCommand() }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(shouldShowControls ? 1 : 0)
