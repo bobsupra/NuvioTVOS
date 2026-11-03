@@ -255,13 +255,13 @@ final class TrailerSettingsTests: XCTestCase {
         XCTAssertFalse(bgEnabled, "Background trailers setting must remain disabled regardless of handoff")
     }
 
-    func testTrailerPlaybackSourceMakePlayerItemSingleVideo() async {
+    func testTrailerPlaybackSourceMakePlayerItemSingleVideo() {
         let source = TrailerPlaybackSource(
             videoUrl: "https://trailerio.test/video.mp4",
             audioUrl: nil,
             qualityLabel: "1080p (MP4)"
         )
-        let item = await source.makePlayerItem(preferredForwardBufferDuration: 2.0)
+        let item = source.makePlayerItem(preferredForwardBufferDuration: 2.0)
         XCTAssertNotNil(item)
         XCTAssertEqual(item?.preferredForwardBufferDuration, 2.0)
         XCTAssertEqual(item?.preferredPeakBitRate, 0)
@@ -269,12 +269,12 @@ final class TrailerSettingsTests: XCTestCase {
         XCTAssertTrue(item?.asset is AVURLAsset)
     }
 
-    func testTrailerPlaybackSourceMakePlayerItemInvalidURL() async {
+    func testTrailerPlaybackSourceMakePlayerItemInvalidURL() {
         let source = TrailerPlaybackSource(
             videoUrl: "",
             audioUrl: nil
         )
-        let item = await source.makePlayerItem()
+        let item = source.makePlayerItem()
         XCTAssertNil(item)
     }
 
@@ -300,5 +300,155 @@ final class TrailerSettingsTests: XCTestCase {
         XCTAssertEqual(source?.videoUrl, "https://googlevideo.test/video.mp4")
         XCTAssertEqual(source?.audioUrl, "https://googlevideo.test/audio.m4a")
         XCTAssertEqual(source?.qualityLabel, "1080p (Adaptive)")
+    }
+
+    func testTrailerResolutionPrefersTrailerioWhenAvailableForEnglish() async {
+        let state = TrailerResolverTestState()
+        let resolver = YouTubeTrailerResolver(
+            preferredLanguageProvider: { "en-US" },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return "tmdb1234567"
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in
+                state.calls.append("trailerio")
+                return TrailerPlaybackSource(videoUrl: "https://trailerio.test/english.mp4", qualityLabel: "1080p")
+            },
+            imdbTrailerProvider: { imdbId in
+                state.calls.append("imdb:\(imdbId)")
+                return TrailerPlaybackSource(
+                    videoUrl: "https://imdb-video.media-imdb.com/1080p.mp4",
+                    qualityLabel: "1080p (IMDb)"
+                )
+            },
+            youtubeSourceProvider: { _, _, _, _ in
+                state.calls.append("youtube")
+                return nil
+            }
+        )
+        let meta = NuvioMeta(id: "tt2359704", name: "JoJo's Bizarre Adventure", imdbId: "tt2359704", type: "series")
+        let source = await resolver.resolve(for: meta)
+
+        XCTAssertEqual(source?.videoUrl, "https://trailerio.test/english.mp4")
+        XCTAssertEqual(state.calls, ["trailerio"])
+    }
+
+    func testTrailerResolutionPrefersImdbWhenTrailerioUnavailable() async {
+        let state = TrailerResolverTestState()
+        let resolver = YouTubeTrailerResolver(
+            preferredLanguageProvider: { "en-US" },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return "tmdb1234567"
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in
+                state.calls.append("trailerio")
+                return nil
+            },
+            imdbTrailerProvider: { imdbId in
+                state.calls.append("imdb:\(imdbId)")
+                return TrailerPlaybackSource(
+                    videoUrl: "https://imdb-video.media-imdb.com/1080p.mp4",
+                    qualityLabel: "1080p (IMDb)"
+                )
+            },
+            youtubeSourceProvider: { _, _, _, _ in
+                state.calls.append("youtube")
+                return nil
+            }
+        )
+        let meta = NuvioMeta(id: "tt2560140", name: "Attack on Titan", imdbId: "tt2560140", type: "series")
+        let source = await resolver.resolve(for: meta)
+
+        XCTAssertEqual(source?.videoUrl, "https://imdb-video.media-imdb.com/1080p.mp4")
+        XCTAssertEqual(source?.qualityLabel, "1080p (IMDb)")
+        XCTAssertEqual(state.calls, ["trailerio", "imdb:tt2560140"])
+    }
+
+    func testBackgroundPreviewPrefersImdbHighResolutionEvenForNonEnglish() async {
+        let state = TrailerResolverTestState()
+        state.language = "de-DE"
+        let resolver = YouTubeTrailerResolver(
+            preferredLanguageProvider: { state.language },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return "tmdb_de_1234"
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in
+                state.calls.append("trailerio")
+                return nil
+            },
+            imdbTrailerProvider: { imdbId in
+                state.calls.append("imdb:\(imdbId)")
+                return TrailerPlaybackSource(
+                    videoUrl: "https://imdb-video.media-imdb.com/backdrop1080p.mp4",
+                    qualityLabel: "1080p (IMDb)"
+                )
+            },
+            youtubeSourceProvider: { _, _, _, _ in
+                state.calls.append("youtube")
+                return nil
+            }
+        )
+        let meta = NuvioMeta(id: "tt7654321", name: "Dune", imdbId: "tt7654321", type: "movie")
+        let source = await resolver.resolvePreview(for: meta)
+
+        XCTAssertEqual(source?.videoUrl, "https://imdb-video.media-imdb.com/backdrop1080p.mp4")
+        XCTAssertEqual(state.calls, ["imdb:tt7654321"])
+    }
+
+    func testImdbTrailerFallbackToYouTubeWhenImdbUnavailable() async {
+        let state = TrailerResolverTestState()
+        let resolver = YouTubeTrailerResolver(
+            preferredLanguageProvider: { "en-US" },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return "ge_ABjtYx88"
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in
+                state.calls.append("trailerio")
+                return nil
+            },
+            imdbTrailerProvider: { imdbId in
+                state.calls.append("imdb:\(imdbId)")
+                return nil
+            },
+            youtubeSourceProvider: { videoID, _, _, _ in
+                state.calls.append("youtube:\(videoID)")
+                return TrailerPlaybackSource(
+                    videoUrl: "https://youtube.test/\(videoID).mp4",
+                    qualityLabel: "360p (MP4)"
+                )
+            }
+        )
+        let meta = NuvioMeta(id: "tt12332200", name: "F1: The Movie", imdbId: "tt12332200", type: "movie")
+        let source = await resolver.resolvePreview(for: meta)
+
+        XCTAssertEqual(source?.videoUrl, "https://youtube.test/ge_ABjtYx88.mp4")
+        XCTAssertEqual(source?.qualityLabel, "360p (MP4)")
+        XCTAssertEqual(state.calls, ["trailerio", "imdb:tt12332200", "tmdb", "youtube:ge_ABjtYx88"])
+    }
+
+    func testImdbCandidateScoringPrefersLanguage() {
+        let enScoreEnglish = YouTubeTrailerResolver.scoreImdbVideoName("Official English Trailer", preferredLanguage: "en-US")
+        let enScoreFrench = YouTubeTrailerResolver.scoreImdbVideoName("Jojo's Bizarre Adventure: Stone Ocean (French Trailer 3 Subtitled)", preferredLanguage: "en-US")
+        let enScoreTrailer = YouTubeTrailerResolver.scoreImdbVideoName("Official Trailer 2", preferredLanguage: "en-US")
+        let enScoreVertical = YouTubeTrailerResolver.scoreImdbVideoName("Official Vertical Teaser", preferredLanguage: "en-US")
+
+        XCTAssertGreaterThan(enScoreEnglish, enScoreFrench, "English trailer must score higher than French subtitled trailer for English user")
+        XCTAssertGreaterThan(enScoreTrailer, enScoreFrench, "Official trailer must score higher than foreign subtitled trailer for English user")
+        XCTAssertLessThan(enScoreVertical, -5000, "Vertical promo video must be heavily penalized")
+
+        let deScoreGerman = YouTubeTrailerResolver.scoreImdbVideoName("Jojo's Bizarre Adventure: Stone Ocean (German Trailer 3 Subtitled)", preferredLanguage: "de-DE")
+        let deScoreEnglish = YouTubeTrailerResolver.scoreImdbVideoName("Official English Trailer", preferredLanguage: "de-DE")
+        XCTAssertGreaterThan(deScoreGerman, deScoreEnglish, "German trailer must score higher than English trailer for German user")
     }
 }

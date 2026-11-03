@@ -2091,11 +2091,8 @@ struct TrailerPlaybackSource {
         self.diagnostics = diagnostics
     }
 
-    /// Creates an AVPlayerItem for the trailer stream. When separate video and
-    /// audio URLs are present (e.g. YouTube adaptive 1080p/720p streams), it
-    /// composes both tracks into an AVMutableComposition with synchronized
-    /// playback in AVPlayer.
-    func makePlayerItem(preferredForwardBufferDuration: TimeInterval? = nil) async -> AVPlayerItem? {
+    /// Creates an AVPlayerItem for the trailer stream.
+    func makePlayerItem(preferredForwardBufferDuration: TimeInterval? = nil) -> AVPlayerItem? {
         guard let url = URL(string: videoUrl) else { return nil }
         let videoAsset: AVURLAsset
         if let userAgent = requestHeaders["User-Agent"], !userAgent.isEmpty {
@@ -2104,66 +2101,7 @@ struct TrailerPlaybackSource {
             videoAsset = AVURLAsset(url: url)
         }
 
-        let item: AVPlayerItem
-        if let audioUrlString = audioUrl,
-           let audioURL = URL(string: audioUrlString) {
-            let audioAsset: AVURLAsset
-            if let userAgent = requestHeaders["User-Agent"], !userAgent.isEmpty {
-                audioAsset = AVURLAsset(url: audioURL, options: [AVURLAssetHTTPUserAgentKey: userAgent])
-            } else {
-                audioAsset = AVURLAsset(url: audioURL)
-            }
-
-            do {
-                let videoTracks = try await videoAsset.loadTracks(withMediaType: .video)
-                let audioTracks = try await audioAsset.loadTracks(withMediaType: .audio)
-                guard !Task.isCancelled else { return nil }
-
-                if let videoTrack = videoTracks.first,
-                   let audioTrack = audioTracks.first {
-                    let videoDuration = try await videoAsset.load(.duration)
-                    let audioDuration = try await audioAsset.load(.duration)
-                    guard !Task.isCancelled else { return nil }
-
-                    if videoDuration.isNumeric, audioDuration.isNumeric,
-                       CMTimeCompare(videoDuration, .zero) > 0,
-                       CMTimeCompare(audioDuration, .zero) > 0 {
-                        let composition = AVMutableComposition()
-                        if let compVideo = composition.addMutableTrack(
-                            withMediaType: .video,
-                            preferredTrackID: kCMPersistentTrackID_Invalid
-                        ), let compAudio = composition.addMutableTrack(
-                            withMediaType: .audio,
-                            preferredTrackID: kCMPersistentTrackID_Invalid
-                        ) {
-                            try compVideo.insertTimeRange(
-                                CMTimeRange(start: .zero, duration: videoDuration),
-                                of: videoTrack,
-                                at: .zero
-                            )
-                            try compAudio.insertTimeRange(
-                                CMTimeRange(start: .zero, duration: CMTimeMinimum(videoDuration, audioDuration)),
-                                of: audioTrack,
-                                at: .zero
-                            )
-                            item = AVPlayerItem(asset: composition)
-                        } else {
-                            item = AVPlayerItem(asset: videoAsset)
-                        }
-                    } else {
-                        item = AVPlayerItem(asset: videoAsset)
-                    }
-                } else {
-                    item = AVPlayerItem(asset: videoAsset)
-                }
-            } catch {
-                guard !Task.isCancelled else { return nil }
-                item = AVPlayerItem(asset: videoAsset)
-            }
-        } else {
-            item = AVPlayerItem(asset: videoAsset)
-        }
-
+        let item = AVPlayerItem(asset: videoAsset)
         if let preferredForwardBufferDuration {
             item.preferredForwardBufferDuration = preferredForwardBufferDuration
         }

@@ -1355,7 +1355,7 @@ struct TrailerPreviewPlayer: View {
 
         currentPlaybackSource = playbackSource
 
-        guard let item = await playbackSource.makePlayerItem(preferredForwardBufferDuration: 2.0) else {
+        guard let item = playbackSource.makePlayerItem(preferredForwardBufferDuration: 2.0) else {
             guard !Task.isCancelled else { return }
             reportPlaybackUnavailable()
             return
