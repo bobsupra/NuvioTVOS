@@ -180,12 +180,12 @@ struct CalendarService: Sendable {
     }
 
     private func item(filling item: CalendarItem, tmdbId: Int, name: String?, posterPath: String?) -> CalendarItem {
-        let existingName = item.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let existingName = CalendarText.readableLibraryTitle(item.name)
         return CalendarItem(
             id: item.id,
             kind: item.kind,
             type: item.type,
-            name: existingName.flatMap { $0.isEmpty ? nil : $0 } ?? name,
+            name: existingName ?? name,
             posterURL: item.posterURL ?? CalendarTmdb.imageURL(posterPath, size: "w342")?.absoluteString,
             year: item.year,
             imdbId: item.imdbId,

@@ -33,6 +33,23 @@ enum CalendarTmdbError: Error, Equatable, Sendable {
 }
 
 enum CalendarText {
+    /// IDs from tracker/library records are not display titles. Prefer a
+    /// resolved TMDB name over an IMDb or TMDB identifier when available.
+    static func readableLibraryTitle(_ candidate: String?) -> String? {
+        guard let text = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.isEmpty else { return nil }
+        let lower = text.lowercased()
+        let imdb = lower.hasPrefix("imdb:") ? String(lower.dropFirst(5)) : lower
+        if imdb.hasPrefix("tt"), imdb.count > 2,
+           imdb.dropFirst(2).allSatisfy({ $0.isNumber }) {
+            return nil
+        }
+        if lower.hasPrefix("tmdb:"), Int(lower.dropFirst(5)) != nil {
+            return nil
+        }
+        return text
+    }
+
     /// True when the text is written in a script most viewers of a Latin,
     /// Cyrillic or Greek UI can't read: Japanese, Chinese, Korean, Indic
     /// (Devanagari, Bengali, Tamil…), Thai, Lao, Khmer, Myanmar, Arabic,

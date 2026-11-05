@@ -70,7 +70,7 @@ enum CalendarBuilder {
     ) -> [CalendarEntry] {
         // A library name in Japanese/Chinese/Korean script gives way to the
         // readable (localized or English) TMDB name.
-        let libraryName = nonEmpty(item.name)
+        let libraryName = CalendarText.readableLibraryTitle(item.name)
         let title = libraryName.flatMap { CalendarText.isNonLatin($0) ? nil : $0 }
             ?? details.readableName
             ?? libraryName ?? nonEmpty(details.name) ?? item.id
@@ -149,7 +149,7 @@ enum CalendarBuilder {
             candidates = [(primary, .release)]
         }
 
-        let title = nonEmpty(item.name) ?? nonEmpty(details.title) ?? item.id
+        let title = CalendarText.readableLibraryTitle(item.name) ?? nonEmpty(details.title) ?? item.id
         let poster = CalendarTmdb.imageURL(details.posterPath, size: "w342")
             ?? item.posterURL.flatMap(URL.init(string:))
         let backdrop = CalendarTmdb.imageURL(details.backdropPath, size: "w500")

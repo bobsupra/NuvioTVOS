@@ -412,6 +412,28 @@ final class CalendarServiceTests: XCTestCase {
         )
     }
 
+    func testTechnicalIdentifierNamesAreEnrichedInCalendarAndFollowState() async throws {
+        let http = CalendarMockHTTP([
+            "/tv/5": (200, #"{"id":5,"name":"Resolved Series","seasons":[{"season_number":1,"air_date":"2026-10-01"}]}"#),
+            "/tv/5/season/1": (200, #"{"episodes":[{"air_date":"2026-10-20","episode_number":1,"season_number":1}]}"#),
+            "/movie/9": (200, #"{"id":9,"title":"Resolved Film","release_date":"2026-11-01","release_dates":{"results":[]}}"#),
+        ])
+        let series = CalendarItem(
+            id: "tt0053494", kind: .series, name: "tt0053494", imdbId: "tt0053494"
+        )
+        let movie = CalendarItem(id: "tmdb:9", kind: .movie, name: "tmdb:9")
+        let result = try await service(http, ids: ["tt0053494": 5, "tmdb:9": 9]).load(
+            items: [series, movie],
+            first: periodFirst,
+            last: periodLast,
+            automaticFollowItemIDs: [series.sourceIdentityKey, movie.sourceIdentityKey]
+        )
+
+        XCTAssertEqual(result.automaticFollowItems["series:5"]?.name, "Resolved Series")
+        XCTAssertEqual(result.automaticFollowItems["movie:9"]?.name, "Resolved Film")
+        XCTAssertEqual(Set(result.days.flatMap(\.entries).map(\.title)), ["Resolved Series", "Resolved Film"])
+    }
+
     func testLongReleasedMoviesAreNotRequested() async throws {
         let http = CalendarMockHTTP([:])
         let old = CalendarItem(id: "tmdb:11", kind: .movie, year: 1999)
@@ -1017,6 +1039,39 @@ final class CalendarReadableTitleTests: XCTestCase {
         let details = try JSONDecoder().decode(CalendarTmdb.TvDetails.self, from: Data(json.utf8))
         XCTAssertEqual(details.readableName, "The Apothecary Diaries")
         XCTAssertEqual(CalendarTmdb.TvDetails(id: 2, name: "Ordinace").readableName, "Ordinace")
+    }
+
+    func testCalendarRejectsTechnicalLibraryNamesButPreservesRealTitles() {
+        XCTAssertNil(CalendarText.readableLibraryTitle("tt0053494"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("  TT0068069  "))
+        XCTAssertNil(CalendarText.readableLibraryTitle("imdb:tt0056758"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("tmdb:444"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("  "))
+        XCTAssertEqual(CalendarText.readableLibraryTitle("One Piece"), "One Piece")
+        XCTAssertEqual(CalendarText.readableLibraryTitle("  A Real Series  "), "A Real Series")
+        XCTAssertEqual(CalendarText.readableLibraryTitle("Titanic"), "Titanic")
+    }
+
+    func testCalendarEventsPreferResolvedNamesOverImdbAndTmdbIdentifiers() {
+        let day = CalendarDay(year: 2026, month: 11, day: 5)
+        let seriesItem = CalendarItem(id: "tt0053494", kind: .series, name: "tt0053494")
+        let seriesDetails = CalendarTmdb.TvDetails(id: 123, name: "Resolved Series")
+        let episodes = [
+            CalendarTmdb.Episode(airDate: "2026-11-05", episodeNumber: 1, seasonNumber: 1)
+        ]
+        let seriesEntries = CalendarBuilder.episodeEntries(
+            item: seriesItem, details: seriesDetails, episodes: episodes, first: day, last: day
+        )
+        XCTAssertEqual(seriesEntries.first?.title, "Resolved Series")
+
+        let movieItem = CalendarItem(id: "tmdb:444", kind: .movie, name: "tmdb:444")
+        let movieDetails = CalendarTmdb.MovieDetails(
+            id: 444, title: "Resolved Movie", releaseDate: "2026-11-05"
+        )
+        let movieEntries = CalendarBuilder.movieEntries(
+            item: movieItem, details: movieDetails, region: "US", first: day, last: day
+        )
+        XCTAssertEqual(movieEntries.first?.title, "Resolved Movie")
     }
 
     func testCalendarUsesReadableNameAndDropsCJKEpisodeTitles() {
