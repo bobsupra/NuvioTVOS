@@ -713,6 +713,14 @@ class DetailsViewModel: ObservableObject {
                             self?.applyTmdbEpisodes(episodes, for: meta.id, generation: generation)
                         }
                     }
+
+                    // 3c. SeriesGraph Episode Ratings (TV series)
+                    group.addTask {
+                        let seriesRatings = await SeriesGraphRatingsService.shared.fetchRatings(for: meta)
+                        await MainActor.run { [weak self] in
+                            self?.applySeriesGraphRatings(seriesRatings, for: meta.id, generation: generation)
+                        }
+                    }
                 }
 
                 // 3b. TMDB Certification (Content Rating)
@@ -880,9 +888,61 @@ class DetailsViewModel: ObservableObject {
             )
             let updatedMeta = currentMeta.withVideos(mergedVideos)
             uiState.meta = updatedMeta
+
+            if let tmdbId = currentMeta.tmdbId {
+                for ep in episodes {
+                    if let r = ep.rating, let val = Double(r), val > 0 {
+                        let epSeason = ep.season
+                        let epNum = ep.episode
+                        Task {
+                            await TmdbEpisodeRatingsStore.shared.setRating(
+                                tmdbId: tmdbId,
+                                season: epSeason,
+                                episode: epNum,
+                                voteAverage: val
+                            )
+                        }
+                    }
+                }
+            }
+
             if (updatedMeta.isSeries || NuvioMeta.isSeriesType(updatedMeta.type)) && prefetchedStreamId == nil {
                 triggerStreamPreFetch(for: updatedMeta)
             }
+        }
+    }
+
+    private func applySeriesGraphRatings(
+        _ ratings: [String: SeriesGraphEpisodeRating],
+        for metaId: String,
+        generation: UInt64
+    ) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
+        guard !ratings.isEmpty, let currentMeta = uiState.meta, let videos = currentMeta.videos, !videos.isEmpty else { return }
+
+        var modified = false
+        let updatedVideos = videos.map { video -> NuvioVideo in
+            let key = "\(video.season):\(video.episode)"
+            guard let epRating = ratings[key] else { return video }
+            let formatted = String(format: "%.1f", epRating.rating)
+            if video.rating != formatted {
+                modified = true
+                return NuvioVideo(
+                    id: video.id,
+                    title: video.title,
+                    season: video.season,
+                    episode: video.episode,
+                    thumbnail: video.thumbnail,
+                    overview: video.overview,
+                    released: video.released,
+                    rating: formatted
+                )
+            }
+            return video
+        }
+
+        if modified {
+            uiState.meta = currentMeta.withVideos(updatedVideos)
         }
     }
 
@@ -1200,7 +1260,7 @@ class DetailsViewModel: ObservableObject {
                     thumbnail: tmdb.thumbnail ?? ex.thumbnail,
                     overview: overviewToUse,
                     released: tmdb.released ?? ex.released,
-                    rating: tmdb.rating ?? ex.rating
+                    rating: nonEmpty(ex.rating) ?? nonEmpty(tmdb.rating)
                 ))
             } else {
                 result.append(tmdb)

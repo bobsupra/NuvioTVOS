@@ -606,6 +606,368 @@ final class ExternalRatingsTests: XCTestCase {
         XCTAssertEqual(merged.externalRatings?.count, 1)
         XCTAssertEqual(merged.externalRatings?.first?.source, "tmdb")
     }
+
+    func testHeroEpisodeRatingStringFormattingAndFallback() {
+        let seriesMeta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            type: "series",
+            rating: 9.5
+        )
+        let episodeVideo = NuvioVideo(
+            id: "tt0903747:5:14",
+            title: "Ozymandias",
+            season: 5,
+            episode: 14,
+            rating: "10.0"
+        )
+        let externalRatings = [
+            NuvioExternalRating(source: "tmdb", value: 9.8),
+            NuvioExternalRating(source: "tomatoes", value: 100)
+        ]
+
+        // 1. Episode rating formatted for IMDb
+        let imdbStr = AddonRatingsService.heroEpisodeRatingString(
+            for: seriesMeta,
+            video: episodeVideo,
+            source: "imdb",
+            ratings: nil
+        )
+        XCTAssertEqual(imdbStr, "IMDb 10.0")
+
+        // 2. Episode external rating formatted for requested source
+        let rtStr = AddonRatingsService.heroEpisodeRatingString(
+            for: seriesMeta,
+            video: episodeVideo,
+            source: "tomatoes",
+            ratings: externalRatings
+        )
+        XCTAssertEqual(rtStr, "Rotten Tomatoes 100%")
+
+        // 3. Fallback to episode rating when requested source is not in external ratings
+        let fallbackStr = AddonRatingsService.heroEpisodeRatingString(
+            for: seriesMeta,
+            video: episodeVideo,
+            source: "letterboxd",
+            ratings: externalRatings
+        )
+        XCTAssertEqual(fallbackStr, "IMDb 10.0")
+
+        // 4. Fallback to series rating when episode has no rating
+        let unratedEpisode = NuvioVideo(
+            id: "tt0903747:1:1",
+            title: "Pilot",
+            season: 1,
+            episode: 1,
+            rating: nil
+        )
+        let seriesFallbackStr = AddonRatingsService.heroEpisodeRatingString(
+            for: seriesMeta,
+            video: unratedEpisode,
+            source: "imdb",
+            ratings: nil
+        )
+        XCTAssertEqual(seriesFallbackStr, "IMDb 9.5")
+    }
+
+    func testHeroEpisodeDisplayRatings() {
+        let seriesMeta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            type: "series",
+            rating: 9.5
+        )
+        let episodeVideo = NuvioVideo(
+            id: "tt0903747:5:14",
+            title: "Ozymandias",
+            season: 5,
+            episode: 14,
+            rating: "10.0"
+        )
+        let epFetched = [
+            NuvioExternalRating(source: "tmdb", value: 9.8)
+        ]
+
+        let displayRatings = AddonRatingsService.heroEpisodeDisplayRatings(
+            for: seriesMeta,
+            video: episodeVideo,
+            fetched: epFetched
+        )
+        XCTAssertEqual(displayRatings.count, 2)
+        XCTAssertTrue(displayRatings.contains(where: { $0.source == "tmdb" && $0.value == 9.8 }))
+        XCTAssertTrue(displayRatings.contains(where: { $0.source == "imdb" && $0.value == 10.0 }))
+
+        // Fallback to series display ratings when episode has no ratings
+        let emptyEpisode = NuvioVideo(
+            id: "tt0903747:1:1",
+            title: "Pilot",
+            season: 1,
+            episode: 1,
+            rating: nil
+        )
+        let fallbackRatings = AddonRatingsService.heroEpisodeDisplayRatings(
+            for: seriesMeta,
+            video: emptyEpisode,
+            fetched: nil
+        )
+        XCTAssertEqual(fallbackRatings.count, 1)
+        XCTAssertEqual(fallbackRatings.first?.value, 9.5)
+    }
+
+    // MARK: - SeriesGraph Tests
+
+    func testSeriesGraphRatingsServiceParsesAndResolvesRatings() async throws {
+        let seriesGraph = SeriesGraphRatingsService()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockRatingsTestURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        let sampleJson = """
+        [
+          {
+            "season_number": 1,
+            "episodes": [
+              {
+                "vote_average": 7.8,
+                "num_votes": 8111,
+                "episode_number": 1,
+                "name": "No Strings",
+                "season_number": 1,
+                "tconst": "tt23134204"
+              },
+              {
+                "episode_number": 2,
+                "name": "Unaired Episode",
+                "season_number": 1,
+                "vote_average": null
+              }
+            ]
+          }
+        ]
+        """.data(using: .utf8)!
+
+        let cinemetaJson = """
+        {
+          "meta": {
+            "id": "tt23112594",
+            "moviedb_id": 213375
+          }
+        }
+        """.data(using: .utf8)!
+
+        MockRatingsTestURLProtocol.requestHandler = { request in
+            let urlStr = request.url?.absoluteString ?? ""
+            if urlStr.contains("cinemeta.strem.io") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, cinemetaJson)
+            } else if urlStr.contains("seriesgraph.com") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, sampleJson)
+            }
+            throw URLError(.badURL)
+        }
+
+        // Test resolving TMDB ID from IMDb parent ID
+        let resolvedTmdbId = await seriesGraph.resolveTmdbId(forParentId: "tt23112594", session: session)
+        XCTAssertEqual(resolvedTmdbId, 213375)
+
+        // Test fetching ratings
+        let ratings = await seriesGraph.fetchRatings(forTmdbId: 213375, session: session)
+        XCTAssertEqual(ratings.count, 1)
+        XCTAssertEqual(ratings["1:1"]?.rating, 7.8)
+        XCTAssertEqual(ratings["1:1"]?.voteCount, 8111)
+        XCTAssertEqual(ratings["1:1"]?.imdbEpisodeId, "tt23134204")
+        XCTAssertEqual(ratings["1:1"]?.title, "No Strings")
+
+        // Unaired episode 2 with null rating should be omitted
+        XCTAssertNil(ratings["1:2"])
+
+        // Test direct episode identifier lookup
+        let episodeRating = await seriesGraph.rating(forEpisodeIdentifier: "tt23112594:1:1", session: session)
+        XCTAssertNotNil(episodeRating)
+        XCTAssertEqual(episodeRating?.rating, 7.8)
+        XCTAssertEqual(episodeRating?.voteCount, 8111)
+
+        // Test direct IMDb ID lookup
+        let imdbLookup = await seriesGraph.rating(forEpisodeIdentifier: "tt23134204", session: session)
+        XCTAssertNotNil(imdbLookup)
+        XCTAssertEqual(imdbLookup?.rating, 7.8)
+    }
+
+    func testAddonRatingsServiceEnrichesWithSeriesGraph() async throws {
+        await AddonEpisodeRatingsCache.shared.clear()
+        await SeriesGraphRatingsService.shared.clear()
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockRatingsTestURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        let sampleJson = """
+        [
+          {
+            "season_number": 2,
+            "episodes": [
+              {
+                "vote_average": 7.8,
+                "num_votes": 2289,
+                "episode_number": 10,
+                "name": "Reconstruction",
+                "season_number": 2,
+                "tconst": "tt31187589"
+              }
+            ]
+          }
+        ]
+        """.data(using: .utf8)!
+
+        let cinemetaJson = """
+        {
+          "meta": {
+            "id": "tt16358384",
+            "moviedb_id": 153312
+          }
+        }
+        """.data(using: .utf8)!
+
+        MockRatingsTestURLProtocol.requestHandler = { request in
+            let urlStr = request.url?.absoluteString ?? ""
+            if urlStr.contains("cinemeta.strem.io") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, cinemetaJson)
+            } else if urlStr.contains("seriesgraph.com") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, sampleJson)
+            }
+            throw URLError(.badURL)
+        }
+
+        // Test fetchRatingsForEpisode with SeriesGraph fallback
+        let episodeRatings = await AddonRatingsService.fetchRatingsForEpisode(
+            episodeId: "tt16358384:2:10",
+            manifestURLs: [],
+            session: session
+        )
+        XCTAssertEqual(episodeRatings.count, 1)
+        XCTAssertEqual(episodeRatings.first?.source, "imdb")
+        XCTAssertEqual(episodeRatings.first?.value, 7.8)
+
+        // Test batch fetchRatingsForEpisodes
+        let batchRatings = await AddonRatingsService.fetchRatingsForEpisodes(
+            episodeIds: ["tt16358384:2:10"],
+            manifestURLs: [],
+            session: session
+        )
+        XCTAssertEqual(batchRatings["tt16358384:2:10"]?.count, 1)
+        XCTAssertEqual(batchRatings["tt16358384:2:10"]?.first?.value, 7.8)
+    }
+
+    func testAddonRatingsServiceEnrichesWithTmdbEpisodeRating() async throws {
+        await AddonEpisodeRatingsCache.shared.clear()
+        await SeriesGraphRatingsService.shared.clear()
+        await TmdbEpisodeRatingsStore.shared.clear()
+
+        // Seed TMDB episode rating
+        await TmdbEpisodeRatingsStore.shared.setRating(
+            tmdbId: 213375,
+            season: 1,
+            episode: 1,
+            voteAverage: 7.3
+        )
+
+        let sampleJson = """
+        [
+          {
+            "season_number": 1,
+            "episodes": [
+              {
+                "vote_average": 7.8,
+                "num_votes": 8111,
+                "episode_number": 1,
+                "name": "No Strings",
+                "season_number": 1,
+                "tconst": "tt23134204"
+              }
+            ]
+          }
+        ]
+        """.data(using: .utf8)!
+
+        let cinemetaJson = """
+        {
+          "meta": {
+            "id": "tt23112594",
+            "moviedb_id": 213375
+          }
+        }
+        """.data(using: .utf8)!
+
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [MockRatingsTestURLProtocol.self]
+        let session = URLSession(configuration: config)
+
+        MockRatingsTestURLProtocol.requestHandler = { request in
+            let urlStr = request.url?.absoluteString ?? ""
+            if urlStr.contains("cinemeta.strem.io") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, cinemetaJson)
+            } else if urlStr.contains("seriesgraph.com") {
+                let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+                return (response, sampleJson)
+            }
+            throw URLError(.badURL)
+        }
+
+        let episodeRatings = await AddonRatingsService.fetchRatingsForEpisode(
+            episodeId: "tt23112594:1:1",
+            manifestURLs: [],
+            session: session
+        )
+
+        XCTAssertEqual(episodeRatings.count, 2)
+        XCTAssertTrue(episodeRatings.contains(where: { $0.source == "imdb" && $0.value == 7.8 }))
+        XCTAssertTrue(episodeRatings.contains(where: { $0.source == "tmdb" && $0.value == 7.3 }))
+
+        // Test visual lookup for badges
+        let imdbVisual = TvRatingVisual.visual(for: "imdb")
+        XCTAssertEqual(imdbVisual?.assetName, "rating_imdb")
+        let tmdbVisual = TvRatingVisual.visual(for: "tmdb")
+        XCTAssertEqual(tmdbVisual?.assetName, "rating_tmdb")
+    }
+
+    @MainActor
+    func testDetailsViewModelMergeEpisodesPreservesExistingRatings() {
+        let existing = [
+            NuvioVideo(
+                id: "tt23112594:1:1",
+                title: "No Strings",
+                season: 1,
+                episode: 1,
+                rating: "7.8"
+            )
+        ]
+        let tmdb = [
+            NuvioVideo(
+                id: "tmdb:213375:1:1",
+                title: "No Strings",
+                season: 1,
+                episode: 1,
+                rating: "7.3"
+            )
+        ]
+
+        let merged = DetailsViewModel.mergeEpisodes(
+            existing: existing,
+            fromTmdb: tmdb,
+            parentId: "tt23112594"
+        )
+        XCTAssertEqual(merged?.count, 1)
+        // Existing IMDb rating (7.8) should be preserved over TMDB rating (7.3)
+        XCTAssertEqual(merged?.first?.rating, "7.8")
+    }
+
+    func testSettingsKeyIncludesEpisodeRatings() {
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.continueWatchingEpisodeRatings))
+    }
 }
 
 private class MockRatingsTestURLProtocol: URLProtocol {

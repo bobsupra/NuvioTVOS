@@ -452,6 +452,17 @@ struct DetailsScreen: View {
             finishSmartPlaybackIfPossible()
             performBackgroundAutoSelectionAndPreResolution()
         }
+        .onChange(of: backgroundStreamPreFetch) { _, isEnabled in
+            if isEnabled {
+                if let meta = viewModel.uiState.meta, meta.id == id {
+                    viewModel.triggerStreamPreFetch(for: meta)
+                }
+                performBackgroundAutoSelectionAndPreResolution()
+            } else {
+                resetPreResolutionCandidate()
+                streamDiscoveryDuration = nil
+            }
+        }
         .onChange(of: viewModel.uiState.isLoading) { _, isLoading in
             if !isLoading {
                 if let meta = viewModel.uiState.meta, meta.id == id, !meta.isSeries {
@@ -1049,8 +1060,7 @@ struct DetailsScreen: View {
 
     private func performBackgroundAutoSelectionAndPreResolution() {
         guard isDetailsPlaybackContextActive, !didHandOffPlayback else { return }
-        let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
-        guard prefetchEnabled else {
+        guard backgroundStreamPreFetch else {
             resetPreResolutionCandidate()
             return
         }
@@ -1217,6 +1227,7 @@ struct DetailsScreen: View {
             guard !Task.isCancelled,
                   self.isDetailsPlaybackContextActive,
                   !self.didHandOffPlayback,
+                  self.backgroundStreamPreFetch,
                   self.preResolutionGeneration == resolutionGeneration else { return }
 
             guard let candidate else {
@@ -1241,6 +1252,11 @@ struct DetailsScreen: View {
         meta: NuvioMeta,
         smartStreamSelection: Bool
     ) {
+        guard backgroundStreamPreFetch else {
+            resetPreResolutionCandidate()
+            return
+        }
+
         let identity = DetailsBackgroundResolutionIdentity(
             streamID: currentStreamId,
             episodeID: currentEpisode?.id,
@@ -1306,7 +1322,10 @@ struct DetailsScreen: View {
             var resolvedURL: URL? = nil
             var debridFilename: String? = nil
             var debridVideoSize: Int64? = nil
-            if resolver.isEnabled {
+            if resolver.isEnabled,
+               !Task.isCancelled,
+               self.backgroundStreamPreFetch,
+               self.preResolutionGeneration == resolutionGeneration {
                 let result = await resolver.resolvedURL(for: candidate, season: season, episode: episode)
                 if case let .success(url, filename, videoSize)? = result {
                     resolvedURL = url
@@ -1363,7 +1382,7 @@ struct DetailsScreen: View {
         let eligible = DetailsPlaybackPrewarmPolicy.shouldPrewarm(
             url: url,
             backend: backend,
-            backgroundStreamPreFetchEnabled: (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true,
+            backgroundStreamPreFetchEnabled: backgroundStreamPreFetch,
             smartStreamSelectionEnabled: smartStreamSelection,
             usesExternalPlayer: effectivePlayer(for: nil) != .builtIn,
             isPlayableMovieOrEpisode: isPlayableMovieOrEpisode,
@@ -1429,7 +1448,7 @@ struct DetailsScreen: View {
         let eligible = DetailsPlaybackPrewarmPolicy.shouldPrewarm(
             url: target.url,
             backend: backend,
-            backgroundStreamPreFetchEnabled: (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true,
+            backgroundStreamPreFetchEnabled: backgroundStreamPreFetch,
             smartStreamSelectionEnabled: smartStreamSelection,
             usesExternalPlayer: effectivePlayer(for: nil) != .builtIn,
             isPlayableMovieOrEpisode: isPlayableMovieOrEpisode,
@@ -8000,7 +8019,6 @@ private struct TvDetailsEpisodes: View {
                     TvEpisodeCard(
                         video: video,
                         fallbackArtworkURL: meta.backdropUrl,
-                        fallbackRating: seriesRating,
                         continueProgress: continueProgress(for: video),
                         isWatched: watchedEpisodeKeys.contains(watchKey),
                         watchCount: episodeWatchCount,
@@ -8088,6 +8106,12 @@ private struct TvDetailsEpisodes: View {
             let indices = materializedEpisodeIndices(visibleCardCount: visibleCount)
             let episodes = indices.compactMap { seasonEpisodes.indices.contains($0) ? seasonEpisodes[$0] : nil }
             guard !episodes.isEmpty else { return }
+            if let tmdbId = meta.tmdbId {
+                await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: meta.id)
+                if let imdb = meta.imdbId {
+                    await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: imdb)
+                }
+            }
             let ids = episodes.map { meta.canonicalEpisodeStreamId(for: $0) }
             let results = await AddonRatingsService.fetchRatingsForEpisodes(episodeIds: ids)
             if !results.isEmpty {
@@ -8251,7 +8275,6 @@ private struct TvEpisodeRatingItem: Identifiable {
 private struct TvEpisodeCard: View {
     let video: NuvioVideo
     let fallbackArtworkURL: String?
-    let fallbackRating: Double?
     let continueProgress: Double?
     let isWatched: Bool
     let watchCount: Int
@@ -8606,20 +8629,22 @@ private struct TvEpisodeCard: View {
 
         for rating in episodeRatings {
             let formatted = AddonRatingsService.formatRating(value: rating.value, max: rating.max)
+            let visual = TvRatingVisual.visual(for: rating.source)
             items.append(
                 TvEpisodeRatingItem(
                     id: rating.source,
                     source: rating.source,
-                    displayName: rating.name ?? rating.source.capitalized,
+                    displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
                     valueText: formatted,
                     iconUrl: rating.iconUrl.flatMap { URL(string: $0) },
-                    assetName: nil,
-                    color: Color(red: 0.96, green: 0.77, blue: 0.22)
+                    assetName: visual?.assetName,
+                    color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
                 )
             )
         }
 
-        if let ratingText {
+        if let ratingText,
+           !items.contains(where: { AddonRatingsService.normalizedSourceKey($0.source) == "imdb" }) {
             items.append(
                 TvEpisodeRatingItem(
                     id: "imdb",
@@ -8637,13 +8662,10 @@ private struct TvEpisodeCard: View {
     }
 
     private var ratingText: String? {
-        if let r = video.rating?.trimmingCharacters(in: .whitespaces), !r.isEmpty {
-            return r
+        guard let r = video.rating?.trimmingCharacters(in: .whitespaces), !r.isEmpty else {
+            return nil
         }
-        if episodeRatings.isEmpty, let fb = fallbackRating {
-            return String(format: "%.1f", fb)
-        }
-        return nil
+        return r
     }
 
     private var dateText: String? {
@@ -9167,20 +9189,22 @@ private struct TvStreamPickerOverlay: View {
 
         for rating in episodeRatings {
             let formatted = AddonRatingsService.formatRating(value: rating.value, max: rating.max)
+            let visual = TvRatingVisual.visual(for: rating.source)
             items.append(
                 TvEpisodeRatingItem(
                     id: rating.source,
                     source: rating.source,
-                    displayName: rating.name ?? rating.source.capitalized,
+                    displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
                     valueText: formatted,
                     iconUrl: rating.iconUrl.flatMap { URL(string: $0) },
-                    assetName: nil,
-                    color: Color(red: 0.96, green: 0.77, blue: 0.22)
+                    assetName: visual?.assetName,
+                    color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
                 )
             )
         }
 
-        if let ratingText = episode.rating?.trimmingCharacters(in: .whitespaces), !ratingText.isEmpty {
+        if let ratingText = episode.rating?.trimmingCharacters(in: .whitespaces), !ratingText.isEmpty,
+           !items.contains(where: { AddonRatingsService.normalizedSourceKey($0.source) == "imdb" }) {
             items.append(
                 TvEpisodeRatingItem(
                     id: "imdb",

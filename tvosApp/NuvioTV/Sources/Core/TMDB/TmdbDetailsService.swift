@@ -621,6 +621,22 @@ enum TmdbDetailsService {
             return []
         }
 
+        if let eps = seasonDetails.episodes {
+            for ep in eps {
+                if let epNum = ep.episodeNumber, let avg = ep.voteAverage, avg > 0 {
+                    let epSeason = ep.seasonNumber ?? seasonNumber
+                    Task {
+                        await TmdbEpisodeRatingsStore.shared.setRating(
+                            tmdbId: tmdbId,
+                            season: epSeason,
+                            episode: epNum,
+                            voteAverage: avg
+                        )
+                    }
+                }
+            }
+        }
+
         let baseParentId = parentId.hasPrefix("tt") ? parentId : "tmdb:\(tmdbId)"
         return (seasonDetails.episodes ?? []).compactMap { ep -> NuvioVideo? in
             guard let epNum = ep.episodeNumber else { return nil }
@@ -650,6 +666,54 @@ enum TmdbDetailsService {
                 rating: ratingStr
             )
         }
+    }
+
+    static func fetchEpisodeRating(
+        tmdbId: Int,
+        season: Int,
+        episode: Int,
+        session: URLSession = .shared,
+        defaults: UserDefaults = ProfileSettings.current
+    ) async -> Double? {
+        if let cached = await TmdbEpisodeRatingsStore.shared.rating(tmdbId: tmdbId, season: season, episode: episode) {
+            return cached
+        }
+
+        let key = defaults.string(forKey: SettingsKey.tmdbApiKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            ?? apiKey ?? ""
+        guard !key.isEmpty else { return nil }
+
+        let requestedLang = defaults.string(forKey: SettingsKey.tmdbLanguage) ?? preferredLanguage
+        var components = URLComponents(
+            url: apiBase.appendingPathComponent("tv/\(tmdbId)/season/\(season)"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: key),
+            URLQueryItem(name: "language", value: requestedLang)
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await session.data(for: URLRequest(url: url)),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let seasonDetails = try? JSONDecoder().decode(TmdbSeasonDetailsResponse.self, from: data),
+              let eps = seasonDetails.episodes else {
+            return nil
+        }
+
+        for ep in eps {
+            if let epNum = ep.episodeNumber, let avg = ep.voteAverage, avg > 0 {
+                let epSeason = ep.seasonNumber ?? season
+                await TmdbEpisodeRatingsStore.shared.setRating(
+                    tmdbId: tmdbId,
+                    season: epSeason,
+                    episode: epNum,
+                    voteAverage: avg
+                )
+            }
+        }
+
+        return await TmdbEpisodeRatingsStore.shared.rating(tmdbId: tmdbId, season: season, episode: episode)
     }
 
     /// Applies the selected TMDB language to user-facing text while retaining
@@ -1588,6 +1652,24 @@ struct TmdbResponseCache<Value> {
     mutating func removeAll() {
         values.removeAll()
         recency.removeAll()
+    }
+}
+
+actor TmdbEpisodeRatingsStore {
+    static let shared = TmdbEpisodeRatingsStore()
+
+    private var cache: [String: Double] = [:] // Key: "\(tmdbId):\(season):\(episode)"
+
+    func setRating(tmdbId: Int, season: Int, episode: Int, voteAverage: Double) {
+        cache["\(tmdbId):\(season):\(episode)"] = voteAverage
+    }
+
+    func rating(tmdbId: Int, season: Int, episode: Int) -> Double? {
+        cache["\(tmdbId):\(season):\(episode)"]
+    }
+
+    func clear() {
+        cache.removeAll()
     }
 }
 

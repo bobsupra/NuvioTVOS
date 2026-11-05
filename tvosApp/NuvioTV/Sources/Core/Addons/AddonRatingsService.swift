@@ -472,55 +472,81 @@ enum AddonRatingsService {
             return cached
         }
 
+        var addonRatings: [NuvioExternalRating] = []
         let urls = manifestURLs ?? CinemetaCatalogRepository.configuredStreamAddonManifestURLs(in: defaults)
-        guard !urls.isEmpty else {
-            await AddonEpisodeRatingsCache.shared.setRatings([], for: cleanId)
-            return []
-        }
+        if !urls.isEmpty {
+            let manifests = await loadManifestsConcurrently(urls: urls)
+            var eligible: [(url: URL, manifest: AddonRatingsManifest)] = []
+            for url in urls {
+                guard let manifest = manifests[url],
+                      manifest.supportsRatings(type: seriesType, id: cleanId),
+                      let sources = manifest.ratingSources,
+                      sources.contains(where: { ($0.episodes == true) && isSourceEnabled($0.source, defaults: defaults) && !builtInProviders.contains($0.source.lowercased()) })
+                else { continue }
+                eligible.append((url, manifest))
+            }
 
-        let manifests = await loadManifestsConcurrently(urls: urls)
-        var eligible: [(url: URL, manifest: AddonRatingsManifest)] = []
-        for url in urls {
-            guard let manifest = manifests[url],
-                  manifest.supportsRatings(type: seriesType, id: cleanId),
-                  let sources = manifest.ratingSources,
-                  sources.contains(where: { ($0.episodes == true) && isSourceEnabled($0.source, defaults: defaults) && !builtInProviders.contains($0.source.lowercased()) })
-            else { continue }
-            eligible.append((url, manifest))
-        }
-
-        guard !eligible.isEmpty else {
-            await AddonEpisodeRatingsCache.shared.setRatings([], for: cleanId)
-            return []
-        }
-
-        let ratings = await withTaskGroup(of: (Int, [NuvioExternalRating]).self) { group in
-            for (index, item) in eligible.enumerated() {
-                group.addTask {
-                    (
-                        index,
-                        await fetchRatingsFromAddon(
-                            manifestURL: item.url,
-                            manifest: item.manifest,
-                            type: seriesType,
-                            id: cleanId,
-                            session: session,
-                            defaults: defaults,
-                            episodesOnly: true
-                        )
-                    )
+            if !eligible.isEmpty {
+                addonRatings = await withTaskGroup(of: (Int, [NuvioExternalRating]).self) { group in
+                    for (index, item) in eligible.enumerated() {
+                        group.addTask {
+                            (
+                                index,
+                                await fetchRatingsFromAddon(
+                                    manifestURL: item.url,
+                                    manifest: item.manifest,
+                                    type: seriesType,
+                                    id: cleanId,
+                                    session: session,
+                                    defaults: defaults,
+                                    episodesOnly: true
+                                )
+                            )
+                        }
+                    }
+                    var ratingsByAddon: [Int: [NuvioExternalRating]] = [:]
+                    for await (index, ratings) in group {
+                        ratingsByAddon[index] = ratings
+                    }
+                    let ordered = eligible.indices.flatMap { ratingsByAddon[$0] ?? [] }
+                    return deduplicatedRatings(ordered)
                 }
             }
-            var ratingsByAddon: [Int: [NuvioExternalRating]] = [:]
-            for await (index, ratings) in group {
-                ratingsByAddon[index] = ratings
-            }
-            let ordered = eligible.indices.flatMap { ratingsByAddon[$0] ?? [] }
-            return deduplicatedRatings(ordered)
         }
 
-        await AddonEpisodeRatingsCache.shared.setRatings(ratings, for: cleanId)
-        return ratings
+        // If no IMDb rating from addons, enrich via SeriesGraph (the same backend used by Android TV)
+        var combined = addonRatings
+        if !combined.contains(where: { $0.source.lowercased() == "imdb" }),
+           isSourceEnabled("imdb", defaults: defaults) {
+            if let sgRating = await SeriesGraphRatingsService.shared.rating(forEpisodeIdentifier: cleanId, session: session) {
+                combined.append(
+                    NuvioExternalRating(
+                        source: "imdb",
+                        value: sgRating.rating,
+                        max: 10
+                    )
+                )
+            }
+        }
+
+        // If no TMDB rating from addons, enrich via TMDB
+        if !combined.contains(where: { $0.source.lowercased() == "tmdb" }),
+           isSourceEnabled("tmdb", defaults: defaults) {
+            if let tmdbScore = await fetchTmdbEpisodeRating(forEpisodeIdentifier: cleanId, session: session, defaults: defaults) {
+                combined.append(
+                    NuvioExternalRating(
+                        source: "tmdb",
+                        value: tmdbScore,
+                        max: 10
+                    )
+                )
+            }
+        }
+
+        var seen = Set<String>()
+        let result = combined.filter { seen.insert($0.source.lowercased()).inserted }
+        await AddonEpisodeRatingsCache.shared.setRatings(result, for: cleanId)
+        return result
     }
 
     static func fetchRatingsForEpisodes(
@@ -547,13 +573,18 @@ enum AddonRatingsService {
 
         guard !missing.isEmpty else { return results }
 
-        let hasProviders = await hasEpisodeRatingProviders(manifestURLs: manifestURLs, defaults: defaults)
-        if !hasProviders {
-            for id in missing {
-                await AddonEpisodeRatingsCache.shared.setRatings([], for: id)
-                results[id] = []
+        // Pre-warm SeriesGraph cache for parent series IDs to resolve in one single batch HTTP call
+        var parentIds = Set<String>()
+        for id in missing {
+            let parts = id.split(separator: ":")
+            if parts.count >= 3 {
+                parentIds.insert(String(parts[0]))
             }
-            return results
+        }
+        for parentId in parentIds {
+            if let tmdbId = await SeriesGraphRatingsService.shared.resolveTmdbId(forParentId: parentId, session: session) {
+                _ = await SeriesGraphRatingsService.shared.fetchRatings(forTmdbId: tmdbId, session: session)
+            }
         }
 
         await withTaskGroup(of: (String, [NuvioExternalRating]).self) { group in
@@ -575,6 +606,33 @@ enum AddonRatingsService {
         }
 
         return results
+    }
+
+    static func fetchTmdbEpisodeRating(
+        forEpisodeIdentifier id: String,
+        session: URLSession = .shared,
+        defaults: UserDefaults = ProfileSettings.current
+    ) async -> Double? {
+        let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+
+        let parts = clean.split(separator: ":")
+        guard parts.count >= 3,
+              let season = Int(parts[1]),
+              let episode = Int(parts[2]) else { return nil }
+
+        let parentId = String(parts[0])
+        guard let tmdbId = await SeriesGraphRatingsService.shared.resolveTmdbId(forParentId: parentId, session: session) else {
+            return nil
+        }
+
+        return await TmdbDetailsService.fetchEpisodeRating(
+            tmdbId: tmdbId,
+            season: season,
+            episode: episode,
+            session: session,
+            defaults: defaults
+        )
     }
 
     static func fetchRatingsFromAddon(
@@ -733,6 +791,48 @@ enum AddonRatingsService {
         return meta.rating.map { String(format: "IMDb %.1f", $0) }
     }
 
+    static func heroEpisodeRatingString(
+        for meta: NuvioMeta,
+        video: NuvioVideo?,
+        source: String,
+        ratings: [NuvioExternalRating]? = nil
+    ) -> String? {
+        let cleanSource = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let resolvedRatings = ratings ?? []
+
+        let episodeNumericRating: Double? = {
+            guard let raw = video?.rating?.trimmingCharacters(in: .whitespaces), !raw.isEmpty,
+                  let parsed = Double(raw), parsed > 0 else { return nil }
+            return parsed
+        }()
+
+        if cleanSource.isEmpty || cleanSource == "imdb" {
+            if let match = resolvedRatings.first(where: { $0.source.lowercased() == "imdb" }) {
+                return "IMDb \(formatRating(value: match.value, max: match.max))"
+            }
+            if let rating = episodeNumericRating {
+                return String(format: "IMDb %.1f", rating)
+            }
+            return heroRatingString(for: meta, source: source, ratings: nil)
+        }
+
+        if let match = resolvedRatings.first(where: { isSourceMatch(requested: cleanSource, actual: $0.source) }) {
+            let label = heroRatingDisplayName(for: match.source, customName: match.name)
+            let formatted = formatRating(value: match.value, max: match.max)
+            return "\(label) \(formatted)"
+        }
+
+        if cleanSource == "tmdb", meta.tmdbId != nil, meta.imdbId == nil, let rating = episodeNumericRating {
+            return String(format: "TMDB %.1f", rating)
+        }
+
+        if let rating = episodeNumericRating {
+            return String(format: "IMDb %.1f", rating)
+        }
+
+        return heroRatingString(for: meta, source: source, ratings: nil)
+    }
+
     static func sampleRatingString(for source: String) -> String {
         switch source.lowercased() {
         case heroAllRatingsSource: return "IMDb 8.6  ·  TMDB 86  ·  RT 92%"
@@ -837,6 +937,30 @@ enum AddonRatingsService {
         (meta.externalRatings ?? []).forEach(add)
         if let imdb = meta.rating, imdb > 0 {
             add(NuvioExternalRating(source: MdbListDetailsService.providerIMDb, value: imdb, max: 10))
+        }
+        return result
+    }
+
+    /// The ratings the hero's "All" row shows for an in-progress or upcoming episode.
+    static func heroEpisodeDisplayRatings(
+        for meta: NuvioMeta,
+        video: NuvioVideo?,
+        fetched: [NuvioExternalRating]?
+    ) -> [NuvioExternalRating] {
+        var result: [NuvioExternalRating] = []
+        var seen = Set<String>()
+        func add(_ rating: NuvioExternalRating) {
+            guard rating.value.isFinite,
+                  seen.insert(normalizedSourceKey(rating.source)).inserted else { return }
+            result.append(rating)
+        }
+        (fetched ?? []).forEach(add)
+        if let raw = video?.rating?.trimmingCharacters(in: .whitespaces), !raw.isEmpty,
+           let parsed = Double(raw), parsed > 0 {
+            add(NuvioExternalRating(source: MdbListDetailsService.providerIMDb, value: parsed, max: 10))
+        }
+        if result.isEmpty {
+            return heroDisplayRatings(for: meta, fetched: nil)
         }
         return result
     }
@@ -965,4 +1089,286 @@ private extension String {
         isEmpty ? nil : self
     }
 }
+
+// MARK: - SeriesGraph Ratings
+
+struct SeriesGraphEpisodeRating: Sendable, Equatable {
+    let season: Int
+    let episode: Int
+    let rating: Double
+    let voteCount: Int?
+    let imdbEpisodeId: String?
+    let title: String?
+
+    init(
+        season: Int,
+        episode: Int,
+        rating: Double,
+        voteCount: Int? = nil,
+        imdbEpisodeId: String? = nil,
+        title: String? = nil
+    ) {
+        self.season = season
+        self.episode = episode
+        self.rating = rating
+        self.voteCount = voteCount
+        self.imdbEpisodeId = imdbEpisodeId
+        self.title = title
+    }
+}
+
+actor SeriesGraphRatingsService {
+    static let shared = SeriesGraphRatingsService()
+
+    private struct CacheEntry {
+        let ratingsBySeasonEpisode: [String: SeriesGraphEpisodeRating] // "season:episode"
+        let ratingsByImdbId: [String: SeriesGraphEpisodeRating]        // "tt..."
+        let timestamp: Date
+    }
+
+    private var cache: [Int: CacheEntry] = [:]
+    private var inFlight: [Int: Task<[String: SeriesGraphEpisodeRating], Never>] = [:]
+    private var imdbToTmdbCache: [String: Int] = [:]
+    private let ttl: TimeInterval = 1800 // 30 minutes
+
+    init() {}
+
+    func cachedRating(forTmdbId tmdbId: Int, season: Int, episode: Int) -> SeriesGraphEpisodeRating? {
+        guard let entry = cache[tmdbId],
+              Date().timeIntervalSince(entry.timestamp) < ttl else { return nil }
+        return entry.ratingsBySeasonEpisode["\(season):\(episode)"]
+    }
+
+    func cachedRatings(forTmdbId tmdbId: Int) -> [String: SeriesGraphEpisodeRating]? {
+        guard let entry = cache[tmdbId],
+              Date().timeIntervalSince(entry.timestamp) < ttl else { return nil }
+        return entry.ratingsBySeasonEpisode
+    }
+
+    func setCachedRatings(_ ratings: [String: SeriesGraphEpisodeRating], forTmdbId tmdbId: Int) {
+        var byImdb: [String: SeriesGraphEpisodeRating] = [:]
+        for rating in ratings.values {
+            if let imdbId = rating.imdbEpisodeId?.lowercased(), !imdbId.isEmpty {
+                byImdb[imdbId] = rating
+            }
+        }
+        cache[tmdbId] = CacheEntry(
+            ratingsBySeasonEpisode: ratings,
+            ratingsByImdbId: byImdb,
+            timestamp: Date()
+        )
+    }
+
+    func registerTmdbId(_ tmdbId: Int, forImdbId imdbId: String) {
+        let clean = imdbId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !clean.isEmpty, tmdbId > 0 else { return }
+        imdbToTmdbCache[clean] = tmdbId
+    }
+
+    func resolveTmdbId(forParentId parentId: String, session: URLSession = .shared) async -> Int? {
+        let clean = parentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !clean.isEmpty else { return nil }
+
+        if clean.hasPrefix("tmdb:") {
+            let stripped = clean.dropFirst(5)
+            let idPart = stripped.split(separator: ":").first.map(String.init) ?? String(stripped)
+            if let id = Int(idPart), id > 0 { return id }
+        }
+
+        if let direct = Int(clean), direct > 0 {
+            return direct
+        }
+
+        let imdbId = clean.hasPrefix("tt") ? (clean.split(separator: ":").first.map(String.init) ?? clean) : clean
+        guard imdbId.hasPrefix("tt") else { return nil }
+
+        if let cached = imdbToTmdbCache[imdbId] {
+            return cached
+        }
+
+        // Query Cinemeta meta endpoint which includes moviedb_id without needing an API key
+        if let url = URL(string: "https://v3-cinemeta.strem.io/meta/series/\(imdbId).json") {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 6
+            if let (data, response) = try? await session.data(for: request),
+               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let meta = json["meta"] as? [String: Any],
+               let moviedbId = meta["moviedb_id"] as? Int, moviedbId > 0 {
+                imdbToTmdbCache[imdbId] = moviedbId
+                return moviedbId
+            }
+        }
+
+        return nil
+    }
+
+    func resolveTmdbId(for meta: NuvioMeta, session: URLSession = .shared) async -> Int? {
+        if let tmdbId = meta.tmdbId, tmdbId > 0 {
+            if let imdb = meta.imdbId { registerTmdbId(tmdbId, forImdbId: imdb) }
+            registerTmdbId(tmdbId, forImdbId: meta.id)
+            return tmdbId
+        }
+
+        let parentId = meta.imdbId ?? meta.id
+        let resolved = await resolveTmdbId(forParentId: parentId, session: session)
+        if let resolved {
+            if let imdb = meta.imdbId { registerTmdbId(resolved, forImdbId: imdb) }
+            registerTmdbId(resolved, forImdbId: meta.id)
+        }
+        return resolved
+    }
+
+    func fetchRatings(for meta: NuvioMeta, session: URLSession = .shared) async -> [String: SeriesGraphEpisodeRating] {
+        guard meta.isSeries || NuvioMeta.isSeriesType(meta.type) else { return [:] }
+        guard let tmdbId = await resolveTmdbId(for: meta, session: session) else { return [:] }
+        return await fetchRatings(forTmdbId: tmdbId, session: session)
+    }
+
+    func fetchRatings(forTmdbId tmdbId: Int, session: URLSession = .shared) async -> [String: SeriesGraphEpisodeRating] {
+        if let entry = cache[tmdbId], Date().timeIntervalSince(entry.timestamp) < ttl {
+            return entry.ratingsBySeasonEpisode
+        }
+
+        if let running = inFlight[tmdbId] {
+            return await running.value
+        }
+
+        let task = Task<[String: SeriesGraphEpisodeRating], Never> {
+            defer {
+                Task { [weak self] in
+                    await self?.clearInFlight(tmdbId)
+                }
+            }
+            guard let url = URL(string: "https://seriesgraph.com/api/shows/\(tmdbId)/season-ratings") else {
+                return [:]
+            }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            guard let (data, response) = try? await session.data(for: request),
+                  let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode) else {
+                return [:]
+            }
+            guard let seasons = try? JSONDecoder().decode([SeriesGraphSeasonResponse].self, from: data) else {
+                return [:]
+            }
+
+            var bySE: [String: SeriesGraphEpisodeRating] = [:]
+            var byImdb: [String: SeriesGraphEpisodeRating] = [:]
+
+            for season in seasons {
+                for ep in season.episodes ?? [] {
+                    guard let s = ep.seasonNumber ?? season.seasonNumber,
+                          let e = ep.episodeNumber,
+                          let rating = ep.resolvedRating else { continue }
+                    let item = SeriesGraphEpisodeRating(
+                        season: s,
+                        episode: e,
+                        rating: rating,
+                        voteCount: ep.resolvedVotes,
+                        imdbEpisodeId: ep.tconst,
+                        title: ep.name
+                    )
+                    bySE["\(s):\(e)"] = item
+                    if let tconst = ep.tconst?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !tconst.isEmpty {
+                        byImdb[tconst] = item
+                    }
+                }
+            }
+
+            self.cache[tmdbId] = CacheEntry(
+                ratingsBySeasonEpisode: bySE,
+                ratingsByImdbId: byImdb,
+                timestamp: Date()
+            )
+            return bySE
+        }
+
+        inFlight[tmdbId] = task
+        return await task.value
+    }
+
+    func rating(
+        forEpisodeIdentifier id: String,
+        session: URLSession = .shared
+    ) async -> SeriesGraphEpisodeRating? {
+        let clean = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !clean.isEmpty else { return nil }
+
+        let parts = clean.split(separator: ":")
+        if parts.count >= 3,
+           let season = Int(parts[1]),
+           let episode = Int(parts[2]) {
+            let parentId = String(parts[0])
+            guard let tmdbId = await resolveTmdbId(forParentId: parentId, session: session) else {
+                return nil
+            }
+            let showRatings = await fetchRatings(forTmdbId: tmdbId, session: session)
+            return showRatings["\(season):\(episode)"]
+        }
+
+        // Direct IMDb episode ID lookup (e.g. "tt23134204")
+        let lower = clean.lowercased()
+        for entry in cache.values {
+            if let match = entry.ratingsByImdbId[lower] {
+                return match
+            }
+        }
+        return nil
+    }
+
+    private func clearInFlight(_ tmdbId: Int) {
+        inFlight[tmdbId] = nil
+    }
+
+    func clear() {
+        cache.removeAll()
+        inFlight.removeAll()
+        imdbToTmdbCache.removeAll()
+    }
+}
+
+private struct SeriesGraphSeasonResponse: Decodable, Sendable {
+    let seasonNumber: Int?
+    let episodes: [SeriesGraphEpisodeItem]?
+
+    enum CodingKeys: String, CodingKey {
+        case seasonNumber = "season_number"
+        case episodes
+    }
+}
+
+private struct SeriesGraphEpisodeItem: Decodable, Sendable {
+    let voteAverage: Double?
+    let numVotes: Int?
+    let episodeNumber: Int?
+    let name: String?
+    let seasonNumber: Int?
+    let tconst: String?
+    let imdbRating: Double?
+    let imdbVotes: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case voteAverage = "vote_average"
+        case numVotes = "num_votes"
+        case episodeNumber = "episode_number"
+        case name
+        case seasonNumber = "season_number"
+        case tconst
+        case imdbRating = "imdb_rating"
+        case imdbVotes = "imdb_votes"
+    }
+
+    var resolvedRating: Double? {
+        if let v = voteAverage, v > 0 { return v }
+        if let v = imdbRating, v > 0 { return v }
+        return nil
+    }
+
+    var resolvedVotes: Int? {
+        numVotes ?? imdbVotes
+    }
+}
+
 

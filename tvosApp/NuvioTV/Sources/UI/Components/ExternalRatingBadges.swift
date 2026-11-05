@@ -151,6 +151,14 @@ struct TvRatingVisual {
             format: { $0 > 10 ? "\(Int($0.rounded()))%" : String(format: "%.1f", $0) }
         ),
     ]
+
+    static func visual(for source: String) -> TvRatingVisual? {
+        let key = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if key == "mal" {
+            return all.first { $0.source.lowercased() == MdbListDetailsService.providerMyAnimeList }
+        }
+        return all.first { $0.source.lowercased() == key }
+    }
 }
 
 /// A provider icon at any height: bundled assets for MDBList providers, the
