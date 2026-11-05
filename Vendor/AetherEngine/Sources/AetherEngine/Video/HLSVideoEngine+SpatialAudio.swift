@@ -144,7 +144,7 @@ extension HLSVideoEngine {
                 codecID: par.codec_id, profile: par.profile, rendering: objectAudioRendering),
               !isLiveSession
         else { return }
-        if audioDemuxer === demuxer {
+        if audioDemuxer === demuxer, !demuxerAtInitialProducerStart {
             seekToInitialProducerStart(audioDemuxer)
             demuxerAtInitialProducerStart = true
         }
@@ -308,7 +308,7 @@ extension HLSVideoEngine {
                 let dtsx = try DTSXObjectAudioDecoder()
                 // On a resume the verdict reads where the first producer starts, not the file head
                 // that step 8's seek would then drop; the decoder decides mid-stream as well.
-                if audioDemuxer === demuxer {
+                if audioDemuxer === demuxer, !demuxerAtInitialProducerStart {
                     seekToInitialProducerStart(audioDemuxer)
                     demuxerAtInitialProducerStart = true
                 }

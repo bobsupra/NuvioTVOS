@@ -414,6 +414,10 @@ public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
     /// A Profile 5 or AV1 Profile 10.0 whose VUI says nothing carries IPT-PQ-c2 and has no base layer to
     /// present, so it keeps its Dolby Vision route and the engine says so in the log.
     case baseLayerOnly
+    /// Prefer an HDR10-compatible PQ base layer only, leaving Dolby Vision enabled for HLG/SDR-base
+    /// profiles. Genuine DV-only Profile 5 keeps its existing fallback. HDR10+ HLS signaling is
+    /// confirmed for URL-backed VOD remuxes; custom readers keep the ordinary Dolby Vision route.
+    case hdr10BaseLayerOnly
 }
 
 public struct LoadOptions: Sendable, Equatable {
@@ -488,7 +492,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// `forceDolbyVisionOnNonDVDisplay`, which asks for the opposite. The software path decodes the base
     /// layer alone in any case, so there it only lifts the Profile 5 refusal (#176) for a record the VUI
     /// contradicts.
+    ///
+    /// `.hdr10BaseLayerOnly` is narrower: it selects only an HDR10-compatible PQ base (HEVC P7 / P8.1,
+    /// AV1 10.1, or a mislabelled DV record whose VUI declares PQ). HLG- and SDR-base profiles keep the
+    /// automatic Dolby Vision route.
     public var dolbyVisionHandling: DolbyVisionHandling
+
 
     /// Opt in to full dual-layer Dolby Vision decoding of Profile 7 FEL streams, composed on the GPU, instead of
     /// the native route (the single-layer Profile 8.1 conversion, or the HDR10 base layer). When true, `dolbyVisionHandling` is `.automatic`, the stream's

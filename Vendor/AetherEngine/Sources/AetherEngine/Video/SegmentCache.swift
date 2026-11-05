@@ -81,6 +81,7 @@ final class SegmentCache: @unchecked Sendable {
     private var initVersions: [(versionID: Int, fromSegment: Int, data: Data)] = []
 
     private var closed = false
+    private var waitersCancelled = false
     /// (index, bytes, parked) of every segment the producer completes, for the provider's
     /// march-rate estimate. `parked`: the producer waited on backpressure since the store before, so
     /// the interval measures the consumer, not the link. Guarded by `condition`, called after it is released.
@@ -547,6 +548,15 @@ final class SegmentCache: @unchecked Sendable {
         return result
     }
 
+    /// Wake priming waits when a prepare is cancelled, without tearing down cache resources that
+    /// the still-unwinding prepare stack may reference. Full `close()` follows after it exits.
+    func cancelWaiters() {
+        condition.lock()
+        waitersCancelled = true
+        condition.broadcast()
+        condition.unlock()
+    }
+
     // MARK: - Reader side
 
     func declareTarget(_ index: Int) {
@@ -749,9 +759,9 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         if initSegment != nil { return true }
-        if closed { return false }
+        if closed || waitersCancelled { return false }
         let deadline = Date().addingTimeInterval(timeout)
-        while !closed, initSegment == nil {
+        while !closed, !waitersCancelled, initSegment == nil {
             if !condition.wait(until: deadline) { break }
         }
         return initSegment != nil
@@ -761,12 +771,12 @@ final class SegmentCache: @unchecked Sendable {
     func awaitSegment(index: Int, timeout: TimeInterval = 10.0) -> Bool {
         if peekURL(index: index) != nil { return true }
         condition.lock()
-        if closed {
+        if closed || waitersCancelled {
             condition.unlock()
             return false
         }
         let deadline = Date().addingTimeInterval(timeout)
-        while !closed, entries[index] == nil {
+        while !closed, !waitersCancelled, entries[index] == nil {
             if !condition.wait(until: deadline) { break }
         }
         condition.unlock()

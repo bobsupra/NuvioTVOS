@@ -10,6 +10,12 @@ import AetherLibavutil
 
 extension AetherEngine {
 
+    /// A producer failure already published while a native item was being prepared to mount.
+    struct NativeStartupReportedError: LocalizedError {
+        let message: String
+        var errorDescription: String? { message }
+    }
+
     /// Apply an AVPlayer clock tick (native VOD/live path) to the engine clock. `nativeClockSeconds`
     /// (the raw pre-shift clock, re-derived against by `onPlaylistShiftChanged`) and the active seam
     /// shift always track it. The UI scrub clock (`clock.currentTime`) is HELD while a recovery seek is
@@ -807,6 +813,18 @@ extension AetherEngine {
         }
     }
 
+    /// Wait before mounting a confirmed HDR10+ master if this load observed a display switch.
+    nonisolated static func preferredHDR10PlusMasterAwaitsSwitch(
+        isLive: Bool,
+        dolbyVisionHandling: DolbyVisionHandling,
+        servingMaster: Bool,
+        advertisesHDR10Plus: Bool,
+        switchRunning: Bool
+    ) -> Bool {
+        !isLive && dolbyVisionHandling == .hdr10BaseLayerOnly
+            && servingMaster && advertisesHDR10Plus && switchRunning
+    }
+
     func loadNative(
         url: URL,
         sourceHTTPHeaders: [String: String] = [:],
@@ -932,6 +950,16 @@ extension AetherEngine {
             forwardBufferSegments: loadedOptions.forwardBufferSegments,
             sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget
         )
+        let needsHDR10PlusPrepareCancellation = dolbyVisionHandling == .hdr10BaseLayerOnly && !isCustomSource
+        if needsHDR10PlusPrepareCancellation {
+            inFlightNativeVideoSession = session
+        }
+        defer {
+            if needsHDR10PlusPrepareCancellation,
+               inFlightNativeVideoSession === session {
+                inFlightNativeVideoSession = nil
+            }
+        }
         sessionCacheStatusToken &+= 1
         let cacheStatusToken = sessionCacheStatusToken
         session.onSessionCacheStatusChanged = { [weak self] status in
@@ -964,6 +992,9 @@ extension AetherEngine {
         // Audit Vcore-101: every hop below is dropped once this session has ended (`hop(for:)`).
         session.onFirstHDR10PlusDetected = { [weak self] in
             self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
+        }
+        session.onHDR10PlusMasterUnavailable = { [weak self] in
+            self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusMasterUnavailable() }
         }
         installPlaylistShiftRelay(on: session, generation: generation)
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
@@ -1321,12 +1352,20 @@ extension AetherEngine {
                 do { try session.prepare() }
                 catch { session.stop(reason: .loadFailed); throw error }
             }.value
+            guard loadGeneration == generation else {
+                session.stop(reason: .sourceChanged)
+                throw CancellationError()
+            }
             let routesAsHDRPanel: Bool
             do {
                 routesAsHDRPanel = try await resolvePanelRouting()
             } catch {
                 session.stop(reason: .loadFailed)
                 throw error
+            }
+            guard loadGeneration == generation else {
+                session.stop(reason: .sourceChanged)
+                throw CancellationError()
             }
             playbackURL = try await BlockingWork.detached(priority: .userInitiated) { [session] in
                 do { return try session.serve(panelIsInHDRMode: routesAsHDRPanel) }
@@ -1338,17 +1377,17 @@ extension AetherEngine {
                 catch { session.stop(reason: .loadFailed); throw error }
             }.value
         }
+        // Do not read or wait on a newer load's display-switch observation.
+        guard !Task.isCancelled, loadGeneration == generation else {
+            session.stop(reason: .sourceChanged)
+            throw CancellationError()
+        }
         // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP so
         // the receiver reaches the engine-processed stream (DV/Atmos/subtitles preserved). An HDR/DV master
         // is downgraded to the media playlist there (an SDR receiver rejects it, DrHurt); an SDR master is
         // kept so its subtitle renditions survive the trip (#227). Reverts on the reload when AirPlay ends.
         let served = airPlayAdjustedPlayback(url: playbackURL, session: session)
         playbackURL = served.url
-        // Superseded while starting: stop and unwind before touching shared state.
-        if loadGeneration != generation {
-            session.stop(reason: .sourceChanged)
-            try checkLoadCurrent(generation)
-        }
         self.nativeVideoSession = session
         if let event = session.pendingVODVideoConfigurationMismatch {
             await handleVODVideoConfigurationChange(session: session, epoch: event.epoch,
@@ -1357,6 +1396,34 @@ extension AetherEngine {
             // If no takeover occurred, the explicitly selected route cannot serve this source.
             throw HLSVideoEngine.HLSVideoEngineError.openFailed(reason: event.summary)
         }
+        #if os(tvOS)
+        // A raised HDR headroom can precede the end of an HDMI mode switch. Avoid letting AVPlayer
+        // open the confirmed HDR10+ master during that transition; preparation above can still overlap it.
+        if Self.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: isLive,
+            dolbyVisionHandling: dolbyVisionHandling,
+            servingMaster: session.servingMasterPlaylist,
+            advertisesHDR10Plus: session.advertisesHDR10Plus,
+            switchRunning: displayCriteria.observedSwitchIsRunning()) {
+            EngineLog.emit(
+                "[DisplayCriteria] preferred HDR10+ master waits for the observed display switch before mounting",
+                category: .session)
+            await displayCriteria.waitForSwitch(consumesRecord: false, settleCap: .awaitObservedEnd,
+                                                isCurrent: { self.loadGeneration == generation })
+            guard !Task.isCancelled, loadGeneration == generation, nativeVideoSession === session else {
+                if nativeVideoSession === session {
+                    nativeVideoSession = nil
+                    session.stop(reason: .sourceChanged)
+                }
+                throw CancellationError()
+            }
+            if case .error(let message) = state {
+                nativeVideoSession = nil
+                session.stop(reason: .loadFailed)
+                throw NativeStartupReportedError(message: message)
+            }
+        }
+        #endif
         isSourceSeekable = session.openedSourceIsSeekable
         // AE#270: anchor the display axis on the container's own start time, which is what `duration` is
         // measured from. Taking it from the session rather than latching the first published shift keeps a
@@ -2945,6 +3012,11 @@ host.audioShaping = loadedOptions.audioShaping
         } catch is CancellationError {
             // Superseded by a newer load/stop: it owns the engine state.
             return nil
+        } catch let reported as NativeStartupReportedError {
+            guard loadGeneration == gen, !Task.isCancelled else { return nil }
+            releaseHeldPicture(reason: "rebuild failed")
+            activeAudioTrackIndex = previousAudioIndex
+            return reported
         } catch {
             guard loadGeneration == gen, !Task.isCancelled else { return nil }
             releaseHeldPicture(reason: "rebuild failed")
@@ -3081,6 +3153,22 @@ host.audioShaping = loadedOptions.audioShaping
         guard videoFormat == .hdr10 else { return }
         EngineLog.emit("[AetherEngine] HDR10+ T.35 detected, upgrading videoFormat .hdr10 → .hdr10Plus", category: .engine)
         videoFormat = .hdr10Plus
+    }
+
+    /// The preferred-base route can only publish HDR10+ when the active master carries `cdm4`.
+    /// If AVPlayer rejects that master and the session falls back to media-direct HDR10, clear the
+    /// output badge so it reflects the format the fallback can actually present.
+    @MainActor
+    func handleHDR10PlusMasterUnavailable() {
+        guard loadedOptions.dolbyVisionHandling == .hdr10BaseLayerOnly else { return }
+        sourceCarriesHDR10PlusMetadata = false
+        if sourceVideoFormat == .hdr10Plus { sourceVideoFormat = .hdr10 }
+        guard videoFormat == .hdr10Plus else { return }
+        videoFormat = .hdr10
+        EngineLog.emit(
+            "[AetherEngine] HDR10+ master signaling unavailable after media fallback; reporting HDR10",
+            category: .engine
+        )
     }
 
     /// AE#515: republish a clamped Dolby Vision label once the item AVFoundation is playing says so.

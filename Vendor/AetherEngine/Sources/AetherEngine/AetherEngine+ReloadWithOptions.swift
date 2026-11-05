@@ -103,7 +103,9 @@ extension AetherEngine {
             // the base layer on and moves to software in one step is honoured, one that keeps the
             // Dolby Vision on a Profile 5 record is refused as before.
             presentsDolbyVisionBaseLayer: proposed.dolbyVisionHandling == .baseLayerOnly
-                && sourceDolbyVisionBaseLayerPresentable,
+                ? sourceDolbyVisionBaseLayerPresentable
+                : (proposed.dolbyVisionHandling == .hdr10BaseLayerOnly
+                    && sourceDolbyVisionHDR10BaseLayerPresentable),
             isLive: loadedOptions.isLive,
             hasCompanionAudioReader: (customReader as? LiveIngestSourceInfo)?.companionAudioReader != nil
         ) {

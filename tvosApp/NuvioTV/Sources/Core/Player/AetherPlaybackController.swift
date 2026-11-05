@@ -5042,6 +5042,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let isLive = request.isLiveStream || request.isSports
         let preferDualLayerDolbyVision = ProfileSettings.current.bool(forKey: SettingsKey.preferDualLayerDolbyVision)
+        let sourceSupportsHDR10PlusPreflight = ["file", "http", "https"].contains(
+            request.videoURL.scheme?.lowercased() ?? "")
+        let prefersHDR10PlusForThisLoad = !panelPresentsDV
+            && !isLive && !isRemoteHLS && sourceSupportsHDR10PlusPreflight
         let upscalesLowResolutionVideo = ProfileSettings.current.object(forKey: SettingsKey.lowResUpscaling) as? Bool ?? true
         let losslessAudioBridge = ProfileSettings.current.bool(forKey: SettingsKey.losslessAudioBridge)
         // Bound find_stream_info probe budget for remote VOD streams (#68).
@@ -5059,6 +5063,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             httpHeaders: request.httpHeaders,
             discImageHint: PlaybackBackendPolicy.isDiscImage(
                 request.videoURL.absoluteString, filename: request.filename),
+            dolbyVisionHandling: prefersHDR10PlusForThisLoad ? .hdr10BaseLayerOnly : .automatic,
             preferDualLayerDolbyVision: preferDualLayerDolbyVision,
             upscalesLowResolutionVideo: upscalesLowResolutionVideo,
             matchContentEnabled: matchContent,

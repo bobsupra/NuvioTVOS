@@ -35,7 +35,6 @@ public struct HDR10PlusDetectionOptions: Sendable, Equatable {
     /// Soft wall-clock budget, checked before and after reads and after inspection. NOT preemptive:
     /// one blocking read can still overrun it, but a late result never confirms HDR10+. Default 2 seconds.
     public var timeBudget: TimeInterval
-
     public init(
         maxPackets: Int = 32,
         maxBytes: Int64 = 16 * 1024 * 1024,

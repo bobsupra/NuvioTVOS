@@ -191,7 +191,7 @@ extension DualLayerRouteDecision.Reason {
         case .enhancementLayerNotInPackets:
             return "enhancement layer on its own PID (UHD Blu-ray), only its RPUs are folded in"
         case .baseLayerOnlyHandling:
-            return "dolbyVisionHandling is baseLayerOnly"
+            return "dolbyVisionHandling selects a base layer"
         case .liveOrNotSeekable:
             return "live or non-seekable source"
         case .noHardwareHEVC:

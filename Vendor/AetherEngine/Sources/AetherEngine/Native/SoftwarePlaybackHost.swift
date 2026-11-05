@@ -241,7 +241,7 @@ final class SoftwarePlaybackHost {
     /// Enhancement layer type for Profile 7 streams (FEL or MEL), used for decoder selection
     var elType: String? = nil
 
-    /// Which layer of a Dolby Vision source to present (.automatic or .baseLayerOnly).
+    /// Which layer of a Dolby Vision source to present.
     var dolbyVisionHandling: DolbyVisionHandling = .automatic
 
     /// Opt-in to full dual-layer Dolby Vision (Profile 7 FEL) decoding and Metal GPU composition over single-layer fallback.

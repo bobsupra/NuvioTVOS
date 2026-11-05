@@ -2804,6 +2804,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                "a live producer started without its provider reports cuts segments no playlist lists (audit HLS-101)")
         stateLock.lock()
         guard !pumpStarted else { stateLock.unlock(); return }
+        guard !shouldStop else {
+            stateLock.unlock()
+            markPumpFinished()
+            return
+        }
         pumpStarted = true
         stateLock.unlock()
 
@@ -2893,8 +2898,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
     func stop() {
         stateLock.lock()
         shouldStop = true
+        let neverStarted = !pumpStarted
         stateLock.unlock()
+        if neverStarted { markPumpFinished() }
         cache.wakeWaiters()
+    }
+
+    private func markPumpFinished() {
+        finishCondition.lock()
+        didFinishFlag = true
+        finishCondition.broadcast()
+        finishCondition.unlock()
     }
 
     fileprivate func checkShouldStop() -> Bool {

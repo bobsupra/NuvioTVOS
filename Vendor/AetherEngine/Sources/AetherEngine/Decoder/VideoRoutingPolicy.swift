@@ -63,7 +63,7 @@ enum VideoRoutingPolicy {
         // Only elType == "FEL" routes to software; MEL, nil, or unknown stay native
         // (the 8.1 conversion where the display takes Dolby Vision, the HDR10 base layer where it does
         // not; the conversion is lossless only for MEL).
-        // If dolbyVisionHandling is .baseLayerOnly, it also stays native (HDR10 base layer).
+        // A base-layer handling mode also stays native (HDR10 base layer).
         if codecID == AV_CODEC_ID_HEVC, dvProfile == 7 {
             return elType == "FEL" && dualLayerRouteIsWanted(
                 codecID: codecID,
@@ -350,6 +350,55 @@ enum VideoRoutingPolicy {
         return hdrTransfer && ycbcrMatrix
     }
 
+    /// True for a Dolby Vision source with an HDR10-compatible PQ base layer. HLG/SDR-base profiles
+    /// remain on the normal Dolby Vision route under the app's HDR10+ preference.
+    static func dolbyVisionHDR10BaseLayerIsPresentable(
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dvBlCompatID: Int?,
+        colorTransfer: AVColorTransferCharacteristic,
+        colorMatrix: AVColorSpace
+    ) -> Bool {
+        guard dolbyVisionBaseLayerIsPresentable(
+            codecID: codecID,
+            dvProfile: dvProfile,
+            dvBlCompatID: dvBlCompatID,
+            colorTransfer: colorTransfer,
+            colorMatrix: colorMatrix
+        ), let dvProfile else { return false }
+
+        switch codecID {
+        case AV_CODEC_ID_HEVC:
+            switch dvProfile {
+            case 7: return true
+            case 8:
+                if dvBlCompatID == 1 { return true }
+                if dvBlCompatID == 2 || dvBlCompatID == 4 { return false }
+                // Unknown compatibility ids (including the known malformed P8.6-as-P8.1 shape)
+                // use the PQ VUI to confirm the base that CodecRoutePolicy will serve.
+                return vuiDeclaresYCbCrHDR10Base(colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+            case 5:
+                return vuiDeclaresYCbCrHDR10Base(colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+            default: return false
+            }
+        case AV_CODEC_ID_AV1:
+            guard dvProfile == 10 else { return false }
+            if dvBlCompatID == 1 { return true }
+            if dvBlCompatID == 2 || dvBlCompatID == 4 { return false }
+            return vuiDeclaresYCbCrHDR10Base(colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+        default:
+            return false
+        }
+    }
+
+    private static func vuiDeclaresYCbCrHDR10Base(
+        colorTransfer: AVColorTransferCharacteristic,
+        colorMatrix: AVColorSpace
+    ) -> Bool {
+        let ycbcrMatrix = colorMatrix == AVCOL_SPC_BT2020_NCL || colorMatrix == AVCOL_SPC_BT2020_CL
+        return colorTransfer == AVCOL_TRC_SMPTE2084 && ycbcrMatrix
+    }
+
     /// `LoadOptions.dolbyVisionHandling` resolved against the source: true when the host asked for the
     /// base layer AND the source has one to present. Both halves are here so the format clamp, the
     /// criteria request, the codec route and the software-path guard read one answer.
@@ -361,9 +410,17 @@ enum VideoRoutingPolicy {
         colorTransfer: AVColorTransferCharacteristic,
         colorMatrix: AVColorSpace
     ) -> Bool {
-        guard handling == .baseLayerOnly else { return false }
-        return dolbyVisionBaseLayerIsPresentable(
-            codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
-            colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+        switch handling {
+        case .automatic:
+            return false
+        case .baseLayerOnly:
+            return dolbyVisionBaseLayerIsPresentable(
+                codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
+                colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+        case .hdr10BaseLayerOnly:
+            return dolbyVisionHDR10BaseLayerIsPresentable(
+                codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
+                colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+        }
     }
 }

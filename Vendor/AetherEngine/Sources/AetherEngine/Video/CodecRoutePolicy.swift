@@ -94,6 +94,8 @@ extension HLSVideoEngine {
         let videoRange: HLSVideoRange
         let primaryCodecs: String
         let supplementalCodecs: String?
+        /// True when a base-layer handling mode stripped DV signaling and serves the compatible base.
+        let usesDolbyVisionBaseLayer: Bool
         /// What the muxer does with the source dvcC on the way into init.mp4.
         /// See `MP4SegmentMuxer.DoviConfigPolicy`.
         let doviConfig: MP4SegmentMuxer.DoviConfigPolicy
@@ -108,7 +110,8 @@ extension HLSVideoEngine {
             supplementalCodecs: String?,
             doviConfig: MP4SegmentMuxer.DoviConfigPolicy,
             convertP7ToProfile81: Bool,
-            dvVariant: DVVariant
+            dvVariant: DVVariant,
+            usesDolbyVisionBaseLayer: Bool = false
         ) {
             self.codecTagOverride = codecTagOverride
             self.videoRange = videoRange
@@ -117,6 +120,7 @@ extension HLSVideoEngine {
             self.doviConfig = doviConfig
             self.convertP7ToProfile81 = convertP7ToProfile81
             self.dvVariant = dvVariant
+            self.usesDolbyVisionBaseLayer = usesDolbyVisionBaseLayer
         }
     }
 
@@ -311,7 +315,7 @@ extension HLSVideoEngine {
 
         if codecID == AV_CODEC_ID_AV1 {
             let sourceRecord = doviConfigRecord(from: codecpar)
-            // `dolbyVisionHandling = .baseLayerOnly`: read the record for nothing but the log, and
+            // A base-layer handling mode reads the record for nothing but the log, and
             // strip it on the way out, so the source takes the plain av01 branch below whatever the
             // display can do. Same predicate as the HEVC path and the format clamp.
             let presentsBaseLayer = sourceRecord.map { r in
@@ -434,7 +438,8 @@ extension HLSVideoEngine {
                     // The source is still what it is; the log should name it even when the record
                     // was read for nothing else.
                     dvVariant: presentsBaseLayer
-                        ? classifyDVVariant(sourceRecord, codecID: AV_CODEC_ID_AV1) : dvVariant
+                        ? classifyDVVariant(sourceRecord, codecID: AV_CODEC_ID_AV1) : dvVariant,
+                    usesDolbyVisionBaseLayer: presentsBaseLayer
                 )
             // HEVC DV variants can't reach this switch (classifyDVVariant
             // is called with AV_CODEC_ID_AV1) but Swift's exhaustivity
@@ -517,8 +522,8 @@ extension HLSVideoEngine {
                 colorMatrix: codecpar.pointee.color_space
             ) {
                 // The base layer on its own, on every display: plain hvc1, the record stripped so no
-                // dvcC reaches the sample entry, no SUPPLEMENTAL, and no P7 conversion (its RPU is
-                // dropped with the record). The RPU NAL units stay in the samples and are ignored, the
+                // dvcC reaches the sample entry, no Dolby Vision supplemental brand, and no P7 conversion
+                // (its RPU is dropped with the record). The RPU NAL units stay in the samples and are ignored, the
                 // route a Profile 7 already takes on a display without Dolby Vision. The range is the
                 // base layer's: PQ for 7 / 8.1 and a relabelled 5, HLG for 8.4, the VUI's for 8.2.
                 let baseRange: HLSVideoRange
@@ -530,7 +535,7 @@ extension HLSVideoEngine {
                 EngineLog.emit(
                     "[HLSVideoEngine] DV Profile \(recordProfile) compat=\(recordCompat): presenting the "
                     + "\(baseRange.rawValue) base layer only (dolbyVisionHandling=baseLayerOnly), plain hvc1, "
-                    + "dvcC stripped, no SUPPLEMENTAL-CODECS"
+                    + "dvcC stripped, no Dolby Vision SUPPLEMENTAL-CODECS"
                     + (dvVariant == .profile7 ? ", no P7 -> P8.1 conversion" : ""),
                     category: .session
                 )
@@ -541,7 +546,8 @@ extension HLSVideoEngine {
                     supplementalCodecs: nil,
                     doviConfig: .strip,
                     convertP7ToProfile81: false,
-                    dvVariant: dvVariant
+                    dvVariant: dvVariant,
+                    usesDolbyVisionBaseLayer: true
                 )
             }
         }

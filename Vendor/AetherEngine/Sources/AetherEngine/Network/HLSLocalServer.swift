@@ -250,7 +250,7 @@ enum HLSVideoRange: String {
 }
 
 /// A served master's DV form (#98). `.primary` is the DV/HDR master start() chose. `.reducedHDR` drops
-/// SUPPLEMENTAL-CODECS (DV signaling) but keeps the source range and the SUBTITLES renditions, for the
+/// Dolby Vision supplemental signaling but keeps HDR10+ `cdm4`, the source range, and SUBTITLES, for the
 /// #35 cold-DV-start gate on an HDR TV. (An SDR-forcing variant was tried and reverted: VIDEO-RANGE=SDR
 /// does not fool the external-display compatibility gate, so HDR/DV on an SDR display stays media-only.)
 enum MasterPlaylistVariant: Equatable {
@@ -391,8 +391,8 @@ final class HLSLocalServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(port)/\(pathToken)/\(livePlaylistPrefix)media.m3u8")
     }
 
-    /// HDR-preserving reduced master (#98): source VIDEO-RANGE kept, no SUPPLEMENTAL-CODECS
-    /// (DV dropped), subtitle renditions kept, for the #35 cold-DV-start gate on an HDR TV.
+    /// HDR-preserving reduced master (#98): source VIDEO-RANGE and HDR10+ `cdm4` kept, DV signaling
+    /// dropped, subtitle renditions kept, for the #35 cold-DV-start gate on an HDR TV.
     var reducedHDRMasterPlaylistURL: URL? {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -1872,9 +1872,10 @@ stateLock.lock()
             streamInfAttrs.append("AVERAGE-BANDWIDTH=\(avg)")
         }
         streamInfAttrs.append("CODECS=\"\(codecs)\"")
-        // #98 Stage 1.5: a reduced master drops the DV SUPPLEMENTAL-CODECS so the variant reads as
-        // plain HDR/SDR HEVC; the segment sample entries still drive decoding.
-        if variant == .primary, let supplemental = provider.masterSupplementalCodecs {
+        // #98 Stage 1.5: a reduced master drops the DV supplemental brand, but keeps HDR10+'s
+        // backward-compatible cdm4 brand so AVPlayer can still consume its in-band metadata.
+        if let supplemental = provider.masterSupplementalCodecs,
+           variant == .primary || supplemental.hasSuffix("/cdm4") {
             streamInfAttrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
         }
         if let resolution = provider.masterResolution {
@@ -1955,7 +1956,8 @@ stateLock.lock()
             // AE#682: BANDWIDTH is the variant's, an honest ceiling (one keyframe cannot outweigh the
             // segment it opens). A value below the real peak logs -12318 on every fetch.
             var iFrameAttrs = ["BANDWIDTH=\(bandwidth)", "CODECS=\"\(videoCodecs(of: codecs))\""]
-            if variant == .primary, let supplemental = provider.masterSupplementalCodecs {
+            if let supplemental = provider.masterSupplementalCodecs,
+               variant == .primary || supplemental.hasSuffix("/cdm4") {
                 iFrameAttrs.append("SUPPLEMENTAL-CODECS=\"\(supplemental)\"")
             }
             if let resolution = provider.masterResolution {

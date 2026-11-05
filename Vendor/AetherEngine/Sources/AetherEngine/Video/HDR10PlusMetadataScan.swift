@@ -24,6 +24,42 @@ enum HDR10PlusMetadataScan {
         return packetCarriesHDR10Plus(packet, codecID: parameters.codec_id, framing: resolvedFraming)
     }
 
+    /// In-band-only scan for HLS signaling. Unlike `packetCarriesHDR10Plus`, this ignores decoded packet
+    /// side data, which the native remux does not carry into its output samples.
+    static func packetBytesCarryHDR10Plus(
+        _ packet: UnsafePointer<AVPacket>,
+        codecParameters: UnsafePointer<AVCodecParameters>,
+        framing: VideoNALFraming? = nil
+    ) -> Bool {
+        let parameters = codecParameters.pointee
+        let inferredFraming = framing ?? NALUnitChain.lengthPrefixSize(
+            codecID: parameters.codec_id,
+            extradata: parameters.extradata,
+            extradataSize: Int(parameters.extradata_size)
+        ).map { .lengthPrefixed(size: $0) } ?? .annexB
+        let data = packet.pointee.data
+        let size = Int(packet.pointee.size)
+        guard bytesCarryHDR10Plus(
+            data, size: size, codecID: parameters.codec_id, framing: inferredFraming
+        ) else {
+            guard parameters.codec_id == AV_CODEC_ID_H264 || parameters.codec_id == AV_CODEC_ID_HEVC else {
+                return false
+            }
+            let candidates: [VideoNALFraming] = [
+                .annexB,
+                .lengthPrefixed(size: 4),
+                .lengthPrefixed(size: 3),
+                .lengthPrefixed(size: 2),
+                .lengthPrefixed(size: 1),
+            ]
+            return candidates.contains { candidate in
+                candidate != inferredFraming
+                    && bytesCarryHDR10Plus(data, size: size, codecID: parameters.codec_id, framing: candidate)
+            }
+        }
+        return true
+    }
+
     static func packetCarriesHDR10Plus(
         _ packet: UnsafePointer<AVPacket>, codecID: AVCodecID, framing: VideoNALFraming = .annexB
     ) -> Bool {

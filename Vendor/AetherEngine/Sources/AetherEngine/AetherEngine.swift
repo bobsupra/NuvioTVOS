@@ -773,12 +773,13 @@ public final class AetherEngine: ObservableObject {
     /// #846: the load generation whose disabled stage still owes the return to the native path.
     var upscaleNativeReturnOwed: UInt64? = nil
 
-    /// Whether the loaded source's Dolby Vision has a base layer `LoadOptions.dolbyVisionHandling =
-    /// .baseLayerOnly` can present (`VideoRoutingPolicy.dolbyVisionBaseLayerIsPresentable`), decided
-    /// on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
+    /// Whether the loaded source's Dolby Vision has a base layer the current handling mode can present,
+    /// decided on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
     /// base layer on and moves to software in one step is judged before the teardown, when the VUI it
     /// rests on is gone.
     var sourceDolbyVisionBaseLayerPresentable: Bool = false
+    /// The narrower HDR10/PQ subset, kept for route corrections after the probe has been closed.
+    var sourceDolbyVisionHDR10BaseLayerPresentable: Bool = false
 
     /// Nominal source frame rate (fps) from the container's `avg_frame_rate` (falling back to `r_frame_rate`),
     /// or nil when the source has no video or libavformat couldn't derive one. Companion to `sourceVideoFormat`
@@ -2243,6 +2244,9 @@ public final class AetherEngine: ObservableObject {
             session.noteResidentSetChanged()
         }
     }
+    /// Native HLS session being prepared. Registered before `prepare()` so stop/supersession can
+    /// mark its demuxer closed while an in-band metadata peek is waiting on the source.
+    var inFlightNativeVideoSession: HLSVideoEngine?
 
     /// Fold the cache's playlist-axis spans onto the published display axis, the same way
     /// `onSeekStateChanged` folds a scrub target (#38). The two axes differ by
@@ -4677,9 +4681,10 @@ public final class AetherEngine: ObservableObject {
         let gen = loadGeneration
         attempt.generation = gen
         waitingLoadGenerations.insert(gen)
-        // Audit LIF-101: an owed background decision is settled from here, not from a waypoint.
+        // A cancelled preflight must release its one-slot origin request before a successor opens the same URL.
         beginLoadInFlight(gen)
         defer { endLoadInFlight(gen) }
+        // Audit LIF-101: an owed background decision is settled from here, not from a waypoint.
         // #361: open the host-visible startup sequence. A reroute re-entering load() continues the
         // one already running rather than starting a second.
         let startupGen = beginStartupProgress()
@@ -4813,6 +4818,7 @@ public final class AetherEngine: ObservableObject {
         sourceUpscaleFrameRate = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
+        sourceDolbyVisionHDR10BaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
@@ -4885,9 +4891,10 @@ public final class AetherEngine: ObservableObject {
         var detectedVideoBitrate: Int64 = 0
         var detectedVideoStreamFormat: VideoStreamFormat? = nil
         var detectedDVProfile: Bool = false
-        // `dolbyVisionHandling = .baseLayerOnly` resolved against this source: the two halves the
+        // The requested `dolbyVisionHandling` resolved against this source: the two halves the
         // format clamp, the criteria request and the software-path guard below all read.
         var detectedDVBaseLayerPresentable = false
+        var detectedDVHDR10BaseLayerPresentable = false
         var presentsDolbyVisionBaseLayer = false
         // AE#532: what this source's own RPU says, and the profile the route should believe instead of
         // the record. Both stay nil for every source but a Profile 5 record over a BT.2020 YCbCr HDR VUI.
@@ -4994,7 +5001,7 @@ public final class AetherEngine: ObservableObject {
                 detectedDVProfileNum = detectedDVConfig?.profile
                 detectedDVBLCompatIDNum = detectedDVConfig?.blCompatID
                 detectedCodecID = stream.pointee.codecpar.pointee.codec_id
-                // `.baseLayerOnly`: the clamp reads a table with Dolby Vision left unclaimed, so the
+                // A base-layer handling mode reads a table with Dolby Vision left unclaimed, so the
                 // source resolves to the HDR10 / HLG its base layer is, the criteria ask for hvc1, and
                 // the served route (same predicate, `CodecRoutePolicy`) agrees. A source with no base
                 // layer to present (a genuine Profile 5) keeps everything as it was.
@@ -5004,8 +5011,19 @@ public final class AetherEngine: ObservableObject {
                     dvBlCompatID: detectedDVBLCompatIDNum,
                     colorTransfer: stream.pointee.codecpar.pointee.color_trc,
                     colorMatrix: stream.pointee.codecpar.pointee.color_space)
-                presentsDolbyVisionBaseLayer = options.dolbyVisionHandling == .baseLayerOnly
-                    && detectedDVBaseLayerPresentable
+                detectedDVHDR10BaseLayerPresentable = VideoRoutingPolicy.dolbyVisionHDR10BaseLayerIsPresentable(
+                    codecID: detectedCodecID,
+                    dvProfile: detectedDVProfileNum,
+                    dvBlCompatID: detectedDVBLCompatIDNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
+                presentsDolbyVisionBaseLayer = VideoRoutingPolicy.presentsDolbyVisionBaseLayer(
+                    handling: options.dolbyVisionHandling,
+                    codecID: detectedCodecID,
+                    dvProfile: detectedDVProfileNum,
+                    dvBlCompatID: detectedDVBLCompatIDNum,
+                    colorTransfer: stream.pointee.codecpar.pointee.color_trc,
+                    colorMatrix: stream.pointee.codecpar.pointee.color_space)
                 // AE#532: a Profile 5 record over a VUI that contradicts it is the one claim in a
                 // container worth checking against the bitstream, because a Profile 5 RPU cannot carry a
                 // residual or an NLQ and the RPU is therefore proof rather than a guess. Gated on that
@@ -5032,15 +5050,18 @@ public final class AetherEngine: ObservableObject {
                               + "; the record stands"),
                         category: .engine)
                 }
-                if options.dolbyVisionHandling == .baseLayerOnly, detectedFormat == .dolbyVision {
+                if options.dolbyVisionHandling != .automatic, detectedFormat == .dolbyVision {
+                    let handlingLabel = options.dolbyVisionHandling.rawValue
+                    let ignoredReason = options.dolbyVisionHandling == .hdr10BaseLayerOnly
+                        ? "has no HDR10-compatible PQ base layer; keeping the Dolby Vision route"
+                        : "has no presentable base layer (IPT-PQ-c2, VUI unspecified); keeping the Dolby Vision route"
                     EngineLog.emit(
                         presentsDolbyVisionBaseLayer
-                            ? "[AetherEngine] dolbyVisionHandling=baseLayerOnly: DV Profile "
+                            ? "[AetherEngine] dolbyVisionHandling=\(handlingLabel): DV Profile "
                               + "\(detectedDVProfileNum ?? 0) presents its base layer; the format clamp and the "
                               + "criteria request leave Dolby Vision unclaimed"
-                            : "[AetherEngine] dolbyVisionHandling=baseLayerOnly ignored: DV Profile "
-                              + "\(detectedDVProfileNum ?? 0) compat=\(detectedDVBLCompatIDNum ?? 0) has no base "
-                              + "layer to present (IPT-PQ-c2, VUI unspecified); keeping the Dolby Vision route",
+                            : "[AetherEngine] dolbyVisionHandling=\(handlingLabel) ignored: DV Profile "
+                              + "\(detectedDVProfileNum ?? 0) compat=\(detectedDVBLCompatIDNum ?? 0) \(ignoredReason)",
                         category: .engine)
                 }
                 effectiveFormat = Self.effectiveVideoFormat(
@@ -5223,6 +5244,7 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = detectedDVProfileNum
         sourceDVBLCompatID = detectedDVBLCompatIDNum
         sourceDolbyVisionBaseLayerPresentable = detectedDVBaseLayerPresentable
+        sourceDolbyVisionHDR10BaseLayerPresentable = detectedDVHDR10BaseLayerPresentable
         sourceDolbyVisionRPUProfile = detectedDVRPUProfile
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
@@ -6222,6 +6244,9 @@ public final class AetherEngine: ObservableObject {
         } catch is CancellationError {
             // Superseded.
             throw CancellationError()
+        } catch let reported as NativeStartupReportedError {
+            // The native producer already published the original failure while the display settled.
+            throw reported
         } catch {
             // A host or open that failed because stop()/load() tore it down mid-flight throws its own
             // error before the post-load generation check; the successor owns the state (audit CORE-1).
@@ -7370,6 +7395,7 @@ resumeOverride: selection.resumePosition,
         sourceUpscaleFrameRate = nil
         sourceDVBLCompatID = nil
         sourceDolbyVisionBaseLayerPresentable = false
+        sourceDolbyVisionHDR10BaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
@@ -8515,6 +8541,12 @@ resumeOverride: selection.resumePosition,
         nativeVideoSession?.setNativeVideoFrameTimeObserver(nil)
         if diagnostics.sessionCacheStatus.route == .nativeRemoteHLS {
             diagnostics.sessionCacheStatus = .inactive
+        }
+        if let preparing = inFlightNativeVideoSession {
+            inFlightNativeVideoSession = nil
+            if nativeVideoSession !== preparing {
+                preparing.cancelPrepare()
+            }
         }
         nativeVideoSession?.stop(reason: cacheCleanupReason)
         nativeVideoSession = nil

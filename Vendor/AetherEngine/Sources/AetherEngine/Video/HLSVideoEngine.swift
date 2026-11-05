@@ -55,9 +55,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// route, and only while `effectiveDvMode` is false.
     let forceDolbyVisionOnNonDVDisplay: Bool
 
-    /// From `LoadOptions.dolbyVisionHandling`; default `.automatic`. `.baseLayerOnly` sends a Dolby
-    /// Vision source with a presentable base layer down the plain hvc1 / av01 route on every display
-    /// (`VideoRoutingPolicy.presentsDolbyVisionBaseLayer`), ahead of every DV branch including AE#455.
+    /// From `LoadOptions.dolbyVisionHandling`; default `.automatic`. `.baseLayerOnly` selects any
+    /// presentable HDR base; `.hdr10BaseLayerOnly` selects only an HDR10-compatible PQ base.
     let dolbyVisionHandling: DolbyVisionHandling
 
     /// From `LoadOptions.stereoPresentation`: how a 3D source is presented (`StereoVideoSignal.resolve`).
@@ -998,17 +997,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
     func isSessionEpochCurrent(_ epoch: UInt64) -> Bool {
         restartLock.lock()
         defer { restartLock.unlock() }
-        return sessionEpoch == epoch
+        return sessionEpoch == epoch && !stopRequested
     }
 
     /// Bumped by `stop()` under `restartLock`. Restarts re-validate before installing the new
     /// producer; a mid-restart stop() wins and the restart unwinds.
     private var sessionEpoch: UInt64 = 0
+    private var stopRequested = false
 
     /// Fires once per session on first HDR10+ T.35 detection so AetherEngine can upgrade
     /// `videoFormat` from `.hdr10` to `.hdr10Plus`. Debounced across producer restarts.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
+    var onHDR10PlusMasterUnavailable: (@Sendable () -> Void)?
     private var hasReportedHDR10Plus = false
+    private var advertisesHDR10PlusValue = false
     private let hdr10PlusLock = NSLock()
 
     /// Target segment duration (4 s). Apple spec recommends 6 s; 4 s cuts ~370 ms first-segment
@@ -1414,6 +1416,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     public func start() throws -> URL {
         try prepare()
+        let epoch = sessionEpochSnapshot()
+        guard isSessionEpochCurrent(epoch) else { throw CancellationError() }
         return try serve(panelIsInHDRMode: panelIsInHDRMode)
     }
 
@@ -1437,17 +1441,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// The panel-independent half of `start()`; `serve(panelIsInHDRMode:)` finishes it.
     public func prepare() throws {
         guard demuxer == nil else { throw HLSVideoEngineError.alreadyStarted }
+        let prepareEpoch = sessionEpochSnapshot()
         restartLock.lock()
         vodAutomaticRestartBudget.resetForSession()
+        let stopped = stopRequested
+        let preopened = preopenedDemuxer
+        preopenedDemuxer = nil
+        let dem = preopened ?? Demuxer()
+        if !stopped { demuxer = dem }
         restartLock.unlock()
+        guard !stopped else {
+            dem.markClosed()
+            throw CancellationError()
+        }
 
         // 1. Open the source; reuse the pre-opened demuxer when available (saves ~1-3 s on slow CDN).
-        let dem: Demuxer
-        if let preopened = preopenedDemuxer {
-            dem = preopened
-            preopenedDemuxer = nil
-        } else {
-            dem = Demuxer()
+        if preopened == nil {
             do {
                 try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders,
                              profile: openProfile.withRequestHeaders(requestHeaders), isLive: isLiveSession)
@@ -1455,7 +1464,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 throw Self.openFailure(from: error)
             }
         }
-        demuxer = dem
+        guard isSessionEpochCurrent(prepareEpoch) else {
+            dem.markClosed()
+            throw CancellationError()
+        }
         openedSourceIsSeekable = dem.isSourceSeekable
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged   // surface source stall/reconnect to playbackPhase (#85)
         dem.playIntentProvider = playIntentProvider   // a held connection ends on a pause, not on a parked producer
@@ -1716,10 +1728,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
         let route = try resolveCodecRoute(codecpar: codecpar)
+        preparedHDR10PlusInBaseLayer = false
+        usesPreferredHDR10BaseLayerRoute =
+            dolbyVisionHandling == .hdr10BaseLayerOnly && route.usesDolbyVisionBaseLayer
         let codecTagOverride = route.codecTagOverride
         let videoRange = route.videoRange
         let primaryCodecs = route.primaryCodecs
-        let supplementalCodecs = route.supplementalCodecs
+        var supplementalCodecs = route.supplementalCodecs
         let doviConfig = route.doviConfig
         let convertP7ToProfile81 = route.convertP7ToProfile81
         let dvVariant = route.dvVariant
@@ -2335,6 +2350,70 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
+        // The HLS master must advertise cdm4 for AVPlayer to consume in-band HDR10+ metadata.
+        // Scan the shared demuxer before the producer changes its stream discard set. Peeking keeps
+        // every packet available to playback, including on forward-only sources.
+        if dolbyVisionHandling == .hdr10BaseLayerOnly,
+           route.usesDolbyVisionBaseLayer,
+           sourceReopenableByURL,
+           videoRange == .pq,
+           !isLiveSession {
+            if !demuxerAtInitialProducerStart {
+                seekToInitialProducerStart(dem)
+                demuxerAtInitialProducerStart = true
+            }
+
+            let maxVideoPackets = 32
+            // Audio can lead the first video packet in TrueHD-heavy Matroska files.
+            let maxForeignPackets = 4096
+            let maxPackets = maxVideoPackets + maxForeignPackets
+            let maxBytes: Int64 = 16 * 1024 * 1024
+            let maxElapsedNanoseconds: UInt64 = 2_000_000_000
+            let scanStarted = DispatchTime.now().uptimeNanoseconds
+            var videoPacketsRead = 0
+            var foreignPacketsRead = 0
+            var bytesRead: Int64 = 0
+            var carriesHDR10Plus = false
+            do {
+                try dem.peekPackets(maxPackets: maxPackets) { packet in
+                    let elapsed = DispatchTime.now().uptimeNanoseconds - scanStarted
+                    let packetBytes = Int64(max(0, Int(packet.pointee.size)))
+                    guard packetBytes <= maxBytes - bytesRead else { return true }
+                    bytesRead += packetBytes
+                    if packet.pointee.stream_index == videoIndex {
+                        videoPacketsRead += 1
+                        if packetBytes > 0,
+                           HDR10PlusMetadataScan.packetBytesCarryHDR10Plus(
+                               UnsafePointer(packet),
+                               codecParameters: UnsafePointer(codecpar),
+                               framing: measuredVideoNALFraming
+                           ) {
+                            carriesHDR10Plus = true
+                            return true
+                        }
+                    } else {
+                        foreignPacketsRead += 1
+                    }
+                    return videoPacketsRead >= maxVideoPackets
+                        || foreignPacketsRead >= maxForeignPackets
+                        || bytesRead >= maxBytes
+                        || elapsed >= maxElapsedNanoseconds
+                }
+            } catch {
+                // An inconclusive scan keeps its packets queued; HDR10+ is advertised only on a positive match.
+            }
+            if carriesHDR10Plus {
+                preparedHDR10PlusInBaseLayer = true
+                supplementalCodecs = "\(primaryCodecs)/cdm4"
+                EngineLog.emit(
+                    "[HLSVideoEngine] in-band HDR10+ confirmed on the Dolby Vision base layer; "
+                    + "advertising SUPPLEMENTAL-CODECS=\(supplementalCodecs ?? "")",
+                    category: .session
+                )
+            }
+        }
+        guard isSessionEpochCurrent(prepareEpoch) else { throw CancellationError() }
+
         // 6b. Run the stream-copy / FLAC-bridge / video-only cascade.
         let prod: HLSSegmentProducer
         prod = try buildProducerWithAudioCascade(
@@ -2347,8 +2426,17 @@ public final class HLSVideoEngine: @unchecked Sendable {
             audioHLSCodecs: &audioHLSCodecs,
             audioLanguage: audioLanguage
         )
-        self.producer = prod
-        self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
+        restartLock.lock()
+        let producerInstallAllowed = !stopRequested && sessionEpoch == prepareEpoch
+        if producerInstallAllowed {
+            self.producer = prod
+            self.activeAudioSourceStreamIndex = savedAudioConfig != nil ? audioStreamIndex : -1
+        }
+        restartLock.unlock()
+        guard producerInstallAllowed else {
+            prod.stop()
+            throw CancellationError()
+        }
         // AE#458: only when the audio actually reached the variant. A cascade that fell through to
         // video-only must not advertise an audio rendition that is not in the segments, and must not
         // force the master for one either.
@@ -2367,6 +2455,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let servedAudioIsAtmosStreamCopy =
             audioIsAtmosStreamCopy && audioDelivery == .streamCopy && savedAudioConfig != nil
 
+        // HDR10+ uses the HDR10 base layer. AVPlayer needs its `cdm4` supplemental brand in the
+        // master playlist to consume the in-band T.35 metadata. The host confirms it before opening
+        // the held playback source; packet side data alone is not evidence for the native remux.
         // 7. Wire provider, server, and URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
         // AE#418: a segment AVPlayer places is what moves the axis it reads.
@@ -2466,7 +2557,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
             segmentPlacedHandler: segmentPlacedHandler,
             segmentServedHandler: segmentServedHandler
         )
-        self.provider = prov
+        restartLock.lock()
+        let providerInstallAllowed = !stopRequested && sessionEpoch == prepareEpoch
+        if providerInstallAllowed { self.provider = prov }
+        restartLock.unlock()
+        guard providerInstallAllowed else {
+            prov.cancelWaiters()
+            throw CancellationError()
+        }
         // AE#520 round 2: the close reads it on the playlist-build thread, so it is a closure over a
         // mirror rather than a read of the item.
         prov.consumerBufferedSecondsProvider = consumerBufferedSecondsProvider
@@ -2483,7 +2581,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         let srv = HLSLocalServer(provider: prov)
         try srv.start()
-        self.server = srv
+        restartLock.lock()
+        let serverInstallAllowed = !stopRequested && sessionEpoch == prepareEpoch
+        if serverInstallAllowed { self.server = srv }
+        restartLock.unlock()
+        guard serverInstallAllowed else {
+            srv.stop()
+            throw CancellationError()
+        }
 
         // 8. Kick the pump. Seek on the video stream's exact plan timestamp and forbid an earlier
         // landing. A global time seek can choose the previous sync point in a multi-stream MP4,
@@ -2502,7 +2607,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
             subtitlePacketStore.noteHarvestAnchor(
                 .pump, at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
         }
-        prod.start()
+        restartLock.lock()
+        let pumpStartAllowed = !stopRequested && sessionEpoch == prepareEpoch
+        if pumpStartAllowed { prod.start() }
+        restartLock.unlock()
+        guard pumpStartAllowed else {
+            prod.stop()
+            throw CancellationError()
+        }
         preparedServe = PreparedServe(
             codecpar: codecpar, demuxer: dem, plan: plan, segmentCache: segmentCache, server: srv,
             provider: prov, frameRate: frameRate, servedAudioLanguage: servedAudioLanguage,
@@ -2517,6 +2629,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// a load can run `prepare()` while the panel is still switching and only this has to wait for it.
     /// Reading `panelIsInHDRMode` mid-switch would route an HDR title as SDR for the whole session.
     public func serve(panelIsInHDRMode: Bool) throws -> URL {
+        let serveEpoch = sessionEpochSnapshot()
+        guard isSessionEpochCurrent(serveEpoch) else { throw CancellationError() }
         guard let prepared = preparedServe else {
             throw HLSVideoEngineError.openFailed(reason: "serve() without a prepared session")
         }
@@ -2556,6 +2670,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 timeout: 5.0
             )
         }
+        guard isSessionEpochCurrent(serveEpoch) else { throw CancellationError() }
 
         // URL routing: master playlist (VIDEO-RANGE=PQ + SUPPLEMENTAL-CODECS=dvh1) only when
         // the panel is already in HDR at load time (`panelIsInHDRMode`). A master claiming HDR
@@ -2653,6 +2768,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
+        setAdvertisesHDR10Plus(preparedHDR10PlusInBaseLayer && useMasterPlaylist)
+        if advertisesHDR10Plus {
+            notifyHDR10PlusOnce()
+        }
         iFrameRenditionVerdict = IFrameRenditionEligibility.resolve(
             candidate: iFrameCandidate, servingMaster: useMasterPlaylist)
         if iFrameRenditionVerdict == .served,
@@ -2874,6 +2993,14 @@ hasIFrameRendition: Bool = false,
 
     /// `true` when `start()` chose the master playlist (HDR/DV signaling). Read after `start()`.
     public private(set) var servingMasterPlaylist: Bool = false
+    /// True only when the active master advertises cdm4 for confirmed in-band HDR10+ metadata.
+    var advertisesHDR10Plus: Bool {
+        hdr10PlusLock.lock()
+        defer { hdr10PlusLock.unlock() }
+        return advertisesHDR10PlusValue
+    }
+    private var preparedHDR10PlusInBaseLayer = false
+    private var usesPreferredHDR10BaseLayerRoute = false
 
     /// AE#849: serve the media playlist whatever the routing would choose. Set by the engine before
     /// `start()` / `serve(panelIsInHDRMode:)` on an audio switch whose session the display already
@@ -2914,7 +3041,11 @@ hasIFrameRendition: Bool = false,
 
     /// Flip the serving flag after the engine has reloaded the media playlist on a display rejection.
     func markServingMediaAfterFallback() {
+        let lostHDR10PlusSignaling = advertisesHDR10Plus && usesPreferredHDR10BaseLayerRoute
         servingMasterPlaylist = false
+        setAdvertisesHDR10Plus(false)
+        preparedHDR10PlusInBaseLayer = false
+        if lostHDR10PlusSignaling { onHDR10PlusMasterUnavailable?() }
         // AE#682: the rendition lives only in the master this session just stopped serving.
         tearDownIFrameRendition()
     }
@@ -3622,6 +3753,25 @@ hasIFrameRendition: Bool = false,
     /// Preserve the original zero-argument function type for hosts storing a stop callback.
     public func stop() { stop(reason: .sessionStopped) }
 
+    /// Abort an in-flight prepare without freeing its demuxer's AVFormatContext underneath the
+    /// prepare stack. The owner performs full teardown after `prepare()` unwinds.
+    func cancelPrepare() {
+        restartLock.lock()
+        if !stopRequested {
+            stopRequested = true
+            sessionEpoch &+= 1
+        }
+        let dem = demuxer ?? preopenedDemuxer
+        let currentProducer = producer
+        let currentCache = cache
+        let currentProvider = provider
+        restartLock.unlock()
+        dem?.markClosed()
+        currentProducer?.stop()
+        currentCache?.cancelWaiters()
+        currentProvider?.cancelWaiters()
+    }
+
     public func stop(reason: SessionCacheCleanupReason) {
         preparedServe = nil
         cancelResidentRangesPublish()
@@ -3635,6 +3785,7 @@ hasIFrameRendition: Bool = false,
         // while the pump exits a parked HTTP byte-range read).
         restartLock.lock()
         sessionEpoch &+= 1
+        stopRequested = true
         vodAutomaticRestartBudget.resetForSession()
         retentionClaim?.release()
         retentionClaim = nil
@@ -3976,7 +4127,11 @@ hasIFrameRendition: Bool = false,
         prod.sideReaderLinkGate = sideReaderLinkGate
         prod.playedMediaLedger = playedMediaLedger
         prod.onFirstHDR10PlusDetected = { [weak self] in
-            self?.notifyHDR10PlusOnce()
+            guard let self else { return }
+            if self.usesPreferredHDR10BaseLayerRoute {
+                guard self.advertisesHDR10Plus else { return }
+            }
+            self.notifyHDR10PlusOnce()
         }
         prod.onVideoShiftKnown = { [weak self] shiftPts, firstItemTfdtPts, normalizationShiftPts in
             self?.handleVideoShiftKnown(
@@ -5091,6 +5246,12 @@ hasIFrameRendition: Bool = false,
         if !alreadyFired {
             onFirstHDR10PlusDetected?()
         }
+    }
+
+    private func setAdvertisesHDR10Plus(_ value: Bool) {
+        hdr10PlusLock.lock()
+        advertisesHDR10PlusValue = value
+        hdr10PlusLock.unlock()
     }
 
     /// Entry point from `VideoSegmentProvider` when AVPlayer requests a segment outside the LRU window.

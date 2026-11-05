@@ -34,6 +34,32 @@ struct Issue667MasterAfterSwitchTests {
             routesAsHDR: false, panelPresentsHDR: false, switchRunning: true))
     }
 
+    @Test("A confirmed preferred HDR10+ master waits for an observed switch")
+    func preferredHDR10PlusMasterWaitsForSwitch() {
+        #expect(AetherEngine.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: false, dolbyVisionHandling: .hdr10BaseLayerOnly, servingMaster: true,
+            advertisesHDR10Plus: true, switchRunning: true))
+    }
+
+    @Test("The preferred master wait is limited to confirmed VOD HDR10+ during a switch")
+    func preferredHDR10PlusMasterWaitIsScoped() {
+        #expect(!AetherEngine.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: true, dolbyVisionHandling: .hdr10BaseLayerOnly, servingMaster: true,
+            advertisesHDR10Plus: true, switchRunning: true))
+        #expect(!AetherEngine.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: false, dolbyVisionHandling: .automatic, servingMaster: true,
+            advertisesHDR10Plus: true, switchRunning: true))
+        #expect(!AetherEngine.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: false, dolbyVisionHandling: .hdr10BaseLayerOnly, servingMaster: false,
+            advertisesHDR10Plus: true, switchRunning: true))
+        #expect(!AetherEngine.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: false, dolbyVisionHandling: .hdr10BaseLayerOnly, servingMaster: true,
+            advertisesHDR10Plus: false, switchRunning: true))
+        #expect(!AetherEngine.preferredHDR10PlusMasterAwaitsSwitch(
+            isLive: false, dolbyVisionHandling: .hdr10BaseLayerOnly, servingMaster: true,
+            advertisesHDR10Plus: true, switchRunning: false))
+    }
+
     @Test("A refusal raised mid-switch does not latch, even on an eligible display")
     func midSwitchRefusalDoesNotLatch() {
         #expect(!MasterFallbackDecision.shouldLatchPanelRefusal(

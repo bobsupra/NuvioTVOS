@@ -48,7 +48,7 @@ final class MP4SegmentMuxer {
         /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
         case keep
         /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P8.2 (hvc1 + dvcC trips VT -12906), AVC
-        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling = .baseLayerOnly`).
+        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling` base-layer modes).
         case strip
         /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7 on every display
         /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
