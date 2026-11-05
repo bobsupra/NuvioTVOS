@@ -431,7 +431,7 @@ final class CalendarServiceTests: XCTestCase {
 
         XCTAssertEqual(result.automaticFollowItems["series:5"]?.name, "Resolved Series")
         XCTAssertEqual(result.automaticFollowItems["movie:9"]?.name, "Resolved Film")
-        XCTAssertEqual(Set(result.days.flatMap(\\.entries).map(\\.title)), ["Resolved Series", "Resolved Film"])
+        XCTAssertEqual(Set(result.days.flatMap(\.entries).map(\.title)), ["Resolved Series", "Resolved Film"])
     }
 
     func testLongReleasedMoviesAreNotRequested() async throws {
