@@ -7924,6 +7924,14 @@ private struct TvDetailsEpisodes: View {
     }
 
     private func setSeasonEpisodes(_ newEpisodes: [NuvioVideo], watchedKeys: Set<String>? = nil) {
+        // Episode guides can be replaced asynchronously while the remote is
+        // focused deep into a long season. Keep the same episode when possible,
+        // otherwise clamp the scroll index to the new season's bounds.
+        episodeScrollIndex = TvDetailsEpisodeIndex.reconciled(
+            previousEpisodes: seasonEpisodes,
+            updatedEpisodes: newEpisodes,
+            index: episodeScrollIndex
+        )
         seasonEpisodes = newEpisodes
         seasonEpisodeIndexByID = Self.episodeIndexByID(newEpisodes)
         refreshSeasonWatchedState(for: newEpisodes, watchedKeys: watchedKeys ?? watchedEpisodeKeys)
@@ -8198,6 +8206,38 @@ private struct TvDetailsEpisodes: View {
             return nil
         }
         return continueItem.progress
+    }
+}
+
+/// Keeps the horizontal episode rail inside its bounds when new metadata
+/// replaces or reorders a season's episodes. The next render uses this index
+/// both to materialize nearby cards and to offset their HStack.
+enum TvDetailsEpisodeIndex {
+    static func reconciled(
+        previousEpisodes: [NuvioVideo],
+        updatedEpisodes: [NuvioVideo],
+        index: Int
+    ) -> Int {
+        guard !updatedEpisodes.isEmpty else { return 0 }
+        if previousEpisodes.indices.contains(index) {
+            let previouslySelected = previousEpisodes[index]
+            if let updatedIndex = updatedEpisodes.firstIndex(where: {
+                $0.id == previouslySelected.id
+                    && $0.season == previouslySelected.season
+                    && $0.episode == previouslySelected.episode
+            }) {
+                return updatedIndex
+            }
+            // Some metadata providers replace episode IDs while enriching
+            // titles and artwork; season/episode numbers remain stable.
+            if let updatedIndex = updatedEpisodes.firstIndex(where: {
+                $0.season == previouslySelected.season
+                    && $0.episode == previouslySelected.episode
+            }) {
+                return updatedIndex
+            }
+        }
+        return min(max(index, 0), updatedEpisodes.count - 1)
     }
 }
 
