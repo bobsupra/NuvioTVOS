@@ -55,6 +55,27 @@ final class DetailsLargeSeriesEpisodeIndexTests: XCTestCase {
         )
     }
 
+    func testMetadataProviderChangePreservesSeasonAndEpisode() {
+        let original = episodes(season: 7, numbers: 1...20)
+        let replacement = (1...20).map { number in
+            NuvioVideo(
+                id: "tmdb:123:7:\(number)",
+                title: "Enriched episode \(number)",
+                season: 7,
+                episode: number
+            )
+        }
+
+        XCTAssertEqual(
+            TvDetailsEpisodeIndex.reconciled(
+                previousEpisodes: original,
+                updatedEpisodes: replacement,
+                index: 17
+            ),
+            17
+        )
+    }
+
     func testNewSeasonStartsAtFirstEpisode() {
         let previousSeason = episodes(season: 1, numbers: 1...100)
         let nextSeason = episodes(season: 30, numbers: 1...40)
