@@ -326,6 +326,62 @@ final class CalendarBuilderTests: XCTestCase {
     }
 }
 
+// MARK: - Calendar Back navigation
+
+final class CalendarBackFocusTests: XCTestCase {
+    private let firstDay = CalendarDay(year: 2026, month: 11, day: 5)
+    private let laterDay = CalendarDay(year: 2026, month: 11, day: 17)
+
+    private func event(_ id: Int, on date: CalendarDay) -> CalendarEntry {
+        CalendarEntry(
+            itemId: "tt\(id)",
+            kind: .series,
+            tmdbId: id,
+            title: "Show \(id)",
+            date: date,
+            releaseKind: .episode,
+            seasonNumber: 1,
+            episodeNumber: 1
+        )
+    }
+
+    func testBackFromFocusedEventUsesItsActualDay() {
+        let first = event(10, on: firstDay)
+        let later = event(20, on: laterDay)
+        let sections = [
+            CalendarDaySection(date: firstDay, entries: [first]),
+            CalendarDaySection(date: laterDay, entries: [later])
+        ]
+        XCTAssertEqual(
+            CalendarBackTarget.day(for: .entry(later.id), selectedDay: firstDay, sections: sections),
+            laterDay
+        )
+    }
+
+    func testBackFromFirstDayRemainsOnThatDay() {
+        let first = event(10, on: firstDay)
+        let sections = [CalendarDaySection(date: firstDay, entries: [first])]
+        XCTAssertEqual(
+            CalendarBackTarget.day(for: .entry(first.id), selectedDay: firstDay, sections: sections),
+            firstDay
+        )
+    }
+
+    func testBackFromDisappearingEntryFallsBackToSelectedDay() {
+        XCTAssertEqual(
+            CalendarBackTarget.day(for: .entry("missing"), selectedDay: firstDay, sections: []),
+            firstDay
+        )
+    }
+
+    func testBackOutsideEventPanelRemainsNativeSidebarAction() {
+        let sections = [CalendarDaySection(date: firstDay, entries: [event(10, on: firstDay)])]
+        XCTAssertNil(CalendarBackTarget.day(for: .day(firstDay), selectedDay: firstDay, sections: sections))
+        XCTAssertNil(CalendarBackTarget.day(for: .nextMonth, selectedDay: firstDay, sections: sections))
+        XCTAssertNil(CalendarBackTarget.day(for: nil, selectedDay: firstDay, sections: sections))
+    }
+}
+
 // MARK: - Service
 
 final class CalendarServiceTests: XCTestCase {
