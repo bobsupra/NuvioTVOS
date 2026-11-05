@@ -1019,6 +1019,39 @@ final class CalendarReadableTitleTests: XCTestCase {
         XCTAssertEqual(CalendarTmdb.TvDetails(id: 2, name: "Ordinace").readableName, "Ordinace")
     }
 
+    func testCalendarRejectsTechnicalLibraryNamesButPreservesRealTitles() {
+        XCTAssertNil(CalendarText.readableLibraryTitle("tt0053494"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("  TT0068069  "))
+        XCTAssertNil(CalendarText.readableLibraryTitle("imdb:tt0056758"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("tmdb:444"))
+        XCTAssertNil(CalendarText.readableLibraryTitle("  "))
+        XCTAssertEqual(CalendarText.readableLibraryTitle("One Piece"), "One Piece")
+        XCTAssertEqual(CalendarText.readableLibraryTitle("  A Real Series  "), "A Real Series")
+        XCTAssertEqual(CalendarText.readableLibraryTitle("Titanic"), "Titanic")
+    }
+
+    func testCalendarEventsPreferResolvedNamesOverImdbAndTmdbIdentifiers() {
+        let day = CalendarDay(year: 2026, month: 11, day: 5)
+        let seriesItem = CalendarItem(id: "tt0053494", kind: .series, name: "tt0053494")
+        let seriesDetails = CalendarTmdb.TvDetails(id: 123, name: "Resolved Series")
+        let episodes = [
+            CalendarTmdb.Episode(airDate: "2026-11-05", episodeNumber: 1, seasonNumber: 1)
+        ]
+        let seriesEntries = CalendarBuilder.episodeEntries(
+            item: seriesItem, details: seriesDetails, episodes: episodes, first: day, last: day
+        )
+        XCTAssertEqual(seriesEntries.first?.title, "Resolved Series")
+
+        let movieItem = CalendarItem(id: "tmdb:444", kind: .movie, name: "tmdb:444")
+        let movieDetails = CalendarTmdb.MovieDetails(
+            id: 444, title: "Resolved Movie", releaseDate: "2026-11-05"
+        )
+        let movieEntries = CalendarBuilder.movieEntries(
+            item: movieItem, details: movieDetails, region: "US", first: day, last: day
+        )
+        XCTAssertEqual(movieEntries.first?.title, "Resolved Movie")
+    }
+
     func testCalendarUsesReadableNameAndDropsCJKEpisodeTitles() {
         let item = CalendarItem(id: "tt1", kind: .series, name: "薬屋のひとりごと")
         let details = CalendarTmdb.TvDetails(id: 1, name: "薬屋のひとりごと", translations: .init(translations: [
