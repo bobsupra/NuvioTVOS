@@ -8204,6 +8204,14 @@ enum TvDetailsEpisodeIndex {
             }) {
                 return updatedIndex
             }
+            // Some metadata providers replace episode IDs while enriching
+            // titles and artwork; season/episode numbers remain stable.
+            if let updatedIndex = updatedEpisodes.firstIndex(where: {
+                $0.season == previouslySelected.season
+                    && $0.episode == previouslySelected.episode
+            }) {
+                return updatedIndex
+            }
         }
         return min(max(index, 0), updatedEpisodes.count - 1)
     }
