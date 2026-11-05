@@ -145,8 +145,42 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertTrue(partial.includesContinueWatching)
         XCTAssertFalse(partial.includesLibrary)
         XCTAssertEqual(partial.catalogRowIDs, ["a"])
+        XCTAssertEqual(partial.librarySource, .active)
+        XCTAssertFalse(partial.shufflesUpNext)
         let empty = try JSONDecoder().decode(TopShelfConfiguration.self, from: Data("{}".utf8))
         XCTAssertEqual(empty, .default)
+    }
+
+    func testConfigurationSupportsLibrarySourceAndShuffleUpNext() throws {
+        var config = TopShelfConfiguration.default
+        config.librarySource = .simkl
+        config.shufflesUpNext = true
+        let data = try JSONEncoder().encode(config)
+        let decoded = try JSONDecoder().decode(TopShelfConfiguration.self, from: data)
+        XCTAssertEqual(decoded.librarySource, .simkl)
+        XCTAssertTrue(decoded.shufflesUpNext)
+    }
+
+    func testShuffleUpNextPreservesAllEntries() {
+        let feeds = makeFeeds()
+        var config = TopShelfConfiguration.default
+        config.shufflesUpNext = true
+        let rows = TopShelfComposer.rows(configuration: config) { feeds[$0] }
+        let upNextRow = rows.first { $0.id == "upNext" }
+        XCTAssertNotNil(upNextRow)
+        let originalIds = Set(feeds[.upNext]?.entries.map(\.contentId) ?? [])
+        let resultIds = Set(upNextRow?.entries.map(\.contentId) ?? [])
+        XCTAssertEqual(originalIds, resultIds)
+    }
+
+    func testTopShelfLibraryFeedEffectiveSourceMode() {
+        let store = UserDefaults(suiteName: "test.topshelf.library.\(UUID().uuidString)")!
+        defer { store.removePersistentDomain(forName: store.description) }
+
+        // Local explicitly
+        XCTAssertEqual(TopShelfLibraryFeed.effectiveSourceMode(for: .local, store: store), .local)
+        // Active when no remote authentication exists falls back to local
+        XCTAssertEqual(TopShelfLibraryFeed.effectiveSourceMode(for: .active, store: store), .local)
     }
 
     func testEntryFromAnEarlierFeedStillDecodes() throws {

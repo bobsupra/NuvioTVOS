@@ -516,6 +516,8 @@ enum TraktSettingsStore {
             ProfileSettings.current.set(newValue.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
             RemoteLibraryStore.clear(source: previous, profileId: ProfileSettings.activeProfileID)
             NotificationCenter.default.post(name: libraryChangedNotification, object: nil)
+            TopShelfLibraryFeed.write()
+            TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
         }
     }
 

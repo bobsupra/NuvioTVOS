@@ -108,6 +108,7 @@ enum TopShelfBackgroundRefresh {
         } else {
             await TopShelfFeedStore.writeCatalogRowsAndWait(rows)
         }
+        TopShelfLibraryFeed.write()
         record(rows: refreshed.count, complete: complete)
         return complete
     }

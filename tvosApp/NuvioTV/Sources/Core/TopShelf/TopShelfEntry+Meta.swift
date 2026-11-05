@@ -74,6 +74,125 @@ enum TopShelfCustomPosters {
     }
 }
 
+/// Mirrors the library titles into the App Group for the Top Shelf Library row.
+/// Pulls from the active library provider (Simkl, Trakt, MDBList, WeTrakr, or Nuvio Local)
+/// or from the user's explicitly selected Top Shelf Library source.
+enum TopShelfLibraryFeed {
+    private static let lock = NSLock()
+
+    /// Resolves the effective library mode based on user configuration and authentication.
+    static func effectiveSourceMode(
+        for configSource: TopShelfConfiguration.LibrarySource = TopShelfConfigurationStore.load().librarySource,
+        profileId: String? = ProfileSettings.activeProfileID,
+        store: UserDefaults = ProfileSettings.current
+    ) -> TraktLibrarySourceMode {
+        switch configSource {
+        case .active:
+            let activeMode = TraktSettingsStore.librarySourceMode(in: store)
+            return isSourceAvailable(activeMode, profileId: profileId, store: store) ? activeMode : .local
+        case .local:
+            return .local
+        case .simkl:
+            return isSourceAvailable(.simkl, profileId: profileId, store: store) ? .simkl : .local
+        case .trakt:
+            return isSourceAvailable(.trakt, profileId: profileId, store: store) ? .trakt : .local
+        case .mdblist:
+            return isSourceAvailable(.mdblist, profileId: profileId, store: store) ? .mdblist : .local
+        case .wetrakr:
+            return isSourceAvailable(.wetrakr, profileId: profileId, store: store) ? .wetrakr : .local
+        }
+    }
+
+    static func isSourceAvailable(
+        _ mode: TraktLibrarySourceMode,
+        profileId: String? = ProfileSettings.activeProfileID,
+        store: UserDefaults = ProfileSettings.current
+    ) -> Bool {
+        switch mode {
+        case .local:
+            return true
+        case .simkl:
+            return SimklRuntimeSession.authenticatedState(store: store, profileScope: profileId) != nil
+        case .trakt:
+            return TraktAuthStore.isAuthenticated(in: store)
+        case .mdblist:
+            return MdbListRuntimeSession.isAuthenticated(in: store, profileScope: profileId)
+        case .wetrakr:
+            return WeTrakrRuntimeSession.isAuthenticated(in: store, profileScope: profileId)
+        }
+    }
+
+    /// Items for the chosen library source.
+    static func items(
+        configSource: TopShelfConfiguration.LibrarySource = TopShelfConfigurationStore.load().librarySource,
+        profileId: String? = ProfileSettings.activeProfileID,
+        store: UserDefaults = ProfileSettings.current
+    ) -> [LibraryStoreItem] {
+        let mode = effectiveSourceMode(for: configSource, profileId: profileId, store: store)
+        if mode == .local {
+            return LibraryStore.items()
+        }
+        let bindingId = RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store)
+        if let remoteItems = RemoteLibraryStore.load(source: mode, profileId: profileId, accountBindingId: bindingId),
+           !remoteItems.isEmpty {
+            return remoteItems
+        }
+        // If remote library cache is empty, fall back to local items rather than showing an empty shelf
+        return LibraryStore.items()
+    }
+
+    /// Prefetches remote library items in the background if the selected remote source
+    /// is authenticated but its on-device cache hasn't been loaded yet.
+    static func prefetchRemoteLibraryIfNeeded() {
+        guard TopShelfFeedStore.isAvailable else { return }
+        let store = ProfileSettings.current
+        let profileId = ProfileSettings.activeProfileID
+        let mode = effectiveSourceMode(profileId: profileId, store: store)
+        guard mode != .local else { return }
+        let bindingId = RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store)
+        let cached = RemoteLibraryStore.load(source: mode, profileId: profileId, accountBindingId: bindingId)
+        if cached == nil || cached?.isEmpty == true {
+            Task { @MainActor in
+                let repo = CinemetaCatalogRepository()
+                if let fetched = await SelectedLibraryService.fetchLibrary(repository: repo), !fetched.isEmpty {
+                    RemoteLibraryStore.save(
+                        items: fetched,
+                        source: mode,
+                        profileId: profileId,
+                        accountBindingId: bindingId
+                    )
+                    write()
+                }
+            }
+        }
+    }
+
+    /// Mirrors the most recently added library titles into the App Group for
+    /// the Top Shelf Library row.
+    static func write() {
+        guard TopShelfFeedStore.isAvailable else { return }
+        lock.lock()
+        defer { lock.unlock() }
+
+        let store = ProfileSettings.current
+        let profileId = ProfileSettings.activeProfileID
+        let config = TopShelfConfigurationStore.load()
+        let libraryItems = items(configSource: config.librarySource, profileId: profileId, store: store)
+
+        let entries = libraryItems
+            .sorted { $0.addedAt > $1.addedAt }
+            .prefix(15)
+            .map { item in
+                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details, screen: .library)
+            }
+        TopShelfFeedStore.write(
+            Array(entries),
+            section: .library,
+            title: L10n.string("nav_library", fallback: "Library")
+        )
+    }
+}
+
 /// Mirrors Home's Today row (the calendar's titles coming out today) for the
 /// shelf. Library metadata supplies the backdrop, logo and summary the
 /// calendar's compact cards lack.
@@ -84,7 +203,7 @@ enum TopShelfTodayFeed {
     static func write(_ row: CalendarHomeToday) {
         guard TopShelfFeedStore.isAvailable else { return }
         let library = Dictionary(
-            LibraryStore.items().map { ($0.meta.id, $0.meta) },
+            TopShelfLibraryFeed.items().map { ($0.meta.id, $0.meta) },
             uniquingKeysWith: { first, _ in first })
         let entries: [TopShelfEntry] = row.metas.prefix(15).compactMap { compact in
             guard let calendarEntry = row.entries[compact.id] else { return nil }

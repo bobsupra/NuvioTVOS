@@ -64,6 +64,7 @@ enum RemoteLibraryStore {
         let success = LargePayloadStore.write(data, key: key, directory: storageDirectoryName)
         if success {
             trackKey(key, profileId: profileId)
+            TopShelfLibraryFeed.write()
         }
         return success
     }
@@ -112,6 +113,7 @@ enum RemoteLibraryStore {
         let key = storageKey(source: source, profileId: profileId, accountBindingId: accountBindingId)
         LargePayloadStore.remove(key: key, directory: storageDirectoryName)
         untrackKey(key, profileId: profileId)
+        TopShelfLibraryFeed.write()
     }
 
     static func clear(

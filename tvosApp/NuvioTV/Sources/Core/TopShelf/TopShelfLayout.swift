@@ -27,6 +27,32 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         public var isCarousel: Bool { self == .carouselDetails || self == .carouselActions }
     }
 
+    public enum LibrarySource: String, Codable, CaseIterable, Sendable {
+        /// Pull from whichever library provider is active in Nuvio settings (Simkl, Trakt, etc.)
+        case active
+        /// Strictly native Nuvio local library
+        case local
+        /// Simkl Plan to Watch
+        case simkl
+        /// Trakt Watchlist
+        case trakt
+        /// MDBList
+        case mdblist
+        /// WeTrakr
+        case wetrakr
+
+        public var label: String {
+            switch self {
+            case .active: return "Active Library"
+            case .local: return "Nuvio Library"
+            case .simkl: return "Simkl"
+            case .trakt: return "Trakt"
+            case .mdblist: return "MDBList"
+            case .wetrakr: return "WeTrakr"
+            }
+        }
+    }
+
     public var style: Style
     public var includesContinueWatching: Bool
     public var includesUpNext: Bool
@@ -44,6 +70,10 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     /// string catalog of its own.
     public var starringLabel: String?
     public var directorLabel: String?
+    /// Which library source Top Shelf pulls from (.active by default).
+    public var librarySource: LibrarySource
+    /// Shuffle / randomize the order of titles in the Up Next row.
+    public var shufflesUpNext: Bool
 
     public init(
         style: Style = .carouselDetails,
@@ -55,7 +85,9 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         catalogRowIDs: [String]? = nil,
         playsTrailers: Bool = true,
         starringLabel: String? = nil,
-        directorLabel: String? = nil
+        directorLabel: String? = nil,
+        librarySource: LibrarySource = .active,
+        shufflesUpNext: Bool = false
     ) {
         self.style = style
         self.includesContinueWatching = includesContinueWatching
@@ -67,6 +99,8 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         self.playsTrailers = playsTrailers
         self.starringLabel = starringLabel
         self.directorLabel = directorLabel
+        self.librarySource = librarySource
+        self.shufflesUpNext = shufflesUpNext
     }
 
     public static let `default` = TopShelfConfiguration()
@@ -74,6 +108,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case style, includesContinueWatching, includesUpNext, mergesUpNext, includesToday, includesLibrary
         case catalogRowIDs, playsTrailers, starringLabel, directorLabel
+        case librarySource, shufflesUpNext
     }
 
     /// Missing or unknown values fall back to the defaults, so a file written
@@ -97,6 +132,10 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
             ?? fallback.playsTrailers
         starringLabel = (try? container.decodeIfPresent(String.self, forKey: .starringLabel)) ?? nil
         directorLabel = (try? container.decodeIfPresent(String.self, forKey: .directorLabel)) ?? nil
+        librarySource = (try? container.decodeIfPresent(LibrarySource.self, forKey: .librarySource))
+            ?? fallback.librarySource
+        shufflesUpNext = (try? container.decodeIfPresent(Bool.self, forKey: .shufflesUpNext))
+            ?? fallback.shufflesUpNext
     }
 }
 
@@ -222,16 +261,25 @@ public enum TopShelfComposer {
             guard included else { continue }
             if section == .continueWatching, configuration.mergesUpNext {
                 let inProgress = feed(.continueWatching)
-                let entries = homeOrdered(inProgress?.entries ?? [], feed(.upNext)?.entries ?? [])
+                var upNextEntries = feed(.upNext)?.entries ?? []
+                if configuration.shufflesUpNext {
+                    upNextEntries.shuffle()
+                }
+                let entries = homeOrdered(inProgress?.entries ?? [], upNextEntries)
                 guard !entries.isEmpty else { continue }
                 rows.append(TopShelfRow(
                     id: section.rawValue, section: section, title: inProgress?.title, entries: entries))
                 continue
             }
             guard let sectionFeed = feed(section) else { continue }
-            let entries = section == .today
-                ? sectionFeed.entries.filter { $0.airDate == nil || $0.airDate == today }
-                : sectionFeed.entries
+            let entries: [TopShelfEntry]
+            if section == .today {
+                entries = sectionFeed.entries.filter { $0.airDate == nil || $0.airDate == today }
+            } else if section == .upNext, configuration.shufflesUpNext {
+                entries = sectionFeed.entries.shuffled()
+            } else {
+                entries = sectionFeed.entries
+            }
             guard !entries.isEmpty else { continue }
             rows.append(TopShelfRow(
                 id: section.rawValue, section: section, title: sectionFeed.title, entries: entries))

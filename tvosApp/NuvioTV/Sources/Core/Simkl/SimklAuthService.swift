@@ -1538,11 +1538,19 @@ final class SimklSettingsViewModel: ObservableObject {
             )
             guard !Task.isCancelled, generation == authGeneration,
                   connectedDataRequestID == requestID else { return }
-            _ = await SimklLibraryService.fetchLibrary(
+            if let libraryItems = await SimklLibraryService.fetchLibrary(
                 repository: CinemetaCatalogRepository(),
                 store: store,
                 force: true
-            )
+            ), !libraryItems.isEmpty {
+                let bindingID = SimklAuthStore.accountBindingID(in: store)
+                RemoteLibraryStore.save(
+                    items: libraryItems,
+                    source: .simkl,
+                    profileId: SimklRuntimeSession.profileScope(),
+                    accountBindingId: bindingID
+                )
+            }
             guard !Task.isCancelled, generation == authGeneration,
                   connectedDataRequestID == requestID else { return }
             let fetchedStats = await stats
