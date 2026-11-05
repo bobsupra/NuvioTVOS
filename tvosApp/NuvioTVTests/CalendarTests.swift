@@ -412,6 +412,28 @@ final class CalendarServiceTests: XCTestCase {
         )
     }
 
+    func testTechnicalIdentifierNamesAreEnrichedInCalendarAndFollowState() async throws {
+        let http = CalendarMockHTTP([
+            "/tv/5": (200, #"{"id":5,"name":"Resolved Series","seasons":[{"season_number":1,"air_date":"2026-10-01"}]}"#),
+            "/tv/5/season/1": (200, #"{"episodes":[{"air_date":"2026-10-20","episode_number":1,"season_number":1}]}"#),
+            "/movie/9": (200, #"{"id":9,"title":"Resolved Film","release_date":"2026-11-01","release_dates":{"results":[]}}"#),
+        ])
+        let series = CalendarItem(
+            id: "tt0053494", kind: .series, name: "tt0053494", imdbId: "tt0053494"
+        )
+        let movie = CalendarItem(id: "tmdb:9", kind: .movie, name: "tmdb:9")
+        let result = try await service(http, ids: ["tt0053494": 5, "tmdb:9": 9]).load(
+            items: [series, movie],
+            first: periodFirst,
+            last: periodLast,
+            automaticFollowItemIDs: [series.sourceIdentityKey, movie.sourceIdentityKey]
+        )
+
+        XCTAssertEqual(result.automaticFollowItems["series:5"]?.name, "Resolved Series")
+        XCTAssertEqual(result.automaticFollowItems["movie:9"]?.name, "Resolved Film")
+        XCTAssertEqual(Set(result.days.flatMap(\\.entries).map(\\.title)), ["Resolved Series", "Resolved Film"])
+    }
+
     func testLongReleasedMoviesAreNotRequested() async throws {
         let http = CalendarMockHTTP([:])
         let old = CalendarItem(id: "tmdb:11", kind: .movie, year: 1999)
