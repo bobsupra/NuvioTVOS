@@ -68,6 +68,7 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
     let onBeginForward: () -> Void
     let onEnd: () -> Void
     var canRevealControls: () -> Bool = { false }
+    var canHandleUp: () -> Bool = { false }
     var onTapUp: () -> Void = {}
 
     func makeUIView(context: Context) -> SeekPressHostView {
@@ -80,6 +81,7 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
             onBeginForward: onBeginForward,
             onEnd: onEnd,
             canRevealControls: canRevealControls,
+            canHandleUp: canHandleUp,
             onTapUp: onTapUp
         )
         return view
@@ -94,6 +96,7 @@ struct RemoteSeekPressCatcher: UIViewRepresentable {
             onBeginForward: onBeginForward,
             onEnd: onEnd,
             canRevealControls: canRevealControls,
+            canHandleUp: canHandleUp,
             onTapUp: onTapUp
         )
     }
@@ -115,6 +118,7 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
     private var onBeginForward: () -> Void = {}
     private var onEnd: () -> Void = {}
     private var canRevealControls: () -> Bool = { false }
+    private var canHandleUp: () -> Bool = { false }
     private var onTapUp: () -> Void = {}
 
     private var activeDirection: Direction?
@@ -134,6 +138,7 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         onBeginForward: @escaping () -> Void,
         onEnd: @escaping () -> Void,
         canRevealControls: @escaping () -> Bool,
+        canHandleUp: @escaping () -> Bool = { false },
         onTapUp: @escaping () -> Void
     ) {
         self.isActive = isActive
@@ -143,6 +148,7 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         self.onBeginForward = onBeginForward
         self.onEnd = onEnd
         self.canRevealControls = canRevealControls
+        self.canHandleUp = canHandleUp
         self.onTapUp = onTapUp
         updateRecognizerState()
     }
@@ -264,8 +270,12 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         onTapForward()
     }
 
+    private func shouldHandleUpPress() -> Bool {
+        canHandleUp() || canRevealControls()
+    }
+
     @objc private func handleUpTap(_ recognizer: UITapGestureRecognizer) {
-        guard canRevealControls() else { return }
+        guard shouldHandleUpPress() else { return }
         onTapUp()
     }
 
@@ -310,7 +320,7 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
         if gestureRecognizer === upTapRecognizer {
-            return canRevealControls()
+            return shouldHandleUpPress()
         }
         return isActive || activeDirection != nil
     }

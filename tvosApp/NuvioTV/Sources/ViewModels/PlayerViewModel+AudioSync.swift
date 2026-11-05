@@ -19,6 +19,14 @@ struct AudioSyncStatus: Equatable {
     var phase: Phase
     /// The add-on subtitle it runs for.
     var subtitleURL: String
+    /// The external subtitle file that was selected when the run started.
+    var loadedURL: String? = nil
+    /// The absolute delay before audio sync changed it.
+    var originalDelayMs: Int? = nil
+    /// The latest absolute delay actually applied by audio sync.
+    var syncedDelayMs: Int? = nil
+    /// Whether the captured pre-sync delay is currently selected.
+    var isOriginalTimingSelected = false
     var lines = 0
     /// Seconds of audio heard in the last window.
     var heard: Double = 0
@@ -104,6 +112,57 @@ final class AudioSyncRun {
 extension PlayerViewModel {
     var isAudioSyncRunning: Bool { audioSyncRun != nil }
 
+    private var selectedAudioSyncExternalSubtitleURL: String? {
+        aetherController?.subtitleTracks.first(where: {
+            $0.selected && !$0.externalFilename.isEmpty
+        })?.externalFilename
+    }
+
+    /// A completed audio sync can be restored only while its source and selected delay are
+    /// still the ones it captured. This remains available after the listener stops.
+    var audioSyncTimingStatusForCurrentSubtitle: AudioSyncStatus? {
+        guard let audioSyncStatus,
+              activeEngineKind == .aether,
+              audioSyncStatus.subtitleURL == activeAddonSubtitle?.url,
+              audioSyncStatus.applied != nil,
+              let loadedURL = audioSyncStatus.loadedURL,
+              let originalDelayMs = audioSyncStatus.originalDelayMs,
+              let syncedDelayMs = audioSyncStatus.syncedDelayMs else {
+            return nil
+        }
+        guard selectedAudioSyncExternalSubtitleURL == loadedURL
+                || (selectedAudioSyncExternalSubtitleURL == nil && loadedURL == audioSyncStatus.subtitleURL),
+              subtitleDelayMs == (audioSyncStatus.isOriginalTimingSelected ? originalDelayMs : syncedDelayMs) else {
+            return nil
+        }
+        return audioSyncStatus
+    }
+
+    /// Switches between the captured original delay and the latest delay audio sync applied.
+    func toggleAudioSyncTiming() {
+        guard let status = audioSyncTimingStatusForCurrentSubtitle,
+              let originalDelayMs = status.originalDelayMs,
+              let syncedDelayMs = status.syncedDelayMs,
+              originalDelayMs != syncedDelayMs else { return }
+
+        let selectingOriginal = !status.isOriginalTimingSelected
+        let targetDelayMs = selectingOriginal ? originalDelayMs : syncedDelayMs
+        if let run = audioSyncRun {
+            guard run.subtitleURL == status.subtitleURL, run.loadedURL == status.loadedURL else { return }
+            // The next listener tick must treat this as an intentional timing selection.
+            run.expectedDelayMs = targetDelayMs
+        }
+
+        audioSyncStatus?.isOriginalTimingSelected = selectingOriginal
+        setSubtitleDelayMs(targetDelayMs)
+
+        // Keep pending estimates while original timing is selected. When synced timing is
+        // restored, let the normal quiet-gap check decide whether a pending follow can apply.
+        if !selectingOriginal, let run = audioSyncRun {
+            applyPendingAudioShift(run)
+        }
+    }
+
     func toggleAudioSync() {
         if audioSyncRun != nil {
             stopAudioSync(reason: "Stopped")
@@ -134,7 +193,9 @@ extension PlayerViewModel {
             subtitleURL: subtitle.url, loadedURL: loadedURL, generation: generation,
             listener: listener, delayMs: subtitleDelayMs)
         audioSyncRun = run
-        audioSyncStatus = AudioSyncStatus(phase: .reading, subtitleURL: subtitle.url)
+        audioSyncStatus = AudioSyncStatus(
+            phase: .reading, subtitleURL: subtitle.url, loadedURL: loadedURL,
+            originalDelayMs: subtitleDelayMs)
         run.control = Task { @MainActor [weak self] in
             let cues = await PlayerViewModel.audioSyncCues(loadedURL)
             guard !Task.isCancelled, let self, self.audioSyncRun === run else { return }
@@ -251,8 +312,7 @@ extension PlayerViewModel {
         if sessionCoordinator.loadGeneration != run.generation { return "New video" }
         if activeEngineKind != .aether { return "Engine switched to MPV" }
         if activeAddonSubtitle?.url != run.subtitleURL { return "Subtitle changed" }
-        if let loaded = aetherController?.subtitleTracks.first(where: { $0.selected && !$0.externalFilename.isEmpty }),
-           loaded.externalFilename != run.loadedURL {
+        if let loadedURL = selectedAudioSyncExternalSubtitleURL, loadedURL != run.loadedURL {
             return "Subtitle timing switched"
         }
         if subtitleDelayMs != run.expectedDelayMs { return "Delay changed by hand" }
@@ -287,6 +347,7 @@ extension PlayerViewModel {
     /// Changes the delay, the first time at once, after that when no line is on screen.
     private func applyPendingAudioShift(_ run: AudioSyncRun) {
         guard let shift = run.pending else { return }
+        guard audioSyncStatus?.isOriginalTimingSelected != true else { return }
         let first = run.tracker.applied == nil
         let waited = ProcessInfo.processInfo.systemUptime - run.pendingSince
         let at = audioSyncClock
@@ -299,6 +360,8 @@ extension PlayerViewModel {
         setSubtitleDelayMs(ms)
         audioSyncStatus?.phase = .following
         audioSyncStatus?.applied = shift
+        audioSyncStatus?.syncedDelayMs = ms
+        audioSyncStatus?.isOriginalTimingSelected = false
         audioSyncStatus?.pending = nil
         audioSyncStatus?.changes.append(AudioSyncStatus.Change(at: at, shift: shift))
         if (audioSyncStatus?.changes.count ?? 0) > 8 { audioSyncStatus?.changes.removeFirst() }

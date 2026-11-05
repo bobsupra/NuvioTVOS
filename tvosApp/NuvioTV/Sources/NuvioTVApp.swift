@@ -849,8 +849,10 @@ struct ContentView: View {
                 watchPartyOwner.suspendForInactivity()
                 backgroundedAt = Date()
                 syncManager.flushPendingPushes()
+                TopShelfLibraryFeed.write()
                 TopShelfBackgroundRefresh.schedule()
             case .active:
+                TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
                 if backgroundedAt != nil {
                     releaseUpdateService.beginForegroundSession()
                     announcementService.beginForegroundSession()
@@ -7842,12 +7844,37 @@ struct TVHomeView: View {
     }
 
     /// Continue Watching context for the hero — only when the focused card is
-    /// actually in the Continue Watching / Upcoming row. The same title can also appear in
+    /// actually in the Continue Watching / Upcoming / Today row. The same title can also appear in
     /// catalog rows (Popular etc.), where the hero should stay generic.
     private func heroContinueItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
-        guard visibleFocusedMeta != nil,
-              (focusedSectionId == TVHomeSection.continueWatchingId || focusedSectionId == TVHomeSection.upcomingId) else { return nil }
-        return continueWatchingByMetaId[meta.id]
+        guard visibleFocusedMeta != nil else { return nil }
+        if focusedSectionId == TVHomeSection.continueWatchingId || focusedSectionId == TVHomeSection.upcomingId {
+            return continueWatchingByMetaId[meta.id]
+        }
+        if focusedSectionId == TVHomeSection.calendarTodayId {
+            if let existing = continueWatchingByMetaId[meta.id] {
+                return existing
+            }
+            if let entry = calendarToday.entries[meta.id],
+               let season = entry.seasonNumber,
+               let episode = entry.episodeNumber {
+                return ContinueWatchingItem(
+                    meta: meta,
+                    streamUrl: "",
+                    position: 0,
+                    duration: 0,
+                    lastWatchedAt: Date(),
+                    season: season,
+                    episode: episode,
+                    released: nil,
+                    episodeTitleOverride: entry.episodeName,
+                    episodeOverviewOverride: entry.overview,
+                    episodeThumbnailOverride: entry.stillURL?.absoluteString,
+                    isUpNext: true
+                )
+            }
+        }
+        return nil
     }
 
     private var visibleHero: NuvioMeta? {
@@ -11376,7 +11403,7 @@ private struct TVHeroView: View {
                     .foregroundColor(.white)
             }
 
-            TVHeroMetaLine(meta: meta, episodeLine: episodeLine)
+            TVHeroMetaLine(meta: meta, episodeLine: episodeLine, continueItem: continueItem)
 
             if let continueItem {
                 Text(continueItem.isUpNextEntry ? continueItem.upNextBadgeText : continueItem.remainingText.uppercased())
@@ -11430,6 +11457,9 @@ extension TVHeroView: Equatable {
             && lhs.continueItem?.meta.id == rhs.continueItem?.meta.id
             && lhs.continueItem?.episodeLabel == rhs.continueItem?.episodeLabel
             && lhs.continueItem?.remainingText == rhs.continueItem?.remainingText
+            && lhs.continueItem?.episodeVideo?.rating == rhs.continueItem?.episodeVideo?.rating
+            && lhs.continueItem?.season == rhs.continueItem?.season
+            && lhs.continueItem?.episode == rhs.continueItem?.episode
     }
 }
 
@@ -12771,12 +12801,37 @@ private struct TVHeroMetaLine: View {
     /// "S1 E3 · Title" for a series in progress; replaces the type/runtime
     /// items so the line reads "S1 E3 · Title • Crime • 2026–".
     var episodeLine: String? = nil
+    var continueItem: ContinueWatchingItem? = nil
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
     @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
+    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = true
     @State private var fetchedRatings: [NuvioExternalRating]?
     /// Which title/source `fetchedRatings` belong to, so a reused view never
     /// shows the previous title's scores.
     @State private var fetchedRatingsKey: String?
+
+    private var targetEpisodeVideo: NuvioVideo? {
+        guard continueWatchingEpisodeRatings, meta.isSeries, let continueItem else { return nil }
+        if let video = continueItem.episodeVideo, video.rating != nil {
+            return video
+        }
+        if let numbers = continueItem.episodeNumbers {
+            if let video = meta.videos?.first(where: { $0.season == numbers.season && $0.episode == numbers.episode }) {
+                return video
+            }
+        }
+        return continueItem.episodeVideo
+    }
+
+    private var episodeRatingsIdentifier: String? {
+        guard continueWatchingEpisodeRatings, meta.isSeries, let continueItem,
+              let numbers = continueItem.episodeNumbers else { return nil }
+        if let video = targetEpisodeVideo {
+            return meta.canonicalEpisodeStreamId(for: video)
+        }
+        let baseId = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id) ?? meta.streamId
+        return "\(baseId):\(numbers.season):\(numbers.episode)"
+    }
 
     var body: some View {
         let values = [
@@ -12787,23 +12842,50 @@ private struct TVHeroMetaLine: View {
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         let badge = meta.statusBadgeLabel
+        let isEpisodeMode = episodeRatingsIdentifier != nil
+        let episodeId = episodeRatingsIdentifier
         // Same key as the ratings cache: enrichment can add an IMDb id to a
         // kitsu:/tmdb: item, which must re-run the lookup below.
-        let ratingsKey = "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
+        let ratingsKey = isEpisodeMode
+            ? "\(episodeId!)-\(homeHeroRatingSource)"
+            : "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
         let fetched = fetchedRatingsKey == ratingsKey ? fetchedRatings : nil
-        let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta)
+        let cached = isEpisodeMode
+            ? episodeId.flatMap { HomeHeroRatingsCache.shared.cachedRatings(for: $0) }
+            : AddonRatingsService.cachedHomeHeroRatings(for: meta)
         let showsAllRatings = AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource)
-        let ratingBadges = showsAllRatings
-            ? TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
-            : []
+        let ratingBadges: [TvRatingBadge] = {
+            guard showsAllRatings else { return [] }
+            if isEpisodeMode {
+                return TvRatingBadge.badges(from: AddonRatingsService.heroEpisodeDisplayRatings(for: meta, video: targetEpisodeVideo, fetched: fetched ?? cached))
+            } else {
+                return TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
+            }
+        }()
         // Still waiting for MDBList/add-on scores: keep the ratings line.
         let ratingsPending = showsAllRatings && fetched == nil && cached == nil
-        let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
-            ?? nonEmpty(fetched)
-            ?? nonEmpty(cached)
-        let rating = showsAllRatings
-            ? nil
-            : AddonRatingsService.heroRatingString(for: meta, source: homeHeroRatingSource, ratings: effectiveRatings)
+        let rating: String? = {
+            if showsAllRatings {
+                return nil
+            } else if isEpisodeMode {
+                let epEffective = nonEmpty(fetched) ?? nonEmpty(cached)
+                return AddonRatingsService.heroEpisodeRatingString(
+                    for: meta,
+                    video: targetEpisodeVideo,
+                    source: homeHeroRatingSource,
+                    ratings: epEffective
+                )
+            } else {
+                let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
+                    ?? nonEmpty(fetched)
+                    ?? nonEmpty(cached)
+                return AddonRatingsService.heroRatingString(
+                    for: meta,
+                    source: homeHeroRatingSource,
+                    ratings: effectiveRatings
+                )
+            }
+        }()
         // Movies have no status badge, so their rating would sit alone on the
         // second line; ride it on the primary line right after the date instead.
         let isMovie = !meta.isSeries
@@ -12857,17 +12939,36 @@ private struct TVHeroMetaLine: View {
             }
         }
         .task(id: ratingsKey) {
-            guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
-            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
-                // Keep them here too, so the row survives the cache entry expiring.
-                fetchedRatings = cached
+            if isEpisodeMode, let episodeId {
+                if let cached = HomeHeroRatingsCache.shared.cachedRatings(for: episodeId) {
+                    fetchedRatings = cached
+                    fetchedRatingsKey = ratingsKey
+                    return
+                }
+                if let tmdbId = meta.tmdbId {
+                    await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: meta.id)
+                    if let imdb = meta.imdbId {
+                        await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: imdb)
+                    }
+                }
+                let ratings = await AddonRatingsService.fetchRatingsForEpisode(episodeId: episodeId)
+                guard !Task.isCancelled else { return }
+                HomeHeroRatingsCache.shared.setRatings(ratings, for: episodeId)
+                fetchedRatings = ratings
                 fetchedRatingsKey = ratingsKey
-                return
+            } else {
+                guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
+                if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
+                    // Keep them here too, so the row survives the cache entry expiring.
+                    fetchedRatings = cached
+                    fetchedRatingsKey = ratingsKey
+                    return
+                }
+                let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
+                guard !Task.isCancelled else { return }
+                fetchedRatings = ratings
+                fetchedRatingsKey = ratingsKey
             }
-            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
-            guard !Task.isCancelled else { return }
-            fetchedRatings = ratings
-            fetchedRatingsKey = ratingsKey
         }
     }
 

@@ -249,7 +249,16 @@ extension PlayerView {
             },
             onBegan: { viewModel.remoteTouchBegan() },
             onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
-            onEnded: { dx, dy in viewModel.remoteTouchEnded(dx: dx, dy: dy) }
+            onEnded: { dx, dy in
+                if viewModel.showControls && viewModel.isTimelineFocused && !viewModel.isScrubbing && dy < -15 && abs(dy) > abs(dx) {
+                    if viewModel.showSkipSegmentCard {
+                        focusSkipSegment()
+                    } else {
+                        requestedControlFocus = .firstTransportButton
+                    }
+                }
+                viewModel.remoteTouchEnded(dx: dx, dy: dy)
+            }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
@@ -297,16 +306,42 @@ extension PlayerView {
                 viewModel.stopRepeatingSkip()
             },
             canRevealControls: { canRevealControlsFromRemotePress },
+            canHandleUp: {
+                canRevealControlsFromRemotePress || canFocusTransportFromTimeline
+            },
             onTapUp: {
-                // Capture the first physical Up after Back/Menu returns from controls;
-                // the focus sink can consume that press during focus handoff.
-                guard canRevealControlsFromRemotePress else { return }
-                viewModel.revealControls()
+                if canRevealControlsFromRemotePress {
+                    viewModel.revealControls()
+                } else if canFocusTransportFromTimeline {
+                    if viewModel.showSkipSegmentCard {
+                        focusSkipSegment()
+                    } else {
+                        requestedControlFocus = .firstTransportButton
+                    }
+                }
             }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
         .accessibilityHidden(true)
+    }
+
+    private var canFocusTransportFromTimeline: Bool {
+        didReportPlaybackStarted
+            && !isWakingFromBackground
+            && viewModel.currentErrorDiagnostic == nil
+            && !viewModel.showSettingsPanel
+            && !viewModel.showScenePanel
+            && !viewModel.isSceneDetailVisible
+            && viewModel.sidePanel == nil
+            && !viewModel.postPlayState.isVisible
+            && viewModel.showControls
+            && viewModel.isTimelineFocused
+            && !viewModel.isScrubbing
+            && !viewModel.isHoldingSeek
+            && viewModel.pendingSeekDelta == 0
+            && !viewModel.controlsAutoHideSuspended
+            && !isGestureCaptureActive
     }
 
     private var canRevealControlsFromRemotePress: Bool {
@@ -811,8 +846,7 @@ extension PlayerView {
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
-                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) },
-                onPlayPause: { handlePlayPauseCommand() }
+                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(shouldShowControls ? 1 : 0)

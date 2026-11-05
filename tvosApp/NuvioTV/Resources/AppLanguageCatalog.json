@@ -17445,6 +17445,8 @@
     "tvos_layout_search_style_subtitle": "Netflix uses the built-in tvOS keyboard with a title list beside the posters; Classic uses the system keyboard over a full-width grid; Native uses the built-in tvOS single-row keyboard",
     "tvos_layout_show_unaired": "Show Unaired Next Up",
     "tvos_layout_show_unaired_subtitle": "Keep upcoming episodes in Continue Watching with their air date",
+    "tvos_layout_episode_ratings": "Episode Ratings",
+    "tvos_layout_episode_ratings_subtitle": "Show individual episode ratings instead of series ratings for in-progress and upcoming titles",
     "tvos_layout_up_next_furthest": "Up Next From Furthest Episode",
     "tvos_layout_up_next_furthest_subtitle": "Show the next episode after the furthest one watched. Turn off for rewatches to follow the most recently watched episode.",
     "tvos_library_content": "Content",

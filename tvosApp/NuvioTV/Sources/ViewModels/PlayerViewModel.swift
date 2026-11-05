@@ -5908,12 +5908,26 @@ class PlayerViewModel: ObservableObject {
         case .undecided:
             let adx = abs(dx), ady = abs(dy)
             guard max(adx, ady) >= 15 else { return }
-            suppressMoveBriefly()
             if ady > adx {
-                touchIntent = .consumed
-                // Vertical swipe: reveal controls. (Info panel is a later port.)
-                revealControls()
+                if showPauseOverlay {
+                    suppressMoveBriefly()
+                    touchIntent = .consumed
+                    revealControls()
+                } else if dy > 0 {
+                    suppressMoveBriefly()
+                    touchIntent = .consumed
+                    if isSceneEnabled {
+                        openScene()
+                    } else {
+                        revealControls()
+                    }
+                } else if !showControls {
+                    suppressMoveBriefly()
+                    touchIntent = .consumed
+                    revealControls()
+                }
             } else {
+                suppressMoveBriefly()
                 // While playing: horizontal swipes are suppressed (no swipe seeking, only tap seek).
                 // While paused: enter scrub only when playback was already paused when the touch began.
                 guard status == .paused,
@@ -5938,8 +5952,13 @@ class PlayerViewModel: ObservableObject {
         guard !isHoldingSeek, pendingSeekDelta == 0, !showScenePanel, !isSceneDetailVisible else { return }
         if touchIntent == .scrub {
             endScrubGesture()
-        } else if touchIntent == .consumed || max(abs(dx), abs(dy)) >= 15 {
+        } else if touchIntent == .consumed {
             suppressMoveBriefly(0.3)
+        } else if max(abs(dx), abs(dy)) >= 15 {
+            let isUpwardFocusSwipe = showControls && isTimelineFocused && dy < 0 && abs(dy) > abs(dx)
+            if !isUpwardFocusSwipe {
+                suppressMoveBriefly(0.3)
+            }
         }
         scrubEngagedThisStroke = false
         touchBeganWhileStatus = nil
@@ -7921,26 +7940,48 @@ class PlayerViewModel: ObservableObject {
         }
 
         let engineOutputFormat = aether?.engine.videoFormat
+        let dynamicRangeReport = reportedValue([debug?.dynamicRange, debug?.hdr]) ?? hdrRaw
+        let effectiveHDRRaw = dynamicRangeReport
+            .components(separatedBy: "→")
+            .last?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? dynamicRangeReport
         let dynamicRange: String
-        if isDV {
-            if engineOutputFormat == .hdr10 || (!tvSupportsDV && tvSupportsHDR) {
-                dynamicRange = "Dolby Vision → HDR10"
-            } else if engineOutputFormat == .sdr || (!tvSupportsDV && !tvSupportsHDR) {
+        if let engineOutputFormat {
+            switch engineOutputFormat {
+            case .hdr10Plus:
+                dynamicRange = isDV ? "Dolby Vision → HDR10+" : "HDR10+"
+            case .hdr10:
+                dynamicRange = isDV ? "Dolby Vision → HDR10" : "HDR10"
+            case .hlg:
+                dynamicRange = isDV ? "Dolby Vision → HLG" : "HLG"
+            case .sdr:
+                dynamicRange = isDV ? "Dolby Vision → SDR" : "SDR"
+            case .dolbyVision:
+                dynamicRange = "Dolby Vision"
+            }
+        } else if isDV {
+            if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR10+") {
+                dynamicRange = "Dolby Vision → HDR10+"
+            } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HLG") {
+                dynamicRange = "Dolby Vision → HLG"
+            } else if effectiveHDRRaw.localizedCaseInsensitiveContains("SDR") {
                 dynamicRange = "Dolby Vision → SDR"
-            } else if debug?.dynamicRange.contains("→") == true {
+            } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR") || (!tvSupportsDV && tvSupportsHDR) {
                 dynamicRange = "Dolby Vision → HDR10"
             } else if tvSupportsDV {
                 dynamicRange = "Dolby Vision"
-            } else {
+            } else if tvSupportsHDR {
                 dynamicRange = "Dolby Vision → HDR10"
+            } else {
+                dynamicRange = "Dolby Vision → SDR"
             }
-        } else if hdrRaw.localizedCaseInsensitiveContains("HLG") {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR10+") {
+            dynamicRange = "HDR10+"
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HLG") {
             dynamicRange = "HLG"
-        } else if hdrRaw.localizedCaseInsensitiveContains("HDR") || engineOutputFormat == .hdr10 {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("HDR") {
             dynamicRange = "HDR10"
-        } else if hdrRaw.localizedCaseInsensitiveContains("SDR") {
-            dynamicRange = "SDR"
-        } else if engineOutputFormat == .sdr {
+        } else if effectiveHDRRaw.localizedCaseInsensitiveContains("SDR") {
             dynamicRange = "SDR"
         } else {
             dynamicRange = "—"

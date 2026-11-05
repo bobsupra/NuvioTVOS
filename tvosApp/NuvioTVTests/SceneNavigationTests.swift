@@ -19,6 +19,114 @@ final class SceneNavigationTests: XCTestCase {
         XCTAssertEqual(viewModel.sceneViewModel.selectedTab, .scene, "Scene tab must be selected initially")
     }
 
+    func testTouchpadSwipeDownOpensSceneWhenControlsHidden() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = false
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: 35) // Downward swipe on touch surface
+
+        XCTAssertTrue(viewModel.showScenePanel, "Swipe down on remote touchpad must open Scene panel")
+        XCTAssertFalse(viewModel.showControls, "Swipe down on remote touchpad must not reveal transport controls")
+        XCTAssertTrue(viewModel.moveSuppressed, "Swipe down should briefly suppress move commands")
+        XCTAssertEqual(viewModel.status, .playing, "Playback must remain playing when Scene opens")
+
+        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+    }
+
+    func testTouchpadSwipeDownRevealsControlsWhenSceneDisabled() {
+        let previous = ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled)
+        ProfileSettings.current.set(false, forKey: SettingsKey.sceneFeatureEnabled)
+        defer {
+            if let previous {
+                ProfileSettings.current.set(previous, forKey: SettingsKey.sceneFeatureEnabled)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.sceneFeatureEnabled)
+            }
+        }
+
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = false
+        XCTAssertFalse(viewModel.isSceneEnabled)
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: 35) // Downward swipe on touch surface
+
+        XCTAssertFalse(viewModel.showScenePanel, "Scene panel must not open when disabled in settings")
+        XCTAssertTrue(viewModel.showControls, "Swipe down should fall back to revealing controls when Scene is disabled")
+        XCTAssertTrue(viewModel.moveSuppressed)
+
+        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+    }
+
+    func testTouchpadSwipeUpRevealsControls() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = false
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: -35) // Upward swipe on touch surface
+
+        XCTAssertFalse(viewModel.showScenePanel, "Swipe up must not open Scene panel")
+        XCTAssertTrue(viewModel.showControls, "Swipe up on remote touchpad must reveal transport controls")
+        XCTAssertTrue(viewModel.moveSuppressed)
+
+        viewModel.remoteTouchEnded(dx: 0, dy: -35)
+    }
+
+    func testTouchpadSwipeUpFromTimelineDoesNotSuppressMove() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = true
+        viewModel.isTimelineFocused = true
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: -35) // Upward swipe on touch surface from timeline
+        viewModel.remoteTouchEnded(dx: 0, dy: -35)
+
+        XCTAssertFalse(viewModel.moveSuppressed, "Swipe up from timeline to transport buttons must not suppress move commands")
+    }
+
+    func testTouchpadSwipeDownFromTimelineOpensScene() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = true
+        viewModel.isTimelineFocused = true
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: 35) // Downward swipe from timeline
+
+        XCTAssertTrue(viewModel.showScenePanel, "Swipe down from timeline must open Scene panel")
+        XCTAssertFalse(viewModel.showControls, "Controls must be hidden when Scene panel opens")
+        XCTAssertTrue(viewModel.moveSuppressed)
+
+        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+    }
+
+    func testTouchpadSwipeDownWithPauseOverlayRevealsControls() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .paused
+        viewModel.showPauseOverlay = true
+        viewModel.showControls = false
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: 35)
+
+        XCTAssertFalse(viewModel.showScenePanel, "Pause overlay swipe should dismiss overlay and reveal controls, not open Scene")
+        XCTAssertTrue(viewModel.showControls, "Controls should be revealed")
+        XCTAssertFalse(viewModel.showPauseOverlay, "Pause overlay should be dismissed")
+
+        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+    }
+
     func testRemoteDownDoesNotOpenSceneWhenDisabledInSettings() {
         let previous = ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled)
         ProfileSettings.current.set(false, forKey: SettingsKey.sceneFeatureEnabled)

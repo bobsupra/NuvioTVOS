@@ -179,6 +179,7 @@ enum SettingsKey {
     static let continueWatchingSort = "nuvio.tv.settings.layout.continueWatchingSort"
     static let upNextFromFurthestEpisode = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
     static let showUnairedNextUp = "nuvio.tv.settings.layout.showUnairedNextUp"
+    static let continueWatchingEpisodeRatings = "nuvio.tv.settings.layout.continueWatchingEpisodeRatings"
     static let cardCornerRadius = "nuvio.tv.settings.layout.cardCornerRadius"
     static let cardSize = "nuvio.tv.settings.layout.cardSize"
     static let liquidGlassCards = "nuvio.tv.settings.layout.liquidGlassCards"
@@ -289,6 +290,7 @@ enum SettingsKey {
 
     static let trueHDSpatialAudio = "nuvio.tv.settings.playback.trueHDSpatialAudio"
     static let preferDualLayerDolbyVision = "nuvio.tv.settings.playback.preferDualLayerDolbyVision"
+    static let preferHDR10Plus = "nuvio.tv.settings.playback.preferHDR10Plus"
     static let lowResUpscaling = "nuvio.tv.settings.playback.lowResUpscaling"
     static let losslessAudioBridge = "nuvio.tv.settings.playback.losslessAudioBridge"
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
@@ -398,7 +400,7 @@ enum SettingsKey {
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
-        continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
+        continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings,
         showCalendarTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
@@ -429,7 +431,7 @@ enum SettingsKey {
         cinemetaDisabled, deletedLocalAddons,
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
-        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
+        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, preferHDR10Plus, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
@@ -3357,6 +3359,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
     @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
+    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = true
     @AppStorage(SettingsKey.homeCalendarToday) private var homeCalendarToday = true
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
@@ -3668,6 +3671,18 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Keep upcoming episodes in Continue Watching with their air date"
                     ),
                     isOn: $showUnairedNextUp,
+                    accentColor: accentColor
+                )
+                .opacity(continueWatchingVisible ? 1 : 0.46)
+                .disabled(!continueWatchingVisible)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_layout_episode_ratings", fallback: "Episode Ratings"),
+                    subtitle: L10n.string(
+                        "tvos_layout_episode_ratings_subtitle",
+                        fallback: "Show individual episode ratings instead of series ratings for in-progress and upcoming titles"
+                    ),
+                    isOn: $continueWatchingEpisodeRatings,
                     accentColor: accentColor
                 )
                 .opacity(continueWatchingVisible ? 1 : 0.46)
@@ -4081,6 +4096,49 @@ private struct TopShelfSettingsGroup: View {
                 accentColor: accentColor
             )
 
+            if configuration.includesUpNext {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_topshelf_shuffle_up_next", fallback: "Shuffle Up Next"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_shuffle_up_next_subtitle",
+                        fallback: "Randomize the order of Up Next titles to surface different content"
+                    ),
+                    isOn: Binding(
+                        get: { configuration.shufflesUpNext },
+                        set: { isOn in
+                            update { $0.shufflesUpNext = isOn }
+                            ContinueWatchingStore.writeTopShelfFeed()
+                        }
+                    ),
+                    accentColor: accentColor
+                )
+            }
+
+            if configuration.includesLibrary {
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_topshelf_library_source", fallback: "Library Source"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_library_source_subtitle",
+                        fallback: "Choose whether Top Shelf pulls from your active library provider or a specific library"
+                    ),
+                    selection: Binding(
+                        get: { configuration.librarySource.rawValue },
+                        set: { raw in
+                            guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else { return }
+                            update { $0.librarySource = source }
+                            TopShelfLibraryFeed.write()
+                            TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
+                        }
+                    ),
+                    options: availableLibrarySources.map { $0.rawValue },
+                    accentColor: accentColor,
+                    optionLabel: { raw in
+                        guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else { return raw }
+                        return librarySourceLabel(source)
+                    }
+                )
+            }
+
             if catalogs.isEmpty {
                 SettingsInfoRow(
                     title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
@@ -4158,6 +4216,43 @@ private struct TopShelfSettingsGroup: View {
         .animation(.easeInOut(duration: 0.2), value: configuration)
     }
 
+    private var availableLibrarySources: [TopShelfConfiguration.LibrarySource] {
+        var sources: [TopShelfConfiguration.LibrarySource] = [.active, .local]
+        let store = ProfileSettings.current
+        let profileId = ProfileSettings.activeProfileID
+        if TopShelfLibraryFeed.isSourceAvailable(.simkl, profileId: profileId, store: store) {
+            sources.append(.simkl)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.trakt, profileId: profileId, store: store) {
+            sources.append(.trakt)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.mdblist, profileId: profileId, store: store) {
+            sources.append(.mdblist)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.wetrakr, profileId: profileId, store: store) {
+            sources.append(.wetrakr)
+        }
+        return sources
+    }
+
+    private func librarySourceLabel(_ source: TopShelfConfiguration.LibrarySource) -> String {
+        switch source {
+        case .active:
+            let effective = TopShelfLibraryFeed.effectiveSourceMode(for: .active)
+            return "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
+        case .local:
+            return L10n.string("library_source_saved", fallback: "Nuvio Library")
+        case .simkl:
+            return "Simkl"
+        case .trakt:
+            return "Trakt"
+        case .mdblist:
+            return "MDBList"
+        case .wetrakr:
+            return "WeTrakr"
+        }
+    }
+
     private func isCatalogSelected(_ id: String) -> Bool {
         if let ids = configuration.catalogRowIDs { return ids.contains(id) }
         return id == catalogs.first?.id
@@ -4183,12 +4278,14 @@ private struct TopShelfSettingsGroup: View {
         next.directorLabel = L10n.string("details_director", fallback: "Director")
         configuration = next
         TopShelfConfigurationStore.save(next)
+        TopShelfLibraryFeed.write()
     }
 
     private func loadCatalogs() {
         configuration = TopShelfConfigurationStore.load()
         backgroundStatus = TopShelfBackgroundRefresh.lastStatus
         catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
+        TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
     }
 }
 

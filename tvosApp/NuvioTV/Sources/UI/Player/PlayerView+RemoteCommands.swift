@@ -4,24 +4,20 @@ extension PlayerView {
     var layersWithRemoteCommands: some View {
         layersObservingFocus
             .onPlayPauseCommand {
-                handlePlayPauseCommand()
+                let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
+                screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                guard !isWakingFromBackground else {
+                    screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand suppressed by isWakingFromBackground")
+                    return
+                }
+                guard viewModel.currentErrorDiagnostic == nil else { return }
+                guard didReportPlaybackStarted else {
+                    revealControlsAndFocusSettings()
+                    return
+                }
+                viewModel.togglePlayPause()
             }
             .onExitCommand(perform: handleRemoteBack)
-    }
-
-    func handlePlayPauseCommand() {
-        let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
-        screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), status=\(viewModel.status), pos=\(viewModel.time.current)")
-        guard !isWakingFromBackground else {
-            screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand suppressed by isWakingFromBackground")
-            return
-        }
-        guard viewModel.currentErrorDiagnostic == nil else { return }
-        guard didReportPlaybackStarted else {
-            revealControlsAndFocusSettings()
-            return
-        }
-        viewModel.togglePlayPause()
     }
 
     /// Back / Menu during playback (also from the remote-gesture layer, which takes the remote).
@@ -86,6 +82,13 @@ extension PlayerView {
             viewModel.dismissActiveInterval()
             skipSegmentFocused = false
             focusRemoteInput()
+            return
+        }
+        if viewModel.showControls,
+           viewModel.controlsAutoHideSuspended,
+           !skipSegmentFocused,
+           !nextEpisodeFocused,
+           !cancelAutoPlayFocused {
             return
         }
         if viewModel.showControls {

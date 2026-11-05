@@ -33,9 +33,9 @@ struct PlayerControls: View {
     @Binding var requestedFocus: PlayerControlFocus?
     var onFocusSkipSegment: () -> Void = {}
     var onFocusNextEpisode: () -> Void = {}
-    var onPlayPause: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
+    @State private var isAuxiliaryCardFocusActive = false
     @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
 
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
@@ -55,7 +55,9 @@ struct PlayerControls: View {
         }
         .onExitCommand(perform: handleExit)
         .onChange(of: requestedFocus) { _, target in
-            guard let target, viewModel.showControls, !viewModel.controlsAutoHideSuspended else { return }
+            guard let target,
+                  viewModel.showControls,
+                  !viewModel.controlsAutoHideSuspended || isAuxiliaryCardFocusActive else { return }
             DispatchQueue.main.async {
                 let resolvedTarget: PlayerControlFocus
                 if target == .firstTransportButton {
@@ -71,6 +73,14 @@ struct PlayerControls: View {
                     focusedControl = isTransportButtonFocusable(resolvedTarget) ? resolvedTarget : (transportFocusOrder.first ?? .settings)
                 }
                 requestedFocus = nil
+            }
+        }
+        .onChange(of: isSkipSegmentFocused || isNextEpisodeFocused, initial: true) { _, isCardFocused in
+            if isCardFocused {
+                isAuxiliaryCardFocusActive = true
+                viewModel.setControlsAutoHideSuspended(false)
+            } else if focusedControl != nil {
+                isAuxiliaryCardFocusActive = false
             }
         }
         .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
@@ -226,6 +236,9 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: focusedControl) { oldControl, newControl in
+            if newControl != nil {
+                isAuxiliaryCardFocusActive = false
+            }
             // Keep this in lockstep with focus so hold-to-seek gating is correct
             // even before the next render cycle.
             let onTimeline = (newControl == .timeline)
@@ -254,16 +267,26 @@ struct PlayerControls: View {
                 viewModel.setControlsAutoHideSuspended(false)
                 viewModel.scheduleControlsHide(after: 10.0)
             } else if viewModel.showControls,
+                      !isAuxiliaryCardFocusActive,
                       let old = oldControl, old == .subtitles || old == .audio {
                 // Focus transitioned from a native Menu button into the presented menu items.
                 // Losing focus because controls were hidden must not suspend
                 // auto-hide and block a later revealControls() call.
-                viewModel.setControlsAutoHideSuspended(true)
+                DispatchQueue.main.async {
+                    // Card focus bindings update asynchronously with the focus handoff.
+                    guard focusedControl == nil,
+                          viewModel.showControls,
+                          !isAuxiliaryCardFocusActive,
+                          !isSkipSegmentFocused,
+                          !isNextEpisodeFocused else { return }
+                    viewModel.setControlsAutoHideSuspended(true)
+                }
             }
         }
         .onDisappear {
             viewModel.setTimelineFocused(false)
             viewModel.setControlsAutoHideSuspended(false)
+            isAuxiliaryCardFocusActive = false
         }
     }
 
@@ -271,6 +294,14 @@ struct PlayerControls: View {
         PlaybackTimelineRecorder.record(.controlsExitReceived, engine: viewModel.activeEngineKind)
         if viewModel.isScrubbing {
             viewModel.cancelScrub()
+        } else if focusedControl == nil,
+                  viewModel.showControls,
+                  viewModel.controlsAutoHideSuspended,
+                  !isAuxiliaryCardFocusActive,
+                  !isSkipSegmentFocused,
+                  !isNextEpisodeFocused {
+            // Native Menu owns focus until Back dismisses it.
+            return
         } else {
             viewModel.hideControls()
         }
@@ -364,18 +395,9 @@ struct PlayerControls: View {
         subtitlePanelOptions(for: viewModel)
     }
 
-    /// Settings-style flash prevention: while the progress bar owns focus, only
-    /// the first transport button stays focusable in the transport row. tvOS spatial focus lands on the
-    /// geometric nearest *focusable* control — with a single candidate it goes
-    /// straight to it, so other buttons never receive a one-frame flash.
-    /// Once any transport button is focused, every visible button is focusable
-    /// again so left/right still walks the full row.
     private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
         guard controlsInteractable else { return false }
         guard key != .pip || didReportPlaybackStarted else { return false }
-        if focusedControl == .timeline {
-            return key == (transportFocusOrder.first ?? .settings)
-        }
         return true
     }
 
@@ -516,6 +538,7 @@ struct PlayerControls: View {
             }
             .id("settings_button")
         }
+        .focusSection()
     }
 
     @ViewBuilder
@@ -586,8 +609,14 @@ struct PlayerControls: View {
             let audioSyncStatus = viewModel.audioSyncStatus.flatMap {
                 $0.subtitleURL == activeAddonSubtitle?.url ? $0 : nil
             }
+            let audioSyncTimingStatus = viewModel.audioSyncTimingStatusForCurrentSubtitle
             let isAudioSyncRunningForSelectedSubtitle = viewModel.isAudioSyncRunning
                 && audioSyncStatus?.isRunning == true
+            let isAudioSyncAppliedForSelectedSubtitle = audioSyncTimingStatus != nil
+            let isAudioSyncUsingOriginalTiming = audioSyncTimingStatus?.isOriginalTimingSelected ?? false
+            let canToggleAudioSyncTiming = audioSyncTimingStatus.map {
+                $0.originalDelayMs != $0.syncedDelayMs
+            } ?? false
             PlayerSubtitleMenuButton(
                 noneOption: subtitleNoneOption,
                 languageGroups: subtitleLanguageGroups,
@@ -597,6 +626,9 @@ struct PlayerControls: View {
                 isSubtitleAutoSyncUsingOriginal: isSubtitleAutoSyncUsingOriginal,
                 hasActiveAddonSubtitle: activeAddonSubtitle != nil,
                 isAudioSyncRunningForSelectedSubtitle: isAudioSyncRunningForSelectedSubtitle,
+                isAudioSyncAppliedForSelectedSubtitle: isAudioSyncAppliedForSelectedSubtitle,
+                isAudioSyncUsingOriginalTiming: isAudioSyncUsingOriginalTiming,
+                canToggleAudioSyncTiming: canToggleAudioSyncTiming,
                 canToggleAudioSync: activeAddonSubtitle != nil
                     && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether),
                 onSelect: { selectSubtitlePickerOption($0) },
@@ -626,13 +658,15 @@ struct PlayerControls: View {
                     }
                     viewModel.setControlsAutoHideSuspended(false)
                     viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onToggleAudioSyncTiming: {
+                    viewModel.toggleAudioSyncTiming()
                 }
             )
             .equatable()
             .focused($focusedControl, equals: .subtitles)
             .disabled(!isTransportButtonFocusable(.subtitles))
             .onExitCommand(perform: handleExit)
-            .onPlayPauseCommand(perform: onPlayPause)
             .onMoveCommand { direction in
                 handleMove(direction, from: .subtitles)
             }
@@ -664,7 +698,6 @@ struct PlayerControls: View {
             .focused($focusedControl, equals: .audio)
             .disabled(!isTransportButtonFocusable(.audio))
             .onExitCommand(perform: handleExit)
-            .onPlayPauseCommand(perform: onPlayPause)
             .onMoveCommand { direction in
                 handleMove(direction, from: .audio)
             }
@@ -883,11 +916,15 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
     let isSubtitleAutoSyncUsingOriginal: Bool
     let hasActiveAddonSubtitle: Bool
     let isAudioSyncRunningForSelectedSubtitle: Bool
+    let isAudioSyncAppliedForSelectedSubtitle: Bool
+    let isAudioSyncUsingOriginalTiming: Bool
+    let canToggleAudioSyncTiming: Bool
     let canToggleAudioSync: Bool
     let onSelect: (SubtitlePanelOption) -> Void
     let onRunAutoSync: () -> Void
     let onToggleSubtitleTiming: () -> Void
     let onToggleAudioSync: () -> Void
+    let onToggleAudioSyncTiming: () -> Void
 
     static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
         lhs.isFocused == rhs.isFocused
@@ -898,6 +935,9 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
             && lhs.isSubtitleAutoSyncUsingOriginal == rhs.isSubtitleAutoSyncUsingOriginal
             && lhs.hasActiveAddonSubtitle == rhs.hasActiveAddonSubtitle
             && lhs.isAudioSyncRunningForSelectedSubtitle == rhs.isAudioSyncRunningForSelectedSubtitle
+            && lhs.isAudioSyncAppliedForSelectedSubtitle == rhs.isAudioSyncAppliedForSelectedSubtitle
+            && lhs.isAudioSyncUsingOriginalTiming == rhs.isAudioSyncUsingOriginalTiming
+            && lhs.canToggleAudioSyncTiming == rhs.canToggleAudioSyncTiming
             && lhs.canToggleAudioSync == rhs.canToggleAudioSync
     }
 
@@ -954,18 +994,50 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                     .disabled(!hasActiveAddonSubtitle)
                 }
 
-                Button {
-                    onToggleAudioSync()
-                } label: {
-                    Label(
-                        L10n.string(
-                            isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
-                            fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
-                        ),
-                        systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform"
-                    )
+                if isAudioSyncAppliedForSelectedSubtitle {
+                    Button {} label: {
+                        Label(
+                            L10n.string(
+                                isAudioSyncUsingOriginalTiming
+                                    ? "player_subtitle_autosync_original"
+                                    : "player_autosync_audio_synced",
+                                fallback: isAudioSyncUsingOriginalTiming ? "Original Timing" : "Synced by Audio"
+                            ),
+                            systemImage: isAudioSyncUsingOriginalTiming ? "clock" : "checkmark.circle"
+                        )
+                    }
+                    .disabled(true)
+
+                    if canToggleAudioSyncTiming {
+                        Button {
+                            onToggleAudioSyncTiming()
+                        } label: {
+                            Label(
+                                L10n.string(
+                                    isAudioSyncUsingOriginalTiming
+                                        ? "player_autosync_use_synced"
+                                        : "player_subtitle_autosync_original",
+                                    fallback: isAudioSyncUsingOriginalTiming ? "Synced Timing" : "Original Timing"
+                                ),
+                                systemImage: isAudioSyncUsingOriginalTiming ? "checkmark.circle" : "arrow.uturn.backward"
+                            )
+                        }
+                        .menuActionDismissBehavior(.disabled)
+                    }
+                } else {
+                    Button {
+                        onToggleAudioSync()
+                    } label: {
+                        Label(
+                            L10n.string(
+                                isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
+                                fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
+                            ),
+                            systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform"
+                        )
+                    }
+                    .disabled(!canToggleAudioSync)
                 }
-                .disabled(!canToggleAudioSync)
 
                 Divider()
 
@@ -3294,6 +3366,7 @@ struct PlayerSettingsPanel: View {
             .frame(width: 900, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
     }
 
     /// A ready-made gesture (Expert mode off): what it does and how it goes; not to be changed.

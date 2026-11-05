@@ -399,7 +399,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             language: language ?? fullMeta.language,
             released: released ?? fullMeta.released,
             status: resolvedStatus,
-            videos: videos,
+            videos: (videos?.isEmpty == false ? videos : nil) ?? fullMeta.videos,
             trailerYtIds: trailerYtIds,
             externalRatings: externalRatings ?? fullMeta.externalRatings,
             posterShape: posterShape ?? fullMeta.posterShape,
@@ -3590,7 +3590,7 @@ enum ContinueWatchingStore {
     /// the Top Shelf extension can render the Apple TV home rows: in-progress
     /// titles, and aired next-episode suggestions as their own Up Next row.
     /// No-op when the shared container isn't available.
-    private static func writeTopShelfFeed() {
+    static func writeTopShelfFeed() {
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
         defer { topShelfSnapshotLock.unlock() }
@@ -3599,9 +3599,12 @@ enum ContinueWatchingStore {
         let allItems = Array(items().enumerated())
         let inProgress = allItems.filter { !$0.element.isUpNextEntry }.prefix(10)
         // Unaired suggestions can't be played yet, so they stay off the shelf.
-        let upNext = allItems
+        let upNextCandidates = allItems
             .filter { $0.element.isUpNextEntry && ($0.element.hasAired || $0.element.isAiringToday) }
-            .prefix(10)
+        let configuration = TopShelfConfigurationStore.load()
+        let upNext = configuration.shufflesUpNext
+            ? Array(upNextCandidates.shuffled().prefix(20))
+            : Array(upNextCandidates.prefix(10))
         // Register these snapshots before any detached work can reorder them.
         // Mapping at most twenty cards is cheap; disk/network/artwork stay async.
         TopShelfFeedStore.write(inProgress.map { topShelfEntry(for: $0.element, homeOrder: $0.offset) },
@@ -4363,18 +4366,8 @@ enum LibraryStore {
 
     /// Mirrors the most recently added library titles into the App Group for
     /// the Top Shelf Library row. No-op when the shared container isn't available.
-    private static func writeTopShelfFeed() {
-        guard TopShelfFeedStore.isAvailable else { return }
-        topShelfSnapshotLock.lock()
-        defer { topShelfSnapshotLock.unlock() }
-        let entries = items()
-            .sorted { $0.addedAt > $1.addedAt }
-            .prefix(15)
-            .map { item in
-                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details, screen: .library)
-            }
-        TopShelfFeedStore.write(Array(entries), section: .library,
-                                title: L10n.string("nav_library", fallback: "Library"))
+    static func writeTopShelfFeed() {
+        TopShelfLibraryFeed.write()
     }
 
     private static var storageKey: String {
