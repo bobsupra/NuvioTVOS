@@ -1236,7 +1236,6 @@ private struct CalendarDayPanel: View {
     var focus: FocusState<CalendarFocus?>.Binding
     let onOpen: (CalendarEntry) -> Void
 
-    @State private var scrolledSectionID: String?
 
     private var sections: [CalendarDaySection] {
         result.days.filter { $0.date.isSameMonth(as: month) }
@@ -1306,22 +1305,12 @@ private struct CalendarDayPanel: View {
                 .padding(.vertical, 20)
                 .padding(.horizontal, 12)
             }
-            .scrollPosition(id: $scrolledSectionID, anchor: .top)
-            .scrollClipDisabledIfAvailable()
-            .onAppear {
-                scrolledSectionID = anchorID
-                scroll(proxy)
-            }
-            .onChange(of: selectedDay) { _, _ in
-                scrolledSectionID = anchorID
-                scroll(proxy)
-            }
-            .onChange(of: month) { _, _ in
-                scrolledSectionID = anchorID
-                scroll(proxy)
-            }
-            .onChange(of: focus.wrappedValue) { _, _ in
-                scrolledSectionID = anchorID
+            // One scroll owner: ScrollViewReader. Native tvOS focus may move
+            // between event buttons independently; do not reset the panel's
+            // position on every focus change or bind a second scroll position.
+            // Clip the list so offscreen rows cannot draw over the calendar.
+            .onAppear { scroll(proxy) }
+            .onChange(of: anchorID) { _, _ in
                 scroll(proxy)
             }
         }
