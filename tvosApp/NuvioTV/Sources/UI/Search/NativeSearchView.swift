@@ -10,6 +10,21 @@ public enum TVOSKeyboardLayoutMode: String, CaseIterable, Identifiable {
     public var id: String { rawValue }
 }
 
+private enum NativeSearchLeftPressDestination: Equatable {
+    case result(String)
+    case gridKeyboard
+}
+
+private struct NativeSearchLeftPressSnapshot: Equatable {
+    let sourceFocusID: String
+    let destination: NativeSearchLeftPressDestination
+    let presentationGeneration: Int
+    let returnGeneration: Int
+    let resultIDs: [String]
+    let columns: Int
+    let layoutMode: TVOSKeyboardLayoutMode
+}
+
 /// Detects whether tvOS is presenting a Linear (horizontal) or Grid (multi-row) keyboard.
 struct TVOSKeyboardLayoutDetector: UIViewRepresentable {
     @Binding var layoutMode: TVOSKeyboardLayoutMode
@@ -226,6 +241,7 @@ struct NativeSearchView: View {
     var forcedLayoutMode: TVOSKeyboardLayoutMode? = nil
     let isFullScreenOverlayPresented: Bool
     let detailsDidDisappearGeneration: UInt
+    let isActive: Bool
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
@@ -242,6 +258,15 @@ struct NativeSearchView: View {
     @State private var overlayFocusRestoreStartedGeneration: Int?
     @State private var overlayFocusRestorationActive = false
     @State private var suppressOverlayDismissalExit = false
+    @State private var overlayRestoreLeftPressSourceID: String?
+    @State private var overlayRestoreResultsSnapshot: [String]?
+    @State private var overlayRestorePresentationGeneration = 0
+    @State private var overlayRestoreEnteredFullscreenPresentationGeneration: Int?
+    @State private var pendingOverlayLeftPressPresentationGeneration: Int?
+    @State private var overlayRestoreReturnGeneration = 0
+    @State private var completedOverlayLeftPressPresentationGeneration: Int?
+    @State private var nativeFocusedResultID: String?
+    @State private var overlayRestoreRetryKey: String?
     @State private var resultsScrollTopGeneration = 0
     @State private var nativeGridColumnCount = Int(NativeSearchGridMetrics.linearColumnCount)
     @State private var discoverOverlayTransitionActive = false
@@ -267,6 +292,7 @@ struct NativeSearchView: View {
         forcedLayoutMode: TVOSKeyboardLayoutMode? = nil,
         isFullScreenOverlayPresented: Bool = false,
         detailsDidDisappearGeneration: UInt = 0,
+        isActive: Bool = true,
         onContentClick: @escaping (String, String) -> Void,
         onLongPress: ((NuvioMeta) -> Void)? = nil
     ) {
@@ -275,6 +301,7 @@ struct NativeSearchView: View {
         self.forcedLayoutMode = forcedLayoutMode
         self.isFullScreenOverlayPresented = isFullScreenOverlayPresented
         self.detailsDidDisappearGeneration = detailsDidDisappearGeneration
+        self.isActive = isActive
         self.onContentClick = onContentClick
         self.onLongPress = onLongPress
     }
@@ -296,6 +323,17 @@ struct NativeSearchView: View {
                 linearBody
             }
         }
+        .background {
+            #if os(tvOS)
+            TVRemoteLeftPressMonitor(
+                snapshotProvider: { overlayRestoreLeftPressSnapshot() },
+                onRecognized: handleOverlayRestoreLeftPress
+            )
+            .frame(width: 0, height: 0)
+            #else
+            EmptyView()
+            #endif
+        }
         .onAppear {
             viewModel.reloadRecent()
         }
@@ -310,11 +348,6 @@ struct NativeSearchView: View {
                         searchPresented = false
                     }
                 }
-                if isEnabled,
-                   newValue == overlayRestoreResultID,
-                   !overlayFocusRestorationActive {
-                    overlayRestoreResultID = nil
-                }
             } else if lastFocusedResultID != nil {
                 scheduleRestoreArm()
             }
@@ -323,14 +356,46 @@ struct NativeSearchView: View {
             if !enabled {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreResultID = focusedResultID ?? lastFocusedResultID
-            } else if let target = overlayRestoreResultID {
-                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            } else if !isFullScreenOverlayPresented {
+                retryOverlayRestoreAfterReturn()
+            }
+        }
+        .onChange(of: isActive) { _, active in
+            if !active { clearOverlayRestoreLeftPressState() }
+        }
+        .onChange(of: visibleResultIDs) { _, resultIDs in
+            if let overlayRestoreResultsSnapshot,
+               overlayRestoreResultsSnapshot != resultIDs {
+                clearOverlayRestoreLeftPressState()
+            }
+        }
+        .onChange(of: isFullScreenOverlayPresented) { wasPresented, presented in
+            if presented {
+                guard isActive,
+                      let sourceID = overlayRestoreLeftPressSourceID,
+                      overlayRestoreResultID == sourceID,
+                      lastFocusedResultID == sourceID,
+                      overlayRestoreResultsSnapshot == visibleResultIDs else {
+                    clearOverlayRestoreLeftPressState()
+                    return
+                }
+                overlayRestoreEnteredFullscreenPresentationGeneration = overlayRestorePresentationGeneration
+            } else if wasPresented,
+                      isActive,
+                      overlayRestoreEnteredFullscreenPresentationGeneration == overlayRestorePresentationGeneration,
+                      overlayRestoreResultsSnapshot == visibleResultIDs,
+                      let sourceID = overlayRestoreLeftPressSourceID,
+                      lastFocusedResultID == sourceID {
+                overlayRestoreReturnGeneration &+= 1
+                pendingOverlayLeftPressPresentationGeneration = overlayRestorePresentationGeneration
+                retryOverlayRestoreAfterReturn()
+            } else if wasPresented {
+                clearOverlayRestoreLeftPressState()
             }
         }
         .onChange(of: detailsDidDisappearGeneration) { _, _ in
-            guard !isFullScreenOverlayPresented,
-                  let target = overlayRestoreResultID else { return }
-            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            guard !isFullScreenOverlayPresented else { return }
+            retryOverlayRestoreAfterReturn()
         }
         .onExitCommand(perform: canHandleExitCommand ? handleExitCommand : nil)
     }
@@ -619,16 +684,166 @@ struct NativeSearchView: View {
                 }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
             if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
                 overlayRestoreResultID = nil
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
             if overlayRestoreGeneration == generation {
                 overlayFocusRestorationActive = false
                 suppressOverlayDismissalExit = false
             }
+        }
+    }
+
+    private func retryOverlayRestoreAfterReturn() {
+        guard !isFullScreenOverlayPresented,
+              isEnabled,
+              let target = overlayRestoreResultID else { return }
+        if overlayRestoreLeftPressSourceID != nil,
+           overlayRestoreEnteredFullscreenPresentationGeneration == overlayRestorePresentationGeneration,
+           pendingOverlayLeftPressPresentationGeneration == nil {
+            return
+        }
+        let retryKey = "\(overlayRestorePresentationGeneration)|\(overlayRestoreReturnGeneration)|\(target)"
+        guard overlayRestoreRetryKey != retryKey else { return }
+        overlayRestoreRetryKey = retryKey
+        overlayRestoreGeneration &+= 1
+        overlayFocusRestoreStartedGeneration = nil
+        restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+    }
+
+    private func clearOverlayRestoreLeftPressState() {
+        overlayRestoreLeftPressSourceID = nil
+        overlayRestoreResultsSnapshot = nil
+        overlayRestoreEnteredFullscreenPresentationGeneration = nil
+        pendingOverlayLeftPressPresentationGeneration = nil
+        completedOverlayLeftPressPresentationGeneration = nil
+    }
+
+    private func handleNativeResultFocusChange(_ isFocused: Bool, focusID: String) {
+        if isFocused {
+            if pendingOverlayLeftPressPresentationGeneration != nil,
+               let sourceID = overlayRestoreLeftPressSourceID,
+               sourceID != focusID {
+                clearOverlayRestoreLeftPressState()
+            } else if pendingOverlayLeftPressPresentationGeneration != nil,
+                      overlayRestoreLeftPressSourceID == focusID {
+                completedOverlayLeftPressPresentationGeneration = pendingOverlayLeftPressPresentationGeneration
+                pendingOverlayLeftPressPresentationGeneration = nil
+            }
+            nativeFocusedResultID = focusID
+            guard isEnabled, overlayRestoreResultID == focusID else { return }
+            overlayRestoreResultID = nil
+            overlayFocusRestorationActive = false
+            suppressOverlayDismissalExit = false
+        } else {
+            if nativeFocusedResultID == focusID { nativeFocusedResultID = nil }
+            if pendingOverlayLeftPressPresentationGeneration != nil,
+               overlayRestoreLeftPressSourceID == focusID,
+               !isFullScreenOverlayPresented {
+                completedOverlayLeftPressPresentationGeneration = pendingOverlayLeftPressPresentationGeneration
+                pendingOverlayLeftPressPresentationGeneration = nil
+            }
+        }
+    }
+
+    private func overlayRestoreLeftPressSnapshot() -> NativeSearchLeftPressSnapshot? {
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              !discoverOverlayTransitionActive,
+              viewModel.hasQuery,
+              !viewModel.isLoading,
+              viewModel.error == nil,
+              let presentationGeneration = pendingOverlayLeftPressPresentationGeneration,
+              presentationGeneration == overlayRestorePresentationGeneration,
+              overlayRestoreEnteredFullscreenPresentationGeneration == presentationGeneration,
+              let sourceFocusID = overlayRestoreLeftPressSourceID,
+              sourceFocusID == lastFocusedResultID,
+              focusedResultID == nil || focusedResultID == sourceFocusID,
+              nativeFocusedResultID == sourceFocusID || (overlayFocusRestorationActive && overlayRestoreResultID == sourceFocusID),
+              focusedFilterID == nil,
+              !clearRecentFocused,
+              overlayRestoreResultID == sourceFocusID || (overlayRestoreResultID == nil && focusedResultID == sourceFocusID),
+              let originalResults = overlayRestoreResultsSnapshot,
+              originalResults == visibleResultIDs,
+              let sourceIndex = visibleResults.firstIndex(where: { $0.id == sourceFocusID }) else {
+            return nil
+        }
+
+        let columns = effectiveLayoutMode == .grid
+            ? Int(NativeSearchGridMetrics.gridColumnCount)
+            : nativeGridColumnCount
+        let column = sourceIndex % columns
+        let destination: NativeSearchLeftPressDestination
+        if column == 0 {
+            // Grid Search already routes this edge to its keyboard. Linear
+            // Search has no poster-grid keyboard edge, so leave it to tvOS.
+            guard effectiveLayoutMode == .grid else { return nil }
+            destination = .gridKeyboard
+        } else {
+            destination = .result(visibleResults[sourceIndex - 1].id)
+        }
+
+        return NativeSearchLeftPressSnapshot(
+            sourceFocusID: sourceFocusID,
+            destination: destination,
+            presentationGeneration: presentationGeneration,
+            returnGeneration: overlayRestoreReturnGeneration,
+            resultIDs: visibleResultIDs,
+            columns: columns,
+            layoutMode: effectiveLayoutMode
+        )
+    }
+
+    private func handleOverlayRestoreLeftPress(_ snapshot: NativeSearchLeftPressSnapshot) {
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              !discoverOverlayTransitionActive,
+              viewModel.hasQuery,
+              !viewModel.isLoading,
+              viewModel.error == nil,
+              pendingOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              overlayRestorePresentationGeneration == snapshot.presentationGeneration,
+              overlayRestoreReturnGeneration == snapshot.returnGeneration,
+              overlayRestoreEnteredFullscreenPresentationGeneration == snapshot.presentationGeneration,
+              overlayRestoreLeftPressSourceID == snapshot.sourceFocusID,
+              lastFocusedResultID == snapshot.sourceFocusID,
+              focusedResultID == nil || focusedResultID == snapshot.sourceFocusID,
+              nativeFocusedResultID == snapshot.sourceFocusID || (overlayFocusRestorationActive && overlayRestoreResultID == snapshot.sourceFocusID) || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              overlayRestoreResultID == snapshot.sourceFocusID || focusedResultID == snapshot.sourceFocusID || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              focusedFilterID == nil,
+              !clearRecentFocused,
+              visibleResultIDs == snapshot.resultIDs,
+              snapshot.layoutMode == effectiveLayoutMode,
+              snapshot.columns == (effectiveLayoutMode == .grid ? Int(NativeSearchGridMetrics.gridColumnCount) : nativeGridColumnCount) else { return }
+
+        overlayRestoreGeneration &+= 1
+        resultFocusGeneration &+= 1
+        overlayFocusRestoreStartedGeneration = nil
+        restoreArmTask?.cancel()
+        shouldRestoreResultFocus = false
+
+        switch snapshot.destination {
+        case .result(let target):
+            overlayRestoreResultID = target
+            lastFocusedResultID = target
+            overlayRestoreLeftPressSourceID = target
+            pendingOverlayLeftPressPresentationGeneration = snapshot.presentationGeneration
+            completedOverlayLeftPressPresentationGeneration = nil
+            overlayRestoreRetryKey = "\(snapshot.presentationGeneration)|\(snapshot.returnGeneration)|\(target)"
+            overlayFocusRestorationActive = true
+            suppressOverlayDismissalExit = true
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        case .gridKeyboard:
+            clearOverlayRestoreLeftPressState()
+            overlayRestoreResultID = nil
+            overlayFocusRestorationActive = false
+            suppressOverlayDismissalExit = false
+            transferFocusToGridKeyboard()
         }
     }
 
@@ -680,6 +895,8 @@ struct NativeSearchView: View {
         guard hideUnreleased else { return viewModel.results }
         return viewModel.results.filter { !ContentReleasePolicy.isUnreleased($0) }
     }
+
+    private var visibleResultIDs: [String] { visibleResults.map(\.id) }
 
     private var gridSuggestionTitles: [String] {
         let query = viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -749,6 +966,8 @@ struct NativeSearchView: View {
                             height: NativeSearchGridMetrics.linearPosterHeight,
                             externalFocus: $focusedResultID,
                             retainFocusAppearance: overlayRestoreResultID == item.id,
+                            onFocus: { _ in handleNativeResultFocusChange(true, focusID: item.id) },
+                            onBlur: { _ in handleNativeResultFocusChange(false, focusID: item.id) },
                             onLongPress: onLongPress.map { cb in { cb(item) } },
                             forceShowLabels: true,
                             onMove: { direction in
@@ -763,15 +982,20 @@ struct NativeSearchView: View {
                                 }
                             }
                         ) {
+                            clearOverlayRestoreLeftPressState()
                             overlayRestoreGeneration &+= 1
                             overlayFocusRestoreStartedGeneration = nil
                             overlayFocusRestorationActive = true
                             suppressOverlayDismissalExit = true
+                            overlayRestorePresentationGeneration &+= 1
+                            overlayRestoreLeftPressSourceID = item.id
+                            overlayRestoreResultsSnapshot = visibleResultIDs
                             overlayRestoreResultID = item.id
                             lastFocusedResultID = item.id
                             viewModel.commitCurrentSearch()
                             onContentClick(item.id, item.type)
                         }
+                        .accessibilityIdentifier("native-search-result-\(item.id)")
                         .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)
                     }
                 }

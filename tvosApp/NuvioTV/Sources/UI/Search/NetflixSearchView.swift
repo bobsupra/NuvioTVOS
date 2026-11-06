@@ -30,11 +30,48 @@ private enum NetflixSearchMetrics {
     static let columnGap: CGFloat = 32
 }
 
+private enum NetflixSearchLeftPressDestination: Equatable {
+    case result(String)
+    case list(String)
+    case gridKeyboard
+}
+
+private struct NetflixSearchLeftPressSnapshot: Equatable {
+    let sourceFocusID: String
+    let destination: NetflixSearchLeftPressDestination
+    let presentationGeneration: Int
+    let returnGeneration: Int
+    let resultIDs: [String]
+    let columns: Int
+    let layoutMode: TVOSKeyboardLayoutMode
+}
+
+private struct NetflixSearchCellFrames: Equatable {
+    var cells: [String: CGRect] = [:]
+    var viewports: [String: CGRect] = [:]
+}
+
+private enum NetflixSearchCellFramesPreferenceKey: PreferenceKey {
+    static var defaultValue = NetflixSearchCellFrames()
+
+    static func reduce(value: inout NetflixSearchCellFrames, nextValue: () -> NetflixSearchCellFrames) {
+        let next = nextValue()
+        value.cells.merge(next.cells) { _, newer in newer }
+        value.viewports.merge(next.viewports) { _, newer in newer }
+    }
+}
+
+private final class NetflixSearchCellFrameCache {
+    var cells: [String: CGRect] = [:]
+    var viewports: [String: CGRect] = [:]
+}
+
 struct NetflixSearchView: View {
     @StateObject private var viewModel: NetflixSearchViewModel
     let showDiscover: Bool
     let isFullScreenOverlayPresented: Bool
     let detailsDidDisappearGeneration: UInt
+    let isActive: Bool
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
@@ -54,6 +91,16 @@ struct NetflixSearchView: View {
     @State private var overlayFocusRestoreStartedGeneration: Int?
     @State private var overlayFocusRestorationActive = false
     @State private var suppressOverlayDismissalExit = false
+    @State private var overlayRestoreLeftPressSourceID: String?
+    @State private var overlayRestoreResultsSnapshot: [String]?
+    @State private var overlayRestorePresentationGeneration = 0
+    @State private var overlayRestoreEnteredFullscreenPresentationGeneration: Int?
+    @State private var pendingOverlayLeftPressPresentationGeneration: Int?
+    @State private var overlayRestoreReturnGeneration = 0
+    @State private var completedOverlayLeftPressPresentationGeneration: Int?
+    @State private var nativeFocusedResultID: String?
+    @State private var overlayRestoreRetryKey: String?
+    @State private var resultFrameCache = NetflixSearchCellFrameCache()
     @State private var resultsScrollTopGeneration = 0
     @State private var discoverOverlayTransitionActive = false
     /// Match Native search: the tvOS keyboard stays mounted for focus
@@ -73,6 +120,7 @@ struct NetflixSearchView: View {
         showDiscover: Bool = true,
         isFullScreenOverlayPresented: Bool = false,
         detailsDidDisappearGeneration: UInt = 0,
+        isActive: Bool = true,
         onContentClick: @escaping (String, String) -> Void,
         onLongPress: ((NuvioMeta) -> Void)? = nil
     ) {
@@ -80,6 +128,7 @@ struct NetflixSearchView: View {
         self.showDiscover = showDiscover
         self.isFullScreenOverlayPresented = isFullScreenOverlayPresented
         self.detailsDidDisappearGeneration = detailsDidDisappearGeneration
+        self.isActive = isActive
         self.onContentClick = onContentClick
         self.onLongPress = onLongPress
     }
@@ -101,6 +150,17 @@ struct NetflixSearchView: View {
                 linearBody
             }
         }
+        .background {
+            #if os(tvOS)
+            TVRemoteLeftPressMonitor(
+                snapshotProvider: { overlayRestoreLeftPressSnapshot() },
+                onRecognized: handleOverlayRestoreLeftPress
+            )
+            .frame(width: 0, height: 0)
+            #else
+            EmptyView()
+            #endif
+        }
         .onAppear {
             viewModel.reloadRecent()
         }
@@ -115,11 +175,6 @@ struct NetflixSearchView: View {
                 }
                 lastFocusedItemID = newValue
                 shouldRestoreFocus = false
-                if isEnabled,
-                   newValue == overlayRestoreItemID,
-                   !overlayFocusRestorationActive {
-                    overlayRestoreItemID = nil
-                }
             } else if lastFocusedItemID != nil {
                 // A fast lazy-list/grid transition can briefly report nil
                 // focus. Match Discover: wait for a stable departure and arm
@@ -128,6 +183,7 @@ struct NetflixSearchView: View {
             }
         }
         .onChange(of: focusedTypeFilterID) { _, newValue in
+            if newValue != nil { clearOverlayRestoreLeftPressState() }
             guard newValue != nil,
                   focusedItemID == nil,
                   isEnabled,
@@ -139,14 +195,56 @@ struct NetflixSearchView: View {
             if !enabled {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreItemID = focusedItemID ?? lastFocusedItemID
-            } else if let target = overlayRestoreItemID {
-                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            } else if !isFullScreenOverlayPresented {
+                retryOverlayRestoreAfterReturn()
+            }
+        }
+        .onChange(of: isActive) { _, active in
+            if !active { clearOverlayRestoreLeftPressState() }
+        }
+        .onChange(of: focusedRecentSearchID) { _, newValue in
+            if newValue != nil { clearOverlayRestoreLeftPressState() }
+        }
+        .onChange(of: clearRecentFocused) { _, focused in
+            if focused { clearOverlayRestoreLeftPressState() }
+        }
+        .onPreferenceChange(NetflixSearchCellFramesPreferenceKey.self) { frames in
+            resultFrameCache.cells = frames.cells
+            resultFrameCache.viewports = frames.viewports
+        }
+        .onChange(of: visibleResultIDs) { _, resultIDs in
+            if let overlayRestoreResultsSnapshot,
+               overlayRestoreResultsSnapshot != resultIDs {
+                clearOverlayRestoreLeftPressState()
+            }
+        }
+        .onChange(of: isFullScreenOverlayPresented) { wasPresented, presented in
+            if presented {
+                guard isActive,
+                      let sourceID = overlayRestoreLeftPressSourceID,
+                      overlayRestoreItemID == sourceID,
+                      lastFocusedItemID == sourceID,
+                      overlayRestoreResultsSnapshot == visibleResultIDs else {
+                    clearOverlayRestoreLeftPressState()
+                    return
+                }
+                overlayRestoreEnteredFullscreenPresentationGeneration = overlayRestorePresentationGeneration
+            } else if wasPresented,
+                      isActive,
+                      overlayRestoreEnteredFullscreenPresentationGeneration == overlayRestorePresentationGeneration,
+                      overlayRestoreResultsSnapshot == visibleResultIDs,
+                      let sourceID = overlayRestoreLeftPressSourceID,
+                      lastFocusedItemID == sourceID {
+                overlayRestoreReturnGeneration &+= 1
+                pendingOverlayLeftPressPresentationGeneration = overlayRestorePresentationGeneration
+                retryOverlayRestoreAfterReturn()
+            } else if wasPresented {
+                clearOverlayRestoreLeftPressState()
             }
         }
         .onChange(of: detailsDidDisappearGeneration) { _, _ in
-            guard !isFullScreenOverlayPresented,
-                  let target = overlayRestoreItemID else { return }
-            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            guard !isFullScreenOverlayPresented else { return }
+            retryOverlayRestoreAfterReturn()
         }
     }
 
@@ -301,6 +399,18 @@ struct NetflixSearchView: View {
         clearRecentFocused = false
     }
 
+    private func handlePosterGridCardMove(index: Int, colCount: Int, direction: MoveCommandDirection) {
+        if detectedKeyboardMode == .grid {
+            if index % colCount == 0, direction == .left {
+                transferFocusToGridKeyboard()
+            }
+        } else if index < colCount {
+            if direction == .up {
+                transferFirstRowFocusToAllFilter()
+            }
+        }
+    }
+
     private func scheduleRestoreArm() {
         guard lastFocusedItemID != nil, focusedItemID == nil else { return }
         restoreArmTask?.cancel()
@@ -333,16 +443,191 @@ struct NetflixSearchView: View {
                 }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
             if overlayRestoreGeneration == generation, overlayRestoreItemID == target {
                 overlayRestoreItemID = nil
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
             if overlayRestoreGeneration == generation {
                 overlayFocusRestorationActive = false
                 suppressOverlayDismissalExit = false
             }
+        }
+    }
+
+    private func retryOverlayRestoreAfterReturn() {
+        guard !isFullScreenOverlayPresented,
+              isEnabled,
+              let target = overlayRestoreItemID else { return }
+        if overlayRestoreLeftPressSourceID != nil,
+           overlayRestoreEnteredFullscreenPresentationGeneration == overlayRestorePresentationGeneration,
+           pendingOverlayLeftPressPresentationGeneration == nil {
+            return
+        }
+        let retryKey = "\(overlayRestorePresentationGeneration)|\(overlayRestoreReturnGeneration)|\(target)"
+        guard overlayRestoreRetryKey != retryKey else { return }
+        overlayRestoreRetryKey = retryKey
+        overlayRestoreGeneration &+= 1
+        overlayFocusRestoreStartedGeneration = nil
+        restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+    }
+
+    private func clearOverlayRestoreLeftPressState() {
+        overlayRestoreLeftPressSourceID = nil
+        overlayRestoreResultsSnapshot = nil
+        overlayRestoreEnteredFullscreenPresentationGeneration = nil
+        pendingOverlayLeftPressPresentationGeneration = nil
+        completedOverlayLeftPressPresentationGeneration = nil
+    }
+
+    private func handleNativeResultFocusChange(_ isFocused: Bool, focusID: String) {
+        if isFocused {
+            if pendingOverlayLeftPressPresentationGeneration != nil,
+               let sourceID = overlayRestoreLeftPressSourceID,
+               sourceID != focusID {
+                clearOverlayRestoreLeftPressState()
+            } else if pendingOverlayLeftPressPresentationGeneration != nil,
+                      overlayRestoreLeftPressSourceID == focusID {
+                completedOverlayLeftPressPresentationGeneration = pendingOverlayLeftPressPresentationGeneration
+                pendingOverlayLeftPressPresentationGeneration = nil
+            }
+            nativeFocusedResultID = focusID
+            guard isEnabled, overlayRestoreItemID == focusID else { return }
+            overlayRestoreItemID = nil
+            overlayFocusRestorationActive = false
+            suppressOverlayDismissalExit = false
+        } else {
+            if nativeFocusedResultID == focusID { nativeFocusedResultID = nil }
+            if pendingOverlayLeftPressPresentationGeneration != nil,
+               overlayRestoreLeftPressSourceID == focusID,
+               !isFullScreenOverlayPresented {
+                completedOverlayLeftPressPresentationGeneration = pendingOverlayLeftPressPresentationGeneration
+                pendingOverlayLeftPressPresentationGeneration = nil
+            }
+        }
+    }
+
+    private func nearestVisibleListFocusID(for sourceFocusID: String) -> String? {
+        guard let sourceFrame = resultFrameCache.cells[sourceFocusID],
+              let gridViewport = resultFrameCache.viewports["grid"],
+              sourceFrame.intersects(gridViewport),
+              let listViewport = resultFrameCache.viewports["list"] else { return nil }
+
+        return visibleResults.compactMap { item -> (String, CGFloat)? in
+            let focusID = "list:\(item.id)"
+            guard let frame = resultFrameCache.cells[focusID], frame.intersects(listViewport) else { return nil }
+            return (focusID, abs(frame.midY - sourceFrame.midY))
+        }
+        .min { $0.1 < $1.1 }?.0
+    }
+
+    private func overlayRestoreLeftPressSnapshot() -> NetflixSearchLeftPressSnapshot? {
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              !discoverOverlayTransitionActive,
+              viewModel.hasQuery,
+              !viewModel.isLoading,
+              viewModel.error == nil,
+              detectedKeyboardMode == .grid || !searchPresented,
+              let presentationGeneration = pendingOverlayLeftPressPresentationGeneration,
+              presentationGeneration == overlayRestorePresentationGeneration,
+              overlayRestoreEnteredFullscreenPresentationGeneration == presentationGeneration,
+              let sourceFocusID = overlayRestoreLeftPressSourceID,
+              sourceFocusID.hasPrefix("grid:"),
+              sourceFocusID == lastFocusedItemID,
+              focusedTypeFilterID == nil,
+              focusedItemID == nil || focusedItemID == sourceFocusID || (overlayFocusRestorationActive && overlayRestoreItemID == sourceFocusID),
+              nativeFocusedResultID == sourceFocusID || (overlayFocusRestorationActive && overlayRestoreItemID == sourceFocusID),
+              overlayRestoreItemID == sourceFocusID || (overlayRestoreItemID == nil && focusedItemID == sourceFocusID),
+              let originalResults = overlayRestoreResultsSnapshot,
+              originalResults == visibleResultIDs,
+              let sourceIndex = visibleResults.firstIndex(where: { "grid:\($0.id)" == sourceFocusID }) else {
+            return nil
+        }
+
+        let columns = detectedKeyboardMode == .grid
+            ? NetflixSearchMetrics.gridColumnCount
+            : NetflixSearchMetrics.linearColumnCount
+        let column = sourceIndex % columns
+        let destination: NetflixSearchLeftPressDestination
+        if column == 0 {
+            if detectedKeyboardMode == .grid {
+                destination = .gridKeyboard
+            } else {
+                guard let listFocusID = nearestVisibleListFocusID(for: sourceFocusID) else { return nil }
+                destination = .list(listFocusID)
+            }
+        } else {
+            destination = .result("grid:\(visibleResults[sourceIndex - 1].id)")
+        }
+
+        return NetflixSearchLeftPressSnapshot(
+            sourceFocusID: sourceFocusID,
+            destination: destination,
+            presentationGeneration: presentationGeneration,
+            returnGeneration: overlayRestoreReturnGeneration,
+            resultIDs: visibleResultIDs,
+            columns: columns,
+            layoutMode: detectedKeyboardMode
+        )
+    }
+
+    private func handleOverlayRestoreLeftPress(_ snapshot: NetflixSearchLeftPressSnapshot) {
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              !discoverOverlayTransitionActive,
+              viewModel.hasQuery,
+              !viewModel.isLoading,
+              viewModel.error == nil,
+              detectedKeyboardMode == .grid || !searchPresented,
+              pendingOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              overlayRestorePresentationGeneration == snapshot.presentationGeneration,
+              overlayRestoreReturnGeneration == snapshot.returnGeneration,
+              overlayRestoreEnteredFullscreenPresentationGeneration == snapshot.presentationGeneration,
+              overlayRestoreLeftPressSourceID == snapshot.sourceFocusID,
+              lastFocusedItemID == snapshot.sourceFocusID,
+              focusedItemID == nil || focusedItemID == snapshot.sourceFocusID || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              nativeFocusedResultID == snapshot.sourceFocusID || (overlayFocusRestorationActive && overlayRestoreItemID == snapshot.sourceFocusID) || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              overlayRestoreItemID == snapshot.sourceFocusID || focusedItemID == snapshot.sourceFocusID || completedOverlayLeftPressPresentationGeneration == snapshot.presentationGeneration,
+              focusedTypeFilterID == nil,
+              visibleResultIDs == snapshot.resultIDs,
+              snapshot.layoutMode == detectedKeyboardMode,
+              snapshot.columns == (detectedKeyboardMode == .grid ? NetflixSearchMetrics.gridColumnCount : NetflixSearchMetrics.linearColumnCount) else { return }
+
+        overlayRestoreGeneration &+= 1
+        resultFocusGeneration &+= 1
+        overlayFocusRestoreStartedGeneration = nil
+        restoreArmTask?.cancel()
+        shouldRestoreFocus = false
+
+        switch snapshot.destination {
+        case .result(let target):
+            overlayRestoreItemID = target
+            lastFocusedItemID = target
+            overlayRestoreLeftPressSourceID = target
+            pendingOverlayLeftPressPresentationGeneration = snapshot.presentationGeneration
+            completedOverlayLeftPressPresentationGeneration = nil
+            overlayRestoreRetryKey = "\(snapshot.presentationGeneration)|\(snapshot.returnGeneration)|\(target)"
+            overlayFocusRestorationActive = true
+            suppressOverlayDismissalExit = true
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        case .list(let target):
+            overlayRestoreItemID = target
+            lastFocusedItemID = target
+            clearOverlayRestoreLeftPressState()
+            overlayRestoreRetryKey = "\(snapshot.presentationGeneration)|\(snapshot.returnGeneration)|\(target)"
+            overlayFocusRestorationActive = true
+            suppressOverlayDismissalExit = true
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        case .gridKeyboard:
+            clearOverlayRestoreLeftPressState()
+            overlayRestoreItemID = nil
+            overlayFocusRestorationActive = false
+            suppressOverlayDismissalExit = false
+            transferFocusToGridKeyboard()
         }
     }
 
@@ -549,6 +834,8 @@ struct NetflixSearchView: View {
         return viewModel.results.filter { !ContentReleasePolicy.isUnreleased($0) }
     }
 
+    private var visibleResultIDs: [String] { visibleResults.map(\.id) }
+
     private var resultsCountLabel: String {
         let count = visibleResults.count
         if count == 1 {
@@ -625,6 +912,7 @@ struct NetflixSearchView: View {
                         let focusID = "list:\(item.id)"
                         let isFocused = focusedItemID == focusID
                         Button {
+                            clearOverlayRestoreLeftPressState()
                             overlayRestoreGeneration &+= 1
                             overlayFocusRestoreStartedGeneration = nil
                             overlayFocusRestorationActive = true
@@ -643,10 +931,20 @@ struct NetflixSearchView: View {
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .modifier(GlassChipBackground(filled: isFocused))
                         }
-                        .buttonStyle(PosterCardButtonStyle())
+                        .buttonStyle(PosterCardButtonStyle(onNativeFocusChange: { focused in
+                            handleNativeResultFocusChange(focused, focusID: focusID)
+                        }))
                         .focused($focusedItemID, equals: focusID)
                         .focusEffectDisabledIfAvailable()
                         .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)
+                        .background {
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: NetflixSearchCellFramesPreferenceKey.self,
+                                    value: NetflixSearchCellFrames(cells: [focusID: geometry.frame(in: .global)])
+                                )
+                            }
+                        }
                         .onMoveCommand { direction in
                             guard index == 0, direction == .up else { return }
                             transferFirstRowFocusToAllFilter()
@@ -655,6 +953,14 @@ struct NetflixSearchView: View {
                 }
                 .padding(.top, 6)
                 .padding(.bottom, 40)
+            }
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: NetflixSearchCellFramesPreferenceKey.self,
+                        value: NetflixSearchCellFrames(viewports: ["list": geometry.frame(in: .global)])
+                    )
+                }
             }
             .onChange(of: resultsScrollTopGeneration) { _, _ in
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -686,35 +992,50 @@ struct NetflixSearchView: View {
                             externalFocus: $focusedItemID,
                             focusValue: focusID,
                             retainFocusAppearance: overlayRestoreItemID == focusID,
+                            onFocus: { _ in handleNativeResultFocusChange(true, focusID: focusID) },
+                            onBlur: { _ in handleNativeResultFocusChange(false, focusID: focusID) },
                             onLongPress: onLongPress.map { cb in { cb(item) } },
                             forceShowLabels: true,
                             onMove: { direction in
-                                if detectedKeyboardMode == .grid {
-                                    if index % colCount == 0, direction == .left {
-                                        transferFocusToGridKeyboard()
-                                    }
-                                } else if index < colCount {
-                                    if direction == .up {
-                                        transferFirstRowFocusToAllFilter()
-                                    }
-                                }
+                                handlePosterGridCardMove(index: index, colCount: colCount, direction: direction)
                             }
                         ) {
+                            clearOverlayRestoreLeftPressState()
                             overlayRestoreGeneration &+= 1
                             overlayFocusRestoreStartedGeneration = nil
                             overlayFocusRestorationActive = true
                             suppressOverlayDismissalExit = true
+                            overlayRestorePresentationGeneration &+= 1
+                            overlayRestoreLeftPressSourceID = focusID
+                            overlayRestoreResultsSnapshot = visibleResultIDs
                             overlayRestoreItemID = focusID
                             lastFocusedItemID = focusID
                             viewModel.commitCurrentSearch()
                             onContentClick(item.id, item.type)
                         }
+                        .accessibilityIdentifier("netflix-search-result-\(focusID)")
                         .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)
+                        .background {
+                            GeometryReader { geometry in
+                                Color.clear.preference(
+                                    key: NetflixSearchCellFramesPreferenceKey.self,
+                                    value: NetflixSearchCellFrames(cells: [focusID: geometry.frame(in: .global)])
+                                )
+                            }
+                        }
                     }
                 }
                 .padding(.top, 12)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 40)
+            }
+            .background {
+                GeometryReader { geometry in
+                    Color.clear.preference(
+                        key: NetflixSearchCellFramesPreferenceKey.self,
+                        value: NetflixSearchCellFrames(viewports: ["grid": geometry.frame(in: .global)])
+                    )
+                }
             }
             .onChange(of: resultsScrollTopGeneration) { _, _ in
                 withAnimation(.easeInOut(duration: 0.2)) {
