@@ -1,8 +1,8 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.55.0)
+## AetherEngine (pin 7.58.0)
 
-Local pin of [AetherEngine 7.55.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.55.0), upstream commit `0947e2951475aece20a9a973a5a87265fe002444`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.55.0 upgrade incorporates exact seeks (`seek(to:exact:)`), AV1 dav1d keyframe snapping (`SWKeyframeSnap`), Matroska attachment skipping on open (`skipsContainerAttachments`), direct live audio read-ahead under video pressure (`DirectLiveAudioReadAhead`), 4:4:4 chroma site optimizations for Dolby Vision FEL, Profile 5 preview reshaping, AirPlay seek audio/bitmap subtitle fixes, and network trickle protection. Nuvio's custom remote playback startup patches, frame extraction, and local traits are preserved.
+Local pin of [AetherEngine 7.58.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.58.0), upstream commit `7ea27bff8d8fb4a457d6e0042b0537eb31253583`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.58.0 upgrade incorporates source video scan detection (`sourceVideoScan` progressive/interlaced reporting), asynchronous off-main upscale stage creation (`upscalesLowResolutionVideo` non-blocking startup), secondary subtitle identity observation, Dolby Vision base-layer source capabilities and split dual-layer joining, BedRegression object audio, PiP enhancements, and paused session presentation. Nuvio's custom remote playback startup patches, frame extraction, disc image hints, and local traits are preserved.
 
 Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests. The patch is merged with the 7.40 bed-split renderer and its telemetry reporting.
 

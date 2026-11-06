@@ -37,7 +37,7 @@ let package = Package(
     traits: [
         .trait(
             name: "TrueHDObjectAudio",
-            description: "Link LibTrueHD and the object renderer, so objectAudioRendering can render TrueHD Atmos objects to APAC."
+            description: "Link LibTrueHD and the bed regression, so objectAudioRendering can deliver TrueHD Atmos with its heights."
         ),
         .trait(
             name: "DTSXObjectAudio",

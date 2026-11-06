@@ -724,9 +724,11 @@ public final class AetherEngine: ObservableObject {
     /// AE#461: base-layer signal compatibility ID from the same dvcC/dvvC record as `sourceDVProfile`
     /// (0 = IPT-only, no compatible base layer). Kept because a decode-path correction has to decide
     /// whether the software path can represent this source BEFORE it tears the session down, and by
-    /// then the probe stream that carried the record is long gone. Internal: `sourceDVProfile` is the
-    /// label hosts read, this is the term only `softwarePathCannotRepresent` needs.
-    var sourceDVBLCompatID: Int? = nil
+    /// then the probe stream that carried the record is long gone. Read alongside
+    /// `sourceDolbyVisionBaseLayerPresentable` when offering source-specific playback choices.
+    /// nil means unavailable; reset on load and stop. This is source metadata, not display output.
+    /// Assigned before `sourceVideoFormat` / `sourceDVProfile`, so their publisher callbacks read it current.
+    public internal(set) var sourceDVBLCompatID: Int? = nil
 
     /// AE#532: the profile the loaded source's own RPU reports, when the record was contradicted enough
     /// to be worth checking (`DolbyVisionRecordAudit`). nil for every other source, including one whose
@@ -756,7 +758,7 @@ public final class AetherEngine: ObservableObject {
     var sessionDisplayEligibleForHDR: Bool { sessionObservedDisplayCaps?.supportsHDR ?? false }
 
     /// Enhancement layer type for Profile 7 streams ("FEL" or "MEL") extracted from the first RPU.
-    var sourceElType: String? = nil
+    public internal(set) var sourceElType: String? = nil
 
     /// #846: the upscale plan the load decided, carried to every software host this session builds.
     var sourceUpscalePlan: UpscalePlan? = nil
@@ -776,8 +778,9 @@ public final class AetherEngine: ObservableObject {
     /// Whether the loaded source's Dolby Vision has a base layer the current handling mode can present,
     /// decided on the probe stream for the same reason as `sourceDVBLCompatID`: a correction that turns the
     /// base layer on and moves to software in one step is judged before the teardown, when the VUI it
-    /// rests on is gone.
-    var sourceDolbyVisionBaseLayerPresentable: Bool = false
+    /// rests on is gone. Reset to false on load and stop. This describes the engine's base-layer
+    /// route eligibility, not the panel's output or a guarantee that a reload will be accepted.
+    public internal(set) var sourceDolbyVisionBaseLayerPresentable: Bool = false
     /// The narrower HDR10/PQ subset, kept for route corrections after the probe has been closed.
     var sourceDolbyVisionHDR10BaseLayerPresentable: Bool = false
 
@@ -786,6 +789,13 @@ public final class AetherEngine: ObservableObject {
     /// for Stats-for-Nerds. `LiveTelemetry.observedFps` measures the live rate but is nil on the native AVPlayer
     /// path (no usable counter); this nominal value fills that gap for the on-screen readout.
     @Published public internal(set) var sourceVideoFrameRate: Double? = nil
+
+    /// AE#983: progressive or interlaced, and the field order, resolved at load from the evidence the
+    /// routing reads: the probe's field order, the H.264 SPS when that is open (#150), and the #232
+    /// frame sample, which turns a declared-interlaced source with progressive pictures into
+    /// `.progressive`. `.unknown` before load, on the probe-free remote-HLS bypass and when nothing
+    /// settles it. Whether a deinterlacer actually runs is `decodedVideoFormat?.deinterlace`.
+    @Published public internal(set) var sourceVideoScan: VideoScan = .unknown
 
     /// Declared source video bitrate in bits/second (0 when the container declares none). From the video
     /// stream's `codecpar.bit_rate`, or the Matroska `BPS` statistics tag when that is 0 (mkvmerge). Static
@@ -1080,6 +1090,10 @@ public final class AetherEngine: ObservableObject {
     /// the keepalive policy + pause-safety read it.
     public var pictureInPictureActive = false {
         didSet {
+            #if os(macOS)
+            updatePictureInPictureTracking()
+            #endif
+            updatePictureFit()
             nativeHost?.pictureInPictureActive = pictureInPictureActive
             // SW-PiP Phase C: flip the frame compositor with the PiP state so subtitles appear in the
             // window and never double-draw under the fullscreen host overlay.
@@ -1088,11 +1102,19 @@ public final class AetherEngine: ObservableObject {
             #if os(tvOS)
             // PiP window closed while backgrounded: nothing keeps the app running anymore, so the
             // wedge-safe teardown is due before idle suspension (mirrors the iOS pause-while-backgrounded path).
-            if oldValue && !pictureInPictureActive {
+            if closingPictureInPictureOwesBackgroundDecision(wasActive: oldValue) {
                 settleBackgroundDecisionAfterPictureInPictureClosed()
             }
             #endif
         }
+    }
+    /// True while `stopInternal` clears `pictureInPictureActive` itself.
+    var isResettingPictureInPictureForStop = false
+    /// Whether the PiP flag going false is a window closing that owes the background decision. Not when
+    /// `stopInternal` is the one clearing it: that is the teardown the decision would schedule, and it
+    /// is half done at that point.
+    func closingPictureInPictureOwesBackgroundDecision(wasActive: Bool) -> Bool {
+        wasActive && !pictureInPictureActive && !isResettingPictureInPictureForStop
     }
     /// #127: seconds a PAUSED session survives backgrounding (iOS) before the wedge-safe teardown runs,
     /// held under a background-task assertion so a quick app switch resumes without a pipeline rebuild.
@@ -1251,7 +1273,22 @@ public final class AetherEngine: ObservableObject {
     /// against it, and it is cleared with the session so the next source cannot be laid out against
     /// this one's rectangle. The native and bypass paths mount an `AVPlayerLayer`, which measures its
     /// own `videoRect` and carries `AVPlayerItem.presentationSize`; this stays nil there.
-    @Published public internal(set) var softwareDisplaySize: CGSize?
+    @Published public internal(set) var softwareDisplaySize: CGSize? {
+        didSet {
+            updatePictureFit()
+            #if os(macOS)
+            updatePictureInPictureAspect()
+            #endif
+        }
+    }
+    #if os(macOS)
+    /// macOS: the content size of the system PiP window while a software session is in it, nil
+    /// otherwise. The display layer is laid out to it (AE#810).
+    var pictureInPictureArea: CGSize? {
+        didSet { if oldValue != pictureInPictureArea { updatePictureFit() } }
+    }
+    var pictureInPictureAreaTracker: PictureInPictureAreaTracker?
+    #endif
 
     /// #846: what the low-resolution upscale stage (`LoadOptions.upscalesLowResolutionVideo`) does for this
     /// session. Published on the first upscaled frame, not when the load decides the route, and again with
@@ -1269,7 +1306,26 @@ public final class AetherEngine: ObservableObject {
     /// next-episode handover (AE#158), but `stop()` tears the host down and the next `load()` builds
     /// a fresh layer. A host driving PiP must still set `pictureInPictureActive`, which arms both the
     /// keepalive policy and that in-place handover.
-    public var nativePlayerLayer: AVPlayerLayer? { nativeHost?.playerLayer }
+    ///
+    /// nil while `LoadOptions.dualLayerRoute == .avPlayerOutput` is running (a Profile 7 FEL session on the
+    /// AVPlayer-output route): AVPlayer's own picture is suppressed there and the composed picture is a
+    /// layer of the bound `AetherPlayerView`, so a Picture in Picture window built on this layer would be
+    /// blank. Picture in Picture is unavailable on that route.
+    public var nativePlayerLayer: AVPlayerLayer? {
+        #if DualLayerDolbyVision
+        if dualLayerOutputRoute != nil { return nil }
+        #endif
+        return nativeHost?.playerLayer
+    }
+
+    /// Whether the AVPlayer-output dual-layer route is currently active.
+    public var isDualLayerOutputRouteActive: Bool {
+        #if DualLayerDolbyVision
+        return dualLayerOutputRoute != nil
+        #else
+        return false
+        #endif
+    }
     /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown
     /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS). Never set on macOS.
     var isBackgrounded = false
@@ -1607,6 +1663,9 @@ public final class AetherEngine: ObservableObject {
     /// lands on a newer serial and is dropped instead of clearing a later tick's in-flight slot.
     var subtitleDrainTickSerial: UInt64 = 0
     #if DEBUG
+    /// AE#973: runs on a software host that has loaded and not yet started its loops. A paused mount
+    /// starts them for the first frame, so a hook installed after `load` returns can miss it.
+    var softwareHostLoadedForTesting: (@MainActor (SoftwarePlaybackHost) -> Void)?
     /// AE#628: lets a test drive the drain tick with a real decoder but no playback session.
     var subtitleDrainDecoderFactoryForTesting: ((Int32) -> EmbeddedSubtitleDecoder?)?
     #endif
@@ -1741,6 +1800,36 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var secondarySubtitleCues: [SubtitleCue] = []
     @Published public internal(set) var isLoadingSecondarySubtitles: Bool = false
     @Published public internal(set) var isSecondarySubtitleActive: Bool = false
+
+    /// Selected secondary TrackInfo.id, embedded or registered external. nil when off or using
+    /// the one-shot URL API; nil alone does not imply inactivity. A registered external publishes
+    /// when its prepared replacement commits; the previous identity stays while it decodes or fails.
+    @Published public private(set) var activeSecondarySubtitleTrackIndex: Int?
+    private var publishingSecondarySubtitleIdentity = false
+
+    /// One update path for the internal selection and its public projection. A synchronous
+    /// @Published subscriber may select/clear again during willSet; drain that newer identity
+    /// after the outer setter returns rather than leaving the projection on the old selection.
+    func setSecondarySubtitleIdentity(embedded: Int32 = -1, external: Int? = nil) {
+        activeSecondaryEmbeddedSubtitleStreamIndex = external == nil ? embedded : -1
+        activeSecondaryExternalSubtitleTrackID = external
+        guard !publishingSecondarySubtitleIdentity else { return }
+        publishingSecondarySubtitleIdentity = true
+        defer { publishingSecondarySubtitleIdentity = false }
+        while true {
+            let selected = secondarySubtitleSelectionIdentity
+            guard activeSecondarySubtitleTrackIndex != selected else { return }
+            activeSecondarySubtitleTrackIndex = selected
+        }
+    }
+
+    /// The internal selection as a TrackInfo.id. Inside a reentrant willSet this is already the
+    /// newer value while the published projection still holds the old one.
+    var secondarySubtitleSelectionIdentity: Int? {
+        activeSecondaryExternalSubtitleTrackID
+            ?? (activeSecondaryEmbeddedSubtitleStreamIndex >= 0
+                ? Int(activeSecondaryEmbeddedSubtitleStreamIndex) : nil)
+    }
 
     /// True once the NativeSubtitleCueStore has at least one cue for the native mov_text track (#55).
     /// Use to gate the AVMediaSelection picker (PiP/AirPlay). Cleared by clearSubtitle and stopInternal.
@@ -1891,6 +1980,11 @@ public final class AetherEngine: ObservableObject {
             // Still correct for hosts that use the engine's layer directly and for the SW displayLayer.
             nativeHost?.playerLayer.videoGravity = newValue
             softwareHost?.displayLayer.videoGravity = newValue
+            #if DualLayerDolbyVision
+            dualLayerOutputRoute?.setVideoGravity(newValue)
+            #endif
+            // The PiP fit depends on the gravity and no layout pass follows a change.
+            if softwareHost != nil { boundView?.refreshHostedLayerFrame() }
         }
     }
     var _videoGravity: AVLayerVideoGravity = .resizeAspect
@@ -2196,12 +2290,48 @@ public final class AetherEngine: ObservableObject {
         presentCurrentLayer()
     }
 
+    /// While PiP is active the bound view shapes the software layer to the picture so the window does
+    /// not inherit the view's aspect; otherwise it fills the view.
+    func updatePictureFit() {
+        boundView?.setPictureFit(pictureInPictureActive && softwareHost != nil ? softwareDisplaySize : nil)
+        #if os(macOS)
+        boundView?.setPictureArea(pictureInPictureActive && softwareHost != nil ? pictureInPictureArea : nil)
+        #endif
+    }
+
+    #if os(macOS)
+    /// The picture's size arrived or changed: let the window tracker match against its aspect.
+    func updatePictureInPictureAspect() {
+        guard pictureInPictureActive, softwareHost != nil,
+              let size = softwareDisplaySize, size.width > 0, size.height > 0 else { return }
+        pictureInPictureAreaTracker?.updateAspect(size.width / size.height)
+    }
+
+    /// macOS: follow the system PiP window while a software session is in it, see
+    /// `PictureInPictureAreaTracker`. Stopped (and the area cleared) when PiP ends.
+    func updatePictureInPictureTracking() {
+        if pictureInPictureActive && softwareHost != nil {
+            if pictureInPictureAreaTracker == nil {
+                pictureInPictureAreaTracker = PictureInPictureAreaTracker { [weak self] in self?.pictureInPictureArea = $0 }
+            }
+            let aspect = softwareDisplaySize.flatMap { $0.width > 0 && $0.height > 0 ? $0.width / $0.height : nil }
+            pictureInPictureAreaTracker?.start(known: softwarePiPSource?.windowsBeforeController ?? .weakObjects(),
+                                               host: boundView?.window, aspect: aspect)
+        } else {
+            pictureInPictureAreaTracker?.stop()
+        }
+    }
+    #endif
+
     /// Attaches nativeHost.playerLayer or softwareHost.displayLayer to the bound view. No-op when no host.
     func presentCurrentLayer() {
         guard let view = boundView else { return }
+        defer { updatePictureFit() }
         if let host = nativeHost {
             view.attach(host.playerLayer)
+            view.attachOverlay(dualLayerOutputLayer)
         } else if let host = softwareHost {
+            view.attachOverlay(nil)
             view.attach(host.displayLayer)
         }
     }
@@ -2636,6 +2766,13 @@ public final class AetherEngine: ObservableObject {
     /// Host observer for per-frame presentation times (#260). Held here so it survives across loads and is
     /// re-installed on each new native session; see `setNativeVideoFrameTimeObserver`.
     var nativeVideoFrameTimeObserver: NativeVideoFrameTimeObserver?
+    /// Set by the load's route decision when a Profile 7 FEL source takes `DualLayerRoute.avPlayerOutput`:
+    /// the stream's frame rate (known and positive; the decision refuses the route otherwise). `loadNative`
+    /// starts the route for the session it builds.
+    var outputRouteFrameRate: Double?
+    #if DualLayerDolbyVision
+    var dualLayerOutputRoute: DualLayerOutputRoute?
+    #endif
 
     /// The software path's equivalent (#311), held for the same reason: a `load()` builds a fresh
     /// host, and the observer has to survive it. See `setSoftwareVideoFrameTimeObserver`.
@@ -2747,7 +2884,11 @@ public final class AetherEngine: ObservableObject {
 
     /// Secondary subtitle reader state mirrors (#47). Driven only through SubtitleChannel.secondary.
     var secondarySidecarTask: Task<Void, Never>?
-    var activeSecondaryEmbeddedSubtitleStreamIndex: Int32 = -1
+    #if DEBUG
+    /// Per-engine failure injection; never changes another session's decoder factory.
+    var secondarySidecarDecoderFactoryForTesting: (@Sendable (SidecarBitmapSource) -> EmbeddedSubtitleDecoder?)?
+    #endif
+    private(set) var activeSecondaryEmbeddedSubtitleStreamIndex: Int32 = -1
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
@@ -4073,7 +4214,9 @@ public final class AetherEngine: ObservableObject {
     var hostExplicitSubtitleAction = false
     /// Synthetic id of the external track active on the secondary channel, nil when the secondary
     /// is off or embedded (#88).
-    var activeSecondaryExternalSubtitleTrackID: Int? = nil
+    private(set) var activeSecondaryExternalSubtitleTrackID: Int? = nil
+    /// Selection intent is separate from the still-visible active track while preparation runs.
+    var pendingSecondaryExternalSubtitleTrackID: Int? = nil
     /// Base for synthetic external-subtitle TrackInfo ids; far above any real AVStream index.
     public static let externalSubtitleTrackIDBase = 100_000
     /// #170: true while `reloadAtCurrentPosition` runs a session-preserving reload. Host
@@ -4756,7 +4899,7 @@ public final class AetherEngine: ObservableObject {
         externalSubtitleRegistry = [:]
         nextExternalSubtitleOrdinal = 0
         hostExplicitSubtitleAction = false
-        activeSecondaryExternalSubtitleTrackID = nil
+        setSecondarySubtitleIdentity()
         // #357: any load that is not the reload claiming it (which consumed it before calling here)
         // is a different session; a parked selection must not follow it.
         backgroundTeardownSelection = nil
@@ -4807,22 +4950,24 @@ public final class AetherEngine: ObservableObject {
         // Reset format/dimension state so paths that skip the probe (nativeRemoteHLS) or find no video
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
         videoFormat = .sdr
+        sourceDVBLCompatID = nil
+        sourceDolbyVisionBaseLayerPresentable = false
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        outputRouteFrameRate = nil
         sourceUpscalePlan = nil
         sourceUpscaleDisabled = nil
         sourceSoftwareOnlyForUpscale = false
         sourceUpscaleFrameRate = nil
-        sourceDVBLCompatID = nil
-        sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionHDR10BaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
+        sourceVideoScan = .unknown
         sourceVideoBitrate = 0
         sourceVideoStreamFormat = nil
         decodedVideoFormat = nil
@@ -5240,11 +5385,12 @@ public final class AetherEngine: ObservableObject {
 
         // sourceVideoFormat = what's in the file; videoFormat = what the panel shows (published after
         // the criteria handshake; see panelHDRAfterHandshake below).
-        sourceVideoFormat = detectedFormat
-        sourceDVProfile = detectedDVProfileNum
+        // The capability pair is assigned before its publishing peers so their sinks read it current.
         sourceDVBLCompatID = detectedDVBLCompatIDNum
         sourceDolbyVisionBaseLayerPresentable = detectedDVBaseLayerPresentable
         sourceDolbyVisionHDR10BaseLayerPresentable = detectedDVHDR10BaseLayerPresentable
+        sourceVideoFormat = detectedFormat
+        sourceDVProfile = detectedDVProfileNum
         sourceDolbyVisionRPUProfile = detectedDVRPUProfile
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
@@ -5680,6 +5826,18 @@ public final class AetherEngine: ObservableObject {
                 category: .engine
             )
         }
+        // A split Dolby Vision source (enhancement layer on its own PID or track) joins the layers into single-track
+        // units when the dual-layer route is wanted, so the checks below see the stream the decoder would read. The
+        // join is undone after the decision when the route is not taken.
+        if probeOpened, !options.isLive, probe.canJoinDolbyVisionEnhancementLayer,
+           VideoRoutingPolicy.dualLayerRouteIsWanted(
+               codecID: detectedCodecID,
+               dvProfile: detectedDVProfileNum,
+               dolbyVisionHandling: options.dolbyVisionHandling,
+               preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
+               canHardwareDecode: nil) {
+            probe.enableDolbyVisionEnhancementLayerJoin()
+        }
         // VideoToolbox capability queries can synchronously enter the system
         // decoder service. Avoid initializing the AV1 probe for other codecs,
         // and run it off @MainActor when AV1 routing actually needs it.
@@ -5691,7 +5849,6 @@ public final class AetherEngine: ObservableObject {
         } else {
             av1Available = true
         }
-
         // A Profile 7 source with in-band parameter sets (`hev1` with an empty hvcC) is unclassifiable
         // to the strict verdict below and would stay native for that reason alone. When the dual-layer
         // route is wanted, complete the probe's record from the head of the stream first; the session
@@ -5743,8 +5900,11 @@ public final class AetherEngine: ObservableObject {
         // that its size alone would refuse still pays the probe.
         var elType: String? = nil
         var dualLayerGeometry = DualLayerRouteDecision.Geometry(width: 0, height: 0, frameRate: nil)
+        // The output route splits the enhancement layer off hvcC-framed (length-prefixed) packets.
+        var dualLayerPacketsAreHVCCFramed = false
         if probeOpened, let vStream = probe.stream(at: probe.videoStreamIndex),
            let cp = vStream.pointee.codecpar {
+            dualLayerPacketsAreHVCCFramed = cp.pointee.extradata_size > 23 && cp.pointee.extradata?[0] == 1
             dualLayerGeometry = DualLayerRouteDecision.Geometry(
                 width: Int(cp.pointee.width), height: Int(cp.pointee.height),
                 frameRate: Self.detectFrameRate(stream: vStream))
@@ -5762,7 +5922,7 @@ public final class AetherEngine: ObservableObject {
             isLive: options.isLive,
             isSourceSeekable: dualLayerSeekable,
             canHardwareDecode: opensHardwareHEVC,
-            enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers,
+            enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers || probe.joinsDolbyVisionEnhancementLayer,
             airPlayVideoReceiver: airPlayVideoReceiver) == nil {
             let vIdx = probe.videoStreamIndex
             elType = await BlockingWork.detached(priority: .userInitiated) { [probe] in
@@ -5795,7 +5955,7 @@ public final class AetherEngine: ObservableObject {
             canHardwareDecode: opensHardwareHEVC,
             elType: elType,
             geometry: dualLayerGeometry,
-            enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers,
+            enhancementLayerInPackets: !probe.foldsBluRayDolbyVisionLayers || probe.joinsDolbyVisionEnhancementLayer,
             airPlayVideoReceiver: airPlayVideoReceiver)
         if let line = dualLayerDecision.logLine {
             EngineLog.emit(line, category: .engine)
@@ -5803,7 +5963,25 @@ public final class AetherEngine: ObservableObject {
         // A route that was not taken leaves no el_type behind, so neither the routing below nor a
         // software host the session reaches for another reason composes the dual layers.
         if !dualLayerDecision.isTaken { elType = nil }
+        if !dualLayerDecision.isTaken, probe.joinsDolbyVisionEnhancementLayer {
+            probe.disableDolbyVisionEnhancementLayerJoin()
+        }
         sourceElType = elType
+        // The AVPlayer-output route keeps the native route: AVPlayer plays the base layer, the enhancement
+        // layer is composed onto its frames. Everything that routes a Profile 7 FEL source to the software
+        // host reads `elType`, so the route hides it from the policy and keeps it in `sourceElType` for
+        // the fallback to the software host.
+        let runsOnAVPlayerOutput = DualLayerRouteDecision.runsOnAVPlayerOutput(
+            dualLayerDecision, route: options.dualLayerRoute, packetsAreHVCCFramed: dualLayerPacketsAreHVCCFramed,
+            frameRate: dualLayerGeometry.frameRate)
+        if options.dualLayerRoute == .avPlayerOutput, dualLayerDecision.isTaken, !runsOnAVPlayerOutput {
+            EngineLog.emit(
+                "[AetherEngine] DV P7 dual-layer: the AVPlayer-output route is not available here "
+                + "(it needs the DualLayerDolbyVision trait, hvcC-framed packets and a known frame rate); "
+                + "taking the software host",
+                category: .engine)
+        }
+        outputRouteFrameRate = runsOnAVPlayerOutput ? dualLayerGeometry.frameRate : nil
         var useSoftwarePath = VideoRoutingPolicy.requiresSoftwarePath(
             codecID: detectedCodecID,
             fieldOrder: detectedFieldOrder,
@@ -5814,11 +5992,12 @@ public final class AetherEngine: ObservableObject {
             dolbyVisionHandling: options.dolbyVisionHandling,
             preferDualLayerDolbyVision: options.preferDualLayerDolbyVision,
             canHardwareDecode: opensHardwareHEVC,
-            elType: elType
+            elType: runsOnAVPlayerOutput ? nil : elType
         )
         var requiresDeinterlaceWarmup = VideoRoutingPolicy.requiresDeinterlaceWarmup(
             codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
             spsIndicatesInterlaced: spsIndicatesInterlaced)
+        var frameSampleRefutesInterlace = false
         // #232: a declared interlaced field order is not evidence that any frame IS interlaced.
         // European 25 fps Blu-ray masters ship as 1080i25 (there is no 1080p25): interlaced carriage,
         // progressive pictures, and FFmpeg's parser reports TT for them off SEI pic_struct alone while
@@ -5853,6 +6032,7 @@ public final class AetherEngine: ObservableObject {
             if InterlaceProbe.refutesDeclaredInterlace(verdict) {
                 useSoftwarePath = false
                 requiresDeinterlaceWarmup = false
+                frameSampleRefutesInterlace = true
                 EngineLog.emit(
                     "[AetherEngine] declared interlaced (fieldOrder=\(detectedFieldOrder.rawValue)) but "
                     + "\(verdict); the deinterlacer would never engage, routing native for HW decode (#232)",
@@ -5866,6 +6046,10 @@ public final class AetherEngine: ObservableObject {
                 )
             }
         }
+        sourceVideoScan = VideoScan.resolve(
+            codecID: detectedCodecID, fieldOrder: detectedFieldOrder,
+            spsIndicatesInterlaced: spsIndicatesInterlaced,
+            frameSampleRefutesInterlace: frameSampleRefutesInterlace)
         // #2: an H.264 / HEVC format AVPlayer accepts at the HLS CODECS level but VideoToolbox can't
         // hardware-decode (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext on Intel Macs / older Apple TV) reaches
         // readyToPlay then renders nothing on the native path. QuickTime plays it via its own software decoder;
@@ -5955,7 +6139,7 @@ public final class AetherEngine: ObservableObject {
                 if !useSoftwarePath {
                     EngineLog.emit(
                         "[AetherEngine] sequential origin keeps the native path (linear read, "
-                        + "declared duration, seeks unavailable)",
+                        + "declared duration, seeks only inside the resident tail)",
                         category: .engine
                     )
                 }
@@ -6130,6 +6314,10 @@ public final class AetherEngine: ObservableObject {
                 if Self.loadPerformsAutostart(options) {
                     softwareHost?.play()
                     state = .playing
+                } else {
+                    // AE#973: the loops only ran on play(), so a paused mount (and every rebuild of a
+                    // paused session, which mounts paused) never decoded the frame at the playhead.
+                    softwareHost?.pause()
                 }
                 startMemoryProbe()
                 startLiveTelemetrySampler()
@@ -6527,6 +6715,21 @@ resumeOverride: selection.resumePosition,
     /// to a position it decided itself out of content the session served; it is not a scrub, so the
     /// live-only refusal below does not apply to it and its landing is measured against what the item
     /// holds rather than against what the session advertises.
+    /// AE#958: a loopback session on a sequential origin can seek inside the resident span that reaches the
+    /// producer's frontier. The cache keeps everything from the consumer's target up to the highest stored
+    /// segment, so every fetch from there on is served or produced next, never a restart (which the origin
+    /// cannot honour). An earlier, detached span would run into a segment that no longer exists.
+    nonisolated static func sequentialSeekStaysResident(
+        target: Double,
+        sequentialOrigin: Bool,
+        loopbackSession: Bool,
+        residentRanges: [ClosedRange<Double>]
+    ) -> Bool {
+        guard sequentialOrigin, loopbackSession, target.isFinite,
+              let frontier = residentRanges.max(by: { $0.upperBound < $1.upperBound }) else { return false }
+        return frontier.contains(target)
+    }
+
     func seek(to seconds: Double, origin: SeekOrigin, exact: Bool = false) async {
         // Guard: a host scrub racing stop() must not flip an idle/error engine to .seeking -> .playing.
         // .ended is terminal too: after end-of-media the host reloads to replay, it does not scrub a parked session.
@@ -6568,7 +6771,13 @@ resumeOverride: selection.resumePosition,
                 return
             }
         }
-        if !isLive, loadedOptions.sequentialOrigin || isSourceSeekable == false {
+        if !isLive, loadedOptions.sequentialOrigin || isSourceSeekable == false,
+           !Self.sequentialSeekStaysResident(
+               target: seconds,
+               sequentialOrigin: loadedOptions.sequentialOrigin,
+               loopbackSession: nativeVideoSession != nil && softwareHost == nil,
+               residentRanges: residentRanges
+           ) {
             EngineLog.emit("[AetherEngine] seek(to:\(seconds)) rejected: source is forward-only", category: .engine)
             // A seek stashed during load must relinquish its optimistic clock as well.
             let wasDeferred = deferredSeekInFlight
@@ -7355,7 +7564,7 @@ resumeOverride: selection.resumePosition,
         externalSubtitleRegistry = [:]
         nextExternalSubtitleOrdinal = 0
         hostExplicitSubtitleAction = false
-        activeSecondaryExternalSubtitleTrackID = nil
+        setSecondarySubtitleIdentity()
         backgroundTeardownSelection = nil     // #357: leaving playback is not a reload
         pendingNativeRenderingRequest = nil   // #170: the session the latched request targeted is gone
         externalNativeStoreFillTask?.cancel()
@@ -7384,22 +7593,25 @@ resumeOverride: selection.resumePosition,
         mediaChapters = []
         videoFormat = .sdr
         effectiveVideoFormat = .sdr
+        sourceDVBLCompatID = nil
+        sourceDolbyVisionBaseLayerPresentable = false
+        sourceDolbyVisionHDR10BaseLayerPresentable = false
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
         dolbyVisionConversion = nil
         sourceCarriesHDR10PlusMetadata = false
         sourceElType = nil
+        outputRouteFrameRate = nil
         sourceUpscalePlan = nil
         sourceUpscaleDisabled = nil
         sourceSoftwareOnlyForUpscale = false
         sourceUpscaleFrameRate = nil
-        sourceDVBLCompatID = nil
-        sourceDolbyVisionBaseLayerPresentable = false
         sourceDolbyVisionHDR10BaseLayerPresentable = false
         sourceDolbyVisionRPUProfile = nil
         sessionPanelHDRReadout = nil
         sessionObservedDisplayCaps = nil
         sourceVideoFrameRate = nil
+        sourceVideoScan = .unknown
         sourceVideoBitrate = 0
         sourceVideoStreamFormat = nil
         decodedVideoFormat = nil
@@ -7723,6 +7935,10 @@ resumeOverride: selection.resumePosition,
     }
 
     private func handleExternalPlaybackChange(active: Bool) {
+        // The AVPlayer-output FEL route draws the picture in a layer of this device; a screen that takes
+        // the picture does not show it. Hand the picture back to AVPlayer (the 8.1 base layer) first, so
+        // the reload or item swap below starts from a player that renders its own frames again.
+        if active { handDualLayerOutputRouteToPlayer() }
         // #227 (device log 2026-07-27): the reload started below tears down the very item the KVO watches, so
         // AVPlayer reports a transient `false` in the middle of it. Acting on that edge cleared `airPlayActive`
         // before `loadNative` read it, the rebuilt session served 127.0.0.1 again, the receiver re-engaged
@@ -8143,6 +8359,11 @@ resumeOverride: selection.resumePosition,
 
     // MARK: - Audio / subtitle track selection
 
+    /// A VOD session on a sequential origin switches audio by a fresh load at the host's position.
+    nonisolated static func audioSwitchNeedsFreshLoad(isLive: Bool, sequentialOrigin: Bool) -> Bool {
+        !isLive && sequentialOrigin
+    }
+
     /// Switch the active audio track mid-playback. Rebuilds the pipeline at the current position;
     /// native audio handover retains the old item until replacement, but decoder readiness can still
     /// interrupt presentation. Software/forward-only sources cannot promise a seamless switch. Display-criteria handshake
@@ -8153,6 +8374,9 @@ resumeOverride: selection.resumePosition,
     /// informational, the selection belongs to AVFoundation, and a pick is logged and ignored rather than
     /// turned into a reload the bypass has no audio override for. A host that wants another language on
     /// that route loads a URL that carries it.
+    ///
+    /// Not available on a sequential origin either (AE#958): the rebuild could only reopen it at byte 0,
+    /// which restarted the programme on the native route and failed the software route's reposition.
     public func selectAudioTrack(index: Int) {
         if videoRoute == .remoteBypass {
             EngineLog.emit(
@@ -8169,6 +8393,14 @@ resumeOverride: selection.resumePosition,
                 "[AetherEngine] selectAudioTrack(\(index)) ignored: forward-only custom "
                 + "source cannot rebuild its pipeline (live ingest / demuxed-audio "
                 + "sessions switch tracks only via a fresh load)",
+                category: .engine
+            )
+            return
+        }
+        if Self.audioSwitchNeedsFreshLoad(isLive: isLive, sequentialOrigin: loadedOptions.sequentialOrigin) {
+            EngineLog.emit(
+                "[AetherEngine] selectAudioTrack(\(index)) ignored: a sequential origin can only "
+                + "reopen at byte 0; load the source again at the position with audioSourceStreamIndex",
                 category: .engine
             )
             return
@@ -8548,6 +8780,7 @@ resumeOverride: selection.resumePosition,
                 preparing.cancelPrepare()
             }
         }
+        stopDualLayerOutputRoute()
         nativeVideoSession?.stop(reason: cacheCleanupReason)
         nativeVideoSession = nil
         nativeSubtitleRenditionsServed = false
@@ -8598,6 +8831,15 @@ resumeOverride: selection.resumePosition,
         decodedVideoFormat = nil
         // #314: same detach on the software path, where the outgoing renderer's decode thread is what
         // can still hand a frame over while the next host comes up.
+        // The window shows this session's layer: close it while the host still feeds that layer, and
+        // drop the host-set flag so the keepalive policy does not treat a gone window as live (a host
+        // that drops its controller with the source never sees a did-stop).
+        if let pipSource = softwarePiPSource {
+            pipSource.endPictureInPicture()
+            isResettingPictureInPictureForStop = true
+            pictureInPictureActive = false
+            isResettingPictureInPictureForStop = false
+        }
         softwareHost?.setVideoFrameTimeObserver(nil)
         softwareHost?.stop()
         softwarePiPSource = nil
@@ -8717,8 +8959,7 @@ resumeOverride: selection.resumePosition,
         cancelNativeSubtitleReaders()
         nativeSubtitleRenditionAvailable = false
         cancelSidecarTask(channel: .secondary)
-        activeSecondaryEmbeddedSubtitleStreamIndex = -1
-        activeSecondaryExternalSubtitleTrackID = nil
+        setSecondarySubtitleIdentity()
         loadedSecondarySidecarURL = nil
         isSecondarySubtitleActive = false
         secondarySubtitleCues = []

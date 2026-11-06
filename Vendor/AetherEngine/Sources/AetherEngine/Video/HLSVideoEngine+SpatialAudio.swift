@@ -387,11 +387,10 @@ extension HLSVideoEngine {
                 : "DTS:X → \(bed)"
             audioDelivery = .bridged
             audioIsRenderedBed = true
-            audioBedIsFromDolbyAtmos = source == .trueHDAtmos
             let rendering: String
             switch source {
             case .trueHDAtmos:
-                rendering = "objects rendered into \(layout.rawValue)"
+                rendering = "the stream's channel presentation regressed onto \(layout.rawValue) by its objects"
             case .dtsHDMasterAudio:
                 rendering = "bed and heights routed one to one into \(layout.rawValue)"
             }

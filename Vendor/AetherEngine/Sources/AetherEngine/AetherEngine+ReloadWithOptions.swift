@@ -129,7 +129,7 @@ extension AetherEngine {
                 record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile
         ) {
             EngineLog.emit(
-                "[AetherEngine] DV P7 dual-layer: preferDualLayerDolbyVision / dolbyVisionHandling correction refused, "
+                "[AetherEngine] DV P7 dual-layer: preferDualLayerDolbyVision / dualLayerRoute / dolbyVisionHandling correction refused, "
                 + "\(refusal.rawValue): a custom source keeps the route it was loaded with; load() it "
                 + "again with the new option",
                 category: .engine
@@ -274,7 +274,7 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// side-audio merge lives in the native path's segment producer, so the session would play
     /// silent. Same reachability as `softwarePathCannotRepresentSource`.
     case demuxedAudioLiveIsNativeOnly
-    /// A correction of `preferDualLayerDolbyVision`, or of `dolbyVisionHandling` while the preference is on, on a Profile 7 session that plays from a custom
+    /// A correction of `preferDualLayerDolbyVision`, of `dualLayerRoute` while the preference is on, or of `dolbyVisionHandling` while the preference is on, on a Profile 7 session that plays from a custom
     /// `IOReader` source. The route is decided by `load()`'s probe, which a custom source's in-place
     /// rebuild does not re-run, so the change could not take effect. Call `load()` again with the
     /// new option. URL sources are not affected: their correction re-runs `load()`.
@@ -436,7 +436,8 @@ enum SessionOptionCorrection {
         let preferenceChanged = proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision
         let handlingMovesRoute = proposed.dolbyVisionHandling != current.dolbyVisionHandling
             && proposed.preferDualLayerDolbyVision
-        guard preferenceChanged || handlingMovesRoute else { return nil }
+        let routeMoves = proposed.dualLayerRoute != current.dualLayerRoute && proposed.preferDualLayerDolbyVision
+        guard preferenceChanged || handlingMovesRoute || routeMoves else { return nil }
         return .dualLayerRouteNeedsFreshLoad
     }
 
@@ -482,14 +483,14 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "discImageHint", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "upscalesLowResolutionVideo", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "dualLayerRoute", "upscalesLowResolutionVideo", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
         "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
         "softwareDVRRetention",
         "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
         "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
-        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
+        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "preferredAudioLanguages",
         "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",

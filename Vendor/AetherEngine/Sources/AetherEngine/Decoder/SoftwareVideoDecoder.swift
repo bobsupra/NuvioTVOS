@@ -34,6 +34,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         var pixelFormat: Int32
         var color: ColorDescription
         var pixelBufferType: OSType = 0
+        var deinterlace: VideoDeinterlace?
     }
 
     /// True when the source is >8-bit (HDR10, AV1 HDR).
@@ -468,6 +469,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             if isInterlaced || deinterlacer.isActive {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
+                    decodedFormatKey?.deinterlace = deinterlacer.activeDeinterlace
                     if filtered == nil { filtered = av_frame_alloc() }
                     if let out = filtered {
                         while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
@@ -722,7 +724,8 @@ loggedOutputFormat = nil
                 color: key.color,
                 codecID: codecContext?.pointee.codec_id ?? AV_CODEC_ID_NONE,
                 profile: codecContext?.pointee.profile ?? AV_PROFILE_UNKNOWN),
-            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType)))
+            pixelBufferFormat: DecodedVideoFormat.fourCC(key.pixelBufferType),
+            deinterlace: key.deinterlace))
     }
 
     // MARK: - AVFrame → CVPixelBuffer (sws_scale)

@@ -286,6 +286,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// rule (keyframe-aligned plan, a reopenable URL, no serial or held origin, no disc), decided at
     /// start. A Profile 5 / 10.0 session never serves that rendition, so this is asked separately.
     private var previewReadsSource = false
+    /// Configured before start; only controls the elective sparse still ladder.
+    var generatesBackgroundScrubPreviews = true
+
     /// Sparse stills for what nothing resident covers (`KeyframeStillLadder`). Eligibility is the
     /// I-frame rule minus the serial-origin exclusion, because the ladder reads only while the origin
     /// has nothing in flight. Guarded by `restartLock`, like the reader and builder below.
@@ -362,6 +365,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
         frameTimeObserverLock.lock()
         _nativeVideoFrameTimeObserver = observer
         frameTimeObserverLock.unlock()
+    }
+
+    /// The enhancement-route tap (`LoadOptions.dualLayerRoute == .avPlayerOutput`). Wired onto every
+    /// producer the session builds, so a restart or a seek keeps feeding it under a new epoch.
+    private let videoPacketTapLock = NSLock()
+    private var _videoPacketTap: VideoPacketTap?
+
+    func setVideoPacketTap(_ tap: VideoPacketTap?) {
+        videoPacketTapLock.lock()
+        _videoPacketTap = tap
+        videoPacketTapLock.unlock()
+    }
+
+    private func videoPacketTapSnapshot() -> VideoPacketTap? {
+        videoPacketTapLock.lock(); defer { videoPacketTapLock.unlock() }
+        return _videoPacketTap
     }
 
     private func nativeVideoFrameTimeObserverSnapshot() -> NativeVideoFrameTimeObserver? {
@@ -613,10 +632,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// The audio is TrueHD Atmos or DTS:X rendered into a speaker bed (`objectAudioRendering`), as APAC or
     /// PCM, which on tvOS some sinks only show as Atmos with `AtmosOutputActivator` beside the player.
     var audioIsRenderedBed = false
-
-    /// The rendered bed is TrueHD Atmos, not DTS:X: only then does `AtmosOutputActivator` bring the
-    /// receiver to Dolby Atmos, which a DTS programme is not.
-    var audioBedIsFromDolbyAtmos = false
 
     /// The DTS:X decoder confirmed the playing track as DTS:X (#744), whatever FFmpeg's profile label said. The
     /// engine folds it into the published track's `isDTSX`.
@@ -2723,7 +2738,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             secondReaderAvailable: sourceReopenableByURL)) == .served
         // AE#937: an idle gap on a one-request origin is still a second reader's open and its ranges,
         // and a rung read overcommits once the pump queues behind it.
-        stillLadderEligible = !previewNeedsCompositor && stillsAvailable
+        stillLadderEligible = generatesBackgroundScrubPreviews && !previewNeedsCompositor && stillsAvailable
             && IFrameRenditionEligibility.candidate(.init(
                 requested: true,
                 isLive: isLiveSession,
@@ -3181,8 +3196,14 @@ hasIFrameRendition: Bool = false,
         let live = isLiveSession
         let cacheRef = cache
         let plan = segmentPlan
+        let sequentialProvider = sequentialOriginPinsProducerToZero ? provider : nil
         restartLock.unlock()
         guard !live, let cacheRef, !plan.isEmpty else { return [] }
+        // AE#958: a sequential session's items carry the muxed durations, not the plan's.
+        if let ranges = sequentialProvider?.sequentialResidentItemRanges(
+            residentIndexes: cacheRef.residentIndexRanges()) {
+            return ranges
+        }
         return cacheRef.residentIndexRanges().compactMap { indexes in
             guard indexes.lowerBound >= 0, indexes.upperBound < plan.count else { return nil }
             let lower = plan[indexes.lowerBound].startSeconds
@@ -3664,7 +3685,7 @@ hasIFrameRendition: Bool = false,
 
     /// The ladder's own side reader and builder, made on the first rung. Its reads are gated on the
     /// origin having nothing in flight, checked again right before each one.
-    private func makeStillLadderSource(plan: [Segment])
+    func makeStillLadderSource(plan: [Segment])
         -> (keyframes: IFrameRendition, builder: PreviewKeyframeBuilder)? {
         restartLock.lock()
         defer { restartLock.unlock() }
@@ -4167,6 +4188,9 @@ hasIFrameRendition: Bool = false,
         // #260: resolved per frame, so installing an observer mid-session reaches this producer too.
         prod.nativeVideoFrameTimeObserverProvider = { [weak self] in
             self?.nativeVideoFrameTimeObserverSnapshot()
+        }
+        prod.videoPacketTapProvider = { [weak self] in
+            self?.videoPacketTapSnapshot()
         }
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.
@@ -5486,6 +5510,14 @@ hasIFrameRendition: Bool = false,
     /// `segmentStartSecondsLocked` uses). Last segment whose `startSeconds <= seconds`, clamped. Used to
     /// re-anchor the producer on AVPlayer's real position after a backpressure wedge (#65). Thread-safe.
     func segmentIndexForPlaylistTime(_ seconds: Double) -> Int {
+        restartLock.lock()
+        let sequentialProvider = sequentialOriginPinsProducerToZero ? provider : nil
+        restartLock.unlock()
+        // AE#958: a sequential session's playlist axis is the muxed durations, which drift from the
+        // plan by seconds, so the plan names the wrong segment for a time inside what was cut.
+        if let index = sequentialProvider?.sequentialSegmentIndex(forPlaylistTime: seconds) {
+            return index
+        }
         restartLock.lock()
         defer { restartLock.unlock() }
         guard !segmentPlan.isEmpty else { return 0 }
