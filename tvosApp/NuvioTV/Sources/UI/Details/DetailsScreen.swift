@@ -5344,20 +5344,19 @@ private struct TvDetailsBackdrop: View {
             }
 
             GeometryReader { proxy in
-                    LinearGradient(
+                LinearGradient(
                     stops: [
-                        .init(color: backdropColor.opacity(0.95), location: 0),
-                        .init(color: backdropColor.opacity(0.86), location: 0.25),
-                        .init(color: backdropColor.opacity(0.64), location: 0.50),
-                        .init(color: backdropColor.opacity(0.34), location: 0.70),
-                        .init(color: backdropColor.opacity(0.10), location: 0.88),
+                        .init(color: backdropColor.opacity(0.96), location: 0),
+                        .init(color: backdropColor.opacity(0.85), location: 0.22),
+                        .init(color: backdropColor.opacity(0.52), location: 0.46),
+                        .init(color: backdropColor.opacity(0.14), location: 0.76),
                         .init(color: .clear, location: 1)
                     ],
                     startPoint: .leading,
                     endPoint: .trailing
                 )
-                .frame(width: proxy.size.width * 0.76)
-                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                .frame(width: proxy.size.width * 0.58, height: proxy.size.height)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
         }
@@ -7406,6 +7405,9 @@ private struct TvEpisodeGuideInput: Equatable {
         guard lhs.metaID == rhs.metaID else { return false }
         guard lhs.videosCount == rhs.videosCount else { return false }
         guard lhs.firstVideoID == rhs.firstVideoID, lhs.lastVideoID == rhs.lastVideoID else { return false }
+        if lhs.videos.withUnsafeBufferPointer({ l in rhs.videos.withUnsafeBufferPointer({ r in l.baseAddress == r.baseAddress }) }) {
+            return true
+        }
         return lhs.videos == rhs.videos
     }
 }
@@ -7425,6 +7427,7 @@ private struct TvEpisodeGuide {
     let episodes: [NuvioVideo]
     let seasons: [Int]
     let episodesBySeason: [Int: [NuvioVideo]]
+    let episodeIndexByIDBySeason: [Int: [String: Int]]
     let airedRegularEpisodes: [NuvioVideo]
 
     init(metaID: String, videos: [NuvioVideo], revision: Int) {
@@ -7441,8 +7444,19 @@ private struct TvEpisodeGuide {
             grouped[episode.season, default: []].append(episode)
         }
 
+        var groupedIndex: [Int: [String: Int]] = [:]
+        for (season, seasonEps) in grouped {
+            var indices: [String: Int] = [:]
+            indices.reserveCapacity(seasonEps.count)
+            for (offset, element) in seasonEps.enumerated() {
+                indices[element.id] = offset
+            }
+            groupedIndex[season] = indices
+        }
+
         episodes = ordered
         episodesBySeason = grouped
+        episodeIndexByIDBySeason = groupedIndex
         seasons = orderedSeasons
         airedRegularEpisodes = CatalogWatchedPolicy.airedRegularEpisodes(ordered)
     }
@@ -7688,9 +7702,10 @@ private final class TvDetailsEpisodeCache: ObservableObject {
             let episodeScrollIndex = initialEpisode.flatMap { target in
                 seasonEpisodes.firstIndex(where: { $0.id == target.id })
             } ?? 0
-            let seasonEpisodeIndexByID = seasonEpisodes.enumerated().reduce(into: [:]) { indices, entry in
-                indices[entry.element.id] = entry.offset
-            }
+            let seasonEpisodeIndexByID = guide.episodeIndexByIDBySeason[selectedSeason]
+                ?? seasonEpisodes.enumerated().reduce(into: [:]) { indices, entry in
+                    indices[entry.element.id] = entry.offset
+                }
             let seasonIsWatched = !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
                 displayWatchedKeys.contains("\($0.season):\($0.episode)")
             }
@@ -7812,7 +7827,14 @@ private struct TvDetailsEpisodes: View {
         _selectedSeason = State(initialValue: initialState.selectedSeason)
         _seasonEpisodes = State(initialValue: initialState.seasonEpisodes)
         _seasonEpisodeIndexByID = State(initialValue: initialState.seasonEpisodeIndexByID)
-        _episodeScrollIndex = State(initialValue: initialState.episodeScrollIndex)
+        var initialScrollIndex = initialState.episodeScrollIndex
+        if let restrictFocusToKey, restrictFocusToKey.hasPrefix("episode-card\u{1}") {
+            let targetID = String(restrictFocusToKey.dropFirst("episode-card\u{1}".count))
+            if let targetIndex = initialState.seasonEpisodeIndexByID[targetID] {
+                initialScrollIndex = targetIndex
+            }
+        }
+        _episodeScrollIndex = State(initialValue: initialScrollIndex)
         _watchedEpisodeKeys = State(initialValue: initialState.watchedEpisodeKeys)
         _episodeWatchCounts = State(initialValue: initialState.episodeWatchCounts)
         _watchedSummary = State(initialValue: initialState.watchedSummary)
@@ -7863,6 +7885,13 @@ private struct TvDetailsEpisodes: View {
         }
         .onChange(of: selectedSeason) { _, newSeason in
             setSeasonEpisodes(episodeGuide.episodesBySeason[newSeason] ?? [])
+        }
+        .onChange(of: restrictFocusToKey) { _, newKey in
+            guard let newKey, newKey.hasPrefix("episode-card\u{1}") else { return }
+            let targetID = String(newKey.dropFirst("episode-card\u{1}".count))
+            if let targetIndex = seasonEpisodeIndexByID[targetID] {
+                episodeScrollIndex = targetIndex
+            }
         }
     }
 
@@ -7933,7 +7962,9 @@ private struct TvDetailsEpisodes: View {
             index: episodeScrollIndex
         )
         seasonEpisodes = newEpisodes
-        seasonEpisodeIndexByID = Self.episodeIndexByID(newEpisodes)
+        let seasonNumber = newEpisodes.first?.season ?? selectedSeason
+        seasonEpisodeIndexByID = episodeGuide.episodeIndexByIDBySeason[seasonNumber]
+            ?? Self.episodeIndexByID(newEpisodes)
         refreshSeasonWatchedState(for: newEpisodes, watchedKeys: watchedKeys ?? watchedEpisodeKeys)
     }
 
@@ -7991,22 +8022,18 @@ private struct TvDetailsEpisodes: View {
 
     private func materializedEpisodeIndices(visibleCardCount: Int) -> [Int] {
         guard !seasonEpisodes.isEmpty else { return [] }
-        let focusIndex = min(max(episodeScrollIndex, 0), seasonEpisodes.count - 1)
-        var lowerBound = max(0, focusIndex - 4)
-        var upperBound = min(seasonEpisodes.count - 1, focusIndex + visibleCardCount + 2)
-
-        if let restriction = effectiveFocusRestriction {
-            let prefix = "episode-card\u{1}"
-            if restriction.hasPrefix(prefix) {
-                let targetID = String(restriction.dropFirst(prefix.count))
-                if let targetIndex = seasonEpisodeIndexByID[targetID] {
-                    lowerBound = min(lowerBound, targetIndex)
-                    upperBound = max(upperBound, targetIndex)
-                }
-            }
-        }
-
-        return Array(lowerBound...upperBound)
+        let targetIndex: Int? = {
+            guard let restriction = effectiveFocusRestriction,
+                  restriction.hasPrefix("episode-card\u{1}") else { return nil }
+            let targetID = String(restriction.dropFirst("episode-card\u{1}".count))
+            return seasonEpisodeIndexByID[targetID]
+        }()
+        return TvDetailsEpisodeIndex.windowIndices(
+            totalEpisodes: seasonEpisodes.count,
+            scrollIndex: episodeScrollIndex,
+            targetIndex: targetIndex,
+            visibleCardCount: visibleCardCount
+        )
     }
 
     private var episodeCardStrip: some View {
@@ -8016,6 +8043,7 @@ private struct TvDetailsEpisodes: View {
             let visibleCardCount = max(1, Int(ceil(stripWidth / TvEpisodeCardLayout.step)) + 1)
             let materializedIndices = materializedEpisodeIndices(visibleCardCount: visibleCardCount)
             let materializedEpisodes = materializedIndices.map { seasonEpisodes[$0] }
+            let currentSeasonEpisodeNumbers = seasonEpisodes.map(\.episode)
 
             HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
                 ForEach(materializedEpisodes) { video in
@@ -8073,14 +8101,14 @@ private struct TvDetailsEpisodes: View {
                                 _ = libraryWatchedContext.setSeasonWatched(
                                     meta,
                                     season: selectedSeason,
-                                    episodes: seasonEpisodes.map(\.episode),
+                                    episodes: currentSeasonEpisodeNumbers,
                                     isWatched: !isSeasonWatched
                                 )
                             } else {
                                 WatchedStore.setSeasonWatched(
                                     meta: meta,
                                     season: selectedSeason,
-                                    episodes: seasonEpisodes.map(\.episode),
+                                    episodes: currentSeasonEpisodeNumbers,
                                     isWatched: !isSeasonWatched
                                 )
                             }
@@ -8109,7 +8137,13 @@ private struct TvDetailsEpisodes: View {
             .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: episodeScrollIndex)
         }
         .frame(height: TvEpisodeCardLayout.stripHeight)
-        .task(id: "\(selectedSeason)-\(materializedEpisodeIndices(visibleCardCount: 6).first ?? 0)-\(materializedEpisodeIndices(visibleCardCount: 6).last ?? 0)") {
+        .task(id: "\(selectedSeason)-\((materializedEpisodeIndices(visibleCardCount: 6).first ?? 0) / 6)") {
+            // Debounce to keep rapid D-pad navigation butter-smooth without spamming network/state passes
+            do {
+                try await Task.sleep(nanoseconds: 180_000_000)
+            } catch {
+                return
+            }
             let visibleCount = max(1, Int(ceil(1920 / TvEpisodeCardLayout.step)) + 1)
             let indices = materializedEpisodeIndices(visibleCardCount: visibleCount)
             let episodes = indices.compactMap { seasonEpisodes.indices.contains($0) ? seasonEpisodes[$0] : nil }
@@ -8123,7 +8157,16 @@ private struct TvDetailsEpisodes: View {
             let ids = episodes.map { meta.canonicalEpisodeStreamId(for: $0) }
             let results = await AddonRatingsService.fetchRatingsForEpisodes(episodeIds: ids)
             if !results.isEmpty {
-                episodeRatings.merge(results) { _, new in new }
+                var hasNew = false
+                for (id, ratings) in results {
+                    if episodeRatings[id] != ratings {
+                        hasNew = true
+                        break
+                    }
+                }
+                if hasNew {
+                    episodeRatings.merge(results) { _, new in new }
+                }
             }
         }
     }
@@ -8238,6 +8281,20 @@ enum TvDetailsEpisodeIndex {
             }
         }
         return min(max(index, 0), updatedEpisodes.count - 1)
+    }
+
+    static func windowIndices(
+        totalEpisodes: Int,
+        scrollIndex: Int,
+        targetIndex: Int?,
+        visibleCardCount: Int
+    ) -> [Int] {
+        guard totalEpisodes > 0 else { return [] }
+        let anchorIndex = targetIndex.map { min(max($0, 0), totalEpisodes - 1) }
+            ?? min(max(scrollIndex, 0), totalEpisodes - 1)
+        let lowerBound = max(0, anchorIndex - 4)
+        let upperBound = min(totalEpisodes - 1, anchorIndex + visibleCardCount + 2)
+        return Array(lowerBound...upperBound)
     }
 }
 
@@ -9771,10 +9828,28 @@ private struct TvStreamCardPresentation {
     let showAddonLogo: Bool
 
     init(stream: NuvioStream, badgeSettings: StreamBadgeSettingsSnapshot) {
-        importedBadges = StreamBadgeMatcher.matchedBadges(
+        let matched = StreamBadgeMatcher.matchedBadges(
             for: stream,
             rules: badgeSettings.rules
         )
+        let tags = StreamQualityTags.parse(stream: stream)
+        if tags.isFEL || tags.isMEL {
+            let elSuffix = tags.isFEL ? "FEL" : "MEL"
+            importedBadges = matched.map { badge in
+                let lowerName = badge.name.lowercased()
+                let lowerId = badge.id.lowercased()
+                if (lowerName.contains("dv") || lowerName.contains("dolby") || lowerId.contains("dv") || lowerId.contains("dolby"))
+                    && !badge.name.localizedCaseInsensitiveContains("fel")
+                    && !badge.name.localizedCaseInsensitiveContains("mel") {
+                    var modified = badge
+                    modified.name = "\(badge.name) \(elSuffix)"
+                    return modified
+                }
+                return badge
+            }
+        } else {
+            importedBadges = matched
+        }
         fileSizeLabel = badgeSettings.showFileSizeBadges
             ? StreamBadgeSizing.fileSizeLabel(for: stream)
             : nil

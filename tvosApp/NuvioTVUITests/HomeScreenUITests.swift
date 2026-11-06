@@ -252,6 +252,130 @@ final class HomeScreenUITests: XCTestCase {
 
     // MARK: - Navigation Tests
 
+    func testImmediateLeftAfterDetailsReturnsToPreviousCard() throws {
+        app.terminate()
+        app.launchArguments = [
+            "-nuvio.auth.skippedLogin", "YES",
+            "-nuvio.tv.settings.layout.homeLayout", "Modern"
+        ]
+        app.launch()
+
+        let catalogPrefix = "poster-card-movie_top\u{1}"
+        let focusedPoster = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND hasFocus == true", catalogPrefix
+        )).firstMatch
+        XCTAssertTrue(
+            focusedPoster.waitForExistence(timeout: 20),
+            "Requires a guest Home fixture with Popular Movies focused and notices dismissed"
+        )
+        let firstID = focusedPoster.identifier
+
+        XCUIRemote.shared.press(.right)
+        let secondPoster = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND identifier != %@ AND hasFocus == true",
+            catalogPrefix, firstID
+        )).firstMatch
+        XCTAssertTrue(secondPoster.waitForExistence(timeout: 5), "The fixture needs at least three cards in a row")
+        let secondID = secondPoster.identifier
+
+        XCUIRemote.shared.press(.right)
+        let thirdPoster = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND identifier != %@ AND identifier != %@ AND hasFocus == true",
+            catalogPrefix, firstID, secondID
+        )).firstMatch
+        XCTAssertTrue(thirdPoster.waitForExistence(timeout: 5), "The fixture needs at least three cards in a row")
+        let thirdID = thirdPoster.identifier
+        let rowID = secondID.components(separatedBy: "\u{1}").dropLast()
+        XCTAssertEqual(rowID, thirdID.components(separatedBy: "\u{1}").dropLast())
+
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(
+            app.buttons["Play"].waitForExistence(timeout: 10) ||
+                app.buttons["Watchlist"].waitForExistence(timeout: 5),
+            "Selecting the third card should open Details"
+        )
+
+        XCUIRemote.shared.press(.menu)
+        XCUIRemote.shared.press(.left)
+
+        let previousCard = app.buttons[secondID]
+        let didFocusPreviousCard = XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hasFocus == true"), object: previousCard
+        )], timeout: 5) == .completed
+        let focusedElement = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasFocus == true")).firstMatch
+        XCTAssertTrue(
+            didFocusPreviousCard,
+            "Immediate Left after Details should focus the previous card; focused: \(focusedElement.debugDescription)"
+        )
+        XCUIRemote.shared.press(.left)
+        XCTAssertTrue(
+            XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "hasFocus == true"), object: app.buttons[firstID]
+            )], timeout: 5) == .completed,
+            "Left navigation should continue normally after the return"
+        )
+    }
+
+    func testNetflixSearchImmediateLeftAfterDetails() throws {
+        try verifySearchReturnLeft(style: "Netflix", resultPrefix: "netflix-search-result-grid:")
+    }
+
+    func testNativeSearchImmediateLeftAfterDetails() throws {
+        try verifySearchReturnLeft(style: "Native", resultPrefix: "native-search-result-")
+    }
+
+    private func verifySearchReturnLeft(style: String, resultPrefix: String) throws {
+        app.terminate()
+        app.launchArguments = [
+            "-nuvio.auth.skippedLogin", "YES",
+            "-nuvio.tv.settings.layout.searchStyle", style
+        ]
+        app.launch()
+
+        let homeCard = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND hasFocus == true", "poster-card-movie_top\u{1}"
+        )).firstMatch
+        XCTAssertTrue(homeCard.waitForExistence(timeout: 20), "Requires a guest Home fixture with notices dismissed")
+        XCUIRemote.shared.press(.left)
+        let searchTab = app.buttons["Search"]
+        XCTAssertTrue(searchTab.waitForExistence(timeout: 5), "The sidebar must expose the Search tab")
+        selectTVElement(searchTab, in: app)
+
+        let searchField = app.searchFields.firstMatch
+        XCTAssertTrue(searchField.waitForExistence(timeout: 10), "Search must expose its text field")
+        if !searchField.hasFocus {
+            selectTVElement(searchField, in: app)
+        }
+        XCTAssertTrue(searchField.hasFocus, "The Search field must have focus before typing")
+        searchField.typeText("Batman")
+
+        let results = app.buttons.matching(NSPredicate(format: "identifier BEGINSWITH %@", resultPrefix))
+        let previousCard = results.element(boundBy: 1)
+        XCTAssertTrue(previousCard.waitForExistence(timeout: 20), "The Batman fixture needs at least three results")
+        let previousID = previousCard.identifier
+        moveTVFocus(.right, in: app, within: previousCard)
+        let selectedCard = results.matching(NSPredicate(format: "hasFocus == true AND identifier != %@", previousID)).firstMatch
+        XCTAssertTrue(selectedCard.waitForExistence(timeout: 5), "Right should focus the next Search result")
+
+        XCUIRemote.shared.press(.select)
+        XCTAssertTrue(
+            app.buttons["Play"].waitForExistence(timeout: 10) ||
+                app.buttons["Watchlist"].waitForExistence(timeout: 5),
+            "Selecting the Search result should open Details"
+        )
+        XCUIRemote.shared.press(.menu)
+        XCUIRemote.shared.press(.left)
+
+        let restoredCard = app.buttons[previousID]
+        let restored = XCTWaiter.wait(for: [XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "hasFocus == true"), object: restoredCard
+        )], timeout: 5) == .completed
+        let focusedElement = app.descendants(matching: .any)
+            .matching(NSPredicate(format: "hasFocus == true")).firstMatch
+        XCTAssertTrue(restored, "Immediate Left in \(style) Search should focus the preceding result; focused: \(focusedElement.debugDescription)")
+    }
+
     func testNavigateFromHomeToDetails() throws {
         sleep(2)
 

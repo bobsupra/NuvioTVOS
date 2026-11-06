@@ -1134,6 +1134,9 @@ class PlayerViewModel: ObservableObject {
         subtitleFetchTask?.cancel()
         scrubThumbnailTask?.cancel()
         preResolvedNextEpisodeTask?.cancel()
+        if let url = preResolvedNextStream?.url {
+            AetherEngine.discardPrewarmedSource(url: url)
+        }
         if let token = preResolvedStreamWarmToken {
             PlaybackStreamCacheManager.discardRangeProbeMemo(token: token)
         }
@@ -2468,12 +2471,19 @@ class PlayerViewModel: ObservableObject {
                     profileID: profileID,
                     token: token
                 )
+                _ = await AetherEngine.prewarm(
+                    url: prepared.url,
+                    httpHeaders: prepared.httpHeaders
+                )
             }
             return prepared
         }
     }
 
     private func cancelPreResolvedNextEpisode() {
+        if let url = preResolvedNextStream?.url {
+            AetherEngine.discardPrewarmedSource(url: url)
+        }
         preResolvedNextEpisodeTask?.cancel()
         preResolvedNextEpisodeTask = nil
         preResolvedNextStream = nil
@@ -7916,12 +7926,19 @@ class PlayerViewModel: ObservableObject {
 
         var dvProfile: String? = nil
         if let p = aether?.engine.sourceDVProfile, p > 0 {
-            dvProfile = "\(p)"
+            if p == 8, let c = aether?.engine.sourceDVBLCompatID, c > 0 {
+                dvProfile = "\(p).\(c)"
+            } else {
+                dvProfile = "\(p)"
+            }
         } else if mpvDVProfile > 0 {
             dvProfile = "\(mpvDVProfile)"
         } else if !dvRaw.isEmpty, dvRaw.caseInsensitiveCompare("None") != .orderedSame {
             let dvStr = dvRaw
-            if dvStr.contains("5") { dvProfile = "5" }
+            if dvStr.contains("8.1") { dvProfile = "8.1" }
+            else if dvStr.contains("8.4") { dvProfile = "8.4" }
+            else if dvStr.contains("8.2") { dvProfile = "8.2" }
+            else if dvStr.contains("5") { dvProfile = "5" }
             else if dvStr.contains("7") { dvProfile = "7" }
             else if dvStr.contains("8") { dvProfile = "8" }
             else if let firstDigit = dvStr.first(where: { $0.isNumber }) {

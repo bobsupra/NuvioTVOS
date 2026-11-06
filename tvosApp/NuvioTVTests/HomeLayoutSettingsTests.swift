@@ -243,6 +243,43 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertEqual(TVHomeFocusRestoration.target(saved: "row\u{1}nested\u{1}removed", rows: [other, row], preferredIndex: 0), row.keys[0])
     }
 
+    func testRestoreLeftPredecessorUsesHorizontalShelfOrder() {
+        let keys = ["card-0", "card-1", "card-2"]
+        XCTAssertEqual(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-2", in: keys, layout: .horizontal),
+            "card-1"
+        )
+    }
+
+    func testRestoreLeftPredecessorStopsAtFirstCard() {
+        let keys = ["card-0", "card-1", "card-2"]
+        XCTAssertNil(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-0", in: keys, layout: .horizontal)
+        )
+    }
+
+    func testGridRestoreLeftPredecessorStopsAtSevenColumnBoundary() {
+        let keys = (0...15).map { "card-\($0)" }
+        XCTAssertNil(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-7", in: keys, layout: .grid(columns: 7))
+        )
+        XCTAssertEqual(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-8", in: keys, layout: .grid(columns: 7)),
+            "card-7"
+        )
+    }
+
+    func testGridAndHorizontalShelvesHandleTheSameColumnBoundaryDifferently() {
+        let keys = (0...15).map { "card-\($0)" }
+        XCTAssertEqual(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-7", in: keys, layout: .horizontal),
+            "card-6"
+        )
+        XCTAssertNil(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-7", in: keys, layout: .grid(columns: 7))
+        )
+    }
+
     func testOverlayReturnCompletesOnlyForTheCardTheRestoreTargets() {
         let rowID = "popular-movies"
         let target = "\(rowID)\u{1}title:movie:m5"

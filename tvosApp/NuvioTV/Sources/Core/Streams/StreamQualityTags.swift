@@ -50,6 +50,8 @@ struct StreamQualityTags: Equatable, Codable, Sendable {
     var isHEVC: Bool = false
     var isAVC: Bool = false
     var isAV1: Bool = false
+    var isFEL: Bool = false
+    var isMEL: Bool = false
     var quality: DebridStreamQuality = .unknown
     var bingeGroup: String? = nil
     var addonName: String? = nil
@@ -137,6 +139,8 @@ struct StreamQualityTags: Equatable, Codable, Sendable {
     private static let av1Regex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:av1|av01)(?![a-z0-9])"#, options: .caseInsensitive)
     private static let hevcRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:hevc|h\.?265|x265|dvhe|dvh1)(?![a-z0-9])"#, options: .caseInsensitive)
     private static let avcRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:avc1?|h\.?264|x264)(?![a-z0-9])"#, options: .caseInsensitive)
+    private static let felRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:(?:p(?:rofile)?[\s._-]?7|dv|dovi)[\s._-]+fel|\[fel\]|\(fel\)|fel)(?![a-z0-9])"#, options: .caseInsensitive)
+    private static let melRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:(?:p(?:rofile)?[\s._-]?7|dv|dovi)[\s._-]+mel|\[mel\]|\(mel\)|mel(?!\s+(?:gibson|brooks)))(?![a-z0-9])"#, options: .caseInsensitive)
 
     private static let camRegex = try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])cam(?:[^a-z0-9]|$)"#, options: .caseInsensitive)
     private static let tsRegex = try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])ts(?:[^a-z0-9]|$)"#, options: .caseInsensitive)
@@ -222,7 +226,17 @@ struct StreamQualityTags: Equatable, Codable, Sendable {
             " profile 5", "profile 5", " profile 7", "profile 7", " profile 8", "profile 8",
             " dv ", "dv.", ".dv.", "[dv]", "(dv)"
         ]
-        tags.isDolbyVision = textContainsAny(fullText, dvNeedles) || regexMatches(dvWordRegex, in: fullText)
+        let hasDV = textContainsAny(fullText, dvNeedles) || regexMatches(dvWordRegex, in: fullText)
+        let hasFEL = regexMatches(felRegex, in: metadataText)
+        let hasMEL = regexMatches(melRegex, in: metadataText)
+        tags.isDolbyVision = hasDV || hasFEL || hasMEL
+        if tags.isDolbyVision {
+            if hasFEL && !hasMEL {
+                tags.isFEL = true
+            } else if hasMEL && !hasFEL {
+                tags.isMEL = true
+            }
+        }
         // Match HDR markers as standalone release tokens. `HDRip` is a common
         // SDR release label (High Definition rip), not an HDR transfer.
         tags.isHDR = tags.isDolbyVision || textContainsHDRToken(fullText)
@@ -844,6 +858,8 @@ enum LastPlaybackStreamStore {
 /// Lightweight badges shown on stream rows (not full Badger packs).
 enum StreamBadgeKind: String, CaseIterable, Identifiable {
     case dolbyVision = "DV"
+    case dolbyVisionFEL = "DV FEL"
+    case dolbyVisionMEL = "DV MEL"
     case hdr = "HDR"
     case atmos = "Atmos"
     case fourK = "4K"
@@ -857,7 +873,7 @@ enum StreamBadgeKind: String, CaseIterable, Identifiable {
 
     var tint: (bg: Double, fg: Double) {
         switch self {
-        case .dolbyVision: return (0.45, 1)
+        case .dolbyVision, .dolbyVisionFEL, .dolbyVisionMEL: return (0.45, 1)
         case .hdr: return (0.35, 1)
         case .atmos: return (0.28, 1)
         case .fourK: return (0.22, 1)
@@ -871,8 +887,17 @@ enum StreamBadgeKind: String, CaseIterable, Identifiable {
 
     static func badges(for tags: StreamQualityTags) -> [StreamBadgeKind] {
         var list: [StreamBadgeKind] = []
-        if tags.isDolbyVision { list.append(.dolbyVision) }
-        else if tags.isHDR { list.append(.hdr) }
+        if tags.isDolbyVision {
+            if tags.isFEL {
+                list.append(.dolbyVisionFEL)
+            } else if tags.isMEL {
+                list.append(.dolbyVisionMEL)
+            } else {
+                list.append(.dolbyVision)
+            }
+        } else if tags.isHDR {
+            list.append(.hdr)
+        }
         if tags.isAtmos { list.append(.atmos) }
         if tags.resolution >= 2160 { list.append(.fourK) }
         else if tags.resolution >= 1080 { list.append(.fullHD) }

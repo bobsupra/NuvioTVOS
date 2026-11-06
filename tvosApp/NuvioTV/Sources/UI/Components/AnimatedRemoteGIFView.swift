@@ -27,6 +27,7 @@ struct AnimatedRemoteGIFView: View {
     let urlString: String
     var isActive: Bool = true
     var contentMode: UIView.ContentMode = .scaleAspectFill
+    var maxPixelSize: Int = 440
 
     @State private var decoded: DecodedAnimatedImage?
     @State private var loadFailed = false
@@ -74,13 +75,13 @@ struct AnimatedRemoteGIFView: View {
             loadFailed = true
             return
         }
-        if let cached = AnimatedGIFCache.shared.image(for: url) {
+        if let cached = AnimatedGIFCache.shared.image(for: url, maxPixelSize: maxPixelSize) {
             decoded = cached
             return
         }
         loadTask?.cancel()
         loadTask = Task {
-            let image = await AnimatedGIFCache.shared.load(url: url)
+            let image = await AnimatedGIFCache.shared.load(url: url, maxPixelSize: maxPixelSize)
             guard !Task.isCancelled else { return }
             if let image {
                 decoded = image
@@ -292,19 +293,23 @@ final class AnimatedGIFCache: @unchecked Sendable {
         cache.delegate = Self.tracker
     }
 
-    func image(for url: URL) -> DecodedAnimatedImage? {
-        cache.object(forKey: url.absoluteString as NSString)
+    private func cacheKey(for url: URL, maxPixelSize: Int) -> String {
+        maxPixelSize == 440 ? url.absoluteString : "\(url.absoluteString)#maxPixelSize=\(maxPixelSize)"
     }
 
-    func preload(url: URL) {
-        if image(for: url) != nil { return }
+    func image(for url: URL, maxPixelSize: Int = 440) -> DecodedAnimatedImage? {
+        cache.object(forKey: cacheKey(for: url, maxPixelSize: maxPixelSize) as NSString)
+    }
+
+    func preload(url: URL, maxPixelSize: Int = 440) {
+        if image(for: url, maxPixelSize: maxPixelSize) != nil { return }
         Task.detached(priority: .utility) {
-            _ = await self.load(url: url)
+            _ = await self.load(url: url, maxPixelSize: maxPixelSize)
         }
     }
 
-    func load(url: URL) async -> DecodedAnimatedImage? {
-        let key = url.absoluteString
+    func load(url: URL, maxPixelSize: Int = 440) async -> DecodedAnimatedImage? {
+        let key = cacheKey(for: url, maxPixelSize: maxPixelSize)
         if let cached = cache.object(forKey: key as NSString) {
             return cached
         }
@@ -314,7 +319,7 @@ final class AnimatedGIFCache: @unchecked Sendable {
                 return (existing, false)
             }
             let task = Task.detached(priority: .userInitiated) { () -> DecodedAnimatedImage? in
-                await Self.fetchAndDecode(url: url)
+                await Self.fetchAndDecode(url: url, maxPixelSize: maxPixelSize)
             }
             inFlight[key] = task
             return (task, true)
@@ -338,19 +343,19 @@ final class AnimatedGIFCache: @unchecked Sendable {
         return image
     }
 
-    private static func fetchAndDecode(url: URL) async -> DecodedAnimatedImage? {
+    private static func fetchAndDecode(url: URL, maxPixelSize: Int = 440) async -> DecodedAnimatedImage? {
         do {
             let (data, response) = try await gifURLSession.data(from: url)
             if let http = response as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
                 return nil
             }
-            return makeDecodedImage(from: data)
+            return makeDecodedImage(from: data, maxPixelSize: maxPixelSize)
         } catch {
             return nil
         }
     }
 
-    static func makeDecodedImage(from data: Data) -> DecodedAnimatedImage? {
+    static func makeDecodedImage(from data: Data, maxPixelSize: Int = 440) -> DecodedAnimatedImage? {
         let sourceOptions: [CFString: Any] = [kCGImageSourceShouldCache: false]
         guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
             guard let still = UIImage(data: data) else { return nil }
@@ -364,7 +369,7 @@ final class AnimatedGIFCache: @unchecked Sendable {
         }
 
         if count == 1 {
-            guard let cgImage = createFrameImage(source: source, index: 0, maxPixelSize: 420) ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+            guard let cgImage = createFrameImage(source: source, index: 0, maxPixelSize: maxPixelSize) ?? CGImageSourceCreateImageAtIndex(source, 0, nil) else {
                 guard let still = UIImage(data: data) else { return nil }
                 return DecodedAnimatedImage(singleFrame: still)
             }
@@ -374,7 +379,7 @@ final class AnimatedGIFCache: @unchecked Sendable {
         // Higher frame ceiling (up to 120 frames) so 30-60 fps collection GIFs are never decimated down to 7-15 fps.
         let maxSourceFrames = 120
         let stride = max(1, Int(ceil(Double(count) / Double(maxSourceFrames))))
-        let maxPixelSize: Int = count > 60 ? 380 : 440
+        let targetMaxPixelSize: Int = maxPixelSize == 440 ? (count > 60 ? 380 : 440) : maxPixelSize
 
         var sampledFrames: [(image: UIImage, delayCentiseconds: Int)] = []
         sampledFrames.reserveCapacity(min(count, maxSourceFrames))
@@ -387,7 +392,7 @@ final class AnimatedGIFCache: @unchecked Sendable {
                 accumulatedCentiseconds += frameDelay(source: source, index: subIndex)
             }
 
-            if let cgImage = createFrameImage(source: source, index: index, maxPixelSize: maxPixelSize) {
+            if let cgImage = createFrameImage(source: source, index: index, maxPixelSize: targetMaxPixelSize) {
                 sampledFrames.append((UIImage(cgImage: cgImage), max(1, accumulatedCentiseconds)))
             }
             index += stride

@@ -127,6 +127,20 @@ final class SceneNavigationTests: XCTestCase {
         viewModel.remoteTouchEnded(dx: 0, dy: 35)
     }
 
+    func testTimelineDownPressOpensSceneWhenEnabled() {
+        let viewModel = PlayerViewModel()
+        viewModel.status = .playing
+        viewModel.showControls = true
+        viewModel.isTimelineFocused = true
+        XCTAssertTrue(viewModel.isSceneEnabled)
+        XCTAssertFalse(viewModel.showScenePanel)
+
+        viewModel.openScene()
+
+        XCTAssertTrue(viewModel.showScenePanel, "Down press from timeline must open Scene/InSight panel")
+        XCTAssertFalse(viewModel.showControls, "Controls must be hidden when Scene/InSight panel opens")
+    }
+
     func testRemoteDownDoesNotOpenSceneWhenDisabledInSettings() {
         let previous = ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled)
         ProfileSettings.current.set(false, forKey: SettingsKey.sceneFeatureEnabled)

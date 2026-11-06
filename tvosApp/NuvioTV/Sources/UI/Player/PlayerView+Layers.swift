@@ -319,11 +319,48 @@ extension PlayerView {
                         requestedControlFocus = .firstTransportButton
                     }
                 }
+            },
+            canHandleDown: {
+                canOpenSceneFromTimeline || canOpenSceneWhenControlsHidden
+            },
+            onTapDown: {
+                if canOpenSceneFromTimeline {
+                    viewModel.openScene()
+                } else if canOpenSceneWhenControlsHidden {
+                    if viewModel.isSceneEnabled {
+                        viewModel.openScene()
+                    } else {
+                        viewModel.revealControls()
+                    }
+                }
             }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
         .accessibilityHidden(true)
+    }
+
+    private var canOpenSceneFromTimeline: Bool {
+        didReportPlaybackStarted
+            && !isWakingFromBackground
+            && viewModel.currentErrorDiagnostic == nil
+            && !viewModel.showSettingsPanel
+            && !viewModel.showScenePanel
+            && !viewModel.isSceneDetailVisible
+            && viewModel.sidePanel == nil
+            && !viewModel.postPlayState.isVisible
+            && viewModel.showControls
+            && viewModel.isTimelineFocused
+            && !viewModel.isScrubbing
+            && !viewModel.isHoldingSeek
+            && viewModel.pendingSeekDelta == 0
+            && !viewModel.controlsAutoHideSuspended
+            && !isGestureCaptureActive
+            && viewModel.isSceneEnabled
+    }
+
+    private var canOpenSceneWhenControlsHidden: Bool {
+        canRevealControlsFromRemotePress
     }
 
     private var canFocusTransportFromTimeline: Bool {
