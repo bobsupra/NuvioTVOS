@@ -14,6 +14,8 @@ public struct Profile: Equatable, Hashable, Identifiable {
     public var avatarId: String
     public var usesPrimaryAddons: Bool
     public var usesPrimaryPlugins: Bool
+    public var profileBackgroundId: String?
+    public var profileBackgroundUrl: String?
 
     public init(
         id: String,
@@ -22,7 +24,9 @@ public struct Profile: Equatable, Hashable, Identifiable {
         isAdmin: Bool = false,
         avatarId: String = "",
         usesPrimaryAddons: Bool = false,
-        usesPrimaryPlugins: Bool = false
+        usesPrimaryPlugins: Bool = false,
+        profileBackgroundId: String? = nil,
+        profileBackgroundUrl: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -31,6 +35,8 @@ public struct Profile: Equatable, Hashable, Identifiable {
         self.avatarId = avatarId
         self.usesPrimaryAddons = usesPrimaryAddons
         self.usesPrimaryPlugins = usesPrimaryPlugins
+        self.profileBackgroundId = profileBackgroundId
+        self.profileBackgroundUrl = profileBackgroundUrl
     }
 }
 
@@ -181,7 +187,9 @@ public class ProfileManager {
             name: input.name,
             isPinProtected: pin != nil,
             isAdmin: false,
-            avatarId: input.avatarId ?? ""
+            avatarId: input.avatarId ?? "",
+            profileBackgroundId: input.profileBackgroundId,
+            profileBackgroundUrl: input.profileBackgroundUrl
         )
         profiles.append(profile)
         if let pin {
@@ -220,6 +228,16 @@ public class ProfileManager {
         var profiles = (try? getProfiles()) ?? []
         guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
         profiles[index].avatarId = avatarId
+        try saveProfiles(profiles)
+    }
+
+    public func updateProfileBackground(id: String, backgroundId: String?, backgroundUrl: String?) throws {
+        var profiles = (try? getProfiles()) ?? []
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        let cleanId = backgroundId?.trimmingCharacters(in: .whitespacesAndNewlines)
+        profiles[index].profileBackgroundId = (cleanId?.isEmpty == false) ? cleanId : nil
+        let cleanUrl = backgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+        profiles[index].profileBackgroundUrl = (cleanUrl?.isEmpty == false) ? cleanUrl : nil
         try saveProfiles(profiles)
     }
 
@@ -349,7 +367,9 @@ public class ProfileManager {
                 isAdmin: profile.isAdmin,
                 avatarId: sanitizedAvatarId(profile.avatarId),
                 usesPrimaryAddons: profile.usesPrimaryAddons,
-                usesPrimaryPlugins: profile.usesPrimaryPlugins
+                usesPrimaryPlugins: profile.usesPrimaryPlugins,
+                profileBackgroundId: profile.profileBackgroundId,
+                profileBackgroundUrl: profile.profileBackgroundUrl
             )
         }
     }
@@ -487,7 +507,7 @@ private enum ProfilePinStore {
 }
 
 // Codable helper for UserDefaults persistence
-private struct StoredProfile: Codable {
+struct StoredProfile: Codable {
     var id: String
     var name: String
     var isPinProtected: Bool
@@ -495,6 +515,8 @@ private struct StoredProfile: Codable {
     var avatarId: String
     var usesPrimaryAddons: Bool?
     var usesPrimaryPlugins: Bool?
+    var profileBackgroundId: String?
+    var profileBackgroundUrl: String?
 
     init(from profile: Profile) {
         self.id = profile.id
@@ -504,6 +526,8 @@ private struct StoredProfile: Codable {
         self.avatarId = profile.avatarId
         self.usesPrimaryAddons = profile.usesPrimaryAddons
         self.usesPrimaryPlugins = profile.usesPrimaryPlugins
+        self.profileBackgroundId = profile.profileBackgroundId
+        self.profileBackgroundUrl = profile.profileBackgroundUrl
     }
 
     func toProfile() -> Profile {
@@ -514,7 +538,9 @@ private struct StoredProfile: Codable {
             isAdmin: isAdmin,
             avatarId: avatarId,
             usesPrimaryAddons: usesPrimaryAddons ?? false,
-            usesPrimaryPlugins: usesPrimaryPlugins ?? false
+            usesPrimaryPlugins: usesPrimaryPlugins ?? false,
+            profileBackgroundId: profileBackgroundId,
+            profileBackgroundUrl: profileBackgroundUrl
         )
     }
 }
@@ -526,13 +552,25 @@ public struct CreateProfileInput {
     public var avatarId: String?
     public var maxAgeRating: String?
     public var pin: String?
+    public var profileBackgroundId: String?
+    public var profileBackgroundUrl: String?
 
-    public init(name: String, profileType: ProfileTypeStub = .adult, avatarId: String? = nil, maxAgeRating: String? = nil, pin: String? = nil) {
+    public init(
+        name: String,
+        profileType: ProfileTypeStub = .adult,
+        avatarId: String? = nil,
+        maxAgeRating: String? = nil,
+        pin: String? = nil,
+        profileBackgroundId: String? = nil,
+        profileBackgroundUrl: String? = nil
+    ) {
         self.name = name
         self.profileType = profileType
         self.avatarId = avatarId
         self.maxAgeRating = maxAgeRating
         self.pin = pin
+        self.profileBackgroundId = profileBackgroundId
+        self.profileBackgroundUrl = profileBackgroundUrl
     }
 }
 
@@ -784,6 +822,8 @@ public class ProfileViewModel: ObservableObject {
         name: String,
         pin: String?,
         avatarId: String = "",
+        profileBackgroundId: String? = nil,
+        profileBackgroundUrl: String? = nil,
         onCreated: (() -> Void)? = nil
     ) {
         guard let manager = profileManager else {
@@ -797,7 +837,14 @@ public class ProfileViewModel: ObservableObject {
         guard !isLoading else { return }
         isLoading = true
         profileCreationError = nil
-        let input = CreateProfileInput(name: name, profileType: .adult, avatarId: avatarId, pin: pin)
+        let input = CreateProfileInput(
+            name: name,
+            profileType: .adult,
+            avatarId: avatarId,
+            pin: pin,
+            profileBackgroundId: profileBackgroundId,
+            profileBackgroundUrl: profileBackgroundUrl
+        )
         Task {
             do {
                 let newProfile = try manager.createProfile(input: input)
@@ -816,6 +863,29 @@ public class ProfileViewModel: ObservableObject {
                 print("Failed to create profile: \(error)")
                 isLoading = false
             }
+        }
+    }
+
+    public func updateProfileBackground(id: String, backgroundId: String?, backgroundUrl: String?) {
+        guard let manager = profileManager else {
+            if let index = profiles.firstIndex(where: { $0.id == id }) {
+                let cleanId = backgroundId?.trimmingCharacters(in: .whitespacesAndNewlines)
+                profiles[index].profileBackgroundId = (cleanId?.isEmpty == false) ? cleanId : nil
+                let cleanUrl = backgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+                profiles[index].profileBackgroundUrl = (cleanUrl?.isEmpty == false) ? cleanUrl : nil
+                if activeProfile?.id == id {
+                    activeProfile = profiles[index]
+                }
+            }
+            return
+        }
+
+        do {
+            try manager.updateProfileBackground(id: id, backgroundId: backgroundId, backgroundUrl: backgroundUrl)
+            loadProfiles()
+            loadActiveProfile()
+        } catch {
+            print("Failed to update profile background: \(error)")
         }
     }
 

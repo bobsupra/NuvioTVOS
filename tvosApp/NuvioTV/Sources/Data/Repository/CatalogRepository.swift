@@ -501,6 +501,26 @@ struct AddonCatalogOption: Identifiable {
 struct StreamAddonPreference: Codable, Equatable {
     let url: String
     var enabled: Bool
+    var name: String?
+
+    enum CodingKeys: String, CodingKey {
+        case url
+        case enabled
+        case name
+    }
+
+    init(url: String, enabled: Bool = true, name: String? = nil) {
+        self.url = url
+        self.enabled = enabled
+        self.name = name
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        url = try container.decode(String.self, forKey: .url)
+        enabled = try container.decode(Bool.self, forKey: .enabled)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+    }
 }
 
 /// Live Cinemeta-backed catalog and metadata repository for the tvOS app.
@@ -1005,7 +1025,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             guard manifest.id != Self.cinemetaAddonId else { continue }
 
             let base = manifestURL.deletingLastPathComponent()
-            let addonDisplayName = manifest.displayName ?? Self.streamAddonName(for: manifestURL)
+            let addonDisplayName = Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName)
             let deletedCatalogKeys = TVHomeCatalogOrder.deletedCatalogKeys()
             let manifestEligible = (manifest.catalogs ?? []).filter { catalog in
                 let settingsKey = TVHomeCatalogOrder.catalogSettingsKey(
@@ -1566,13 +1586,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private static func normalizedPreferences(_ preferences: [StreamAddonPreference]) -> [StreamAddonPreference] {
-        var seen: Set<String> = []
-        return preferences.compactMap { preference -> StreamAddonPreference? in
-            guard let url = normalizedManifestURL(from: preference.url) else { return nil }
+        var seen: [String: StreamAddonPreference] = [:]
+        var orderedKeys: [String] = []
+        for preference in preferences {
+            guard let url = normalizedManifestURL(from: preference.url) else { continue }
             let key = url.absoluteString
-            guard seen.insert(key).inserted else { return nil }
-            return StreamAddonPreference(url: key, enabled: preference.enabled)
+            if let existing = seen[key] {
+                let mergedName = (existing.name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                    ? existing.name
+                    : preference.name
+                seen[key] = StreamAddonPreference(url: key, enabled: existing.enabled, name: mergedName)
+            } else {
+                seen[key] = StreamAddonPreference(url: key, enabled: preference.enabled, name: preference.name)
+                orderedKeys.append(key)
+            }
         }
+        return orderedKeys.compactMap { seen[$0] }
     }
 
     private static func normalizedURLs(from rawValues: [String]) -> [URL] {
@@ -1600,7 +1629,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                   manifest.supportsResource(resource, type: type, id: id) else { continue }
             addons.append(
                 StremioStreamAddon(
-                    name: manifest.displayName ?? Self.streamAddonName(for: manifestURL),
+                    name: Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName),
                     manifestURL: manifestURL
                 )
             )
@@ -1640,6 +1669,23 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return "AIOStreams"
         }
         return host
+    }
+
+    static func streamAddonDisplayName(
+        for manifestURL: URL,
+        manifestName: String? = nil,
+        in defaults: UserDefaults = ProfileSettings.current
+    ) -> String {
+        let preferences = configuredStreamAddonPreferences(in: defaults)
+        if let customName = preferences.first(where: {
+            normalizedManifestURL(from: $0.url)?.absoluteString == manifestURL.absoluteString
+        })?.name?.trimmingCharacters(in: .whitespacesAndNewlines), !customName.isEmpty {
+            return customName
+        }
+        if let manifestName = manifestName?.trimmingCharacters(in: .whitespacesAndNewlines), !manifestName.isEmpty {
+            return manifestName
+        }
+        return streamAddonName(for: manifestURL)
     }
 
     func getStreams(id: String, type: String) async throws -> [NuvioStream] {
@@ -1838,7 +1884,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                   manifest.supportsResource("subtitles", type: subtitleType, id: id) else { continue }
             addons.append(
                 StremioSubtitleAddon(
-                    name: manifest.displayName ?? Self.streamAddonName(for: manifestURL),
+                    name: Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName),
                     manifestURL: manifestURL
                 )
             )
@@ -1961,7 +2007,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     ? manifestURL.deletingLastPathComponent()
                     : manifestURL
 
-                let addonName = manifest.displayName ?? Self.streamAddonName(for: manifestURL)
+                let addonName = Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName)
                 let catalogs = manifest.catalogs ?? []
                 advertisedCatalogCount += catalogs.count
                 for catalog in catalogs where catalog.supportsSearch {
@@ -2521,7 +2567,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var seenKeys = Set<String>()
         for source in manifestSources {
             guard let manifest = await manifest(for: source.manifestURL) else { continue }
-            let addonName = manifest.displayName ?? source.name
+            let addonName = Self.streamAddonDisplayName(for: source.manifestURL, manifestName: manifest.displayName)
             for catalog in manifest.catalogs ?? [] where catalog.supportsDiscover {
                 let genreExtra = catalog.extra?.first { $0.name.lowercased() == "genre" }
                 let genreOptions = genreExtra?.options ?? []

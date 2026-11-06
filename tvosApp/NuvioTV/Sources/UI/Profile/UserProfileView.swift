@@ -12,6 +12,8 @@ public struct UserProfileView: View {
     @State private var newProfilePin = ""
     @State private var newProfileAvatarId = ProfileAvatarCatalog.defaultId
     @State private var focusedColor = Color(hex: "#1E88E5")
+    @State private var focusedBackgroundUrl: String? = nil
+    @State private var focusedBackgroundId: String? = nil
     @FocusState private var focusedItem: String?
 
     private static let addProfileFocusId = "add_profile"
@@ -31,7 +33,11 @@ public struct UserProfileView: View {
 
     public var body: some View {
         ZStack {
-            ProfileBackground(targetColor: focusedColor)
+            ProfileBackground(
+                targetColor: focusedColor,
+                backgroundUrl: focusedBackgroundUrl,
+                backgroundId: focusedBackgroundId
+            )
 
             VStack(spacing: 0) {
                 Spacer().frame(height: 162)
@@ -142,6 +148,7 @@ public struct UserProfileView: View {
         .animation(.easeInOut(duration: 0.18), value: showingAddProfile)
         .onAppear {
             AvatarCatalogStore.shared.loadIfNeeded()
+            ProfileBackgroundCatalogStore.shared.loadIfNeeded()
             if accountSyncError != nil, onRetryAccountSync != nil {
                 focusRetryIfNeeded()
             } else if focusedItem == nil {
@@ -164,6 +171,9 @@ public struct UserProfileView: View {
         .onReceive(AvatarCatalogStore.shared.$items) { _ in
             updateFocusedColor(for: focusedItem ?? initialFocusTarget())
         }
+        .onReceive(ProfileBackgroundCatalogStore.shared.$items) { _ in
+            updateFocusedColor(for: focusedItem ?? initialFocusTarget())
+        }
     }
 
     private func initialFocusTarget() -> String? {
@@ -183,15 +193,21 @@ public struct UserProfileView: View {
         guard let itemId else {
             if let first = viewModel.profiles.first {
                 focusedColor = profileColor(for: first)
+                focusedBackgroundUrl = first.profileBackgroundUrl
+                focusedBackgroundId = first.profileBackgroundId
             }
             return
         }
         if itemId == Self.addProfileFocusId {
             focusedColor = Color(hex: "#555555")
+            focusedBackgroundUrl = nil
+            focusedBackgroundId = nil
             return
         }
         if let profile = viewModel.profiles.first(where: { $0.id == itemId }) {
             focusedColor = profileColor(for: profile)
+            focusedBackgroundUrl = profile.profileBackgroundUrl
+            focusedBackgroundId = profile.profileBackgroundId
         }
     }
 
@@ -229,13 +245,34 @@ public struct UserProfileView: View {
     }
 }
 
-/// Dynamic background matching Android TV: shifts color based on the focused profile
-/// using dual blended vertical and horizontal wash gradients.
-private struct ProfileBackground: View {
+/// Dynamic background matching Android TV and Compose: shifts color based on the focused profile
+/// using 4 dynamic radial mesh gradient patches, dual blended wash gradients, and optional
+/// contributor animated GIF or custom image backdrops with contrast vignette overlay.
+struct ProfileBackground: View {
     var targetColor: Color = Color(hex: "#1E88E5")
+    var backgroundUrl: String? = nil
+    var backgroundId: String? = nil
 
     private static let background = Color(hex: "#0D0D0F")
     private static let backgroundElevated = Color(hex: "#1A1A1E")
+
+    private var effectiveURL: URL? {
+        ProfileBackgroundCatalogStore.shared.effectiveBackgroundURL(
+            backgroundUrl: backgroundUrl,
+            backgroundId: backgroundId
+        )
+    }
+
+    private var isGIF: Bool {
+        guard let url = effectiveURL else { return false }
+        let ext = url.pathExtension.lowercased()
+        if ext == "gif" { return true }
+        if let query = url.query?.lowercased(),
+           query.contains("format=gif") || query.contains("image/gif") {
+            return true
+        }
+        return false
+    }
 
     var body: some View {
         let gradientTop = Self.backgroundElevated.lerp(to: targetColor, fraction: 0.30)
@@ -244,6 +281,50 @@ private struct ProfileBackground: View {
         let halfFadeSoft = targetColor.opacity(0.08)
 
         ZStack {
+            // Base layer: deep dark background
+            Self.background
+
+            // 4-point dynamic radial mesh gradient patches reacting to profile targetColor
+            GeometryReader { proxy in
+                let w = proxy.size.width
+                let h = proxy.size.height
+
+                ZStack {
+                    // Top-leading primary radial patch
+                    RadialGradient(
+                        colors: [targetColor.opacity(0.36), targetColor.opacity(0.12), .clear],
+                        center: .topLeading,
+                        startRadius: 20,
+                        endRadius: max(w, h) * 0.72
+                    )
+
+                    // Top-trailing accent radial patch
+                    RadialGradient(
+                        colors: [targetColor.opacity(0.20), .clear],
+                        center: .topTrailing,
+                        startRadius: 10,
+                        endRadius: max(w, h) * 0.55
+                    )
+
+                    // Bottom-leading soft radial glow
+                    RadialGradient(
+                        colors: [targetColor.opacity(0.15), .clear],
+                        center: .bottomLeading,
+                        startRadius: 20,
+                        endRadius: max(w, h) * 0.65
+                    )
+
+                    // Bottom-trailing ambient depth patch
+                    RadialGradient(
+                        colors: [Self.backgroundElevated.opacity(0.85), .clear],
+                        center: .bottomTrailing,
+                        startRadius: 40,
+                        endRadius: max(w, h) * 0.80
+                    )
+                }
+            }
+
+            // Android TV dual blended directional wash gradients
             LinearGradient(
                 stops: [
                     .init(color: gradientTop, location: 0.0),
@@ -264,8 +345,50 @@ private struct ProfileBackground: View {
                 startPoint: .leading,
                 endPoint: .trailing
             )
+
+            // Contributor animated GIF or custom backdrop overlay
+            if let url = effectiveURL {
+                Group {
+                    if isGIF {
+                        AnimatedRemoteGIFView(
+                            urlString: url.absoluteString,
+                            contentMode: .scaleAspectFill,
+                            maxPixelSize: 1920
+                        )
+                    } else {
+                        AsyncImage(url: url) { phase in
+                            switch phase {
+                            case .success(let image):
+                                image
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fill)
+                            default:
+                                Color.clear
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .clipped()
+                .transition(.opacity)
+
+                // Contrast-protecting scrim and vignette over custom backdrop
+                Color.black.opacity(0.48)
+
+                LinearGradient(
+                    stops: [
+                        .init(color: Color.black.opacity(0.65), location: 0.0),
+                        .init(color: .clear, location: 0.28),
+                        .init(color: .clear, location: 0.72),
+                        .init(color: Color.black.opacity(0.78), location: 1.0)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+            }
         }
         .ignoresSafeArea()
+        .animation(.easeInOut(duration: 0.45), value: effectiveURL)
         .animation(.easeInOut(duration: 0.52), value: targetColor)
     }
 }
@@ -1210,5 +1333,456 @@ private struct ProfileAvatarPickerButton: View {
     private var foreground: Color {
         if isFocused { return .black }
         return prominent ? .black : .white
+    }
+}
+
+// MARK: - Synced profile background catalog (supporter / contributor backgrounds)
+
+struct ProfileBackgroundCatalogItem: Identifiable, Codable, Equatable {
+    let id: String
+    let displayName: String
+    let storagePath: String
+    let portraitStoragePath: String?
+    let assetVersion: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case displayName = "display_name"
+        case storagePath = "storage_path"
+        case portraitStoragePath = "portrait_storage_path"
+        case assetVersion = "asset_version"
+    }
+
+    var imageURL: URL? {
+        let path = storagePath.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
+        guard !path.isEmpty else { return nil }
+        return URL(string: "\(AuthConfig.normalizedAPIBaseURL)/storage/v1/object/public/membership-profile-backgrounds/\(path)")
+    }
+}
+
+@MainActor
+final class ProfileBackgroundCatalogStore: ObservableObject {
+    static let shared = ProfileBackgroundCatalogStore()
+
+    @Published private(set) var items: [ProfileBackgroundCatalogItem] = []
+    private var byId: [String: ProfileBackgroundCatalogItem] = [:]
+    private var isLoading = false
+    private var hasLoaded = false
+    private var attempts = 0
+
+    private static let cacheKey = "nuvio.tv.profileBackgroundCatalog.v1"
+    private static let storageDirectoryName = "profileBackgroundCatalog"
+    private static let maxAttempts = 3
+
+    static let defaultPresets: [ProfileBackgroundCatalogItem] = [
+        ProfileBackgroundCatalogItem(
+            id: "open_road",
+            displayName: "Open Road",
+            storagePath: "open_road.png",
+            portraitStoragePath: nil,
+            assetVersion: 1
+        ),
+        ProfileBackgroundCatalogItem(
+            id: "sunlit_coast",
+            displayName: "Sunlit Coast",
+            storagePath: "sunlit_coast.png",
+            portraitStoragePath: nil,
+            assetVersion: 1
+        ),
+        ProfileBackgroundCatalogItem(
+            id: "teal_horizon",
+            displayName: "Teal Horizon",
+            storagePath: "teal_horizon.png",
+            portraitStoragePath: nil,
+            assetVersion: 1
+        ),
+        ProfileBackgroundCatalogItem(
+            id: "neon_pulse",
+            displayName: "Neon Pulse",
+            storagePath: "neon_pulse.png",
+            portraitStoragePath: nil,
+            assetVersion: 1
+        ),
+        ProfileBackgroundCatalogItem(
+            id: "midnight_nebula",
+            displayName: "Midnight Nebula",
+            storagePath: "midnight_nebula.png",
+            portraitStoragePath: nil,
+            assetVersion: 1
+        )
+    ]
+
+    private init() {
+        apply(Self.defaultPresets)
+        hydrateFromCache()
+    }
+
+    private func hydrateFromCache() {
+        let data: Data? = {
+            if let fileData = LargePayloadStore.read(key: Self.cacheKey, directory: Self.storageDirectoryName) {
+                return fileData
+            }
+            guard let legacy = UserDefaults.standard.data(forKey: Self.cacheKey) else { return nil }
+            if LargePayloadStore.write(legacy, key: Self.cacheKey, directory: Self.storageDirectoryName) {
+                UserDefaults.standard.removeObject(forKey: Self.cacheKey)
+            }
+            return legacy
+        }()
+        guard let data,
+              let cached = try? JSONDecoder().decode([ProfileBackgroundCatalogItem].self, from: data),
+              !cached.isEmpty else { return }
+        apply(cached)
+    }
+
+    func loadIfNeeded() {
+        guard !hasLoaded, !isLoading, AuthConfig.isConfigured else { return }
+        isLoading = true
+        Task { await load() }
+    }
+
+    private func apply(_ catalog: [ProfileBackgroundCatalogItem]) {
+        var merged = Self.defaultPresets
+        for item in catalog {
+            if let idx = merged.firstIndex(where: { $0.id == item.id }) {
+                merged[idx] = item
+            } else {
+                merged.append(item)
+            }
+        }
+        items = merged
+        byId = Dictionary(merged.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private func load() async {
+        defer { isLoading = false }
+        attempts += 1
+        guard let url = URL(string: "\(AuthConfig.normalizedAPIBaseURL)/rest/v1/rpc/get_member_profile_background_catalog") else { return }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue(AuthConfig.apiKey, forHTTPHeaderField: "apikey")
+        let sessionToken = SessionStore().load()?.accessToken
+        let token = (sessionToken?.isEmpty == false) ? sessionToken! : AuthConfig.apiKey
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = Data("{}".utf8)
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+                scheduleRetry()
+                return
+            }
+            let decoded = try JSONDecoder().decode([ProfileBackgroundCatalogItem].self, from: data)
+            apply(decoded)
+            hasLoaded = true
+            if let encoded = try? JSONEncoder().encode(items) {
+                if LargePayloadStore.write(encoded, key: Self.cacheKey, directory: Self.storageDirectoryName) {
+                    UserDefaults.standard.removeObject(forKey: Self.cacheKey)
+                }
+            }
+        } catch {
+            scheduleRetry()
+        }
+    }
+
+    private func scheduleRetry() {
+        guard attempts < Self.maxAttempts else { return }
+        let delay = Double(attempts) * 2
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, !self.hasLoaded else { return }
+            self.isLoading = true
+            await self.load()
+        }
+    }
+
+    func item(for id: String?) -> ProfileBackgroundCatalogItem? {
+        guard let id = id?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return nil }
+        return byId[id]
+    }
+
+    func imageURL(for id: String?) -> URL? {
+        guard let id = id?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return nil }
+        if let catalogURL = item(for: id)?.imageURL {
+            return catalogURL
+        }
+        guard let url = URL(string: id),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else { return nil }
+        return url
+    }
+
+    func effectiveBackgroundURL(backgroundUrl: String?, backgroundId: String?) -> URL? {
+        if let urlStr = backgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !urlStr.isEmpty,
+           let url = URL(string: urlStr),
+           let scheme = url.scheme?.lowercased(),
+           scheme == "http" || scheme == "https",
+           url.host != nil {
+            return url
+        }
+        if let bgId = backgroundId?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !bgId.isEmpty {
+            return imageURL(for: bgId)
+        }
+        return nil
+    }
+}
+
+// MARK: - Profile Background Picker Sheet
+
+struct ProfileBackgroundPickerSheet: View {
+    @Binding var isPresented: Bool
+    let title: String
+    let standardColor: Color
+    @State private var selectedBackgroundId: String?
+    @State private var selectedBackgroundUrl: String?
+    @State private var customURL: String
+    @State private var isEditingCustomURL = false
+    @FocusState private var isCustomURLFieldFocused: Bool
+    @ObservedObject private var catalog = ProfileBackgroundCatalogStore.shared
+    let onSave: (String?, String?) -> Void
+
+    init(
+        isPresented: Binding<Bool>,
+        title: String,
+        standardColor: Color,
+        initialBackgroundId: String?,
+        initialBackgroundUrl: String?,
+        onSave: @escaping (String?, String?) -> Void
+    ) {
+        _isPresented = isPresented
+        self.title = title
+        self.standardColor = standardColor
+        _selectedBackgroundId = State(initialValue: initialBackgroundId)
+        _selectedBackgroundUrl = State(initialValue: initialBackgroundUrl)
+        _customURL = State(initialValue: initialBackgroundUrl ?? "")
+        self.onSave = onSave
+    }
+
+    private var previewURL: String? {
+        let trimmed = customURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        return selectedBackgroundUrl
+    }
+
+    private var previewID: String? {
+        let trimmed = customURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty || selectedBackgroundUrl != nil { return nil }
+        return selectedBackgroundId
+    }
+
+    private var isStandardSelected: Bool {
+        selectedBackgroundId == nil && selectedBackgroundUrl == nil && customURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        ZStack {
+            ProfileBackground(
+                targetColor: standardColor,
+                backgroundUrl: previewURL,
+                backgroundId: previewID
+            )
+            .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 24) {
+                // Header with live preview
+                HStack(alignment: .center, spacing: 28) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(L10n.string("profile_background_title", fallback: "Profile Background"))
+                            .font(.system(size: 42, weight: .bold))
+                            .foregroundColor(.white)
+
+                        Text(title)
+                            .font(.system(size: 22, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    Spacer()
+
+                    // Live preview box
+                    ZStack {
+                        ProfileBackground(
+                            targetColor: standardColor,
+                            backgroundUrl: previewURL,
+                            backgroundId: previewID
+                        )
+                        .frame(width: 256, height: 144)
+                        .clipShape(RoundedRectangle(cornerRadius: 12))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Color.white.opacity(0.35), lineWidth: 2)
+                        )
+                    }
+                    .frame(width: 256, height: 144)
+                }
+
+                // Custom URL input
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(L10n.string("profile_custom_background_url_title", fallback: "Custom Image or Animated GIF URL"))
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.72))
+
+                    Button {
+                        isEditingCustomURL = true
+                    } label: {
+                        SettingsGlassTextField(
+                            text: $customURL,
+                            placeholder: "https://example.com/background.gif",
+                            focused: isCustomURLFieldFocused,
+                            isEditing: $isEditingCustomURL,
+                            fieldWidth: 760,
+                            onCommit: applyCustomURL
+                        )
+                    }
+                    .buttonStyle(ProfilePlainButtonStyle())
+                    .focused($isCustomURLFieldFocused)
+                    .focusEffectDisabledIfAvailable()
+
+                    Text(L10n.string(
+                        "profile_custom_background_url_hint",
+                        fallback: "Paste a direct link to an animated GIF or image, or choose a contributor preset below."
+                    ))
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundColor(.white.opacity(0.48))
+                }
+
+                // Presets
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(L10n.string("profile_background_presets_title", fallback: "Curated Presets"))
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.72))
+
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 20) {
+                            // Standard mesh gradient
+                            ProfileBackgroundGridCell(
+                                title: L10n.string("profile_background_normal", fallback: "Standard"),
+                                isSelected: isStandardSelected
+                            ) {
+                                selectStandard()
+                            } preview: {
+                                ProfileBackground(
+                                    targetColor: standardColor,
+                                    backgroundUrl: nil,
+                                    backgroundId: nil
+                                )
+                            }
+
+                            // Curated contributor presets
+                            ForEach(catalog.items) { item in
+                                ProfileBackgroundGridCell(
+                                    title: item.displayName,
+                                    isSelected: selectedBackgroundId == item.id && customURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                ) {
+                                    selectPreset(item)
+                                } preview: {
+                                    ProfileBackground(
+                                        targetColor: standardColor,
+                                        backgroundUrl: nil,
+                                        backgroundId: item.id
+                                    )
+                                }
+                            }
+                        }
+                        .padding(.vertical, 8)
+                        .padding(.horizontal, 4)
+                    }
+                }
+
+                HStack(spacing: 16) {
+                    ProfileAvatarPickerButton(
+                        title: L10n.string("profile_cancel", fallback: "Cancel"),
+                        systemImage: "xmark"
+                    ) {
+                        isPresented = false
+                    }
+
+                    ProfileAvatarPickerButton(
+                        title: L10n.string("profile_save", fallback: "Save"),
+                        systemImage: "checkmark",
+                        prominent: true
+                    ) {
+                        saveSelection()
+                    }
+                }
+            }
+            .padding(.horizontal, 84)
+            .padding(.vertical, 54)
+            .frame(maxWidth: 1180, maxHeight: .infinity)
+        }
+        .onAppear {
+            catalog.loadIfNeeded()
+        }
+    }
+
+    private func selectStandard() {
+        selectedBackgroundId = nil
+        selectedBackgroundUrl = nil
+        customURL = ""
+    }
+
+    private func selectPreset(_ item: ProfileBackgroundCatalogItem) {
+        selectedBackgroundId = item.id
+        selectedBackgroundUrl = nil
+        customURL = ""
+    }
+
+    private func applyCustomURL() {
+        let trimmed = customURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            selectedBackgroundId = nil
+            selectedBackgroundUrl = trimmed
+        }
+        isEditingCustomURL = false
+    }
+
+    private func saveSelection() {
+        let trimmedCustom = customURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedCustom.isEmpty {
+            onSave(nil, trimmedCustom)
+        } else if let bgId = selectedBackgroundId {
+            onSave(bgId, nil)
+        } else {
+            onSave(nil, nil)
+        }
+        isPresented = false
+    }
+}
+
+private struct ProfileBackgroundGridCell<Content: View>: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+    @ViewBuilder let preview: () -> Content
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 8) {
+                preview()
+                    .frame(width: 176, height: 99)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10)
+                            .stroke(
+                                isSelected || isFocused ? Color.white : Color.white.opacity(0.18),
+                                lineWidth: isFocused ? AppFocusOutline.width : (isSelected ? 3 : 1)
+                            )
+                    )
+                    .scaleEffect(isFocused ? 1.08 : 1)
+                    .animation(.easeInOut(duration: 0.15), value: isFocused)
+
+                Text(title)
+                    .font(.system(size: 16, weight: .semibold))
+                    .foregroundColor(.white.opacity(isFocused ? 1 : (isSelected ? 0.95 : 0.68)))
+                    .lineLimit(1)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
     }
 }

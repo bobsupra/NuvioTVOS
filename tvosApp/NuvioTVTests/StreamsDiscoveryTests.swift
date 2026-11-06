@@ -1321,6 +1321,78 @@ final class StreamsDiscoveryTests: XCTestCase {
             XCTAssertEqual(error.code, .badServerResponse)
         }
     }
+
+    // MARK: - AIOStreams Custom Name Sync & Display (#395)
+
+    func testStreamAddonPreferenceCodingBackwardCompatibility() throws {
+        // Legacy JSON without "name" field
+        let legacyJSON = """
+        [{"url":"https://aiostreams.elfhosted.com/1/manifest.json","enabled":true}]
+        """
+        let decodedLegacy = try JSONDecoder().decode([StreamAddonPreference].self, from: Data(legacyJSON.utf8))
+        XCTAssertEqual(decodedLegacy.count, 1)
+        XCTAssertEqual(decodedLegacy[0].url, "https://aiostreams.elfhosted.com/1/manifest.json")
+        XCTAssertTrue(decodedLegacy[0].enabled)
+        XCTAssertNil(decodedLegacy[0].name)
+
+        // Modern JSON with custom "name" field
+        let modernPref = StreamAddonPreference(
+            url: "https://aiostreams.elfhosted.com/1/manifest.json",
+            enabled: true,
+            name: "AIOStreams - 4K Remux"
+        )
+        let modernData = try JSONEncoder().encode([modernPref])
+        let decodedModern = try JSONDecoder().decode([StreamAddonPreference].self, from: modernData)
+        XCTAssertEqual(decodedModern.count, 1)
+        XCTAssertEqual(decodedModern[0].name, "AIOStreams - 4K Remux")
+    }
+
+    func testAIOStreamsDisplayNamePriority() throws {
+        let suiteName = "NuvioTVTests.AIOStreamsNameSync.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let aioURL1 = try XCTUnwrap(URL(string: "https://aiostreams.elfhosted.com/movies/manifest.json"))
+        let aioURL2 = try XCTUnwrap(URL(string: "https://aiostreams.elfhosted.com/shows/manifest.json"))
+        let aioURLDefault = try XCTUnwrap(URL(string: "https://aiostreams.elfhosted.com/default/manifest.json"))
+
+        let preferences = [
+            StreamAddonPreference(url: aioURL1.absoluteString, enabled: true, name: "AIOStreams Movies"),
+            StreamAddonPreference(url: aioURL2.absoluteString, enabled: true, name: "AIOStreams Shows"),
+            StreamAddonPreference(url: aioURLDefault.absoluteString, enabled: true, name: nil)
+        ]
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences, in: defaults)
+
+        // Custom names override generic manifest name "AIOStreams"
+        let name1 = CinemetaCatalogRepository.streamAddonDisplayName(for: aioURL1, manifestName: "AIOStreams", in: defaults)
+        let name2 = CinemetaCatalogRepository.streamAddonDisplayName(for: aioURL2, manifestName: "AIOStreams", in: defaults)
+        XCTAssertEqual(name1, "AIOStreams Movies")
+        XCTAssertEqual(name2, "AIOStreams Shows")
+
+        // Without custom name, falls back to manifest displayName
+        let nameManifest = CinemetaCatalogRepository.streamAddonDisplayName(for: aioURLDefault, manifestName: "Custom Manifest Name", in: defaults)
+        XCTAssertEqual(nameManifest, "Custom Manifest Name")
+
+        // Without custom name or manifest displayName, falls back to host-based streamAddonName
+        let nameFallback = CinemetaCatalogRepository.streamAddonDisplayName(for: aioURLDefault, manifestName: nil, in: defaults)
+        XCTAssertEqual(nameFallback, "AIOStreams")
+    }
+
+    func testNormalizedPreferencesPreservesAndMergesNames() throws {
+        let suiteName = "NuvioTVTests.NormalizedPrefs.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let prefs = [
+            StreamAddonPreference(url: "https://aiostreams.example/manifest.json", enabled: true, name: "AIO 1"),
+            StreamAddonPreference(url: "https://aiostreams.example/manifest.json", enabled: false, name: "AIO Updated")
+        ]
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(prefs, in: defaults)
+        let configured = CinemetaCatalogRepository.configuredStreamAddonPreferences(in: defaults)
+
+        XCTAssertEqual(configured.count, 1)
+        XCTAssertEqual(configured[0].name, "AIO 1")
+    }
 }
 
 private final class MockStreamHTTPURLProtocol: URLProtocol {

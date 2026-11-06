@@ -368,7 +368,7 @@ enum AddonRatingsService {
         for url in urls {
             guard let manifest = manifests[url],
                   let sources = manifest.ratingSources, !sources.isEmpty else { continue }
-            let addonName = manifest.displayName ?? CinemetaCatalogRepository.streamAddonName(for: url)
+            let addonName = CinemetaCatalogRepository.streamAddonDisplayName(for: url, manifestName: manifest.displayName)
             for source in sources {
                 let lower = source.source.lowercased()
                 guard !builtInProviders.contains(lower) else { continue }

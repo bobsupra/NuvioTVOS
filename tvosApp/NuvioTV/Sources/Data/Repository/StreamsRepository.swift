@@ -319,8 +319,10 @@ final class StreamsRepository: ObservableObject {
         for url in enabledURLs {
             guard let manifest = manifestsByURL[url] else { continue }
             guard manifest.supportsResource("stream", type: type, id: videoId) else { continue }
-            let displayName = manifest.displayName
-                ?? CinemetaCatalogRepository.streamAddonName(for: url)
+            let displayName = CinemetaCatalogRepository.streamAddonDisplayName(
+                for: url,
+                manifestName: manifest.displayName
+            )
             targets.append(
                 StreamAddonTarget(
                     addonId: Self.stableAddonId(manifest: manifest, manifestURL: url),
@@ -705,7 +707,11 @@ final class StreamsRepository: ObservableObject {
         manifestURLs.compactMap { url in
             guard let manifest = manifests[url],
                   manifest.supportsResource("subtitles", type: type, id: id) else { return nil }
-            return (manifest.displayName ?? CinemetaCatalogRepository.streamAddonName(for: url), url)
+            let displayName = CinemetaCatalogRepository.streamAddonDisplayName(
+                for: url,
+                manifestName: manifest.displayName
+            )
+            return (displayName, url)
         }
     }
 

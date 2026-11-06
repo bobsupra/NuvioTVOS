@@ -371,3 +371,159 @@ final class ProfileManagerLimitTests: XCTestCase {
         }
     }
 }
+
+final class ProfileBackgroundTests: XCTestCase {
+    private var tempDir: URL!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("profile-bg-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: tempDir)
+        try super.tearDownWithError()
+    }
+
+    func testProfileBackgroundFieldsOnProfileAndStoredProfile() throws {
+        let profile = Profile(
+            id: "test-bg-1",
+            name: "Alice",
+            isPinProtected: false,
+            isAdmin: true,
+            avatarId: "avatar-1",
+            usesPrimaryAddons: false,
+            usesPrimaryPlugins: false,
+            profileBackgroundId: "teal_horizon",
+            profileBackgroundUrl: "https://example.com/custom.gif"
+        )
+
+        XCTAssertEqual(profile.profileBackgroundId, "teal_horizon")
+        XCTAssertEqual(profile.profileBackgroundUrl, "https://example.com/custom.gif")
+
+        let stored = StoredProfile(from: profile)
+        XCTAssertEqual(stored.profileBackgroundId, "teal_horizon")
+        XCTAssertEqual(stored.profileBackgroundUrl, "https://example.com/custom.gif")
+
+        let encoded = try JSONEncoder().encode(stored)
+        let decoded = try JSONDecoder().decode(StoredProfile.self, from: encoded)
+
+        XCTAssertEqual(decoded.profileBackgroundId, "teal_horizon")
+        XCTAssertEqual(decoded.profileBackgroundUrl, "https://example.com/custom.gif")
+
+        let restoredProfile = decoded.toProfile()
+        XCTAssertEqual(restoredProfile.profileBackgroundId, "teal_horizon")
+        XCTAssertEqual(restoredProfile.profileBackgroundUrl, "https://example.com/custom.gif")
+    }
+
+    func testProfileManagerCreateAndUpdateProfileBackground() throws {
+        let manager = try ProfileManager(baseDir: tempDir.path)
+
+        let input = CreateProfileInput(
+            name: "Bob",
+            profileType: .adult,
+            avatarId: "avatar-2",
+            pin: nil,
+            profileBackgroundId: "open_road",
+            profileBackgroundUrl: nil
+        )
+        let profile = try manager.createProfile(input: input)
+        XCTAssertEqual(profile.profileBackgroundId, "open_road")
+        XCTAssertNil(profile.profileBackgroundUrl)
+
+        // Update with whitespace that must be trimmed
+        try manager.updateProfileBackground(
+            id: profile.id,
+            backgroundId: "  sunlit_coast  ",
+            backgroundUrl: "  https://cdn.example.com/art.gif  "
+        )
+
+        let reloadedProfiles = try manager.getProfiles()
+        let reloaded = try XCTUnwrap(reloadedProfiles.first(where: { $0.id == profile.id }))
+        XCTAssertEqual(reloaded.profileBackgroundId, "sunlit_coast")
+        XCTAssertEqual(reloaded.profileBackgroundUrl, "https://cdn.example.com/art.gif")
+
+        // Clear background with empty whitespace
+        try manager.updateProfileBackground(
+            id: profile.id,
+            backgroundId: "   ",
+            backgroundUrl: nil
+        )
+
+        let clearedProfiles = try manager.getProfiles()
+        let cleared = try XCTUnwrap(clearedProfiles.first(where: { $0.id == profile.id }))
+        XCTAssertNil(cleared.profileBackgroundId)
+        XCTAssertNil(cleared.profileBackgroundUrl)
+    }
+
+    @MainActor
+    func testProfileViewModelUpdateProfileBackground() throws {
+        let manager = try ProfileManager(baseDir: tempDir.path)
+        let profile = try manager.createProfile(input: CreateProfileInput(
+            name: "Charlie",
+            profileType: .adult,
+            avatarId: "",
+            pin: nil
+        ))
+
+        let viewModel = ProfileViewModel(profileManager: manager)
+        XCTAssertNil(viewModel.profiles.first?.profileBackgroundId)
+
+        viewModel.updateProfileBackground(id: profile.id, backgroundId: "neon_pulse", backgroundUrl: nil)
+        XCTAssertEqual(viewModel.profiles.first?.profileBackgroundId, "neon_pulse")
+        XCTAssertNil(viewModel.profiles.first?.profileBackgroundUrl)
+    }
+
+    @MainActor
+    func testProfileBackgroundCatalogStorePresetsAndResolution() {
+        let defaultIds = ProfileBackgroundCatalogStore.defaultPresets.map(\.id)
+        XCTAssertTrue(defaultIds.contains("open_road"))
+        XCTAssertTrue(defaultIds.contains("sunlit_coast"))
+        XCTAssertTrue(defaultIds.contains("teal_horizon"))
+        XCTAssertTrue(defaultIds.contains("neon_pulse"))
+        XCTAssertTrue(defaultIds.contains("midnight_nebula"))
+
+        let store = ProfileBackgroundCatalogStore.shared
+        let item = store.item(for: "open_road")
+        XCTAssertNotNil(item)
+        XCTAssertEqual(item?.displayName, "Open Road")
+
+        // Custom URL resolution
+        let customResolved = store.effectiveBackgroundURL(
+            backgroundUrl: "https://example.com/test.gif",
+            backgroundId: nil
+        )
+        XCTAssertEqual(customResolved?.absoluteString, "https://example.com/test.gif")
+
+        // Preset ID resolution
+        let presetResolved = store.effectiveBackgroundURL(
+            backgroundUrl: nil,
+            backgroundId: "open_road"
+        )
+        XCTAssertNotNil(presetResolved)
+        XCTAssertTrue(presetResolved?.absoluteString.contains("open_road") == true)
+
+        // Empty returns nil
+        XCTAssertNil(store.effectiveBackgroundURL(backgroundUrl: nil, backgroundId: nil))
+        XCTAssertNil(store.effectiveBackgroundURL(backgroundUrl: "   ", backgroundId: "  "))
+    }
+
+    func testRemoteProfileBackgroundDecoding() throws {
+        let json = """
+        {
+            "profileIndex": 1,
+            "name": "Remote User",
+            "avatarId": "avatar-remote",
+            "profileBackgroundId": "midnight_nebula",
+            "profileBackgroundUrl": "https://example.com/backdrop.gif",
+            "usesPrimaryAddons": false,
+            "usesPrimaryPlugins": false
+        }
+        """.data(using: .utf8)!
+
+        let remote = try JSONDecoder().decode(RemoteProfile.self, from: json)
+        XCTAssertEqual(remote.profileBackgroundId, "midnight_nebula")
+        XCTAssertEqual(remote.profileBackgroundUrl, "https://example.com/backdrop.gif")
+    }
+}

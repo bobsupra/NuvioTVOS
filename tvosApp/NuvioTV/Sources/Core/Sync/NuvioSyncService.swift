@@ -742,6 +742,8 @@ final class NuvioSyncManager: ObservableObject {
                 && remote.effectiveAvatarValue == local.avatarId
                 && remote.usesPrimaryAddons == local.usesPrimaryAddons
                 && remote.usesPrimaryPlugins == local.usesPrimaryPlugins
+                && remote.profileBackgroundId == local.profileBackgroundId
+                && remote.profileBackgroundUrl == local.profileBackgroundUrl
         }
     }
 
@@ -2066,7 +2068,8 @@ final class NuvioSyncManager: ObservableObject {
                     "sort_order": index,
                     "enabled": preference.enabled
                 ]
-                if let name = known?.name, !name.isEmpty { row["name"] = name }
+                let nameToUse = preference.name ?? known?.name
+                if let nameToUse, !nameToUse.isEmpty { row["name"] = nameToUse }
                 payload.append(row)
             }
 
@@ -2087,12 +2090,21 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     private static func normalizedAddonPreferences(_ preferences: [StreamAddonPreference]) -> [StreamAddonPreference] {
-        var seen: Set<String> = []
-        return preferences.compactMap { preference -> StreamAddonPreference? in
-            guard let url = normalizedAddonURL(preference.url),
-                  seen.insert(url).inserted else { return nil }
-            return StreamAddonPreference(url: url, enabled: preference.enabled)
+        var seen: [String: StreamAddonPreference] = [:]
+        var orderedKeys: [String] = []
+        for preference in preferences {
+            guard let url = normalizedAddonURL(preference.url) else { continue }
+            if let existing = seen[url] {
+                let mergedName = (existing.name?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+                    ? existing.name
+                    : preference.name
+                seen[url] = StreamAddonPreference(url: url, enabled: existing.enabled, name: mergedName)
+            } else {
+                seen[url] = StreamAddonPreference(url: url, enabled: preference.enabled, name: preference.name)
+                orderedKeys.append(url)
+            }
         }
+        return orderedKeys.compactMap { seen[$0] }
     }
 
     private static func normalizedAddonURL(_ rawValue: String) -> String? {
@@ -2272,7 +2284,9 @@ private enum ProfileSyncIndexStore {
                     // while catalog selections use avatar_id.
                     avatarId: remote.effectiveAvatarValue,
                     usesPrimaryAddons: remote.usesPrimaryAddons,
-                    usesPrimaryPlugins: remote.usesPrimaryPlugins
+                    usesPrimaryPlugins: remote.usesPrimaryPlugins,
+                    profileBackgroundId: remote.profileBackgroundId,
+                    profileBackgroundUrl: remote.profileBackgroundUrl
                 )
             }
     }
@@ -3163,7 +3177,9 @@ final class NuvioAPIClient {
             .sorted { $0.sortOrder < $1.sortOrder }
             .compactMap { addon -> StreamAddonPreference? in
                 guard let url = CinemetaCatalogRepository.normalizedManifestURL(from: addon.url) else { return nil }
-                return StreamAddonPreference(url: url.absoluteString, enabled: addon.enabled)
+                let trimmedName = addon.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+                let nameToUse = (trimmedName?.isEmpty == false) ? trimmedName : nil
+                return StreamAddonPreference(url: url.absoluteString, enabled: addon.enabled, name: nameToUse)
             }
 
         let defaults = ProfileSettings.store(for: localProfileId)
@@ -3452,6 +3468,12 @@ final class NuvioAPIClient {
                 payload["avatar_url"] = avatarURL
             } else if !avatarValue.isEmpty {
                 payload["avatar_id"] = avatarValue
+            }
+            if let bgId = profile.profileBackgroundId?.trimmingCharacters(in: .whitespacesAndNewlines), !bgId.isEmpty {
+                payload["profile_background_id"] = bgId
+            }
+            if let bgUrl = profile.profileBackgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !bgUrl.isEmpty {
+                payload["profile_background_url"] = bgUrl
             }
             return payload
         }
@@ -4925,11 +4947,13 @@ private struct LossyRows<Element: Decodable>: Decodable {
     private struct DiscardedRow: Decodable {}
 }
 
-private struct RemoteProfile: Decodable {
+struct RemoteProfile: Decodable {
     let profileIndex: Int
     let name: String
     let avatarId: String?
     let avatarUrl: String?
+    let profileBackgroundId: String?
+    let profileBackgroundUrl: String?
     let usesPrimaryAddons: Bool
     let usesPrimaryPlugins: Bool
     let pinEnabled: Bool?
@@ -4944,6 +4968,8 @@ private struct RemoteProfile: Decodable {
         case name
         case avatarId
         case avatarUrl
+        case profileBackgroundId
+        case profileBackgroundUrl
         case usesPrimaryAddons
         case usesPrimaryPlugins
         case pinEnabled
@@ -4955,6 +4981,8 @@ private struct RemoteProfile: Decodable {
         name = (try? container.decode(String.self, forKey: .name)) ?? ""
         avatarId = try? container.decodeIfPresent(String.self, forKey: .avatarId)
         avatarUrl = try? container.decodeIfPresent(String.self, forKey: .avatarUrl)
+        profileBackgroundId = try? container.decodeIfPresent(String.self, forKey: .profileBackgroundId)
+        profileBackgroundUrl = try? container.decodeIfPresent(String.self, forKey: .profileBackgroundUrl)
         usesPrimaryAddons = (try? container.decode(Bool.self, forKey: .usesPrimaryAddons)) ?? false
         usesPrimaryPlugins = (try? container.decode(Bool.self, forKey: .usesPrimaryPlugins)) ?? false
         pinEnabled = try? container.decodeIfPresent(Bool.self, forKey: .pinEnabled)
@@ -4965,6 +4993,8 @@ private struct RemoteProfile: Decodable {
         name = profile.name
         avatarId = profile.avatarId
         avatarUrl = profile.avatarUrl
+        profileBackgroundId = profile.profileBackgroundId
+        profileBackgroundUrl = profile.profileBackgroundUrl
         usesPrimaryAddons = profile.usesPrimaryAddons
         usesPrimaryPlugins = profile.usesPrimaryPlugins
         self.pinEnabled = pinEnabled
