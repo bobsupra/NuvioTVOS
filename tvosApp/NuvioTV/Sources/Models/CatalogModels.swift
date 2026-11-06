@@ -1287,7 +1287,8 @@ enum EpisodeReleasePolicy {
     // shared behind this lock because release dates are read from SwiftUI and
     // sync work on several threads. Keep both successful and failed parses so
     // malformed metadata cannot repeatedly take the formatter path.
-    private static let releaseDateCacheLimit = 256
+    // Cache sized for large-season series (1000+ episodes like One Piece).
+    private static let releaseDateCacheLimit = 4096
     private static let releaseDateCacheLock = NSLock()
     private static let fractionalISO8601Formatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -4918,6 +4919,9 @@ struct NuvioCollectionSource: Decodable, Hashable {
     var title: String?
     var tmdbId: Int?
     var traktListId: Int64?
+    var mdblistId: Int?
+    var mdblistSlug: String?
+    var mdblistUrl: String?
     var mediaType: String?
     var sortBy: String?
     var sortHow: String?
@@ -4925,8 +4929,10 @@ struct NuvioCollectionSource: Decodable, Hashable {
 
     enum CodingKeys: String, CodingKey {
         case provider, addonId, type, catalogId, genre, tmdbSourceType, title
-        case tmdbId, traktListId, mediaType, sortBy, sortHow, filters
+        case tmdbId, traktListId, mdblistId, mdblistSlug, mdblistUrl
+        case mediaType, sortBy, sortHow, filters
         case addon_id, catalog_id, tmdb_source_type, tmdb_id, trakt_list_id
+        case mdblist_id, mdblist_slug, mdblist_url
         case media_type, sort_by, sort_how
     }
 
@@ -4940,6 +4946,9 @@ struct NuvioCollectionSource: Decodable, Hashable {
         title: String? = nil,
         tmdbId: Int? = nil,
         traktListId: Int64? = nil,
+        mdblistId: Int? = nil,
+        mdblistSlug: String? = nil,
+        mdblistUrl: String? = nil,
         mediaType: String? = nil,
         sortBy: String? = nil,
         sortHow: String? = nil,
@@ -4954,6 +4963,9 @@ struct NuvioCollectionSource: Decodable, Hashable {
         self.title = title
         self.tmdbId = tmdbId
         self.traktListId = traktListId
+        self.mdblistId = mdblistId
+        self.mdblistSlug = mdblistSlug
+        self.mdblistUrl = mdblistUrl
         self.mediaType = mediaType
         self.sortBy = sortBy
         self.sortHow = sortHow
@@ -4976,6 +4988,12 @@ struct NuvioCollectionSource: Decodable, Hashable {
             ?? c.decodeIfPresent(Int.self, forKey: .tmdb_id)
         traktListId = try c.decodeIfPresent(Int64.self, forKey: .traktListId)
             ?? c.decodeIfPresent(Int64.self, forKey: .trakt_list_id)
+        mdblistId = try c.decodeIfPresent(Int.self, forKey: .mdblistId)
+            ?? c.decodeIfPresent(Int.self, forKey: .mdblist_id)
+        mdblistSlug = try c.decodeIfPresent(String.self, forKey: .mdblistSlug)
+            ?? c.decodeIfPresent(String.self, forKey: .mdblist_slug)
+        mdblistUrl = try c.decodeIfPresent(String.self, forKey: .mdblistUrl)
+            ?? c.decodeIfPresent(String.self, forKey: .mdblist_url)
         mediaType = try c.decodeIfPresent(String.self, forKey: .mediaType)
             ?? c.decodeIfPresent(String.self, forKey: .media_type)
         sortBy = try c.decodeIfPresent(String.self, forKey: .sortBy)
@@ -4996,31 +5014,227 @@ struct NuvioCollectionSource: Decodable, Hashable {
             return "tmdb_\(tmdbSourceType ?? "")_\(tmdbId.map(String.init) ?? "")_\(mediaType ?? "")_\(sortBy ?? "")_\(filters?.routeKey ?? "")"
         case "trakt":
             return "trakt_\(traktListId.map(String.init) ?? "")_\(mediaType ?? "")_\(sortBy ?? "")_\(sortHow ?? "")"
+        case "mdblist":
+            let listIdentifier = mdblistId.map(String.init) ?? mdblistSlug ?? mdblistUrl ?? catalogId ?? ""
+            return "mdblist_\(listIdentifier)_\(mediaType ?? "")_\(sortBy ?? "")_\(sortHow ?? "")"
         default:
             return "addon_\(addonId ?? "")_\(type ?? "")_\(catalogId ?? "")_\(genre ?? "")"
         }
     }
 }
 
-struct NuvioTmdbCollectionFilters: Decodable, Hashable {
+struct NuvioTmdbCollectionFilters: Codable, Hashable {
     var withGenres: String?
+    var withoutGenres: String?
     var releaseDateGte: String?
     var releaseDateLte: String?
     var voteAverageGte: Double?
     var voteAverageLte: Double?
     var voteCountGte: Int?
+    var voteCountLte: Int?
     var withOriginalLanguage: String?
+    var withoutOriginalLanguage: String?
     var withOriginCountry: String?
+    var withoutOriginCountry: String?
     var withKeywords: String?
+    var withoutKeywords: String?
     var withCompanies: String?
+    var withoutCompanies: String?
     var withNetworks: String?
     var year: Int?
     var watchRegion: String?
     var withWatchProviders: String?
+    var withoutWatchProviders: String?
+
+    enum CodingKeys: String, CodingKey {
+        case withGenres, withoutGenres, releaseDateGte, releaseDateLte
+        case voteAverageGte, voteAverageLte, voteCountGte, voteCountLte
+        case withOriginalLanguage, withoutOriginalLanguage
+        case withOriginCountry, withoutOriginCountry
+        case withKeywords, withoutKeywords
+        case withCompanies, withoutCompanies
+        case withNetworks, year, watchRegion
+        case withWatchProviders, withoutWatchProviders
+
+        case with_genres, without_genres, release_date_gte, release_date_lte
+        case vote_average_gte, vote_average_lte, vote_count_gte, vote_count_lte
+        case with_original_language, without_original_language
+        case with_origin_country, without_origin_country
+        case with_keywords, without_keywords
+        case with_companies, without_companies
+        case with_networks, watch_region
+        case with_watch_providers, without_watch_providers
+    }
+
+    init(
+        withGenres: String? = nil,
+        withoutGenres: String? = nil,
+        releaseDateGte: String? = nil,
+        releaseDateLte: String? = nil,
+        voteAverageGte: Double? = nil,
+        voteAverageLte: Double? = nil,
+        voteCountGte: Int? = nil,
+        voteCountLte: Int? = nil,
+        withOriginalLanguage: String? = nil,
+        withoutOriginalLanguage: String? = nil,
+        withOriginCountry: String? = nil,
+        withoutOriginCountry: String? = nil,
+        withKeywords: String? = nil,
+        withoutKeywords: String? = nil,
+        withCompanies: String? = nil,
+        withoutCompanies: String? = nil,
+        withNetworks: String? = nil,
+        year: Int? = nil,
+        watchRegion: String? = nil,
+        withWatchProviders: String? = nil,
+        withoutWatchProviders: String? = nil
+    ) {
+        self.withGenres = withGenres
+        self.withoutGenres = withoutGenres
+        self.releaseDateGte = releaseDateGte
+        self.releaseDateLte = releaseDateLte
+        self.voteAverageGte = voteAverageGte
+        self.voteAverageLte = voteAverageLte
+        self.voteCountGte = voteCountGte
+        self.voteCountLte = voteCountLte
+        self.withOriginalLanguage = withOriginalLanguage
+        self.withoutOriginalLanguage = withoutOriginalLanguage
+        self.withOriginCountry = withOriginCountry
+        self.withoutOriginCountry = withoutOriginCountry
+        self.withKeywords = withKeywords
+        self.withoutKeywords = withoutKeywords
+        self.withCompanies = withCompanies
+        self.withoutCompanies = withoutCompanies
+        self.withNetworks = withNetworks
+        self.year = year
+        self.watchRegion = watchRegion
+        self.withWatchProviders = withWatchProviders
+        self.withoutWatchProviders = withoutWatchProviders
+    }
+
+    private struct AnyCodingKey: CodingKey {
+        var stringValue: String
+        var intValue: Int?
+        init?(stringValue: String) { self.stringValue = stringValue; self.intValue = nil }
+        init?(intValue: Int) { self.stringValue = String(intValue); self.intValue = intValue }
+    }
+
+    init(from decoder: Decoder) throws {
+        let anyContainer = try? decoder.container(keyedBy: AnyCodingKey.self)
+        func string(for keys: [String]) -> String? {
+            guard let container = anyContainer else { return nil }
+            for key in keys {
+                if let k = AnyCodingKey(stringValue: key),
+                   let val = try? container.decodeIfPresent(String.self, forKey: k),
+                   !val.isEmpty {
+                    return val
+                }
+            }
+            return nil
+        }
+        func double(for keys: [String]) -> Double? {
+            guard let container = anyContainer else { return nil }
+            for key in keys {
+                if let k = AnyCodingKey(stringValue: key) {
+                    if let val = try? container.decodeIfPresent(Double.self, forKey: k) {
+                        return val
+                    }
+                    if let str = try? container.decodeIfPresent(String.self, forKey: k),
+                       let val = Double(str) {
+                        return val
+                    }
+                }
+            }
+            return nil
+        }
+        func int(for keys: [String]) -> Int? {
+            guard let container = anyContainer else { return nil }
+            for key in keys {
+                if let k = AnyCodingKey(stringValue: key) {
+                    if let val = try? container.decodeIfPresent(Int.self, forKey: k) {
+                        return val
+                    }
+                    if let str = try? container.decodeIfPresent(String.self, forKey: k),
+                       let val = Int(str) {
+                        return val
+                    }
+                }
+            }
+            return nil
+        }
+
+        withGenres = string(for: ["withGenres", "with_genres"])
+        withoutGenres = string(for: ["withoutGenres", "without_genres"])
+        releaseDateGte = string(for: ["releaseDateGte", "release_date_gte", "primary_release_date.gte", "release_date.gte"])
+        releaseDateLte = string(for: ["releaseDateLte", "release_date_lte", "primary_release_date.lte", "release_date.lte"])
+        voteAverageGte = double(for: ["voteAverageGte", "vote_average_gte", "vote_average.gte"])
+        voteAverageLte = double(for: ["voteAverageLte", "vote_average_lte", "vote_average.lte"])
+        voteCountGte = int(for: ["voteCountGte", "vote_count_gte", "vote_count.gte"])
+        voteCountLte = int(for: ["voteCountLte", "vote_count_lte", "vote_count.lte"])
+        withOriginalLanguage = string(for: ["withOriginalLanguage", "with_original_language"])
+        withoutOriginalLanguage = string(for: ["withoutOriginalLanguage", "without_original_language"])
+        withOriginCountry = string(for: ["withOriginCountry", "with_origin_country"])
+        withoutOriginCountry = string(for: ["withoutOriginCountry", "without_origin_country"])
+        withKeywords = string(for: ["withKeywords", "with_keywords"])
+        withoutKeywords = string(for: ["withoutKeywords", "without_keywords"])
+        withCompanies = string(for: ["withCompanies", "with_companies"])
+        withoutCompanies = string(for: ["withoutCompanies", "without_companies"])
+        withNetworks = string(for: ["withNetworks", "with_networks"])
+        year = int(for: ["year", "primary_release_year"])
+        watchRegion = string(for: ["watchRegion", "watch_region"])
+        withWatchProviders = string(for: ["withWatchProviders", "with_watch_providers"])
+        withoutWatchProviders = string(for: ["withoutWatchProviders", "without_watch_providers"])
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(withGenres, forKey: .withGenres)
+        try c.encodeIfPresent(withGenres, forKey: .with_genres)
+        try c.encodeIfPresent(withoutGenres, forKey: .withoutGenres)
+        try c.encodeIfPresent(withoutGenres, forKey: .without_genres)
+        try c.encodeIfPresent(releaseDateGte, forKey: .releaseDateGte)
+        try c.encodeIfPresent(releaseDateGte, forKey: .release_date_gte)
+        try c.encodeIfPresent(releaseDateLte, forKey: .releaseDateLte)
+        try c.encodeIfPresent(releaseDateLte, forKey: .release_date_lte)
+        try c.encodeIfPresent(voteAverageGte, forKey: .voteAverageGte)
+        try c.encodeIfPresent(voteAverageGte, forKey: .vote_average_gte)
+        try c.encodeIfPresent(voteAverageLte, forKey: .voteAverageLte)
+        try c.encodeIfPresent(voteAverageLte, forKey: .vote_average_lte)
+        try c.encodeIfPresent(voteCountGte, forKey: .voteCountGte)
+        try c.encodeIfPresent(voteCountGte, forKey: .vote_count_gte)
+        try c.encodeIfPresent(voteCountLte, forKey: .voteCountLte)
+        try c.encodeIfPresent(voteCountLte, forKey: .vote_count_lte)
+        try c.encodeIfPresent(withOriginalLanguage, forKey: .withOriginalLanguage)
+        try c.encodeIfPresent(withOriginalLanguage, forKey: .with_original_language)
+        try c.encodeIfPresent(withoutOriginalLanguage, forKey: .withoutOriginalLanguage)
+        try c.encodeIfPresent(withoutOriginalLanguage, forKey: .without_original_language)
+        try c.encodeIfPresent(withOriginCountry, forKey: .withOriginCountry)
+        try c.encodeIfPresent(withOriginCountry, forKey: .with_origin_country)
+        try c.encodeIfPresent(withoutOriginCountry, forKey: .withoutOriginCountry)
+        try c.encodeIfPresent(withoutOriginCountry, forKey: .without_origin_country)
+        try c.encodeIfPresent(withKeywords, forKey: .withKeywords)
+        try c.encodeIfPresent(withKeywords, forKey: .with_keywords)
+        try c.encodeIfPresent(withoutKeywords, forKey: .withoutKeywords)
+        try c.encodeIfPresent(withoutKeywords, forKey: .without_keywords)
+        try c.encodeIfPresent(withCompanies, forKey: .withCompanies)
+        try c.encodeIfPresent(withCompanies, forKey: .with_companies)
+        try c.encodeIfPresent(withoutCompanies, forKey: .withoutCompanies)
+        try c.encodeIfPresent(withoutCompanies, forKey: .without_companies)
+        try c.encodeIfPresent(withNetworks, forKey: .withNetworks)
+        try c.encodeIfPresent(withNetworks, forKey: .with_networks)
+        try c.encodeIfPresent(year, forKey: .year)
+        try c.encodeIfPresent(watchRegion, forKey: .watchRegion)
+        try c.encodeIfPresent(watchRegion, forKey: .watch_region)
+        try c.encodeIfPresent(withWatchProviders, forKey: .withWatchProviders)
+        try c.encodeIfPresent(withWatchProviders, forKey: .with_watch_providers)
+        try c.encodeIfPresent(withoutWatchProviders, forKey: .withoutWatchProviders)
+        try c.encodeIfPresent(withoutWatchProviders, forKey: .without_watch_providers)
+    }
 
     var routeKey: String {
         var parts: [String] = []
         parts.append(withGenres ?? "")
+        parts.append(withoutGenres ?? "")
         parts.append(releaseDateGte ?? "")
         parts.append(releaseDateLte ?? "")
         if let voteAverageGte {
@@ -5038,10 +5252,19 @@ struct NuvioTmdbCollectionFilters: Decodable, Hashable {
         } else {
             parts.append("")
         }
+        if let voteCountLte {
+            parts.append(String(voteCountLte))
+        } else {
+            parts.append("")
+        }
         parts.append(withOriginalLanguage ?? "")
+        parts.append(withoutOriginalLanguage ?? "")
         parts.append(withOriginCountry ?? "")
+        parts.append(withoutOriginCountry ?? "")
         parts.append(withKeywords ?? "")
+        parts.append(withoutKeywords ?? "")
         parts.append(withCompanies ?? "")
+        parts.append(withoutCompanies ?? "")
         parts.append(withNetworks ?? "")
         if let year {
             parts.append(String(year))
@@ -5050,6 +5273,7 @@ struct NuvioTmdbCollectionFilters: Decodable, Hashable {
         }
         parts.append(watchRegion ?? "")
         parts.append(withWatchProviders ?? "")
+        parts.append(withoutWatchProviders ?? "")
         return parts.joined(separator: ",")
     }
 }

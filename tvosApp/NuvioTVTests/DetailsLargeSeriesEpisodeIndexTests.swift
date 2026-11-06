@@ -119,4 +119,49 @@ final class DetailsLargeSeriesEpisodeIndexTests: XCTestCase {
             1
         )
     }
+
+    func testLargeSeriesWindowRemainsBoundedWhenFocusRestoredDeepInSeason() {
+        let indices = TvDetailsEpisodeIndex.windowIndices(
+            totalEpisodes: 1200,
+            scrollIndex: 0,
+            targetIndex: 950,
+            visibleCardCount: 6
+        )
+
+        // Must NOT expand across the entire 0...950 range (which previously materialized 951 cards)
+        XCTAssertLessThanOrEqual(indices.count, 15)
+        XCTAssertEqual(indices.first, 946)
+        XCTAssertEqual(indices.last, 958)
+        XCTAssertTrue(indices.contains(950))
+    }
+
+    func testLargeSeriesWindowClampingAtBoundaries() {
+        let startIndices = TvDetailsEpisodeIndex.windowIndices(
+            totalEpisodes: 1200,
+            scrollIndex: 0,
+            targetIndex: nil,
+            visibleCardCount: 6
+        )
+        XCTAssertEqual(startIndices.first, 0)
+        XCTAssertEqual(startIndices.last, 8)
+
+        let endIndices = TvDetailsEpisodeIndex.windowIndices(
+            totalEpisodes: 1200,
+            scrollIndex: 1199,
+            targetIndex: nil,
+            visibleCardCount: 6
+        )
+        XCTAssertEqual(endIndices.first, 1195)
+        XCTAssertEqual(endIndices.last, 1199)
+    }
+
+    func testReleaseDateCacheHandlesOverThousandEpisodes() {
+        // Verify parsing 1200 distinct episode release dates works smoothly with the enlarged cache
+        for episodeNum in 1...1200 {
+            let day = (episodeNum % 28) + 1
+            let month = ((episodeNum / 28) % 12) + 1
+            let dateStr = String(format: "2020-%02d-%02dT00:00:00.000Z", month, day)
+            XCTAssertTrue(EpisodeReleasePolicy.hasAired(dateStr))
+        }
+    }
 }

@@ -6,6 +6,7 @@ enum CollectionSourceError: LocalizedError {
     case missingTmdbID(String)
     case missingTraktClientID
     case missingTraktListID
+    case missingMdbListSource
     case unsupportedProvider(String)
     case requestFailed(String, Int)
     case invalidResponse(String)
@@ -22,6 +23,8 @@ enum CollectionSourceError: LocalizedError {
             return "Enter a Trakt Client ID in Settings to load this folder."
         case .missingTraktListID:
             return "This Trakt source has no public list ID."
+        case .missingMdbListSource:
+            return "This MDBList source has no list URL or list ID."
         case .unsupportedProvider(let provider):
             return "The collection source provider “\(provider)” is not supported."
         case .requestFailed(let provider, let status):
@@ -59,6 +62,8 @@ struct CollectionSourceResolver {
             page = try await browseTmdb(source, page: max(cursor, 1))
         case "trakt":
             page = try await browseTrakt(source, page: max(cursor, 1))
+        case "mdblist":
+            page = try await browseMdbList(source, page: max(cursor, 1))
         default:
             throw CollectionSourceError.unsupportedProvider(source.provider)
         }
@@ -78,6 +83,15 @@ struct CollectionSourceResolver {
             return (nonEmpty(source.tmdbSourceType) ?? "TMDB").capitalized
         case "trakt":
             return "Trakt List"
+        case "mdblist":
+            if let slug = nonEmpty(source.mdblistSlug) {
+                let name = slug.split(separator: "/").last.map(String.init) ?? slug
+                return name.replacingOccurrences(of: "-", with: " ").capitalized
+            }
+            if let id = source.mdblistId {
+                return "MDBList #\(id)"
+            }
+            return "MDBList"
         default:
             if source.normalizedProvider == "addon",
                let addonId = nonEmpty(source.addonId),
@@ -184,7 +198,15 @@ struct CollectionSourceResolver {
                 apiKey: apiKey,
                 query: query
             )
-            let items = response.results.compactMap {
+            var rawResults = response.results
+            if let withoutLang = nonEmpty(source.filters?.withoutOriginalLanguage)?.lowercased() {
+                let excluded = Set(withoutLang.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces).lowercased() })
+                rawResults = rawResults.filter { item in
+                    guard let lang = item.originalLanguage?.lowercased() else { return true }
+                    return !excluded.contains(lang)
+                }
+            }
+            let items = rawResults.compactMap {
                 tmdbMeta(from: $0, fallbackMediaType: mediaType)
             }
             let hasMore = page < (response.totalPages ?? page) && !items.isEmpty
@@ -221,6 +243,7 @@ struct CollectionSourceResolver {
         let releaseDateLte = nonEmpty(filters?.releaseDateLte)
             ?? (isRecentReleaseSource(source, sort: sort) ? currentLocalDateString() : nil)
         let voteCountGte = filters?.voteCountGte.map { String($0) }
+        let voteCountLte = filters?.voteCountLte.map { String($0) }
         let voteAverageGte = filters?.voteAverageGte.map { String($0) }
         let voteAverageLte = filters?.voteAverageLte.map { String($0) }
         var values: [(String, String?)] = [
@@ -228,19 +251,27 @@ struct CollectionSourceResolver {
             ("page", String(page)),
             ("sort_by", sort),
             ("with_companies", filters?.withCompanies),
+            ("without_companies", filters?.withoutCompanies),
             ("with_networks", filters?.withNetworks),
             ("with_genres", filters?.withGenres),
+            ("without_genres", filters?.withoutGenres),
             ("vote_count.gte", voteCountGte),
+            ("vote_count.lte", voteCountLte),
             ("vote_average.gte", voteAverageGte),
             ("vote_average.lte", voteAverageLte),
             ("with_original_language", filters?.withOriginalLanguage),
             ("with_origin_country", filters?.withOriginCountry),
+            ("without_origin_country", filters?.withoutOriginCountry),
             ("with_keywords", filters?.withKeywords),
+            ("without_keywords", filters?.withoutKeywords),
         ]
         if let providers = nonEmpty(filters?.withWatchProviders) {
             values.append(("with_watch_providers", providers))
             values.append(("watch_region", nonEmpty(filters?.watchRegion) ?? "US"))
             values.append(("with_watch_monetization_types", "flatrate|free|ads|rent|buy"))
+        }
+        if let withoutProviders = nonEmpty(filters?.withoutWatchProviders) {
+            values.append(("without_watch_providers", withoutProviders))
         }
         if let year = filters?.year {
             values.append((mediaType == "tv" ? "first_air_date_year" : "year", String(year)))
@@ -487,7 +518,251 @@ struct CollectionSourceResolver {
         return value
     }
 
+    // MARK: - MDBList
+
+    private func browseMdbList(_ source: NuvioCollectionSource, page: Int) async throws -> CatalogPage {
+        let (rawItems, hasMore): ([MdbListCollectionRawItem], Bool) = try await fetchMdbListItems(source: source, page: page)
+
+        var pageMetas: [NuvioMeta] = rawItems.compactMap { item in
+            let imdbId = nonEmpty(item.imdbId) ?? nonEmpty(item.ids?.imdb)
+            let tmdbId = item.id ?? item.ids?.tmdb
+            let id: String
+            if let imdb = imdbId {
+                id = imdb
+            } else if let tmdb = tmdbId, tmdb > 0 {
+                id = "tmdb:\(tmdb)"
+            } else {
+                return nil
+            }
+            let title = nonEmpty(item.title) ?? nonEmpty(item.name) ?? nonEmpty(item.originalTitle) ?? id
+            let rawType = (item.mediatype ?? item.type ?? "").lowercased()
+            let resolvedType = (rawType == "show" || rawType == "series" || rawType == "tv") ? "series" : "movie"
+            let year = item.releaseYear ?? item.year
+
+            let cached = repository.cachedMetadata(for: id)
+            let posterUrl = nonEmpty(item.poster) ?? cached?.posterUrl
+            let backgroundUrl = nonEmpty(item.backdrop) ?? cached?.backgroundUrl
+            let rating = item.score.flatMap { $0 > 0 ? $0 : nil } ?? cached?.rating
+
+            return NuvioMeta(
+                id: id,
+                name: title,
+                description: nonEmpty(item.description) ?? cached?.description,
+                posterUrl: posterUrl,
+                backgroundUrl: backgroundUrl,
+                logoUrl: cached?.logoUrl,
+                imdbId: imdbId,
+                tmdbId: tmdbId,
+                type: resolvedType,
+                year: year,
+                genres: cached?.genres,
+                rating: rating,
+                releaseInfo: year.map(String.init),
+                runtime: cached?.runtime,
+                cast: nil,
+                director: nil,
+                writer: nil,
+                certification: cached?.certification,
+                country: cached?.country,
+                released: year.map { "\($0)-01-01" }
+            )
+        }
+
+        // Enrich the first few items that lack a poster
+        await withTaskGroup(of: (Int, NuvioMeta).self) { group in
+            for (idx, meta) in pageMetas.enumerated().prefix(15) {
+                guard meta.posterUrl == nil else { continue }
+                group.addTask {
+                    if let full = try? await repository.getMetadata(id: meta.id, type: meta.type) {
+                        return (idx, meta.fillingMissingHeroMetadata(from: full))
+                    }
+                    return (idx, meta)
+                }
+            }
+            for await (idx, enriched) in group {
+                pageMetas[idx] = enriched
+            }
+        }
+
+        for meta in pageMetas {
+            repository.cacheCatalogMetadata(meta)
+        }
+
+        return CatalogPage(
+            items: pageMetas,
+            hasMore: hasMore && !pageMetas.isEmpty,
+            page: page,
+            nextSkip: hasMore && !pageMetas.isEmpty ? page + 1 : nil
+        )
+    }
+
+    private func fetchMdbListItems(
+        source: NuvioCollectionSource,
+        page: Int
+    ) async throws -> (items: [MdbListCollectionRawItem], hasMore: Bool) {
+        let apiKey = settings.string(forKey: SettingsKey.mdbListApiKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let targetUrl: URL
+        let limit = 50
+
+        if let rawUrl = nonEmpty(source.mdblistUrl) {
+            targetUrl = try mdbListJsonUrl(from: rawUrl, apiKey: apiKey)
+        } else if let slug = nonEmpty(source.mdblistSlug) {
+            targetUrl = try mdbListJsonUrl(from: slug, apiKey: apiKey)
+        } else if let id = source.mdblistId, id > 0 {
+            if let apiKey, !apiKey.isEmpty {
+                let mediaPath = source.mediaType == "tv" || source.mediaType == "series" ? "/show" : (source.mediaType == "movie" ? "/movie" : "")
+                var components = URLComponents(string: "\(MdbListConfig.apiBaseURL)/lists/\(id)/items\(mediaPath)")!
+                let queryItems = [
+                    URLQueryItem(name: "apikey", value: apiKey),
+                    URLQueryItem(name: "limit", value: String(limit)),
+                    URLQueryItem(name: "offset", value: String((page - 1) * limit)),
+                    URLQueryItem(name: "append_to_response", value: "poster,description,ratings")
+                ]
+                components.queryItems = queryItems
+                if let url = components.url {
+                    do {
+                        let (data, _) = try await requestData(url, provider: "MDBList", headers: [:])
+                        let parsed = parseMdbListItems(from: data)
+                        if !parsed.isEmpty {
+                            let hasMore = parsed.count >= limit
+                            return (filterAndSortMdbListItems(parsed, source: source), hasMore)
+                        }
+                    } catch {
+                        // Fallback to web json
+                    }
+                }
+            }
+            targetUrl = try mdbListJsonUrl(from: String(id), apiKey: apiKey)
+        } else if let catalogId = nonEmpty(source.catalogId) {
+            targetUrl = try mdbListJsonUrl(from: catalogId, apiKey: apiKey)
+        } else {
+            throw CollectionSourceError.missingMdbListSource
+        }
+
+        let (data, _) = try await requestData(targetUrl, provider: "MDBList", headers: [:])
+        let allItems = filterAndSortMdbListItems(parseMdbListItems(from: data), source: source)
+
+        let startIndex = (page - 1) * limit
+        guard startIndex < allItems.count else {
+            return ([], false)
+        }
+        let slice = Array(allItems[startIndex..<min(startIndex + limit, allItems.count)])
+        let hasMore = startIndex + limit < allItems.count
+        return (slice, hasMore)
+    }
+
+    private func mdbListJsonUrl(from input: String, apiKey: String?) throws -> URL {
+        var trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.lowercased().hasPrefix("http://") && !trimmed.lowercased().hasPrefix("https://") {
+            if trimmed.lowercased().hasPrefix("mdblist.com/") {
+                trimmed = "https://\(trimmed)"
+            } else if trimmed.contains("/") {
+                trimmed = "https://mdblist.com/lists/\(trimmed)"
+            } else {
+                trimmed = "https://mdblist.com/lists/\(trimmed)"
+            }
+        }
+        while trimmed.hasSuffix("/") {
+            trimmed.removeLast()
+        }
+        if !trimmed.lowercased().hasSuffix("/json") {
+            trimmed += "/json"
+        }
+        guard var components = URLComponents(string: trimmed) else {
+            throw CollectionSourceError.invalidResponse("MDBList")
+        }
+        if let apiKey = nonEmpty(apiKey) {
+            var items = components.queryItems ?? []
+            if !items.contains(where: { $0.name.lowercased() == "apikey" }) {
+                items.append(URLQueryItem(name: "apikey", value: apiKey))
+                components.queryItems = items
+            }
+        }
+        guard let url = components.url else {
+            throw CollectionSourceError.invalidResponse("MDBList")
+        }
+        return url
+    }
+
+    private func parseMdbListItems(from data: Data) -> [MdbListCollectionRawItem] {
+        if let list = try? JSONDecoder().decode([MdbListCollectionRawItem].self, from: data) {
+            return list
+        }
+        if let envelope = try? JSONDecoder().decode(MdbListCollectionEnvelope.self, from: data) {
+            if let items = envelope.items { return items }
+            if let results = envelope.results { return results }
+            if let d = envelope.data { return d }
+        }
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            var rawArray: [[String: Any]] = []
+            for key in ["items", "data", "results", "movies", "shows"] {
+                if let array = root[key] as? [[String: Any]] {
+                    rawArray.append(contentsOf: array)
+                }
+            }
+            if !rawArray.isEmpty,
+               let reencoded = try? JSONSerialization.data(withJSONObject: rawArray),
+               let parsed = try? JSONDecoder().decode([MdbListCollectionRawItem].self, from: reencoded) {
+                return parsed
+            }
+        }
+        return []
+    }
+
+    private func filterAndSortMdbListItems(
+        _ items: [MdbListCollectionRawItem],
+        source: NuvioCollectionSource
+    ) -> [MdbListCollectionRawItem] {
+        var filtered = items
+        if let mediaType = nonEmpty(source.mediaType)?.lowercased(), mediaType != "all" {
+            let isSeries = mediaType == "tv" || mediaType == "series" || mediaType == "show"
+            filtered = filtered.filter { item in
+                let raw = (item.mediatype ?? item.type ?? "").lowercased()
+                let itemIsSeries = raw == "tv" || raw == "series" || raw == "show"
+                return isSeries ? itemIsSeries : !itemIsSeries
+            }
+        }
+
+        switch source.sortBy {
+        case "title.asc":
+            filtered.sort { ($0.title ?? $0.name ?? "").localizedCaseInsensitiveCompare($1.title ?? $1.name ?? "") == .orderedAscending }
+        case "title.desc":
+            filtered.sort { ($0.title ?? $0.name ?? "").localizedCaseInsensitiveCompare($1.title ?? $1.name ?? "") == .orderedDescending }
+        case "year.desc":
+            filtered.sort { ($0.releaseYear ?? $0.year ?? 0) > ($1.releaseYear ?? $1.year ?? 0) }
+        case "year.asc":
+            filtered.sort { ($0.releaseYear ?? $0.year ?? 0) < ($1.releaseYear ?? $1.year ?? 0) }
+        case "score.desc", "rating.desc":
+            filtered.sort { ($0.score ?? 0) > ($1.score ?? 0) }
+        default:
+            filtered.sort { ($0.rank ?? Int.max) < ($1.rank ?? Int.max) }
+        }
+        return filtered
+    }
+
     // MARK: - Networking
+
+    private func requestData(
+        _ url: URL,
+        provider: String,
+        headers: [String: String]
+    ) async throws -> (data: Data, http: HTTPURLResponse) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        for (name, value) in headers {
+            request.setValue(value, forHTTPHeaderField: name)
+        }
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw CollectionSourceError.invalidResponse(provider)
+        }
+        guard 200..<300 ~= http.statusCode else {
+            throw CollectionSourceError.requestFailed(provider, http.statusCode)
+        }
+        return (data, http)
+    }
 
     private func request<T: Decodable>(
         _ url: URL,
@@ -647,6 +922,7 @@ private struct TmdbCollectionItem: Decodable {
     let voteAverage: Double?
     let mediaType: String?
     let job: String?
+    let originalLanguage: String?
 
     enum CodingKeys: String, CodingKey {
         case id, title, name, overview, job
@@ -656,6 +932,7 @@ private struct TmdbCollectionItem: Decodable {
         case firstAirDate = "first_air_date"
         case voteAverage = "vote_average"
         case mediaType = "media_type"
+        case originalLanguage = "original_language"
     }
 }
 
@@ -698,4 +975,45 @@ private struct TraktCollectionImages: Decodable {
     let clearart: [String]?
     let banner: [String]?
     let thumb: [String]?
+}
+
+private struct MdbListCollectionRawItem: Decodable {
+    let id: Int?
+    let title: String?
+    let name: String?
+    let originalTitle: String?
+    let mediatype: String?
+    let type: String?
+    let releaseYear: Int?
+    let year: Int?
+    let imdbId: String?
+    let tvdbid: Int?
+    let poster: String?
+    let backdrop: String?
+    let description: String?
+    let score: Double?
+    let rank: Int?
+    let ids: MdbListCollectionIds?
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, name, mediatype, type, score, rank, ids, poster, backdrop, description
+        case originalTitle = "original_title"
+        case releaseYear = "release_year"
+        case year
+        case imdbId = "imdb_id"
+        case tvdbid
+    }
+}
+
+private struct MdbListCollectionIds: Decodable {
+    let imdb: String?
+    let tmdb: Int?
+    let tvdb: Int?
+    let trakt: Int?
+}
+
+private struct MdbListCollectionEnvelope: Decodable {
+    let items: [MdbListCollectionRawItem]?
+    let results: [MdbListCollectionRawItem]?
+    let data: [MdbListCollectionRawItem]?
 }

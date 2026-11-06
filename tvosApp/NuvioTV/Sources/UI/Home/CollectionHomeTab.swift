@@ -8,6 +8,8 @@ struct CollectionHomeTab: View {
     let catalogRevision: UInt
     let isActive: Bool
     let isFullScreenOverlayPresented: Bool
+    let isDetailsOrPlayerOverlayPresented: Bool
+    let isVisibleCardMenuPresented: Bool
     let detailsDidDisappearGeneration: UInt
     let collectionArtwork: UIImage?
     let onNavigateToDetails: (String, String) -> Void
@@ -15,12 +17,15 @@ struct CollectionHomeTab: View {
     let onLongPressCard: (NuvioMeta) -> Void
 
     @StateObject private var model: CollectionHomeModel
+    @State private var focusedFailureActionID: String?
 
     init(
         destination: CollectionHomeDestination,
         catalogRevision: UInt,
         isActive: Bool,
         isFullScreenOverlayPresented: Bool,
+        isDetailsOrPlayerOverlayPresented: Bool,
+        isVisibleCardMenuPresented: Bool,
         detailsDidDisappearGeneration: UInt,
         collectionArtwork: UIImage? = nil,
         onNavigateToDetails: @escaping (String, String) -> Void,
@@ -31,6 +36,8 @@ struct CollectionHomeTab: View {
         self.catalogRevision = catalogRevision
         self.isActive = isActive
         self.isFullScreenOverlayPresented = isFullScreenOverlayPresented
+        self.isDetailsOrPlayerOverlayPresented = isDetailsOrPlayerOverlayPresented
+        self.isVisibleCardMenuPresented = isVisibleCardMenuPresented
         self.detailsDidDisappearGeneration = detailsDidDisappearGeneration
         self.collectionArtwork = collectionArtwork
         self.onNavigateToDetails = onNavigateToDetails
@@ -50,7 +57,15 @@ struct CollectionHomeTab: View {
             }
         }
         .onChange(of: isActive) { _, active in
-            if !active { model.releaseCatalogs() }
+            if !active {
+                model.releaseCatalogs()
+                focusedFailureActionID = nil
+            }
+        }
+        .onChange(of: model.failures.map(\.id)) { _, failureIDs in
+            if let focusedFailureActionID, !failureIDs.contains(focusedFailureActionID) {
+                self.focusedFailureActionID = nil
+            }
         }
     }
 
@@ -64,6 +79,9 @@ struct CollectionHomeTab: View {
             repository: CinemetaCatalogRepository(),
             isActive: isActive,
             isFullScreenOverlayPresented: isFullScreenOverlayPresented,
+            isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
+            isVisibleCardMenuPresented: isVisibleCardMenuPresented,
+            isExternalRetryFocusActive: focusedFailureActionID != nil,
             detailsDidDisappearGeneration: detailsDidDisappearGeneration,
             contentIdentity: TVHomeContentIdentity(
                 profileId: destination.id.profileID,
@@ -147,7 +165,13 @@ struct CollectionHomeTab: View {
                         .padding(.vertical, 12)
                         .background(.ultraThinMaterial, in: Capsule())
                     }
-                    .buttonStyle(PosterCardButtonStyle())
+                    .buttonStyle(PosterCardButtonStyle(onNativeFocusChange: { isFocused in
+                        if isFocused {
+                            focusedFailureActionID = failure.id
+                        } else if focusedFailureActionID == failure.id {
+                            focusedFailureActionID = nil
+                        }
+                    }))
                     // Keep the native focus target mounted while retrying;
                     // the model coalesces repeated presses for the same row.
                 }
