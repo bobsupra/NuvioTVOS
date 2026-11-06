@@ -48,22 +48,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.4.9** is the latest tvOS release.
+**Beta 3.5.0** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.9/NuvioTV-3.4.9-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.9) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.0/NuvioTV-3.5.0-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.0) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.4.9
+### New in Beta 3.5.0
 
-- **Lossless Audio Bridge (eARC / AVR):** Transcode non-streamable surround audio (TrueHD, DTS-HD MA, Opus) directly to uncompressed 24-bit 7.1 LPCM for AVRs and eARC soundbars in AetherEngine.
-- **Metal Video Upscaling:** Real-time Metal-accelerated frame upscaling (`FrameUpscaler`) for low-res and SD content on 4K Apple TV displays, paired with dynamic audio shaping and dialogue lift.
-- **File Chapters & Segmented Timeline:** Container MKV/MP4 chapters across both players, a dedicated Chapters shelf in InSight, piece-by-piece timeline with elevated active chapters, Intro/Ending skip fallbacks, and seek snapping.
-- **Seekr Integration & Out-of-Buffer Previews:** External trickplay storyboards via Seekr API keys, out-of-buffer preview scrub streams (Seekr or dedicated NNTP preview lines), and preview stabilization.
-- **Redesigned Top Shelf & 4K Carousel:** Interactive full-bleed 4K carousel with background trailers, instant resume Play button, mixed shelf catalog sources, and preserved App Group entitlements in unsigned IPAs.
-- **In-Player Subtitle Height Adjustment:** Granular vertical position adjustments on screen directly from the in-player subtitle menu in 4 pt steps.
-- **Usenet Cloud Sync & Jellyfin Auto-Sync:** Backup Usenet servers and passwords to Nuvio accounts, dropped connection recovery, and background auto-sync for Jellyfin libraries.
+- **AutoSubSync & Sync by Audio:** Lines add-on subtitles up with the video automatically using embedded MKV Cues index range requests. When no embedded subtitle reference exists, Sync by Audio listens to speech patterns through AetherEngine's shared audio tap to dynamically line lines up and track delay.
+- **Siri Remote Custom Gestures & Expert Mode:** Gesture recognition in the player with 8 ready-made shortcuts (chapter skips, intro/outro jump, -30s rewind, subtitle toggle, audio track switch, and next episode), plus an Expert Mode to record custom gestures and draw touchpad shapes for 11 actions.
+- **Watch Party Sidebar Toggle:** Customizable setting in **Settings → General** to show or hide the Watch Party tab in the sidebar navigation.
+- **MDBList Integration & Filters:** Direct MDBList catalog sources and dynamic filtering support across Collections.
+- **Profile Cloud Sync:** Synchronizes custom profile background art and add-on names to your cloud account.
+- **Native IMDb Trailer Streams:** Directly resolves high-definition trailer playback sources from IMDb on Details screens.
+- **Top Shelf & Focus Hardening:** Remote library items on Apple TV Top Shelf, focus-safe Back routing in Calendar, day panel scroll stabilization, and clamped episode guide index on long series.
 
 ### Built-in Player
 
