@@ -286,7 +286,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
 
     static var allCases: [Self] {
         var tabs: [Self] = [.profile, .home]
-        if WatchPartyConfiguration.isEnabled { tabs.append(.party) }
+        if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
         if isCalendarEnabled { tabs.append(.calendar) }
         tabs.append(.settings)
@@ -296,6 +296,12 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
     /// Settings → Appearance → Sidebar → Calendar (on unless turned off).
     static var isCalendarEnabled: Bool {
         ProfileSettings.current.object(forKey: SettingsKey.showCalendarTab) as? Bool ?? true
+    }
+
+    /// Settings → Appearance → Sidebar → Watch Party (on unless turned off).
+    static var isWatchPartyEnabled: Bool {
+        WatchPartyConfiguration.isEnabled
+            && (ProfileSettings.current.object(forKey: SettingsKey.showWatchPartyTab) as? Bool ?? true)
     }
     var id: String { rawValue }
     var rawValue: String {
@@ -4386,6 +4392,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
@@ -4419,6 +4426,9 @@ private struct TVMainTabView: View {
         }
         .onChange(of: showCalendarTab) { _, isShown in
             if !isShown, selectedTab == .calendar { selectedTab = .home }
+        }
+        .onChange(of: showWatchPartyTab) { _, isShown in
+            if !isShown, selectedTab == .party { selectedTab = .home }
         }
     }
 
@@ -4623,7 +4633,7 @@ private struct TVMainTabView: View {
             homeTabContent
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
-            if WatchPartyConfiguration.isEnabled {
+            if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
                 partyTabContent
                     .tabItem { Label(TVTab.party.title, systemImage: TVTab.party.symbol) }
                     .tag(TVTab.party)
@@ -4674,7 +4684,7 @@ private struct TVMainTabView: View {
             Tab(TVTab.home.title, systemImage: TVTab.home.symbol, value: TVTab.home) {
                 homeTabContent
             }
-            if WatchPartyConfiguration.isEnabled {
+            if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
                 Tab(TVTab.party.title, systemImage: TVTab.party.symbol, value: TVTab.party) {
                     partyTabContent
                 }

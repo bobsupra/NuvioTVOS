@@ -185,6 +185,8 @@ enum SettingsKey {
     static let liquidGlassCards = "nuvio.tv.settings.layout.liquidGlassCards"
     /// Settings → Appearance → Sidebar → Calendar.
     static let showCalendarTab = "nuvio.tv.settings.layout.showCalendarTab"
+    /// Settings → Appearance → Sidebar → Watch Party.
+    static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
     /// Settings → Layout → Calendar → Today Row.
     static let homeCalendarToday = "nuvio.tv.settings.layout.homeCalendarToday"
     /// The calendar's own options, chosen from its header.
@@ -401,7 +403,7 @@ enum SettingsKey {
         homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings,
-        showCalendarTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
+        showCalendarTab, showWatchPartyTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -2297,6 +2299,7 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
     @State private var customPosterURLDraft = ""
@@ -2329,6 +2332,15 @@ private struct AppearanceSettingsView: View {
                         fallback: "Upcoming episodes and releases from your library"
                     ),
                     isOn: $showCalendarTab,
+                    accentColor: accentColor
+                )
+                SettingsToggleRow(
+                    title: L10n.string("nav_watch_party", fallback: "Watch Party"),
+                    subtitle: L10n.string(
+                        "settings_show_watch_party_tab_subtitle",
+                        fallback: "Show Watch Party in the sidebar"
+                    ),
+                    isOn: $showWatchPartyTab,
                     accentColor: accentColor
                 )
             }
