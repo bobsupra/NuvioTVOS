@@ -7,7 +7,7 @@ final class AppNoticeSelectionTests: XCTestCase {
         let tag = "tvos-beta-3.4.7"
         let release = try XCTUnwrap(ReleaseUpdateMetadata(
             tagName: tag,
-            releaseURLString: "https://github.com/bobsupra/NuvioTVOS/releases/tag/\(tag)"
+            releaseURLString: "https://github.com/\(AppRepository.slug)/releases/tag/\(tag)"
         ))
         let announcement = makeAnnouncement(id: tag)
 

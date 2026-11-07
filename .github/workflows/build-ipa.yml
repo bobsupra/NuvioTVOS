@@ -16,6 +16,7 @@ concurrency:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   build:
@@ -65,3 +66,8 @@ jobs:
             "${{ runner.temp }}/ipa/NuvioTV-unsigned.ipa#NuvioTVOSxIPTV-${GITHUB_REF_NAME}-unsigned.ipa" \
             --title "NuvioTVOSxIPTV $GITHUB_REF_NAME" \
             --notes "Unsigned tvOS IPA – sideload and re-sign with your own Apple ID."
+
+          # Releases created with GITHUB_TOKEN don't fire `release` events, so
+          # start the AltStore source and README updates explicitly.
+          gh workflow run altstore.yml --ref main
+          gh workflow run update-latest-beta.yml --ref main -f tag="$GITHUB_REF_NAME"

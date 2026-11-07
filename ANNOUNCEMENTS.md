@@ -12,7 +12,7 @@ The checked-in feed starts empty. The example below is documentation only; it is
       "id": "2026-10-24-maintenance",
       "title": "Upcoming maintenance",
       "message": "Account sync may be briefly unavailable during maintenance. You can continue using your installed add-ons.",
-      "linkURL": "https://github.com/bobsupra/NuvioTVOS/discussions"
+      "linkURL": "https://github.com/Arrgh106/NuvioTVOSxIPTV/discussions"
     }
   ]
 }
@@ -26,7 +26,7 @@ The checked-in feed starts empty. The example below is documentation only; it is
 
 The app reads:
 
-`https://raw.githubusercontent.com/bobsupra/NuvioTVOS/main/announcements.json`
+`https://raw.githubusercontent.com/Arrgh106/NuvioTVOSxIPTV/main/announcements.json`
 
 Apps check when opened or resumed, at most once per hour. Publishing is not an immediate push to closed apps. Each device receives the message on its next eligible successful check. A failed check also counts toward the hourly limit.
 

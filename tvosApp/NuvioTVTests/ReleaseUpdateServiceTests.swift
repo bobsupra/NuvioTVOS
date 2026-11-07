@@ -203,7 +203,7 @@ final class ReleaseUpdateServiceTests: XCTestCase {
         tag: String,
         url: String? = nil
     ) -> String {
-        let releaseURL = url ?? "https://github.com/bobsupra/NuvioTVOS/releases/tag/\(tag)"
+        let releaseURL = url ?? "https://github.com/\(AppRepository.slug)/releases/tag/\(tag)"
         return """
         {"tag_name":"\(tag)","html_url":"\(releaseURL)","prerelease":false,"draft":false}
         """

@@ -21,7 +21,7 @@ final class AnnouncementService: ObservableObject {
     static let lastAttemptKey = "announcementsLastAttempt"
     static let cachedFeedKey = "announcementsCachedFeed"
     static let skippedIDsKey = "announcementSkippedIDs"
-    static let feedEndpoint = URL(string: "https://raw.githubusercontent.com/bobsupra/NuvioTVOS/main/announcements.json")!
+    static let feedEndpoint = URL(string: "https://raw.githubusercontent.com/\(AppRepository.slug)/main/announcements.json")!
 
     private static let throttleInterval: TimeInterval = 60 * 60
     private static let maximumFeedBytes = 64 * 1024

@@ -54,7 +54,7 @@ struct ReleaseUpdateMetadata: Codable, Equatable, Identifiable {
               components.password == nil,
               components.query == nil,
               components.fragment == nil,
-              components.path == "/bobsupra/NuvioTVOS/releases/tag/\(tagName)" else {
+              components.path == "/\(AppRepository.slug)/releases/tag/\(tagName)" else {
             return nil
         }
         self.tagName = tagName
@@ -68,7 +68,7 @@ final class ReleaseUpdateService: ObservableObject {
     static let lastAttemptKey = "releaseUpdatesLastAttempt"
     static let cachedReleaseKey = "releaseUpdatesCachedRelease"
     static let skippedTagKey = "releaseUpdatesSkippedTag"
-    static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/bobsupra/NuvioTVOS/releases/latest")!
+    static let latestReleaseEndpoint = URL(string: "https://api.github.com/repos/\(AppRepository.slug)/releases/latest")!
 
     private struct GitHubRelease: Decodable {
         let tagName: String

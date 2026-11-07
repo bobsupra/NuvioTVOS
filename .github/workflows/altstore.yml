@@ -21,9 +21,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Detect upstream parent if running inside a fork
-          PARENT_REPO=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')
-          TARGET_REPO="${PARENT_REPO:-$GITHUB_REPOSITORY}"
+          # This fork publishes its own IPAs (with Live TV), so list its own
+          # releases rather than the upstream parent's.
+          TARGET_REPO="$GITHUB_REPOSITORY"
           echo "Fetching releases from: $TARGET_REPO"
 
           # Fetch up to 30 recent releases
