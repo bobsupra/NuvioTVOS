@@ -4737,9 +4737,16 @@ private struct TVMainTabView: View {
     @available(tvOS 18.0, *)
     private var groupedCollectionTabs: some View {
         TabView(selection: $selectedTab) {
+            // With the tvOS 27 SDK the profile lives in the sidebar header
+            // (see tabShell); builds on an older SDK (GitHub's Xcode 26
+            // runners) keep it as a tab on every system.
+            #if compiler(>=6.4)
             if #unavailable(tvOS 27.0) {
                 Tab(value: TVTab.profile) { Color.clear } label: { profileTabLabel }
             }
+            #else
+            Tab(value: TVTab.profile) { Color.clear } label: { profileTabLabel }
+            #endif
             Tab(TVTab.home.title, systemImage: TVTab.home.symbol, value: TVTab.home) {
                 homeTabContent
             }
@@ -4777,6 +4784,7 @@ private struct TVMainTabView: View {
                 }
             }
             if !genreCollectionDestinations.isEmpty {
+                #if compiler(>=6.4)
                 if #available(tvOS 27.0, *) {
                     // tvOS supports the automatic policy, but not an explicit
                     // collapsed default. Keep the system's native behavior;
@@ -4786,6 +4794,9 @@ private struct TVMainTabView: View {
                     // Earlier systems retain a usable, expanded native section.
                     genreTabSection
                 }
+                #else
+                genreTabSection
+                #endif
             }
         }
     }
@@ -4807,6 +4818,20 @@ private struct TVMainTabView: View {
 
     @ViewBuilder
     private var tabShell: some View {
+        #if compiler(>=6.4)
+        tvOS27TabShell
+        #else
+        if #available(tvOS 18.0, *) {
+            groupedCollectionTabs
+        } else {
+            standardTabs
+        }
+        #endif
+    }
+
+    #if compiler(>=6.4)
+    @ViewBuilder
+    private var tvOS27TabShell: some View {
         if #available(tvOS 27.0, *) {
             groupedCollectionTabs
                 .tabViewSidebarHeader {
@@ -4823,6 +4848,7 @@ private struct TVMainTabView: View {
             standardTabs
         }
     }
+    #endif
 
     private var tabs: some View {
         tabShell
