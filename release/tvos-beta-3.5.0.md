@@ -14,7 +14,7 @@
 
 ### Siri Remote Custom Gestures & Expert Mode
 
-- **Ready-Made Remote Gestures:** Seamless gestures in the player (off by default, enabled in **InSight → Gestures**). Includes 8 non-interfering shortcuts: long swipe right/left for chapters, swipe right & back to skip intro/outro, swipe left & back for -30s, swipe up & back to toggle subtitles, swipe down & back for next audio track, tap-and-hold center for chapters, and circle clockwise for next episode.
+- **Ready-Made Remote Gestures:** Seamless gestures in the player (off by default, enabled in the player's **•••** settings panel under **Gestures**). Includes 8 non-interfering shortcuts: long swipe right/left for chapters, swipe right & back to skip intro/outro, swipe left & back for -30s, swipe up & back to toggle subtitles, swipe down & back for next audio track, tap-and-hold center for chapters, and circle clockwise for next episode.
 - **Expert Mode & Gesture Recording:** Record custom gestures for 11 distinct player actions, draw unique touchpad shapes, tune recognition sensitivity, and test with live visual finger feedback.
 - **Non-Swallowing Input Architecture:** Gestures without assigned actions preserve native tvOS remote navigation without conflict.
 

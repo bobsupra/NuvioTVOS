@@ -58,7 +58,7 @@ The IPA requires a compatible tvOS development or sideloading signing workflow b
 ### New in Beta 3.5.0
 
 - **AutoSubSync & Sync by Audio:** Lines add-on subtitles up with the video automatically using embedded MKV Cues index range requests. When no embedded subtitle reference exists, Sync by Audio listens to speech patterns through AetherEngine's shared audio tap to dynamically line lines up and track delay.
-- **Siri Remote Custom Gestures & Expert Mode:** Gesture recognition in the player with 8 ready-made shortcuts (chapter skips, intro/outro jump, -30s rewind, subtitle toggle, audio track switch, and next episode), plus an Expert Mode to record custom gestures and draw touchpad shapes for 11 actions.
+- **Siri Remote Custom Gestures & Expert Mode:** Gesture recognition in the player (enabled in the player's **•••** settings panel under **Gestures**) with 8 ready-made shortcuts (chapter skips, intro/outro jump, -30s rewind, subtitle toggle, audio track switch, and next episode), plus an Expert Mode to record custom gestures and draw touchpad shapes for 11 actions.
 - **Watch Party Sidebar Toggle:** Customizable setting in **Settings → General** to show or hide the Watch Party tab in the sidebar navigation.
 - **MDBList Integration & Filters:** Direct MDBList catalog sources and dynamic filtering support across Collections.
 - **Profile Cloud Sync:** Synchronizes custom profile background art and add-on names to your cloud account.
