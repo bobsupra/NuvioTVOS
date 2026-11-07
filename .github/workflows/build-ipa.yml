@@ -24,10 +24,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Select latest stable Xcode
+      - name: List installed Xcode versions
+        run: ls -d /Applications/Xcode*.app
+
+      # The app uses tvOS 27 SDK APIs (e.g. tabViewSidebarHeader), so it needs
+      # Xcode 27; "latest" also picks a beta when no stable 27 is installed.
+      - name: Select Xcode 27
         uses: maxim-lobanov/setup-xcode@v1
         with:
-          xcode-version: latest-stable
+          xcode-version: ${{ vars.XCODE_VERSION || 'latest' }}
 
       - name: Install Tuist (pinned in mise.toml)
         uses: jdx/mise-action@v2
