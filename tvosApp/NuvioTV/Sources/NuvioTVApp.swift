@@ -286,11 +286,11 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, party, search, library, calendar, settings
+    case profile, home, liveTV, party, search, library, calendar, settings
     case collection(CollectionHomeID)
 
     static var allCases: [Self] {
-        var tabs: [Self] = [.profile, .home]
+        var tabs: [Self] = [.profile, .home, .liveTV]
         if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
         if isCalendarEnabled { tabs.append(.calendar) }
@@ -313,6 +313,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         switch self {
         case .profile: return "Profile"
         case .home: return "Home"
+        case .liveTV: return "Live TV"
         case .search: return "Search"
         case .library: return "Library"
         case .calendar: return "Calendar"
@@ -325,6 +326,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         switch self {
         case .profile: return L10n.string("settings_profiles", fallback: "Profile")
         case .home: return L10n.string("nav_home", fallback: "Home")
+        case .liveTV: return L10n.string("nav_live_tv", fallback: "Live TV")
         case .search: return L10n.string("nav_search", fallback: "Search")
         case .library: return L10n.string("nav_library", fallback: "Library")
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
@@ -337,6 +339,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         switch self {
         case .profile: return "person.crop.circle"
         case .home: return "house"
+        case .liveTV: return "tv"
         case .search: return "magnifyingglass"
         case .library: return "rectangle.stack"
         case .calendar: return "calendar"
@@ -3080,6 +3083,20 @@ struct ContentView: View {
             },
             onOpenCalendarEntry: { entry in
                 openCalendarEntry(entry)
+            },
+            onPlayLiveChannel: { url, meta, headers in
+                playbackEpisodes = []
+                playbackCurrentEpisode = nil
+                presentPlayback(
+                    url: url,
+                    meta: meta,
+                    subtitle: "",
+                    externalSubtitles: [],
+                    resumeFrom: nil,
+                    httpHeaders: headers,
+                    origin: .main,
+                    filename: meta.name
+                )
             }
         )
     }
@@ -4409,6 +4426,7 @@ private struct TVMainTabView: View {
     let onOpenCloudLibrary: () -> Void
     let onPlayCloudFile: (URL, NuvioMeta) -> Void
     var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
+    var onPlayLiveChannel: ((URL, NuvioMeta, [String: String]) -> Void)? = nil
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
@@ -4590,6 +4608,13 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    private var liveTVTabContent: some View {
+        LiveTVView(onPlayChannel: { url, meta, headers in
+            onPlayLiveChannel?(url, meta, headers)
+        })
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var calendarTabContent: some View {
         CalendarView(
             onOpenEntry: { entry in onOpenCalendarEntry?(entry) },
@@ -4664,6 +4689,9 @@ private struct TVMainTabView: View {
             homeTabContent
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
+            liveTVTabContent
+                .tabItem { Label(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol) }
+                .tag(TVTab.liveTV)
             if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
                 partyTabContent
                     .tabItem { Label(TVTab.party.title, systemImage: TVTab.party.symbol) }
@@ -4714,6 +4742,9 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.home.title, systemImage: TVTab.home.symbol, value: TVTab.home) {
                 homeTabContent
+            }
+            Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
+                liveTVTabContent
             }
             if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
                 Tab(TVTab.party.title, systemImage: TVTab.party.symbol, value: TVTab.party) {

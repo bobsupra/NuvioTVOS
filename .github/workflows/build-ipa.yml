@@ -3,7 +3,7 @@ name: Build unsigned IPA
 on:
   workflow_dispatch:
   push:
-    branches: [main]
+    branches: ['**']
     tags: ['v*']
     paths-ignore:
       - '**.md'
