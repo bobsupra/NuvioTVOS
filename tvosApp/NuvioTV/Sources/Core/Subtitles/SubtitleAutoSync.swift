@@ -346,6 +346,34 @@ actor SubtitleAutoSync {
         return SubtitleAutoSyncRun(outcome: outcome, report: report)
     }
 
+    /// When the primary subtitle fails to match, searches candidate alternative subtitles for the same
+    /// language against the video's index. Returns the first confident or in-sync match, if any.
+    func findBestAlternative(
+        candidates: [NuvioSubtitle],
+        source: SubtitleAutoSyncSource,
+        toleranceMs: Int
+    ) async -> (subtitle: NuvioSubtitle, run: SubtitleAutoSyncRun)? {
+        guard !candidates.isEmpty else { return nil }
+        let pool = Array(candidates.prefix(4))
+        for candidate in pool {
+            if Task.isCancelled { return nil }
+            let run = await sync(
+                subtitle: candidate,
+                source: source,
+                toleranceMs: toleranceMs,
+                useCache: true,
+                force: false
+            )
+            switch run.outcome {
+            case .synced, .kept(.inSync):
+                return (candidate, run)
+            case .kept:
+                continue
+            }
+        }
+        return nil
+    }
+
     static func stronger(_ current: SubtitleSyncVerdict, _ next: SubtitleSyncVerdict) -> SubtitleSyncVerdict {
         func rank(_ verdict: SubtitleSyncVerdict) -> Int {
             switch verdict {

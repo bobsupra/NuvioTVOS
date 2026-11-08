@@ -618,6 +618,39 @@ enum SubtitleSyncReference {
             if !isNew { skipped[candidate.track.number] = "same timing as another track" }
             return isNew
         }
+
+        // Outlier rejection: if 3 or more candidate tracks exist, drop any track that no other
+        // candidate confirms at near-zero delay while at least two others confirm each other.
+        if pool.count >= 3 {
+            var agrees = Array(repeating: Array(repeating: false, count: pool.count), count: pool.count)
+            for i in 0..<pool.count {
+                for j in (i + 1)..<pool.count {
+                    let agreed = agreeAtNearZeroDelay(pool[i].cues, pool[j].cues)
+                    agrees[i][j] = agreed
+                    agrees[j][i] = agreed
+                }
+            }
+            var outliers = Set<Int>()
+            for i in 0..<pool.count {
+                if !agrees[i].contains(true) {
+                    let othersConfirm = pool.indices.contains { first in
+                        first != i && pool.indices.contains { second in
+                            second != i && second != first && agrees[first][second]
+                        }
+                    }
+                    if othersConfirm {
+                        outliers.insert(i)
+                    }
+                }
+            }
+            if !outliers.isEmpty {
+                for i in outliers {
+                    skipped[pool[i].track.number] = "timing differs from other embedded tracks (outlier or commentary)"
+                }
+                pool = pool.enumerated().filter { !outliers.contains($0.offset) }.map(\.element)
+            }
+        }
+
         let target = Double(max(targetLineCount, 1))
         func isEnglish(_ track: MatroskaSubtitleTrack) -> Bool {
             (track.language ?? "").lowercased().hasPrefix("en")
@@ -649,6 +682,28 @@ enum SubtitleSyncReference {
             skipped[left.track.number] = "not tried (\(maxCandidates) better ones first)"
         }
         return Review(candidates: Array(ordered.prefix(maxCandidates)), skipped: skipped)
+    }
+
+    /// Whether two cue sequences agree on a constant delay within 1.0 second.
+    static func agreeAtNearZeroDelay(_ first: [SubtitleTimingCue], _ second: [SubtitleTimingCue]) -> Bool {
+        guard !first.isEmpty, !second.isEmpty else { return false }
+        let (shorter, longer) = first.count <= second.count ? (first, second) : (second, first)
+        let startsLonger = longer.map(\.start).sorted()
+        var deltas: [Double] = []
+        for cue in shorter {
+            if let near = SubtitleSyncAligner.nearest(startsLonger, to: cue.start) {
+                let diff = near - cue.start
+                if abs(diff) <= 1.2 {
+                    deltas.append(diff)
+                }
+            }
+        }
+        guard Double(deltas.count) >= 0.30 * Double(shorter.count) else { return false }
+        deltas.sort()
+        let median = deltas[deltas.count / 2]
+        guard abs(median) <= 1.0 else { return false }
+        let clustered = deltas.filter { abs($0 - median) <= 0.5 }.count
+        return Double(clustered) >= 0.30 * Double(shorter.count)
     }
 
     private static func matches(_ expression: NSRegularExpression, _ value: String?) -> Bool {

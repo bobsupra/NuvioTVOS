@@ -537,4 +537,71 @@ final class SubtitleAutoSyncTests: XCTestCase {
         let segment = [0x18, 0x53, 0x80, 0x67] + [0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF] + segmentBody
         return Data(ebml + segment)
     }
+
+    // MARK: - Candidate Alternative Hunting
+
+    func testLanguageMatchingForAlternatives() {
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("en", "eng"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("eng", "en"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("en-US", "en"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("en_GB", "eng"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("English", "en"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("spa", "es"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("Spanish", "spa"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("fre", "fr"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("cze", "ces"))
+        XCTAssertTrue(PlayerViewModel.isSameSubtitleLanguage("pt-BR", "por"))
+
+        XCTAssertFalse(PlayerViewModel.isSameSubtitleLanguage("en", "fr"))
+        XCTAssertFalse(PlayerViewModel.isSameSubtitleLanguage("spa", "deu"))
+        XCTAssertFalse(PlayerViewModel.isSameSubtitleLanguage("", "en"))
+        XCTAssertFalse(PlayerViewModel.isSameSubtitleLanguage("   ", "eng"))
+    }
+
+    func testCanHuntAlternativesForIssue() {
+        XCTAssertTrue(PlayerViewModel.canHuntAlternatives(for: .noMatch))
+        XCTAssertTrue(PlayerViewModel.canHuntAlternatives(for: .ambiguous))
+        XCTAssertTrue(PlayerViewModel.canHuntAlternatives(for: .tooFewLines))
+        XCTAssertTrue(PlayerViewModel.canHuntAlternatives(for: .downloadFailed))
+
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .inSync))
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .unsupportedSource))
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .unsupportedFormat))
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .notMatroska))
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .noIndex))
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .noEmbeddedSubtitles))
+        XCTAssertFalse(PlayerViewModel.canHuntAlternatives(for: .indexFailed))
+    }
+
+    func testFindBestAlternativeEmptyCandidates() async {
+        guard let url = URL(string: "https://example.com/video.mkv") else { return }
+        let source = SubtitleAutoSyncSource(url: url, headers: [:], fileKey: "test", description: "test")
+        let result = await SubtitleAutoSync.shared.findBestAlternative(candidates: [], source: source, toleranceMs: 0)
+        XCTAssertNil(result)
+    }
+
+    // MARK: - Reference Outlier Rejection
+
+    func testOutlierReferenceIsRejectedWhenOthersConfirmEachOther() {
+        func track(_ number: UInt64, _ codec: String, name: String?, events: [(start: Double, duration: Double?)]) -> MatroskaSubtitleTrack {
+            MatroskaSubtitleTrack(
+                number: number, codecID: codec, language: "eng", name: name, isDefault: false,
+                isForced: false, isHearingImpaired: false, isCommentary: false, events: events)
+        }
+        // Tracks 2 and 3 share dialogue timing
+        let dialogueEvents = (0..<100).map { (start: 10 + Double($0) * 3, duration: Optional(2.0)) }
+        let confirmedEvents = (0..<100).map { (start: 10.1 + Double($0) * 3, duration: Optional(2.0)) }
+        // Track 4 is a commentary track with arbitrary spoken timing during pauses
+        let commentaryEvents = (0..<80).map { (start: 25 + Double($0) * 7.5, duration: Optional(4.0)) }
+
+        let index = MatroskaSubtitleIndex(tracks: [
+            track(2, "S_TEXT/UTF8", name: "English", events: dialogueEvents),
+            track(3, "S_TEXT/ASS", name: "Dialogue", events: confirmedEvents),
+            track(4, "S_TEXT/UTF8", name: "Director Track", events: commentaryEvents),
+        ])
+
+        let review = SubtitleSyncReference.review(in: index, targetLineCount: 100)
+        XCTAssertEqual(review.candidates.map(\.track.number).sorted(), [2, 3])
+        XCTAssertEqual(review.skipped[4], "timing differs from other embedded tracks (outlier or commentary)")
+    }
 }
