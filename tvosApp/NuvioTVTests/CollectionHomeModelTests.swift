@@ -234,6 +234,55 @@ final class CollectionHomeModelTests: XCTestCase {
         XCTAssertNotEqual(sourceA.routeKey, sourceB.routeKey)
     }
 
+    func testTmdbDateNormalizerFormatsAndRanges() {
+        // Direct ISO date format
+        XCTAssertEqual(TmdbDateNormalizer.normalize("2000-01-01"), "2000-01-01")
+        XCTAssertEqual(TmdbDateNormalizer.normalize("2010-12-31", isEndDate: true), "2010-12-31")
+
+        // Human-readable dates (user issue #391: e.g. from 01 January 2000 to 31 December 2010)
+        XCTAssertEqual(TmdbDateNormalizer.normalize("01 January 2000"), "2000-01-01")
+        XCTAssertEqual(TmdbDateNormalizer.normalize("31 December 2010", isEndDate: true), "2010-12-31")
+        XCTAssertEqual(TmdbDateNormalizer.normalize("January 1, 2000"), "2000-01-01")
+        XCTAssertEqual(TmdbDateNormalizer.normalize("December 31, 2010", isEndDate: true), "2010-12-31")
+
+        // Compound date range strings
+        let compound = "01 January 2000 to 31 December 2010"
+        XCTAssertEqual(TmdbDateNormalizer.normalize(compound, isEndDate: false), "2000-01-01")
+        XCTAssertEqual(TmdbDateNormalizer.normalize(compound, isEndDate: true), "2010-12-31")
+
+        // Hyphenated range
+        let hyphenated = "2000-01-01 - 2010-12-31"
+        XCTAssertEqual(TmdbDateNormalizer.normalize(hyphenated, isEndDate: false), "2000-01-01")
+        XCTAssertEqual(TmdbDateNormalizer.normalize(hyphenated, isEndDate: true), "2010-12-31")
+
+        // Year only
+        XCTAssertEqual(TmdbDateNormalizer.normalize("2000", isEndDate: false), "2000-01-01")
+        XCTAssertEqual(TmdbDateNormalizer.normalize("2010", isEndDate: true), "2010-12-31")
+
+        // Blank input
+        XCTAssertNil(TmdbDateNormalizer.normalize(""))
+        XCTAssertNil(TmdbDateNormalizer.normalize("   "))
+    }
+
+    func testTmdbCollectionFiltersDateNormalization() throws {
+        let json = """
+        {
+            "releaseDateGte": "01 January 2000",
+            "releaseDateLte": "31 December 2010"
+        }
+        """.data(using: .utf8)!
+        let filters = try JSONDecoder().decode(NuvioTmdbCollectionFilters.self, from: json)
+        XCTAssertEqual(filters.releaseDateGte, "2000-01-01")
+        XCTAssertEqual(filters.releaseDateLte, "2010-12-31")
+
+        let programmatic = NuvioTmdbCollectionFilters(
+            releaseDateGte: "01 January 2000",
+            releaseDateLte: "31 December 2010"
+        )
+        XCTAssertEqual(programmatic.releaseDateGte, "2000-01-01")
+        XCTAssertEqual(programmatic.releaseDateLte, "2010-12-31")
+    }
+
     func testCollectionSourceResolverMdbListLabels() {
         // Title precedence
         let withTitle = NuvioCollectionSource(

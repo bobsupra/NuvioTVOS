@@ -5023,6 +5023,92 @@ struct NuvioCollectionSource: Decodable, Hashable {
     }
 }
 
+enum TmdbDateNormalizer {
+    static func normalize(_ input: String?, isEndDate: Bool = false) -> String? {
+        guard let raw = input?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+
+        // Handle compound range string like "01 January 2000 to 31 December 2010"
+        let lower = raw.lowercased()
+        if lower.contains(" to ") {
+            let parts = raw.components(separatedBy: lower.contains(" to ") ? " to " : " TO ")
+            if parts.count >= 2 {
+                let target = isEndDate ? parts[1] : parts[0]
+                return normalizeSingleDate(target, isEndDate: isEndDate)
+            }
+        }
+        if raw.contains(" – ") || raw.contains(" - ") {
+            let sep = raw.contains(" – ") ? " – " : " - "
+            let parts = raw.components(separatedBy: sep)
+            if parts.count >= 2 {
+                let target = isEndDate ? parts[1] : parts[0]
+                return normalizeSingleDate(target, isEndDate: isEndDate)
+            }
+        }
+
+        return normalizeSingleDate(raw, isEndDate: isEndDate)
+    }
+
+    private static func normalizeSingleDate(_ input: String, isEndDate: Bool) -> String? {
+        let trimmed = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        // If already ISO YYYY-MM-DD
+        let isoRegex = #"^\d{4}-\d{2}-\d{2}$"#
+        if trimmed.range(of: isoRegex, options: .regularExpression) != nil {
+            return trimmed
+        }
+
+        // If 4-digit year like "2000"
+        if let year = Int(trimmed), year >= 1880, year <= 2100 {
+            return isEndDate ? "\(year)-12-31" : "\(year)-01-01"
+        }
+
+        let formats = [
+            "d MMMM yyyy",      // 01 January 2000, 1 January 2000
+            "d MMM yyyy",       // 01 Jan 2000, 1 Jan 2000
+            "MMMM d, yyyy",     // January 1, 2000
+            "MMMM d yyyy",      // January 1 2000
+            "MMM d, yyyy",      // Jan 1, 2000
+            "MMM d yyyy",       // Jan 1 2000
+            "yyyy/MM/dd",       // 2000/01/01
+            "yyyy.MM.dd",       // 2000.01.01
+            "dd-MM-yyyy",       // 01-01-2000
+            "dd/MM/yyyy",       // 01/01/2000
+            "MM/dd/yyyy"        // 01/01/2000
+        ]
+
+        let outputFormatter = DateFormatter()
+        outputFormatter.locale = Locale(identifier: "en_US_POSIX")
+        outputFormatter.dateFormat = "yyyy-MM-dd"
+        outputFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        let inputFormatter = DateFormatter()
+        inputFormatter.timeZone = TimeZone(secondsFromGMT: 0)
+
+        // Try en_US_POSIX first (English month names like January, December)
+        inputFormatter.locale = Locale(identifier: "en_US_POSIX")
+        for format in formats {
+            inputFormatter.dateFormat = format
+            if let date = inputFormatter.date(from: trimmed) {
+                return outputFormatter.string(from: date)
+            }
+        }
+
+        // Try current user locale
+        inputFormatter.locale = Locale.current
+        for format in formats {
+            inputFormatter.dateFormat = format
+            if let date = inputFormatter.date(from: trimmed) {
+                return outputFormatter.string(from: date)
+            }
+        }
+
+        return trimmed
+    }
+}
+
 struct NuvioTmdbCollectionFilters: Codable, Hashable {
     var withGenres: String?
     var withoutGenres: String?
@@ -5091,8 +5177,8 @@ struct NuvioTmdbCollectionFilters: Codable, Hashable {
     ) {
         self.withGenres = withGenres
         self.withoutGenres = withoutGenres
-        self.releaseDateGte = releaseDateGte
-        self.releaseDateLte = releaseDateLte
+        self.releaseDateGte = TmdbDateNormalizer.normalize(releaseDateGte, isEndDate: false)
+        self.releaseDateLte = TmdbDateNormalizer.normalize(releaseDateLte, isEndDate: true)
         self.voteAverageGte = voteAverageGte
         self.voteAverageLte = voteAverageLte
         self.voteCountGte = voteCountGte
@@ -5165,8 +5251,14 @@ struct NuvioTmdbCollectionFilters: Codable, Hashable {
 
         withGenres = string(for: ["withGenres", "with_genres"])
         withoutGenres = string(for: ["withoutGenres", "without_genres"])
-        releaseDateGte = string(for: ["releaseDateGte", "release_date_gte", "primary_release_date.gte", "release_date.gte"])
-        releaseDateLte = string(for: ["releaseDateLte", "release_date_lte", "primary_release_date.lte", "release_date.lte"])
+        releaseDateGte = TmdbDateNormalizer.normalize(
+            string(for: ["releaseDateGte", "release_date_gte", "primary_release_date.gte", "release_date.gte"]),
+            isEndDate: false
+        )
+        releaseDateLte = TmdbDateNormalizer.normalize(
+            string(for: ["releaseDateLte", "release_date_lte", "primary_release_date.lte", "release_date.lte"]),
+            isEndDate: true
+        )
         voteAverageGte = double(for: ["voteAverageGte", "vote_average_gte", "vote_average.gte"])
         voteAverageLte = double(for: ["voteAverageLte", "vote_average_lte", "vote_average.lte"])
         voteCountGte = int(for: ["voteCountGte", "vote_count_gte", "vote_count.gte"])

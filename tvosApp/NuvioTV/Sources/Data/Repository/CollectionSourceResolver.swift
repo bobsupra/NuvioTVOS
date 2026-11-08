@@ -240,7 +240,10 @@ struct CollectionSourceResolver {
     ) -> [URLQueryItem] {
         let filters = source.filters
         let sort = normalizedTmdbSort(source.sortBy, mediaType: mediaType)
-        let releaseDateLte = nonEmpty(filters?.releaseDateLte)
+        let rawGte = filters?.releaseDateGte
+        let normalizedGte = TmdbDateNormalizer.normalize(rawGte, isEndDate: false)
+        let rawLte = filters?.releaseDateLte
+        let normalizedLte = TmdbDateNormalizer.normalize(rawLte, isEndDate: true)
             ?? (isRecentReleaseSource(source, sort: sort) ? currentLocalDateString() : nil)
         let voteCountGte = filters?.voteCountGte.map { String($0) }
         let voteCountLte = filters?.voteCountLte.map { String($0) }
@@ -278,11 +281,11 @@ struct CollectionSourceResolver {
         }
         values.append((
             mediaType == "tv" ? "first_air_date.gte" : "primary_release_date.gte",
-            filters?.releaseDateGte
+            normalizedGte
         ))
         values.append((
             mediaType == "tv" ? "first_air_date.lte" : "primary_release_date.lte",
-            releaseDateLte
+            normalizedLte
         ))
         return values.compactMap { name, value in
             nonEmpty(value).map { URLQueryItem(name: name, value: $0) }
