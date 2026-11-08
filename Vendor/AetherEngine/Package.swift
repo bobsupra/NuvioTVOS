@@ -48,6 +48,10 @@ let package = Package(
             description: "Compile the Dolby Vision Profile 7 FEL dual-layer composer, so preferDualLayerDolbyVision can take that route."
         ),
         .trait(
+            name: "DolbyVisionFelCurves",
+            description: "Fold a Dolby Vision Profile 7 FEL source's enhancement layer into per-scene reshaping curves of the Profile 8.1 RPU, so the platform's Dolby Vision decoder applies most of its effect on the native route."
+        ),
+        .trait(
             name: "DolbyVisionStillReshaping",
             description: "Compile the CPU reshaping that turns a Dolby Vision Profile 5 / 10.0 frame into a still (scrub thumbnails, I-frame stills, held pictures)."
         ),
@@ -55,6 +59,7 @@ let package = Package(
             "TrueHDObjectAudio",
             "DTSXObjectAudio",
             "DualLayerDolbyVision",
+            "DolbyVisionFelCurves",
             "DolbyVisionStillReshaping",
         ]),
     ],
@@ -72,11 +77,11 @@ let package = Package(
         // Pinned to the minor: 1.1.0 shipped a tvOS floor raise as a minor, SwiftPM
         // floated every `from: "1.0.x"` consumer onto it and then failed on the
         // floor instead of backing off, so all of 5.x stopped resolving.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.1.0")),  // 2.1.0: dolby_vision 3.4.0, header additive only (two new CMv4.0 metadata entry points, nothing removed); 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
+        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.2.0")),  // 2.2.0: dovi_rpu_set_polynomial_mapping (one additive C entry point, for the DolbyVisionFelCurves fold), same dolby_vision 3.4.0; 2.1.0: dolby_vision 3.4.0, header additive only (two new CMv4.0 metadata entry points, nothing removed); 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
         // TrueHD decoder that also decodes the Atmos object presentation (beds, objects, OAMD) for
         // `objectAudioRendering` (#731). The Rust `truehd` crate (Apache-2.0) behind a C API, prebuilt
         // as an xcframework like LibDovi so consumers need no Rust. Pinned to the minor for the same reason.
-        .package(url: "https://github.com/superuser404notfound/LibTrueHD", .upToNextMinor(from: "3.1.0")),  // 3.1.0: the shipped binary decodes exactly again, matrix interpolation included (the object renderer needs it, #731); same API 2; 3.0.0: API 2, the bed companion (the channel presentation decoded with the object presentation) and a per-handle interpolation switch; the interpolating decode an opt-in build feature, off in that binary (#731); 2.3.1: truehd_atmos_version_string() names the truehd commit actually built in (read from Cargo.lock, LibTrueHD#2), same decoder; 2.3.0: decodes about a third faster again (harletty's truehd speed work: blocks decoded in place, table-driven Huffman, vectorised prediction filters, whole-block matrices; truehdd#42 included), byte-identical output; 2.2.1: rust_eh_personality exported weak, so it coalesces with LibDovi's copy and a host with its own Objective-C and C++ stays within compact unwind's three personality routines (#752); same decoder; 2.2.0: decodes about 30% faster (the truehd crate with its block and PCM buffers sized to the samples they hold, truehdd#42, from a fork of upstream main until that is merged), byte-identical output; 2.1.0: x86_64 in the iOS simulator slice, so a generic iOS Simulator build of a host links; same decoder; 2.0.0: transferred from Silo-Server/SiloObjectAudio and renamed (product TrueHD), rebuilt from source; same decoder as SiloObjectAudio 1.0.0
+        .package(url: "https://github.com/superuser404notfound/LibTrueHD", .upToNextMinor(from: "3.2.0")),  // 3.2.0: truehd 0.4.0; 3.1.0: the shipped binary decodes exactly again, matrix interpolation included (the object renderer needs it, #731); same API 2; 3.0.0: API 2, the bed companion (the channel presentation decoded with the object presentation) and a per-handle interpolation switch; the interpolating decode an opt-in build feature, off in that binary (#731); 2.3.1: truehd_atmos_version_string() names the truehd commit actually built in (read from Cargo.lock, LibTrueHD#2), same decoder; 2.3.0: decodes about a third faster again (harletty's truehd speed work: blocks decoded in place, table-driven Huffman, vectorised prediction filters, whole-block matrices; truehdd#42 included), byte-identical output; 2.2.1: rust_eh_personality exported weak, so it coalesces with LibDovi's copy and a host with its own Objective-C and C++ stays within compact unwind's three personality routines (#752); same decoder; 2.2.0: decodes about 30% faster (the truehd crate with its block and PCM buffers sized to the samples they hold, truehdd#42, from a fork of upstream main until that is merged), byte-identical output; 2.1.0: x86_64 in the iOS simulator slice, so a generic iOS Simulator build of a host links; same decoder; 2.0.0: transferred from Silo-Server/SiloObjectAudio and renamed (product TrueHD), rebuilt from source; same decoder as SiloObjectAudio 1.0.0
     ],
     targets: [
         .target(

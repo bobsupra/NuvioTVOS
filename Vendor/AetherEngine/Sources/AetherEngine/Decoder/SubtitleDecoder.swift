@@ -3,6 +3,7 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 
+
 /// Supplied headers can contain arbitrary secrets, not only well-known auth fields.
 /// Immutable per-task state; no request can replace another task's trusted origin.
 final class SubtitleHTTPRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -56,6 +57,8 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
     case textLimitExceeded
     case unsupportedTextCodec
     case codecOpenFailed(code: Int32)
+    /// AE#984: the whole-body fetch of a text sidecar was answered with this status.
+    case httpStatus(Int)
 
     var description: String {
         switch self {
@@ -66,6 +69,7 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
         case .textLimitExceeded: "SubtitleDecoder: text resource limit"
         case .unsupportedTextCodec: "SubtitleDecoder: unsupported text codec"
         case .codecOpenFailed(let code): "SubtitleDecoder: decoder open failed (\(FFmpegErr.text(for: code)))"
+        case .httpStatus(let status): "SubtitleDecoder: the sidecar was answered with HTTP \(status)"
         }
     }
 
@@ -97,6 +101,7 @@ enum SubtitleDecoder {
     #endif
 
 
+    
     /// A per-task delegate covers both initial and dynamically selected sidecars.
     static func downloadHTTPData(
         for request: URLRequest,
@@ -106,7 +111,7 @@ enum SubtitleDecoder {
         return try await URLSession.shared.data(for: request, delegate: delegate)
     }
 
-    /// Decode every cue from the subtitle file at `url`, cancellable via Task.cancel().
+/// Decode every cue from the subtitle file at `url`, cancellable via Task.cancel().
     /// When preserveASSMarkup is true, ASS/SSA cues carry the raw libavcodec event line
     /// (ReadOrder,Layer,Style,...,Text) so ASSScriptBuilder can restyle them; no effect on SRT/VTT.
     /// `sourceStreamIndex` (#266) is an ABSOLUTE AVStream index inside the container at `url`, for
@@ -121,12 +126,13 @@ enum SubtitleDecoder {
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil,
         preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
-        keepsBitmapPackets: Bool = false
+        keepsBitmapPackets: Bool = false,
+        formatHint: String? = nil
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }, preparationPolicy: preparationPolicy,
-            keepsBitmapPackets: keepsBitmapPackets
+            keepsBitmapPackets: keepsBitmapPackets, formatHint: formatHint
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -141,12 +147,13 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
-        sourceStreamIndices: [Int32?]
+        sourceStreamIndices: [Int32?],
+        formatHint: String? = nil
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices
+            requested: sourceStreamIndices, formatHint: formatHint
         )
     }
 
@@ -156,64 +163,23 @@ enum SubtitleDecoder {
         httpHeaders: [String: String],
         preserveASSMarkup: Bool,
         requested: [Int32?]?, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
-        keepsBitmapPackets: Bool = false
+        keepsBitmapPackets: Bool = false, formatHint: String? = nil
     ) async throws -> [SidecarDecodeResult] {
-        let isHTTP = url.scheme == "http" || url.scheme == "https"
-        let effectiveURL: URL
-        let tempFileToClean: URL?
-
-        if isHTTP {
-            var request = URLRequest(url: url)
-            request.timeoutInterval = 15
-            for (key, value) in httpHeaders {
-                request.setValue(value, forHTTPHeaderField: key)
-            }
-            if request.value(forHTTPHeaderField: "User-Agent") == nil {
-                request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
-            }
-            let (data, response) = try await downloadHTTPData(for: request, suppliedHeaders: httpHeaders)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-                throw SubtitleDecoderError.openFailed(code: Int32(code))
-            }
-            guard !data.isEmpty else {
-                throw SubtitleDecoderError.noSubtitleStream
-            }
-
-            var ext = url.pathExtension
-            if ext.isEmpty, let suggested = http.suggestedFilename {
-                ext = (suggested as NSString).pathExtension
-            }
-            if ext.isEmpty, let mime = http.mimeType {
-                if mime.contains("vtt") { ext = "vtt" }
-                else if mime.contains("ass") || mime.contains("ssa") { ext = "ass" }
-                else { ext = "srt" }
-            }
-            if ext.isEmpty { ext = "srt" }
-
-            let tempURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("sub-\(UUID().uuidString).\(ext)")
-            try data.write(to: tempURL)
-            effectiveURL = tempURL
-            tempFileToClean = tempURL
-        } else {
-            effectiveURL = url
-            tempFileToClean = nil
+        // AE#984: a text sidecar over HTTP is one whole-body GET, then a local decode.
+        if preparationPolicy == nil, SidecarTextFetch.appliesTo(url, formatHint: formatHint) {
+            let local = try await SidecarTextFetch.download(url, headers: httpHeaders, formatHint: formatHint)
+            defer { try? FileManager.default.removeItem(at: local) }
+            return try await decode(
+                url: local, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
+                requested: requested, keepsBitmapPackets: keepsBitmapPackets)
         }
-
-        defer {
-            if let tempFileToClean {
-                try? FileManager.default.removeItem(at: tempFileToClean)
-            }
-        }
-
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()
         return try await withTaskCancellationHandler {
             try await BlockingWork.detached(priority: .userInitiated) {
                 try decodeFileSync(
-                    url: effectiveURL, httpHeaders: httpHeaders,
+                    url: url, httpHeaders: httpHeaders,
                     preserveASSMarkup: preserveASSMarkup, requested: requested, cancel: token, preparationPolicy: preparationPolicy,
                     keepsBitmapPackets: keepsBitmapPackets
                 )

@@ -1,131 +1,131 @@
 {
-  "pins" : [
+  "pins": [
     {
-      "identity" : "combine-schedulers",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/combine-schedulers",
-      "state" : {
-        "revision" : "114354e8c1667a2edc4993700fb9fa4f90157b56",
-        "version" : "1.2.2"
+      "identity": "combine-schedulers",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/pointfreeco/combine-schedulers",
+      "state": {
+        "revision": "114354e8c1667a2edc4993700fb9fa4f90157b56",
+        "version": "1.2.2"
       }
     },
     {
-      "identity" : "libdovi",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibDovi",
-      "state" : {
-        "revision" : "0d7cce1d6836a30d13a3a2326e50a153af53f014",
-        "version" : "2.1.0"
+      "identity": "libdovi",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/superuser404notfound/LibDovi",
+      "state": {
+        "revision": "caff700968700467c089a3f38c8b4180620518b5",
+        "version": "2.2.0"
       }
     },
     {
-      "identity" : "libtruehd",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/superuser404notfound/LibTrueHD",
-      "state" : {
-        "revision" : "73bee84d7ac7b8619db570e36490b92761fe91a6",
-        "version" : "3.1.0"
+      "identity": "libtruehd",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/superuser404notfound/LibTrueHD",
+      "state": {
+        "revision": "12b26e487a2ade918e53380d47f5727883fedafc",
+        "version": "3.2.0"
       }
     },
     {
-      "identity" : "smbclient",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/kishikawakatsumi/SMBClient",
-      "state" : {
-        "revision" : "e636c2b2458930770932a36d311ec9d478575b90",
-        "version" : "0.3.1"
+      "identity": "smbclient",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/kishikawakatsumi/SMBClient",
+      "state": {
+        "revision": "e636c2b2458930770932a36d311ec9d478575b90",
+        "version": "0.3.1"
       }
     },
     {
-      "identity" : "supabase-swift",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/supabase/supabase-swift.git",
-      "state" : {
-        "revision" : "fee4bd78997f8b4e919c1c9711e0cfb346fd7a55",
-        "version" : "2.55.4"
+      "identity": "supabase-swift",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/supabase/supabase-swift.git",
+      "state": {
+        "revision": "fee4bd78997f8b4e919c1c9711e0cfb346fd7a55",
+        "version": "2.55.4"
       }
     },
     {
-      "identity" : "swift-asn1",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-asn1.git",
-      "state" : {
-        "revision" : "3b6410f7dee09eb33cdd26260c5fd47fda19b0e2",
-        "version" : "1.7.3"
+      "identity": "swift-asn1",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/apple/swift-asn1.git",
+      "state": {
+        "revision": "3b6410f7dee09eb33cdd26260c5fd47fda19b0e2",
+        "version": "1.7.3"
       }
     },
     {
-      "identity" : "swift-ass-renderer",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mihai8804858/swift-ass-renderer.git",
-      "state" : {
-        "revision" : "28919f6b5ddd896d327b0283f8d97624902236e6",
-        "version" : "1.3.1"
+      "identity": "swift-ass-renderer",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/mihai8804858/swift-ass-renderer.git",
+      "state": {
+        "revision": "28919f6b5ddd896d327b0283f8d97624902236e6",
+        "version": "1.3.1"
       }
     },
     {
-      "identity" : "swift-clocks",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/swift-clocks",
-      "state" : {
-        "revision" : "82440fa0a8b1c381a6d1e8e0fc7bbba53ec63204",
-        "version" : "1.1.1"
+      "identity": "swift-clocks",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/pointfreeco/swift-clocks",
+      "state": {
+        "revision": "82440fa0a8b1c381a6d1e8e0fc7bbba53ec63204",
+        "version": "1.1.1"
       }
     },
     {
-      "identity" : "swift-concurrency-extras",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/swift-concurrency-extras",
-      "state" : {
-        "revision" : "5fa253428866f2360c3754e88537f700ed2656b5",
-        "version" : "1.4.1"
+      "identity": "swift-concurrency-extras",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/pointfreeco/swift-concurrency-extras",
+      "state": {
+        "revision": "5fa253428866f2360c3754e88537f700ed2656b5",
+        "version": "1.4.1"
       }
     },
     {
-      "identity" : "swift-crypto",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-crypto.git",
-      "state" : {
-        "revision" : "da9d28d69ebe3894b18376c8f2395c2f37b8448f",
-        "version" : "4.5.2"
+      "identity": "swift-crypto",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/apple/swift-crypto.git",
+      "state": {
+        "revision": "da9d28d69ebe3894b18376c8f2395c2f37b8448f",
+        "version": "4.5.2"
       }
     },
     {
-      "identity" : "swift-http-types",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/apple/swift-http-types.git",
-      "state" : {
-        "revision" : "bff4b6903cdc99dda49649dd52f46c11cfd3ed50",
-        "version" : "1.8.0"
+      "identity": "swift-http-types",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/apple/swift-http-types.git",
+      "state": {
+        "revision": "bff4b6903cdc99dda49649dd52f46c11cfd3ed50",
+        "version": "1.8.0"
       }
     },
     {
-      "identity" : "swift-issue-reporting",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/swift-issue-reporting",
-      "state" : {
-        "revision" : "75b000cea2ca6d7527a57e1b9cc0bdf21a9abe9f",
-        "version" : "2.1.1"
+      "identity": "swift-issue-reporting",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/pointfreeco/swift-issue-reporting",
+      "state": {
+        "revision": "75b000cea2ca6d7527a57e1b9cc0bdf21a9abe9f",
+        "version": "2.1.1"
       }
     },
     {
-      "identity" : "swift-libass",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/mihai8804858/swift-libass",
-      "state" : {
-        "revision" : "6513c488e377a26c06db327fb2acfc2653a041d5",
-        "version" : "1.4.0"
+      "identity": "swift-libass",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/mihai8804858/swift-libass",
+      "state": {
+        "revision": "6513c488e377a26c06db327fb2acfc2653a041d5",
+        "version": "1.4.0"
       }
     },
     {
-      "identity" : "xctest-dynamic-overlay",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/pointfreeco/xctest-dynamic-overlay",
-      "state" : {
-        "revision" : "d9308ad679143c26a30dec52daefe82f54af2b82",
-        "version" : "1.13.1"
+      "identity": "xctest-dynamic-overlay",
+      "kind": "remoteSourceControl",
+      "location": "https://github.com/pointfreeco/xctest-dynamic-overlay",
+      "state": {
+        "revision": "d9308ad679143c26a30dec52daefe82f54af2b82",
+        "version": "1.13.1"
       }
     }
   ],
-  "version" : 2
+  "version": 2
 }

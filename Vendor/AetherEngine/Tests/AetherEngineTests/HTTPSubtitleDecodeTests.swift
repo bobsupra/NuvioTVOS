@@ -53,6 +53,14 @@ final class HTTPSubtitleDecodeTests: XCTestCase {
     override func setUp() {
         super.setUp()
         HTTPSubtitleDecodeURLProtocol.reset()
+        let config = URLSessionConfiguration.ephemeral
+        config.protocolClasses = [HTTPSubtitleDecodeURLProtocol.self]
+        SidecarTextFetch.customSession = URLSession(configuration: config)
+    }
+
+    override func tearDown() {
+        SidecarTextFetch.customSession = nil
+        super.tearDown()
     }
 
     func testHTTPSubtitleDecodeSuccess() async throws {
@@ -96,8 +104,10 @@ final class HTTPSubtitleDecodeTests: XCTestCase {
 
         do {
             _ = try await SubtitleDecoder.decodeFile(url: url)
-            XCTFail("Expected 404 to throw openFailed")
-        } catch let SubtitleDecoderError.openFailed(code) {
+            XCTFail("Expected 404 to throw")
+        } catch SubtitleDecoderError.httpStatus(let code) {
+            XCTAssertEqual(code, 404)
+        } catch SubtitleDecoderError.openFailed(let code) {
             XCTAssertEqual(code, 404)
         }
     }

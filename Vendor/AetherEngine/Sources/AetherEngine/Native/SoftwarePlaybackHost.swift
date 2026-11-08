@@ -477,7 +477,7 @@ final class SoftwarePlaybackHost {
 
     var isUsingSoftwareSpatialAudio: Bool {
         switch audioRoute {
-        case .apac, .pcmBed:
+        case .apac, .pcmBed, .decodedEAC3JOC:
             return hasSoftwareSpatialAudioRoute
         default:
             return false
@@ -492,6 +492,7 @@ final class SoftwarePlaybackHost {
         switch audioRoute {
         case .pcm: return nil
         case .compressedEAC3JOC: return "E-AC-3 JOC → renderer (compressed)"
+        case .decodedEAC3JOC(let layout): return "E-AC-3 JOC → PCM \(layout.rawValue) (system decoder)"
         case .apac(let layout): return "APAC \(layout.rawValue)"
         case .pcmBed(let layout): return "LPCM Bed \(layout.rawValue)"
         }
@@ -1132,7 +1133,7 @@ final class SoftwarePlaybackHost {
         switch route {
         case .pcm: return .decoded
         case .compressedEAC3JOC: return .streamCopy
-        case .apac, .pcmBed: return .bridged
+        case .apac, .pcmBed, .decodedEAC3JOC: return .bridged
         }
     }
 
@@ -1884,7 +1885,7 @@ final class SoftwarePlaybackHost {
 
     /// Waits for the registration on the route that needs it and never on any other.
     static func awaitAtmosPrimer(for route: SoftwareAtmosRoute, wait: @MainActor () async -> Void) async {
-        guard route == .compressedEAC3JOC else { return }
+        guard route.needsAtmosDecoder else { return }
         await wait()
     }
 

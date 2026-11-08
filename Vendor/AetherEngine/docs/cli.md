@@ -216,6 +216,8 @@ arms read as `The system does not trust the origin's certificate` without the fl
 
 `--teletext-page N` sets `LoadOptions.teletextPage` for the load, and `--switch-teletext-page <page|auto>[@ms]` changes it on a channel that is already playing (default +20 s, deliberately long: the switch has to land after `--subs` has a teletext track showing, else the run measures the load option it could already measure). The engine states what the change reached, `re-decoding N channel(s)` or `no active teletext track to re-decode`, so a page that does nothing is distinguishable from a page that never arrived. Real teletext needs a broadcast transport stream; there is no way to synthesise one with ffmpeg, so the CLI check covers the wiring and the gate, and the decode itself is confirmed against a live DVB channel (#364).
 
+`--subtitle-offset-reach SECONDS` sets `maximumSubtitleOffsetSeconds` before the load, and every tick line then carries `bmp=<count>/<MB>`, the decoded bitmap cues `$subtitleCues` retains. Together with `--malloc-census` or the memprobe line that is the A/B for AE#929: on a 300 s fixture with an opaque 1120x900 PGS image every 3 s, a reach of 60 retains 41 images (165 MB) and 0 retains 16 (64.5 MB), with the landing cue of a seek back still in the next tick.
+
 `--preserve-ass-markup` sets `LoadOptions.preserveASSMarkup` for the load, so the cue log shows which codecs the flag reaches: an ASS track prints the raw nine-field event line (`0,0,Default,,0,0,0,,{\i1}line{\i0}`) and every other text codec prints extracted text, in the same session. libavcodec normalises SubRip, WebVTT and mov_text through `ff_ass_add_rect`, so all of them carry an ASS payload the engine could emit, and the codec gate is the only thing between a host and nine stray header fields. AE#587 reported the gate missing on the embedded path and could only be argued from the source, because no harness had ever set the flag. Fixture: mux an SRT and an ASS file into one container and select each in turn.
 
 ```bash
@@ -283,6 +285,8 @@ live-only session took a rebuild that rejoins at the edge.
 `--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, `prefer-dual-layer-dv` (alias `fel-mode`, `true|false`: `LoadOptions.preferDualLayerDolbyVision`, so a running session can be moved on or off the Profile 7 FEL route), `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored, and `autoplay`, which drives the third answer: a field the session owns, neither refused nor applied. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
 
 `play --sw` sets `LoadOptions.preferredDecodePath = .software` (#461), the shipping per-session lever, rather than the process-global `setForceSoftwarePathForTesting` it drove before; that hook is still what `live --sw` and `dvr` use, since those harnesses run several sessions and want every one of them on the software host. `--reload-applying decode-path=software` is the same lever applied to a session that is already playing: on the 300 s H.264 fixture the run dispatches `codec=27 → native`, takes the correction at t=9.90 s and comes back `codec=27 → software` at 10.81 s, playing. On a live load the override reaches the same routing decision, which is the case with no alternative, since the #2 capability gate is VOD-only for H.264 / HEVC and such a live session is never classified at all.
+
+On a finite MPEG-TS HLS playlist `play --sw` is also the AE#990 route: the AE#154 reroute logs `AE#990: finite MPEG-TS HLS with preferredDecodePath=.software`, the session dispatches `codec=27 → software` off the seekable TS ingest, and `--start-position` and `--seek-pattern` land (30.00 s and 41.29 s on a 60 s 1080i H.264 fixture with 5 reference frames, MP2 plus AC-3). The refusal half needs a native mount that fails on its media, and macOS AVPlayer plays that fixture. An origin that serves AVFoundation (`User-Agent` containing `AppleCoreMedia`) the segments with every PES payload byte scrambled, and serves the engine's own fetcher the real ones, is that mount: plain `play` then prints `#561 AVPlayer refused the media (CoreMediaErrorDomain/-12976)`, `ESCALATION at 0.00s`, the AE#990 line and `VERDICT: OK`, where main ends in `.error` with exit 2.
 
 `play --no-sw-escalation` sets `LoadOptions.escalatesToSoftwarePath = false` (AE#629), and every `play` run prints an `ESCALATION at <s> duringStartup=<bool> absorbed=<domain>/<code> <kind>` line when the AE#561 rebuild is taken. The pair is the A/B for a host's own fallback ladder. On a 40 s HEVC fixture from `Scripts/nal-overrun-fixture.py --after 20`, played with `AETHER_DISABLE_NAL_SANITIZER=1`, the default arm prints `ESCALATION at 12.00s duringStartup=false absorbed=CoreMediaErrorDomain/-19602 nativeItemFailed`, rebuilds on the software path and plays to the end (`VERDICT: OK`). The declining arm prints no escalation, goes to `.error` with `-19602` at 12.00 s and exits 2.
 
@@ -555,6 +559,14 @@ Composes one Profile 7 FEL keyframe twice on the dual-layer composer, with and w
 
 ```bash
 swift run aetherctl elframe --at 600 --out /tmp/elframe <p7-source>
+```
+
+## felcurves
+
+Runs a whole Profile 7 FEL source through the curve fold the segment producer uses (`AetherEngine.felCurveFold`, [Dolby Vision FEL › Curve fold](dolby-vision-fel.md#7-curve-fold-on-the-native-route)) and writes the Profile 8.1 RPUs it produced (stream mapping kept, luma residual folded in), in presentation order, as a dovi_tool RPU file. `dovi_tool inject-rpu` puts them into the base layer for playback through the platform decoder. Prints how many scenes were fitted, had no residual or failed, and the time taken. Needs the `DolbyVisionFelCurves` trait.
+
+```bash
+swift run --traits DolbyVisionFelCurves aetherctl felcurves <p7-fel-source> /tmp/folded.rpu
 ```
 
 ## pktdump
