@@ -559,10 +559,9 @@ private struct DiscoverCard: View {
 
                 if posterLabels {
                     VStack(alignment: .leading, spacing: 2) {
-                        Text(meta.name)
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
-                            .lineLimit(1)
+                        MarqueeText(meta.name, size: 20, weight: .semibold,
+                                    color: showsFocusedAppearance ? .white : .white.opacity(0.78),
+                                    isActive: showsFocusedAppearance)
                         if let year = meta.year {
                             Text(String(year))
                                 .font(.system(size: 16, weight: .medium))

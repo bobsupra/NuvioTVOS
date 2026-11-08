@@ -922,10 +922,8 @@ struct NetflixSearchView: View {
                             viewModel.commitCurrentSearch()
                             onContentClick(item.id, item.type)
                         } label: {
-                            Text(item.name)
-                                .font(.system(size: 24, weight: isFocused ? .bold : .regular))
-                                .foregroundColor(isFocused ? .black : .white.opacity(0.85))
-                                .lineLimit(1)
+                            MarqueeText(item.name, size: 24, weight: isFocused ? .bold : .regular,
+                                        color: isFocused ? .black : .white.opacity(0.85), isActive: isFocused)
                                 .padding(.horizontal, 20)
                                 .frame(height: 54)
                                 .frame(maxWidth: .infinity, alignment: .leading)
