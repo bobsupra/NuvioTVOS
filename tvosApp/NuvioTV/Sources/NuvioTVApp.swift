@@ -25,6 +25,8 @@ struct NuvioTVApp: App {
         URLCache.shared.memoryCapacity = memCapacity
         URLCache.shared.diskCapacity = diskCapacity
         TopShelfRatingsBridge.install()
+        // Fonts added in Settings → Subtitles → Custom Fonts, registered for this app.
+        SubtitleFontLibrary.prepareAtLaunch()
         // Before launch finishes, as BGTaskScheduler requires.
         TopShelfBackgroundRefresh.register()
         let payloadMigrationKey = "nuvio.tv.migrations.largePayloadPreferences.v1"

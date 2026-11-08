@@ -681,6 +681,10 @@ struct SubtitleStyle: Codable, Equatable, Hashable, Sendable {
         case "Helvetica Neue", "Trebuchet MS", "Futura", "Avenir Next", "Georgia", "Menlo", "Courier New":
             return .custom(fontName, size: size).weight(weight)
         default:
+            // A family from Custom Fonts: by its regular face, a family name alone isn't a font name.
+            if let face = SubtitleFontFaces.regularFaceName(family: fontName) {
+                return .custom(face, size: size).weight(weight)
+            }
             return .system(size: size, weight: weight, design: .default)
         }
     }
@@ -6622,6 +6626,298 @@ private struct MdbListOptionsSheet: View {
     }
 }
 
+/// Settings → Subtitles → Custom Fonts: fonts sent from another device through this Apple TV's
+/// own page, or downloaded from a link, then chosen in Font like the built-in ones.
+private struct CustomSubtitleFontsSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SubtitleStyleKey.fontName) private var fontName = SubtitleStyleDefaults.fontName
+    @ObservedObject private var library = SubtitleFontLibrary.shared
+    @State private var server = SubtitleFontUploadServer()
+    @State private var serverState: SubtitleFontUploadServer.State = .stopped
+    @State private var link = ""
+    @State private var linkStatus: String?
+    @State private var linkFailed = false
+    @State private var isDownloading = false
+    @State private var selectedFont: SubtitleFont?
+    // Per Apple TV, as the fonts are.
+    @AppStorage(SubtitleFontPageKey.keepAddressKey, store: .standard) private var keepAddress = true
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(L10n.string("subtitle_custom_fonts", fallback: "Custom Fonts"))
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(L10n.string(
+                            "subtitle_custom_fonts_intro",
+                            fallback: "Fonts added here can be chosen in Font. Styled (ASS) subtitles keep their own fonts, and find yours when they ask for them by name."
+                        ))
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("subtitle_custom_fonts_add", fallback: "Add Fonts"),
+                        subtitle: L10n.string(
+                            "subtitle_custom_fonts_add_subtitle",
+                            fallback: "TTF, OTF or TTC files, or a ZIP with fonts in it"
+                        )
+                    ) {
+                        deviceUpload
+
+                        SettingsToggleRow(
+                            title: L10n.string("subtitle_custom_fonts_keep_address", fallback: "Keep the Same Address"),
+                            subtitle: L10n.string(
+                                "subtitle_custom_fonts_keep_address_subtitle",
+                                fallback: "The page keeps its address, so it can be bookmarked; off makes a new one each time"
+                            ),
+                            isOn: $keepAddress,
+                            accentColor: accentColor
+                        )
+
+                        if keepAddress {
+                            SettingsActionRow(
+                                title: L10n.string("subtitle_custom_fonts_new_address", fallback: "New Address"),
+                                subtitle: L10n.string(
+                                    "subtitle_custom_fonts_new_address_subtitle",
+                                    fallback: "A new address for the page; the old one stops working"
+                                ),
+                                value: "",
+                                accentColor: accentColor
+                            ) {
+                                server.change(key: SubtitleFontPageKey.renew())
+                            }
+                        }
+
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("subtitle_custom_fonts_link", fallback: "From a Link"),
+                            subtitle: L10n.string(
+                                "subtitle_custom_fonts_link_subtitle",
+                                fallback: "A font file or a ZIP, or a GitHub, Dropbox, Google Drive or Google Fonts link"
+                            ),
+                            placeholder: L10n.string("subtitle_custom_fonts_link_placeholder", fallback: "Type or paste a link"),
+                            text: $link,
+                            fieldWidth: 420,
+                            status: linkStatus,
+                            statusColor: linkFailed ? .red.opacity(0.9) : .green.opacity(0.9),
+                            onCommit: addLink
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("subtitle_custom_fonts_yours", fallback: "Your Fonts"),
+                        subtitle: library.fonts.isEmpty
+                            ? L10n.string("subtitle_custom_fonts_none", fallback: "No fonts yet")
+                            : L10n.format(
+                                "subtitle_custom_fonts_total",
+                                fallback: "%@ on this Apple TV. Select a font to use or delete it.",
+                                Self.sizeText(library.totalBytes)
+                            )
+                    ) {
+                        ForEach(library.fonts) { font in
+                            CustomSubtitleFontRow(
+                                font: font,
+                                details: details(for: font),
+                                isMissing: library.isMissing(font),
+                                isChosen: font.families.contains(fontName) && !library.isMissing(font),
+                                accentColor: accentColor
+                            ) {
+                                selectedFont = font
+                            }
+                        }
+                    }
+                }
+                .frame(width: 1_000, alignment: .leading)
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+        // The page for another device listens only while this screen is open and the app is in
+        // front; nothing runs in the background otherwise.
+        .onAppear(perform: startServer)
+        .onDisappear { server.stop() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .background {
+                server.stop()
+            } else if phase == .active, serverState == .stopped {
+                startServer()
+            }
+        }
+        .onChange(of: keepAddress) { _, keep in
+            server.change(key: keep ? SubtitleFontPageKey.current() : SubtitleFontUploadServer.makeKey())
+        }
+        .onExitCommand { dismiss() }
+        .confirmationDialog(
+            selectedFont?.displayName ?? "",
+            isPresented: Binding(
+                get: { selectedFont != nil },
+                set: { if !$0 { selectedFont = nil } }
+            ),
+            titleVisibility: .visible,
+            presenting: selectedFont
+        ) { font in
+            if !library.isMissing(font) {
+                Button(L10n.string("subtitle_custom_fonts_use", fallback: "Use for Subtitles")) {
+                    fontName = font.family
+                }
+            }
+            Button(L10n.string("subtitle_custom_fonts_delete", fallback: "Delete"), role: .destructive) {
+                library.delete(font)
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        }
+    }
+
+    @ViewBuilder
+    private var deviceUpload: some View {
+        switch serverState {
+        case let .ready(url):
+            HStack(alignment: .center, spacing: 28) {
+                SettingsQRCodeCard(
+                    title: L10n.string("subtitle_custom_fonts_device", fallback: "From Another Device"),
+                    link: url.absoluteString
+                )
+                Text(L10n.string(
+                    "subtitle_custom_fonts_device_steps",
+                    fallback: "Scan the code, or type the address, on a phone, tablet or computer on the same network as this Apple TV. Choose the font files or drop them on the page; you can paste a link there too. The page works while this screen is open. With Keep the Same Address on, a bookmark of it keeps working as long as the Apple TV keeps its network address."
+                ))
+                .font(.system(size: 19, weight: .medium))
+                .foregroundColor(.white.opacity(0.7))
+                .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.vertical, 8)
+        case .failed:
+            Text(L10n.string(
+                "subtitle_custom_fonts_device_failed",
+                fallback: "Sending from another device needs this Apple TV on your home network (Wi-Fi or Ethernet). A link still works."
+            ))
+            .font(.system(size: 19, weight: .medium))
+            .foregroundColor(.orange.opacity(0.9))
+            .fixedSize(horizontal: false, vertical: true)
+        case .starting, .stopped:
+            Text(L10n.string("subtitle_custom_fonts_device_starting", fallback: "Preparing the page for another device…"))
+                .font(.system(size: 19, weight: .medium))
+                .foregroundColor(.white.opacity(0.56))
+        }
+    }
+
+    private func startServer() {
+        server.start(
+            key: SubtitleFontPageKey.current(),
+            handler: { route, body in
+                await SubtitleFontWebAPI.respond(to: route, body: body)
+            },
+            changed: { state in
+                Task { @MainActor in serverState = state }
+            }
+        )
+    }
+
+    private func addLink() {
+        let text = link.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, !isDownloading else { return }
+        isDownloading = true
+        linkFailed = false
+        linkStatus = L10n.string("subtitle_custom_fonts_downloading", fallback: "Downloading…")
+        Task { @MainActor in
+            do {
+                let added = try await library.add(link: text)
+                let names = added.map(\.displayName)
+                linkStatus = names.count == 1
+                    ? L10n.format("subtitle_custom_fonts_added_one", fallback: "Added %@", names[0])
+                    : L10n.format("subtitle_custom_fonts_added_many", fallback: "Added %@ fonts", String(names.count))
+                link = ""
+            } catch {
+                linkFailed = true
+                linkStatus = SubtitleFontError.message(for: error)
+            }
+            isDownloading = false
+        }
+    }
+
+    private func details(for font: SubtitleFont) -> String {
+        if library.isMissing(font) {
+            return L10n.string(
+                "subtitle_custom_fonts_missing",
+                fallback: "Missing: tvOS removed the file to free space. Add it again."
+            )
+        }
+        var parts = [font.family, Self.sizeText(font.bytes)]
+        if font.fullNames.count > 1 {
+            parts.append(L10n.format("subtitle_custom_fonts_styles", fallback: "%@ styles", String(font.fullNames.count)))
+        }
+        parts.append(font.link == nil
+            ? L10n.string("subtitle_custom_fonts_from_device", fallback: "sent from a device")
+            : L10n.string("subtitle_custom_fonts_from_link", fallback: "from a link"))
+        return parts.joined(separator: " · ")
+    }
+
+    static func sizeText(_ bytes: Int) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+}
+
+/// A font in Custom Fonts, its name written in itself.
+private struct CustomSubtitleFontRow: View {
+    let font: SubtitleFont
+    let details: String
+    let isMissing: Bool
+    let isChosen: Bool
+    let accentColor: Color
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(font.displayName)
+                        .font(nameFont)
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    Text(details)
+                        .font(.appFont(size: 17, weight: .medium))
+                        .foregroundColor(isMissing ? .orange.opacity(0.9) : .white.opacity(0.56))
+                        .lineLimit(2)
+                }
+
+                Spacer(minLength: 24)
+
+                if isChosen {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(accentColor)
+                }
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .entryLockable()
+    }
+
+    private var nameFont: Font {
+        guard !isMissing, let face = font.postScriptNames.first else {
+            return .appFont(size: 24, weight: .semibold)
+        }
+        return .custom(face, size: 26)
+    }
+}
+
 private struct AISubtitleOptionsSheet: View {
     let accentColor: Color
 
@@ -10790,6 +11086,8 @@ struct SubtitleStyleEditor: View {
     let accentColor: Color
     var onChange: (() -> Void)? = nil
 
+    @ObservedObject private var fontLibrary = SubtitleFontLibrary.shared
+    @State private var showingCustomFonts = false
     @AppStorage(SubtitleStyleKey.fontName) private var fontName = SubtitleStyleDefaults.fontName
     @AppStorage(SubtitleStyleKey.textSize) private var textSize = SubtitleStyleDefaults.textSize
     @AppStorage(SubtitleStyleKey.bold) private var bold = SubtitleStyleDefaults.bold
@@ -10849,6 +11147,10 @@ struct SubtitleStyleEditor: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .onChange(of: changeToken) { _, _ in onChange?() }
+        .sheet(isPresented: $showingCustomFonts) {
+            CustomSubtitleFontsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
     }
 
     private var controls: some View {
@@ -10996,9 +11298,27 @@ struct SubtitleStyleEditor: View {
                     title: L10n.string("subtitle_font", fallback: "Font"),
                     subtitle: L10n.string("subtitle_font_desc", fallback: "Typeface used for subtitles"),
                     selection: $fontName,
-                    options: SubtitleFontOption.allCases.map(\.rawValue),
-                    accentColor: accentColor
+                    options: SubtitleFontOption.allCases.map(\.rawValue) + fontLibrary.familyNames,
+                    accentColor: accentColor,
+                    optionLabel: { name in
+                        // Fonts from Custom Fonts are marked as uploaded.
+                        SubtitleFontOption(rawValue: name) == nil && fontLibrary.familyNames.contains(name)
+                            ? name + " · " + L10n.string("player_subtitle_font_uploaded", fallback: "Uploaded")
+                            : L10n.optionLabel(name)
+                    }
                 )
+
+                SettingsActionRow(
+                    title: L10n.string("subtitle_custom_fonts", fallback: "Custom Fonts"),
+                    subtitle: L10n.string(
+                        "subtitle_custom_fonts_desc",
+                        fallback: "Your own fonts, sent from a phone or computer or downloaded from a link"
+                    ),
+                    value: fontLibrary.fonts.isEmpty ? "" : "\(fontLibrary.fonts.count)",
+                    accentColor: accentColor
+                ) {
+                    showingCustomFonts = true
+                }
 
                 SettingsStepperRow(
                     title: L10n.string("tvos_settings_text_size", fallback: "Text Size"),

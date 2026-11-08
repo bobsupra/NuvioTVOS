@@ -118,7 +118,9 @@ enum SubtitleAttributedText {
         let design: UIFontDescriptor.SystemDesign
         switch family {
         case .system: return system
-        case let .named(name): return UIFont(name: name, size: size) ?? system
+        case let .named(name):
+            // A family from Custom Fonts goes by its regular face: a family name isn't a font name.
+            return UIFont(name: name, size: size) ?? SubtitleFontFaces.font(family: name, size: size) ?? system
         case .rounded: design = .rounded
         case .serif: design = .serif
         case .monospaced: design = .monospaced

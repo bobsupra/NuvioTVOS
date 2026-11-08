@@ -2312,6 +2312,8 @@ struct PlayerSettingsPanel: View {
         case debugOverlay
         case aspect(String)
         case style(StyleControl)
+        /// A font in the Font list: a built-in option's name, or "custom:" and an added family.
+        case fontChoice(String)
         case gesturesSwitch
         case gestureReset
         case gestureAction(String)
@@ -2340,6 +2342,9 @@ struct PlayerSettingsPanel: View {
     @State private var isNamingPreset = false
     @State private var presetNameToSave = ""
     @State private var renamingPresetID: String?
+    /// The style column shows the list of fonts instead (Font pressed); Back returns.
+    @State private var isPickingFont = false
+    @ObservedObject private var fontLibrary = SubtitleFontLibrary.shared
     @FocusState private var focus: Focus?
 
     private var visibleTabs: [Tab] {
@@ -2485,6 +2490,8 @@ struct PlayerSettingsPanel: View {
             if isNamingPreset {
                 isNamingPreset = false
                 renamingPresetID = nil
+            } else if isPickingFont {
+                closeFontPicker()
             } else {
                 onClose()
             }
@@ -2618,7 +2625,11 @@ struct PlayerSettingsPanel: View {
         HStack(alignment: .top, spacing: 56) {
             languagesColumn
             subtitlesColumn
-            styleColumn
+            if isPickingFont {
+                fontPickerColumn
+            } else {
+                styleColumn
+            }
         }
         .frame(maxHeight: .infinity, alignment: .top)
     }
@@ -3013,10 +3024,7 @@ struct PlayerSettingsPanel: View {
                         value: style.fontName,
                         focusKey: .font
                     ) {
-                        let all = SubtitleFontOption.allCases.map(\.rawValue)
-                        let idx = all.firstIndex(of: style.fontName) ?? 0
-                        let next = all[(idx + 1) % all.count]
-                        updateStyle { $0.fontName = next }
+                        isPickingFont = true
                     }
 
                     toggleRow(title: L10n.string("subtitle_style_bold", fallback: "Bold"), isOn: style.bold, focusKey: .bold) {
@@ -3096,6 +3104,99 @@ struct PlayerSettingsPanel: View {
         let defaults = ProfileSettings.current
         style.applyToDefaults(defaults)
         viewModel.applySubtitleStyle()
+    }
+
+    // MARK: Font list
+
+    /// Every font for subtitles: the built-in ones, then the ones added in Settings → Subtitles →
+    /// Custom Fonts, marked as uploaded. Each name is written in its own font.
+    private var fontPickerColumn: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            columnHeader(L10n.string("subtitle_font", fallback: "Font"))
+            ScrollView(showsIndicators: false) {
+                VStack(alignment: .leading, spacing: 12) {
+                    ForEach(SubtitleFontOption.allCases) { option in
+                        fontChoiceRow(name: option.rawValue, title: option.displayName, isUploaded: false)
+                    }
+
+                    if !fontLibrary.familyNames.isEmpty {
+                        styleLabel(L10n.string("subtitle_custom_fonts_yours", fallback: "Your Fonts"))
+                            .padding(.top, 16)
+                        ForEach(fontLibrary.familyNames, id: \.self) { family in
+                            fontChoiceRow(name: family, title: family, isUploaded: true)
+                        }
+                    }
+                }
+                .padding(.vertical, 6)
+                .padding(.bottom, 26)
+            }
+            .focusSection()
+            .scrollClipDisabledIfAvailable()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .onAppear {
+            DispatchQueue.main.async { focus = .fontChoice(currentFontChoiceKey) }
+        }
+    }
+
+    /// The list key of the chosen font: an added family when it isn't a built-in name.
+    private var currentFontChoiceKey: String {
+        let builtIn = SubtitleFontOption.allCases.map(\.rawValue)
+        if builtIn.contains(style.fontName) { return style.fontName }
+        if fontLibrary.familyNames.contains(style.fontName) { return "custom:" + style.fontName }
+        return SubtitleFontOption.system.rawValue
+    }
+
+    private func fontChoiceRow(name: String, title: String, isUploaded: Bool) -> some View {
+        let key = isUploaded ? "custom:" + name : name
+        let isFocused = focus == .fontChoice(key)
+        let isSelected = currentFontChoiceKey == key
+        return Button {
+            updateStyle { $0.fontName = name }
+            closeFontPicker()
+        } label: {
+            HStack(alignment: .center, spacing: 14) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(title)
+                        .font(SubtitleStyle(fontName: name).font(size: 28, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                    if isUploaded {
+                        Text(L10n.string("player_subtitle_font_uploaded", fallback: "Uploaded"))
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(isFocused ? .black.opacity(0.66) : .white.opacity(0.72))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 4)
+                            .background(
+                                Capsule().fill(isFocused ? Color.black.opacity(0.10) : Color.white.opacity(0.14))
+                            )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 27, weight: .bold))
+                        .foregroundColor(isFocused ? .black : .white)
+                }
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 16)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(0.07))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: .fontChoice(key))
+        .focusEffectDisabledIfAvailable()
+    }
+
+    private func closeFontPicker() {
+        isPickingFont = false
+        DispatchQueue.main.async { focus = .style(.font) }
     }
 
     private func cycleRow(title: String, value: String, focusKey: StyleControl, action: @escaping () -> Void) -> some View {
