@@ -1393,6 +1393,255 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(configured.count, 1)
         XCTAssertEqual(configured[0].name, "AIO 1")
     }
+
+    func testBaseContentIdExtractsExpectedRoot() {
+        XCTAssertEqual(StreamsRepository.baseContentId(from: "tt1856101"), "tt1856101")
+        XCTAssertEqual(StreamsRepository.baseContentId(from: "tt0903747:1:2"), "tt0903747")
+        XCTAssertEqual(StreamsRepository.baseContentId(from: "tmdb:335984"), "tmdb:335984")
+        XCTAssertEqual(StreamsRepository.baseContentId(from: "tmdb:1396:1:2"), "tmdb:1396")
+        XCTAssertEqual(StreamsRepository.baseContentId(from: "jellyfin-server1-item1"), "jellyfin-server1-item1")
+        XCTAssertEqual(StreamsRepository.baseContentId(from: "jellyfin-server1-series1:2:3"), "jellyfin-server1-series1")
+    }
+
+    @MainActor
+    func testJellyfinLibraryIndexTitlesMatching() {
+        let serverID = "srv-\(UUID().uuidString)"
+        let title = JellyfinIndexedTitle(
+            contentId: "jellyfin-\(serverID)-item42",
+            serverID: serverID,
+            libraryID: "lib1",
+            libraryName: "Movies",
+            itemId: "item42",
+            type: "movie",
+            name: "Blade Runner 2049",
+            overview: "A young blade runner...",
+            year: 2017,
+            genres: ["Sci-Fi"],
+            communityRating: 8.0,
+            officialRating: "R",
+            premiereDate: "2017-10-06",
+            runTimeTicks: 164 * 60 * 10_000_000,
+            imdbId: "tt1856101",
+            tmdbId: 335984,
+            primaryImageTag: "tag1",
+            backdropImageTag: "tag2",
+            cast: ["Ryan Gosling"],
+            directors: ["Denis Villeneuve"],
+            items: [
+                JellyfinIndexedItem(
+                    itemId: "item42",
+                    container: "mkv",
+                    size: 15_000_000_000,
+                    season: nil,
+                    episode: nil,
+                    episodeName: nil,
+                    episodeOverview: nil,
+                    episodePremiereDate: nil,
+                    episodeImageTag: nil
+                )
+            ]
+        )
+
+        JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+        defer { JellyfinLibraryIndex.shared.removeAll(forServerID: serverID) }
+
+        // Match by synthetic contentId
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles(matching: "jellyfin-\(serverID)-item42").count, 1)
+        // Match by raw itemId
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles(matching: "item42").count, 1)
+        // Match by canonical IMDb ID (what NuvioMeta.streamId outputs for Blade Runner 2049)
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles(matching: "tt1856101").count, 1)
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles(matching: "imdb:1856101").count, 1)
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles(matching: "1856101").count, 1)
+        // Match by TMDB ID
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles(matching: "tmdb:335984").count, 1)
+        // Non-matches
+        XCTAssertTrue(JellyfinLibraryIndex.shared.titles(matching: "tt9999999").isEmpty)
+        XCTAssertTrue(JellyfinLibraryIndex.shared.titles(matching: "tmdb:9999999").isEmpty)
+        XCTAssertTrue(JellyfinLibraryIndex.shared.titles(matching: "").isEmpty)
+    }
+
+    @MainActor
+    func testJellyfinStreamGroupResolvesWhenPlayUsesImdbStreamId() async throws {
+        let suiteName = "NuvioTVTests.JellyfinPlay.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        let testProfileID = "jellyfin-play-\(UUID().uuidString)"
+        ProfileSettings.setActiveProfile(testProfileID, isPrimary: false)
+        defer {
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
+            }
+        }
+
+        // Configure Jellyfin server
+        let serverID = "srv-\(UUID().uuidString)"
+        let server = JellyfinServerConfig(
+            id: serverID,
+            displayName: "Home Jellyfin",
+            baseURLString: "http://127.0.0.1:8096",
+            authKind: .apiKey,
+            username: "user",
+            userId: "uid-1",
+            selectedLibraryIDs: ["lib-1"],
+            lastSyncDate: Date(),
+            lastSyncTitleCount: 1,
+            syncAutomatically: false
+        )
+        JellyfinServerStore.shared.upsert(server)
+        JellyfinCredentialStore.save("test-token-123", forServerID: serverID)
+        defer {
+            JellyfinServerStore.shared.remove(serverID)
+        }
+
+        // Index Blade Runner 2049 with IMDb id tt1856101
+        let title = JellyfinIndexedTitle(
+            contentId: "jellyfin-\(serverID)-item42",
+            serverID: serverID,
+            libraryID: "lib-1",
+            libraryName: "Movies",
+            itemId: "item42",
+            type: "movie",
+            name: "Blade Runner 2049",
+            overview: "A young blade runner...",
+            year: 2017,
+            genres: ["Sci-Fi"],
+            communityRating: 8.0,
+            officialRating: "R",
+            premiereDate: "2017-10-06",
+            runTimeTicks: 164 * 60 * 10_000_000,
+            imdbId: "tt1856101",
+            tmdbId: 335984,
+            primaryImageTag: "tag1",
+            backdropImageTag: "tag2",
+            cast: ["Ryan Gosling"],
+            directors: ["Denis Villeneuve"],
+            items: [
+                JellyfinIndexedItem(
+                    itemId: "item42",
+                    container: "mkv",
+                    size: 15_000_000_000,
+                    season: nil,
+                    episode: nil,
+                    episodeName: nil,
+                    episodeOverview: nil,
+                    episodePremiereDate: nil,
+                    episodeImageTag: nil
+                )
+            ]
+        )
+        JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+
+        // Clear any external add-ons so only local sources are evaluated (matching #401 reproduction)
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([], in: ProfileSettings.current)
+
+        // When user plays, NuvioMeta.streamId substitutes IMDb ID "tt1856101"
+        let streams = await StreamsRepository.shared.collectStreams(type: "movie", videoId: "tt1856101", forceRefresh: true)
+
+        XCTAssertFalse(streams.isEmpty, "Jellyfin stream should be resolved for IMDb ID tt1856101")
+        XCTAssertEqual(streams.first?.addonName, "Jellyfin")
+        XCTAssertEqual(streams.first?.name, "Home Jellyfin")
+        XCTAssertTrue(streams.first?.url?.contains("Videos/item42/stream") ?? false)
+        XCTAssertTrue(streams.first?.url?.contains("api_key=test-token-123") ?? false)
+
+        // Verify discovery state does not report "No compatible add-ons"
+        let state = StreamsRepository.shared.state
+        XCTAssertNil(state.emptyStateReason, "Empty state reason should be nil when Jellyfin stream is present")
+        let jellyfinGroup = state.groups.first(where: { $0.addonId == "local.jellyfin" })
+        XCTAssertNotNil(jellyfinGroup)
+        XCTAssertEqual(jellyfinGroup?.streams.count, 1)
+    }
+
+    @MainActor
+    func testJellyfinStreamGroupResolvesSeriesEpisodeWhenUsingCanonicalEpisodeStreamId() async throws {
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        let testProfileID = "jellyfin-series-\(UUID().uuidString)"
+        ProfileSettings.setActiveProfile(testProfileID, isPrimary: false)
+        defer {
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
+            }
+        }
+
+        let serverID = "srv-\(UUID().uuidString)"
+        let server = JellyfinServerConfig(
+            id: serverID,
+            displayName: "Home Jellyfin",
+            baseURLString: "http://127.0.0.1:8096",
+            authKind: .apiKey,
+            username: "user",
+            userId: "uid-1",
+            selectedLibraryIDs: ["lib-shows"],
+            lastSyncDate: Date(),
+            lastSyncTitleCount: 1,
+            syncAutomatically: false
+        )
+        JellyfinServerStore.shared.upsert(server)
+        JellyfinCredentialStore.save("test-token-series", forServerID: serverID)
+        defer {
+            JellyfinServerStore.shared.remove(serverID)
+        }
+
+        let seriesTitle = JellyfinIndexedTitle(
+            contentId: "jellyfin-\(serverID)-series100",
+            serverID: serverID,
+            libraryID: "lib-shows",
+            libraryName: "TV Shows",
+            itemId: "series100",
+            type: "series",
+            name: "Breaking Bad",
+            overview: "Chemistry teacher...",
+            year: 2008,
+            genres: ["Drama"],
+            communityRating: 9.5,
+            officialRating: "TV-MA",
+            premiereDate: "2008-01-20",
+            runTimeTicks: 48 * 60 * 10_000_000,
+            imdbId: "tt0903747",
+            tmdbId: 1396,
+            primaryImageTag: "tag1",
+            backdropImageTag: "tag2",
+            cast: ["Bryan Cranston"],
+            directors: ["Vince Gilligan"],
+            items: [
+                JellyfinIndexedItem(
+                    itemId: "ep-s1e1",
+                    container: "mp4",
+                    size: 2_000_000_000,
+                    season: 1,
+                    episode: 1,
+                    episodeName: "Pilot",
+                    episodeOverview: nil,
+                    episodePremiereDate: nil,
+                    episodeImageTag: nil
+                ),
+                JellyfinIndexedItem(
+                    itemId: "ep-s1e2",
+                    container: "mp4",
+                    size: 2_100_000_000,
+                    season: 1,
+                    episode: 2,
+                    episodeName: "Cat's in the Bag...",
+                    episodeOverview: nil,
+                    episodePremiereDate: nil,
+                    episodeImageTag: nil
+                )
+            ]
+        )
+        JellyfinLibraryIndex.shared.replace(titles: [seriesTitle], forServerID: serverID)
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([], in: ProfileSettings.current)
+
+        // Episode play uses canonicalEpisodeStreamId e.g. "tt0903747:1:2"
+        let streams = await StreamsRepository.shared.collectStreams(type: "series", videoId: "tt0903747:1:2", forceRefresh: true)
+
+        XCTAssertEqual(streams.count, 1)
+        XCTAssertEqual(streams.first?.addonName, "Jellyfin")
+        XCTAssertTrue(streams.first?.url?.contains("Videos/ep-s1e2/stream") ?? false)
+    }
 }
 
 private final class MockStreamHTTPURLProtocol: URLProtocol {

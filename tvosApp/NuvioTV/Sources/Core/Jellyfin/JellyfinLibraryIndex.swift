@@ -108,12 +108,56 @@ final class JellyfinLibraryIndex: ObservableObject {
         return ordered + unordered
     }
 
+    /// Finds all indexed titles matching the given content ID (synthetic Jellyfin ID,
+    /// raw Jellyfin item ID, canonical IMDb ID, or TMDB ID).
+    func titles(matching contentId: String) -> [JellyfinIndexedTitle] {
+        var trimmed = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [] }
+
+        if trimmed.prefix(5).caseInsensitiveCompare("imdb:") == .orderedSame {
+            trimmed = String(trimmed.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let targetImdb: String? = {
+            let candidate = trimmed.lowercased().hasPrefix("tt") ? trimmed : "tt\(trimmed)"
+            return NuvioMeta.canonicalImdbID(from: candidate)
+        }()
+
+        let targetTmdb: Int? = {
+            if trimmed.hasPrefix("tmdb:") {
+                return Int(trimmed.dropFirst("tmdb:".count))
+            }
+            return nil
+        }()
+
+        return titles().filter { title in
+            if title.contentId == trimmed || title.contentId == contentId {
+                return true
+            }
+            if title.itemId == trimmed || trimmed == "jellyfin:\(title.itemId)" {
+                return true
+            }
+            if let targetImdb, let rawImdb = title.imdbId {
+                let candidate = rawImdb.lowercased().hasPrefix("tt") ? rawImdb : "tt\(rawImdb)"
+                if let titleImdb = NuvioMeta.canonicalImdbID(from: candidate), targetImdb == titleImdb {
+                    return true
+                }
+            }
+            if let targetTmdb,
+               let titleTmdb = title.tmdbId,
+               targetTmdb == titleTmdb {
+                return true
+            }
+            return false
+        }
+    }
+
     /// Builds a `NuvioMeta` straight from the synced title — this is the
     /// only metadata Home or Details ever show for a Jellyfin-sourced id.
     /// `nil` only when the title isn't indexed or its server has since been
     /// removed (so there's nowhere to point an image URL).
     func meta(forContentId contentId: String) -> NuvioMeta? {
-        guard let title = titles().first(where: { $0.contentId == contentId }),
+        guard let title = titles().first(where: { $0.contentId == contentId || $0.itemId == contentId }),
               let server = JellyfinServerStore.shared.server(id: title.serverID),
               let baseURL = server.baseURL else { return nil }
         let token = JellyfinCredentialStore.token(forServerID: server.id)

@@ -62,8 +62,14 @@ final class StreamsRepository: ObservableObject {
         return (season, episode)
     }
 
-    nonisolated private static func baseContentId(from videoId: String) -> String {
-        String(videoId.split(separator: ":").first ?? Substring(videoId))
+    nonisolated static func baseContentId(from videoId: String) -> String {
+        let parts = videoId.split(separator: ":")
+        guard parts.count >= 3,
+              Int(parts[parts.count - 2]) != nil,
+              Int(parts[parts.count - 1]) != nil else {
+            return videoId
+        }
+        return parts.dropLast(2).joined(separator: ":")
     }
 
     private func localStreamGroup(videoId: String) -> AddonStreamGroup? {
@@ -97,26 +103,33 @@ final class StreamsRepository: ObservableObject {
     private func jellyfinStreamGroup(videoId: String) -> AddonStreamGroup? {
         let contentId = Self.baseContentId(from: videoId)
         let episode = Self.seasonEpisode(fromVideoId: videoId)
-        guard let title = JellyfinLibraryIndex.shared.titles().first(where: { $0.contentId == contentId }),
-              let server = JellyfinServerStore.shared.server(id: title.serverID),
-              let baseURL = server.baseURL else {
-            return nil
-        }
-        let token = JellyfinCredentialStore.token(forServerID: server.id)
-        let streams = title.items
-            .filter { $0.season == episode.season && $0.episode == episode.episode }
-            .compactMap { item -> NuvioStream? in
-                guard let url = item.streamURL(baseURL: baseURL, accessToken: token) else { return nil }
-                return NuvioStream(
-                    url: url.absoluteString,
-                    name: server.displayName,
-                    description: item.size.map {
-                        ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
-                    },
-                    addonName: "Jellyfin",
-                    videoSize: item.size
+        let matchingTitles = JellyfinLibraryIndex.shared.titles(matching: contentId)
+        guard !matchingTitles.isEmpty else { return nil }
+
+        let servers = Dictionary(uniqueKeysWithValues: JellyfinServerStore.shared.servers.map { ($0.id, $0) })
+        var streams: [NuvioStream] = []
+
+        for title in matchingTitles {
+            guard let server = servers[title.serverID],
+                  let baseURL = server.baseURL else { continue }
+            let token = JellyfinCredentialStore.token(forServerID: server.id)
+            let matchingItems = title.items
+                .filter { $0.season == episode.season && $0.episode == episode.episode }
+            for item in matchingItems {
+                guard let url = item.streamURL(baseURL: baseURL, accessToken: token) else { continue }
+                streams.append(
+                    NuvioStream(
+                        url: url.absoluteString,
+                        name: server.displayName,
+                        description: item.size.map {
+                            ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+                        },
+                        addonName: "Jellyfin",
+                        videoSize: item.size
+                    )
                 )
             }
+        }
         guard !streams.isEmpty else { return nil }
         return AddonStreamGroup(
             addonId: "local.jellyfin",

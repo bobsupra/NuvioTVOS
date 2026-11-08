@@ -73,8 +73,9 @@ final class SMBLibraryIndex: ObservableObject {
     }
 
     func files(forContentId contentId: String, season: Int?, episode: Int?) -> [SMBIndexedFile] {
-        titles()
-            .first { $0.contentId == contentId }?
+        let canonicalTarget = NuvioMeta.canonicalImdbID(from: contentId) ?? contentId
+        return titles()
+            .first { (NuvioMeta.canonicalImdbID(from: $0.contentId) ?? $0.contentId) == canonicalTarget }?
             .files
             .filter { $0.season == season && $0.episode == episode }
             ?? []

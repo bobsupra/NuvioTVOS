@@ -128,11 +128,11 @@ enum SMBLibraryResolver {
     /// among same-title candidates (a search can return both a movie and a
     /// series with the same name).
     static func score(meta: NuvioMeta, query: QueryKey) -> Int {
-        let metaTitle = meta.name.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        let queryTitle = query.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let metaTitle = normalizeTitle(meta.name)
+        let queryTitle = normalizeTitle(query.title)
 
         var score: Int
-        if metaTitle == queryTitle {
+        if !metaTitle.isEmpty && metaTitle == queryTitle {
             score = 60
         } else {
             return 0
@@ -149,5 +149,17 @@ enum SMBLibraryResolver {
         }
 
         return score
+    }
+
+    /// Normalizes title text by expanding equivalents ("&" -> "and"), folding
+    /// case and diacritics, and stripping punctuation and whitespace so
+    /// punctuation differences (colons, apostrophes, hyphens) between
+    /// filenames and catalog titles do not defeat exact equality.
+    static func normalizeTitle(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "&amp;", with: " and ")
+            .replacingOccurrences(of: "&", with: " and ")
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .filter { $0.isLetter || $0.isNumber }
     }
 }

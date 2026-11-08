@@ -195,7 +195,8 @@ enum MediaFilenameParser {
             }
         }
 
-        let title = words.prefix(cutIndex).joined(separator: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        let title = words.prefix(cutIndex).joined(separator: " ")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "-_:, ")))
         return title.isEmpty ? nil : title
     }
 
