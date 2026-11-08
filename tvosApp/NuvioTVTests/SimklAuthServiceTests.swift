@@ -1705,6 +1705,438 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertTrue(resolved.first?.isUpNext == true)
     }
 
+    func testSimklSyncItemResolvedNextToWatchFormats() throws {
+        let s2e4 = SimklSyncItem(
+            title: "Test",
+            year: 2026,
+            ids: SimklSyncIDs(),
+            status: "watching",
+            addedToWatchlistAt: nil,
+            lastWatchedAt: nil,
+            seasons: nil,
+            nextToWatch: "S02E04"
+        )
+        XCTAssertEqual(s2e4.resolvedNextToWatch?.season, 2)
+        XCTAssertEqual(s2e4.resolvedNextToWatch?.episode, 4)
+
+        let e12 = SimklSyncItem(
+            title: "Test",
+            year: 2026,
+            ids: SimklSyncIDs(),
+            status: "watching",
+            addedToWatchlistAt: nil,
+            lastWatchedAt: nil,
+            seasons: nil,
+            nextToWatch: "E12"
+        )
+        XCTAssertEqual(e12.resolvedNextToWatch?.season, 1)
+        XCTAssertEqual(e12.resolvedNextToWatch?.episode, 12)
+
+        let plainNum = SimklSyncItem(
+            title: "Test",
+            year: 2026,
+            ids: SimklSyncIDs(),
+            status: "watching",
+            addedToWatchlistAt: nil,
+            lastWatchedAt: nil,
+            seasons: nil,
+            nextToWatch: "7"
+        )
+        XCTAssertEqual(plainNum.resolvedNextToWatch?.season, 1)
+        XCTAssertEqual(plainNum.resolvedNextToWatch?.episode, 7)
+
+        let info = SimklSyncItem(
+            title: "Test",
+            year: 2026,
+            ids: SimklSyncIDs(),
+            status: "watching",
+            addedToWatchlistAt: nil,
+            lastWatchedAt: nil,
+            seasons: nil,
+            nextToWatchInfo: SimklNextToWatchInfo(title: "Ep 5", season: 3, episode: 5, date: nil)
+        )
+        XCTAssertEqual(info.resolvedNextToWatch?.season, 3)
+        XCTAssertEqual(info.resolvedNextToWatch?.episode, 5)
+
+        let json = """
+        {
+          "status": "watching",
+          "next_to_watch": "S04E09",
+          "next_to_watch_info": {
+            "title": "Season Finale",
+            "season": 4,
+            "episode": 9,
+            "date": "2026-05-15"
+          },
+          "watched_episodes_count": 33,
+          "total_episodes_count": 34,
+          "not_aired_episodes_count": 1,
+          "show": {
+            "title": "Show Title",
+            "year": 2026,
+            "ids": {"imdb": "tt1234567"}
+          }
+        }
+        """
+        let decoded = try JSONDecoder().decode(SimklSyncItem.self, from: Data(json.utf8))
+        XCTAssertEqual(decoded.nextToWatch, "S04E09")
+        XCTAssertEqual(decoded.nextToWatchInfo?.title, "Season Finale")
+        XCTAssertEqual(decoded.nextToWatchInfo?.season, 4)
+        XCTAssertEqual(decoded.nextToWatchInfo?.episode, 9)
+        XCTAssertEqual(decoded.watchedEpisodesCount, 33)
+        XCTAssertEqual(decoded.totalEpisodesCount, 34)
+        XCTAssertEqual(decoded.notAiredEpisodesCount, 1)
+        XCTAssertEqual(decoded.resolvedNextToWatch?.season, 4)
+        XCTAssertEqual(decoded.resolvedNextToWatch?.episode, 9)
+    }
+
+    func testSimklSyncItemLatestWatchedEpisode() {
+        let seasons = [
+            SimklSyncSeason(number: 1, episodes: [
+                SimklSyncEpisode(number: 1, episode: nil, watchedAt: nil),
+                SimklSyncEpisode(number: 2, episode: nil, watchedAt: nil)
+            ]),
+            SimklSyncSeason(number: 2, episodes: [
+                SimklSyncEpisode(number: 1, episode: nil, watchedAt: nil),
+                SimklSyncEpisode(number: 3, episode: nil, watchedAt: nil)
+            ])
+        ]
+        let item = SimklSyncItem(
+            title: "Test",
+            year: 2026,
+            ids: SimklSyncIDs(),
+            status: "watching",
+            addedToWatchlistAt: nil,
+            lastWatchedAt: nil,
+            seasons: seasons
+        )
+        XCTAssertEqual(item.latestWatchedEpisode?.season, 2)
+        XCTAssertEqual(item.latestWatchedEpisode?.episode, 3)
+    }
+
+    func testContinueWatchingIncludesWatchingShowWithNextToWatch() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+
+        let meta = NuvioMeta(
+            id: "tt9990001",
+            name: "Season Three Show",
+            imdbId: "tt9990001",
+            type: "series",
+            year: 2026,
+            videos: [
+                NuvioVideo(id: "tt9990001:3:4", title: "Episode 4", season: 3, episode: 4, thumbnail: nil, overview: nil, released: nil, rating: nil)
+            ]
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "all": "2026-05-15T00:32:21Z",
+                      "playback": "2026-05-15T00:32:21Z",
+                      "tv_shows": {
+                        "all": "2026-05-15T00:32:21Z",
+                        "watched_at": "2026-05-15T00:32:21Z"
+                      }
+                    }
+                    """
+                )
+            case "/sync/playback":
+                return Self.response(for: request, status: 204, json: "")
+            case "/sync/all-items/shows":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "shows": [
+                        {
+                          "last_watched_at": "2026-05-15T00:32:21Z",
+                          "status": "watching",
+                          "next_to_watch": "S03E04",
+                          "show": {
+                            "title": "Season Three Show",
+                            "year": 2026,
+                            "ids": {"simkl": 3001, "imdb": "tt9990001"}
+                          }
+                        }
+                      ]
+                    }
+                    """
+                )
+            case "/sync/all-items/movies", "/sync/all-items/anime":
+                return Self.response(for: request, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let repo = SimklContinueWatchingTestRepo(meta: meta)
+        let items = await SimklProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        let resolved = try XCTUnwrap(items)
+        XCTAssertEqual(resolved.count, 1)
+        let item = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(item.meta.id, "tt9990001")
+        XCTAssertEqual(item.episodeNumbers?.season, 3)
+        XCTAssertEqual(item.episodeNumbers?.episode, 4)
+        XCTAssertTrue(item.isUpNext == true)
+    }
+
+    func testContinueWatchingIncludesAnimeWithNextToWatchWithoutCinemetaVideos() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+
+        let animeMeta = NuvioMeta(
+            id: "simkl:7777",
+            name: "Anime Adventure",
+            type: "series",
+            year: 2026,
+            videos: []
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "all": "2026-05-15T00:32:21Z",
+                      "playback": "2026-05-15T00:32:21Z",
+                      "anime": {
+                        "all": "2026-05-15T00:32:21Z",
+                        "watched_at": "2026-05-15T00:32:21Z"
+                      }
+                    }
+                    """
+                )
+            case "/sync/playback":
+                return Self.response(for: request, status: 204, json: "")
+            case "/sync/all-items/anime":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "anime": [
+                        {
+                          "last_watched_at": "2026-05-15T00:32:21Z",
+                          "status": "watching",
+                          "next_to_watch": "E12",
+                          "anime": {
+                            "title": "Anime Adventure",
+                            "year": 2026,
+                            "ids": {"simkl": 7777}
+                          }
+                        }
+                      ]
+                    }
+                    """
+                )
+            case "/sync/all-items/shows", "/sync/all-items/movies":
+                return Self.response(for: request, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let repo = SimklContinueWatchingTestRepo(meta: animeMeta)
+        let items = await SimklProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        let resolved = try XCTUnwrap(items)
+        XCTAssertEqual(resolved.count, 1, "Anime must not be dropped when Cinemeta video list is empty")
+        let item = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(item.meta.id, "simkl:7777")
+        XCTAssertEqual(item.episodeNumbers?.season, 1)
+        XCTAssertEqual(item.episodeNumbers?.episode, 12)
+        XCTAssertTrue(item.isUpNext == true)
+    }
+
+    func testContinueWatchingIncludesWatchingMovie() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+
+        let movieMeta = NuvioMeta(
+            id: "tt8888888",
+            name: "Watching Movie",
+            imdbId: "tt8888888",
+            type: "movie",
+            year: 2026
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "all": "2026-05-15T00:32:21Z",
+                      "playback": "2026-05-15T00:32:21Z",
+                      "movies": {
+                        "all": "2026-05-15T00:32:21Z",
+                        "watched_at": "2026-05-15T00:32:21Z"
+                      }
+                    }
+                    """
+                )
+            case "/sync/playback":
+                return Self.response(for: request, status: 204, json: "")
+            case "/sync/all-items/movies":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "movies": [
+                        {
+                          "last_watched_at": "2026-05-15T00:32:21Z",
+                          "status": "watching",
+                          "movie": {
+                            "title": "Watching Movie",
+                            "year": 2026,
+                            "ids": {"simkl": 8888, "imdb": "tt8888888"}
+                          }
+                        }
+                      ]
+                    }
+                    """
+                )
+            case "/sync/all-items/shows", "/sync/all-items/anime":
+                return Self.response(for: request, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let repo = SimklContinueWatchingTestRepo(meta: movieMeta)
+        let items = await SimklProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        let resolved = try XCTUnwrap(items)
+        XCTAssertEqual(resolved.count, 1)
+        let item = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(item.meta.id, "tt8888888")
+        XCTAssertEqual(item.meta.type, "movie")
+        XCTAssertFalse(item.isUpNext == true)
+        XCTAssertNil(item.episodeNumbers)
+    }
+
+    func testContinueWatchingPrioritizesPlaybackOverWatchingList() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+
+        let seriesMeta = NuvioMeta(
+            id: "tt1234567",
+            name: "Example Show",
+            imdbId: "tt1234567",
+            type: "series",
+            year: 2026,
+            runtime: "45 min"
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "all": "2026-05-15T00:32:21Z",
+                      "playback": "2026-05-15T00:32:21Z",
+                      "tv_shows": {
+                        "all": "2026-05-15T00:32:21Z",
+                        "playback": "2026-05-15T00:32:21Z",
+                        "watched_at": "2026-05-15T00:32:21Z"
+                      }
+                    }
+                    """
+                )
+            case "/sync/playback":
+                return Self.response(
+                    for: request,
+                    json: """
+                    [
+                      {
+                        "id": 101,
+                        "progress": 50.0,
+                        "paused_at": "2026-05-15T01:00:00Z",
+                        "type": "episode",
+                        "episode": {"season": 1, "number": 1, "title": "Pilot"},
+                        "show": {"title": "Example Show", "year": 2026, "ids": {"imdb": "tt1234567"}}
+                      }
+                    ]
+                    """
+                )
+            case "/sync/all-items/shows":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "shows": [
+                        {
+                          "last_watched_at": "2026-05-15T00:32:21Z",
+                          "status": "watching",
+                          "next_to_watch": "S01E02",
+                          "show": {
+                            "title": "Example Show",
+                            "year": 2026,
+                            "ids": {"simkl": 2090, "imdb": "tt1234567"}
+                          }
+                        }
+                      ]
+                    }
+                    """
+                )
+            case "/sync/all-items/movies", "/sync/all-items/anime":
+                return Self.response(for: request, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let repo = SimklContinueWatchingTestRepo(meta: seriesMeta)
+        let items = await SimklProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        let resolved = try XCTUnwrap(items)
+        XCTAssertEqual(resolved.count, 1, "Duplicate title from watching list must not create a second card")
+        let item = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(item.meta.id, "tt1234567")
+        XCTAssertEqual(item.episodeNumbers?.season, 1)
+        XCTAssertEqual(item.episodeNumbers?.episode, 1, "Must surface the in-progress paused episode, not next up")
+        XCTAssertFalse(item.isUpNext == true)
+        XCTAssertGreaterThan(item.position, 1.0)
+    }
+
     func testWatchedItemsFallsBackToShowDateWhenEpisodeWatchedAtIsMissing() throws {
         let json = """
         {
@@ -2602,6 +3034,309 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertEqual(response.userCode, "ABC123")
         XCTAssertFalse(service.currentState().isV2Flow)
     }
+
+    func testFetchLibraryCategoryFailureDoesNotSaveIncompleteCacheAndRetries() async throws {
+        authorizeReviewV2()
+        defaults.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let store = defaults!
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SimklURLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            SimklURLProtocolStub.handler = nil
+        }
+
+        var shouldFailMovies = true
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(for: request, json: #"{"all":"2026-10-14T00:00:00Z"}"#)
+            case "/sync/all-items/shows":
+                return Self.response(
+                    for: request,
+                    json: #"{"shows":[{"status":"plantowatch","added_to_watchlist_at":"2026-10-13T00:00:00Z","show":{"title":"Test Show","year":2024,"ids":{"imdb":"tt1234567"}}}]}"#
+                )
+            case "/sync/all-items/movies":
+                if shouldFailMovies {
+                    return Self.response(for: request, status: 503, json: "{}")
+                }
+                return Self.response(
+                    for: request,
+                    json: #"{"movies":[{"status":"plantowatch","added_to_watchlist_at":"2026-10-13T00:00:00Z","movie":{"title":"Test Movie","year":2024,"ids":{"imdb":"tt7654321"}}}]}"#
+                )
+            case "/sync/all-items/anime":
+                return Self.response(for: request, status: 204, json: "")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let firstItems = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: false,
+            client: SimklAPIClient(session: session),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertNil(firstItems, "A failed category request must cause fetchLibrary to return nil so displayed items are preserved")
+        XCTAssertNil(SimklSyncCache.itemSnapshot(in: store), "Incomplete category results must not be saved to cache")
+
+        // Retry with same timestamp, now movies succeeds
+        shouldFailMovies = false
+        let secondItems = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: false,
+            client: SimklAPIClient(session: session),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertNotNil(secondItems)
+        XCTAssertEqual(secondItems?.count, 2)
+        XCTAssertNotNil(SimklSyncCache.itemSnapshot(in: store), "Complete category results must be saved to cache")
+        XCTAssertEqual(SimklSyncCache.itemActivities(in: store)?.all, "2026-10-14T00:00:00Z")
+    }
+
+    func testIncrementalSyncFailurePreservesPreviousCacheAndWatermark() async throws {
+        authorizeReviewV2()
+        defaults.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let store = defaults!
+        let initialItem = SimklSyncItem(
+            title: "Existing Show",
+            year: 2024,
+            ids: SimklSyncIDs(imdb: "tt1111111"),
+            status: "plantowatch",
+            addedToWatchlistAt: "2026-10-10T00:00:00Z",
+            lastWatchedAt: nil,
+            seasons: nil
+        )
+        let initialActivities = SimklActivitiesResponse(
+            all: "2026-10-10T00:00:00Z",
+            tvShows: nil,
+            movies: nil,
+            anime: nil,
+            settings: nil
+        )
+        SimklSyncCache.saveItems(
+            SimklAllItemsResponse(shows: [initialItem], movies: [], anime: []),
+            activities: initialActivities,
+            store: store
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SimklURLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            SimklURLProtocolStub.handler = nil
+        }
+
+        var deltaRequested = false
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(for: request, json: #"{"all":"2026-10-15T00:00:00Z"}"#)
+            case "/sync/all-items":
+                deltaRequested = true
+                XCTAssertTrue(request.url?.query?.contains("date_from=2026-10-10T00:00:00Z") == true)
+                return Self.response(for: request, status: 500, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let items = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: false,
+            client: SimklAPIClient(session: session),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertTrue(deltaRequested)
+        XCTAssertNil(items, "Failed incremental sync must return nil so caller preserves displayed results")
+        XCTAssertEqual(SimklSyncCache.itemActivities(in: store)?.all, "2026-10-10T00:00:00Z", "Previous watermark must not advance on delta failure")
+        XCTAssertEqual(SimklSyncCache.items(in: store)?.shows?.count, 1, "Previous cached items must be preserved")
+    }
+
+    func testIncrementalSyncHTTP204AdvancesWatermark() async throws {
+        authorizeReviewV2()
+        defaults.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let store = defaults!
+        let initialItem = SimklSyncItem(
+            title: "Existing Show",
+            year: 2024,
+            ids: SimklSyncIDs(imdb: "tt1111111"),
+            status: "plantowatch",
+            addedToWatchlistAt: "2026-10-10T00:00:00Z",
+            lastWatchedAt: nil,
+            seasons: nil
+        )
+        let initialActivities = SimklActivitiesResponse(
+            all: "2026-10-10T00:00:00Z",
+            tvShows: nil,
+            movies: nil,
+            anime: nil,
+            settings: nil
+        )
+        SimklSyncCache.saveItems(
+            SimklAllItemsResponse(shows: [initialItem], movies: [], anime: []),
+            activities: initialActivities,
+            store: store
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SimklURLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            SimklURLProtocolStub.handler = nil
+        }
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(for: request, json: #"{"all":"2026-10-15T00:00:00Z"}"#)
+            case "/sync/all-items":
+                return Self.response(for: request, status: 204, json: "")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let items = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: false,
+            client: SimklAPIClient(session: session),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertNotNil(items)
+        XCTAssertEqual(items?.count, 1)
+        XCTAssertEqual(SimklSyncCache.itemActivities(in: store)?.all, "2026-10-15T00:00:00Z", "HTTP 204 indicates clean sync and should advance the watermark")
+    }
+
+    func testForcedRefreshPerformsFullBootstrap() async throws {
+        authorizeReviewV2()
+        defaults.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let store = defaults!
+        let initialItem = SimklSyncItem(
+            title: "Old Show",
+            year: 2024,
+            ids: SimklSyncIDs(imdb: "tt1111111"),
+            status: "plantowatch",
+            addedToWatchlistAt: "2026-10-10T00:00:00Z",
+            lastWatchedAt: nil,
+            seasons: nil
+        )
+        let activities = SimklActivitiesResponse(
+            all: "2026-10-14T00:00:00Z",
+            tvShows: nil,
+            movies: nil,
+            anime: nil,
+            settings: nil
+        )
+        SimklSyncCache.saveItems(
+            SimklAllItemsResponse(shows: [initialItem], movies: [], anime: []),
+            activities: activities,
+            store: store
+        )
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SimklURLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            SimklURLProtocolStub.handler = nil
+        }
+
+        var queriedEndpoints = Set<String>()
+        SimklURLProtocolStub.handler = { request in
+            let path = request.url?.path ?? ""
+            queriedEndpoints.insert(path)
+            switch path {
+            case "/sync/activities":
+                return Self.response(for: request, json: #"{"all":"2026-10-14T00:00:00Z"}"#)
+            case "/sync/all-items/shows":
+                return Self.response(
+                    for: request,
+                    json: #"{"shows":[{"status":"plantowatch","added_to_watchlist_at":"2026-10-13T00:00:00Z","show":{"title":"Bootstrapped Show","year":2024,"ids":{"imdb":"tt2222222"}}}]}"#
+                )
+            case "/sync/all-items/movies":
+                return Self.response(for: request, json: #"{"movies":[]}"#)
+            case "/sync/all-items/anime":
+                return Self.response(for: request, json: #"{"anime":[]}"#)
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let items = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: true,
+            client: SimklAPIClient(session: session),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertNotNil(items)
+        XCTAssertEqual(items?.map(\.id), ["tt2222222"])
+        XCTAssertTrue(queriedEndpoints.contains("/sync/all-items/shows"))
+        XCTAssertTrue(queriedEndpoints.contains("/sync/all-items/movies"))
+        XCTAssertTrue(queriedEndpoints.contains("/sync/all-items/anime"))
+        XCTAssertFalse(queriedEndpoints.contains("/sync/all-items"), "Forced refresh must not use incremental sync")
+    }
+
+    func testFetchLibraryReturnsNilWhenUnauthenticatedOrActivitiesFail() async throws {
+        defaults.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let store = defaults!
+
+        // 1. Unauthenticated client
+        let unauthItems = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: false,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        XCTAssertNil(unauthItems, "Unauthenticated fetch must return nil to preserve displayed items")
+
+        // 2. Activities failure
+        authorizeReviewV2()
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SimklURLProtocolStub.self]
+        let session = URLSession(configuration: configuration)
+        defer {
+            session.invalidateAndCancel()
+            SimklURLProtocolStub.handler = nil
+        }
+        SimklURLProtocolStub.handler = { request in
+            Self.response(for: request, status: 500, json: "{}")
+        }
+
+        let failedItems = await SimklLibraryService.fetchLibrary(
+            repository: MockCatalogRepository(),
+            store: store,
+            force: false,
+            client: SimklAPIClient(session: session),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        XCTAssertNil(failedItems, "Activities network failure must return nil to preserve displayed items")
+    }
 }
 
 private final class SimklLibrarySnapshotProbe: @unchecked Sendable {
@@ -2643,6 +3378,32 @@ private actor SimklIntegerRecorder {
 
     func values() -> [Int] {
         recordedValues
+    }
+}
+
+private final class SimklContinueWatchingTestRepo: MockCatalogRepository {
+    private let lookup: (String, String) -> NuvioMeta
+
+    init(lookup: @escaping (String, String) -> NuvioMeta) {
+        self.lookup = lookup
+    }
+
+    convenience init(meta: NuvioMeta) {
+        self.init { _, _ in meta }
+    }
+
+    convenience init(metas: [String: NuvioMeta] = [:]) {
+        self.init { id, type in
+            metas[id] ?? NuvioMeta(id: id, name: "Title \(id)", type: type)
+        }
+    }
+
+    override func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        lookup(id, type)
+    }
+
+    override func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        lookup(id, type)
     }
 }
 
