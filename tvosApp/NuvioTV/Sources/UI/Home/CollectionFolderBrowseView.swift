@@ -1191,10 +1191,8 @@ struct CollectionFolderResultCard: View {
 
                 if posterLabels {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(meta.name)
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(focused ? .white : .white.opacity(0.78))
-                            .lineLimit(1)
+                        MarqueeText(meta.name, size: 20, weight: .semibold,
+                                    color: focused ? .white : .white.opacity(0.78), isActive: focused)
                         Text(subtitle)
                             .font(.system(size: 16, weight: .medium))
                             .foregroundColor(.white.opacity(0.45))

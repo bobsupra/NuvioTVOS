@@ -739,10 +739,8 @@ struct ProductionBrowseCard: View {
 
                 if posterLabels || alwaysShowLabels {
                     VStack(alignment: .leading, spacing: 3) {
-                        Text(title.name)
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(isFocused ? .white : .white.opacity(0.78))
-                            .lineLimit(1)
+                        MarqueeText(title.name, size: 20, weight: .semibold,
+                                    color: isFocused ? .white : .white.opacity(0.78), isActive: isFocused)
                         Text(subtitle)
                             .font(.system(size: 16, weight: .medium))
                             .foregroundColor(.white.opacity(0.45))
