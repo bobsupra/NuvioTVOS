@@ -443,6 +443,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsKey.playerShowSources, "nuvio.tv.settings.playback.showSources")
         XCTAssertEqual(SettingsKey.playerShowSubtitles, "nuvio.tv.settings.playback.showSubtitles")
         XCTAssertEqual(SettingsKey.playerShowAudio, "nuvio.tv.settings.playback.showAudio")
+        XCTAssertEqual(SettingsKey.playerShowSpeed, "nuvio.tv.settings.playback.showSpeed")
         XCTAssertEqual(SettingsKey.seekPreviewEnabled, "nuvio.tv.settings.playback.seekPreviewEnabled")
         XCTAssertEqual(SettingsKey.showLoadingStatus, "nuvio.tv.settings.playback.showLoadingStatus")
         XCTAssertEqual(SettingsKey.sceneFeatureEnabled, "nuvio.tv.settings.playback.sceneFeatureEnabled")
@@ -454,6 +455,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.playerShowSources))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.playerShowSubtitles))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.playerShowAudio))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.playerShowSpeed))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.seekPreviewEnabled))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.showLoadingStatus))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.sceneFeatureEnabled))
@@ -549,6 +551,123 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertEqual(style.verticalAlignment, "Top")
     }
 
+    func testAppleTVSubtitleStylePresets() {
+        let presets = SubtitleStylePreset.appleTVPresets
+        XCTAssertEqual(presets.count, 6)
+
+        let transparent = SubtitleStylePreset.transparentBackground
+        XCTAssertEqual(transparent.id, "appletv.transparentBackground")
+        XCTAssertTrue(transparent.isBuiltIn)
+        XCTAssertTrue(transparent.style.backgroundEnabled)
+        XCTAssertEqual(transparent.style.backgroundOpacity, 55)
+        XCTAssertFalse(transparent.style.outlineEnabled)
+        XCTAssertEqual(transparent.style.textColorHex, "#FFFFFF")
+
+        let large = SubtitleStylePreset.largeText
+        XCTAssertEqual(large.id, "appletv.largeText")
+        XCTAssertTrue(large.isBuiltIn)
+        XCTAssertEqual(large.style.textSize, 135)
+        XCTAssertTrue(large.style.bold)
+        XCTAssertTrue(large.style.backgroundEnabled)
+
+        let classic = SubtitleStylePreset.classic
+        XCTAssertEqual(classic.id, "appletv.classic")
+        XCTAssertTrue(classic.isBuiltIn)
+        XCTAssertTrue(classic.style.outlineEnabled)
+        XCTAssertFalse(classic.style.backgroundEnabled)
+
+        let outline = SubtitleStylePreset.outlineText
+        XCTAssertEqual(outline.id, "appletv.outlineText")
+        XCTAssertTrue(outline.isBuiltIn)
+        XCTAssertTrue(outline.style.outlineEnabled)
+        XCTAssertEqual(outline.style.outlineWidth, 4)
+        XCTAssertEqual(outline.style.textColorHex, "#F2C94C")
+        XCTAssertFalse(outline.style.backgroundEnabled)
+
+        let yellowOnBlack = SubtitleStylePreset.yellowOnBlack
+        XCTAssertEqual(yellowOnBlack.id, "appletv.yellowOnBlack")
+        XCTAssertEqual(yellowOnBlack.style.textColorHex, "#F2C94C")
+        XCTAssertTrue(yellowOnBlack.style.backgroundEnabled)
+
+        let solidBlack = SubtitleStylePreset.solidBlack
+        XCTAssertEqual(solidBlack.id, "appletv.solidBlack")
+        XCTAssertTrue(solidBlack.style.backgroundEnabled)
+        XCTAssertEqual(solidBlack.style.backgroundOpacity, 100)
+    }
+
+    func testSubtitleStyleMatchingAndEquality() {
+        let base = SubtitleStylePreset.transparentBackground.style
+        var modified = base
+        XCTAssertTrue(base.matches(modified))
+
+        modified.textSize = 150
+        XCTAssertFalse(base.matches(modified))
+
+        modified = base
+        modified.textColorHex = "#F2C94C"
+        XCTAssertFalse(base.matches(modified))
+
+        modified = base
+        modified.outlineEnabled = true
+        XCTAssertFalse(base.matches(modified))
+    }
+
+    @MainActor
+    func testSubtitleStylePresetStorePersistenceAndCustomPresets() {
+        let store = SubtitleStylePresetStore.shared
+        let defaults = ProfileSettings.current
+
+        let savedSelectedID = defaults.string(forKey: SubtitleStyleKey.selectedPresetID)
+        let savedCustom = defaults.data(forKey: SubtitleStyleKey.customPresets)
+        defer {
+            if let savedSelectedID {
+                defaults.set(savedSelectedID, forKey: SubtitleStyleKey.selectedPresetID)
+            } else {
+                defaults.removeObject(forKey: SubtitleStyleKey.selectedPresetID)
+            }
+            if let savedCustom {
+                defaults.set(savedCustom, forKey: SubtitleStyleKey.customPresets)
+            } else {
+                defaults.removeObject(forKey: SubtitleStyleKey.customPresets)
+            }
+        }
+
+        // Apply Apple TV Classic preset
+        store.applyPreset(SubtitleStylePreset.classic, defaults: defaults)
+        XCTAssertEqual(store.savedPresetID(defaults: defaults), SubtitleStylePreset.classic.id)
+        XCTAssertEqual(SubtitleStyle.current.outlineEnabled, true)
+        XCTAssertEqual(SubtitleStyle.current.backgroundEnabled, false)
+        XCTAssertEqual(store.activePreset(for: SubtitleStyle.current, defaults: defaults)?.id, SubtitleStylePreset.classic.id)
+        XCTAssertEqual(store.activePresetTitle(for: SubtitleStyle.current, defaults: defaults), SubtitleStylePreset.classic.name)
+
+        // Save current appearance as custom preset
+        let custom = store.saveCurrentAsPreset(name: "My Custom Yellow", defaults: defaults)
+        XCTAssertEqual(custom.name, "My Custom Yellow")
+        XCTAssertFalse(custom.isBuiltIn)
+        XCTAssertEqual(store.savedPresetID(defaults: defaults), custom.id)
+        XCTAssertTrue(store.customPresets(defaults: defaults).contains(where: { $0.id == custom.id }))
+        XCTAssertTrue(store.allPresets(defaults: defaults).contains(where: { $0.id == custom.id }))
+
+        // Update custom preset style and name
+        var updatedStyle = custom.style
+        updatedStyle.textSize = 175
+        updatedStyle.textColorHex = "#6FCF97"
+        store.updateCustomPresetStyle(id: custom.id, style: updatedStyle, newName: "My Green Style", defaults: defaults)
+        let updatedPreset = store.customPresets(defaults: defaults).first(where: { $0.id == custom.id })
+        XCTAssertEqual(updatedPreset?.name, "My Green Style")
+        XCTAssertEqual(updatedPreset?.style.textSize, 175)
+        XCTAssertEqual(updatedPreset?.style.textColorHex, "#6FCF97")
+
+        // Rename custom preset
+        store.renameCustomPreset(id: custom.id, newName: "My Renamed Style", defaults: defaults)
+        let renamed = store.customPresets(defaults: defaults).first(where: { $0.id == custom.id })
+        XCTAssertEqual(renamed?.name, "My Renamed Style")
+
+        // Delete custom preset
+        store.deleteCustomPreset(id: custom.id, defaults: defaults)
+        XCTAssertFalse(store.customPresets(defaults: defaults).contains(where: { $0.id == custom.id }))
+    }
+
     func testPromptFocusBlocksWindowInputCaptureButTimelineCaptureRemainsAllowed() {
         XCTAssertTrue(PlayerWindowInputCapturePolicy.allowsCapture(
             existingConditions: true, // Existing timeline/hidden-controls condition allows capture.
@@ -584,6 +703,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertEqual(localMappings[SettingsKey.playerShowSources], "player_show_sources")
         XCTAssertEqual(localMappings[SettingsKey.playerShowSubtitles], "player_show_subtitles")
         XCTAssertEqual(localMappings[SettingsKey.playerShowAudio], "player_show_audio")
+        XCTAssertEqual(localMappings[SettingsKey.playerShowSpeed], "player_show_speed")
         XCTAssertEqual(localMappings[SettingsKey.seekPreviewEnabled], "seek_preview_enabled")
         XCTAssertEqual(localMappings[SettingsKey.showLoadingStatus], "show_player_loading_status")
 
@@ -593,6 +713,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertEqual(remoteMappings["player_show_sources"], SettingsKey.playerShowSources)
         XCTAssertEqual(remoteMappings["player_show_subtitles"], SettingsKey.playerShowSubtitles)
         XCTAssertEqual(remoteMappings["player_show_audio"], SettingsKey.playerShowAudio)
+        XCTAssertEqual(remoteMappings["player_show_speed"], SettingsKey.playerShowSpeed)
         XCTAssertEqual(remoteMappings["seek_preview_enabled"], SettingsKey.seekPreviewEnabled)
         XCTAssertEqual(remoteMappings["show_player_loading_status"], SettingsKey.showLoadingStatus)
         XCTAssertEqual(remoteMappings["player_show_loading_status"], SettingsKey.showLoadingStatus)
@@ -608,6 +729,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         let sourcesEnabled = defaults.object(forKey: SettingsKey.playerShowSources) as? Bool ?? true
         let subtitlesEnabled = defaults.object(forKey: SettingsKey.playerShowSubtitles) as? Bool ?? true
         let audioEnabled = defaults.object(forKey: SettingsKey.playerShowAudio) as? Bool ?? true
+        let speedEnabled = defaults.object(forKey: SettingsKey.playerShowSpeed) as? Bool ?? true
         let seekPreviewEnabled = defaults.object(forKey: SettingsKey.seekPreviewEnabled) as? Bool ?? true
         let showLoadingStatus = defaults.object(forKey: SettingsKey.showLoadingStatus) as? Bool ?? true
         let sceneEnabled = defaults.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool ?? true
@@ -617,6 +739,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertTrue(sourcesEnabled)
         XCTAssertTrue(subtitlesEnabled)
         XCTAssertTrue(audioEnabled)
+        XCTAssertTrue(speedEnabled)
         XCTAssertTrue(seekPreviewEnabled)
         XCTAssertTrue(showLoadingStatus)
         XCTAssertTrue(sceneEnabled)
@@ -627,6 +750,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         defaults.set(false, forKey: SettingsKey.playerShowSources)
         defaults.set(false, forKey: SettingsKey.playerShowSubtitles)
         defaults.set(false, forKey: SettingsKey.playerShowAudio)
+        defaults.set(false, forKey: SettingsKey.playerShowSpeed)
         defaults.set(false, forKey: SettingsKey.seekPreviewEnabled)
         defaults.set(false, forKey: SettingsKey.showLoadingStatus)
         defaults.set(false, forKey: SettingsKey.sceneFeatureEnabled)
@@ -636,6 +760,7 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.playerShowSources))
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.playerShowSubtitles))
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.playerShowAudio))
+        XCTAssertFalse(defaults.bool(forKey: SettingsKey.playerShowSpeed))
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.seekPreviewEnabled))
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.showLoadingStatus))
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.sceneFeatureEnabled))
@@ -3012,6 +3137,75 @@ extension PlayerControlsSettingsTests {
 
         vm.handleMoveSeek(direction: .right)
         XCTAssertEqual(vm.pendingSeekDelta, 20, "Second tap must accumulate to +20s seek")
+    }
+
+    func testPlaybackSpeedQuickCyclingAndLabels() {
+        XCTAssertNotNil(UIImage(systemName: "gauge.with.dots.needle.bottom.50percent"))
+        XCTAssertNotNil(UIImage(systemName: "speedometer"))
+
+        XCTAssertEqual(PlaybackSpeed.quarter.label, "0.25x")
+        XCTAssertEqual(PlaybackSpeed.half.label, "0.5x")
+        XCTAssertEqual(PlaybackSpeed.normal.label, "1x")
+        XCTAssertEqual(PlaybackSpeed.oneAndQuarter.label, "1.25x")
+        XCTAssertEqual(PlaybackSpeed.oneAndHalf.label, "1.5x")
+        XCTAssertEqual(PlaybackSpeed.double.label, "2x")
+
+        XCTAssertEqual(PlaybackSpeed.quickSpeeds, [.normal, .oneAndQuarter, .oneAndHalf, .double])
+
+        // Cycle through quick speeds: 1x -> 1.25x -> 1.5x -> 2x -> 1x
+        XCTAssertEqual(PlaybackSpeed.normal.nextQuickSpeed, .oneAndQuarter)
+        XCTAssertEqual(PlaybackSpeed.oneAndQuarter.nextQuickSpeed, .oneAndHalf)
+        XCTAssertEqual(PlaybackSpeed.oneAndHalf.nextQuickSpeed, .double)
+        XCTAssertEqual(PlaybackSpeed.double.nextQuickSpeed, .normal)
+
+        // Below 1x (slowmos) jump to 1x when cycling
+        XCTAssertEqual(PlaybackSpeed.quarter.nextQuickSpeed, .normal)
+        XCTAssertEqual(PlaybackSpeed.half.nextQuickSpeed, .normal)
+    }
+
+    func testTVPlayerButtonOrderIncludesSpeed() {
+        XCTAssertEqual(TVPlayerButton(caseInsensitive: "speed"), .speed)
+        XCTAssertEqual(TVPlayerButton.speed.title, "Playback Speed Button")
+        XCTAssertTrue(TVPlayerButtonOrder.defaultOrder.contains(.speed))
+
+        let defaults = UserDefaults(suiteName: "TVPlayerButtonOrderTests")!
+        defaults.removePersistentDomain(forName: "TVPlayerButtonOrderTests")
+
+        let current = TVPlayerButtonOrder.currentOrder(in: defaults)
+        XCTAssertTrue(current.contains(.speed))
+
+        // Saving a custom order with speed persists
+        TVPlayerButtonOrder.saveOrder([.speed, .pip], in: defaults)
+        let custom = TVPlayerButtonOrder.currentOrder(in: defaults)
+        XCTAssertEqual(custom.first, .speed)
+    }
+
+    @MainActor
+    func testPlayerViewModelCycleSpeed() {
+        let coordinator = PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer { model.shutdown() }
+
+        model.playbackSpeed = .normal
+        model.cycleSpeed()
+        XCTAssertEqual(model.playbackSpeed, .oneAndQuarter)
+
+        model.cycleSpeed()
+        XCTAssertEqual(model.playbackSpeed, .oneAndHalf)
+
+        model.cycleSpeed()
+        XCTAssertEqual(model.playbackSpeed, .double)
+
+        model.cycleSpeed()
+        XCTAssertEqual(model.playbackSpeed, .normal)
+
+        // Starting from slowmo jumps directly to 1x
+        model.playbackSpeed = .half
+        model.cycleSpeed()
+        XCTAssertEqual(model.playbackSpeed, .normal)
     }
 }
 

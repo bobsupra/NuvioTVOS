@@ -11312,6 +11312,7 @@ enum TVPlayerButton: String, CaseIterable, Identifiable {
     case sources
     case subtitles
     case audio
+    case speed
 
     var id: String { rawValue }
 
@@ -11322,6 +11323,7 @@ enum TVPlayerButton: String, CaseIterable, Identifiable {
         case "sources": self = .sources
         case "subtitles": self = .subtitles
         case "audio": self = .audio
+        case "speed": self = .speed
         default: return nil
         }
     }
@@ -11338,6 +11340,8 @@ enum TVPlayerButton: String, CaseIterable, Identifiable {
             return L10n.string("tvos_settings_player_subtitles", fallback: "Subtitles Button")
         case .audio:
             return L10n.string("tvos_settings_player_audio", fallback: "Audio & Sound Button")
+        case .speed:
+            return L10n.string("tvos_settings_player_speed", fallback: "Playback Speed Button")
         }
     }
 }
@@ -11345,7 +11349,7 @@ enum TVPlayerButton: String, CaseIterable, Identifiable {
 /// Profile-scoped ordering for the player controls row.
 enum TVPlayerButtonOrder {
     static let changedNotification = Notification.Name("nuvio.tv.playerButtonOrder.changed")
-    static let defaultOrder: [TVPlayerButton] = [.pip, .episodes, .sources, .subtitles, .audio]
+    static let defaultOrder: [TVPlayerButton] = [.pip, .episodes, .sources, .subtitles, .audio, .speed]
 
     static func currentOrder(in settings: UserDefaults = ProfileSettings.current) -> [TVPlayerButton] {
         var result: [TVPlayerButton] = []
@@ -11896,9 +11900,42 @@ private struct TVHeroView: View {
     var continueItem: ContinueWatchingItem? = nil
     let onSelect: () -> Void
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
 
     private var heroHeight: CGFloat {
         homeLayout == "Compact" ? 390 : 500
+    }
+
+    private var isContinueItemCurrentlyWatching: Bool {
+        guard let continueItem else { return false }
+        return !continueItem.isUpNextEntry
+    }
+
+    private var isContinueItemWatched: Bool {
+        guard let continueItem else { return false }
+        if continueItem.isUpNextEntry { return false }
+        if let numbers = continueItem.episodeNumbers {
+            let key = "\(numbers.season):\(numbers.episode)"
+            return WatchedStore.catalogWatchedEpisodeKeys(meta: continueItem.meta).contains(key)
+                || WatchedStore.episodeWatchCount(meta: continueItem.meta, season: numbers.season, episode: numbers.episode) > 0
+        }
+        return false
+    }
+
+    /// True if the continue item represents an unstarted/unwatched episode that should have spoilers hidden.
+    /// In-progress (currently watching) episodes and already watched episodes are never hidden.
+    private var shouldHideSpoilersForContinueItem: Bool {
+        guard let continueItem else { return false }
+        if isContinueItemCurrentlyWatching || isContinueItemWatched {
+            return false
+        }
+        return true
+    }
+
+    private var isHeroDescriptionSpoilerHidden: Bool {
+        guard hideUnwatchedEpisodeDescriptions, continueItem != nil else { return false }
+        return shouldHideSpoilersForContinueItem
     }
 
     var body: some View {
@@ -11921,13 +11958,24 @@ private struct TVHeroView: View {
             }
 
             if let description = heroDescription {
-                Text(description.wrappedEveryNWords(9))
-                    .font(.appFont(size: 24, weight: .regular))
-                    .foregroundColor(.white)
-                    .lineSpacing(3)
-                    .lineLimit(4)
-                    .frame(maxWidth: 900, alignment: .leading)
-                    .padding(.top, 4)
+                if isHeroDescriptionSpoilerHidden {
+                    Text(description)
+                        .font(.appFont(size: 24, weight: .regular))
+                        .foregroundColor(.white.opacity(0.48))
+                        .italic()
+                        .lineSpacing(3)
+                        .lineLimit(4)
+                        .frame(maxWidth: 900, alignment: .leading)
+                        .padding(.top, 4)
+                } else {
+                    Text(description.wrappedEveryNWords(9))
+                        .font(.appFont(size: 24, weight: .regular))
+                        .foregroundColor(.white)
+                        .lineSpacing(3)
+                        .lineLimit(4)
+                        .frame(maxWidth: 900, alignment: .leading)
+                        .padding(.top, 4)
+                }
             }
         }
         .foregroundColor(.white)
@@ -11940,12 +11988,19 @@ private struct TVHeroView: View {
     /// "S1 E3 · Title" for the episode in progress; nil for movies or when the
     /// entry predates episode tracking.
     private var episodeLine: String? {
-        continueItem?.episodeDisplayLine
+        guard let continueItem else { return nil }
+        if hideUnwatchedEpisodeTitles && shouldHideSpoilersForContinueItem {
+            return continueItem.episodeLabel
+        }
+        return continueItem.episodeDisplayLine
     }
 
     /// Prefer the in-progress episode's overview; fall back to the series/movie
     /// description.
     private var heroDescription: String? {
+        if hideUnwatchedEpisodeDescriptions && shouldHideSpoilersForContinueItem {
+            return L10n.string("details_spoiler_hidden_description", fallback: "Description hidden to avoid spoilers.")
+        }
         if let overview = continueItem?.episodeOverview, !overview.isEmpty {
             return overview
         }
@@ -11969,6 +12024,10 @@ extension TVHeroView: Equatable {
             && lhs.continueItem?.episodeVideo?.rating == rhs.continueItem?.episodeVideo?.rating
             && lhs.continueItem?.season == rhs.continueItem?.season
             && lhs.continueItem?.episode == rhs.continueItem?.episode
+            && lhs.continueItem?.episodeOverview == rhs.continueItem?.episodeOverview
+            && lhs.continueItem?.isUpNext == rhs.continueItem?.isUpNext
+            && lhs.hideUnwatchedEpisodeDescriptions == rhs.hideUnwatchedEpisodeDescriptions
+            && lhs.hideUnwatchedEpisodeTitles == rhs.hideUnwatchedEpisodeTitles
     }
 }
 

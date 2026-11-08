@@ -6380,6 +6380,12 @@ class PlayerViewModel: ObservableObject {
         engine.setSpeed(speed.rawValue)
     }
 
+    func cycleSpeed() {
+        let next = playbackSpeed.nextQuickSpeed
+        setSpeed(next)
+        showPlayerToast("Speed \(next.label)")
+    }
+
     func applySubtitleStyle() {
         subtitleStyle = SubtitleStyle.current
         engine.applySubtitleStyle()
@@ -6516,7 +6522,11 @@ class PlayerViewModel: ObservableObject {
 
     /// Lines the add-on subtitle up once per file, when AutoSubSync is on. `force` (the
     /// AutoSubSync tab's button) runs it anyway; pressed again, without the remembered answer.
-    private func startSubtitleAutoSyncIfNeeded(for subtitle: NuvioSubtitle, force: Bool = false) {
+    private func startSubtitleAutoSyncIfNeeded(
+        for subtitle: NuvioSubtitle,
+        force: Bool = false,
+        huntAlternatives: Bool = true
+    ) {
         guard subtitleAutoSyncCopies[subtitle.url] == nil, !subtitle.url.hasPrefix("file:") else { return }
         if !force {
             guard SubtitleAutoSyncSettings.isEnabled(in: ProfileSettings.current),
@@ -6530,10 +6540,29 @@ class PlayerViewModel: ObservableObject {
         let generation = sessionCoordinator.loadGeneration
         let tolerance = SubtitleAutoSyncSettings.toleranceMs(in: ProfileSettings.current)
         subtitleAutoSyncTasks[subtitle.url] = Task { @MainActor [weak self] in
-            let run: SubtitleAutoSyncRun
+            var run: SubtitleAutoSyncRun
             if let source = await sourceTask.value {
                 run = await SubtitleAutoSync.shared.sync(
                     subtitle: subtitle, source: source, toleranceMs: tolerance, useCache: useCache, force: force)
+
+                // If the selected subtitle failed to match, search for candidate alternatives in the same language.
+                if huntAlternatives, case .kept(let issue) = run.outcome, Self.canHuntAlternatives(for: issue) {
+                    guard let self, !Task.isCancelled, self.sessionCoordinator.loadGeneration == generation else { return }
+                    let alternatives = self.availableAlternativeSubtitles(for: subtitle)
+                    if !alternatives.isEmpty {
+                        SeekPreviewDiagnostics.shared.updateSync("hunting alternatives…")
+                        if let match = await SubtitleAutoSync.shared.findBestAlternative(
+                            candidates: alternatives, source: source, toleranceMs: tolerance) {
+                            guard !Task.isCancelled, self.sessionCoordinator.loadGeneration == generation else { return }
+                            self.applyAlternativeSubtitleMatch(
+                                originalSubtitle: subtitle,
+                                matchedSubtitle: match.subtitle,
+                                run: match.run,
+                                announce: true)
+                            return
+                        }
+                    }
+                }
             } else {
                 run = SubtitleAutoSyncRun(
                     outcome: .kept(.unsupportedSource),
@@ -6542,6 +6571,75 @@ class PlayerViewModel: ObservableObject {
             }
             guard !Task.isCancelled, let self, self.sessionCoordinator.loadGeneration == generation else { return }
             self.finishSubtitleAutoSync(subtitle, run: run, announce: force)
+        }
+    }
+
+    /// Same-language external subtitles that can be tried as alternatives when the selected one fails.
+    func availableAlternativeSubtitles(for subtitle: NuvioSubtitle) -> [NuvioSubtitle] {
+        availableExternalSubtitles.filter { candidate in
+            candidate.url != subtitle.url &&
+            !candidate.url.hasPrefix("file:") &&
+            Self.isSameSubtitleLanguage(candidate.language, subtitle.language)
+        }
+    }
+
+    /// Matches subtitle language codes or names (e.g. "en", "eng", "en-US", "English").
+    nonisolated static func isSameSubtitleLanguage(_ a: String, _ b: String) -> Bool {
+        let cleanA = a.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanB = b.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if cleanA.isEmpty || cleanB.isEmpty { return false }
+        if cleanA == cleanB { return true }
+        let prefixA = cleanA.components(separatedBy: CharacterSet(charactersIn: "-_")).first ?? cleanA
+        let prefixB = cleanB.components(separatedBy: CharacterSet(charactersIn: "-_")).first ?? cleanB
+        if prefixA == prefixB && !prefixA.isEmpty { return true }
+        let normA = SubtitleLanguagePreferences.humanLanguageName(from: cleanA).lowercased()
+        let normB = SubtitleLanguagePreferences.humanLanguageName(from: cleanB).lowercased()
+        if !normA.isEmpty && normA == normB { return true }
+        return SubtitleLanguagePreferences.matches(cleanA, target: cleanB) ||
+               SubtitleLanguagePreferences.matches(cleanB, target: cleanA)
+    }
+
+    /// Whether an auto-sync issue warrants searching alternative subtitles from add-on providers.
+    nonisolated static func canHuntAlternatives(for issue: SubtitleAutoSyncIssue) -> Bool {
+        switch issue {
+        case .noMatch, .ambiguous, .tooFewLines, .downloadFailed:
+            return true
+        case .inSync, .unsupportedSource, .unsupportedFormat, .notMatroska, .noIndex, .noEmbeddedSubtitles, .indexFailed:
+            return false
+        }
+    }
+
+    /// When an alternative candidate matches the video, records the switch and applies it.
+    private func applyAlternativeSubtitleMatch(
+        originalSubtitle: NuvioSubtitle,
+        matchedSubtitle: NuvioSubtitle,
+        run: SubtitleAutoSyncRun,
+        announce: Bool
+    ) {
+        subtitleAutoSyncStates[originalSubtitle.url] = .kept(.noMatch)
+        var originalReport = subtitleAutoSyncReports[originalSubtitle.url] ?? SubtitleAutoSyncReport()
+        let matchedName = matchedSubtitle.label ?? matchedSubtitle.source ?? matchedSubtitle.language
+        originalReport.notes.append("AutoSubSync switched to alternative: \(matchedName)")
+        subtitleAutoSyncReports[originalSubtitle.url] = originalReport
+
+        let isOriginalSelected = isExternalSubtitleSelected(originalSubtitle) || activeAddonSubtitle?.url == originalSubtitle.url
+        finishSubtitleAutoSync(matchedSubtitle, run: run, announce: false)
+
+        if isOriginalSelected {
+            selectExternalSubtitle(matchedSubtitle)
+            let shift: String
+            if case .synced(_, let res) = run.outcome {
+                shift = " (\(res.shortLabel))"
+            } else {
+                shift = ""
+            }
+            if announce {
+                showPlayerToast(L10n.format(
+                    "subtitle_autosync_switched_toast",
+                    fallback: "AutoSubSync: Switched to matching %@%@",
+                    matchedName,
+                    shift))
+            }
         }
     }
 
@@ -7422,6 +7520,13 @@ class PlayerViewModel: ObservableObject {
 
     var panelCurrentEpisodeId: String? {
         currentEpisodeVideo?.id
+    }
+
+    func isEpisodeWatched(_ episode: NuvioVideo) -> Bool {
+        guard let meta = activeMeta else { return false }
+        let key = "\(episode.season):\(episode.episode)"
+        return WatchedStore.catalogWatchedEpisodeKeys(meta: meta).contains(key)
+            || WatchedStore.episodeWatchCount(meta: meta, season: episode.season, episode: episode.episode) > 0
     }
 
     func openSidePanel(_ panel: PlayerSidePanel) {

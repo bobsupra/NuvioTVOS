@@ -232,7 +232,16 @@ struct PosterCard: View {
     private let landscapeTransitionDuration: TimeInterval = 0.3
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @AppStorage(SettingsKey.continueWatchingBlurNextUp) private var continueWatchingBlurNextUp = false
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
     @State private var loadedCustomLandscapeArtworkURL: String?
+
+    private var shouldBlurNextUpArtwork: Bool {
+        (continueWatchingBlurNextUp || blurUnwatchedEpisodes)
+            && continueIsUpNext
+            && continueEpisodeArtworkURL != nil
+    }
 
     #if os(tvOS)
     @FocusState private var isFocused: Bool
@@ -404,6 +413,9 @@ struct PosterCard: View {
                 placeholderView
             }
             .frame(width: cardWidth, height: cardHeight)
+            .scaleEffect(shouldBlurNextUpArtwork ? 1.08 : 1.0)
+            .blur(radius: shouldBlurNextUpArtwork ? 16 : 0)
+            .clipped()
             #if os(tvOS)
             // Cross-fade the landscape artwork away only once the resolved
             // trailer is ready to draw, avoiding a black frame on slow links.
@@ -566,11 +578,13 @@ struct PosterCard: View {
                 .minimumScaleFactor(0.82)
 
             if let continueEpisodeTitleText, !continueEpisodeTitleText.isEmpty {
-                Text(continueEpisodeTitleText)
-                    .font(.system(size: 23, weight: .medium))
-                    .foregroundColor(.white.opacity(0.66))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.82)
+                if !(hideUnwatchedEpisodeTitles && continueIsUpNext) {
+                    Text(continueEpisodeTitleText)
+                        .font(.system(size: 23, weight: .medium))
+                        .foregroundColor(.white.opacity(0.66))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+                }
             }
         }
         .frame(maxWidth: cardWidth * 0.70, alignment: .leading)

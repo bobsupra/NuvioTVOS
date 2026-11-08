@@ -8,6 +8,7 @@ enum PlayerControlFocus: Hashable {
     case sources
     case subtitles
     case audio
+    case speed
     case settings
     case timeline
     case firstTransportButton
@@ -21,6 +22,7 @@ private extension TVPlayerButton {
         case .sources: return .sources
         case .subtitles: return .subtitles
         case .audio: return .audio
+        case .speed: return .speed
         }
     }
 }
@@ -37,21 +39,59 @@ struct PlayerControls: View {
     @FocusState private var focusedControl: PlayerControlFocus?
     @State private var isAuxiliaryCardFocusActive = false
     @State private var playerButtonOrder = TVPlayerButtonOrder.currentOrder()
+    @State private var isNamingSubtitlePreset = false
+    @State private var presetNameToSave = ""
+    @State private var renamingPresetID: String?
 
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
     @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
+    @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
 
     var body: some View {
-        GlassControlsContainer {
-            VStack {
-                Spacer(minLength: 0)
-                bottomControls
+        ZStack {
+            GlassControlsContainer {
+                VStack {
+                    Spacer(minLength: 0)
+                    bottomControls
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onExitCommand(perform: handleExit)
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .onExitCommand(perform: handleExit)
+            .disabled(isNamingSubtitlePreset)
+
+            if isNamingSubtitlePreset {
+                PlayerPresetNameDialog(
+                    title: renamingPresetID != nil
+                        ? L10n.string("subtitle_style_rename_title", fallback: "Rename Subtitle Preset")
+                        : L10n.string("subtitle_style_save_title", fallback: "Save Subtitle Preset"),
+                    text: $presetNameToSave,
+                    onSave: { customName in
+                        isNamingSubtitlePreset = false
+                        if let renamingPresetID {
+                            SubtitleStylePresetStore.shared.renameCustomPreset(id: renamingPresetID, newName: customName)
+                            self.renamingPresetID = nil
+                            viewModel.applySubtitleStyle()
+                            viewModel.showPlayerToast(L10n.format("subtitle_style_renamed_toast", fallback: "Renamed preset: %@", customName))
+                        } else {
+                            let newPreset = SubtitleStylePresetStore.shared.saveCurrentAsPreset(name: customName)
+                            viewModel.applySubtitleStyle()
+                            viewModel.showPlayerToast(L10n.format("subtitle_style_saved_toast", fallback: "Saved preset: %@", newPreset.name))
+                        }
+                        viewModel.setControlsAutoHideSuspended(false)
+                        viewModel.scheduleControlsHide(after: 10.0)
+                    },
+                    onCancel: {
+                        isNamingSubtitlePreset = false
+                        renamingPresetID = nil
+                        viewModel.setControlsAutoHideSuspended(false)
+                        viewModel.scheduleControlsHide(after: 10.0)
+                    }
+                )
+                .transition(.opacity)
+            }
         }
         .onExitCommand(perform: handleExit)
         .onChange(of: requestedFocus) { _, target in
@@ -291,6 +331,11 @@ struct PlayerControls: View {
     }
 
     private func handleExit() {
+        if isNamingSubtitlePreset {
+            isNamingSubtitlePreset = false
+            renamingPresetID = nil
+            return
+        }
         PlaybackTimelineRecorder.record(.controlsExitReceived, engine: viewModel.activeEngineKind)
         if viewModel.isScrubbing {
             viewModel.cancelScrub()
@@ -360,6 +405,8 @@ struct PlayerControls: View {
                 return didReportPlaybackStarted && canShowSubtitlePicker && playerShowSubtitles
             case .audio:
                 return didReportPlaybackStarted && canShowAudioPicker && playerShowAudio
+            case .speed:
+                return didReportPlaybackStarted && playerShowSpeed
             }
         }
     }
@@ -631,6 +678,9 @@ struct PlayerControls: View {
                 canToggleAudioSyncTiming: canToggleAudioSyncTiming,
                 canToggleAudioSync: activeAddonSubtitle != nil
                     && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether),
+                activeStylePresetTitle: SubtitleStylePresetStore.shared.activePresetTitle(for: viewModel.subtitleStyle),
+                activeStylePresetID: SubtitleStylePresetStore.shared.activePreset(for: viewModel.subtitleStyle)?.id,
+                stylePresets: SubtitleStylePresetStore.shared.allPresets(),
                 onSelect: { selectSubtitlePickerOption($0) },
                 onRunAutoSync: {
                     guard let activeAddonSubtitle = viewModel.activeAddonSubtitle else { return }
@@ -661,6 +711,32 @@ struct PlayerControls: View {
                 },
                 onToggleAudioSyncTiming: {
                     viewModel.toggleAudioSyncTiming()
+                },
+                onSelectPreset: { preset in
+                    SubtitleStylePresetStore.shared.applyPreset(preset)
+                    viewModel.applySubtitleStyle()
+                    viewModel.showPlayerToast(L10n.format("subtitle_style_applied_toast", fallback: "Style: %@", preset.name))
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onSaveCurrentAsPreset: {
+                    presetNameToSave = SubtitleStylePresetStore.shared.suggestedCustomPresetName()
+                    renamingPresetID = nil
+                    isNamingSubtitlePreset = true
+                    viewModel.setControlsAutoHideSuspended(true)
+                },
+                onRenameCustomPreset: { preset in
+                    presetNameToSave = preset.name
+                    renamingPresetID = preset.id
+                    isNamingSubtitlePreset = true
+                    viewModel.setControlsAutoHideSuspended(true)
+                },
+                onDeleteCustomPreset: { preset in
+                    SubtitleStylePresetStore.shared.deleteCustomPreset(id: preset.id)
+                    viewModel.applySubtitleStyle()
+                    viewModel.showPlayerToast(L10n.format("subtitle_style_deleted_toast", fallback: "Deleted preset: %@", preset.name))
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
                 }
             )
             .equatable()
@@ -702,6 +778,24 @@ struct PlayerControls: View {
                 handleMove(direction, from: .audio)
             }
 
+        case .speed:
+            PlayerSpeedMenuButton(
+                currentSpeed: viewModel.playbackSpeed,
+                isFocused: focusedControl == .speed,
+                onSelectSpeed: { speed in
+                    viewModel.setSpeed(speed)
+                    viewModel.showPlayerToast("Speed \(speed.label)")
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                }
+            )
+            .equatable()
+            .focused($focusedControl, equals: .speed)
+            .disabled(!isTransportButtonFocusable(.speed))
+            .onExitCommand(perform: handleExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .speed)
+            }
         }
     }
 
@@ -920,11 +1014,18 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
     let isAudioSyncUsingOriginalTiming: Bool
     let canToggleAudioSyncTiming: Bool
     let canToggleAudioSync: Bool
+    let activeStylePresetTitle: String
+    let activeStylePresetID: String?
+    let stylePresets: [SubtitleStylePreset]
     let onSelect: (SubtitlePanelOption) -> Void
     let onRunAutoSync: () -> Void
     let onToggleSubtitleTiming: () -> Void
     let onToggleAudioSync: () -> Void
     let onToggleAudioSyncTiming: () -> Void
+    let onSelectPreset: (SubtitleStylePreset) -> Void
+    let onSaveCurrentAsPreset: () -> Void
+    let onRenameCustomPreset: (SubtitleStylePreset) -> Void
+    let onDeleteCustomPreset: (SubtitleStylePreset) -> Void
 
     static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
         lhs.isFocused == rhs.isFocused
@@ -939,6 +1040,9 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
             && lhs.isAudioSyncUsingOriginalTiming == rhs.isAudioSyncUsingOriginalTiming
             && lhs.canToggleAudioSyncTiming == rhs.canToggleAudioSyncTiming
             && lhs.canToggleAudioSync == rhs.canToggleAudioSync
+            && lhs.activeStylePresetTitle == rhs.activeStylePresetTitle
+            && lhs.activeStylePresetID == rhs.activeStylePresetID
+            && lhs.stylePresets == rhs.stylePresets
     }
 
     var body: some View {
@@ -1039,6 +1143,77 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                     .disabled(!canToggleAudioSync)
                 }
 
+                Menu {
+                    ForEach(stylePresets.filter(\.isBuiltIn)) { preset in
+                        Button {
+                            onSelectPreset(preset)
+                        } label: {
+                            subtitleMenuItem(
+                                title: preset.name,
+                                isSelected: activeStylePresetID == preset.id
+                            )
+                        }
+                    }
+
+                    let customPresets = stylePresets.filter { !$0.isBuiltIn }
+                    if !customPresets.isEmpty {
+                        Section(L10n.string("subtitle_style_presets_custom", fallback: "Custom Styles")) {
+                            ForEach(customPresets) { preset in
+                                Button {
+                                    onSelectPreset(preset)
+                                } label: {
+                                    subtitleMenuItem(
+                                        title: preset.name,
+                                        isSelected: activeStylePresetID == preset.id
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Section {
+                        Button {
+                            onSaveCurrentAsPreset()
+                        } label: {
+                            Label(
+                                L10n.string("subtitle_style_save_preset", fallback: "Save Current Style as Preset"),
+                                systemImage: "plus.circle"
+                            )
+                        }
+
+                        if !customPresets.isEmpty {
+                            Menu(L10n.string("subtitle_style_rename_preset", fallback: "Rename Custom Style")) {
+                                ForEach(customPresets) { preset in
+                                    Button {
+                                        onRenameCustomPreset(preset)
+                                    } label: {
+                                        Text(preset.name)
+                                    }
+                                }
+                            }
+
+                            Menu(L10n.string("subtitle_style_delete_preset", fallback: "Delete Custom Style")) {
+                                ForEach(customPresets) { preset in
+                                    Button(role: .destructive) {
+                                        onDeleteCustomPreset(preset)
+                                    } label: {
+                                        Text(preset.name)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } label: {
+                    HStack {
+                        Label(
+                            L10n.string("subtitle_style_title", fallback: "Subtitle Style"),
+                            systemImage: "textformat"
+                        )
+                        Spacer()
+                        Text(activeStylePresetTitle)
+                    }
+                }
+
                 Divider()
 
                 if let none = noneOption {
@@ -1110,7 +1285,6 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                     }
                 }
             }
-
         } label: {
             Image(systemName: "captions.bubble")
                 .font(.system(size: 28, weight: .semibold))
@@ -1290,6 +1464,65 @@ private struct PlayerAudioMenuButton: View, Equatable {
         }
 
         return rawName
+    }
+}
+
+private struct PlayerSpeedMenuButton: View, Equatable {
+    let currentSpeed: PlaybackSpeed
+    let isFocused: Bool
+    let onSelectSpeed: (PlaybackSpeed) -> Void
+
+    static func == (lhs: PlayerSpeedMenuButton, rhs: PlayerSpeedMenuButton) -> Bool {
+        lhs.isFocused == rhs.isFocused
+            && lhs.currentSpeed == rhs.currentSpeed
+    }
+
+    var body: some View {
+        Menu {
+            Section(L10n.string("player_speed_title", fallback: "Playback Speed")) {
+                ForEach(PlaybackSpeed.allCases) { speed in
+                    Button {
+                        onSelectSpeed(speed)
+                    } label: {
+                        speedMenuItem(
+                            title: speedTitle(for: speed),
+                            isSelected: currentSpeed == speed
+                        )
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "gauge.with.dots.needle.bottom.50percent")
+                .font(.system(size: 28, weight: .semibold))
+                .foregroundColor(isFocused ? .black : .white)
+                .frame(width: 70, height: 70)
+                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
+                .frame(width: 70, height: 70)
+                .clipShape(Circle())
+                .contentShape(Circle())
+        }
+        .menuStyle(.borderlessButton)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.06 : 1.0)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+        .id("speed_button")
+    }
+
+    private func speedMenuItem(title: String, isSelected: Bool) -> some View {
+        HStack {
+            Text(title)
+            Spacer()
+            if isSelected {
+                Image(systemName: "checkmark")
+            }
+        }
+    }
+
+    private func speedTitle(for speed: PlaybackSpeed) -> String {
+        if speed == .normal {
+            return "\(speed.label) (\(L10n.string("player_speed_normal", fallback: "Normal")))"
+        }
+        return speed.label
     }
 }
 
@@ -1628,6 +1861,8 @@ struct NextEpisodeOverlay: View {
     let isAutoPlayCancelled: Bool
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
 
     private var overlayCornerRadius: CGFloat {
         max(14, AppCardStyle.episodeCornerRadius(for: cardCornerRadiusSetting))
@@ -1638,7 +1873,10 @@ struct NextEpisodeOverlay: View {
     }
 
     private var episodeLine: String {
-        "S\(episode.season) E\(episode.episode) • \(episode.title)"
+        if hideUnwatchedEpisodeTitles {
+            return "S\(episode.season) E\(episode.episode)"
+        }
+        return "S\(episode.season) E\(episode.episode) • \(episode.title)"
     }
 
     private var isPlayable: Bool {
@@ -1705,6 +1943,8 @@ struct NextEpisodeOverlay: View {
             }
         }
         .frame(width: 158, height: 90)
+        .scaleEffect(blurUnwatchedEpisodes ? 1.08 : 1.0)
+        .blur(radius: blurUnwatchedEpisodes ? 14 : 0)
         .clipShape(RoundedRectangle(cornerRadius: thumbCornerRadius, style: .continuous))
     }
 
@@ -2029,6 +2269,11 @@ struct PlayerSettingsPanel: View {
     }
 
     private enum StyleControl: Hashable {
+        case preset
+        case savePreset
+        case updatePreset
+        case renamePreset
+        case deletePreset
         case delayMinus, delayPlus
         case autoSync
         case aiTranslation
@@ -2092,6 +2337,9 @@ struct PlayerSettingsPanel: View {
     @State private var gestureSensitivity = PlayerGestureSettings.sensitivity()
     @State private var selectedLanguage: String?
     @State private var style = SubtitleStyle.current
+    @State private var isNamingPreset = false
+    @State private var presetNameToSave = ""
+    @State private var renamingPresetID: String?
     @FocusState private var focus: Focus?
 
     private var visibleTabs: [Tab] {
@@ -2129,7 +2377,34 @@ struct PlayerSettingsPanel: View {
             .padding(.bottom, 44)
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             // Recording or the overview: nothing behind can take the focus (a swipe moved it there).
-            .disabled(recordingGestureAction != nil || isShowingGestureGallery || isMakingCustomGesture)
+            .disabled(recordingGestureAction != nil || isShowingGestureGallery || isMakingCustomGesture || isNamingPreset)
+
+            if isNamingPreset {
+                PlayerPresetNameDialog(
+                    title: renamingPresetID != nil
+                        ? L10n.string("subtitle_style_rename_title", fallback: "Rename Subtitle Preset")
+                        : L10n.string("subtitle_style_save_title", fallback: "Save Subtitle Preset"),
+                    text: $presetNameToSave,
+                    onSave: { customName in
+                        isNamingPreset = false
+                        if let renamingPresetID {
+                            SubtitleStylePresetStore.shared.renameCustomPreset(id: renamingPresetID, newName: customName)
+                            self.renamingPresetID = nil
+                            viewModel.applySubtitleStyle()
+                            viewModel.showPlayerToast(L10n.format("subtitle_style_renamed_toast", fallback: "Renamed preset: %@", customName))
+                        } else {
+                            let newPreset = SubtitleStylePresetStore.shared.saveCurrentAsPreset(name: customName)
+                            viewModel.applySubtitleStyle()
+                            viewModel.showPlayerToast(L10n.format("subtitle_style_saved_toast", fallback: "Saved preset: %@", newPreset.name))
+                        }
+                    },
+                    onCancel: {
+                        isNamingPreset = false
+                        renamingPresetID = nil
+                    }
+                )
+                .transition(.opacity)
+            }
 
             if let action = recordingGestureAction {
                 PlayerGestureRecorderView(
@@ -2206,7 +2481,14 @@ struct PlayerSettingsPanel: View {
             }
         }
         .focusSection()
-        .onExitCommand { onClose() }
+        .onExitCommand {
+            if isNamingPreset {
+                isNamingPreset = false
+                renamingPresetID = nil
+            } else {
+                onClose()
+            }
+        }
     }
 
     // MARK: Tabs
@@ -2595,6 +2877,75 @@ struct PlayerSettingsPanel: View {
             columnHeader(L10n.string("subtitle_style_title", fallback: "Subtitle Style"))
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 30) {
+                    cycleRow(
+                        title: L10n.string("subtitle_style_preset", fallback: "Preset Style"),
+                        value: SubtitleStylePresetStore.shared.activePresetTitle(for: style),
+                        focusKey: .preset
+                    ) {
+                        let presets = SubtitleStylePresetStore.shared.allPresets()
+                        let currentID = SubtitleStylePresetStore.shared.activePreset(for: style)?.id
+                        let currentIndex = presets.firstIndex(where: { $0.id == currentID }) ?? -1
+                        let nextIndex = (currentIndex + 1) % presets.count
+                        let nextPreset = presets[nextIndex]
+                        SubtitleStylePresetStore.shared.applyPreset(nextPreset)
+                        style = nextPreset.style
+                        viewModel.applySubtitleStyle()
+                    }
+
+                    if let activePreset = SubtitleStylePresetStore.shared.activePreset(for: style), !activePreset.isBuiltIn {
+                        if !activePreset.style.matches(style) {
+                            cycleRow(
+                                title: L10n.format("subtitle_style_update_preset", fallback: "Update '%@'", activePreset.name),
+                                value: L10n.string("common_update", fallback: "Update Style"),
+                                focusKey: .updatePreset
+                            ) {
+                                SubtitleStylePresetStore.shared.updateCustomPresetStyle(id: activePreset.id, style: style)
+                                viewModel.applySubtitleStyle()
+                                viewModel.showPlayerToast(L10n.format("subtitle_style_updated_toast", fallback: "Updated preset: %@", activePreset.name))
+                            }
+                        }
+
+                        cycleRow(
+                            title: L10n.string("subtitle_style_rename_preset", fallback: "Rename Style"),
+                            value: activePreset.name,
+                            focusKey: .renamePreset
+                        ) {
+                            presetNameToSave = activePreset.name
+                            renamingPresetID = activePreset.id
+                            isNamingPreset = true
+                        }
+
+                        cycleRow(
+                            title: L10n.string("subtitle_style_delete_preset", fallback: "Delete Style"),
+                            value: L10n.string("common_delete", fallback: "Delete"),
+                            focusKey: .deletePreset
+                        ) {
+                            SubtitleStylePresetStore.shared.deleteCustomPreset(id: activePreset.id)
+                            viewModel.applySubtitleStyle()
+                            viewModel.showPlayerToast(L10n.format("subtitle_style_deleted_toast", fallback: "Deleted preset: %@", activePreset.name))
+                        }
+
+                        cycleRow(
+                            title: L10n.string("subtitle_style_save_preset", fallback: "Save New"),
+                            value: L10n.string("common_create", fallback: "Save as New"),
+                            focusKey: .savePreset
+                        ) {
+                            presetNameToSave = SubtitleStylePresetStore.shared.suggestedCustomPresetName()
+                            renamingPresetID = nil
+                            isNamingPreset = true
+                        }
+                    } else if SubtitleStylePresetStore.shared.activePreset(for: style) == nil {
+                        cycleRow(
+                            title: L10n.string("subtitle_style_save_preset", fallback: "Save Style"),
+                            value: L10n.string("common_save", fallback: "Save as Preset"),
+                            focusKey: .savePreset
+                        ) {
+                            presetNameToSave = SubtitleStylePresetStore.shared.suggestedCustomPresetName()
+                            renamingPresetID = nil
+                            isNamingPreset = true
+                        }
+                    }
+
                     stepperRow(
                         title: L10n.string("subtitle_tab_delay", fallback: "Delay"),
                         value: "\(viewModel.subtitleDelayMs)ms",
@@ -2743,21 +3094,7 @@ struct PlayerSettingsPanel: View {
     private func updateStyle(_ mutate: (inout SubtitleStyle) -> Void) {
         mutate(&style)
         let defaults = ProfileSettings.current
-        defaults.set(style.fontName, forKey: SubtitleStyleKey.fontName)
-        defaults.set(style.textSize, forKey: SubtitleStyleKey.textSize)
-        defaults.set(style.bold, forKey: SubtitleStyleKey.bold)
-        defaults.set(style.verticalAlignment, forKey: SubtitleStyleKey.verticalAlignment)
-        defaults.set(style.bottomOffset, forKey: SubtitleStyleKey.bottomOffset)
-        defaults.set(style.horizontalMargin, forKey: SubtitleStyleKey.horizontalMargin)
-        defaults.set(style.letterSpacing, forKey: SubtitleStyleKey.letterSpacing)
-        defaults.set(style.textColorHex, forKey: SubtitleStyleKey.textColor)
-        defaults.set(style.textOpacity, forKey: SubtitleStyleKey.textOpacity)
-        defaults.set(style.outlineEnabled, forKey: SubtitleStyleKey.outlineEnabled)
-        defaults.set(style.outlineColorHex, forKey: SubtitleStyleKey.outlineColor)
-        defaults.set(style.outlineWidth, forKey: SubtitleStyleKey.outlineWidth)
-        defaults.set(style.backgroundEnabled, forKey: SubtitleStyleKey.backgroundEnabled)
-        defaults.set(style.backgroundColorHex, forKey: SubtitleStyleKey.backgroundColor)
-        defaults.set(style.backgroundOpacity, forKey: SubtitleStyleKey.backgroundOpacity)
+        style.applyToDefaults(defaults)
         viewModel.applySubtitleStyle()
     }
 
@@ -3764,5 +4101,113 @@ private struct PlaybackLogsPage: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+}
+
+struct PlayerPresetNameDialog: View {
+    var title: String = L10n.string("subtitle_style_name_dialog_title", fallback: "Subtitle Style Name")
+    @Binding var text: String
+    let onSave: (String) -> Void
+    let onCancel: () -> Void
+
+    @FocusState private var focusedField: DialogFocus?
+    @State private var isEditing = false
+
+    private enum DialogFocus: Hashable {
+        case textField
+        case cancel
+        case save
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.65)
+                .ignoresSafeArea()
+                .onTapGesture {
+                    onCancel()
+                }
+
+            VStack(spacing: 28) {
+                VStack(spacing: 10) {
+                    Text(title)
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text(L10n.string("subtitle_style_name_dialog_desc", fallback: "Enter a custom name for this subtitle preset"))
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundColor(.white.opacity(0.65))
+                }
+
+                Button {
+                    isEditing = true
+                } label: {
+                    SettingsGlassTextField(
+                        text: $text,
+                        placeholder: SubtitleStylePresetStore.shared.suggestedCustomPresetName(),
+                        focused: focusedField == .textField,
+                        isEditing: $isEditing,
+                        fieldWidth: 500,
+                        centerDisplayText: true,
+                        onCommit: {
+                            isEditing = false
+                            save()
+                        }
+                    )
+                }
+                .buttonStyle(PosterCardButtonStyle())
+                .focused($focusedField, equals: .textField)
+                .focusEffectDisabledIfAvailable()
+
+                HStack(spacing: 24) {
+                    Button(action: onCancel) {
+                        Text(L10n.string("common_cancel", fallback: "Cancel"))
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(focusedField == .cancel ? .black : .white)
+                            .frame(width: 238, height: 60)
+                            .background(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(focusedField == .cancel ? Color.white : Color.white.opacity(0.12))
+                            )
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($focusedField, equals: .cancel)
+                    .focusEffectDisabledIfAvailable()
+
+                    Button(action: save) {
+                        Text(L10n.string("common_save", fallback: "Save"))
+                            .font(.system(size: 22, weight: .bold))
+                            .foregroundColor(focusedField == .save ? .black : .white)
+                            .frame(width: 238, height: 60)
+                            .background(
+                                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                                    .fill(focusedField == .save ? Color.white : Color.white.opacity(0.12))
+                            )
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($focusedField, equals: .save)
+                    .focusEffectDisabledIfAvailable()
+                }
+            }
+            .padding(40)
+            .background(
+                RoundedRectangle(cornerRadius: 32, style: .continuous)
+                    .fill(Color(white: 0.14).opacity(0.95))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 32, style: .continuous)
+                            .stroke(Color.white.opacity(0.18), lineWidth: 1)
+                    )
+            )
+            .frame(maxWidth: 620)
+        }
+        .onExitCommand(perform: onCancel)
+        .onAppear {
+            focusedField = .textField
+        }
+    }
+
+    private func save() {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let resolved = trimmed.isEmpty ? SubtitleStylePresetStore.shared.suggestedCustomPresetName() : trimmed
+        onSave(resolved)
     }
 }

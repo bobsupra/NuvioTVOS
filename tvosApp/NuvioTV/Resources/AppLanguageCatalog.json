@@ -2231,7 +2231,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "bg": {
     "sidebar_genres_title": "Жанрове",
@@ -4465,7 +4476,18 @@
     "auto_skip_movie_credits": "Крайни надписи",
     "auto_skip_movie_credits_sub": "Автоматично пропускане на надписите на филма, като се запазват сцените след надписите.",
     "skip_movie_credits": "Пропускане на надписите",
-    "skip_to_post_credits": "Премини към „Пост-кредити“"
+    "skip_to_post_credits": "Премини към „Пост-кредити“",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "bs": {
     "sidebar_genres_title": "Žanrovi",
@@ -6699,7 +6721,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "cs": {
     "sidebar_genres_title": "Žánry",
@@ -9044,7 +9077,18 @@
     "subtitle_autosync_warn_no_reference": "%@ (%d replik): titulky ve videu tu nic nemají (upoutávka nebo vystřižená scéna?), ponecháno %@",
     "subtitle_autosync_warn_before_start": "%d replik začíná před začátkem videa",
     "player_autosync_parts": "Úseky",
-    "player_autosync_notes": "Pozn."
+    "player_autosync_notes": "Pozn.",
+    "settings_meta_blur_unwatched_episodes": "Rozmazat nezhlédnuté epizody",
+    "settings_meta_blur_unwatched_episodes_description": "Rozmazat náhledy epizod, dokud nebudou zhlédnuty, abyste se vyhnuli spoilerům.",
+    "settings_continue_watching_blur_next_up_title": "Rozmazat nezhlédnuté v Pokračovat ve sledování",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "da": {
     "sidebar_genres_title": "Genrer",
@@ -11278,7 +11322,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "de": {
     "sidebar_genres_title": "Genres",
@@ -13512,7 +13567,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "el": {
     "sidebar_genres_title": "Είδη",
@@ -15746,7 +15812,18 @@
     "auto_skip_movie_credits": "Τίτλοι τέλους",
     "auto_skip_movie_credits_sub": "Αυτόματη παράλειψη των τίτλων τέλους των ταινιών, διατηρώντας τις σκηνές μετά τους τίτλους.",
     "skip_movie_credits": "Παράλειψη τίτλων",
-    "skip_to_post_credits": "Παράλειψη μετά τους τίτλους"
+    "skip_to_post_credits": "Παράλειψη μετά τους τίτλους",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "en": {
     "sidebar_genres_title": "Genres",
@@ -17733,6 +17810,8 @@
     "tvos_settings_player_scene_subtitle": "Press Down during playback to recognize cast members and songs currently playing",
     "tvos_settings_player_sources": "Streams & Sources Button",
     "tvos_settings_player_sources_subtitle": "Show the alternate streams and sources button",
+    "tvos_settings_player_speed": "Playback Speed Button",
+    "tvos_settings_player_speed_subtitle": "Show the quick playback speed button in player controls",
     "tvos_settings_player_subtitles": "Subtitles Button",
     "tvos_settings_player_subtitles_subtitle": "Show the native subtitle selector button in player controls",
     "tvos_settings_popular_add_ons_with_one_tap_install": "Popular add-ons with one-tap install",
@@ -18093,7 +18172,18 @@
     "subtitle_autosync_warn_no_reference": "%@ (%d lines): nothing in the video's subtitles here (trailer or cut scene?), kept %@",
     "subtitle_autosync_warn_before_start": "%d lines start before the video",
     "player_autosync_parts": "Parts",
-    "player_autosync_notes": "Notes"
+    "player_autosync_notes": "Notes",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "es": {
     "sidebar_genres_title": "Géneros",
@@ -20327,7 +20417,18 @@
     "auto_skip_movie_credits": "Créditos finales",
     "auto_skip_movie_credits_sub": "Salta automáticamente los créditos de la película, conservando las escenas post-créditos.",
     "skip_movie_credits": "Saltar créditos",
-    "skip_to_post_credits": "Saltar a la escena post-créditos"
+    "skip_to_post_credits": "Saltar a la escena post-créditos",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "es-419": {
     "sidebar_genres_title": "Géneros",
@@ -22561,7 +22662,18 @@
     "auto_skip_movie_credits": "Créditos finales",
     "auto_skip_movie_credits_sub": "Omite automáticamente los créditos de la película, conservando las escenas poscréditos.",
     "skip_movie_credits": "Omitir créditos",
-    "skip_to_post_credits": "Saltar a poscréditos"
+    "skip_to_post_credits": "Saltar a poscréditos",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "fr": {
     "sidebar_genres_title": "Genres",
@@ -24803,7 +24915,18 @@
     "auto_skip_movie_credits": "Générique de fin",
     "auto_skip_movie_credits_sub": "Passer automatiquement le générique des films, en conservant les scènes post-générique.",
     "skip_movie_credits": "Passer le générique",
-    "skip_to_post_credits": "Aller à la scène post-générique"
+    "skip_to_post_credits": "Aller à la scène post-générique",
+    "settings_meta_blur_unwatched_episodes": "Flouter les épisodes non vus",
+    "settings_meta_blur_unwatched_episodes_description": "Floute les vignettes d’épisodes jusqu’à leur visionnage pour éviter les spoilers.",
+    "settings_continue_watching_blur_next_up_title": "Flouter le contenu non vu dans Continuer à regarder",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "he": {
     "sidebar_genres_title": "ז׳אנרים",
@@ -27037,7 +27160,18 @@
     "auto_skip_movie_credits": "דילוג על קרדיטים",
     "auto_skip_movie_credits_sub": "דילוג אוטומטי על קרדיטים בסוף הסרט, מבלי לדלג על סצנות שאחרי הקרדיטים.",
     "skip_movie_credits": "דילוג על הקרדיטים",
-    "skip_to_post_credits": "דילוג לסצנה שאחרי הקרדיטים"
+    "skip_to_post_credits": "דילוג לסצנה שאחרי הקרדיטים",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "hi": {
     "sidebar_genres_title": "शैलियाँ",
@@ -29271,7 +29405,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "hu": {
     "sidebar_genres_title": "Műfajok",
@@ -31505,7 +31650,18 @@
     "auto_skip_movie_credits": "Filmstáblista",
     "auto_skip_movie_credits_sub": "A film stáblistájának automatikus átugrása a stáblista utáni jelenetek kihagyása nélkül.",
     "skip_movie_credits": "Stáblista átugrása",
-    "skip_to_post_credits": "Ugrás a stáblista utáni jelenethez"
+    "skip_to_post_credits": "Ugrás a stáblista utáni jelenethez",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "in": {
     "sidebar_genres_title": "Genre",
@@ -33747,7 +33903,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "it": {
     "sidebar_genres_title": "Generi",
@@ -35989,7 +36156,18 @@
     "auto_skip_movie_credits": "Titoli di coda",
     "auto_skip_movie_credits_sub": "Salta automaticamente i titoli di coda dei film, mantenendo le scene post-crediti.",
     "skip_movie_credits": "Salta i titoli di coda",
-    "skip_to_post_credits": "Vai alla scena dopo i titoli di coda"
+    "skip_to_post_credits": "Vai alla scena dopo i titoli di coda",
+    "settings_meta_blur_unwatched_episodes": "Sfoca episodi non visti",
+    "settings_meta_blur_unwatched_episodes_description": "Sfoca le miniature degli episodi finché non vengono visti per evitare spoiler.",
+    "settings_continue_watching_blur_next_up_title": "Sfoca non visti in Inizia a guardare",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "ja": {
     "sidebar_genres_title": "ジャンル",
@@ -38231,7 +38409,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "未視聴エピソードをぼかす",
+    "settings_meta_blur_unwatched_episodes_description": "ネタバレを避けるため、視聴済みになるまでエピソードのサムネイルをぼかします。",
+    "settings_continue_watching_blur_next_up_title": "「視聴を続ける」で未視聴をぼかす",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "lt": {
     "sidebar_genres_title": "Žanrai",
@@ -40465,7 +40654,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "nl": {
     "sidebar_genres_title": "Genres",
@@ -42699,7 +42899,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "no": {
     "sidebar_genres_title": "Sjangre",
@@ -44945,7 +45156,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "pl": {
     "sidebar_genres_title": "Gatunki",
@@ -47187,7 +47409,18 @@
     "auto_skip_movie_credits": "Napisy końcowe",
     "auto_skip_movie_credits_sub": "Automatycznie pomijaj napisy końcowe filmów, zachowując sceny po napisach.",
     "skip_movie_credits": "Pomiń napisy końcowe",
-    "skip_to_post_credits": "Do sceny po napisach"
+    "skip_to_post_credits": "Do sceny po napisach",
+    "settings_meta_blur_unwatched_episodes": "Rozmyj nieobejrzane odcinki",
+    "settings_meta_blur_unwatched_episodes_description": "Rozmyj miniatury odcinków do momentu obejrzenia, aby uniknąć spoilerów.",
+    "settings_continue_watching_blur_next_up_title": "Rozmyj nieobejrzane w Kontynuuj oglądanie",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "pt-BR": {
     "sidebar_genres_title": "Gêneros",
@@ -49429,7 +49662,18 @@
     "auto_skip_movie_credits": "Créditos finais",
     "auto_skip_movie_credits_sub": "Pule os créditos dos filmes automaticamente, mantendo as cenas pós-créditos.",
     "skip_movie_credits": "Pular créditos",
-    "skip_to_post_credits": "Pular para o pós-créditos"
+    "skip_to_post_credits": "Pular para o pós-créditos",
+    "settings_meta_blur_unwatched_episodes": "Desfocar Episódios Não Assistidos",
+    "settings_meta_blur_unwatched_episodes_description": "Desfocar thumbnails de episódios até serem assistidos para evitar spoilers.",
+    "settings_continue_watching_blur_next_up_title": "Desfocar Não Assistidos em Continuar Assistindo",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "pt-PT": {
     "sidebar_genres_title": "Géneros",
@@ -51671,7 +51915,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Desfocar episódios não vistos",
+    "settings_meta_blur_unwatched_episodes_description": "Desfoca as miniaturas dos episódios até serem vistos para evitar spoilers.",
+    "settings_continue_watching_blur_next_up_title": "Desfocar não vistos no Continuar a Ver",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "ro": {
     "sidebar_genres_title": "Genuri",
@@ -53905,7 +54160,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "ru": {
     "sidebar_genres_title": "Жанры",
@@ -56139,7 +56405,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "sk": {
     "sidebar_genres_title": "Žánre",
@@ -58374,7 +58651,18 @@
     "auto_skip_movie_credits": "Záverečné titulky",
     "auto_skip_movie_credits_sub": "Automaticky preskakovať záverečné titulky filmov so zachovaním medzititulkových a potitulkových scén.",
     "skip_movie_credits": "Preskočiť titulky",
-    "skip_to_post_credits": "Preskočiť na potitulkovú scénu"
+    "skip_to_post_credits": "Preskočiť na potitulkovú scénu",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "sl": {
     "sidebar_genres_title": "Žanri",
@@ -60608,7 +60896,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "sv": {
     "sidebar_genres_title": "Genrer",
@@ -62842,7 +63141,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "ta": {
     "sidebar_genres_title": "வகைகள்",
@@ -65076,7 +65386,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "tr": {
     "sidebar_genres_title": "Türler",
@@ -67318,7 +67639,18 @@
     "auto_skip_movie_credits": "Bitiş Jeneriği",
     "auto_skip_movie_credits_sub": "Film jeneriğini otomatik atlar; jenerik sonrası sahneleri korur.",
     "skip_movie_credits": "Jeneriği Atla",
-    "skip_to_post_credits": "Jenerik Sonrasına Atla"
+    "skip_to_post_credits": "Jenerik Sonrasına Atla",
+    "settings_meta_blur_unwatched_episodes": "İzlenmemiş Bölümleri Bulanıklaştır",
+    "settings_meta_blur_unwatched_episodes_description": "Sürprizbozanları önlemek için bölümler izlenene kadar küçük resimlerini bulanıklaştır.",
+    "settings_continue_watching_blur_next_up_title": "İzlemeye Devam Et Rafında İzlenmeyenleri Bulanıklaştır",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "uk": {
     "sidebar_genres_title": "Жанри",
@@ -69552,7 +69884,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "vi": {
     "sidebar_genres_title": "Thể loại",
@@ -71786,7 +72129,18 @@
     "auto_skip_movie_credits": "Danh đề kết thúc",
     "auto_skip_movie_credits_sub": "Tự động bỏ qua danh đề phim, giữ lại các cảnh hậu danh đề.",
     "skip_movie_credits": "Bỏ qua Danh đề",
-    "skip_to_post_credits": "Đến cảnh hậu danh đề"
+    "skip_to_post_credits": "Đến cảnh hậu danh đề",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "zh-CN": {
     "sidebar_genres_title": "类型",
@@ -74020,7 +74374,18 @@
     "auto_skip_movie_credits": "片尾字幕",
     "auto_skip_movie_credits_sub": "自动跳过电影片尾字幕，保留片尾彩蛋场景。",
     "skip_movie_credits": "跳过片尾字幕",
-    "skip_to_post_credits": "跳到片尾彩蛋"
+    "skip_to_post_credits": "跳到片尾彩蛋",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   },
   "zh-TW": {
     "sidebar_genres_title": "類型",
@@ -76254,6 +76619,17 @@
     "auto_skip_movie_credits": "片尾字幕",
     "auto_skip_movie_credits_sub": "自動跳過電影片尾字幕，保留片尾彩蛋場景。",
     "skip_movie_credits": "跳過片尾字幕",
-    "skip_to_post_credits": "跳到片尾彩蛋"
+    "skip_to_post_credits": "跳到片尾彩蛋",
+    "settings_meta_blur_unwatched_episodes": "Blur Unwatched Episodes",
+    "settings_meta_blur_unwatched_episodes_description": "Blur episode thumbnails until watched to avoid spoilers",
+    "settings_continue_watching_blur_next_up_title": "Blur Next Up Artwork",
+    "settings_continue_watching_blur_next_up_description": "Blur episode thumbnails in Continue Watching for episodes you haven't started yet",
+    "tvos_settings_episode_spoilers": "Episode Spoilers",
+    "tvos_settings_episode_spoilers_subtitle": "Hide spoilers for unwatched episodes in Details and Player",
+    "tvos_settings_hide_unwatched_descriptions": "Hide Unwatched Descriptions",
+    "tvos_settings_hide_unwatched_descriptions_subtitle": "Hide episode descriptions until watched to prevent plot spoilers",
+    "tvos_settings_hide_unwatched_titles": "Hide Unwatched Titles",
+    "tvos_settings_hide_unwatched_titles_subtitle": "Replace unwatched episode titles with Episode numbers to avoid spoilers",
+    "details_spoiler_hidden_description": "Description hidden to avoid spoilers."
   }
 }

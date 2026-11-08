@@ -125,6 +125,8 @@ struct PlayerEpisodesPanel: View {
     @FocusState private var focusedID: String?
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
 
     private var rowCornerRadius: CGFloat {
         AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 18)
@@ -200,7 +202,14 @@ struct PlayerEpisodesPanel: View {
     }
 
     private func episodeRow(_ episode: NuvioVideo, isCurrent: Bool, isFocused: Bool) -> some View {
-        HStack(spacing: 16) {
+        let isWatched = viewModel.isEpisodeWatched(episode)
+        let shouldBlur = blurUnwatchedEpisodes && !isWatched && !isCurrent
+        let shouldHideTitle = hideUnwatchedEpisodeTitles && !isWatched && !isCurrent
+        let displayTitle = shouldHideTitle
+            ? L10n.format("calendar_episode_number", fallback: "Episode %d", episode.episode)
+            : episode.title
+
+        return HStack(spacing: 16) {
             ZStack {
                 Color.white.opacity(0.08)
                 if let thumb = episode.thumbnail, let url = URL(string: thumb) {
@@ -216,13 +225,15 @@ struct PlayerEpisodesPanel: View {
                 }
             }
             .frame(width: 150, height: 84)
+            .scaleEffect(shouldBlur ? 1.08 : 1.0)
+            .blur(radius: shouldBlur ? 14 : 0)
             .clipShape(RoundedRectangle(cornerRadius: thumbCornerRadius, style: .continuous))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("S\(episode.season) E\(episode.episode)")
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundStyle(isFocused ? .black.opacity(0.55) : .white.opacity(0.55))
-                Text(episode.title)
+                Text(displayTitle)
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(isFocused ? .black : .white)
                     .lineLimit(3)

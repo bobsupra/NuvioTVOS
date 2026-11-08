@@ -2738,6 +2738,7 @@ enum PlayerSettingsSyncMapper {
         ("player_show_sources", SettingsKey.playerShowSources),
         ("player_show_subtitles", SettingsKey.playerShowSubtitles),
         ("player_show_audio", SettingsKey.playerShowAudio),
+        ("player_show_speed", SettingsKey.playerShowSpeed),
         ("seek_preview_enabled", SettingsKey.seekPreviewEnabled),
         ("show_player_loading_status", SettingsKey.showLoadingStatus),
         ("player_show_loading_status", SettingsKey.showLoadingStatus)
@@ -2767,6 +2768,7 @@ enum PlayerSettingsSyncMapper {
         (SettingsKey.playerShowSources, "player_show_sources"),
         (SettingsKey.playerShowSubtitles, "player_show_subtitles"),
         (SettingsKey.playerShowAudio, "player_show_audio"),
+        (SettingsKey.playerShowSpeed, "player_show_speed"),
         (SettingsKey.seekPreviewEnabled, "seek_preview_enabled"),
         (SettingsKey.showLoadingStatus, "show_player_loading_status")
     ]

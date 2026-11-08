@@ -8396,9 +8396,31 @@ private struct TvEpisodeCard: View {
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
 
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
     private var isFocused: Bool { focus.wrappedValue == cardKey }
+
+    private var isCurrentlyWatching: Bool {
+        (continueProgress ?? 0) > 0
+    }
+
+    private var shouldApplySpoilerProtection: Bool {
+        !isWatched && !isCurrentlyWatching
+    }
+
+    private var shouldBlurThumbnail: Bool {
+        blurUnwatchedEpisodes && shouldApplySpoilerProtection
+    }
+
+    private var displayTitle: String {
+        if hideUnwatchedEpisodeTitles && shouldApplySpoilerProtection {
+            return L10n.format("calendar_episode_number", fallback: "Episode %d", video.episode)
+        }
+        return video.title
+    }
 
     private let cardWidth: CGFloat = TvEpisodeCardLayout.width
     private let thumbHeight: CGFloat = 300
@@ -8446,19 +8468,30 @@ private struct TvEpisodeCard: View {
                             }
                         }
 
-                    Text(video.title)
+                    Text(displayTitle)
                         .font(.system(size: 30, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)
 
                     if let overview = video.overview, !overview.isEmpty {
-                        Text(overview)
-                            .font(.system(size: 22, weight: .regular))
-                            .foregroundColor(.white.opacity(0.78))
-                            .lineSpacing(4)
-                            .lineLimit(3)
-                            .fixedSize(horizontal: false, vertical: true)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        if hideUnwatchedEpisodeDescriptions && shouldApplySpoilerProtection {
+                            Text(L10n.string("details_spoiler_hidden_description", fallback: "Description hidden to avoid spoilers."))
+                                .font(.system(size: 22, weight: .regular))
+                                .foregroundColor(.white.opacity(0.48))
+                                .italic()
+                                .lineSpacing(4)
+                                .lineLimit(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        } else {
+                            Text(overview)
+                                .font(.system(size: 22, weight: .regular))
+                                .foregroundColor(.white.opacity(0.78))
+                                .lineSpacing(4)
+                                .lineLimit(3)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
 
                     HStack(spacing: 16) {
@@ -8629,6 +8662,8 @@ private struct TvEpisodeCard: View {
             placeholder: { placeholderThumb }
         )
         .frame(width: cardWidth, height: cardHeight)
+        .scaleEffect(shouldBlurThumbnail ? 1.08 : 1.0)
+        .blur(radius: shouldBlurThumbnail ? 18 : 0)
         .clipped()
     }
 
@@ -8845,6 +8880,7 @@ private struct TvStreamPickerOverlay: View {
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
+    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
     /// Cached filter+sort result. Rebuilt only when derivation inputs change —
     /// never when focus moves between cards.
     @State private var displayedStreams: [NuvioStream] = []
@@ -9233,7 +9269,7 @@ private struct TvStreamPickerOverlay: View {
                         .foregroundColor(.white)
                         .multilineTextAlignment(.center)
 
-                    Text(episode.title)
+                    Text(displayEpisodeTitle(for: episode))
                         .font(.system(size: 30, weight: .regular))
                         .foregroundColor(.white.opacity(0.7))
                         .lineSpacing(6)
@@ -9277,6 +9313,31 @@ private struct TvStreamPickerOverlay: View {
                     .frame(width: 560, alignment: .center)
             }
         }
+    }
+
+    private func displayEpisodeTitle(for episode: NuvioVideo) -> String {
+        if hideUnwatchedEpisodeTitles && shouldApplySpoilerProtection(for: episode) {
+            return L10n.format("calendar_episode_number", fallback: "Episode %d", episode.episode)
+        }
+        return episode.title
+    }
+
+    private func shouldApplySpoilerProtection(for episode: NuvioVideo) -> Bool {
+        if isEpisodeWatched(episode) { return false }
+        if let continueItem = ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id),
+           !continueItem.isUpNextEntry,
+           let numbers = continueItem.episodeNumbers,
+           numbers.season == episode.season,
+           numbers.episode == episode.episode {
+            return false
+        }
+        return true
+    }
+
+    private func isEpisodeWatched(_ episode: NuvioVideo) -> Bool {
+        let key = "\(episode.season):\(episode.episode)"
+        return WatchedStore.catalogWatchedEpisodeKeys(meta: meta).contains(key)
+            || WatchedStore.episodeWatchCount(meta: meta, season: episode.season, episode: episode.episode) > 0
     }
 
     private var episodeRatingItems: [TvEpisodeRatingItem] {

@@ -58,6 +58,7 @@ enum PlaybackSpeed: Float, CaseIterable, Identifiable {
     case quarter = 0.25
     case half = 0.5
     case normal = 1.0
+    case oneAndQuarter = 1.25
     case oneAndHalf = 1.5
     case double = 2.0
     
@@ -65,6 +66,18 @@ enum PlaybackSpeed: Float, CaseIterable, Identifiable {
     
     var label: String {
         return "\(String(format: "%g", rawValue))x"
+    }
+
+    /// Speeds available for quick cycling in the player controls (no slowmos).
+    static let quickSpeeds: [PlaybackSpeed] = [.normal, .oneAndQuarter, .oneAndHalf, .double]
+
+    /// Next speed when cycling from the quick speed button.
+    var nextQuickSpeed: PlaybackSpeed {
+        let speeds = Self.quickSpeeds
+        guard let currentIndex = speeds.firstIndex(of: self) else {
+            return .normal
+        }
+        return speeds[(currentIndex + 1) % speeds.count]
     }
 }
 
