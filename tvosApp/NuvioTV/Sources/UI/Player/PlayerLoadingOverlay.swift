@@ -359,12 +359,18 @@ struct PlayerLoadingOverlay: View {
             // 1. Solid Black Base
             Color.black.ignoresSafeArea()
 
-            // 2. Fullscreen Backdrop Image
+            // 2. Fullscreen Backdrop Image. Filled inside a screen-sized frame and cut
+            // to it: a portrait poster (a title without a backdrop) filled on its own
+            // grows the overlay far past the screen, and the video surface measured
+            // beside it keeps that size, leaving the top of the picture black.
             if let backdropImage {
-                Image(uiImage: backdropImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                Color.clear
+                    .overlay {
+                        Image(uiImage: backdropImage)
+                            .resizable()
+                            .aspectRatio(contentMode: .fill)
+                    }
+                    .clipped()
                     .ignoresSafeArea()
             }
 
