@@ -45,11 +45,21 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
                     for: slots.map(\.entry), in: TopShelfFeedStore.containerURL)
                 completionHandler(Self.carousel(slots, configuration: configuration, ratings: ratings, trailers: trailers))
             }
+        case .featuredCards:
+            let sections = TopShelfComposer.featuredSections(from: rows)
+            let collections = sections.enumerated().map { index, row in
+                let collection = TVTopShelfItemCollection(items: row.entries.map {
+                    Self.sectionedItem(for: $0, rowID: row.id, poster: index != 0, showsEpisodeLabels: configuration.showsEpisodeLabels)
+                })
+                collection.title = row.title ?? Self.fallbackTitles[row.section]
+                return collection
+            }
+            completionHandler(TVTopShelfSectionedContent(sections: collections))
         case .rows, .posters:
             let posters = configuration.style == .posters
             let collections = rows.map { row -> TVTopShelfItemCollection<TVTopShelfSectionedItem> in
                 let collection = TVTopShelfItemCollection(items: row.entries.map {
-                    Self.sectionedItem(for: $0, rowID: row.id, poster: posters)
+                    Self.sectionedItem(for: $0, rowID: row.id, poster: posters, showsEpisodeLabels: configuration.showsEpisodeLabels)
                 })
                 collection.title = row.title ?? Self.fallbackTitles[row.section]
                 return collection
@@ -58,16 +68,15 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         }
     }
 
-    private static func sectionedItem(for entry: TopShelfEntry, rowID: String, poster: Bool) -> TVTopShelfSectionedItem {
+    private static func sectionedItem(for entry: TopShelfEntry, rowID: String, poster: Bool, showsEpisodeLabels: Bool) -> TVTopShelfSectionedItem {
         // A title can sit on more than one row (e.g. Library and a catalog).
         let item = TVTopShelfSectionedItem(identifier: "\(rowID):\(entry.contentId)")
         item.title = entry.title
         item.imageShape = poster ? .poster : .hdtv
 
         // The rendered card or poster; the raw artwork stands in until it exists.
-        let imageURL = poster
-            ? TopShelfFeedStore.posterArtworkURL(for: entry) ?? entry.posterSourceURL.flatMap(URL.init(string:))
-            : TopShelfFeedStore.artworkURL(for: entry) ?? entry.cardSourceURL.flatMap(URL.init(string:))
+        let imageURL = TopShelfFeedStore.sectionedArtworkURL(
+            for: entry, poster: poster, showsEpisodeLabels: showsEpisodeLabels)
         if let url = imageURL {
             item.setImageURL(url, for: .screenScale1x)
             item.setImageURL(url, for: .screenScale2x)
@@ -107,7 +116,7 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         item.title = entry.title
         // Why it is here: the row, and for a resumable title the episode and time left.
         let rowTitle = slot.rowTitle ?? fallbackTitles[slot.section]
-        item.contextTitle = [rowTitle, entry.subtitle].compactMap { $0 }.joined(separator: "  ·  ")
+        item.contextTitle = [rowTitle, configuration.showsEpisodeLabels ? entry.subtitle : nil].compactMap { $0 }.joined(separator: "  ·  ")
         item.summary = entry.summary
         if let genres = entry.genres, !genres.isEmpty {
             item.genre = genres.prefix(2).joined(separator: ", ")

@@ -233,6 +233,13 @@ struct PosterCard: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.focused.rawValue
+
+    private var showsContinueWatchingLabels: Bool {
+        (CardLabelVisibility(rawValue: continueWatchingLabels) ?? .focused)
+            .isVisible(isFocused: showsFocusedAppearance)
+    }
+
     @AppStorage(SettingsKey.continueWatchingBlurNextUp) private var continueWatchingBlurNextUp = false
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
@@ -564,7 +571,7 @@ struct PosterCard: View {
 
     private var continueLandscapeSummary: some View {
         VStack(alignment: .leading, spacing: 3) {
-            if let continueEpisodeText {
+            if showsContinueWatchingLabels, let continueEpisodeText {
                 MarqueeText(continueEpisodeText, size: 25, weight: .medium, color: .white,
                             isActive: showsFocusedAppearance)
             }
@@ -572,7 +579,7 @@ struct PosterCard: View {
             MarqueeText(meta.name, size: 28, weight: .semibold, color: .white,
                         isActive: showsFocusedAppearance, minimumScaleFactor: 0.82)
 
-            if let continueEpisodeTitleText, !continueEpisodeTitleText.isEmpty {
+            if showsContinueWatchingLabels, let continueEpisodeTitleText, !continueEpisodeTitleText.isEmpty {
                 if !(hideUnwatchedEpisodeTitles && continueIsUpNext) {
                     MarqueeText(continueEpisodeTitleText, size: 23, weight: .medium, color: .white.opacity(0.66),
                                 isActive: showsFocusedAppearance, minimumScaleFactor: 0.82)
@@ -604,7 +611,7 @@ struct PosterCard: View {
 
     @ViewBuilder
     private var continueBadge: some View {
-        if let continueBadgeDisplayText {
+        if showsContinueWatchingLabels, let continueBadgeDisplayText {
             let badgeRadius = AppCardStyle.badgeCornerRadius(for: cardCornerRadiusSetting, base: 10)
             Text(continueBadgeDisplayText)
                 .font(.system(size: 22, weight: .semibold))

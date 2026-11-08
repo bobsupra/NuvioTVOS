@@ -90,6 +90,7 @@ final class TopShelfArtworkPrunerTests: XCTestCase {
         try writeFeed(artwork: [watching], to: directory)
         try writeFeed(artwork: [library], to: directory, section: .library)
 
+        TopShelfConfigurationStore.write(TopShelfConfiguration(), in: directory)
         TopShelfArtworkPruner.prune(in: directory)
 
         XCTAssertTrue(exists(watching, in: directory))

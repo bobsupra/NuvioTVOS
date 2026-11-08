@@ -5,16 +5,16 @@ import XCTest
 final class TopShelfLayoutTests: XCTestCase {
     // MARK: Rows
 
-    func testDefaultShowsTheFixedSectionsAndTheFirstCatalog() {
+    func testAdvancedMixShowsTheFixedSectionsAndTheFirstCatalog() {
         let feeds = makeFeeds()
-        let rows = TopShelfComposer.rows(configuration: .default) { feeds[$0] }
+        let rows = TopShelfComposer.rows(configuration: TopShelfConfiguration()) { feeds[$0] }
         XCTAssertEqual(rows.map(\.id), ["continueWatching", "upNext", "library", "catalog:popular"])
         XCTAssertEqual(rows.last?.title, "Popular")
     }
 
     func testChosenCatalogsComeInHomeOrderAfterTheChosenSections() {
         let feeds = makeFeeds()
-        var configuration = TopShelfConfiguration.default
+        var configuration = TopShelfConfiguration()
         configuration.includesUpNext = false
         configuration.includesLibrary = false
         configuration.catalogRowIDs = ["trending", "popular"]
@@ -44,7 +44,7 @@ final class TopShelfLayoutTests: XCTestCase {
     func testEmptySourcesAreLeftOut() {
         var feeds = makeFeeds()
         feeds[.upNext] = TopShelfFeed(entries: [], title: "Up Next")
-        let rows = TopShelfComposer.rows(configuration: .default) { feeds[$0] }
+        let rows = TopShelfComposer.rows(configuration: TopShelfConfiguration()) { feeds[$0] }
         XCTAssertFalse(rows.contains { $0.id == "upNext" })
     }
 
@@ -55,12 +55,12 @@ final class TopShelfLayoutTests: XCTestCase {
         let yesterday = TopShelfEntry(contentId: "tt-old", contentType: "series", title: "Old", subtitle: nil,
                                       imageURL: nil, progress: nil, action: .details, airDate: "2026-10-28")
         feeds[.today] = TopShelfFeed(entries: [airing, yesterday], title: "Today")
-        let rows = TopShelfComposer.rows(configuration: .default, today: "2026-10-29") { feeds[$0] }
+        let rows = TopShelfComposer.rows(configuration: TopShelfConfiguration(), today: "2026-10-29") { feeds[$0] }
         XCTAssertEqual(rows.map(\.id), ["continueWatching", "upNext", "today", "library", "catalog:popular"])
         XCTAssertEqual(rows.first { $0.id == "today" }?.entries.map(\.contentId), ["tt-today"])
-        let nextDay = TopShelfComposer.rows(configuration: .default, today: "2026-10-30") { feeds[$0] }
+        let nextDay = TopShelfComposer.rows(configuration: TopShelfConfiguration(), today: "2026-10-30") { feeds[$0] }
         XCTAssertFalse(nextDay.contains { $0.id == "today" }, "past days leave the shelf without the app")
-        var off = TopShelfConfiguration.default
+        var off = TopShelfConfiguration()
         off.includesToday = false
         XCTAssertFalse(TopShelfComposer.rows(configuration: off, today: "2026-10-29") { feeds[$0] }.contains { $0.id == "today" })
     }
@@ -141,7 +141,7 @@ final class TopShelfLayoutTests: XCTestCase {
         let partial = try JSONDecoder().decode(
             TopShelfConfiguration.self,
             from: Data(#"{"style":"sideways","includesLibrary":false,"catalogRowIDs":["a"]}"#.utf8))
-        XCTAssertEqual(partial.style, .carouselDetails)
+        XCTAssertEqual(partial.style, .featuredCards)
         XCTAssertTrue(partial.includesContinueWatching)
         XCTAssertFalse(partial.includesLibrary)
         XCTAssertEqual(partial.catalogRowIDs, ["a"])
@@ -152,7 +152,7 @@ final class TopShelfLayoutTests: XCTestCase {
     }
 
     func testConfigurationSupportsLibrarySourceAndShuffleUpNext() throws {
-        var config = TopShelfConfiguration.default
+        var config = TopShelfConfiguration()
         config.librarySource = .simkl
         config.shufflesUpNext = true
         let data = try JSONEncoder().encode(config)
@@ -163,7 +163,7 @@ final class TopShelfLayoutTests: XCTestCase {
 
     func testShuffleUpNextPreservesAllEntries() {
         let feeds = makeFeeds()
-        var config = TopShelfConfiguration.default
+        var config = TopShelfConfiguration()
         config.shufflesUpNext = true
         let rows = TopShelfComposer.rows(configuration: config) { feeds[$0] }
         let upNextRow = rows.first { $0.id == "upNext" }
