@@ -10,7 +10,7 @@ on:
         required: false
         type: string
       all:
-        description: Add notification and feedback links to every published release
+        description: Add notification, feedback, and Discord links to every published release
         required: false
         default: false
         type: boolean
@@ -79,7 +79,7 @@ jobs:
           readme_path.write_text(readme[:start] + block + readme[end:])
           PY
 
-      - name: Add notification and feedback links to release notes
+      - name: Add notification, feedback, and Discord links to release notes
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
@@ -106,10 +106,16 @@ jobs:
 
             if [[ "$body" != *"${GITHUB_REPOSITORY}/subscription"* ]]; then
               body="${body}"$'\n\n'"$links"
+            fi
+            if [[ "$body" != *"https://discord.gg/2YnNr2xmnJ"* ]]; then
+              body="${body}"$'\n\n'"> **Join the community:** [NuvioTVOS Discord](https://discord.gg/2YnNr2xmnJ) — chat, get help, report bugs, and share ideas."
+            fi
+            original_body="$(printf '%s' "$release_json" | jq -r '.body // ""')"
+            if [[ "$body" != "$original_body" ]]; then
               gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -f body="$body" >/dev/null
               echo "Updated release $tag"
             else
-              echo "Release $tag already contains the beta links"
+              echo "Release $tag already contains the community links"
             fi
           done <<< "$release_tags"
 
