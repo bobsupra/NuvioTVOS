@@ -2450,6 +2450,10 @@ class PlayerViewModel: ObservableObject {
               let resolver = resolveNextStream else { return }
 
         guard preResolvedNextEpisodeId != next.id, preResolvedNextEpisodeTask == nil else { return }
+        // The Usenet engine plays one stream at a time: starting the next episode's Usenet
+        // stream ahead would stop the one playing now (a rewind then found no source and the
+        // player switched to another). The next episode is resolved when it actually begins.
+        guard !UsenetStreamServer.isStreamURL(activeStreamURL.flatMap { URL(string: $0) }) else { return }
 
         let episodeId = next.id
         preResolvedNextEpisodeId = episodeId
