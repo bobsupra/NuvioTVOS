@@ -11928,7 +11928,7 @@ private struct TVHeroView: View {
     /// True if the continue item represents an unstarted/unwatched episode that should have spoilers hidden.
     /// In-progress (currently watching) episodes and already watched episodes are never hidden.
     private var shouldHideSpoilersForContinueItem: Bool {
-        guard let continueItem else { return false }
+        guard continueItem != nil else { return false }
         if isContinueItemCurrentlyWatching || isContinueItemWatched {
             return false
         }

@@ -1236,9 +1236,7 @@ actor SeriesGraphRatingsService {
 
         let task = Task<[String: SeriesGraphEpisodeRating], Never> {
             defer {
-                Task { [weak self] in
-                    await self?.clearInFlight(tmdbId)
-                }
+                self.clearInFlight(tmdbId)
             }
             guard let url = URL(string: "https://seriesgraph.com/api/shows/\(tmdbId)/season-ratings") else {
                 return [:]
