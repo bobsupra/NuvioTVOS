@@ -619,6 +619,8 @@ final class PlayerControlsSettingsTests: XCTestCase {
 
         let savedSelectedID = defaults.string(forKey: SubtitleStyleKey.selectedPresetID)
         let savedCustom = defaults.data(forKey: SubtitleStyleKey.customPresets)
+        let seededKey = "nuvio.subtitle_presets.defaults_seeded.v1"
+        let wasSeeded = defaults.bool(forKey: seededKey)
         defer {
             if let savedSelectedID {
                 defaults.set(savedSelectedID, forKey: SubtitleStyleKey.selectedPresetID)
@@ -629,6 +631,11 @@ final class PlayerControlsSettingsTests: XCTestCase {
                 defaults.set(savedCustom, forKey: SubtitleStyleKey.customPresets)
             } else {
                 defaults.removeObject(forKey: SubtitleStyleKey.customPresets)
+            }
+            if wasSeeded {
+                defaults.set(true, forKey: seededKey)
+            } else {
+                defaults.removeObject(forKey: seededKey)
             }
         }
 
@@ -666,6 +673,74 @@ final class PlayerControlsSettingsTests: XCTestCase {
         // Delete custom preset
         store.deleteCustomPreset(id: custom.id, defaults: defaults)
         XCTAssertFalse(store.customPresets(defaults: defaults).contains(where: { $0.id == custom.id }))
+
+        // Move presets (reorder)
+        let initialPresets = store.allPresets(defaults: defaults)
+        XCTAssertGreaterThanOrEqual(initialPresets.count, 2)
+        let firstID = initialPresets[0].id
+        let secondID = initialPresets[1].id
+        store.movePreset(at: 0, up: false, defaults: defaults) // move down
+        var reordered = store.allPresets(defaults: defaults)
+        XCTAssertEqual(reordered[0].id, secondID)
+        XCTAssertEqual(reordered[1].id, firstID)
+        store.movePreset(at: 1, up: true, defaults: defaults) // move up back
+        reordered = store.allPresets(defaults: defaults)
+        XCTAssertEqual(reordered[0].id, firstID)
+        XCTAssertEqual(reordered[1].id, secondID)
+
+        // Reset to defaults
+        store.resetToDefaults(defaults: defaults)
+        let resetPresets = store.allPresets(defaults: defaults)
+        XCTAssertEqual(resetPresets.count, SubtitleStylePreset.appleTVPresets.count)
+        XCTAssertEqual(resetPresets.map(\.name), SubtitleStylePreset.appleTVPresets.map(\.name))
+    }
+
+    @MainActor
+    func testSubtitlePresetAutoSaveOnAppearanceEdit() {
+        let store = SubtitleStylePresetStore.shared
+        let defaults = ProfileSettings.current
+
+        let savedSelectedID = defaults.string(forKey: SubtitleStyleKey.selectedPresetID)
+        let savedCustom = defaults.data(forKey: SubtitleStyleKey.customPresets)
+        let seededKey = "nuvio.subtitle_presets.defaults_seeded.v1"
+        let wasSeeded = defaults.bool(forKey: seededKey)
+        defer {
+            if let savedSelectedID {
+                defaults.set(savedSelectedID, forKey: SubtitleStyleKey.selectedPresetID)
+            } else {
+                defaults.removeObject(forKey: SubtitleStyleKey.selectedPresetID)
+            }
+            if let savedCustom {
+                defaults.set(savedCustom, forKey: SubtitleStyleKey.customPresets)
+            } else {
+                defaults.removeObject(forKey: SubtitleStyleKey.customPresets)
+            }
+            if wasSeeded {
+                defaults.set(true, forKey: seededKey)
+            } else {
+                defaults.removeObject(forKey: seededKey)
+            }
+        }
+
+        // Apply a built-in preset
+        store.applyPreset(SubtitleStylePreset.classic, defaults: defaults)
+        XCTAssertEqual(store.savedPresetID(defaults: defaults), SubtitleStylePreset.classic.id)
+
+        // Mutating appearance without manual save button updates active preset in-place
+        var editedStyle = SubtitleStyle.current
+        editedStyle.textSize = 140
+        editedStyle.textColorHex = "#FFCC00"
+
+        let targetID = store.savedPresetID(defaults: defaults)
+        XCTAssertNotNil(targetID)
+        store.updateCustomPresetStyle(id: targetID!, style: editedStyle, defaults: defaults)
+
+        // Verify active preset title retains the preset name without requiring manual save
+        XCTAssertEqual(store.activePresetTitle(for: editedStyle, defaults: defaults), SubtitleStylePreset.classic.name)
+        let activePreset = store.activePreset(for: editedStyle, defaults: defaults)
+        XCTAssertEqual(activePreset?.id, SubtitleStylePreset.classic.id)
+        XCTAssertEqual(activePreset?.style.textSize, 140)
+        XCTAssertEqual(activePreset?.style.textColorHex, "#FFCC00")
     }
 
     func testPromptFocusBlocksWindowInputCaptureButTimelineCaptureRemainsAllowed() {

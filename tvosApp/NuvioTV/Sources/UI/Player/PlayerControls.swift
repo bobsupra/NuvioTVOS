@@ -718,25 +718,6 @@ struct PlayerControls: View {
                     viewModel.showPlayerToast(L10n.format("subtitle_style_applied_toast", fallback: "Style: %@", preset.name))
                     viewModel.setControlsAutoHideSuspended(false)
                     viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onSaveCurrentAsPreset: {
-                    presetNameToSave = SubtitleStylePresetStore.shared.suggestedCustomPresetName()
-                    renamingPresetID = nil
-                    isNamingSubtitlePreset = true
-                    viewModel.setControlsAutoHideSuspended(true)
-                },
-                onRenameCustomPreset: { preset in
-                    presetNameToSave = preset.name
-                    renamingPresetID = preset.id
-                    isNamingSubtitlePreset = true
-                    viewModel.setControlsAutoHideSuspended(true)
-                },
-                onDeleteCustomPreset: { preset in
-                    SubtitleStylePresetStore.shared.deleteCustomPreset(id: preset.id)
-                    viewModel.applySubtitleStyle()
-                    viewModel.showPlayerToast(L10n.format("subtitle_style_deleted_toast", fallback: "Deleted preset: %@", preset.name))
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
                 }
             )
             .equatable()
@@ -1023,9 +1004,6 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
     let onToggleAudioSync: () -> Void
     let onToggleAudioSyncTiming: () -> Void
     let onSelectPreset: (SubtitleStylePreset) -> Void
-    let onSaveCurrentAsPreset: () -> Void
-    let onRenameCustomPreset: (SubtitleStylePreset) -> Void
-    let onDeleteCustomPreset: (SubtitleStylePreset) -> Void
 
     static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
         lhs.isFocused == rhs.isFocused
@@ -1144,7 +1122,7 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                 }
 
                 Menu {
-                    ForEach(stylePresets.filter(\.isBuiltIn)) { preset in
+                    ForEach(stylePresets) { preset in
                         Button {
                             onSelectPreset(preset)
                         } label: {
@@ -1152,55 +1130,6 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                                 title: preset.name,
                                 isSelected: activeStylePresetID == preset.id
                             )
-                        }
-                    }
-
-                    let customPresets = stylePresets.filter { !$0.isBuiltIn }
-                    if !customPresets.isEmpty {
-                        Section(L10n.string("subtitle_style_presets_custom", fallback: "Custom Styles")) {
-                            ForEach(customPresets) { preset in
-                                Button {
-                                    onSelectPreset(preset)
-                                } label: {
-                                    subtitleMenuItem(
-                                        title: preset.name,
-                                        isSelected: activeStylePresetID == preset.id
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    Section {
-                        Button {
-                            onSaveCurrentAsPreset()
-                        } label: {
-                            Label(
-                                L10n.string("subtitle_style_save_preset", fallback: "Save Current Style as Preset"),
-                                systemImage: "plus.circle"
-                            )
-                        }
-
-                        if !customPresets.isEmpty {
-                            Menu(L10n.string("subtitle_style_rename_preset", fallback: "Rename Custom Style")) {
-                                ForEach(customPresets) { preset in
-                                    Button {
-                                        onRenameCustomPreset(preset)
-                                    } label: {
-                                        Text(preset.name)
-                                    }
-                                }
-                            }
-
-                            Menu(L10n.string("subtitle_style_delete_preset", fallback: "Delete Custom Style")) {
-                                ForEach(customPresets) { preset in
-                                    Button(role: .destructive) {
-                                        onDeleteCustomPreset(preset)
-                                    } label: {
-                                        Text(preset.name)
-                                    }
-                                }
-                            }
                         }
                     }
                 } label: {
@@ -2271,7 +2200,6 @@ struct PlayerSettingsPanel: View {
     private enum StyleControl: Hashable {
         case preset
         case savePreset
-        case updatePreset
         case renamePreset
         case deletePreset
         case delayMinus, delayPlus
@@ -2903,19 +2831,7 @@ struct PlayerSettingsPanel: View {
                         viewModel.applySubtitleStyle()
                     }
 
-                    if let activePreset = SubtitleStylePresetStore.shared.activePreset(for: style), !activePreset.isBuiltIn {
-                        if !activePreset.style.matches(style) {
-                            cycleRow(
-                                title: L10n.format("subtitle_style_update_preset", fallback: "Update '%@'", activePreset.name),
-                                value: L10n.string("common_update", fallback: "Update Style"),
-                                focusKey: .updatePreset
-                            ) {
-                                SubtitleStylePresetStore.shared.updateCustomPresetStyle(id: activePreset.id, style: style)
-                                viewModel.applySubtitleStyle()
-                                viewModel.showPlayerToast(L10n.format("subtitle_style_updated_toast", fallback: "Updated preset: %@", activePreset.name))
-                            }
-                        }
-
+                    if let activePreset = SubtitleStylePresetStore.shared.activePreset(for: style) {
                         cycleRow(
                             title: L10n.string("subtitle_style_rename_preset", fallback: "Rename Style"),
                             value: activePreset.name,
@@ -2926,14 +2842,16 @@ struct PlayerSettingsPanel: View {
                             isNamingPreset = true
                         }
 
-                        cycleRow(
-                            title: L10n.string("subtitle_style_delete_preset", fallback: "Delete Style"),
-                            value: L10n.string("common_delete", fallback: "Delete"),
-                            focusKey: .deletePreset
-                        ) {
-                            SubtitleStylePresetStore.shared.deleteCustomPreset(id: activePreset.id)
-                            viewModel.applySubtitleStyle()
-                            viewModel.showPlayerToast(L10n.format("subtitle_style_deleted_toast", fallback: "Deleted preset: %@", activePreset.name))
+                        if SubtitleStylePresetStore.shared.allPresets().count > 1 {
+                            cycleRow(
+                                title: L10n.string("subtitle_style_delete_preset", fallback: "Delete Style"),
+                                value: L10n.string("common_delete", fallback: "Delete"),
+                                focusKey: .deletePreset
+                            ) {
+                                SubtitleStylePresetStore.shared.deleteCustomPreset(id: activePreset.id)
+                                viewModel.applySubtitleStyle()
+                                viewModel.showPlayerToast(L10n.format("subtitle_style_deleted_toast", fallback: "Deleted preset: %@", activePreset.name))
+                            }
                         }
 
                         cycleRow(
@@ -2945,7 +2863,7 @@ struct PlayerSettingsPanel: View {
                             renamingPresetID = nil
                             isNamingPreset = true
                         }
-                    } else if SubtitleStylePresetStore.shared.activePreset(for: style) == nil {
+                    } else {
                         cycleRow(
                             title: L10n.string("subtitle_style_save_preset", fallback: "Save Style"),
                             value: L10n.string("common_save", fallback: "Save as Preset"),
@@ -3103,6 +3021,12 @@ struct PlayerSettingsPanel: View {
         mutate(&style)
         let defaults = ProfileSettings.current
         style.applyToDefaults(defaults)
+        let targetID = SubtitleStylePresetStore.shared.savedPresetID(defaults: defaults)
+            ?? SubtitleStylePresetStore.shared.activePreset(for: style, defaults: defaults)?.id
+            ?? SubtitleStylePresetStore.shared.allPresets(defaults: defaults).first?.id
+        if let targetID {
+            SubtitleStylePresetStore.shared.updateCustomPresetStyle(id: targetID, style: style, defaults: defaults)
+        }
         viewModel.applySubtitleStyle()
     }
 

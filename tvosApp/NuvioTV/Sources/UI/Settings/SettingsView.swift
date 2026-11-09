@@ -902,17 +902,43 @@ extension SubtitleStylePreset {
 final class SubtitleStylePresetStore: @unchecked Sendable {
     static let shared = SubtitleStylePresetStore()
 
+    static let presetsChangedNotification = Notification.Name("SubtitleStylePresetStore.presetsChangedNotification")
+    private static let defaultsSeededKey = "nuvio.subtitle_presets.defaults_seeded.v1"
+
     func savedPresetID(defaults: UserDefaults = ProfileSettings.current) -> String? {
         defaults.string(forKey: SubtitleStyleKey.selectedPresetID)
     }
 
-    func customPresets(defaults: UserDefaults = ProfileSettings.current) -> [SubtitleStylePreset] {
-        guard let data = defaults.data(forKey: SubtitleStyleKey.customPresets) else { return [] }
-        return (try? JSONDecoder().decode([SubtitleStylePreset].self, from: data)) ?? []
+    func savePresets(_ presets: [SubtitleStylePreset], defaults: UserDefaults = ProfileSettings.current) {
+        if let encoded = try? JSONEncoder().encode(presets) {
+            defaults.set(encoded, forKey: SubtitleStyleKey.customPresets)
+        }
+        NotificationCenter.default.post(name: Self.presetsChangedNotification, object: nil)
     }
 
     func allPresets(defaults: UserDefaults = ProfileSettings.current) -> [SubtitleStylePreset] {
-        SubtitleStylePreset.appleTVPresets + customPresets(defaults: defaults)
+        if !defaults.bool(forKey: Self.defaultsSeededKey) {
+            var seeded = SubtitleStylePreset.appleTVPresets
+            if let data = defaults.data(forKey: SubtitleStyleKey.customPresets),
+               let existing = try? JSONDecoder().decode([SubtitleStylePreset].self, from: data) {
+                for item in existing where !seeded.contains(where: { $0.id == item.id }) {
+                    seeded.append(item)
+                }
+            }
+            savePresets(seeded, defaults: defaults)
+            defaults.set(true, forKey: Self.defaultsSeededKey)
+            return seeded
+        }
+
+        guard let data = defaults.data(forKey: SubtitleStyleKey.customPresets),
+              let presets = try? JSONDecoder().decode([SubtitleStylePreset].self, from: data) else {
+            return SubtitleStylePreset.appleTVPresets
+        }
+        return presets
+    }
+
+    func customPresets(defaults: UserDefaults = ProfileSettings.current) -> [SubtitleStylePreset] {
+        allPresets(defaults: defaults)
     }
 
     func activePreset(for style: SubtitleStyle, defaults: UserDefaults = ProfileSettings.current) -> SubtitleStylePreset? {
@@ -934,7 +960,7 @@ final class SubtitleStylePresetStore: @unchecked Sendable {
         }
         if let savedID = savedPresetID(defaults: defaults),
            let saved = presets.first(where: { $0.id == savedID }) {
-            return "\(saved.name)*"
+            return saved.name
         }
         return L10n.string("subtitle_style_custom", fallback: "Custom")
     }
@@ -945,14 +971,14 @@ final class SubtitleStylePresetStore: @unchecked Sendable {
     }
 
     func suggestedCustomPresetName(defaults: UserDefaults = ProfileSettings.current) -> String {
-        let existing = customPresets(defaults: defaults)
+        let existing = allPresets(defaults: defaults)
         let nextIndex = existing.count + 1
         return "\(L10n.string("subtitle_style_custom", fallback: "Custom Style")) \(nextIndex)"
     }
 
     @discardableResult
     func saveCurrentAsPreset(name: String? = nil, defaults: UserDefaults = ProfileSettings.current) -> SubtitleStylePreset {
-        var existing = customPresets(defaults: defaults)
+        var existing = allPresets(defaults: defaults)
         let resolvedName: String
         if let name = name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty {
             resolvedName = name
@@ -966,9 +992,7 @@ final class SubtitleStylePresetStore: @unchecked Sendable {
             style: SubtitleStyle.current
         )
         existing.append(newPreset)
-        if let encoded = try? JSONEncoder().encode(existing) {
-            defaults.set(encoded, forKey: SubtitleStyleKey.customPresets)
-        }
+        savePresets(existing, defaults: defaults)
         defaults.set(newPreset.id, forKey: SubtitleStyleKey.selectedPresetID)
         return newPreset
     }
@@ -979,40 +1003,53 @@ final class SubtitleStylePresetStore: @unchecked Sendable {
         newName: String? = nil,
         defaults: UserDefaults = ProfileSettings.current
     ) {
-        var existing = customPresets(defaults: defaults)
+        var existing = allPresets(defaults: defaults)
         guard let index = existing.firstIndex(where: { $0.id == id }) else { return }
         existing[index].style = style
         if let newName = newName?.trimmingCharacters(in: .whitespacesAndNewlines), !newName.isEmpty {
             existing[index].name = newName
         }
-        if let encoded = try? JSONEncoder().encode(existing) {
-            defaults.set(encoded, forKey: SubtitleStyleKey.customPresets)
-        }
+        savePresets(existing, defaults: defaults)
         defaults.set(id, forKey: SubtitleStyleKey.selectedPresetID)
         style.applyToDefaults(defaults)
     }
 
     func renameCustomPreset(id: String, newName: String, defaults: UserDefaults = ProfileSettings.current) {
-        var existing = customPresets(defaults: defaults)
+        var existing = allPresets(defaults: defaults)
         guard let index = existing.firstIndex(where: { $0.id == id }) else { return }
         let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         existing[index].name = trimmed
-        if let encoded = try? JSONEncoder().encode(existing) {
-            defaults.set(encoded, forKey: SubtitleStyleKey.customPresets)
-        }
+        savePresets(existing, defaults: defaults)
     }
 
     func deleteCustomPreset(id: String, defaults: UserDefaults = ProfileSettings.current) {
-        var existing = customPresets(defaults: defaults)
+        var existing = allPresets(defaults: defaults)
         existing.removeAll { $0.id == id }
-        if let encoded = try? JSONEncoder().encode(existing) {
-            defaults.set(encoded, forKey: SubtitleStyleKey.customPresets)
-        } else {
-            defaults.removeObject(forKey: SubtitleStyleKey.customPresets)
-        }
+        savePresets(existing, defaults: defaults)
         if savedPresetID(defaults: defaults) == id {
-            defaults.removeObject(forKey: SubtitleStyleKey.selectedPresetID)
+            if let first = existing.first {
+                applyPreset(first, defaults: defaults)
+            } else {
+                defaults.removeObject(forKey: SubtitleStyleKey.selectedPresetID)
+            }
+        }
+    }
+
+    func movePreset(at index: Int, up: Bool, defaults: UserDefaults = ProfileSettings.current) {
+        var existing = allPresets(defaults: defaults)
+        let targetIndex = up ? index - 1 : index + 1
+        guard existing.indices.contains(index), existing.indices.contains(targetIndex) else { return }
+        existing.swapAt(index, targetIndex)
+        savePresets(existing, defaults: defaults)
+    }
+
+    func resetToDefaults(defaults: UserDefaults = ProfileSettings.current) {
+        defaults.removeObject(forKey: Self.defaultsSeededKey)
+        defaults.removeObject(forKey: SubtitleStyleKey.customPresets)
+        let seeded = allPresets(defaults: defaults)
+        if let first = seeded.first {
+            applyPreset(first, defaults: defaults)
         }
     }
 }
@@ -9964,7 +10001,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     subtitle: L10n.string(
                         "tvos_settings_prefer_dual_layer_dolby_vision_subtitle",
-                        fallback: "AetherEngine only. Enable Spatial Audio for supported Atmos/DTS:X on FEL playback; otherwise PCM. Applies next playback."
+                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with per-scene FEL curve folding. Turn on for full pixel-level dual-layer composition. Applies next playback."
                     ),
                     isOn: Binding(
                         get: { preferDualLayerDolbyVision },
@@ -11078,6 +11115,269 @@ private struct SubtitleStyleSettingsView: View {
     var body: some View { SubtitleStyleEditor(accentColor: accentColor) }
 }
 
+/// A single row in the subtitle presets reorder panel matching the Add-ons manager design.
+private struct SubtitlePresetSettingsRow: View {
+    let preset: SubtitleStylePreset
+    let isActive: Bool
+    let accentColor: Color
+    var canMoveUp: Bool = false
+    var canMoveDown: Bool = false
+    var canDelete: Bool = true
+    var onSelect: (() -> Void)? = nil
+    var onRename: (() -> Void)? = nil
+    var onDelete: (() -> Void)? = nil
+    var onMove: ((Bool) -> Void)? = nil
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            rowButton
+
+            if let onRename {
+                AddonReorderButton(systemImage: "pencil", disabled: false, action: onRename)
+            }
+
+            if let onDelete {
+                AddonReorderButton(systemImage: "trash", disabled: !canDelete, action: onDelete)
+            }
+
+            if let onMove {
+                AddonReorderButton(systemImage: "chevron.up", disabled: !canMoveUp) {
+                    onMove(true)
+                }
+                AddonReorderButton(systemImage: "chevron.down", disabled: !canMoveDown) {
+                    onMove(false)
+                }
+            }
+        }
+    }
+
+    private var rowButton: some View {
+        Button(action: { onSelect?() }) {
+            SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                Image(systemName: "captions.bubble.fill")
+                    .font(.system(size: 24))
+                    .foregroundColor(isActive ? accentColor : .white.opacity(0.4))
+                    .frame(width: 44, height: 44)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Text(preset.name)
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(isActive ? .white : .white.opacity(0.88))
+                            .lineLimit(1)
+                        if isActive {
+                            Text(L10n.string("settings_fusion_badge_url_active", fallback: "Active"))
+                                .font(.system(size: 13, weight: .bold))
+                                .foregroundColor(accentColor)
+                        }
+                    }
+
+                    Text(subtitleText)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.white.opacity(isActive ? 0.6 : 0.38))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 20)
+
+                Text(isActive ? L10n.string("settings_fusion_badge_url_active", fallback: "Active") : L10n.string("common_load", fallback: "Load"))
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(isActive ? accentColor : .white.opacity(0.42))
+                    .lineLimit(1)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .entryLockable()
+    }
+
+    private var subtitleText: String {
+        var parts: [String] = []
+        parts.append(preset.style.fontName)
+        parts.append("\(Int(preset.style.textSize))%")
+        if preset.style.backgroundEnabled {
+            parts.append(L10n.string("subtitle_bg_card", fallback: "Background"))
+        } else if preset.style.outlineEnabled {
+            parts.append(L10n.string("subtitle_outline", fallback: "Outline"))
+        }
+        return parts.joined(separator: " · ")
+    }
+}
+
+/// The reorder and preset management panel presented inside SettingsFeatureSettingsSheet.
+private struct SubtitlePresetsSettingsSection: View {
+    let accentColor: Color
+    let style: SubtitleStyle
+    let onSelectPreset: (SubtitleStylePreset) -> Void
+    var onChange: (() -> Void)? = nil
+
+    @State private var renamingPresetID: String?
+    @State private var renamingText = ""
+    @State private var newPresetNameDraft = ""
+    @State private var presets: [SubtitleStylePreset] = SubtitleStylePresetStore.shared.allPresets()
+
+    private var activePreset: SubtitleStylePreset? {
+        SubtitleStylePresetStore.shared.activePreset(for: style)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            SettingsGroup(
+                title: L10n.string("subtitle_style_presets", fallback: "Presets"),
+                subtitle: L10n.string("subtitle_style_presets_subtitle", fallback: "Create new presets, reorder them, or tap a style to load and edit it.")
+            ) {
+                SettingsNativeTextFieldRow(
+                    title: L10n.string("subtitle_style_preset_name", fallback: "New Preset Name"),
+                    subtitle: L10n.string("subtitle_style_preset_name_desc", fallback: "Custom name for creating a new preset"),
+                    placeholder: SubtitleStylePresetStore.shared.suggestedCustomPresetName(),
+                    text: $newPresetNameDraft
+                )
+                .settingsEntryAnchor()
+
+                SettingsActionRow(
+                    title: L10n.string("subtitle_style_save_preset", fallback: "Save Current Style as New Preset"),
+                    subtitle: L10n.string("subtitle_style_save_preset_desc", fallback: "Create a new preset with current appearance settings"),
+                    value: L10n.string("common_save", fallback: "Create"),
+                    accentColor: accentColor,
+                    action: {
+                        let name = newPresetNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let newPreset = SubtitleStylePresetStore.shared.saveCurrentAsPreset(name: name.isEmpty ? nil : name)
+                        newPresetNameDraft = ""
+                        refreshPresets()
+                        onSelectPreset(newPreset)
+                        onChange?()
+                    }
+                )
+
+                ForEach(Array(presets.enumerated()), id: \.element.id) { index, preset in
+                    let isActive = activePreset?.id == preset.id
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        SubtitlePresetSettingsRow(
+                            preset: preset,
+                            isActive: isActive,
+                            accentColor: accentColor,
+                            canMoveUp: index > 0,
+                            canMoveDown: index < presets.count - 1,
+                            canDelete: presets.count > 1,
+                            onSelect: {
+                                if isActive {
+                                    if renamingPresetID == preset.id {
+                                        renamingPresetID = nil
+                                        renamingText = ""
+                                    } else {
+                                        renamingPresetID = preset.id
+                                        renamingText = preset.name
+                                    }
+                                } else {
+                                    onSelectPreset(preset)
+                                    renamingPresetID = nil
+                                    renamingText = ""
+                                }
+                            },
+                            onRename: {
+                                if renamingPresetID == preset.id {
+                                    renamingPresetID = nil
+                                    renamingText = ""
+                                } else {
+                                    renamingPresetID = preset.id
+                                    renamingText = preset.name
+                                }
+                            },
+                            onDelete: {
+                                if renamingPresetID == preset.id {
+                                    renamingPresetID = nil
+                                    renamingText = ""
+                                }
+                                SubtitleStylePresetStore.shared.deleteCustomPreset(id: preset.id)
+                                refreshPresets()
+                                if activePreset?.id == preset.id,
+                                   let remaining = presets.first {
+                                    onSelectPreset(remaining)
+                                }
+                                onChange?()
+                            },
+                            onMove: { up in
+                                if renamingPresetID == preset.id {
+                                    renamingPresetID = nil
+                                    renamingText = ""
+                                }
+                                SubtitleStylePresetStore.shared.movePreset(at: index, up: up)
+                                refreshPresets()
+                                onChange?()
+                            }
+                        )
+
+                        if renamingPresetID == preset.id {
+                            HStack(spacing: 14) {
+                                SettingsTextFieldRow(
+                                    title: L10n.string("subtitle_style_rename_preset", fallback: "Rename Style"),
+                                    subtitle: L10n.string("subtitle_style_rename_preset_desc", fallback: "Enter a new name for this style"),
+                                    placeholder: preset.name,
+                                    text: $renamingText,
+                                    fieldWidth: 500,
+                                    onCommit: { commitRename(for: preset.id) }
+                                )
+                                AddonReorderButton(systemImage: "checkmark", disabled: false) {
+                                    commitRename(for: preset.id)
+                                }
+                                AddonReorderButton(systemImage: "xmark", disabled: false) {
+                                    renamingPresetID = nil
+                                    renamingText = ""
+                                }
+                            }
+                            .padding(.leading, 20)
+                        }
+                    }
+                }
+
+                SettingsActionRow(
+                    title: L10n.string("subtitle_style_reset_all_presets", fallback: "Reset All Styles to Defaults"),
+                    subtitle: L10n.string("subtitle_style_reset_all_presets_desc", fallback: "Restore the 6 built-in Apple TV subtitle styles"),
+                    value: L10n.string("common_reset", fallback: "Reset"),
+                    accentColor: .red,
+                    action: {
+                        SubtitleStylePresetStore.shared.resetToDefaults()
+                        refreshPresets()
+                        if let first = presets.first {
+                            onSelectPreset(first)
+                        }
+                        renamingPresetID = nil
+                        renamingText = ""
+                        onChange?()
+                    }
+                )
+            }
+        }
+        .onAppear {
+            refreshPresets()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SubtitleStylePresetStore.presetsChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshPresets()
+        }
+    }
+
+    private func refreshPresets() {
+        withAnimation(.easeInOut(duration: 0.2)) {
+            presets = SubtitleStylePresetStore.shared.allPresets()
+        }
+    }
+
+    private func commitRename(for presetID: String) {
+        let trimmed = renamingText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            SubtitleStylePresetStore.shared.renameCustomPreset(id: presetID, newName: trimmed)
+            refreshPresets()
+            onChange?()
+        }
+        renamingPresetID = nil
+        renamingText = ""
+    }
+}
+
 /// The full subtitle-appearance editor: a live preview plus every control.
 /// Reused by the Settings tab and by the in-player styling panel. `onChange`
 /// fires after any value changes so the player can re-apply the style to mpv
@@ -11088,6 +11388,9 @@ struct SubtitleStyleEditor: View {
 
     @ObservedObject private var fontLibrary = SubtitleFontLibrary.shared
     @State private var showingCustomFonts = false
+    @State private var showingPresetsSheet = false
+    @State private var presetsRevision = 0
+    @State private var isApplyingPreset = false
     @AppStorage(SubtitleStyleKey.fontName) private var fontName = SubtitleStyleDefaults.fontName
     @AppStorage(SubtitleStyleKey.textSize) private var textSize = SubtitleStyleDefaults.textSize
     @AppStorage(SubtitleStyleKey.bold) private var bold = SubtitleStyleDefaults.bold
@@ -11103,8 +11406,6 @@ struct SubtitleStyleEditor: View {
     @AppStorage(SubtitleStyleKey.backgroundEnabled) private var backgroundEnabled = SubtitleStyleDefaults.backgroundEnabled
     @AppStorage(SubtitleStyleKey.backgroundColor) private var backgroundColor = SubtitleStyleDefaults.backgroundColor
     @AppStorage(SubtitleStyleKey.backgroundOpacity) private var backgroundOpacity = SubtitleStyleDefaults.backgroundOpacity
-
-    @State private var customPresetNameDraft = ""
 
     private var style: SubtitleStyle {
         SubtitleStyle(
@@ -11146,151 +11447,54 @@ struct SubtitleStyleEditor: View {
             .focusSection()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: changeToken) { _, _ in onChange?() }
+        .onChange(of: changeToken) { _, _ in
+            guard !isApplyingPreset else { return }
+            let targetID = SubtitleStylePresetStore.shared.savedPresetID()
+                ?? SubtitleStylePresetStore.shared.activePreset(for: style)?.id
+                ?? SubtitleStylePresetStore.shared.allPresets().first?.id
+            if let targetID {
+                SubtitleStylePresetStore.shared.updateCustomPresetStyle(id: targetID, style: style)
+            }
+            onChange?()
+        }
         .sheet(isPresented: $showingCustomFonts) {
             CustomSubtitleFontsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .onReceive(NotificationCenter.default.publisher(for: SubtitleStylePresetStore.presetsChangedNotification).receive(on: RunLoop.main)) { _ in
+            presetsRevision &+= 1
+        }
+        .fullScreenCover(isPresented: $showingPresetsSheet) {
+            SettingsFeatureSettingsSheet(
+                title: L10n.string("subtitle_style_presets", fallback: "Presets"),
+                subtitle: L10n.string("subtitle_style_presets_sheet_subtitle", fallback: "Reorder, rename, or delete saved subtitle styles")
+            ) {
+                SubtitlePresetsSettingsSection(
+                    accentColor: accentColor,
+                    style: style,
+                    onSelectPreset: { preset in
+                        applyPreset(preset)
+                    },
+                    onChange: onChange
+                )
+            }
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
     }
 
     private var controls: some View {
-        VStack(alignment: .leading, spacing: 22) {
-            SettingsGroup(
-                title: L10n.string("subtitle_style_presets", fallback: "Presets"),
-                subtitle: L10n.string("subtitle_style_presets_subtitle", fallback: "Choose from pre-saved styles, or create and edit your own")
+        _ = presetsRevision
+        let allPresets = SubtitleStylePresetStore.shared.allPresets()
+
+        return VStack(alignment: .leading, spacing: 22) {
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("subtitle_style_presets", fallback: "Presets"),
+                status: "\(SubtitleStylePresetStore.shared.activePresetTitle(for: style)) · \(settingsCountSummary(allPresets.count, singular: "preset", plural: "presets"))",
+                actionSubtitle: L10n.string("subtitle_style_presets_subtitle", fallback: "Create, reorder, rename, or delete preset styles"),
+                accentColor: accentColor,
+                isEntryAnchor: true
             ) {
-                SettingsOptionRow(
-                    title: L10n.string("subtitle_style_preset", fallback: "Preset Style"),
-                    subtitle: L10n.string("subtitle_style_preset_desc", fallback: "Pre-saved caption styles"),
-                    selection: Binding(
-                        get: { SubtitleStylePresetStore.shared.activePresetTitle(for: style) },
-                        set: { selectedTitle in
-                            if let preset = SubtitleStylePresetStore.shared.allPresets().first(where: { $0.name == selectedTitle }) {
-                                applyPreset(preset)
-                                if !preset.isBuiltIn {
-                                    customPresetNameDraft = preset.name
-                                }
-                            }
-                        }
-                    ),
-                    options: SubtitleStylePresetStore.shared.allPresets().map(\.name),
-                    accentColor: accentColor
-                )
-
-                SettingsNativeTextFieldRow(
-                    title: L10n.string("subtitle_style_preset_name", fallback: "Preset Name"),
-                    subtitle: L10n.string("subtitle_style_preset_name_desc", fallback: "Custom name for creating or renaming a preset"),
-                    placeholder: SubtitleStylePresetStore.shared.suggestedCustomPresetName(),
-                    text: $customPresetNameDraft
-                )
-
-                SettingsActionRow(
-                    title: L10n.string("subtitle_style_save_preset", fallback: "Save Current Style as New Preset"),
-                    subtitle: L10n.string("subtitle_style_save_preset_desc", fallback: "Create a new preset with current appearance settings"),
-                    value: L10n.string("common_save", fallback: "Create"),
-                    accentColor: accentColor,
-                    action: {
-                        let name = customPresetNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                        _ = SubtitleStylePresetStore.shared.saveCurrentAsPreset(name: name.isEmpty ? nil : name)
-                        customPresetNameDraft = ""
-                        onChange?()
-                    }
-                )
-
-                if let activeCustom = SubtitleStylePresetStore.shared.activePreset(for: style), !activeCustom.isBuiltIn {
-                    SettingsActionRow(
-                        title: L10n.format("subtitle_style_update_preset", fallback: "Update '%@' with Current Style", activeCustom.name),
-                        subtitle: L10n.string("subtitle_style_update_preset_desc", fallback: "Overwrite this preset's saved appearance with the settings below"),
-                        value: L10n.string("common_update", fallback: "Update"),
-                        accentColor: accentColor,
-                        action: {
-                            let name = customPresetNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                            SubtitleStylePresetStore.shared.updateCustomPresetStyle(
-                                id: activeCustom.id,
-                                style: style,
-                                newName: name.isEmpty ? nil : name
-                            )
-                            onChange?()
-                        }
-                    )
-
-                    SettingsActionRow(
-                        title: L10n.string("subtitle_style_rename_preset", fallback: "Rename Custom Preset"),
-                        subtitle: L10n.string("subtitle_style_rename_preset_desc", fallback: "Update the name of this custom preset to the entered text above"),
-                        value: L10n.string("common_rename", fallback: "Rename"),
-                        accentColor: accentColor,
-                        action: {
-                            let name = customPresetNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                            if !name.isEmpty {
-                                SubtitleStylePresetStore.shared.renameCustomPreset(id: activeCustom.id, newName: name)
-                                customPresetNameDraft = ""
-                                onChange?()
-                            }
-                        }
-                    )
-
-                    SettingsActionRow(
-                        title: L10n.string("subtitle_style_delete_preset", fallback: "Delete Custom Preset"),
-                        subtitle: L10n.string("subtitle_style_delete_preset_desc", fallback: "Remove this custom preset from saved styles"),
-                        value: L10n.string("common_delete", fallback: "Delete"),
-                        accentColor: .red,
-                        action: {
-                            SubtitleStylePresetStore.shared.deleteCustomPreset(id: activeCustom.id)
-                            customPresetNameDraft = ""
-                            onChange?()
-                        }
-                    )
-                }
-            }
-
-            let customPresets = SubtitleStylePresetStore.shared.customPresets()
-            if !customPresets.isEmpty {
-                SettingsGroup(
-                    title: L10n.string("subtitle_style_presets_custom", fallback: "Custom Presets"),
-                    subtitle: L10n.string("subtitle_style_presets_custom_subtitle", fallback: "Load, update, or remove your saved custom presets")
-                ) {
-                    ForEach(customPresets) { preset in
-                        let isActive = SubtitleStylePresetStore.shared.activePreset(for: style)?.id == preset.id
-                        SettingsActionRow(
-                            title: preset.name,
-                            subtitle: isActive
-                                ? L10n.string("subtitle_style_preset_active_desc", fallback: "Currently loaded in editor · Click to update with changes")
-                                : L10n.string("subtitle_style_preset_load_desc", fallback: "Click to load and edit this preset"),
-                            value: isActive
-                                ? L10n.string("common_update", fallback: "Update")
-                                : L10n.string("common_load", fallback: "Load"),
-                            accentColor: accentColor,
-                            action: {
-                                if isActive {
-                                    let name = customPresetNameDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-                                    SubtitleStylePresetStore.shared.updateCustomPresetStyle(
-                                        id: preset.id,
-                                        style: style,
-                                        newName: name.isEmpty ? nil : name
-                                    )
-                                } else {
-                                    applyPreset(preset)
-                                    customPresetNameDraft = preset.name
-                                }
-                                onChange?()
-                            }
-                        )
-
-                        SettingsActionRow(
-                            title: L10n.format("subtitle_style_delete_named_preset", fallback: "Delete '%@'", preset.name),
-                            subtitle: L10n.string("subtitle_style_delete_preset_desc", fallback: "Remove this custom preset from saved styles"),
-                            value: L10n.string("common_delete", fallback: "Delete"),
-                            accentColor: .red,
-                            action: {
-                                SubtitleStylePresetStore.shared.deleteCustomPreset(id: preset.id)
-                                if customPresetNameDraft == preset.name {
-                                    customPresetNameDraft = ""
-                                }
-                                onChange?()
-                            }
-                        )
-                    }
-                }
+                showingPresetsSheet = true
             }
 
             SettingsGroup(title: L10n.string("tvos_settings_text", fallback: "Text"), subtitle: L10n.string("tvos_settings_size_weight_spacing_color_and_opacity_of_4755001d", fallback: "Size, weight, spacing, color, and opacity of the caption text")) {
@@ -11329,7 +11533,6 @@ struct SubtitleStyleEditor: View {
                     suffix: "%",
                     accentColor: accentColor
                 )
-                .settingsEntryAnchor()
 
                 SettingsToggleRow(
                     title: L10n.string("subtitle_bold", fallback: "Bold"),
@@ -11484,6 +11687,7 @@ struct SubtitleStyleEditor: View {
     }
 
     private func applyPreset(_ preset: SubtitleStylePreset) {
+        isApplyingPreset = true
         fontName = preset.style.fontName
         textSize = preset.style.textSize
         bold = preset.style.bold
@@ -11500,6 +11704,9 @@ struct SubtitleStyleEditor: View {
         backgroundColor = preset.style.backgroundColorHex
         backgroundOpacity = preset.style.backgroundOpacity
         SubtitleStylePresetStore.shared.applyPreset(preset)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            isApplyingPreset = false
+        }
         onChange?()
     }
 
