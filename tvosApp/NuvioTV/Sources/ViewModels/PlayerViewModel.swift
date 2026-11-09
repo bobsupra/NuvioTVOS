@@ -2448,6 +2448,12 @@ class PlayerViewModel: ObservableObject {
               lastAdvancedEpisodeId != next.id,
               (EpisodeReleasePolicy.hasAired(next.released) || EpisodeReleasePolicy.isAiringToday(next.released)),
               let resolver = resolveNextStream else { return }
+        // The on-device P2P torrent engine plays one torrent at a time: starting the next
+        // episode's torrent ahead would stop the one playing now (a rewind then found no source
+        // and the player switched to another). While a P2P torrent plays, the next episode is
+        // resolved when it actually begins.
+        let currentStreamURL = activeStreamURL.flatMap { URL(string: $0) }
+        guard currentStreamURL == nil || TorrentEngineManager.shared.activeStreamURL != currentStreamURL else { return }
 
         guard preResolvedNextEpisodeId != next.id, preResolvedNextEpisodeTask == nil else { return }
 
