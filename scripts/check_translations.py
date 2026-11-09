@@ -10,9 +10,9 @@ from pathlib import Path
 
 
 SUPPORTED_LANGUAGES = {
-    "ar", "bg", "bs", "cs", "da", "de", "el", "en", "es", "es-419",
-    "fr", "he", "hi", "hu", "in", "it", "ja", "lt", "nl", "no", "pl",
-    "pt-BR", "pt-PT", "ro", "ru", "sk", "sl", "sv", "ta", "tr", "uk",
+    "ar", "bg", "bn", "bs", "cs", "da", "de", "el", "en", "es", "es-419",
+    "fr", "he", "hi", "hr", "hu", "in", "it", "ja", "lt", "nl", "no", "pl",
+    "pt-BR", "pt-PT", "ro", "ru", "sk", "sl", "sq", "sr-Latn", "sv", "ta", "tr", "uk",
     "vi", "zh-CN", "zh-TW",
 }
 

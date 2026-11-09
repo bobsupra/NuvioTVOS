@@ -47,6 +47,10 @@ enum AppLanguage: String, CaseIterable, Identifiable, Hashable {
     case hebrew = "he"
     case chineseSimplified = "zh-CN"
     case chineseTraditional = "zh-TW"
+    case bengali = "bn"
+    case croatian = "hr"
+    case albanian = "sq"
+    case serbianLatin = "sr-Latn"
 
     var id: String { rawValue.isEmpty ? "system" : rawValue }
 
@@ -101,6 +105,10 @@ enum AppLanguage: String, CaseIterable, Identifiable, Hashable {
         case .lithuanian: return "Lithuanian"
         case .hebrew: return "Hebrew"
         case .chineseSimplified, .chineseTraditional: return "Chinese"
+        case .bengali: return "Bengali"
+        case .croatian: return "Croatian"
+        case .albanian: return "Albanian"
+        case .serbianLatin: return "Serbian"
         }
     }
 
@@ -141,6 +149,9 @@ enum AppLanguage: String, CaseIterable, Identifiable, Hashable {
         if normalized.caseInsensitiveCompare("iw") == .orderedSame {
             return .hebrew
         }
+        if normalized.caseInsensitiveCompare("sr") == .orderedSame {
+            return .serbianLatin
+        }
         if let match = allCases.first(where: { $0.tag.caseInsensitiveCompare(normalized) == .orderedSame }) {
             return match
         }
@@ -159,10 +170,12 @@ enum AppLanguage: String, CaseIterable, Identifiable, Hashable {
 
     private static let legacyDisplayNameMap: [String: AppLanguage] = [
         "English": .english,
+        "Albanian": .albanian,
         "Arabic": .arabic,
+        "Bengali": .bengali,
         "Bulgarian": .bulgarian,
         "Chinese": .chineseSimplified,
-        "Croatian": .system, // not in Android TV app set; fall back to system
+        "Croatian": .croatian,
         "Czech": .czech,
         "Danish": .danish,
         "Dutch": .dutch,
@@ -182,6 +195,7 @@ enum AppLanguage: String, CaseIterable, Identifiable, Hashable {
         "Portuguese": .portuguesePortugal,
         "Romanian": .romanian,
         "Russian": .russian,
+        "Serbian": .serbianLatin,
         "Spanish": .spanish,
         "Swedish": .swedish,
         "Thai": .system,
@@ -427,6 +441,9 @@ enum L10n {
         }
         if lower.hasPrefix("he") || lower.hasPrefix("iw") {
             return "he"
+        }
+        if lower.hasPrefix("sr") {
+            return "sr-Latn"
         }
         let lang = String(preferred.split(separator: "-").first ?? Substring(preferred))
         if catalog[lang] != nil { return lang }
