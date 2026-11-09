@@ -664,6 +664,11 @@ struct ContentView: View {
             }
 
             AtvloadlyNoticeCountdownDriver(release: atvloadlyNoticeRelease)
+
+            // A quick Back during a transition (nothing focused) stays in the app.
+            RemoteBackGuard()
+                .allowsHitTesting(false)
+                .frame(width: 0, height: 0)
         }
         // Resolve every @AppStorage in the app against the active profile's
         // settings suite, so each profile keeps its own theme, layout, playback
