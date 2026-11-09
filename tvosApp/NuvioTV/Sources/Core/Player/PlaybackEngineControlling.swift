@@ -217,6 +217,7 @@ struct PlaybackDebugInfo: Equatable {
 protocol PlaybackEngineControlling: AnyObject {
     var onPlaybackSuspended: ((Int64, Int64) -> Void)? { get set }
     var onFirstFrameReady: (() -> Void)? { get set }
+    var onAwaitingDisplaySwitchChanged: ((Bool) -> Void)? { get set }
 
     var audioTracks: [PlaybackTrackInfo] { get }
     var subtitleTracks: [PlaybackTrackInfo] { get }
@@ -241,6 +242,7 @@ protocol PlaybackEngineControlling: AnyObject {
     var supportsAudioProcessing: Bool { get }
     var playbackDebugInfo: PlaybackDebugInfo { get }
     var loadingStepMessage: String? { get }
+    var isAwaitingDisplaySwitch: Bool { get }
     var discTitles: [PlaybackDiscTitleInfo] { get }
     var selectedDiscTitleId: Int? { get }
 
@@ -273,6 +275,11 @@ extension PlaybackEngineControlling {
     var supportsAudioProcessing: Bool { false }
     var discTitles: [PlaybackDiscTitleInfo] { [] }
     var selectedDiscTitleId: Int? { nil }
+    var isAwaitingDisplaySwitch: Bool { false }
+    var onAwaitingDisplaySwitchChanged: ((Bool) -> Void)? {
+        get { nil }
+        set {}
+    }
     func seekToMs(_ ms: Int64, exact: Bool) { seekToMs(ms) }
     func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {}
     func selectDiscTitle(_ id: Int) {}

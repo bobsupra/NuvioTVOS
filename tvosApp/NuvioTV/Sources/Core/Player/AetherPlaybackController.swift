@@ -2744,6 +2744,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     @Published private(set) var startupProgress: StartupProgress?
     var onStartupProgressChanged: ((StartupProgress?) -> Void)?
+    public var isAwaitingDisplaySwitch: Bool { engine.isAwaitingDisplaySwitch }
+    public var onAwaitingDisplaySwitchChanged: ((Bool) -> Void)?
     private let startupProgressGenerationObserver = StartupProgressGenerationObserver()
     private var startupBenchmarkLoadOwner: StartupBenchmarkLoadOwner?
 
@@ -2771,6 +2773,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     var loadingStepMessage: String? {
+        if engine.isAwaitingDisplaySwitch {
+            return L10n.string("player_matching_display_mode", fallback: "Matching display mode…")
+        }
         guard let stage = engine.startupProgress?.stage else {
             return isPlayerLoading ? L10n.string("player_loading_buffering", fallback: "Buffering…") : nil
         }
@@ -2782,7 +2787,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         case .analyzingStreams:
             return L10n.string("player_loading_detecting_format", fallback: "Analyzing streams…")
         case .preparingDisplay:
-            return L10n.string("player_loading_preparing", fallback: "Matching display settings…")
+            return L10n.string("player_matching_display_mode", fallback: "Matching display mode…")
         case .selectingRoute:
             return L10n.string("player_loading_building", fallback: "Selecting playback decoder…")
         case .buildingSession:
@@ -3928,7 +3933,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
 
         // Display refresh rate
-        let displayStr = PlaybackSystemMonitor.displayRefreshRate(nominalFps: fpsVal)
+        var displayStr = PlaybackSystemMonitor.displayRefreshRate(nominalFps: fpsVal)
+        if engine.isAwaitingDisplaySwitch {
+            displayStr += " · Mode switch in flight"
+        }
 
         let deliveryStr = Self.audioDeliveryDescription(
             engine.audioDelivery,
@@ -4059,8 +4067,25 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             socTemp: socTempStr,
             isThermalElevated: thermal.isElevated,
             cpuClock: cpuClockStr,
-            diagnostics: engine.displayDebugLines
+            diagnostics: displayDebugLines
         )
+    }
+
+    public var displayDebugLines: [String] {
+        var lines = engine.displayDebugLines
+        let isDV = engine.effectiveVideoFormat == .dolbyVision || (engine.sourceVideoFormat == .dolbyVision && engine.videoFormat != .sdr)
+        let dvProfile = engine.sourceDVProfile ?? sourceProbe?.dvProfile
+        if isDV, dvProfile == 7 {
+            if engine.isDualLayerOutputRouteActive {
+                lines.append("DV ROUTE  Profile 7 FEL · Composed (Metal)")
+            } else if engine.sourceElType == "FEL" {
+                lines.append("DV ROUTE  Profile 7 FEL · Curve Fold (P8.1)")
+            }
+        }
+        if engine.isAwaitingDisplaySwitch {
+            lines.append("Display · HDMI mode switch in flight")
+        }
+        return lines
     }
 
     /// Creates an Aether host when the engine can be initialized. A failed
@@ -4413,6 +4438,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                     }
                     self.onFirstFrameReady?()
                 }
+            }
+            .store(in: &cancellables)
+
+        engine.$isAwaitingDisplaySwitch
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] isAwaiting in
+                guard let self else { return }
+                self.onAwaitingDisplaySwitchChanged?(isAwaiting)
             }
             .store(in: &cancellables)
 
@@ -4856,6 +4889,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
         if conversion == .profile7ToProfile81 {
             if let elType {
+                if elType == "FEL" {
+                    return "P7→8.1 (FEL Curve Fold)"
+                }
                 return "P7→8.1 libdovi (\(elType))"
             }
             return "P7→8.1 libdovi"

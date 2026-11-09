@@ -246,6 +246,10 @@ final class PlaybackSessionCoordinator: ObservableObject {
         return activeEngine.loadingStepMessage
     }
 
+    var isAwaitingDisplaySwitch: Bool {
+        activeEngine.isAwaitingDisplaySwitch
+    }
+
     init(
         aetherController: AetherPlaybackController? = nil,
         aetherControllerFactory: @escaping @MainActor () -> AetherPlaybackController? = { AetherPlaybackController() },

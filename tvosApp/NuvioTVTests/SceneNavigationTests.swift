@@ -520,6 +520,24 @@ final class SceneNavigationTests: XCTestCase {
         XCTAssertEqual(
             AetherPlaybackController.dolbyVisionRouteDescription(
                 sourceProfile: 7,
+                conversion: .profile7ToProfile81,
+                felComposedFrameCount: nil,
+                elType: "FEL"
+            ),
+            "P7→8.1 (FEL Curve Fold)"
+        )
+        XCTAssertEqual(
+            AetherPlaybackController.dolbyVisionRouteDescription(
+                sourceProfile: 7,
+                conversion: .profile7ToProfile81,
+                felComposedFrameCount: nil,
+                elType: "MEL"
+            ),
+            "P7→8.1 libdovi (MEL)"
+        )
+        XCTAssertEqual(
+            AetherPlaybackController.dolbyVisionRouteDescription(
+                sourceProfile: 7,
                 conversion: nil,
                 felComposedFrameCount: nil
             ),
@@ -569,6 +587,16 @@ final class SceneNavigationTests: XCTestCase {
         XCTAssertEqual(activeSnapshot?.videoCodec, "AV1")
         XCTAssertEqual(activeSnapshot?.frameRate, "59.940 fps")
         XCTAssertEqual(activeSnapshot?.aBitrate, "meas 2.00 Mbit/s")
+    }
+
+    func testAetherDisplayDebugLinesIncludeDiagnostics() throws {
+        guard let aetherController = AetherPlaybackController() else {
+            throw XCTSkip("AetherEngine is unavailable in this test environment")
+        }
+        XCTAssertFalse(aetherController.isAwaitingDisplaySwitch)
+        let lines = aetherController.displayDebugLines
+        XCTAssertFalse(lines.isEmpty)
+        XCTAssertTrue(lines.contains(where: { $0.hasPrefix("HDRSRC") }))
     }
 
     func testSceneInfoUsesAetherDeliveryAndSyncGapThenClearsThemOnHandoff() throws {

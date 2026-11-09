@@ -931,6 +931,9 @@ class PlayerViewModel: ObservableObject {
         aetherController?.onStartupProgressChanged = { [weak self] _ in
             self?.updateLoadingStepMessage()
         }
+        aetherController?.onAwaitingDisplaySwitchChanged = { [weak self] _ in
+            self?.updateLoadingStepMessage()
+        }
         aetherController?.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
             self?.handleAISubtitleTranslationOutcome(outcome)
         }
@@ -5400,6 +5403,8 @@ class PlayerViewModel: ObservableObject {
             } else {
                 nextMessage = L10n.string("player_torrent_starting_engine", fallback: "Starting P2P engine…")
             }
+        } else if engine.isAwaitingDisplaySwitch {
+            nextMessage = L10n.string("player_matching_display_mode", fallback: "Matching display mode…")
         } else if isLoadingExternalSubtitles && !hasRenderedFirstFrame {
             nextMessage = L10n.string("player_loading_subtitles", fallback: "Fetching subtitles…")
         } else if let engineMessage = engine.loadingStepMessage, !engineMessage.isEmpty {
