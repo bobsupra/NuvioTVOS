@@ -277,4 +277,145 @@ final class JellyfinClientTests: XCTestCase {
         XCTAssertEqual(items[0].productionYear, 2024)
         XCTAssertEqual(items[0].communityRating, 8.5)
     }
+
+    func testItemsPaginatesWhenTotalRecordCountExceedsPageSize() async throws {
+        var requestedStartIndices: [String] = []
+
+        JellyfinMockURLProtocol.requestHandler = { request in
+            guard let url = request.url else {
+                return (HTTPURLResponse(url: URL(string: "http://error")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
+            }
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            let startIndex = components?.queryItems?.first(where: { $0.name == "StartIndex" })?.value ?? "0"
+            requestedStartIndices.append(startIndex)
+
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+
+            if startIndex == "0" {
+                // First page returns 24 items with TotalRecordCount: 50 (matching Silo server behavior)
+                var itemsJson = ""
+                for i in 0..<24 {
+                    itemsJson += """
+                    {
+                        "Id": "item-\(i)",
+                        "Name": "Movie \(i)",
+                        "Type": "Movie",
+                        "ProductionYear": \(2020 + i)
+                    }\(i < 23 ? "," : "")
+                    """
+                }
+                let json = """
+                {
+                    "Items": [\(itemsJson)],
+                    "TotalRecordCount": 50,
+                    "StartIndex": 0
+                }
+                """
+                return (response, Data(json.utf8))
+            } else if startIndex == "24" {
+                // Second page returns next 24 items
+                var itemsJson = ""
+                for i in 24..<48 {
+                    itemsJson += """
+                    {
+                        "Id": "item-\(i)",
+                        "Name": "Movie \(i)",
+                        "Type": "Movie",
+                        "ProductionYear": \(2020 + i)
+                    }\(i < 47 ? "," : "")
+                    """
+                }
+                let json = """
+                {
+                    "Items": [\(itemsJson)],
+                    "TotalRecordCount": 50,
+                    "StartIndex": 24
+                }
+                """
+                return (response, Data(json.utf8))
+            } else if startIndex == "48" {
+                // Third page returns final 2 items
+                let json = """
+                {
+                    "Items": [
+                        { "Id": "item-48", "Name": "Movie 48", "Type": "Movie" },
+                        { "Id": "item-49", "Name": "Movie 49", "Type": "Movie" }
+                    ],
+                    "TotalRecordCount": 50,
+                    "StartIndex": 48
+                }
+                """
+                return (response, Data(json.utf8))
+            }
+
+            return (HTTPURLResponse(url: url, statusCode: 404, httpVersion: nil, headerFields: nil)!, Data())
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "test-token", session: session)
+        var progressUpdates: [Int] = []
+        let items = try await client.items(userId: "user-1", libraryId: "lib-movies") { countSoFar in
+            progressUpdates.append(countSoFar)
+        }
+
+        XCTAssertEqual(items.count, 50, "All 50 items should be paginated and imported")
+        XCTAssertEqual(requestedStartIndices, ["0", "24", "48"])
+        XCTAssertEqual(progressUpdates, [24, 48, 50])
+        XCTAssertEqual(items.first?.id, "item-0")
+        XCTAssertEqual(items.last?.id, "item-49")
+    }
+
+    func testEpisodesFetchesAndPaginatesShowsEpisodes() async throws {
+        var requestedPath: String?
+        var capturedUserId: String?
+
+        JellyfinMockURLProtocol.requestHandler = { request in
+            guard let url = request.url else {
+                return (HTTPURLResponse(url: URL(string: "http://error")!, statusCode: 400, httpVersion: nil, headerFields: nil)!, Data())
+            }
+            requestedPath = url.path
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            capturedUserId = components?.queryItems?.first(where: { $0.name == "userId" })?.value
+
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            // Notice: Silo/Jellyfin shows episode response might omit SeriesId because it's in the path
+            let json = """
+            {
+                "Items": [
+                    {
+                        "Id": "ep-1",
+                        "Name": "Pilot",
+                        "Type": "Episode",
+                        "IndexNumber": 1,
+                        "ParentIndexNumber": 1,
+                        "MediaSources": [{ "Container": "mkv", "Size": 1048576 }]
+                    },
+                    {
+                        "Id": "ep-2",
+                        "Name": "Episode 2",
+                        "Type": "Episode",
+                        "IndexNumber": 2,
+                        "ParentIndexNumber": 1,
+                        "MediaSources": [{ "Container": "mkv", "Size": 1048576 }]
+                    }
+                ],
+                "TotalRecordCount": 2,
+                "StartIndex": 0
+            }
+            """
+            return (response, Data(json.utf8))
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "test-token", session: session)
+        let episodes = try await client.episodes(seriesId: "series-abc", userId: "user-1")
+
+        XCTAssertEqual(episodes.count, 2)
+        XCTAssertEqual(requestedPath, "/Shows/series-abc/Episodes")
+        XCTAssertEqual(capturedUserId, "user-1")
+        XCTAssertEqual(episodes[0].id, "ep-1")
+        XCTAssertEqual(episodes[0].seriesId, "series-abc", "Should fall back to seriesId parameter when omitted in payload")
+        XCTAssertEqual(episodes[0].indexNumber, 1)
+        XCTAssertEqual(episodes[0].parentIndexNumber, 1)
+        XCTAssertEqual(episodes[1].id, "ep-2")
+        XCTAssertEqual(episodes[1].seriesId, "series-abc")
+    }
 }

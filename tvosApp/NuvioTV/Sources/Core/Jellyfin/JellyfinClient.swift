@@ -176,92 +176,233 @@ struct JellyfinClient {
         return payload.Items.map { JellyfinLibrary(id: $0.Id, name: $0.Name, collectionType: $0.CollectionType) }
     }
 
+    private struct ItemsPayload: Decodable {
+        struct ProviderIds: Decodable {
+            let Imdb: String?
+            let Tmdb: String?
+        }
+        struct MediaSource: Decodable {
+            let Container: String?
+            let Size: Int64?
+        }
+        struct Person: Decodable {
+            let Name: String
+            let PersonType: String?
+        }
+        struct ImageTags: Decodable {
+            let Primary: String?
+        }
+        struct Item: Decodable {
+            let Id: String
+            let Name: String
+            let Overview: String?
+            let ProductionYear: Int?
+            let PremiereDate: String?
+            let CommunityRating: Double?
+            let OfficialRating: String?
+            let Genres: [String]?
+            let RunTimeTicks: Int64?
+            let ProviderIds: ProviderIds?
+            let MediaSources: [MediaSource]?
+            let ParentIndexNumber: Int?
+            let IndexNumber: Int?
+            let SeriesId: String?
+            let People: [Person]?
+            let ImageTags: ImageTags?
+            let BackdropImageTags: [String]?
+
+            enum CodingKeys: String, CodingKey {
+                case Id, Name, Overview, ProductionYear, PremiereDate, CommunityRating, OfficialRating
+                case Genres, RunTimeTicks, ProviderIds, MediaSources, ParentIndexNumber, IndexNumber
+                case SeriesId, People, ImageTags, BackdropImageTags
+                case ItemType = "Type"
+            }
+            let ItemType: String?
+        }
+
+        let Items: [Item]
+        let TotalRecordCount: Int?
+        let StartIndex: Int?
+
+        init(from decoder: Decoder) throws {
+            if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+                self.Items = (try? container.decode([Item].self, forKey: .Items)) ?? []
+                self.TotalRecordCount = try? container.decode(Int.self, forKey: .TotalRecordCount)
+                self.StartIndex = try? container.decode(Int.self, forKey: .StartIndex)
+            } else if let singleContainer = try? decoder.singleValueContainer(),
+                      let array = try? singleContainer.decode([Item].self) {
+                self.Items = array
+                self.TotalRecordCount = array.count
+                self.StartIndex = 0
+            } else {
+                self.Items = []
+                self.TotalRecordCount = 0
+                self.StartIndex = 0
+            }
+        }
+
+        enum CodingKeys: String, CodingKey {
+            case Items, TotalRecordCount, StartIndex
+        }
+    }
+
+    private static func mapMediaItem(
+        _ item: ItemsPayload.Item,
+        fallbackSeriesId: String? = nil,
+        fallbackType: String = "Movie"
+    ) -> JellyfinMediaItem {
+        let rawType = item.ItemType ?? fallbackType
+        let normalizedType: String
+        if rawType.caseInsensitiveCompare("Series") == .orderedSame {
+            normalizedType = "Series"
+        } else if rawType.caseInsensitiveCompare("Episode") == .orderedSame {
+            normalizedType = "Episode"
+        } else if rawType.caseInsensitiveCompare("Movie") == .orderedSame {
+            normalizedType = "Movie"
+        } else {
+            normalizedType = rawType
+        }
+
+        return JellyfinMediaItem(
+            id: item.Id,
+            name: item.Name,
+            type: normalizedType,
+            overview: item.Overview,
+            productionYear: item.ProductionYear,
+            premiereDate: item.PremiereDate,
+            communityRating: item.CommunityRating,
+            officialRating: item.OfficialRating,
+            genres: item.Genres,
+            runTimeTicks: item.RunTimeTicks,
+            imdbId: item.ProviderIds?.Imdb,
+            tmdbId: item.ProviderIds?.Tmdb.flatMap(Int.init),
+            primaryImageTag: item.ImageTags?.Primary,
+            backdropImageTag: item.BackdropImageTags?.first,
+            cast: item.People?.filter { $0.PersonType == "Actor" }.map(\.Name),
+            directors: item.People?.filter { $0.PersonType == "Director" }.map(\.Name),
+            seriesId: item.SeriesId ?? fallbackSeriesId,
+            parentIndexNumber: item.ParentIndexNumber,
+            indexNumber: item.IndexNumber,
+            container: item.MediaSources?.first?.Container,
+            sizeBytes: item.MediaSources?.first?.Size
+        )
+    }
+
     /// Every movie, series, and episode under one library, with every field
     /// `JellyfinLibraryResolver` needs to build display metadata and a
-    /// playable file locally — no second request per title. Jellyfin
-    /// returns the whole recursive listing in one response — no paging loop
-    /// needed for libraries in the size a home NAS/server realistically hosts.
-    func items(userId: String, libraryId: String) async throws -> [JellyfinMediaItem] {
-        let (data, response) = try await get("Users/\(userId)/Items", query: [
-            "ParentId": libraryId,
-            "Recursive": "true",
-            "IncludeItemTypes": "Movie,Series,Episode",
-            "Fields": Self.itemFields,
-            "EnableImages": "true"
-        ])
-        try Self.validate(response, data: data)
+    /// playable file locally — no second request per title.
+    /// Paginates through all results using `StartIndex` and `Limit` so servers
+    /// with default page sizes (such as Silo or paginated Jellyfin instances)
+    /// import complete libraries rather than only the first page.
+    func items(
+        userId: String,
+        libraryId: String,
+        onPageFetched: ((Int) -> Void)? = nil
+    ) async throws -> [JellyfinMediaItem] {
+        var allItems: [JellyfinMediaItem] = []
+        var seenIds = Set<String>()
+        var startIndex = 0
+        let pageSize = 100
+        var iteration = 0
 
-        struct Payload: Decodable {
-            struct ProviderIds: Decodable {
-                let Imdb: String?
-                let Tmdb: String?
-            }
-            struct MediaSource: Decodable {
-                let Container: String?
-                let Size: Int64?
-            }
-            struct Person: Decodable {
-                let Name: String
-                let PersonType: String?
-            }
-            struct ImageTags: Decodable {
-                let Primary: String?
-            }
-            struct Item: Decodable {
-                let Id: String
-                let Name: String
-                let Overview: String?
-                let ProductionYear: Int?
-                let PremiereDate: String?
-                let CommunityRating: Double?
-                let OfficialRating: String?
-                let Genres: [String]?
-                let RunTimeTicks: Int64?
-                let ProviderIds: ProviderIds?
-                let MediaSources: [MediaSource]?
-                let ParentIndexNumber: Int?
-                let IndexNumber: Int?
-                let SeriesId: String?
-                let People: [Person]?
-                let ImageTags: ImageTags?
-                let BackdropImageTags: [String]?
+        while iteration < 500 {
+            iteration += 1
+            try Task.checkCancellation()
 
-                enum CodingKeys: String, CodingKey {
-                    case Id, Name, Overview, ProductionYear, PremiereDate, CommunityRating, OfficialRating
-                    case Genres, RunTimeTicks, ProviderIds, MediaSources, ParentIndexNumber, IndexNumber
-                    case SeriesId, People, ImageTags, BackdropImageTags
-                    case ItemType = "Type"
-                }
-                let ItemType: String
+            let (data, response) = try await get("Users/\(userId)/Items", query: [
+                "ParentId": libraryId,
+                "Recursive": "true",
+                "IncludeItemTypes": "Movie,Series,Episode",
+                "Fields": Self.itemFields,
+                "EnableImages": "true",
+                "StartIndex": String(startIndex),
+                "Limit": String(pageSize)
+            ])
+            try Self.validate(response, data: data)
+
+            let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
+            if payload.Items.isEmpty {
+                break
             }
-            let Items: [Item]
+
+            let pageItems = payload.Items.compactMap { item -> JellyfinMediaItem? in
+                guard !seenIds.contains(item.Id) else { return nil }
+                seenIds.insert(item.Id)
+                return Self.mapMediaItem(item)
+            }
+
+            allItems.append(contentsOf: pageItems)
+            onPageFetched?(allItems.count)
+
+            startIndex += payload.Items.count
+
+            if let total = payload.TotalRecordCount, startIndex >= total {
+                break
+            }
+            if payload.TotalRecordCount == nil && payload.Items.count < pageSize {
+                break
+            }
         }
-        let payload = try JSONDecoder().decode(Payload.self, from: data)
-        return payload.Items.map { item in
-            JellyfinMediaItem(
-                id: item.Id,
-                name: item.Name,
-                type: item.ItemType,
-                overview: item.Overview,
-                productionYear: item.ProductionYear,
-                premiereDate: item.PremiereDate,
-                communityRating: item.CommunityRating,
-                officialRating: item.OfficialRating,
-                genres: item.Genres,
-                runTimeTicks: item.RunTimeTicks,
-                imdbId: item.ProviderIds?.Imdb,
-                tmdbId: item.ProviderIds?.Tmdb.flatMap(Int.init),
-                primaryImageTag: item.ImageTags?.Primary,
-                backdropImageTag: item.BackdropImageTags?.first,
-                cast: item.People?.filter { $0.PersonType == "Actor" }.map(\.Name),
-                directors: item.People?.filter { $0.PersonType == "Director" }.map(\.Name),
-                seriesId: item.SeriesId,
-                parentIndexNumber: item.ParentIndexNumber,
-                indexNumber: item.IndexNumber,
-                container: item.MediaSources?.first?.Container,
-                sizeBytes: item.MediaSources?.first?.Size
-            )
+
+        return allItems
+    }
+
+    /// All episodes under one TV series, fetched hierarchically.
+    /// Paginates results to handle large series and servers (such as Silo)
+    /// that do not return Episode items in the top-level recursive library query.
+    func episodes(
+        seriesId: String,
+        userId: String? = nil,
+        onPageFetched: ((Int) -> Void)? = nil
+    ) async throws -> [JellyfinMediaItem] {
+        var allEpisodes: [JellyfinMediaItem] = []
+        var seenIds = Set<String>()
+        var startIndex = 0
+        let pageSize = 100
+        var iteration = 0
+
+        while iteration < 500 {
+            iteration += 1
+            try Task.checkCancellation()
+
+            var query: [String: String] = [
+                "Fields": Self.itemFields,
+                "EnableImages": "true",
+                "StartIndex": String(startIndex),
+                "Limit": String(pageSize)
+            ]
+            if let userId, !userId.isEmpty {
+                query["userId"] = userId
+            }
+
+            let (data, response) = try await get("Shows/\(seriesId)/Episodes", query: query)
+            try Self.validate(response, data: data)
+
+            let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
+            if payload.Items.isEmpty {
+                break
+            }
+
+            let pageItems = payload.Items.compactMap { item -> JellyfinMediaItem? in
+                guard !seenIds.contains(item.Id) else { return nil }
+                seenIds.insert(item.Id)
+                return Self.mapMediaItem(item, fallbackSeriesId: seriesId, fallbackType: "Episode")
+            }
+
+            allEpisodes.append(contentsOf: pageItems)
+            onPageFetched?(allEpisodes.count)
+
+            startIndex += payload.Items.count
+
+            if let total = payload.TotalRecordCount, startIndex >= total {
+                break
+            }
+            if payload.TotalRecordCount == nil && payload.Items.count < pageSize {
+                break
+            }
         }
+
+        return allEpisodes
     }
 
     // MARK: - Media URLs

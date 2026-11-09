@@ -200,10 +200,45 @@ final class JellyfinSessionManager: ObservableObject {
                     await MainActor.run {
                         self.syncStates[server.id] = .syncing(found: foundCount, currentLibrary: library.name)
                     }
-                    let items = try await client.items(userId: server.userId, libraryId: library.id)
-                    fetchedItemCount += items.count
+                    var libraryItems = try await client.items(userId: server.userId, libraryId: library.id) { [weak self] countInLibrary in
+                        guard let self else { return }
+                        Task { @MainActor in
+                            self.syncStates[server.id] = .syncing(found: foundCount + countInLibrary, currentLibrary: library.name)
+                        }
+                    }
+                    fetchedItemCount += libraryItems.count
+                    let countAfterItems = fetchedItemCount
+                    await MainActor.run {
+                        self.syncStates[server.id] = .syncing(found: countAfterItems, currentLibrary: library.name)
+                    }
+
+                    // On Silo or servers where recursive library items omit episodes, fetch episodes separately per series
+                    let existingEpisodeSeriesIds = Set(libraryItems.compactMap { $0.type == "Episode" ? $0.seriesId : nil })
+                    let seriesNeedingEpisodes = libraryItems.filter { $0.type == "Series" && !existingEpisodeSeriesIds.contains($0.id) }
+
+                    if !seriesNeedingEpisodes.isEmpty {
+                        for series in seriesNeedingEpisodes {
+                            try Task.checkCancellation()
+                            do {
+                                let episodes = try await client.episodes(seriesId: series.id, userId: server.userId)
+                                if !episodes.isEmpty {
+                                    libraryItems.append(contentsOf: episodes)
+                                    fetchedItemCount += episodes.count
+                                    let currentCount = fetchedItemCount
+                                    await MainActor.run {
+                                        self.syncStates[server.id] = .syncing(found: currentCount, currentLibrary: library.name)
+                                    }
+                                }
+                            } catch is CancellationError {
+                                throw CancellationError()
+                            } catch {
+                                // Continue to next series if one show's episode query fails
+                            }
+                        }
+                    }
+
                     let resolution = JellyfinLibraryResolver.resolve(
-                        items,
+                        libraryItems,
                         serverID: server.id,
                         libraryID: library.id,
                         libraryName: library.name
@@ -229,7 +264,7 @@ final class JellyfinSessionManager: ObservableObject {
                 syncStates[server.id] = .done(
                     JellyfinSyncReport(
                         matchedTitles: resolution.titles.count,
-                        matchedEpisodes: resolution.titles.reduce(0) { $0 + $1.items.count },
+                        matchedEpisodes: resolution.titles.filter { $0.type == "series" }.reduce(0) { $0 + $1.items.count },
                         unmatched: resolution.unmatched
                     )
                 )
