@@ -1,3 +1,5 @@
+<p align="center"><a href="https://discord.gg/2YnNr2xmnJ"><img src="https://img.shields.io/badge/Discord-Join%20the%20community-5865F2?logo=discord&logoColor=white&style=for-the-badge" alt="Join the NuvioTVOS Discord" /></a><br />Chat, get help, report bugs, and share feature ideas.</p>
+
 <div align="center">
 
   <img src="https://github.com/tapframe/NuvioTV/blob/main/assets/brand/app_logo_wordmark.png" alt="Nuvio" width="300" />
