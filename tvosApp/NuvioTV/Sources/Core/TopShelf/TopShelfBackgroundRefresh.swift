@@ -43,7 +43,12 @@ enum TopShelfBackgroundRefresh {
 
     /// Asks for the next run. A new request replaces the pending one.
     static func schedule() {
-        guard isRegistered, TopShelfFeedStore.isAvailable else { return }
+        guard isRegistered else { return }
+        guard TopShelfConfigurationStore.load().isEnabled else {
+            BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: taskIdentifier)
+            return
+        }
+        guard TopShelfFeedStore.isAvailable else { return }
         let request = BGAppRefreshTaskRequest(identifier: taskIdentifier)
         request.earliestBeginDate = Date(timeIntervalSinceNow: interval)
         try? BGTaskScheduler.shared.submit(request)
@@ -64,7 +69,7 @@ enum TopShelfBackgroundRefresh {
     @MainActor
     @discardableResult
     static func refresh() async -> Bool {
-        guard TopShelfFeedStore.isAvailable else { return false }
+        guard TopShelfFeedStore.isAvailable, TopShelfConfigurationStore.load().isEnabled else { return false }
         // Launched in the background, nothing has loaded the profile yet:
         // the last active one, as the app's own launch picks it.
         if ProfileSettings.activeProfileID == nil {

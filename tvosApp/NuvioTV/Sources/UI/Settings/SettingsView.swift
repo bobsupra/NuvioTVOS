@@ -166,6 +166,7 @@ enum SettingsKey {
     static let heroCatalogs = "nuvio.tv.settings.layout.heroCatalogs"
     static let fullscreenHeroBackdrop = "nuvio.tv.settings.layout.fullscreenHeroBackdrop"
     static let homeHeroRatingSource = "nuvio.tv.settings.layout.homeHeroRatingSource"
+    static let continueWatchingLabels = "nuvio.tv.settings.layout.continueWatchingLabels"
     static let posterLabels = "nuvio.tv.settings.layout.posterLabels"
     static let catalogAddonNames = "nuvio.tv.settings.layout.catalogAddonNames"
     static let landscapePosters = "nuvio.tv.settings.layout.landscapePosters"
@@ -421,7 +422,7 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
         accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
-        homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
+        homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
         showCalendarTab, showWatchPartyTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
@@ -4035,6 +4036,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.fullscreenHeroBackdrop) private var fullscreenHeroBackdrop = true
     @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+    @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.focused.rawValue
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
     @AppStorage(SettingsKey.landscapePosters) private var landscapePosters = false
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
@@ -4187,6 +4189,16 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(heroEnabled ? 1 : 0.46)
                 .disabled(!heroEnabled)
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_layout_continue_labels", fallback: "Continue Watching Labels"),
+                    subtitle: L10n.string("tvos_layout_continue_labels_subtitle",
+                                          fallback: "When episode, time-left, and next-up labels appear on cards"),
+                    selection: $continueWatchingLabels,
+                    options: CardLabelVisibility.allCases.map(\.rawValue),
+                    accentColor: accentColor,
+                    optionLabel: { CardLabelVisibility(rawValue: $0)?.label ?? $0 }
+                )
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_poster_labels", fallback: "Poster Labels"),
@@ -4751,6 +4763,7 @@ private struct TopShelfSettingsGroup: View {
     @State private var backgroundStatus = TopShelfBackgroundRefresh.lastStatus
 
     private static let styleLabels: [TopShelfConfiguration.Style: (key: String, fallback: String)] = [
+        .featuredCards: ("tvos_settings_topshelf_style_featured_cards", "Featured Card & Posters"),
         .carouselDetails: ("tvos_settings_topshelf_style_carousel_details", "Just Carousel"),
         .rows: ("tvos_settings_topshelf_style_rows", "Landscape Posters"),
         .posters: ("tvos_settings_topshelf_style_posters", "Posters"),
@@ -4771,145 +4784,198 @@ private struct TopShelfSettingsGroup: View {
                 )
             }
 
-            SettingsOptionRow(
-                title: L10n.string("tvos_settings_topshelf_style", fallback: "Style"),
-                subtitle: L10n.string(
-                    "tvos_settings_topshelf_style_subtitle",
-                    fallback: "A full-screen carousel, or rows of cards or posters"
-                ),
-                selection: Binding(
-                    get: { configuration.style.rawValue },
-                    set: { raw in
-                        guard let style = TopShelfConfiguration.Style(rawValue: raw) else { return }
-                        update { $0.style = style }
-                    }
-                ),
-                options: TopShelfConfiguration.Style.allCases.map(\.rawValue),
-                accentColor: accentColor,
-                optionLabel: { raw in
-                    guard let style = TopShelfConfiguration.Style(rawValue: raw),
-                          let label = Self.styleLabels[style] else { return raw }
-                    return L10n.string(label.key, fallback: label.fallback)
-                }
-            )
-
-            if configuration.style.isCarousel {
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_topshelf_trailers", fallback: "Trailers"),
-                    subtitle: L10n.string(
-                        "tvos_settings_topshelf_trailers_subtitle",
-                        fallback: "Stay on a title and the carousel plays its trailer, in the best quality available"
-                    ),
-                    isOn: Binding(
-                        get: { configuration.playsTrailers },
-                        set: { isOn in update { $0.playsTrailers = isOn } }
-                    ),
-                    accentColor: accentColor
-                )
-            }
-
-            chipSection(
-                title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
-                subtitle: L10n.string(
-                    "tvos_settings_topshelf_sources_subtitle",
-                    fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
-                )
-            ) {
-                TopShelfChipButton(
-                    title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
-                    isSelected: configuration.includesContinueWatching
-                ) { update { $0.includesContinueWatching.toggle() } }
-                if !configuration.mergesUpNext {
-                    TopShelfChipButton(
-                        title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
-                        isSelected: configuration.includesUpNext
-                    ) { update { $0.includesUpNext.toggle() } }
-                }
-                TopShelfChipButton(
-                    title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
-                    isSelected: configuration.includesToday
-                ) { update { $0.includesToday.toggle() } }
-                TopShelfChipButton(
-                    title: L10n.string("nav_library", fallback: "Library"),
-                    isSelected: configuration.includesLibrary
-                ) { update { $0.includesLibrary.toggle() } }
-            }
-
             SettingsToggleRow(
-                title: L10n.string("tvos_settings_topshelf_merge_up_next", fallback: "Up Next in Continue Watching"),
+                title: L10n.string("tvos_settings_topshelf_enabled", fallback: "Home Screen Cards"),
                 subtitle: L10n.string(
-                    "tvos_settings_topshelf_merge_up_next_subtitle",
-                    fallback: "One row, in the order Home shows them"
-                ),
+                    "tvos_settings_topshelf_enabled_subtitle",
+                    fallback: "Show dynamic cards above Nuvio on the Apple TV Home Screen"),
                 isOn: Binding(
-                    get: { configuration.mergesUpNext },
-                    set: { isOn in update { $0.mergesUpNext = isOn } }
-                ),
+                    get: { configuration.isEnabled },
+                    set: { enabled in
+                        update { $0.isEnabled = enabled }
+                    }),
                 accentColor: accentColor
             )
 
-            if configuration.includesUpNext {
+            if configuration.isEnabled {
                 SettingsToggleRow(
-                    title: L10n.string("tvos_settings_topshelf_shuffle_up_next", fallback: "Shuffle Up Next"),
-                    subtitle: L10n.string(
-                        "tvos_settings_topshelf_shuffle_up_next_subtitle",
-                        fallback: "Randomize the order of Up Next titles to surface different content"
-                    ),
+                    title: L10n.string("tvos_settings_topshelf_episode_labels", fallback: "Episode & Time Labels"),
+                    subtitle: L10n.string("tvos_settings_topshelf_episode_labels_subtitle",
+                                          fallback: "Show episode and time-left labels on Home Screen artwork"),
                     isOn: Binding(
-                        get: { configuration.shufflesUpNext },
-                        set: { isOn in
-                            update { $0.shufflesUpNext = isOn }
-                            ContinueWatchingStore.writeTopShelfFeed()
-                        }
+                        get: { configuration.showsEpisodeLabels },
+                        set: { show in update { $0.showsEpisodeLabels = show } }
                     ),
                     accentColor: accentColor
                 )
-            }
 
-            if configuration.includesLibrary {
                 SettingsOptionRow(
-                    title: L10n.string("tvos_settings_topshelf_library_source", fallback: "Library Source"),
+                    title: L10n.string("tvos_settings_topshelf_home_row", fallback: "Home Screen Row"),
                     subtitle: L10n.string(
-                        "tvos_settings_topshelf_library_source_subtitle",
-                        fallback: "Choose whether Top Shelf pulls from your active library provider or a specific library"
+                        "tvos_settings_topshelf_home_row_subtitle",
+                        fallback: "Mirror Continue Watching or a catalog row from Home"),
+                    selection: Binding(
+                        get: { configuration.homeScreenRowID ?? "custom" },
+                        set: { id in update { $0.homeScreenRowID = id == "custom" ? nil : id } }
+                    ),
+                    options: homeScreenRowOptions,
+                    accentColor: accentColor,
+                    optionLabel: homeScreenRowLabel
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_topshelf_style", fallback: "Style"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_style_subtitle",
+                        fallback: "A full-screen carousel, or rows of cards or posters"
                     ),
                     selection: Binding(
-                        get: { configuration.librarySource.rawValue },
+                        get: { configuration.style.rawValue },
                         set: { raw in
-                            guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else { return }
-                            update { $0.librarySource = source }
-                            TopShelfLibraryFeed.write()
-                            TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
+                            guard let style = TopShelfConfiguration.Style(rawValue: raw) else { return }
+                            update { $0.style = style }
                         }
                     ),
-                    options: availableLibrarySources.map { $0.rawValue },
+                    options: TopShelfConfiguration.Style.allCases.map(\.rawValue),
                     accentColor: accentColor,
                     optionLabel: { raw in
-                        guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else { return raw }
-                        return librarySourceLabel(source)
+                        guard let style = TopShelfConfiguration.Style(rawValue: raw),
+                            let label = Self.styleLabels[style]
+                        else { return raw }
+                        return L10n.string(label.key, fallback: label.fallback)
                     }
                 )
-            }
 
-            if catalogs.isEmpty {
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
-                    value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
-                )
-            } else {
-                chipSection(
-                    title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
-                    subtitle: L10n.string(
-                        "tvos_settings_topshelf_catalogs_subtitle",
-                        fallback: "Shown in Home order. Until you choose, the first Home catalog."
+                if configuration.style.isCarousel {
+                    SettingsToggleRow(
+                        title: L10n.string("tvos_settings_topshelf_trailers", fallback: "Trailers"),
+                        subtitle: L10n.string(
+                            "tvos_settings_topshelf_trailers_subtitle",
+                            fallback:
+                                "Stay on a title and the carousel plays its trailer, in the best quality available"
+                        ),
+                        isOn: Binding(
+                            get: { configuration.playsTrailers },
+                            set: { isOn in update { $0.playsTrailers = isOn } }
+                        ),
+                        accentColor: accentColor
                     )
-                ) {
-                    ForEach(catalogs, id: \.id) { catalog in
+                }
+
+                if configuration.homeScreenRowID == nil {
+                    chipSection(
+                        title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
+                        subtitle: L10n.string(
+                            "tvos_settings_topshelf_sources_subtitle",
+                            fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
+                        )
+                    ) {
                         TopShelfChipButton(
-                            title: catalog.title ?? catalog.id,
-                            isSelected: isCatalogSelected(catalog.id)
-                        ) { toggleCatalog(catalog.id) }
+                            title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
+                            isSelected: configuration.includesContinueWatching
+                        ) { update { $0.includesContinueWatching.toggle() } }
+                        if !configuration.mergesUpNext {
+                            TopShelfChipButton(
+                                title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
+                                isSelected: configuration.includesUpNext
+                            ) { update { $0.includesUpNext.toggle() } }
+                        }
+                        TopShelfChipButton(
+                            title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
+                            isSelected: configuration.includesToday
+                        ) { update { $0.includesToday.toggle() } }
+                        TopShelfChipButton(
+                            title: L10n.string("nav_library", fallback: "Library"),
+                            isSelected: configuration.includesLibrary
+                        ) { update { $0.includesLibrary.toggle() } }
                     }
+
+                    SettingsToggleRow(
+                        title: L10n.string(
+                            "tvos_settings_topshelf_merge_up_next", fallback: "Up Next in Continue Watching"),
+                        subtitle: L10n.string(
+                            "tvos_settings_topshelf_merge_up_next_subtitle",
+                            fallback: "One row, in the order Home shows them"
+                        ),
+                        isOn: Binding(
+                            get: { configuration.mergesUpNext },
+                            set: { isOn in update { $0.mergesUpNext = isOn } }
+                        ),
+                        accentColor: accentColor
+                    )
+
+                    if configuration.includesUpNext {
+                        SettingsToggleRow(
+                            title: L10n.string(
+                                "tvos_settings_topshelf_shuffle_up_next", fallback: "Shuffle Up Next"),
+                            subtitle: L10n.string(
+                                "tvos_settings_topshelf_shuffle_up_next_subtitle",
+                                fallback: "Randomize the order of Up Next titles to surface different content"
+                            ),
+                            isOn: Binding(
+                                get: { configuration.shufflesUpNext },
+                                set: { isOn in
+                                    update { $0.shufflesUpNext = isOn }
+                                    ContinueWatchingStore.writeTopShelfFeed()
+                                }
+                            ),
+                            accentColor: accentColor
+                        )
+                    }
+
+                    if configuration.includesLibrary {
+                        SettingsOptionRow(
+                            title: L10n.string(
+                                "tvos_settings_topshelf_library_source", fallback: "Library Source"),
+                            subtitle: L10n.string(
+                                "tvos_settings_topshelf_library_source_subtitle",
+                                fallback:
+                                    "Choose whether Top Shelf pulls from your active library provider or a specific library"
+                            ),
+                            selection: Binding(
+                                get: { configuration.librarySource.rawValue },
+                                set: { raw in
+                                    guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else {
+                                        return
+                                    }
+                                    update { $0.librarySource = source }
+                                    TopShelfLibraryFeed.write()
+                                    TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
+                                }
+                            ),
+                            options: availableLibrarySources.map { $0.rawValue },
+                            accentColor: accentColor,
+                            optionLabel: { raw in
+                                guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else {
+                                    return raw
+                                }
+                                return librarySourceLabel(source)
+                            }
+                        )
+                    }
+
+                    if catalogs.isEmpty {
+                        SettingsInfoRow(
+                            title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                            value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
+                        )
+                    } else {
+                        chipSection(
+                            title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                            subtitle: L10n.string(
+                                "tvos_settings_topshelf_catalogs_subtitle",
+                                fallback: "Shown in Home order. Until you choose, the first Home catalog."
+                            )
+                        ) {
+                            ForEach(catalogs, id: \.id) { catalog in
+                                TopShelfChipButton(
+                                    title: catalog.title ?? catalog.id,
+                                    isSelected: isCatalogSelected(catalog.id)
+                                ) { toggleCatalog(catalog.id) }
+                            }
+                        }
+                    }
+
                 }
             }
 
@@ -4922,6 +4988,30 @@ private struct TopShelfSettingsGroup: View {
         .onAppear(perform: loadCatalogs)
     }
 
+    private var homeScreenRowOptions: [String] {
+        var options = ["continueWatching", "upNext", "today", "library"]
+        options += catalogs.map { "catalog:\($0.id)" }
+        if let selected = configuration.homeScreenRowID, !options.contains(selected) {
+            options.append(selected)
+        }
+        return options + ["custom"]
+    }
+
+    private func homeScreenRowLabel(_ id: String) -> String {
+        switch id {
+        case "continueWatching":
+            return L10n.string("home_continue_watching", fallback: "Continue Watching")
+        case "upNext": return L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized
+        case "today": return L10n.string("tvos_settings_topshelf_today", fallback: "Today")
+        case "library": return L10n.string("nav_library", fallback: "Library")
+        case "custom":
+            return L10n.string("tvos_settings_topshelf_custom", fallback: "Custom Source Mix")
+        default:
+            return catalogs.first { "catalog:\($0.id)" == id }?.title
+                ?? L10n.string("tvos_settings_topshelf_missing_row", fallback: "Selected Row (Unavailable)")
+        }
+    }
+
     private var backgroundStatusText: String {
         guard let status = backgroundStatus else {
             return L10n.string("tvos_settings_topshelf_background_never", fallback: "Not yet")
@@ -4932,9 +5022,10 @@ private struct TopShelfSettingsGroup: View {
         formatter.doesRelativeDateFormatting = true
         var parts = [formatter.string(from: status.date)]
         if status.rows > 0 {
-            parts.append(String(
-                format: L10n.string("tvos_settings_topshelf_background_rows", fallback: "catalogs: %d"),
-                status.rows))
+            parts.append(
+                String(
+                    format: L10n.string("tvos_settings_topshelf_background_rows", fallback: "catalogs: %d"),
+                    status.rows))
         }
         if !status.complete {
             parts.append(L10n.string("tvos_settings_topshelf_background_partial", fallback: "incomplete"))
@@ -4991,7 +5082,8 @@ private struct TopShelfSettingsGroup: View {
         switch source {
         case .active:
             let effective = TopShelfLibraryFeed.effectiveSourceMode(for: .active)
-            return "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
+            return
+                "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
         case .local:
             return L10n.string("library_source_saved", fallback: "Nuvio Library")
         case .simkl:
@@ -5030,13 +5122,14 @@ private struct TopShelfSettingsGroup: View {
         next.directorLabel = L10n.string("details_director", fallback: "Director")
         configuration = next
         TopShelfConfigurationStore.save(next)
+        TopShelfBackgroundRefresh.schedule()
         TopShelfLibraryFeed.write()
     }
 
     private func loadCatalogs() {
         configuration = TopShelfConfigurationStore.load()
         backgroundStatus = TopShelfBackgroundRefresh.lastStatus
-        catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
+        catalogs = TopShelfFeedStore.read(.catalog)?.catalogRows ?? []
         TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
     }
 }

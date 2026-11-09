@@ -422,7 +422,7 @@ public enum TopShelfFeedStore {
         init(_ style: TopShelfConfiguration.Style) {
             switch style {
             case .carouselDetails, .carouselActions: self = .carousel
-            case .rows: self = .card
+            case .rows, .featuredCards: self = .card
             case .posters: self = .poster
             }
         }
@@ -543,7 +543,13 @@ public enum TopShelfFeedStore {
                     TopShelfRatingsStore.write(ratings, in: container)
                 }
             }
-            await cacheArtwork(for: displayed, kind: ArtworkKind(configuration.style), ratings: ratings, scale: scale)
+            if configuration.style == .featuredCards {
+                let sections = TopShelfComposer.featuredSections(from: rows)
+                await cacheArtwork(for: sections.first?.entries ?? [], kind: .card, ratings: ratings, scale: scale)
+                await cacheArtwork(for: sections.dropFirst().flatMap(\.entries), kind: .poster, ratings: ratings, scale: scale)
+            } else {
+                await cacheArtwork(for: displayed, kind: ArtworkKind(configuration.style), ratings: ratings, scale: scale)
+            }
             #endif
             TopShelfArtworkPruner.prune(in: container)
             notifyTopShelfContentChanged()
@@ -561,6 +567,16 @@ public enum TopShelfFeedStore {
     public static func carouselArtworkURL(for entry: TopShelfEntry, ratings: [String: TopShelfRatingsStore.Record]) -> URL? {
         existingArtwork(named: carouselImageName(for: entry, badges: ratings[entry.contentId]?.badges))
             ?? existingArtwork(named: entry.carouselArtworkFileName)
+    }
+
+    /// Hidden labels use the original artwork, never an already-decorated cache
+    /// file. Top Shelf does not offer a per-focus artwork overlay callback.
+    public static func sectionedArtworkURL(
+        for entry: TopShelfEntry, poster: Bool, showsEpisodeLabels: Bool
+    ) -> URL? {
+        let original = (poster ? entry.posterSourceURL : entry.cardSourceURL).flatMap(URL.init(string:))
+        guard showsEpisodeLabels else { return original }
+        return (poster ? posterArtworkURL(for: entry) : artworkURL(for: entry)) ?? original
     }
 
     /// Resolves the rendered 2:3 poster with its episode/time pill.

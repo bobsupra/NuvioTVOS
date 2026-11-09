@@ -1,5 +1,22 @@
 import Foundation
 
+/// Visibility of episode/status labels on focusable in-app cards.
+public enum CardLabelVisibility: String, CaseIterable, Sendable {
+    case always, focused, hidden
+
+    public func isVisible(isFocused: Bool) -> Bool {
+        self == .always || (self == .focused && isFocused)
+    }
+
+    public var label: String {
+        switch self {
+        case .always: return "Always"
+        case .focused: return "Focused Only"
+        case .hidden: return "Hidden"
+        }
+    }
+}
+
 // MARK: - Top Shelf layout
 //
 // What the Apple TV home screen shows for the app: which mirrored sections and
@@ -11,6 +28,8 @@ import Foundation
 /// The user's Top Shelf choice. Device-wide: the shelf is one per Apple TV.
 public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     public enum Style: String, Codable, CaseIterable, Sendable {
+        /// A featured landscape card followed by native poster cards.
+        case featuredCards
         /// Full-screen carousel with the summary, genre, year and length.
         case carouselDetails
         /// Full-screen carousel with the title and the two buttons only.
@@ -22,7 +41,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         case posters
 
         /// The action-only carousel was removed; the details carousel remains.
-        public static let allCases: [Style] = [.carouselDetails, .rows, .posters]
+        public static let allCases: [Style] = [.featuredCards, .carouselDetails, .rows, .posters]
 
         public var isCarousel: Bool { self == .carouselDetails || self == .carouselActions }
     }
@@ -53,6 +72,10 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         }
     }
 
+    public var showsEpisodeLabels: Bool
+    public var isEnabled: Bool
+    /// Nil preserves the advanced multi-source layout; otherwise mirrors one Home row.
+    public var homeScreenRowID: String?
     public var style: Style
     public var includesContinueWatching: Bool
     public var includesUpNext: Bool
@@ -76,6 +99,9 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     public var shufflesUpNext: Bool
 
     public init(
+        showsEpisodeLabels: Bool = false,
+        isEnabled: Bool = true,
+        homeScreenRowID: String? = nil,
         style: Style = .carouselDetails,
         includesContinueWatching: Bool = true,
         includesUpNext: Bool = true,
@@ -89,6 +115,9 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         librarySource: LibrarySource = .active,
         shufflesUpNext: Bool = false
     ) {
+        self.showsEpisodeLabels = showsEpisodeLabels
+        self.isEnabled = isEnabled
+        self.homeScreenRowID = homeScreenRowID
         self.style = style
         self.includesContinueWatching = includesContinueWatching
         self.includesUpNext = includesUpNext
@@ -103,9 +132,11 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         self.shufflesUpNext = shufflesUpNext
     }
 
-    public static let `default` = TopShelfConfiguration()
+    public static let `default` = TopShelfConfiguration(
+        homeScreenRowID: TopShelfSection.continueWatching.rawValue, style: .featuredCards)
 
     private enum CodingKeys: String, CodingKey {
+        case isEnabled, homeScreenRowID, showsEpisodeLabels
         case style, includesContinueWatching, includesUpNext, mergesUpNext, includesToday, includesLibrary
         case catalogRowIDs, playsTrailers, starringLabel, directorLabel
         case librarySource, shufflesUpNext
@@ -115,7 +146,12 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     /// by another version still reads.
     public init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.allKeys.isEmpty { self = .default; return }
         let fallback = TopShelfConfiguration.default
+        showsEpisodeLabels = (try? container.decodeIfPresent(Bool.self, forKey: .showsEpisodeLabels)) ?? false
+        isEnabled = (try? container.decodeIfPresent(Bool.self, forKey: .isEnabled)) ?? true
+        // Preserve saved multi-source preferences; new installations use .default.
+        homeScreenRowID = (try? container.decodeIfPresent(String.self, forKey: .homeScreenRowID)) ?? nil
         style = (try? container.decodeIfPresent(Style.self, forKey: .style)) ?? fallback.style
         includesContinueWatching = (try? container.decodeIfPresent(Bool.self, forKey: .includesContinueWatching))
             ?? fallback.includesContinueWatching
@@ -150,12 +186,32 @@ public enum TopShelfConfigurationStore {
     public static func load() -> TopShelfConfiguration {
         if let data = UserDefaults.standard.data(forKey: defaultsKey),
            let configuration = try? JSONDecoder().decode(TopShelfConfiguration.self, from: data) {
-            return removingActionOnlyCarousel(from: configuration)
+            let migrated = migratingUntouchedDefaults(configuration, data: data)
+            if migrated != configuration { save(migrated) }
+            return removingActionOnlyCarousel(from: migrated)
         }
         if let directory = TopShelfFeedStore.containerURL, let configuration = read(in: directory) {
             return removingActionOnlyCarousel(from: configuration)
         }
         return .default
+    }
+
+    /// The old app saved its defaults when localizing feed labels, even before
+    /// the user opened Settings. Upgrade only that untouched choice; keep every
+    /// explicitly customized legacy layout and every saved on/off preference.
+    static func migratingUntouchedDefaults(
+        _ configuration: TopShelfConfiguration, data: Data
+    ) -> TopShelfConfiguration {
+        guard let fields = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              fields["isEnabled"] == nil else { return configuration }
+        var legacyDefault = TopShelfConfiguration()
+        legacyDefault.starringLabel = configuration.starringLabel
+        legacyDefault.directorLabel = configuration.directorLabel
+        guard configuration == legacyDefault else { return configuration }
+        var updated = TopShelfConfiguration.default
+        updated.starringLabel = configuration.starringLabel
+        updated.directorLabel = configuration.directorLabel
+        return updated
     }
 
     /// Convert configurations saved with the removed action-only carousel to
@@ -250,6 +306,20 @@ public enum TopShelfComposer {
         today: String = TopShelfComposer.day(of: Date()),
         feed: (TopShelfSection) -> TopShelfFeed?
     ) -> [TopShelfRow] {
+        guard configuration.isEnabled else { return [] }
+        if let selectedID = configuration.homeScreenRowID {
+            var selected = configuration
+            selected.homeScreenRowID = nil
+            selected.includesContinueWatching = selectedID == TopShelfSection.continueWatching.rawValue
+            selected.includesUpNext = selectedID == TopShelfSection.upNext.rawValue
+            selected.includesToday = selectedID == TopShelfSection.today.rawValue
+            selected.includesLibrary = selectedID == TopShelfSection.library.rawValue
+            selected.mergesUpNext = false
+            selected.catalogRowIDs = selectedID.hasPrefix("catalog:")
+                ? [String(selectedID.dropFirst("catalog:".count))] : []
+            // Never replace a missing chosen row with an unrelated catalog.
+            return rows(configuration: selected, today: today, feed: feed).filter { $0.id == selectedID }
+        }
         var rows: [TopShelfRow] = []
         let fixed: [(TopShelfSection, Bool)] = [
             (.continueWatching, configuration.includesContinueWatching),
@@ -301,6 +371,20 @@ public enum TopShelfComposer {
                 section: .catalog, title: row.title, entries: row.entries))
         }
         return rows
+    }
+
+    /// One hero plus posters from the same chosen row, without repeating the hero.
+    /// Multiple rows are retained for users who choose the advanced source mix.
+    public static func featuredSections(from rows: [TopShelfRow]) -> [TopShelfRow] {
+        guard let first = rows.first, let hero = first.entries.first else { return [] }
+        var sections = [TopShelfRow(id: "featured:\(first.id)", section: first.section,
+                                    title: "Featured", entries: [hero])]
+        for (index, row) in rows.enumerated() {
+            let entries = index == 0 ? Array(row.entries.dropFirst()) : row.entries
+            guard !entries.isEmpty else { continue }
+            sections.append(TopShelfRow(id: row.id, section: row.section, title: row.title, entries: entries))
+        }
+        return sections
     }
 
     /// Continue Watching and Up Next as one list, in the order Home shows them.
