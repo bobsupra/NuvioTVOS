@@ -17,6 +17,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
   ) -> Bool {
     // Apply in-app language before the first SwiftUI frame is built.
     AppLocaleManager.bootstrap()
+    // Badge images the system cleared from Caches (or that never came down) are fetched again,
+    // once the first screens are up.
+    DispatchQueue.main.asyncAfter(deadline: .now() + 8) {
+      StreamBadgeImageStore.shared.prefetch(StreamBadgeSettingsStore.snapshot.rules)
+    }
     return true
   }
 

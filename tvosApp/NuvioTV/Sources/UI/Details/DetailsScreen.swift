@@ -10512,20 +10512,43 @@ private struct TvStreamImportedBadgeRow: View {
 private struct TvStreamImportedBadge: View {
     let badge: StreamBadgeFilter
     var scale: CGFloat = 1
+    /// The image, kept on this Apple TV by `StreamBadgeImageStore` (it used to be downloaded
+    /// again by `AsyncImage`, with a spinner, every time the card came on screen).
+    @State private var image: UIImage?
+    @State private var failed = false
+
+    init(badge: StreamBadgeFilter, scale: CGFloat = 1) {
+        self.badge = badge
+        self.scale = scale
+        _image = State(initialValue: Self.imageURL(of: badge).flatMap {
+            StreamBadgeImageStore.shared.cachedImage(for: $0)
+        })
+    }
+
+    private static func imageURL(of badge: StreamBadgeFilter) -> URL? {
+        let text = badge.imageURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        return text.isEmpty ? nil : URL(string: text)
+    }
 
     var body: some View {
         Group {
-            if !badge.imageURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-               let url = URL(string: badge.imageURL.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                AsyncImage(url: url) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image.resizable().scaledToFit()
-                    case .failure:
+            if let url = Self.imageURL(of: badge) {
+                ZStack {
+                    if let image {
+                        Image(uiImage: image).resizable().scaledToFit()
+                    } else if failed {
                         fallbackText
-                    default:
-                        ProgressView().tint(.white)
                     }
+                }
+                .task(id: url) {
+                    if let cached = StreamBadgeImageStore.shared.cachedImage(for: url) {
+                        if image !== cached { image = cached }
+                        return
+                    }
+                    let loaded = await StreamBadgeImageStore.shared.image(for: url)
+                    guard !Task.isCancelled else { return }
+                    image = loaded
+                    failed = loaded == nil
                 }
             } else {
                 fallbackText

@@ -1320,6 +1320,8 @@ enum StreamBadgeSettingsStore {
             defaults.removeObject(forKey: SettingsKey.streamBadgeRules)
         }
         postChanged()
+        // The badge images come down now, not the first time a stream list shows them.
+        StreamBadgeImageStore.shared.prefetch(rules)
     }
 
     static func setPlacement(_ placement: StreamBadgePlacement) {
