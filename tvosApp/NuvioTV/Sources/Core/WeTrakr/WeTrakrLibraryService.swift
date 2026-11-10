@@ -8,7 +8,9 @@ enum WeTrakrLibraryService {
 
     static func fetchLibrary(
         repository: CatalogRepository? = nil,
-        store: UserDefaults = ProfileSettings.current
+        store: UserDefaults = ProfileSettings.current,
+        updateCachedLibraryItems: Bool = true,
+        requireSuccessfulResponses: Bool = false
     ) async -> [LibraryStoreItem]? {
         guard let token = WeTrakrRuntimeSession.authenticatedState(store: store)?.accessToken,
               !token.isEmpty else { return nil }
@@ -19,22 +21,26 @@ enum WeTrakrLibraryService {
             URLQueryItem(name: "limit", value: "100")
         ]
 
-        async let moviesResult: WeTrakrHTTPResult<[WeTrakrTrackingPlayingItemDTO]> = client.get(
+        async let moviesRequest: WeTrakrHTTPResult<[WeTrakrTrackingPlayingItemDTO]> = client.get(
             path: "/sync/tracking/planning/movies",
             accessToken: token,
             clientID: clientID,
             queryItems: extendedQuery
         )
-        async let showsResult: WeTrakrHTTPResult<[WeTrakrTrackingPlayingItemDTO]> = client.get(
+        async let showsRequest: WeTrakrHTTPResult<[WeTrakrTrackingPlayingItemDTO]> = client.get(
             path: "/sync/tracking/planning/shows",
             accessToken: token,
             clientID: clientID,
             queryItems: extendedQuery
         )
 
+        let movies = try? await moviesRequest.valueOrThrow()
+        let shows = try? await showsRequest.valueOrThrow()
+        guard !requireSuccessfulResponses || (movies != nil && shows != nil) else { return nil }
+
         var items: [LibraryStoreItem] = []
 
-        if let movies = try? await moviesResult.valueOrThrow() {
+        if let movies {
             for item in movies {
                 let media = item.resolvedMedia
                 guard media.id != nil || media.ids?.hasUsableIdentifier == true else { continue }
@@ -44,7 +50,7 @@ enum WeTrakrLibraryService {
             }
         }
 
-        if let shows = try? await showsResult.valueOrThrow() {
+        if let shows {
             for item in shows {
                 let media = item.resolvedMedia
                 guard media.id != nil || media.ids?.hasUsableIdentifier == true else { continue }
@@ -54,7 +60,9 @@ enum WeTrakrLibraryService {
             }
         }
 
-        cachedLibraryItems = items
+        if updateCachedLibraryItems {
+            cachedLibraryItems = items
+        }
         return items
     }
 

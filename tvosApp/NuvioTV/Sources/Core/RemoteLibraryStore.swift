@@ -4,16 +4,28 @@ import Foundation
 /// Partitioned per source, profile, and account binding ID so one account's library
 /// never shows under another.
 enum RemoteLibraryStore {
+    enum ConditionalSaveResult: Equatable {
+        case saved
+        case revisionChanged
+        case failed
+    }
+
     private static let storageDirectoryName = "RemoteLibraryStore"
     private static let trackedKeysPrefix = "nuvio.tv.remoteLibrary.trackedKeys"
     private static let lock = NSRecursiveLock()
+    private struct RevisionKey: Hashable {
+        let source: TraktLibrarySourceMode
+        let profileId: String
+        let accountBindingId: String
+    }
+    private static var revisions: [RevisionKey: UInt64] = [:]
 
     static func storageKey(
         source: TraktLibrarySourceMode,
         profileId: String?,
         accountBindingId: String?
     ) -> String {
-        let safeProfile = (profileId?.isEmpty == false) ? profileId! : "default"
+        let safeProfile = normalizedProfileId(profileId)
         let safeBinding = (accountBindingId?.isEmpty == false) ? accountBindingId! : "none"
         return "remoteLibrary.\(source.rawValue).\(safeProfile).\(safeBinding)"
     }
@@ -51,6 +63,23 @@ enum RemoteLibraryStore {
         return try? JSONDecoder().decode([LibraryStoreItem].self, from: data)
     }
 
+    /// Revision used to prevent an older in-flight fetch from replacing a newer
+    /// library save or mutation for the same source, profile, and account.
+    static func revision(
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        accountBindingId: String?
+    ) -> UInt64 {
+        guard let key = revisionKey(source: source, profileId: profileId, accountBindingId: accountBindingId) else {
+            return 0
+        }
+        lock.lock()
+        defer { lock.unlock() }
+        let revision = revisions[key] ?? 0
+        revisions[key] = revision
+        return revision
+    }
+
     @discardableResult
     static func save(
         items: [LibraryStoreItem],
@@ -58,15 +87,68 @@ enum RemoteLibraryStore {
         profileId: String?,
         accountBindingId: String?
     ) -> Bool {
-        guard source != .local, let accountBindingId, !accountBindingId.isEmpty else { return false }
+        persist(
+            items: items,
+            source: source,
+            profileId: profileId,
+            accountBindingId: accountBindingId,
+            expectedRevision: nil
+        ) == .saved
+    }
+
+    /// Commits a fetched snapshot only if no save, mutation, or clear has changed
+    /// this cache key since the fetch began.
+    @discardableResult
+    static func saveIfUnchanged(
+        items: [LibraryStoreItem],
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        accountBindingId: String?,
+        expectedRevision: UInt64
+    ) -> ConditionalSaveResult {
+        persist(
+            items: items,
+            source: source,
+            profileId: profileId,
+            accountBindingId: accountBindingId,
+            expectedRevision: expectedRevision
+        )
+    }
+
+    private static func persist(
+        items: [LibraryStoreItem],
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        accountBindingId: String?,
+        expectedRevision: UInt64?
+    ) -> ConditionalSaveResult {
+        guard source != .local, let accountBindingId, !accountBindingId.isEmpty else { return .failed }
         let key = storageKey(source: source, profileId: profileId, accountBindingId: accountBindingId)
-        guard let data = try? JSONEncoder().encode(items) else { return false }
-        let success = LargePayloadStore.write(data, key: key, directory: storageDirectoryName)
+        let revisionKey = RevisionKey(
+            source: source,
+            profileId: normalizedProfileId(profileId),
+            accountBindingId: accountBindingId
+        )
+        guard let data = try? JSONEncoder().encode(items) else { return .failed }
+
+        lock.lock()
+        if let expectedRevision, (revisions[revisionKey] ?? 0) != expectedRevision {
+            lock.unlock()
+            return .revisionChanged
+        }
+        let success = writeLocked(
+            data,
+            key: key,
+            profileId: profileId,
+            revisionKey: revisionKey,
+            incrementsRevision: true
+        )
+        lock.unlock()
+
         if success {
-            trackKey(key, profileId: profileId)
             TopShelfLibraryFeed.write()
         }
-        return success
+        return success ? .saved : .failed
     }
 
     static func applyMutation(
@@ -77,8 +159,14 @@ enum RemoteLibraryStore {
         accountBindingId: String?
     ) {
         guard source != .local, let accountBindingId, !accountBindingId.isEmpty else { return }
+        let key = storageKey(source: source, profileId: profileId, accountBindingId: accountBindingId)
+        let revisionKey = RevisionKey(
+            source: source,
+            profileId: normalizedProfileId(profileId),
+            accountBindingId: accountBindingId
+        )
         lock.lock()
-        defer { lock.unlock() }
+        advanceRevision(for: revisionKey)
 
         var current = load(source: source, profileId: profileId, accountBindingId: accountBindingId) ?? []
         if isInWatchlist {
@@ -102,7 +190,21 @@ enum RemoteLibraryStore {
                 )
             }
         }
-        save(items: current, source: source, profileId: profileId, accountBindingId: accountBindingId)
+        let data = try? JSONEncoder().encode(current)
+        let success = data.map {
+            writeLocked(
+                $0,
+                key: key,
+                profileId: profileId,
+                revisionKey: revisionKey,
+                incrementsRevision: false
+            )
+        } ?? false
+        lock.unlock()
+
+        if success {
+            TopShelfLibraryFeed.write()
+        }
     }
 
     static func clear(
@@ -111,8 +213,17 @@ enum RemoteLibraryStore {
         accountBindingId: String?
     ) {
         let key = storageKey(source: source, profileId: profileId, accountBindingId: accountBindingId)
+        lock.lock()
         LargePayloadStore.remove(key: key, directory: storageDirectoryName)
+        if let keyRevision = revisionKey(
+            source: source,
+            profileId: profileId,
+            accountBindingId: accountBindingId
+        ) {
+            advanceRevision(for: keyRevision)
+        }
         untrackKey(key, profileId: profileId)
+        lock.unlock()
         TopShelfLibraryFeed.write()
     }
 
@@ -122,33 +233,83 @@ enum RemoteLibraryStore {
     ) {
         lock.lock()
         defer { lock.unlock() }
-        let keys = trackedKeys(for: profileId)
-        let prefix = "remoteLibrary.\(source.rawValue)."
-        for key in keys where key.hasPrefix(prefix) {
+        let storagePrefix = "remoteLibrary.\(source.rawValue)."
+        let trackedSourceKeys = trackedKeys(for: profileId).filter { $0.hasPrefix(storagePrefix) }
+        for key in trackedSourceKeys {
             LargePayloadStore.remove(key: key, directory: storageDirectoryName)
             untrackKey(key, profileId: profileId)
+        }
+        let profileKey = normalizedProfileId(profileId)
+        for key in Array(revisions.keys.filter({ $0.source == source && $0.profileId == profileKey })) {
+            advanceRevision(for: key)
         }
     }
 
     static func clearAll(for profileId: String?) {
         lock.lock()
         defer { lock.unlock() }
-        let keys = trackedKeys(for: profileId)
-        for key in keys {
+        for key in trackedKeys(for: profileId) {
             LargePayloadStore.remove(key: key, directory: storageDirectoryName)
         }
-        let profileKey = trackedKeysStorageKey(for: profileId)
-        UserDefaults.standard.removeObject(forKey: profileKey)
+        let profileKey = normalizedProfileId(profileId)
+        for key in Array(revisions.keys.filter({ $0.profileId == profileKey })) {
+            advanceRevision(for: key)
+        }
+        let trackedProfileKey = trackedKeysStorageKey(for: profileId)
+        UserDefaults.standard.removeObject(forKey: trackedProfileKey)
     }
 
     static func clearAll() {
+        lock.lock()
+        for key in Array(revisions.keys) {
+            advanceRevision(for: key)
+        }
         LargePayloadStore.removeDirectory(storageDirectoryName)
+        lock.unlock()
+    }
+
+    private static func normalizedProfileId(_ profileId: String?) -> String {
+        (profileId?.isEmpty == false) ? profileId! : "default"
+    }
+
+    private static func revisionKey(
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        accountBindingId: String?
+    ) -> RevisionKey? {
+        guard source != .local, let accountBindingId, !accountBindingId.isEmpty else { return nil }
+        return RevisionKey(
+            source: source,
+            profileId: normalizedProfileId(profileId),
+            accountBindingId: accountBindingId
+        )
+    }
+
+    private static func advanceRevision(for key: RevisionKey) {
+        revisions[key] = (revisions[key] ?? 0) &+ 1
+    }
+
+    /// Caller holds `lock` so the payload write and its revision update are atomic
+    /// with respect to `saveIfUnchanged`.
+    private static func writeLocked(
+        _ data: Data,
+        key: String,
+        profileId: String?,
+        revisionKey: RevisionKey,
+        incrementsRevision: Bool
+    ) -> Bool {
+        guard LargePayloadStore.write(data, key: key, directory: storageDirectoryName) else { return false }
+        if incrementsRevision {
+            advanceRevision(for: revisionKey)
+        }
+        trackKey(key, profileId: profileId)
+        return true
     }
 
     // MARK: - Key tracking
 
     private static func trackedKeysStorageKey(for profileId: String?) -> String {
-        let safeProfile = (profileId?.isEmpty == false) ? profileId! : "default"
+        let safeProfile = normalizedProfileId(profileId)
         return "\(trackedKeysPrefix).\(safeProfile)"
     }
 

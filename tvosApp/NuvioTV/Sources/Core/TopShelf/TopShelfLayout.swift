@@ -132,8 +132,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         self.shufflesUpNext = shufflesUpNext
     }
 
-    public static let `default` = TopShelfConfiguration(
-        homeScreenRowID: TopShelfSection.continueWatching.rawValue, style: .featuredCards)
+    public static let `default` = TopShelfConfiguration(style: .featuredCards)
 
     private enum CodingKeys: String, CodingKey {
         case isEnabled, homeScreenRowID, showsEpisodeLabels
@@ -185,15 +184,22 @@ public enum TopShelfConfigurationStore {
     /// else the defaults.
     public static func load() -> TopShelfConfiguration {
         if let data = UserDefaults.standard.data(forKey: defaultsKey),
-           let configuration = try? JSONDecoder().decode(TopShelfConfiguration.self, from: data) {
+           let loaded = try? JSONDecoder().decode(TopShelfConfiguration.self, from: data) {
+            let configuration = customSourceMix(loaded)
             let migrated = migratingUntouchedDefaults(configuration, data: data)
-            if migrated != configuration { save(migrated) }
+            if migrated != loaded { save(migrated) }
             return removingActionOnlyCarousel(from: migrated)
         }
         if let directory = TopShelfFeedStore.containerURL, let configuration = read(in: directory) {
-            return removingActionOnlyCarousel(from: configuration)
+            return removingActionOnlyCarousel(from: customSourceMix(configuration))
         }
         return .default
+    }
+
+    private static func customSourceMix(_ configuration: TopShelfConfiguration) -> TopShelfConfiguration {
+        var updated = configuration
+        updated.homeScreenRowID = nil
+        return updated
     }
 
     /// The old app saved its defaults when localizing feed labels, even before
@@ -228,6 +234,7 @@ public enum TopShelfConfigurationStore {
 
     /// Saves the choice and redraws the shelf with it.
     public static func save(_ configuration: TopShelfConfiguration) {
+        let configuration = customSourceMix(configuration)
         if let data = try? JSONEncoder().encode(configuration) {
             UserDefaults.standard.set(data, forKey: defaultsKey)
         }
@@ -255,7 +262,10 @@ public enum TopShelfConfigurationStore {
     static func read(in directory: URL) -> TopShelfConfiguration? {
         let url = directory.appendingPathComponent(fileName)
         guard let data = try? Data(contentsOf: url) else { return nil }
-        return try? JSONDecoder().decode(TopShelfConfiguration.self, from: data)
+        guard let configuration = try? JSONDecoder().decode(TopShelfConfiguration.self, from: data) else {
+            return nil
+        }
+        return customSourceMix(configuration)
     }
 
     static func write(_ configuration: TopShelfConfiguration, in directory: URL) {

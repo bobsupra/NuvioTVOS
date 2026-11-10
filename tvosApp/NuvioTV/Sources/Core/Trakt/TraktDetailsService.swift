@@ -96,7 +96,7 @@ enum TraktDetailsService {
 
     private static func searchImdbViaTrakt(tmdbId: Int, type: String) async -> String? {
         let route = "search/tmdb/\(tmdbId)?type=\(type)"
-        guard let data = await traktGET(route: route),
+        guard let data = await traktGET(route: route, requireAuth: false),
               let results = try? JSONDecoder().decode([TraktSearchResultDTO].self, from: data) else {
             return nil
         }
@@ -113,7 +113,7 @@ enum TraktDetailsService {
 
     private static func searchSlugViaTrakt(tmdbId: Int, type: String) async -> String? {
         let route = "search/tmdb/\(tmdbId)?type=\(type)"
-        guard let data = await traktGET(route: route),
+        guard let data = await traktGET(route: route, requireAuth: false),
               let results = try? JSONDecoder().decode([TraktSearchResultDTO].self, from: data) else {
             return nil
         }
@@ -124,14 +124,36 @@ enum TraktDetailsService {
         return nil
     }
 
+    static func resolveImdbID(tmdbId: Int, isSeries: Bool) async -> String? {
+        await searchImdbViaTrakt(tmdbId: tmdbId, type: isSeries ? "show" : "movie")
+    }
+
+    static func resolveImdbFromSlug(_ slug: String, isSeries: Bool) async -> String? {
+        let endpoint = isSeries ? "shows" : "movies"
+        guard let data = await traktGET(route: "\(endpoint)/\(slug)", requireAuth: false) else { return nil }
+        guard let container = try? JSONDecoder().decode(TraktIdContainer.self, from: data) else { return nil }
+        if let imdb = container.ids?.imdb, imdb.hasPrefix("tt") {
+            return imdb
+        }
+        return nil
+    }
+
     // MARK: - Trakt API
 
-    private static func traktGET(route: String) async -> Data? {
+    private static func traktGET(route: String, requireAuth: Bool = true) async -> Data? {
         guard TraktConfig.isConfigured else { return nil }
-        let authService = TraktAuthService()
-        guard await authService.refreshTokenIfNeeded(),
-              let token = TraktAuthStore.state.accessToken,
-              !token.isEmpty else { return nil }
+        var token: String? = nil
+        if requireAuth {
+            let authService = TraktAuthService()
+            guard await authService.refreshTokenIfNeeded(),
+                  let t = TraktAuthStore.state.accessToken,
+                  !t.isEmpty else { return nil }
+            token = t
+        } else {
+            if let t = TraktAuthStore.state.accessToken, !t.isEmpty {
+                token = t
+            }
+        }
 
         let base = TraktConfig.apiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(base)/\(route)") else { return nil }
@@ -142,7 +164,9 @@ enum TraktDetailsService {
         request.setValue(TraktConfig.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(TraktConfig.clientID, forHTTPHeaderField: "trakt-api-key")
         request.setValue("2", forHTTPHeaderField: "trakt-api-version")
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        if let token {
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
         request.timeoutInterval = 15
 
         do {

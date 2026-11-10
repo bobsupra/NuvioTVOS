@@ -23,7 +23,8 @@ enum MdbListLibraryService {
         store: UserDefaults = ProfileSettings.current,
         client: MdbListAPIClient = MdbListAPIClient(),
         tokenStorage: MdbListTokenStorage = MdbListKeychainTokenStorage(),
-        profileScope: String? = nil
+        profileScope: String? = nil,
+        requireCompleteSnapshot: Bool = false
     ) async -> [LibraryStoreItem]? {
         let scope = profileScope ?? MdbListRuntimeSession.profileScope()
         let service = MdbListAuthService(
@@ -48,6 +49,7 @@ enum MdbListLibraryService {
                 do {
                     let response = try await service.authorizedRequest(path: path, method: .get, queryItems: query)
                     guard (200..<300).contains(response.statusCode) else {
+                        if requireCompleteSnapshot { return nil }
                         return receivedResponse
                             ? await resolve(
                                 Array(deduplicated(seeds).prefix(maxLibraryItems)),
@@ -56,19 +58,26 @@ enum MdbListLibraryService {
                             : nil
                     }
                     receivedResponse = true
-                    guard let object = try JSONSerialization.jsonObject(with: response.data) as? [String: Any] else { break }
+                    guard let object = try JSONSerialization.jsonObject(with: response.data) as? [String: Any] else {
+                        if requireCompleteSnapshot { return nil }
+                        break
+                    }
                     seeds.append(contentsOf: parseSeeds(object, source: path))
-                    guard let next = nextCursor(in: object),
-                          !next.isEmpty,
-                          seenCursors.insert(next).inserted else { break }
+                    guard let next = nextCursor(in: object), !next.isEmpty else { break }
+                    guard seenCursors.insert(next).inserted else {
+                        if requireCompleteSnapshot { return nil }
+                        break
+                    }
                     cursor = next
                 } catch {
+                    if requireCompleteSnapshot { return nil }
                     if !receivedResponse { return nil }
                     break
                 }
             }
         }
 
+        guard !requireCompleteSnapshot || !Task.isCancelled else { return nil }
         guard receivedResponse else { return nil }
         return await resolve(
             Array(deduplicated(seeds).prefix(maxLibraryItems)),

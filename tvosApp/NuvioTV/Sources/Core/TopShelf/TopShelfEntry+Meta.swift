@@ -79,6 +79,15 @@ enum TopShelfCustomPosters {
 /// or from the user's explicitly selected Top Shelf Library source.
 enum TopShelfLibraryFeed {
     private static let lock = NSLock()
+    private static let prefetchLock = NSLock()
+    private enum PrefetchOutcome: Equatable {
+        case published
+        case revisionConflict
+        case failed
+    }
+    private static var inFlightPrefetchTasks: [String: Task<PrefetchOutcome, Never>] = [:]
+    private static var pendingPrefetchKeys = Set<String>()
+    private static var pendingForcedPrefetchKeys = Set<String>()
 
     /// Resolves the effective library mode based on user configuration and authentication.
     static func effectiveSourceMode(
@@ -133,52 +142,216 @@ enum TopShelfLibraryFeed {
             return LibraryStore.items()
         }
         let bindingId = RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store)
-        if let remoteItems = RemoteLibraryStore.load(source: mode, profileId: profileId, accountBindingId: bindingId),
-           !remoteItems.isEmpty {
-            return remoteItems
-        }
-        // If remote library cache is empty, fall back to local items rather than showing an empty shelf
-        return LibraryStore.items()
+        return RemoteLibraryStore.load(source: mode, profileId: profileId, accountBindingId: bindingId) ?? []
     }
 
     /// Prefetches remote library items in the background if the selected remote source
     /// is authenticated but its on-device cache hasn't been loaded yet.
-    static func prefetchRemoteLibraryIfNeeded() {
+    static func prefetchRemoteLibraryIfNeeded(force: Bool = false) {
+        startPrefetch(force: force)
+    }
+
+    private static func startPrefetch(force: Bool, conflictRetryBudget: Int = 1) {
         guard TopShelfFeedStore.isAvailable else { return }
         let store = ProfileSettings.current
         let profileId = ProfileSettings.activeProfileID
-        let mode = effectiveSourceMode(profileId: profileId, store: store)
+        let configuration = TopShelfConfigurationStore.load()
+        guard configuration.isEnabled, configuration.includesLibrary else { return }
+        let mode = effectiveSourceMode(for: configuration.librarySource, profileId: profileId, store: store)
         guard mode != .local else { return }
-        let bindingId = RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store)
+        guard let bindingId = RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store),
+              !bindingId.isEmpty else { return }
+        let expectedRevision = RemoteLibraryStore.revision(
+            source: mode,
+            profileId: profileId,
+            accountBindingId: bindingId
+        )
         let cached = RemoteLibraryStore.load(source: mode, profileId: profileId, accountBindingId: bindingId)
-        if cached == nil || cached?.isEmpty == true {
-            Task { @MainActor in
-                let repo = CinemetaCatalogRepository()
-                if let fetched = await SelectedLibraryService.fetchLibrary(repository: repo), !fetched.isEmpty {
-                    RemoteLibraryStore.save(
-                        items: fetched,
-                        source: mode,
-                        profileId: profileId,
-                        accountBindingId: bindingId
-                    )
-                    write()
-                }
+        // An empty array is a successfully loaded empty library; source changes can force a refresh.
+        guard force || cached == nil else { return }
+
+        let cacheKey = RemoteLibraryStore.storageKey(
+            source: mode,
+            profileId: profileId,
+            accountBindingId: bindingId
+        )
+        prefetchLock.lock()
+        if let task = inFlightPrefetchTasks[cacheKey] {
+            pendingPrefetchKeys.insert(cacheKey)
+            if force {
+                pendingForcedPrefetchKeys.insert(cacheKey)
             }
+            prefetchLock.unlock()
+            return
         }
+
+        let task = Task { @MainActor in
+            var outcome: PrefetchOutcome = .failed
+            defer {
+                finishPrefetch(
+                    for: cacheKey,
+                    outcome: outcome,
+                    conflictRetryBudget: conflictRetryBudget,
+                    mode: mode,
+                    profileId: profileId,
+                    store: store,
+                    bindingId: bindingId
+                )
+            }
+            outcome = await fetchAndPublishRemoteLibrary(
+                mode: mode,
+                profileId: profileId,
+                store: store,
+                bindingId: bindingId,
+                expectedRevision: expectedRevision
+            )
+            return outcome
+        }
+        // The task's cleanup takes this lock, so it cannot finish before its
+        // handle is installed in the in-flight table.
+        inFlightPrefetchTasks[cacheKey] = task
+        prefetchLock.unlock()
+    }
+
+    @MainActor
+    private static func fetchAndPublishRemoteLibrary(
+        mode: TraktLibrarySourceMode,
+        profileId: String?,
+        store: UserDefaults,
+        bindingId: String,
+        expectedRevision: UInt64
+    ) async -> PrefetchOutcome {
+        guard !Task.isCancelled else { return .failed }
+        let repo = CinemetaCatalogRepository()
+        let fetched: [LibraryStoreItem]?
+        switch mode {
+        case .local:
+            return .failed
+        case .trakt:
+            fetched = await TraktLibraryService.fetchLibrary(
+                repository: repo,
+                requireSelectedSource: false,
+                requireCompleteSnapshot: true
+            )
+        case .simkl:
+            fetched = await SimklLibraryService.fetchLibrary(
+                repository: repo,
+                store: store,
+                force: true,
+                profileScope: profileId,
+                requireSelectedSource: false
+            )
+        case .mdblist:
+            fetched = await MdbListLibraryService.fetchLibrary(
+                repository: repo,
+                store: store,
+                profileScope: profileId,
+                requireCompleteSnapshot: true
+            )
+        case .wetrakr:
+            fetched = await WeTrakrLibraryService.fetchLibrary(
+                repository: repo,
+                store: store,
+                updateCachedLibraryItems: false,
+                requireSuccessfulResponses: true
+            )
+        }
+
+        guard !Task.isCancelled,
+              let fetched,
+              ProfileSettings.activeProfileID == profileId,
+              ProfileSettings.isActiveStore(store) else { return .failed }
+        let currentConfiguration = TopShelfConfigurationStore.load()
+        guard currentConfiguration.isEnabled,
+              currentConfiguration.includesLibrary,
+              effectiveSourceMode(
+                for: currentConfiguration.librarySource,
+                profileId: profileId,
+                store: store
+              ) == mode,
+              RemoteLibraryStore.accountBindingID(
+                for: mode,
+                profileId: profileId,
+                in: store
+              ) == bindingId else { return .failed }
+
+        switch RemoteLibraryStore.saveIfUnchanged(
+            items: fetched,
+            source: mode,
+            profileId: profileId,
+            accountBindingId: bindingId,
+            expectedRevision: expectedRevision
+        ) {
+        case .saved:
+            return .published
+        case .revisionChanged:
+            return .revisionConflict
+        case .failed:
+            return .failed
+        }
+    }
+
+    @MainActor
+    private static func finishPrefetch(
+        for cacheKey: String,
+        outcome: PrefetchOutcome,
+        conflictRetryBudget: Int,
+        mode: TraktLibrarySourceMode,
+        profileId: String?,
+        store: UserDefaults,
+        bindingId: String
+    ) {
+        prefetchLock.lock()
+        inFlightPrefetchTasks.removeValue(forKey: cacheKey)
+        let hadPendingRequest = pendingPrefetchKeys.remove(cacheKey) != nil
+        let shouldForce = pendingForcedPrefetchKeys.remove(cacheKey) != nil
+        prefetchLock.unlock()
+
+        let shouldRetryConflict = outcome == .revisionConflict
+            && conflictRetryBudget > 0
+            && isCurrentPrefetchTarget(mode: mode, profileId: profileId, store: store, bindingId: bindingId)
+        let shouldRetryPending = shouldForce || (hadPendingRequest && outcome != .published)
+        guard shouldRetryConflict || shouldRetryPending else { return }
+
+        let retryForce = shouldForce || shouldRetryConflict
+        let nextConflictRetryBudget = shouldRetryConflict && !shouldForce
+            ? conflictRetryBudget - 1
+            : 1
+        startPrefetch(force: retryForce, conflictRetryBudget: nextConflictRetryBudget)
+    }
+
+    @MainActor
+    private static func isCurrentPrefetchTarget(
+        mode: TraktLibrarySourceMode,
+        profileId: String?,
+        store: UserDefaults,
+        bindingId: String
+    ) -> Bool {
+        guard ProfileSettings.activeProfileID == profileId,
+              ProfileSettings.isActiveStore(store) else { return false }
+        let configuration = TopShelfConfigurationStore.load()
+        return configuration.isEnabled
+            && configuration.includesLibrary
+            && effectiveSourceMode(for: configuration.librarySource, profileId: profileId, store: store) == mode
+            && RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store) == bindingId
     }
 
     /// Mirrors the most recently added library titles into the App Group for
     /// the Top Shelf Library row.
-    static func write() {
+    static func write(prefetchOnCacheMiss: Bool = true) {
         guard TopShelfFeedStore.isAvailable else { return }
         lock.lock()
-        defer { lock.unlock() }
 
         let store = ProfileSettings.current
         let profileId = ProfileSettings.activeProfileID
         let config = TopShelfConfigurationStore.load()
+        let mode = effectiveSourceMode(for: config.librarySource, profileId: profileId, store: store)
+        let bindingId = RemoteLibraryStore.accountBindingID(for: mode, profileId: profileId, in: store)
+        let remoteItems = mode == .local
+            ? nil
+            : RemoteLibraryStore.load(source: mode, profileId: profileId, accountBindingId: bindingId)
+        let shouldPrefetch = mode != .local && remoteItems == nil
         let libraryItems = items(configSource: config.librarySource, profileId: profileId, store: store)
-
         let entries = libraryItems
             .sorted { $0.addedAt > $1.addedAt }
             .prefix(15)
@@ -190,6 +363,11 @@ enum TopShelfLibraryFeed {
             section: .library,
             title: L10n.string("nav_library", fallback: "Library")
         )
+        lock.unlock()
+
+        if prefetchOnCacheMiss && shouldPrefetch {
+            prefetchRemoteLibraryIfNeeded()
+        }
     }
 }
 

@@ -3,14 +3,14 @@ import XCTest
 @testable import NuvioTV
 
 final class TopShelfHomeCardsTests: XCTestCase {
-    func testHomeScreenCardsDefaultToContinueWatching() {
+    func testHomeScreenCardsDefaultToCustomSourceMix() {
         let configuration = TopShelfConfiguration.default
         XCTAssertTrue(configuration.isEnabled)
         XCTAssertEqual(configuration.style, .featuredCards)
-        XCTAssertEqual(configuration.homeScreenRowID, "continueWatching")
+        XCTAssertNil(configuration.homeScreenRowID)
         let feeds = makeFeeds()
         XCTAssertEqual(TopShelfComposer.rows(configuration: configuration) { feeds[$0] }.map(\.id),
-                       ["continueWatching"])
+                       ["continueWatching", "upNext", "library", "catalog:popular"])
     }
 
     func testDisabledCardsReturnNoRowsWithoutReadingFeeds() {
@@ -63,7 +63,7 @@ final class TopShelfHomeCardsTests: XCTestCase {
         fields.removeValue(forKey: "isEnabled")
         let oldData = try JSONSerialization.data(withJSONObject: fields)
         let upgraded = TopShelfConfigurationStore.migratingUntouchedDefaults(legacy, data: oldData)
-        XCTAssertEqual(upgraded.homeScreenRowID, "continueWatching")
+        XCTAssertNil(upgraded.homeScreenRowID)
         XCTAssertEqual(upgraded.style, .featuredCards)
         XCTAssertEqual(upgraded.starringLabel, "Cast")
         legacy.style = .posters

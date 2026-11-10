@@ -2197,10 +2197,11 @@ struct SimklLibraryService {
         client: SimklAPIClient = SimklAPIClient(),
         tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
         profileScope: String? = nil,
+        requireSelectedSource: Bool = true,
         onSnapshot: LibraryMetadataHydrator.SnapshotHandler? = nil
     ) async -> [LibraryStoreItem]? {
         let resolvedProfile = profileScope ?? SimklRuntimeSession.profileScope()
-        guard TraktSettingsStore.librarySourceMode(in: store) == .simkl else {
+        guard !requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store) == .simkl else {
             return []
         }
         guard let owner = SimklAuthorizedClient(
@@ -2209,15 +2210,16 @@ struct SimklLibraryService {
         ) else {
             return nil
         }
+        guard owner.isCurrentAuthorization() else { return nil }
         guard let response = await SimklSyncLoader.libraryItems(
             using: owner,
             force: force
         ) else {
-            return TraktSettingsStore.librarySourceMode(in: store) == .simkl ? nil : []
+            return (!requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store) == .simkl) ? nil : []
         }
-        guard owner.isCurrentAuthorization(),
-              TraktSettingsStore.librarySourceMode(in: store) == .simkl else {
-            return TraktSettingsStore.librarySourceMode(in: store) == .simkl ? nil : []
+        guard owner.isCurrentAuthorization() else { return nil }
+        guard !requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store) == .simkl else {
+            return []
         }
 
         let seeds: [(String, SimklSyncItem)] =
@@ -2228,9 +2230,9 @@ struct SimklLibraryService {
         var results: [LibraryStoreItem] = []
         var seen = Set<String>()
         for (type, item) in seeds {
-            guard owner.isCurrentAuthorization(),
-                  TraktSettingsStore.librarySourceMode(in: store) == .simkl else {
-                return TraktSettingsStore.librarySourceMode(in: store) == .simkl ? nil : []
+            guard owner.isCurrentAuthorization() else { return nil }
+            guard !requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store) == .simkl else {
+                return []
             }
             guard !Task.isCancelled,
                   let placeholder = placeholderMeta(item: item, type: type),
@@ -2255,7 +2257,7 @@ struct SimklLibraryService {
             onSnapshot: onSnapshot,
             isCurrent: {
                 !Task.isCancelled && owner.isCurrentAuthorization()
-                    && TraktSettingsStore.librarySourceMode(in: store) == .simkl
+                    && (!requireSelectedSource || TraktSettingsStore.librarySourceMode(in: store) == .simkl)
             }
         )
     }
