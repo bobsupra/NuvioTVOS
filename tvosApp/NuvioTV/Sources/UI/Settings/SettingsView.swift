@@ -189,6 +189,7 @@ enum SettingsKey {
     static let liquidGlassCards = "nuvio.tv.settings.layout.liquidGlassCards"
     /// Settings → Appearance → Sidebar → Calendar.
     static let showCalendarTab = "nuvio.tv.settings.layout.showCalendarTab"
+    static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
     /// Settings → Layout → Calendar → Today Row.
@@ -425,7 +426,7 @@ enum SettingsKey {
         homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
-        showCalendarTab, showWatchPartyTab, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
+        showCalendarTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -2743,6 +2744,7 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
@@ -2769,6 +2771,12 @@ private struct AppearanceSettingsView: View {
                 title: L10n.string("settings_sidebar_tabs", fallback: "Sidebar"),
                 subtitle: L10n.string("settings_sidebar_tabs_subtitle", fallback: "Choose which sections appear in the sidebar")
             ) {
+                SettingsToggleRow(
+                    title: L10n.string("settings_top_navigation", fallback: "Top Navigation Bar"),
+                    subtitle: L10n.string("settings_top_navigation_subtitle", fallback: "Use the Apple TV top tab bar instead of the sidebar"),
+                    isOn: $useTopNavigation,
+                    accentColor: accentColor
+                )
                 SettingsToggleRow(
                     title: L10n.string("nav_calendar", fallback: "Calendar"),
                     subtitle: L10n.string(

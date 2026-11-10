@@ -4420,6 +4420,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
@@ -4446,7 +4447,7 @@ private struct TVMainTabView: View {
 
     var body: some View {
         Group {
-            if #available(tvOS 18.0, *) {
+            if #available(tvOS 18.0, *), !useTopNavigation {
                 tabs
                     .tabViewStyle(.sidebarAdaptable)
             } else {
@@ -4688,6 +4689,11 @@ private struct TVMainTabView: View {
                     .tag(TVTab.calendar)
             }
             settingsTabContent.tabItem { settingsTabLabel }.tag(TVTab.settings)
+            ForEach(directCollectionDestinations + genreCollectionDestinations) { destination in
+                collectionTabContent(destination)
+                    .tabItem { collectionTabLabel(destination) }
+                    .tag(TVTab.collection(destination.id))
+            }
         }
     }
 
@@ -4783,7 +4789,9 @@ private struct TVMainTabView: View {
 
     @ViewBuilder
     private var tabShell: some View {
-        if #available(tvOS 27.0, *) {
+        if useTopNavigation {
+            standardTabs
+        } else if #available(tvOS 27.0, *) {
             groupedCollectionTabs
                 .tabViewSidebarHeader {
                     TVSidebarProfileHeader(profile: displayedProfile) {
