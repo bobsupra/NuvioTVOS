@@ -92,8 +92,11 @@ final class TopShelfLayoutTests: XCTestCase {
 
     func testRatingsAreFreshForADay() {
         let now = Date()
-        XCTAssertTrue(TopShelfRatingsStore.isFresh(.init(badges: [], fetchedAt: now.addingTimeInterval(-3_600)), now: now))
-        XCTAssertFalse(TopShelfRatingsStore.isFresh(.init(badges: [], fetchedAt: now.addingTimeInterval(-90_000)), now: now))
+        let rated = [TopShelfRatingBadge(source: "imdb", name: "IMDb", value: "8.1", iconAssetName: nil, iconURL: nil, iconWidth: 40)]
+        XCTAssertTrue(TopShelfRatingsStore.isFresh(.init(badges: rated, fetchedAt: now.addingTimeInterval(-3_600)), now: now))
+        XCTAssertFalse(TopShelfRatingsStore.isFresh(.init(badges: rated, fetchedAt: now.addingTimeInterval(-90_000)), now: now))
+        // No rating at all is asked again after half an hour.
+        XCTAssertFalse(TopShelfRatingsStore.isFresh(.init(badges: [], fetchedAt: now.addingTimeInterval(-3_600)), now: now))
         XCTAssertFalse(TopShelfRatingsStore.isFresh(nil, now: now))
     }
 

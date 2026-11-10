@@ -654,6 +654,8 @@ struct TVCatalogRow: View {
                     continueUpNextBadgeText: upNextBadgeText,
                     collectionOrigin: id == TVHomeSection.continueWatchingId && progressItem?.isUpNextEntry == false
                         ? collectionOriginsByItemId[item.id] : nil,
+                    showsAniListOrigin: id == TVHomeSection.continueWatchingId,
+                    sourceBadge: AniListService.sourceBadge(rowID: id),
                     showsWatchedBadge: id != TVHomeSection.continueWatchingId && id != TVHomeSection.upcomingId
                         && id != TVHomeSection.calendarTodayId,
                     shouldRequestInitialFocus: shouldRequestInitialFocus,
@@ -901,6 +903,7 @@ struct TVHomeCatalogGridSection: View {
                     PosterGridCard(
                         meta: item,
                         customPosterScreen: customPosterScreen,
+                        sourceBadge: AniListService.sourceBadge(rowID: section.id),
                         width: TVHomeGridLayout.posterWidth,
                         height: TVHomeGridLayout.posterHeight,
                         externalFocus: externalFocus,

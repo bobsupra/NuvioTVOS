@@ -543,9 +543,10 @@ struct PlayerControls: View {
     private var playbackSubtitle: String? {
         let subtitle = viewModel.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !subtitle.isEmpty, subtitle != PlaybackMarkers.trailerSubtitle else { return nil }
-        return subtitle
+        let line = subtitle
             .replacingOccurrences(of: " · E", with: ", E")
             .replacingOccurrences(of: " · ", with: " • ")
+        return AniListMetaBuilder.playerEpisodeLine(line, titleID: viewModel.activeMeta?.id)
     }
 
     // MARK: - Bottom controls

@@ -2472,6 +2472,8 @@ enum SelectedLibraryService {
 
     @MainActor
     static func setWatchlist(_ meta: NuvioMeta, isInWatchlist: Bool) async -> Bool {
+        // An AniList title goes by the IMDb/TMDB ids it maps to.
+        let meta = await AniListService.libraryMeta(for: meta)
         switch TraktSettingsStore.librarySourceMode {
         case .local:
             return false

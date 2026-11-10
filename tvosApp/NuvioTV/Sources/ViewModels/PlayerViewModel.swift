@@ -8962,6 +8962,8 @@ class PlayerViewModel: ObservableObject {
             completionAccounts: tracker.completionAccounts
         )
         guard accepted else { return }
+        // Settings → Integrations → AniList: how far the viewer watched, to their AniList list.
+        AniListScrobbler.recordPlayback(meta: activeMeta, video: currentEpisodeVideo, season: season, episode: episode)
         sessionCoordinator.markPlaybackCompletionRecorded(completionID: completionID)
         finishPlaybackCompletion(
             meta: activeMeta,

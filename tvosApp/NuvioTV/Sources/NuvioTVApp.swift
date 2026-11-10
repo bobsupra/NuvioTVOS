@@ -25,6 +25,7 @@ struct NuvioTVApp: App {
         URLCache.shared.memoryCapacity = memCapacity
         URLCache.shared.diskCapacity = diskCapacity
         TopShelfRatingsBridge.install()
+        TopShelfAniListBridge.install()
         // Fonts added in Settings → Subtitles → Custom Fonts, registered for this app.
         SubtitleFontLibrary.prepareAtLaunch()
         // Before launch finishes, as BGTaskScheduler requires.
@@ -8695,6 +8696,12 @@ struct TVHomeView: View {
                 collectionSections: collectionSections,
                 resetFocusIfEmpty: isColdStart
             )
+            if AniListSettings.isEnabled {
+                // Settings → Integrations → AniList → Status: the rows that reached Home.
+                AniListDiagnostics.noteHomeOnScreen(rows: store.sections.filter {
+                    $0.addonId == AniListService.addonID && !$0.isLoadingPlaceholder && !$0.items.isEmpty
+                }.count)
+            }
             store.finishLoad(generation, for: identity)
             lastLoadedInputSignature = inputSignature
             refreshWatchedTitles()
@@ -9212,6 +9219,13 @@ struct TVHomeView: View {
     /// `focusedMeta` (hero) and the pending focus target without stalling `@MainActor`.
     @MainActor
     private func enrichSettledCatalogMeta(_ settledMeta: NuvioMeta, in sectionId: String) {
+        // Settings → Integrations → AniList: an AniList card already has its description and
+        // rating. Its full details would cost AniList requests on every focus, so only its
+        // background and logo are asked, from ani.zip.
+        if AniListMetaBuilder.isAniListID(settledMeta.id) {
+            enrichAniListHero(settledMeta, in: sectionId)
+            return
+        }
         let metadataContext = CinemetaCatalogRepository.metadataCacheContext
         let enrichmentKey = "\(metadataContext)\u{1f}\(settledMeta.type.lowercased())\u{1f}\(settledMeta.id)"
         if let cached = focusWork.enrichedHeroMetadata[enrichmentKey] {
@@ -9255,6 +9269,37 @@ struct TVHomeView: View {
             focusWork.pendingFocusedMeta = merged
             TVHomeDebugTrace.log("hero.enrich published merged hero item=\(settledMeta.id)")
         }
+    }
+
+    @MainActor
+    private func enrichAniListHero(_ settledMeta: NuvioMeta, in sectionId: String) {
+        let metadataContext = CinemetaCatalogRepository.metadataCacheContext
+        let enrichmentKey = "\(metadataContext)\u{1f}anilist\u{1f}\(settledMeta.id)"
+        if let cached = focusWork.enrichedHeroMetadata[enrichmentKey] {
+            publishAniListHero(cached, for: settledMeta, in: sectionId)
+            return
+        }
+        focusWork.heroEnrichmentTask?.cancel()
+        focusWork.heroEnrichmentTask = Task { @MainActor in
+            guard let artwork = await AniListService.heroArtwork(for: settledMeta),
+                  !Task.isCancelled,
+                  metadataContext == CinemetaCatalogRepository.metadataCacheContext else { return }
+            let hero = AniListMetaBuilder.applying(artwork, to: settledMeta)
+            focusWork.enrichedHeroMetadata[enrichmentKey] = hero
+            publishAniListHero(hero, for: settledMeta, in: sectionId)
+        }
+    }
+
+    @MainActor
+    private func publishAniListHero(_ hero: NuvioMeta, for settledMeta: NuvioMeta, in sectionId: String) {
+        guard focusWork.pendingFocusedMeta?.id == settledMeta.id,
+              focusWork.pendingSectionId == sectionId,
+              focusWork.pendingFocusedFolder == nil else {
+            return
+        }
+        focusedMeta = hero
+        focusWork.pendingFocusedMeta = hero
+        TVHomeDebugTrace.log("hero.enrich published AniList artwork item=\(settledMeta.id)")
     }
 
     @MainActor
@@ -10978,6 +11023,14 @@ enum TVHomeCatalogOrder {
                 return false
             }
         }
+        if row.addonId == AniListService.addonID
+            || (row.settingsKey?.hasPrefix(AniListService.addonID + "_") ?? false) {
+            // Only the catalogs chosen in AniList Catalogs and MAL Catalogs.
+            let catalogID = AniListSettings.homeCatalogID(rowID: row.id, catalogId: row.catalogId)
+            if !AniListSettings.showsHomeRow(catalogId: catalogID) {
+                return false
+            }
+        }
         if let addonId = row.addonId, disabledAddonIDs().contains(addonId) {
             return false
         }
@@ -11964,9 +12017,13 @@ private struct TVHeroView: View {
     }
 
     var body: some View {
+        // An AniList title's name under its logo: the logo shrinks and the description gives
+        // up a line, so the name never has to be cut short in the hero's fixed height.
+        let nameBelow = meta.logoUrl == nil ? nil : AniListMetaBuilder.nameUnderLogo(meta)
         VStack(alignment: .leading, spacing: 18) {
             if let logoUrl = meta.logoUrl {
-                CachedHeroLogo(url: logoUrl, title: meta.name)
+                CachedHeroLogo(url: logoUrl, title: meta.name, nameBelow: nameBelow, logoMaxHeight: nameBelow == nil ? 136 : 100)
+                    .layoutPriority(nameBelow == nil ? 0 : 1)
             } else {
                 Text(meta.name)
                     .font(.appFont(size: 54, weight: .bold))
@@ -11989,7 +12046,7 @@ private struct TVHeroView: View {
                         .foregroundColor(.white.opacity(0.48))
                         .italic()
                         .lineSpacing(3)
-                        .lineLimit(4)
+                        .lineLimit(nameBelow == nil ? 4 : 3)
                         .frame(maxWidth: 900, alignment: .leading)
                         .padding(.top, 4)
                 } else {
@@ -11997,7 +12054,7 @@ private struct TVHeroView: View {
                         .font(.appFont(size: 24, weight: .regular))
                         .foregroundColor(.white)
                         .lineSpacing(3)
-                        .lineLimit(4)
+                        .lineLimit(nameBelow == nil ? 4 : 3)
                         .frame(maxWidth: 900, alignment: .leading)
                         .padding(.top, 4)
                 }
@@ -12967,8 +13024,10 @@ private struct TVGridHeroSlideshowView: View {
             // 1. Logo or Title
             Group {
                 if let logoURL = item.logoUrl, !logoURL.isEmpty {
-                    CachedHeroLogo(url: logoURL, title: item.name)
-                        .frame(maxWidth: 540, maxHeight: 110, alignment: .bottomLeading)
+                    let nameBelow = AniListMetaBuilder.nameUnderLogo(item)
+                    CachedHeroLogo(url: logoURL, title: item.name, nameBelow: nameBelow, logoMaxHeight: nameBelow == nil ? 110 : 84)
+                        .frame(maxWidth: 540, maxHeight: nameBelow == nil ? 110 : nil, alignment: .bottomLeading)
+                        .layoutPriority(nameBelow == nil ? 0 : 1)
                 } else {
                     Text(item.name)
                         .font(.appFont(size: 48, weight: .bold))
@@ -13311,6 +13370,10 @@ private struct TVGridHeroSlideshowView: View {
 private struct CachedHeroLogo: View {
     let url: String
     let title: String
+    /// The title's whole name under its logo: AniList's logo is the series', so a second
+    /// season would otherwise look like its first.
+    var nameBelow: String? = nil
+    var logoMaxHeight: CGFloat = 136
 
     @State private var image: UIImage?
     @State private var loadedURL: String?
@@ -13329,22 +13392,37 @@ private struct CachedHeroLogo: View {
         // fallback must not reserve that slot either.
         Group {
             if showsLogoImage {
-                ZStack(alignment: .bottomLeading) {
-                    if let outgoingImage {
-                        Image(uiImage: outgoingImage)
-                            .resizable()
-                            .scaledToFit()
-                            .opacity(outgoingOpacity)
+                VStack(alignment: .leading, spacing: 10) {
+                    ZStack(alignment: .bottomLeading) {
+                        if let outgoingImage {
+                            Image(uiImage: outgoingImage)
+                                .resizable()
+                                .scaledToFit()
+                                .opacity(outgoingOpacity)
+                        }
+                        if let image {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFit()
+                                .opacity(imageOpacity)
+                                .id(loadedURL)
+                        }
                     }
-                    if let image {
-                        Image(uiImage: image)
-                            .resizable()
-                            .scaledToFit()
-                            .opacity(imageOpacity)
-                            .id(loadedURL)
+                    .frame(maxWidth: 520, maxHeight: logoMaxHeight, alignment: .bottomLeading)
+
+                    if let nameBelow, !nameBelow.isEmpty {
+                        // Whole, on up to two lines; a very long name gets a smaller font
+                        // rather than an ellipsis.
+                        Text(nameBelow)
+                            .font(.appFont(size: 28, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.92))
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.75)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .shadow(color: .black.opacity(0.6), radius: 6, y: 3)
+                            .frame(maxWidth: 620, alignment: .leading)
                     }
                 }
-                .frame(maxWidth: 520, maxHeight: 136, alignment: .bottomLeading)
             } else {
                 Text(title)
                     .font(.appFont(size: 54, weight: .bold))

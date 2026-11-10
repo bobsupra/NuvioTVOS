@@ -180,17 +180,29 @@ public enum TopShelfTrailerResolver {
         now: Date = Date()
     ) async -> [String: TopShelfTrailerLink] {
         let saved = container.map(TopShelfTrailerStore.read(in:)) ?? [:]
-        var lookups: [(contentId: String, url: URL)] = []
+        var lookups: [(contentId: String, urls: [URL])] = []
         var seen = Set<String>()
         for entry in entries where seen.insert(entry.contentId).inserted {
-            guard TopShelfTrailerStore.needsLookup(saved[entry.contentId], now: now),
-                  let url = lookupURL(for: entry) else { continue }
-            lookups.append((entry.contentId, url))
+            let urls = lookupURLs(for: entry)
+            guard TopShelfTrailerStore.needsLookup(saved[entry.contentId], now: now), !urls.isEmpty else { continue }
+            lookups.append((entry.contentId, urls))
         }
 
         let results = await withTaskGroup(of: (String, Lookup).self) { group -> [String: Lookup] in
             for lookup in lookups {
-                group.addTask { (lookup.contentId, await self.lookup(lookup.url)) }
+                group.addTask {
+                    // The title's own trailer, else an earlier season's.
+                    var failed = false
+                    for url in lookup.urls {
+                        let result = await self.lookup(url)
+                        switch result {
+                        case .found: return (lookup.contentId, result)
+                        case .failed: failed = true
+                        case .missing: break
+                        }
+                    }
+                    return (lookup.contentId, failed ? .failed : .missing)
+                }
             }
             var results: [String: Lookup] = [:]
             for await (contentId, result) in group {
@@ -213,16 +225,138 @@ public enum TopShelfTrailerResolver {
         if let container, records != saved {
             TopShelfTrailerStore.write(records, in: container)
         }
-        return records.compactMapValues(\.link)
+        var found = records.compactMapValues(\.link)
+
+        // What Trailerio doesn't have, IMDb itself may (as Details plays it). Its links are signed
+        // and expire, so they are asked again at every refresh and never kept.
+        let withoutTrailer = entries.filter { found[$0.contentId] == nil }
+        if !withoutTrailer.isEmpty {
+            let fromIMDb = await withTaskGroup(of: (String, TopShelfTrailerLink?).self) { group -> [String: TopShelfTrailerLink] in
+                var asked = Set<String>()
+                for entry in withoutTrailer where asked.insert(entry.contentId).inserted {
+                    let ids = Self.imdbIDs(for: entry)
+                    guard !ids.isEmpty else { continue }
+                    group.addTask {
+                        for id in ids {
+                            if let link = await Self.imdbTrailer(imdbID: id) { return (entry.contentId, link) }
+                        }
+                        return (entry.contentId, nil)
+                    }
+                }
+                var links: [String: TopShelfTrailerLink] = [:]
+                for await (contentId, link) in group {
+                    if let link { links[contentId] = link }
+                }
+                return links
+            }
+            found.merge(fromIMDb) { trailerio, _ in trailerio }
+        }
+        return found
     }
 
     /// Trailerio's page for the title, by its IMDb id. Nil for titles without
     /// one (Kitsu, TMDB-only add-on ids).
     static func lookupURL(for entry: TopShelfEntry) -> URL? {
-        let candidates = [entry.imdbId, entry.contentId.split(separator: ":").first.map(String.init)]
-        guard let imdbID = candidates.lazy.compactMap({ $0.flatMap(canonicalIMDbID) }).first else { return nil }
+        lookupURLs(for: entry).first
+    }
+
+    /// The title's page, then its earlier seasons' (`TopShelfEntry.trailerFallbackIMDbIds`).
+    static func lookupURLs(for entry: TopShelfEntry) -> [URL] {
         let kind = isSeries(entry.contentType) ? "series" : "movie"
-        return URL(string: "https://trailerio.cc/meta/\(kind)/\(imdbID).json")
+        return imdbIDs(for: entry).compactMap { URL(string: "https://trailerio.cc/meta/\(kind)/\($0).json") }
+    }
+
+    /// The title's IMDb id, then its earlier seasons' (at most four).
+    static func imdbIDs(for entry: TopShelfEntry) -> [String] {
+        let candidates = [entry.imdbId, entry.contentId.split(separator: ":").first.map(String.init)]
+            + (entry.trailerFallbackIMDbIds ?? []).map { Optional($0) }
+        var seen = Set<String>()
+        let ids = candidates.compactMap { $0.flatMap(canonicalIMDbID) }.filter { seen.insert($0).inserted }
+        return Array(ids.prefix(4))
+    }
+
+    // MARK: IMDb
+
+    private struct IMDbResponse: Decodable {
+        struct DataField: Decodable { var title: Title? = nil }
+        struct Title: Decodable {
+            var latestTrailer: Video? = nil
+            var primaryVideos: Videos? = nil
+        }
+        struct Videos: Decodable {
+            struct Edge: Decodable { var node: Video? = nil }
+            var edges: [Edge]? = nil
+        }
+        struct Video: Decodable {
+            struct Name: Decodable { var value: String? = nil }
+            struct Playback: Decodable {
+                var url: String? = nil
+                var videoMimeType: String? = nil
+                var videoDefinition: String? = nil
+            }
+            var id: String? = nil
+            var name: Name? = nil
+            var playbackURLs: [Playback]? = nil
+        }
+        var data: DataField? = nil
+    }
+
+    static let imdbQuery = """
+    query TitleTrailer($const: ID!) { title(id: $const) {
+      latestTrailer { id name { value } playbackURLs { url videoMimeType videoDefinition } }
+      primaryVideos(first: 10) { edges { node { id name { value } playbackURLs { url videoMimeType videoDefinition } } } }
+    } }
+    """
+
+    /// The title's trailer straight from IMDb: its latest trailer, else a video named a trailer,
+    /// in the best file the shelf plays (1080p MP4 first).
+    static func imdbTrailer(imdbID: String) async -> TopShelfTrailerLink? {
+        guard let url = URL(string: "https://graphql.prod.api.imdb.a2z.com/"),
+              let body = try? JSONSerialization.data(withJSONObject: ["query": imdbQuery, "variables": ["const": imdbID]]) else { return nil }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.httpBody = body
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("https://www.imdb.com", forHTTPHeaderField: "Origin")
+        request.setValue("https://www.imdb.com/", forHTTPHeaderField: "Referer")
+        guard let result = try? await session.data(for: request),
+              let http = result.1 as? HTTPURLResponse, (200...299).contains(http.statusCode) else { return nil }
+        return imdbLink(from: result.0)
+    }
+
+    static func imdbLink(from data: Data) -> TopShelfTrailerLink? {
+        guard let title = (try? JSONDecoder().decode(IMDbResponse.self, from: data))?.data?.title else { return nil }
+        var videos: [IMDbResponse.Video] = []
+        if let latest = title.latestTrailer { videos.append(latest) }
+        for edge in title.primaryVideos?.edges ?? [] {
+            guard let node = edge.node, !videos.contains(where: { $0.id != nil && $0.id == node.id }) else { continue }
+            videos.append(node)
+        }
+        func name(_ video: IMDbResponse.Video) -> String { (video.name?.value ?? "").lowercased() }
+        let playable = videos.filter { !($0.playbackURLs ?? []).isEmpty && !name($0).contains("vertical") }
+        let latest = title.latestTrailer.flatMap { trailer in playable.first(where: { $0.id == trailer.id }) }
+        let named = playable.first(where: { name($0).contains("trailer") })
+        let chosen = latest ?? named ?? playable.first
+        guard let files = chosen?.playbackURLs else { return nil }
+        let ranked = files.compactMap { file -> (url: String, rank: Int, definition: String)? in
+            guard let url = file.url?.trimmingCharacters(in: .whitespacesAndNewlines), url.hasPrefix("https://") else { return nil }
+            return (url, imdbRank(definition: file.videoDefinition, mime: file.videoMimeType), file.videoDefinition ?? "")
+        }.sorted { $0.rank > $1.rank }
+        guard let best = ranked.first else { return nil }
+        let quality = best.definition.replacingOccurrences(of: "DEF_", with: "")
+        return TopShelfTrailerLink(url: best.url, provider: "IMDb \(quality)".trimmingCharacters(in: .whitespaces))
+    }
+
+    /// 1080p, 720p, 480p MP4, then HLS; anything else last.
+    static func imdbRank(definition: String?, mime: String?) -> Int {
+        let isMP4 = (mime ?? "").lowercased().contains("mp4")
+        switch definition {
+        case "DEF_1080p": return isMP4 ? 50 : 40
+        case "DEF_720p": return isMP4 ? 30 : 25
+        case "DEF_AUTO": return 20
+        case "DEF_480p": return isMP4 ? 15 : 10
+        default: return isMP4 ? 5 : 1
+        }
     }
 
     /// The playable links of a Trailerio response, in its order. Nil when it

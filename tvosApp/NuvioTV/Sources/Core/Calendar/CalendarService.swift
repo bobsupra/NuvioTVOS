@@ -20,14 +20,18 @@ struct CalendarService: Sendable {
     var region: String
     /// Broadcast times for anime (AniList); nil leaves TMDB dates as they are.
     var animeTimes: CalendarAnimeTimes?
+    /// Anime straight from AniList (calendar option); nil leaves AniList titles to TMDB.
+    var aniList: CalendarAniList?
 
     init(client: CalendarTmdb.Client, maxConcurrent: Int = 6, region: String,
-         animeTimes: CalendarAnimeTimes? = nil, resolveTmdbId: @escaping IdResolver) {
+         animeTimes: CalendarAnimeTimes? = nil, aniList: CalendarAniList? = nil,
+         resolveTmdbId: @escaping IdResolver) {
         self.client = client
         self.resolveTmdbId = resolveTmdbId
         self.maxConcurrent = max(1, maxConcurrent)
         self.region = region
         self.animeTimes = animeTimes
+        self.aniList = aniList
     }
 
     enum Outcome: Sendable {
@@ -45,12 +49,17 @@ struct CalendarService: Sendable {
     ) async throws -> CalendarResult {
         guard !client.apiKey.isEmpty else { throw CalendarLoadError.tmdbNotConfigured }
 
+        // AniList series go to AniList itself when that option is on, not to TMDB.
         // Movies released more than a year before the period cannot have a
         // release inside it; don't spend a request on each of them.
-        let items = items.filter { item in
-            guard item.kind == .movie, let year = item.year else { return true }
-            return year >= first.year - 1
-        }
+        let (aniListFollows, items) = (
+            aniList == nil ? [] : items.filter(CalendarAniList.handles),
+            items.filter { item in
+                if aniList != nil, CalendarAniList.handles(item) { return false }
+                guard item.kind == .movie, let year = item.year else { return true }
+                return year >= first.year - 1
+            }
+        )
 
         // 1. Resolve ids, then drop duplicates (the same title saved twice
         //    under different ids).
@@ -113,6 +122,33 @@ struct CalendarService: Sendable {
                 imdbByTmdb[target.tmdbId] = String(target.item.id.prefix { $0 != ":" })
             }
             entries = await animeTimes.apply(to: entries, imdbByTmdb: imdbByTmdb, first: first, last: last)
+        }
+
+        if let aniList {
+            let shows = targets.filter { $0.item.kind == .series }.map { target in
+                (tmdb: target.tmdbId, imdb: NuvioMeta.canonicalImdbID(from: target.item.imdbId ?? target.item.id))
+            }
+            let covered = await CalendarAniList.covered(shows: shows, cache: animeTimes?.cache ?? .shared)
+            let found = await aniList.load(followed: aniListFollows, covered: covered, first: first, last: last)
+            entries += found.entries
+            for item in aniListFollows {
+                let isManualFollow = manualFollowItemIDs?.contains(item.sourceIdentityKey) ?? true
+                let isAutomaticFollow = automaticFollowItemIDs.contains(item.sourceIdentityKey)
+                if found.failed {
+                    if isManualFollow {
+                        skipped.append(CalendarSkippedItem(item: item, reason: .failed("AniList didn't answer")))
+                    }
+                    continue
+                }
+                guard let key = found.followKeys[item.id] else { continue }
+                if isManualFollow {
+                    manualFollowKeys.insert(key)
+                    if manualFollowItems[key] == nil { manualFollowItems[key] = item }
+                }
+                if isAutomaticFollow, automaticFollowItems[key] == nil {
+                    automaticFollowItems[key] = item
+                }
+            }
         }
 
         return CalendarResult(
