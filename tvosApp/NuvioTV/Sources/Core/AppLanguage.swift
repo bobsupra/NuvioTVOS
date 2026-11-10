@@ -407,6 +407,58 @@ enum L10n {
             return string("tvos_settings_option_size", fallback: "Size")
         case "Name":
             return string("tvos_settings_option_name", fallback: "Name")
+        case "Focused Only", "focused":
+            return string("tvos_settings_option_focused_only", fallback: "Focused Only")
+        case "Hidden", "hidden":
+            return string("tvos_settings_option_hidden", fallback: "Hidden")
+        case "Sharp (0pt)":
+            return string("tvos_settings_option_sharp", fallback: "Sharp (0pt)")
+        case "Subtle (8pt)":
+            return string("tvos_settings_option_subtle", fallback: "Subtle (8pt)")
+        case "Classic (16pt)":
+            return string("tvos_settings_option_classic", fallback: "Classic (16pt)")
+        case "Rounded (22pt)":
+            return string("tvos_settings_option_rounded", fallback: "Rounded (22pt)")
+        case "Pill (28pt)":
+            return string("tvos_settings_option_pill", fallback: "Pill (28pt)")
+        case "Small":
+            return string("tvos_settings_option_small", fallback: "Small")
+        case "Wide":
+            return string("tvos_settings_option_wide", fallback: "Wide")
+        case "Full":
+            return string("tvos_settings_option_full", fallback: "Full")
+        case "Tall":
+            return string("tvos_settings_option_tall", fallback: "Tall")
+        case "Tight":
+            return string("tvos_settings_option_tight", fallback: "Tight")
+        case "Loose":
+            return string("tvos_settings_option_loose", fallback: "Loose")
+        case "All":
+            return string("action_all", fallback: "All")
+        case "Software Host":
+            return string("tvos_settings_option_software_host", fallback: "Software Host")
+        case "Native Pipeline":
+            return string("tvos_settings_option_native_pipeline", fallback: "Native Pipeline")
+        case "Custom":
+            return string("subtitle_style_custom", fallback: "Custom")
+        case "Large Text":
+            return string("subtitle_style_large_text", fallback: "Large Text")
+        case "Outline Text":
+            return string("subtitle_style_outline_text", fallback: "Outline Text")
+        case "Solid Black":
+            return string("subtitle_style_solid_black", fallback: "Solid Black")
+        case "Transparent Background":
+            return string("subtitle_style_transparent_bg", fallback: "Transparent Background")
+        case "Yellow on Black":
+            return string("subtitle_style_yellow_on_black", fallback: "Yellow on Black")
+        case "Featured Card & Posters":
+            return string("tvos_settings_topshelf_style_featured_cards", fallback: "Featured Card & Posters")
+        case "Just Carousel":
+            return string("tvos_settings_topshelf_style_carousel_details", fallback: "Just Carousel")
+        case "Landscape Posters":
+            return string("tvos_settings_topshelf_style_rows", fallback: "Landscape Posters")
+        case "Posters":
+            return string("tvos_settings_topshelf_style_posters", fallback: "Posters")
         default:
             return stored
         }

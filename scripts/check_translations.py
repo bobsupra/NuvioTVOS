@@ -16,7 +16,7 @@ SUPPORTED_LANGUAGES = {
     "vi", "zh-CN", "zh-TW",
 }
 
-KEY_PATTERN = re.compile(r'L10n\.(?:string|format)\(\s*"([^"]+)"')
+KEY_PATTERN = re.compile(r'(?:L10n\.)?(?:string|format)\(\s*"([^"]+)"')
 PLACEHOLDER_PATTERN = re.compile(r'%(?:\d+\$)?[0-9.]*[@a-zA-Z]')
 
 
