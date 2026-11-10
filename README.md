@@ -50,22 +50,23 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.5.0** is the latest tvOS release.
+**Beta 3.5.1** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.0/NuvioTV-3.5.0-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.0) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.1/NuvioTV-3.5.1-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.1) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.5.0
+### New in Beta 3.5.1
 
-- **AutoSubSync & Sync by Audio:** Lines add-on subtitles up with the video automatically using embedded MKV Cues index range requests. When no embedded subtitle reference exists, Sync by Audio listens to speech patterns through AetherEngine's shared audio tap to dynamically line lines up and track delay.
-- **Siri Remote Custom Gestures & Expert Mode:** Gesture recognition in the player (enabled in the player's **•••** settings panel under **Gestures**) with 8 ready-made shortcuts (chapter skips, intro/outro jump, -30s rewind, subtitle toggle, audio track switch, and next episode), plus an Expert Mode to record custom gestures and draw touchpad shapes for 11 actions.
-- **Watch Party Sidebar Toggle:** Customizable setting in **Settings → General** to show or hide the Watch Party tab in the sidebar navigation.
-- **MDBList Integration & Filters:** Direct MDBList catalog sources and dynamic filtering support across Collections.
-- **Profile Cloud Sync:** Synchronizes custom profile background art and add-on names to your cloud account.
-- **Native IMDb Trailer Streams:** Directly resolves high-definition trailer playback sources from IMDb on Details screens.
-- **Top Shelf & Focus Hardening:** Remote library items on Apple TV Top Shelf, focus-safe Back routing in Calendar, day panel scroll stabilization, and clamped episode guide index on long series.
+- **AniList & MyAnimeList Integrations:** Full anime tracking sync with AniList and MyAnimeList. Syncs watched episodes, scores, and status with client credentials kept securely on the Apple TV.
+- **Native Top Tab Navigation:** Optional layout in **Settings → Appearance** to switch from sidebar to native Apple TV top tab bar.
+- **Custom Subtitle Fonts & Style Presets:** Load custom `.ttf`/`.otf` fonts transferred locally or via URL, plus manage and reorder subtitle style presets.
+- **Stream List Customization & Live Preview:** Customize stream source formatting with an interactive live preview, plus locally cached provider badge artwork.
+- **Continue Watching Labels & Title Scrolling:** Control Continue Watching card labels (Focused Only, Always, Hidden) and marquee scroll long titles on focus.
+- **Player Speed Controls & Spoiler Masking:** Granular playback speed adjustment and episode thumbnail/description spoiler protection.
+- **Multi-Source External Hero Ratings:** Ratings from IMDb, Rotten Tomatoes, AniList, MyAnimeList, and TMDB with configurable order and provider switches.
+- **Hardening & Stability:** Decoupled next-episode pre-buffering (no interruptions to playing torrent or Usenet streams), stabilized Details back-navigation, loading backdrop alignment fix, and Trakt Keychain persistence.
 
 ### Built-in Player
 
@@ -80,7 +81,7 @@ For supported 48 kHz TrueHD Atmos and DTS:X VOD, **Settings → Playback → Pla
 
 ### Supported Tracking Services
 
-[Trakt](https://trakt.tv) · [Simkl](https://simkl.com) · [WeTrakr](https://wetrakr.com) · [MDBList](https://mdblist.com)
+[Trakt](https://trakt.tv) · [Simkl](https://simkl.com) · [AniList](https://anilist.co) · [MyAnimeList](https://myanimelist.net) · [WeTrakr](https://wetrakr.com) · [MDBList](https://mdblist.com)
 
 ### Notes
 
