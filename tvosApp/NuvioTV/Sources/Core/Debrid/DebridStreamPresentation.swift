@@ -2,9 +2,14 @@ import Foundation
 
 struct DebridStreamPresentation {
     private let store: UserDefaults
+    private let localDebridService: LocalDebridService
 
-    init(store: UserDefaults = ProfileSettings.current) {
+    init(
+        store: UserDefaults = ProfileSettings.current,
+        localDebridService: LocalDebridService = LocalDebridService()
+    ) {
         self.store = store
+        self.localDebridService = localDebridService
     }
 
     static func present(streams: [NuvioStream], store: UserDefaults = ProfileSettings.current) async -> [NuvioStream] {
@@ -36,8 +41,7 @@ struct DebridStreamPresentation {
         guard !torrentStreams.isEmpty else { return streams }
 
         let hashes = Array(Set(torrentStreams.compactMap(\.effectiveInfoHash)))
-        let service = LocalDebridService()
-        let cachedMap = await service.checkCached(provider: provider, apiKey: token, hashes: hashes)
+        let statuses = await localDebridService.checkCached(provider: provider, apiKey: token, hashes: hashes)
 
         return streams.compactMap { stream -> NuvioStream? in
             guard stream.isDebridResolvable else {
@@ -46,16 +50,16 @@ struct DebridStreamPresentation {
             }
             guard let infoHash = stream.effectiveInfoHash?.lowercased() else { return nil }
 
-            if let cachedMap {
-                guard let cachedItem = cachedMap[infoHash] else {
-                    // Uncached torrent: filter out so user only sees instantly playable streams
-                    return nil
-                }
+            switch statuses[infoHash] ?? .unknown {
+            case .cached(let cachedItem):
                 return formattedDebridStream(stream, provider: provider, cachedItem: cachedItem)
-            } else {
-                // If cache check network call failed completely (e.g. offline),
-                // pass through so user can still attempt click-time resolution
-                return stream
+            case .notCached:
+                // Confirmed uncached torrents stay filtered while Debrid is enabled.
+                return nil
+            case .unknown:
+                // Keep add-on metadata and cache claims intact when the provider
+                // cannot confirm availability; the card labels this uncertainty.
+                return stream.withDebridCacheStatusUnavailable(true)
             }
         }
     }

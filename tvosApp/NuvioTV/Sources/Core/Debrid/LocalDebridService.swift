@@ -5,27 +5,35 @@ struct LocalDebridCachedItem: Sendable {
     let size: Int64?
 }
 
+enum LocalDebridCacheStatus: Sendable {
+    case cached(LocalDebridCachedItem)
+    case notCached
+    case unknown
+}
+
 private actor RealDebridAvailabilityCache {
     static let shared = RealDebridAvailabilityCache()
     private var cache: [String: (item: LocalDebridCachedItem?, expiresAt: Date)] = [:]
     private var lastRequestTime = Date.distantPast
     private let minimumRequestInterval: TimeInterval = 1.0 // Real-Debrid rate limit: 1 req/sec
 
-    func lookup(hashes: [String]) -> (cached: [String: LocalDebridCachedItem], missing: [String]) {
+    func lookup(hashes: [String]) -> (statuses: [String: LocalDebridCacheStatus], missing: [String]) {
         let now = Date()
-        var found: [String: LocalDebridCachedItem] = [:]
+        var statuses: [String: LocalDebridCacheStatus] = [:]
         var missing: [String] = []
         for hash in hashes {
             let lower = hash.lowercased()
             if let entry = cache[lower], entry.expiresAt > now {
                 if let item = entry.item {
-                    found[lower] = item
+                    statuses[lower] = .cached(item)
+                } else {
+                    statuses[lower] = .notCached
                 }
             } else {
                 missing.append(lower)
             }
         }
-        return (found, missing)
+        return (statuses, missing)
     }
 
     func store(items: [String: LocalDebridCachedItem], checkedHashes: [String], ttl: TimeInterval = 300) {
@@ -60,7 +68,7 @@ struct LocalDebridService: Sendable {
         provider: DebridProviderKind,
         apiKey: String,
         hashes: [String]
-    ) async -> [String: LocalDebridCachedItem]? {
+    ) async -> [String: LocalDebridCacheStatus] {
         let normalized = hashes
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
             .filter { !$0.isEmpty }
@@ -69,18 +77,24 @@ struct LocalDebridService: Sendable {
         switch provider {
         case .torbox:
             return await checkTorboxCached(apiKey: apiKey, hashes: normalized)
+                ?? unknownStatuses(for: normalized)
         case .realDebrid:
             return await checkRealDebridCached(apiKey: apiKey, hashes: normalized)
         case .premiumize:
             return await checkPremiumizeCached(apiKey: apiKey, hashes: normalized)
+                ?? unknownStatuses(for: normalized)
         default:
-            return nil
+            return unknownStatuses(for: normalized)
         }
+    }
+
+    private func unknownStatuses(for hashes: [String]) -> [String: LocalDebridCacheStatus] {
+        Dictionary(uniqueKeysWithValues: hashes.map { ($0, .unknown) })
     }
 
     // MARK: - TorBox
 
-    private func checkTorboxCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCachedItem]? {
+    private func checkTorboxCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCacheStatus]? {
         guard let url = URL(string: "https://api.torbox.app/v1/api/torrents/checkcached?format=object") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -100,13 +114,17 @@ struct LocalDebridService: Sendable {
                 return nil
             }
 
-            var result: [String: LocalDebridCachedItem] = [:]
+            var items: [String: LocalDebridCachedItem] = [:]
             for (hash, itemVal) in dataDict {
                 if let itemDict = itemVal as? [String: Any] {
                     let name = itemDict["name"] as? String
                     let size = (itemDict["size"] as? NSNumber)?.int64Value
-                    result[hash.lowercased()] = LocalDebridCachedItem(name: name, size: size)
+                    items[hash.lowercased()] = LocalDebridCachedItem(name: name, size: size)
                 }
+            }
+            var result = Dictionary(uniqueKeysWithValues: hashes.map { ($0, LocalDebridCacheStatus.notCached) })
+            for (hash, item) in items {
+                result[hash] = .cached(item)
             }
             return result
         } catch {
@@ -116,14 +134,13 @@ struct LocalDebridService: Sendable {
 
     // MARK: - Real-Debrid
 
-    private func checkRealDebridCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCachedItem]? {
-        let (cached, missing) = await RealDebridAvailabilityCache.shared.lookup(hashes: hashes)
+    private func checkRealDebridCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCacheStatus] {
+        let (cachedStatuses, missing) = await RealDebridAvailabilityCache.shared.lookup(hashes: hashes)
         if missing.isEmpty {
-            return cached
+            return cachedStatuses
         }
 
-        var merged = cached
-        var completedBatch = false
+        var merged = cachedStatuses
         for batchStart in stride(from: 0, to: missing.count, by: 50) {
             guard !Task.isCancelled else { break }
             let batchEnd = min(batchStart + 50, missing.count)
@@ -153,43 +170,49 @@ struct LocalDebridService: Sendable {
                     continue
                 }
 
-                var fetched: [String: LocalDebridCachedItem] = [:]
-                for (hash, val) in json {
-                    guard let providerDict = val as? [String: Any],
-                          let rdArray = providerDict["rd"] as? [[String: Any]],
-                          !rdArray.isEmpty else {
+                var fetched: [String: LocalDebridCacheStatus] = [:]
+                var fetchedItems: [String: LocalDebridCachedItem] = [:]
+                for hash in batch {
+                    guard let value = json.first(where: { $0.key.lowercased() == hash })?.value as? [String: Any],
+                          let rdArray = value["rd"] as? [[String: Any]] else {
+                        continue
+                    }
+                    guard !rdArray.isEmpty else {
+                        fetched[hash] = .notCached
                         continue
                     }
                     var firstName: String?
                     var totalSize: Int64?
-                    if let firstVariant = rdArray.first {
-                        for (_, fileInfoVal) in firstVariant {
-                            if let fileInfo = fileInfoVal as? [String: Any] {
-                                firstName = fileInfo["filename"] as? String
-                                totalSize = (fileInfo["filesize"] as? NSNumber)?.int64Value
-                                break
-                            }
+                    for (_, fileInfoVal) in rdArray[0] {
+                        if let fileInfo = fileInfoVal as? [String: Any] {
+                            firstName = fileInfo["filename"] as? String
+                            totalSize = (fileInfo["filesize"] as? NSNumber)?.int64Value
+                            break
                         }
                     }
-                    fetched[hash.lowercased()] = LocalDebridCachedItem(name: firstName, size: totalSize)
+                    let item = LocalDebridCachedItem(name: firstName, size: totalSize)
+                    fetched[hash] = .cached(item)
+                    fetchedItems[hash] = item
                 }
-                await RealDebridAvailabilityCache.shared.store(items: fetched, checkedHashes: batch)
-                completedBatch = true
-                for (hash, item) in fetched {
-                    merged[hash] = item
-                }
+                await RealDebridAvailabilityCache.shared.store(items: fetchedItems, checkedHashes: Array(fetched.keys))
+                merged.merge(fetched) { _, new in new }
             } catch is CancellationError {
                 break
             } catch {
                 continue
             }
         }
-        return completedBatch || !merged.isEmpty ? merged : nil
+        for hash in hashes {
+            if case nil = merged[hash] {
+                merged[hash] = .unknown
+            }
+        }
+        return merged
     }
 
     // MARK: - Premiumize
 
-    private func checkPremiumizeCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCachedItem]? {
+    private func checkPremiumizeCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCacheStatus]? {
         var components = URLComponents(string: "https://www.premiumize.me/api/cache/check")
         var queryItems: [URLQueryItem] = [
             URLQueryItem(name: "apikey", value: apiKey.trimmingCharacters(in: .whitespacesAndNewlines))
@@ -212,13 +235,16 @@ struct LocalDebridService: Sendable {
             let filenames = json["filename"] as? [String?]
             let filesizes = json["filesize"] as? [NSNumber?]
 
-            var result: [String: LocalDebridCachedItem] = [:]
-            for (index, isCached) in responses.enumerated() where isCached {
-                guard index < hashes.count else { continue }
+            var result = unknownStatuses(for: hashes)
+            for (index, isCached) in responses.enumerated() where index < hashes.count {
                 let hash = hashes[index].lowercased()
+                guard isCached else {
+                    result[hash] = .notCached
+                    continue
+                }
                 let name = (filenames?.indices.contains(index) == true) ? filenames?[index] : nil
                 let size = (filesizes?.indices.contains(index) == true) ? filesizes?[index]?.int64Value : nil
-                result[hash] = LocalDebridCachedItem(name: name, size: size)
+                result[hash] = .cached(LocalDebridCachedItem(name: name, size: size))
             }
             return result
         } catch {
