@@ -124,15 +124,15 @@ enum WatchPartyRoomCreationError: Error {
     var message: String {
         switch self {
         case .unsupportedMedia:
-            return "Live streams, trailers, and previews can't host a Watch Party."
+            return L10n.string("party_error_unsupported_media", fallback: "Live streams, trailers, and previews can't host a Watch Party.")
         case .invalidEpisode:
-            return "Watch Party couldn't identify this episode. Start a numbered episode and try again."
+            return L10n.string("party_error_invalid_episode", fallback: "Watch Party couldn't identify this episode. Start a numbered episode and try again.")
         case .transitionInProgress:
-            return "Wait for the source or episode change to finish before creating a room."
+            return L10n.string("party_error_transition_in_progress", fallback: "Wait for the source or episode change to finish before creating a room.")
         case .playbackNotReady:
-            return "Playback needs to be ready before creating a room."
+            return L10n.string("party_error_playback_not_ready", fallback: "Playback needs to be ready before creating a room.")
         case .stalePlayback:
-            return "Playback changed while the room was being created."
+            return L10n.string("party_error_stale_playback", fallback: "Playback changed while the room was being created.")
         }
     }
 }

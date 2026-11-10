@@ -457,6 +457,12 @@ private extension NuvioStream {
 
     var panelSubtitle: String {
         var parts: [String] = []
+        if debridCacheStatusUnavailable == true {
+            parts.append(L10n.string(
+                "debrid_cache_status_unavailable",
+                fallback: "Cache status unavailable"
+            ))
+        }
         if let addonName, !addonName.isEmpty { parts.append(addonName) }
         if let description, !description.isEmpty,
            description.caseInsensitiveCompare(panelTitle) != .orderedSame {

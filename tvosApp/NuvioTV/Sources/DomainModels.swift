@@ -129,7 +129,6 @@ public class ProfileManager {
         try FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
         profilesURL = baseURL.appendingPathComponent("nuvio-profiles.json")
         try migrateProfilesFromUserDefaultsIfNeeded()
-        UserDefaults.standard.removeObject(forKey: Self.profilesKey)
     }
 
     private init(userDefaultsBacked: Void) {
@@ -145,10 +144,14 @@ public class ProfileManager {
         do {
             let data: Data
             if let profilesURL {
-                guard FileManager.default.fileExists(atPath: profilesURL.path) else {
+                if FileManager.default.fileExists(atPath: profilesURL.path) {
+                    data = try Data(contentsOf: profilesURL)
+                } else if let stored = UserDefaults.standard.data(forKey: Self.profilesKey) {
+                    data = stored
+                    try? stored.write(to: profilesURL, options: [.atomic])
+                } else {
                     return []
                 }
-                data = try Data(contentsOf: profilesURL)
             } else {
                 guard let stored = UserDefaults.standard.data(forKey: Self.profilesKey) else {
                     return []
@@ -331,9 +334,8 @@ public class ProfileManager {
         let data = try JSONEncoder().encode(stored)
         if let profilesURL {
             try data.write(to: profilesURL, options: [.atomic])
-        } else {
-            UserDefaults.standard.set(data, forKey: Self.profilesKey)
         }
+        UserDefaults.standard.set(data, forKey: Self.profilesKey)
     }
 
     private func migrateProfilesFromUserDefaultsIfNeeded() throws {
@@ -345,7 +347,6 @@ public class ProfileManager {
         }
 
         try writeProfiles(decoded.map { $0.toProfile() })
-        UserDefaults.standard.removeObject(forKey: Self.profilesKey)
     }
 
     private func quarantineUnreadableProfilesFile() {
@@ -663,10 +664,6 @@ public class ProfileViewModel: ObservableObject {
     private static func makeDefaultProfileManager(fileManager: FileManager = .default) throws -> ProfileManager {
         var candidates: [URL] = []
 
-        if let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            candidates.append(caches.appendingPathComponent("Nuvio", isDirectory: true))
-        }
-
         if let applicationSupport = fileManager.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -676,12 +673,16 @@ public class ProfileViewModel: ObservableObject {
 
         let homeLibrary = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library", isDirectory: true)
-        candidates.append(homeLibrary.appendingPathComponent("Caches", isDirectory: true).appendingPathComponent("Nuvio", isDirectory: true))
         candidates.append(
             homeLibrary
                 .appendingPathComponent("Application Support", isDirectory: true)
                 .appendingPathComponent("Nuvio", isDirectory: true)
         )
+
+        if let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            candidates.append(caches.appendingPathComponent("Nuvio", isDirectory: true))
+        }
+        candidates.append(homeLibrary.appendingPathComponent("Caches", isDirectory: true).appendingPathComponent("Nuvio", isDirectory: true))
         candidates.append(homeLibrary.appendingPathComponent("Nuvio", isDirectory: true))
 
         let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
@@ -709,11 +710,14 @@ public class ProfileViewModel: ObservableObject {
                 // Keep profiles from development/older builds when that file
                 // is readable, but never make startup depend on Documents.
                 let profilesURL = candidate.appendingPathComponent("nuvio-profiles.json")
-                if let documentsURL {
-                    let legacyURL = documentsURL.appendingPathComponent("nuvio-profiles.json")
-                    if !fileManager.fileExists(atPath: profilesURL.path),
-                       fileManager.fileExists(atPath: legacyURL.path) {
-                        try? fileManager.copyItem(at: legacyURL, to: profilesURL)
+                if !fileManager.fileExists(atPath: profilesURL.path) {
+                    for legacyCandidate in candidates {
+                        let legacyURL = legacyCandidate.appendingPathComponent("nuvio-profiles.json")
+                        if legacyURL.path != profilesURL.path,
+                           fileManager.fileExists(atPath: legacyURL.path) {
+                            try? fileManager.copyItem(at: legacyURL, to: profilesURL)
+                            break
+                        }
                     }
                 }
 

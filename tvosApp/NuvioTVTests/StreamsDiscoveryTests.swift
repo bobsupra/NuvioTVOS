@@ -375,6 +375,38 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(byQuality.first?.id, torrentio.id, "4K should rank above 1080p")
     }
 
+    func testUnknownDebridCacheStatusIsOptInForCachedOnlyLists() {
+        let stream = NuvioStream(
+            url: nil,
+            name: "Torrentio 1080p",
+            description: nil,
+            addonName: "Torrentio",
+            infoHash: String(repeating: "a", count: 40),
+            debridCacheStatusUnavailable: true
+        )
+
+        let automaticCandidates = StreamPickerListBuilder.displayedStreams(
+            streams: [stream],
+            groups: [],
+            selectedAddonId: nil,
+            sortOption: .quality,
+            includeDebrid: true,
+            cachedOnly: true
+        )
+        let manualPickerCandidates = StreamPickerListBuilder.displayedStreams(
+            streams: [stream],
+            groups: [],
+            selectedAddonId: nil,
+            sortOption: .quality,
+            includeDebrid: true,
+            cachedOnly: true,
+            includeUnknownCacheStatus: true
+        )
+
+        XCTAssertTrue(automaticCandidates.isEmpty)
+        XCTAssertEqual(manualPickerCandidates.map(\.id), [stream.id])
+    }
+
     func testFocusChangeDoesNotChangeDerivedStreamList() {
         let streams = [
             makeStream(url: "https://cdn.example/1.mkv", name: "1080p", addon: "A"),

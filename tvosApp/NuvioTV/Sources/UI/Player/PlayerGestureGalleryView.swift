@@ -18,10 +18,10 @@ struct PlayerGestureGalleryView: View {
 
             VStack(alignment: .leading, spacing: 26) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("Gesture overview")
+                    Text(L10n.string("player_gesture_overview", fallback: "Gesture overview"))
                         .font(.system(size: 40, weight: .bold))
                         .foregroundColor(.white)
-                    Text("Pick a card to see all its variants below and what each does during playback now · Back closes")
+                    Text(L10n.string("player_gesture_overview_hint", fallback: "Pick a card to see all its variants below and what each does during playback now · Back closes"))
                         .font(.system(size: 21, weight: .medium))
                         .foregroundColor(.white.opacity(0.5))
                 }

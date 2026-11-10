@@ -590,7 +590,9 @@ class DetailsViewModel: ObservableObject {
                       self.detailsRequestGeneration == requestGeneration else { return }
                 self.didLoadMetadataSuccessfully = false
                 self.metadataLoadError = error.localizedDescription
-                if self.uiState.meta == nil {
+                if let currentMeta = self.uiState.meta {
+                    self.triggerStreamPreFetch(for: currentMeta)
+                } else {
                     self.uiState.isLoading = false
                     self.uiState.error = error.localizedDescription
                 }
@@ -948,6 +950,10 @@ class DetailsViewModel: ObservableObject {
 
     private func applyMoreLikeThis(_ items: [RelatedTitle], for metaId: String, generation: UInt64) {
         guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
+        for item in items {
+            repository.cacheCatalogMetadata(item.asMeta)
+            CinemetaCatalogRepository.cacheCatalogMetadata(item.asMeta)
+        }
         uiState.moreLikeThis = items
     }
 

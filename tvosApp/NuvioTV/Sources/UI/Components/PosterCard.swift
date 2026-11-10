@@ -233,10 +233,10 @@ struct PosterCard: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
-    @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.focused.rawValue
+    @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.always.rawValue
 
     private var showsContinueWatchingLabels: Bool {
-        (CardLabelVisibility(rawValue: continueWatchingLabels) ?? .focused)
+        (CardLabelVisibility(rawValue: continueWatchingLabels) ?? .always)
             .isVisible(isFocused: showsFocusedAppearance)
     }
 
@@ -649,7 +649,9 @@ struct PosterCard: View {
             return Color(red: 0xB4 / 255, green: 0x53 / 255, blue: 0x09 / 255)
         } else if badge == "NEW EPISODE" {
             return Color(red: 0x1D / 255, green: 0x4E / 255, blue: 0xD8 / 255)
-        } else if badge == "AIRING TODAY" {
+        } else if badge == "AIRING TODAY"
+            || badge == "DIFFUSION AUJOURD'HUI"
+            || badge == L10n.string("calendar_home_today_badge", fallback: "AIRING TODAY").uppercased() {
             return Color(red: 0x05 / 255, green: 0x96 / 255, blue: 0x69 / 255)
         } else if badge.hasPrefix("AIRS IN") || badge == "COMING SOON" {
             return Color(red: 0x47 / 255, green: 0x55 / 255, blue: 0x69 / 255)

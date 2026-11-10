@@ -637,7 +637,7 @@ struct ScenePanelView: View {
                         }
                         
                         VStack(alignment: .leading, spacing: 8) {
-                            Text("Up Next")
+                            Text(L10n.string("scene_up_next", fallback: "Up Next"))
                                 .font(.system(size: 14, weight: .bold))
                                 .foregroundColor(isNextFocused ? Color(red: 0.0, green: 0.45, blue: 0.85) : Color(red: 0.10, green: 0.68, blue: 1.0))
                                 .textCase(.uppercase)
@@ -703,7 +703,7 @@ struct ScenePanelView: View {
                 .padding(.horizontal, 60)
                 .padding(.top, 16)
             } else {
-                Text("No upcoming episode")
+                Text(L10n.string("scene_no_upcoming_episode", fallback: "No upcoming episode"))
                     .font(.system(size: 20, weight: .medium))
                     .foregroundColor(.white.opacity(0.6))
                     .padding(.horizontal, 60)

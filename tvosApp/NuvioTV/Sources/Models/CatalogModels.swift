@@ -1735,6 +1735,9 @@ struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
     let trickplayURL: URL?
     /// Stremio `behaviorHints.notPlayable` or `behaviorHints.action` for non-media helper/action items.
     let notPlayable: Bool?
+    /// True when a Debrid cache check could not determine this torrent's status.
+    /// The stream remains playable on demand; this only adds a picker label.
+    let debridCacheStatusUnavailable: Bool?
 
     var isNotPlayable: Bool {
         notPlayable == true
@@ -1757,7 +1760,8 @@ struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
         isCached: Bool? = nil,
         httpHeaders: [String: String]? = nil,
         trickplayURL: URL? = nil,
-        notPlayable: Bool? = nil
+        notPlayable: Bool? = nil,
+        debridCacheStatusUnavailable: Bool? = nil
     ) {
         let parsed = TorrentSourceParser.parse(
             url: url,
@@ -1781,6 +1785,7 @@ struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
         self.httpHeaders = httpHeaders
         self.trickplayURL = trickplayURL
         self.notPlayable = notPlayable
+        self.debridCacheStatusUnavailable = debridCacheStatusUnavailable
     }
 
     /// Explicit availability notice from a source add-on. Ordinary titles, filenames, and add-on names
@@ -1952,7 +1957,19 @@ struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
             subtitles: subtitles, addonLogoURL: logo, infoHash: infoHash,
             fileIdx: fileIdx, sources: sources, filename: filename, videoSize: videoSize,
             videoHash: videoHash, bingeGroup: bingeGroup, isCached: isCached,
-            httpHeaders: httpHeaders, trickplayURL: trickplayURL, notPlayable: notPlayable
+            httpHeaders: httpHeaders, trickplayURL: trickplayURL, notPlayable: notPlayable,
+            debridCacheStatusUnavailable: debridCacheStatusUnavailable
+        )
+    }
+
+    func withDebridCacheStatusUnavailable(_ unavailable: Bool) -> NuvioStream {
+        NuvioStream(
+            url: url, name: name, description: description, addonName: addonName,
+            subtitles: subtitles, addonLogoURL: addonLogoURL, infoHash: infoHash,
+            fileIdx: fileIdx, sources: sources, filename: filename, videoSize: videoSize,
+            videoHash: videoHash, bingeGroup: bingeGroup, isCached: isCached,
+            httpHeaders: httpHeaders, trickplayURL: trickplayURL, notPlayable: notPlayable,
+            debridCacheStatusUnavailable: unavailable
         )
     }
 
@@ -1982,7 +1999,8 @@ struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
             isCached: isCached,
             httpHeaders: httpHeaders,
             trickplayURL: trickplayURL,
-            notPlayable: notPlayable
+            notPlayable: notPlayable,
+            debridCacheStatusUnavailable: debridCacheStatusUnavailable
         )
     }
 }
@@ -3587,17 +3605,28 @@ enum ContinueWatchingStore {
         }
     }
 
-    /// Mirrors the active profile's Continue Watching list into the App Group so
-    /// the Top Shelf extension can render the Apple TV home rows: in-progress
-    /// titles, and aired next-episode suggestions as their own Up Next row.
-    /// No-op when the shared container isn't available.
+    /// Mirrors Nuvio Sync's local Continue Watching list into the App Group.
+    /// Remote-provider snapshots are written by Home after their fetch completes.
     static func writeTopShelfFeed() {
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
         defer { topShelfSnapshotLock.unlock() }
+        guard TraktSettingsStore.watchProgressSource == .nuvioSync else { return }
+        writeTopShelfFeedLocked(from: items())
+    }
+
+    /// Mirrors the visible provider snapshot after Home finishes fetching it.
+    static func writeTopShelfFeed(from selectedItems: [ContinueWatchingItem]) {
+        guard TopShelfFeedStore.isAvailable else { return }
+        topShelfSnapshotLock.lock()
+        defer { topShelfSnapshotLock.unlock() }
+        writeTopShelfFeedLocked(from: selectedItems)
+    }
+
+    private static func writeTopShelfFeedLocked(from selectedItems: [ContinueWatchingItem]) {
         // Each entry keeps its place on Home's row, so the shelf can show both
         // sections as one row in that order.
-        let allItems = Array(items().enumerated())
+        let allItems = Array(selectedItems.enumerated())
         let inProgress = allItems.filter { !$0.element.isUpNextEntry }.prefix(10)
         // Unaired suggestions can't be played yet, so they stay off the shelf.
         let upNextCandidates = allItems
@@ -12483,8 +12512,6 @@ enum ProfileSettings {
                 && (includeProfileLocalIntegrationSettings || !profileLocalIntegrationKeys.contains(key)) {
             if let value = source.object(forKey: key) {
                 destination.set(value, forKey: key)
-            } else {
-                destination.removeObject(forKey: key)
             }
         }
     }

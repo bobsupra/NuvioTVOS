@@ -331,7 +331,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .library: return L10n.string("nav_library", fallback: "Library")
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
-        case .party: return "Watch Party"
+        case .party: return L10n.string("nav_watch_party", fallback: "Watch Party")
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
         }
     }
@@ -519,6 +519,7 @@ struct ContentView: View {
     /// Home uses this lifecycle signal to request focus at the first moment
     /// tvOS can accept it, instead of guessing with delayed timers.
     @State private var detailsDidDisappearGeneration: UInt = 0
+    @State private var previousAuthState: AuthState? = nil
     @StateObject private var authManager = AuthManager()
     @StateObject private var watchPartyOwner = WatchPartyAppOwner()
     @StateObject private var profileViewModel = ProfileViewModel()
@@ -828,8 +829,10 @@ struct ContentView: View {
             }
         }
         .onReceive(authManager.$authState.receive(on: RunLoop.main)) { state in
+            let wasAuthenticated = previousAuthState?.isAuthenticated == true
+            previousAuthState = state
             syncManager.authStateChanged(state)
-            if state == .signedOut, profileViewModel.activeProfile?.id != "guest" {
+            if wasAuthenticated, state == .signedOut, profileViewModel.activeProfile?.id != "guest" {
                 profileViewModel.resetForSignedOut()
             }
         }
@@ -2762,6 +2765,7 @@ struct ContentView: View {
                 ProductionBrowseView(
                     company: company,
                     onSelect: { title in
+                        CinemetaCatalogRepository.cacheCatalogMetadata(title.asMeta)
                         withAnimation(.easeInOut(duration: 0.28)) {
                             if let ret = productionBrowseReturn {
                                 // Keep the originating Details screen in the
@@ -2801,6 +2805,7 @@ struct ContentView: View {
                 PersonBrowseView(
                     person: person,
                     onSelect: { title in
+                        CinemetaCatalogRepository.cacheCatalogMetadata(title.asMeta)
                         withAnimation(.easeInOut(duration: 0.28)) {
                             if let ret = personBrowseReturn {
                                 // Keep the originating Details screen in the
@@ -3479,7 +3484,8 @@ struct ContentView: View {
             sortOption: sortOption,
             includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
             cachedOnly: cachedOnly,
-            preserveAddonStreams: preserveAddonOrder
+            preserveAddonStreams: preserveAddonOrder,
+            includeUnknownCacheStatus: true
         )
     }
 
@@ -4013,7 +4019,7 @@ private struct SimklHomeLoadingDebugReport: View {
             .padding(16)
             .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
 
-            Text("Read or screenshot this report and send it to the developer.")
+            Text(L10n.string("diagnostic_report_hint", fallback: "Read or screenshot this report and send it to the developer."))
                 .font(.system(size: 17, weight: .medium))
                 .foregroundColor(.white.opacity(0.66))
         }
@@ -4434,8 +4440,7 @@ private struct TVMainTabView: View {
     @State private var showingReauthSheet = false
 
     private var displayedProfile: Profile? {
-        if isAuthenticated { return activeProfile }
-        return activeProfile?.id == "guest" ? activeProfile : nil
+        activeProfile
     }
 
     /// Name shown on the profile tab, mirroring the sidebar header's
@@ -4715,7 +4720,7 @@ private struct TVMainTabView: View {
                 },
                 detailsMedia: partyDetailsMedia, onRoomExited: onPartyRoomExited)
         } else {
-            Text("Sign in and choose a profile to use Watch Party.")
+            Text(L10n.string("party_signin_profile_prompt", fallback: "Sign in and choose a profile to use Watch Party."))
         }
     }
 
@@ -9808,9 +9813,13 @@ struct TVHomeView: View {
         }
 
         if usesRemoteProgress {
+            if displayedProgressSource != source {
+                ContinueWatchingStore.writeTopShelfFeed(from: [])
+            }
             refreshContinueWatching()
         }
         guard usesRemoteProgress else {
+            ContinueWatchingStore.writeTopShelfFeed()
             // The ledger this just read is only as fresh as the last account
             // pull. Ask for a new one; it lands via the store's change
             // notification, which already refreshes the row.
@@ -9865,6 +9874,7 @@ struct TVHomeView: View {
         print("[ContinueWatching][Home] refreshContinueWatchingFromSelectedSource: remote returned \(items.count) items -> visible \(visibleItems.count)")
         setContinueWatching(visibleItems)
         displayedProgressSource = source
+        ContinueWatchingStore.writeTopShelfFeed(from: visibleItems)
 
         // Continue Watching is visible now. Other providers own their own
         // watched snapshots; Trakt is refreshed independently above so its

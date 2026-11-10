@@ -57,8 +57,7 @@ struct CalendarHomeToday: Equatable {
     static func badge(for entry: CalendarEntry, time: (Date) -> String) -> String {
         if let airTime = entry.airTime { return time(airTime) }
         if entry.kind == .movie, let release = CalendarFormat.releaseLabel(entry.releaseKind) { return release }
-        // Matches Nuvio's own green "airing today" badge, so not translated.
-        return "AIRING TODAY"
+        return L10n.string("calendar_home_today_badge", fallback: "AIRING TODAY")
     }
 
     /// A compact card; Home fills in the hero's details once it is focused,

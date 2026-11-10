@@ -2469,9 +2469,9 @@ struct PlayerSettingsPanel: View {
 
     private var titlesPage: some View {
         VStack(alignment: .leading, spacing: 18) {
-            columnHeader("Disc Titles")
+            columnHeader(L10n.string("player_disc_titles", fallback: "Disc Titles"))
             if viewModel.discTitles.isEmpty {
-                Text("No disc titles available")
+                Text(L10n.string("player_no_disc_titles", fallback: "No disc titles available"))
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.45))
                     .padding(.top, 10)
@@ -4089,7 +4089,7 @@ private struct PlaybackLogsPage: View {
                 ScrollView(.vertical) {
                     LazyVStack(alignment: .leading, spacing: 8) {
                         if entries.isEmpty {
-                            Text("No playback events captured yet.")
+                            Text(L10n.string("player_no_playback_events", fallback: "No playback events captured yet."))
                                 .font(.system(size: 20, design: .monospaced))
                                 .foregroundColor(.white.opacity(0.55))
                                 .frame(maxWidth: .infinity, alignment: .leading)

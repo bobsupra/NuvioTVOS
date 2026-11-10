@@ -685,10 +685,18 @@ final class CinemetaCatalogRepository: CatalogRepository {
         let context = metadataCacheContext
         metadataCacheQueue.sync(flags: .barrier) {
             guard prepareMetadataCache(for: context) else { return }
-            if cachedFullMetaIds.contains(meta.id) {
-                return
+            if !cachedFullMetaIds.contains(meta.id) {
+                cachedMetaById[meta.id] = meta
             }
-            cachedMetaById[meta.id] = meta
+            if let imdbId = meta.imdbId, !imdbId.isEmpty, imdbId != meta.id {
+                if !cachedFullMetaIds.contains(imdbId) {
+                    cachedMetaById[imdbId] = meta
+                }
+            }
+        }
+        if let tmdbId = meta.tmdbId, let imdbId = meta.imdbId, imdbId.hasPrefix("tt") {
+            let type = meta.isSeries ? "series" : "movie"
+            cacheImdb(imdbId, forTmdbId: tmdbId, type: type)
         }
     }
 
@@ -1244,9 +1252,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         // Map tmdb:123 → imdb when TMDB is configured so Cinemeta can resolve.
         if id.hasPrefix("tmdb:"),
-           let tmdbNum = Int(id.dropFirst(5)),
-           let imdb = await Self.resolveImdbFromTmdb(tmdbId: tmdbNum, type: metaType) {
-            resolvedId = imdb
+           let tmdbNum = Int(id.dropFirst(5)) {
+            if let cachedImdb = cachedMetadata(for: id)?.imdbId, cachedImdb.hasPrefix("tt") {
+                resolvedId = cachedImdb
+            } else if let imdb = await Self.resolveImdbFromTmdb(tmdbId: tmdbNum, type: metaType) {
+                resolvedId = imdb
+            }
         }
 
         // Same for simkl:123. Simkl's recommendation payload carries only its
@@ -1258,6 +1269,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
                type: metaType
            ) {
             resolvedId = imdb
+        }
+
+        if id.hasPrefix("trakt:") {
+            let slug = String(id.dropFirst(6))
+            if let cachedImdb = cachedMetadata(for: id)?.imdbId, cachedImdb.hasPrefix("tt") {
+                resolvedId = cachedImdb
+            } else if let imdb = await TraktDetailsService.resolveImdbFromSlug(slug, isSeries: isSeries) {
+                resolvedId = imdb
+            }
         }
 
         if id.hasPrefix("wetrakr:"),
@@ -1326,7 +1346,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         // 2. Query upstream Cinemeta if enabled
-        if !isLive, Self.isCinemetaEnabled, let resolvedCanonicalImdbID {
+        if !isLive, Self.isCinemetaMetadataEnabled, let resolvedCanonicalImdbID {
             for candidateType in Self.cinemetaMetadataTypesToTry(
                 primaryType: metaType,
                 canonicalImdbID: resolvedCanonicalImdbID
@@ -1372,40 +1392,44 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         // If no /meta endpoint returned a response, check if the item was already cached from a catalog
         if let cached = cachedMetadata(for: id) ?? cachedMetadata(for: resolvedId) {
-            return await TmdbDetailsService.localizedMetadata(for: cached)
+            let localized = await TmdbDetailsService.localizedMetadata(for: cached)
+            cacheMetadata(localized, requestedID: id, context: metadataContext)
+            return localized
         }
 
         // For Live TV / channel items or non-IMDb streams where the add-on provides streams
-        // but no dedicated /meta endpoint, synthesize a fallback NuvioMeta so details and playback can proceed.
-        if isLive || !resolvedId.hasPrefix("tt") {
-            let fallbackMeta = NuvioMeta(
-                id: id,
-                name: Self.fallbackTitle(forId: id),
-                description: nil,
-                posterUrl: nil,
-                backgroundUrl: nil,
-                logoUrl: nil,
-                imdbId: resolvedId.hasPrefix("tt") ? resolvedId : nil,
-                tmdbId: nil,
-                type: type,
-                year: nil,
-                genres: nil,
-                rating: nil,
-                releaseInfo: nil,
-                runtime: nil,
-                cast: nil,
-                director: nil,
-                writer: nil,
-                certification: nil,
-                country: nil,
-                released: nil,
-                status: nil,
-                videos: nil,
-                trailerYtIds: nil,
-                externalRatings: nil
-            )
-            cacheMetadata(fallbackMeta, requestedID: id, context: metadataContext)
-            return fallbackMeta
+        // but no dedicated /meta endpoint, or when Cinemeta is down/disabled, synthesize fallback
+        // NuvioMeta so details and playback can proceed instead of failing.
+        let fallbackMeta = NuvioMeta(
+            id: id,
+            name: Self.fallbackTitle(forId: id),
+            description: nil,
+            posterUrl: resolvedId.hasPrefix("tt") ? "https://images.metahub.space/poster/small/\(resolvedId)/img" : nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: resolvedId.hasPrefix("tt") ? resolvedId : nil,
+            tmdbId: id.hasPrefix("tmdb:") ? Int(id.dropFirst(5)) : nil,
+            type: type,
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+        let enrichedFallback = await TmdbDetailsService.localizedMetadata(for: fallbackMeta)
+        if enrichedFallback.name != Self.fallbackTitle(forId: id) || isLive || !resolvedId.hasPrefix("tt") {
+            cacheMetadata(enrichedFallback, requestedID: id, context: metadataContext)
+            return enrichedFallback
         }
 
         throw lastError ?? URLError(.badServerResponse)
@@ -1451,20 +1475,25 @@ final class CinemetaCatalogRepository: CatalogRepository {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A TMDB-backed collection is an explicit source choice, independent
         // of whether optional Details enrichment is enabled.
-        guard !apiKey.isEmpty else { return nil }
-        let fallbackMedia = primaryMedia == "tv" ? "movie" : "tv"
-        for media in [primaryMedia, fallbackMedia] {
-            var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
-            components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
-            guard let url = components.url,
-                  let (data, response) = try? await Self.networkSession.data(from: url),
-                  let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let imdb = json["imdb_id"] as? String,
-                  imdb.hasPrefix("tt") else {
-                continue
+        if !apiKey.isEmpty {
+            let fallbackMedia = primaryMedia == "tv" ? "movie" : "tv"
+            for media in [primaryMedia, fallbackMedia] {
+                var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
+                components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
+                guard let url = components.url,
+                      let (data, response) = try? await Self.networkSession.data(from: url),
+                      let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode),
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let imdb = json["imdb_id"] as? String,
+                      imdb.hasPrefix("tt") else {
+                    continue
+                }
+                cacheImdb(imdb, forTmdbId: tmdbId, type: primaryMedia)
+                return imdb
             }
+        }
+        if let imdb = await TraktDetailsService.resolveImdbID(tmdbId: tmdbId, isSeries: isSeriesType(type)) {
             cacheImdb(imdb, forTmdbId: tmdbId, type: primaryMedia)
             return imdb
         }
@@ -2718,6 +2747,28 @@ final class CinemetaCatalogRepository: CatalogRepository {
         isCinemetaEnabled(in: ProfileSettings.current)
     }
 
+    /// Cinemeta metadata (/meta) resolution is enabled by default for canonical IMDb titles,
+    /// even when custom stream add-on catalogs are installed without Cinemeta on the Home screen.
+    /// It is disabled only when explicitly disabled via SettingsKey.cinemetaDisabled or when
+    /// Cinemeta is present in preferences with enabled = false.
+    static func isCinemetaMetadataEnabled(in defaults: UserDefaults = ProfileSettings.current) -> Bool {
+        if defaults.bool(forKey: SettingsKey.cinemetaDisabled) {
+            return false
+        }
+        let manifestURL = "https://v3-cinemeta.strem.io/manifest.json"
+        let preferences = configuredStreamAddonPreferences(in: defaults)
+        if let preference = preferences.first(where: {
+            normalizedManifestURL(from: $0.url)?.absoluteString == manifestURL
+        }) {
+            return preference.enabled
+        }
+        return true
+    }
+
+    static var isCinemetaMetadataEnabled: Bool {
+        isCinemetaMetadataEnabled(in: ProfileSettings.current)
+    }
+
     static func setCinemetaDisabled(_ disabled: Bool, in defaults: UserDefaults = ProfileSettings.current) {
         defaults.set(disabled, forKey: SettingsKey.cinemetaDisabled)
     }
@@ -3537,6 +3588,9 @@ class MockCatalogRepository: CatalogRepository {
 
     func cacheCatalogMetadata(_ meta: NuvioMeta) {
         mockCachedMetadata[meta.id] = meta
+        if let imdbId = meta.imdbId, !imdbId.isEmpty {
+            mockCachedMetadata[imdbId] = meta
+        }
     }
 
     func cachedMetadata(for id: String) -> NuvioMeta? {

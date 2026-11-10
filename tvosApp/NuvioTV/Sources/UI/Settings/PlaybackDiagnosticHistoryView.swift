@@ -95,15 +95,15 @@ struct PlaybackDiagnosticHistoryView: View {
     var body: some View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 24) {
-                Text("Playback Diagnostic History").font(.largeTitle.bold())
-                Text("Recent playback actions saved on this Apple TV. A previous session without a recorded ending is not proof of a crash. Recent events may be missing after a sudden exit.")
+                Text(L10n.string("diagnostic_history_title", fallback: "Playback Diagnostic History")).font(.largeTitle.bold())
+                Text(L10n.string("diagnostic_history_subtitle", fallback: "Recent playback actions saved on this Apple TV. A previous session without a recorded ending is not proof of a crash. Recent events may be missing after a sudden exit."))
                     .font(.system(size: 23)).foregroundStyle(.secondary)
                 HStack(spacing: 24) {
-                    Button("Refresh") { model.refresh() }
-                    Button("Export History") { model.exportHistory() }
+                    Button(L10n.string("calendar_refresh", fallback: "Refresh")) { model.refresh() }
+                    Button(L10n.string("diagnostic_history_export", fallback: "Export History")) { model.exportHistory() }
                         .disabled(model.snapshot?.timeline.sessions.isEmpty != false)
-                    Button("Delete History", role: .destructive) { confirmDelete = true }
-                    Button("Done") { dismiss() }
+                    Button(L10n.string("diagnostic_history_delete", fallback: "Delete History"), role: .destructive) { confirmDelete = true }
+                    Button(L10n.string("tvos_common_done", fallback: "Done")) { dismiss() }
                 }
                 .buttonStyle(.bordered)
                 .tint(accentColor)
@@ -121,20 +121,20 @@ struct PlaybackDiagnosticHistoryView: View {
                         }
                         VStack(alignment: .leading, spacing: 16) {
                             Text(url.absoluteString).font(.system(size: 21, design: .monospaced))
-                            Text("The link downloads a JSON report. No automatic upload is performed. Close this screen or choose Stop Download to end access.")
+                            Text(L10n.string("diagnostic_history_download_notice", fallback: "The link downloads a JSON report. No automatic upload is performed. Close this screen or choose Stop Download to end access."))
                                 .font(.system(size: 22)).foregroundStyle(.secondary)
-                            Button("Stop Download") { model.stopExport() }
+                            Button(L10n.string("diagnostic_history_stop_download", fallback: "Stop Download")) { model.stopExport() }
                         }
                     }
                 }
 
                 if let snapshot = model.snapshot {
                     if snapshot.timeline.sessions.isEmpty {
-                        Text("No saved events. Enable Persistent Playback History in Advanced Settings, then use the player.")
+                        Text(L10n.string("diagnostic_history_empty", fallback: "No saved events. Enable Persistent Playback History in Advanced Settings, then use the player."))
                     }
                     ForEach(Array(snapshot.timeline.sessions.reversed())) { session in
                         VStack(alignment: .leading, spacing: 10) {
-                            Text(session.id == PlaybackTimelineRecorder.sessionID ? "This app session" : "Previous app session")
+                            Text(session.id == PlaybackTimelineRecorder.sessionID ? L10n.string("diagnostic_session_current", fallback: "This app session") : L10n.string("diagnostic_session_previous", fallback: "Previous app session"))
                                 .font(.title2.bold())
                             Text("Nuvio \(session.appVersion) (\(session.build)) · \(session.osVersion)")
                                 .font(.system(size: 20)).foregroundStyle(.secondary)
@@ -152,7 +152,7 @@ struct PlaybackDiagnosticHistoryView: View {
                         .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 16))
                     }
                     if snapshot.timeline.droppedPendingEvents > 0 {
-                        Text("Some events were dropped because the diagnostic queue was full.").foregroundStyle(.secondary)
+                        Text(L10n.string("diagnostic_history_dropped_events", fallback: "Some events were dropped because the diagnostic queue was full.")).foregroundStyle(.secondary)
                     }
                 }
             }

@@ -1023,6 +1023,64 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertTrue(CinemetaCatalogRepository.isCinemetaEnabled(in: testDefaults))
     }
 
+    func testCinemetaMetadataEnabledBehavior() {
+        let testDefaults = UserDefaults(suiteName: "CinemetaMetadataEnabledBehaviorTests")!
+        testDefaults.removePersistentDomain(forName: "CinemetaMetadataEnabledBehaviorTests")
+
+        // 1. Fresh install / no preferences configured: Cinemeta metadata defaults to true
+        XCTAssertTrue(CinemetaCatalogRepository.isCinemetaMetadataEnabled(in: testDefaults))
+
+        // 2. Explicitly disabled via SettingsKey.cinemetaDisabled
+        CinemetaCatalogRepository.setCinemetaDisabled(true, in: testDefaults)
+        XCTAssertFalse(CinemetaCatalogRepository.isCinemetaMetadataEnabled(in: testDefaults))
+        CinemetaCatalogRepository.setCinemetaDisabled(false, in: testDefaults)
+        XCTAssertTrue(CinemetaCatalogRepository.isCinemetaMetadataEnabled(in: testDefaults))
+
+        // 3. User has configured/synced addons (e.g., Torrentio), but Cinemeta is NOT in preferences:
+        let otherAddon = StreamAddonPreference(url: "https://torrentio.strem.fun/manifest.json", enabled: true)
+        let otherAddonData = try! JSONEncoder().encode([otherAddon])
+        testDefaults.set(String(data: otherAddonData, encoding: .utf8)!, forKey: SettingsKey.streamAddonManifestStates)
+        // Home catalogs Cinemeta is false, BUT metadata resolution remains TRUE
+        XCTAssertFalse(CinemetaCatalogRepository.isCinemetaEnabled(in: testDefaults))
+        XCTAssertTrue(CinemetaCatalogRepository.isCinemetaMetadataEnabled(in: testDefaults))
+
+        // 4. Cinemeta is explicitly in preferences with enabled = false
+        let cinemetaDisabledPref = StreamAddonPreference(url: "https://v3-cinemeta.strem.io/manifest.json", enabled: false)
+        let disabledData = try! JSONEncoder().encode([otherAddon, cinemetaDisabledPref])
+        testDefaults.set(String(data: disabledData, encoding: .utf8)!, forKey: SettingsKey.streamAddonManifestStates)
+        XCTAssertFalse(CinemetaCatalogRepository.isCinemetaMetadataEnabled(in: testDefaults))
+
+        // 5. Cinemeta is explicitly in preferences with enabled = true
+        let cinemetaEnabledPref = StreamAddonPreference(url: "https://v3-cinemeta.strem.io/manifest.json", enabled: true)
+        let enabledData = try! JSONEncoder().encode([otherAddon, cinemetaEnabledPref])
+        testDefaults.set(String(data: enabledData, encoding: .utf8)!, forKey: SettingsKey.streamAddonManifestStates)
+        XCTAssertTrue(CinemetaCatalogRepository.isCinemetaMetadataEnabled(in: testDefaults))
+    }
+
+    func testMoreLikeThisPreCachingAndMetadataLookup() {
+        let relatedMovie = RelatedTitle(
+            id: "tt0110912",
+            type: "movie",
+            name: "Pulp Fiction",
+            posterURL: "https://example.com/pulp.jpg",
+            year: "1994",
+            rating: 8.9,
+            overview: "A burger-loving hit man..."
+        )
+        let asMeta = relatedMovie.asMeta
+        XCTAssertEqual(asMeta.id, "tt0110912")
+        XCTAssertEqual(asMeta.name, "Pulp Fiction")
+        XCTAssertEqual(asMeta.imdbId, "tt0110912")
+
+        let repo = CinemetaCatalogRepository()
+        CinemetaCatalogRepository.cacheCatalogMetadata(asMeta)
+
+        let cached = repo.cachedMetadata(for: "tt0110912")
+        XCTAssertNotNil(cached)
+        XCTAssertEqual(cached?.name, "Pulp Fiction")
+        XCTAssertEqual(cached?.releaseInfo, "1994")
+    }
+
     func testTVHomeCatalogOrderSectionKeyMatching() {
         let cinemetaSection = TVHomeSection(
             id: "movie_top",

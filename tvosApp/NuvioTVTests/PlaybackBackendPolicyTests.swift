@@ -2603,6 +2603,11 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertNil(subview?.image)
         XCTAssertTrue(subview?.isHidden ?? false)
     }
+
+    @MainActor
+    func testASSRenderCoordinatorPresentationPipelineLeadIs150ms() {
+        XCTAssertEqual(ASSRenderCoordinator.presentationPipelineLeadSeconds, 0.150, accuracy: 0.001)
+    }
 }
 
 private final class GeminiURLProtocolStub: URLProtocol {

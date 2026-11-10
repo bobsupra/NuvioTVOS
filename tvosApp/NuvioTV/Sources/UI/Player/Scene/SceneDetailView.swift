@@ -311,7 +311,7 @@ struct SceneDetailView: View {
                         }) {
                             HStack(spacing: 8) {
                                 Image(systemName: "applelogo")
-                                Text("Open in Music")
+                                Text(L10n.string("scene_open_in_music", fallback: "Open in Music"))
                             }
                             .font(.system(size: 20, weight: .semibold))
                             .padding(.horizontal, 20)
@@ -323,7 +323,7 @@ struct SceneDetailView: View {
                     }
                     
                     Button(action: onDismiss) {
-                        Text("Done")
+                        Text(L10n.string("tvos_common_done", fallback: "Done"))
                             .font(.system(size: 20, weight: .semibold))
                             .frame(minWidth: 140)
                             .padding(.vertical, 12)

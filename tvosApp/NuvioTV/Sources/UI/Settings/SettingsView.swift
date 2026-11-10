@@ -4044,7 +4044,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.fullscreenHeroBackdrop) private var fullscreenHeroBackdrop = true
     @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
-    @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.focused.rawValue
+    @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.always.rawValue
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
     @AppStorage(SettingsKey.landscapePosters) private var landscapePosters = false
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
@@ -4205,7 +4205,7 @@ private struct LayoutDiscoverySettingsView: View {
                     selection: $continueWatchingLabels,
                     options: CardLabelVisibility.allCases.map(\.rawValue),
                     accentColor: accentColor,
-                    optionLabel: { CardLabelVisibility(rawValue: $0)?.label ?? $0 }
+                    optionLabel: { L10n.optionLabel(CardLabelVisibility(rawValue: $0)?.label ?? $0) }
                 )
 
                 SettingsToggleRow(
@@ -4792,6 +4792,14 @@ private struct TopShelfSettingsGroup: View {
                 )
             }
 
+            SettingsInfoRow(
+                title: L10n.string("tvos_settings_topshelf_source_settings", fallback: "Source Settings"),
+                value: L10n.string(
+                    "tvos_settings_topshelf_source_settings_hint",
+                    fallback: "Continue Watching Source and Library Source are selected in Integrations."
+                )
+            )
+
             SettingsToggleRow(
                 title: L10n.string("tvos_settings_topshelf_enabled", fallback: "Home Screen Cards"),
                 subtitle: L10n.string(
@@ -4815,20 +4823,6 @@ private struct TopShelfSettingsGroup: View {
                         set: { show in update { $0.showsEpisodeLabels = show } }
                     ),
                     accentColor: accentColor
-                )
-
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_topshelf_home_row", fallback: "Home Screen Row"),
-                    subtitle: L10n.string(
-                        "tvos_settings_topshelf_home_row_subtitle",
-                        fallback: "Mirror Continue Watching or a catalog row from Home"),
-                    selection: Binding(
-                        get: { configuration.homeScreenRowID ?? "custom" },
-                        set: { id in update { $0.homeScreenRowID = id == "custom" ? nil : id } }
-                    ),
-                    options: homeScreenRowOptions,
-                    accentColor: accentColor,
-                    optionLabel: homeScreenRowLabel
                 )
 
                 SettingsOptionRow(
@@ -4870,120 +4864,86 @@ private struct TopShelfSettingsGroup: View {
                     )
                 }
 
-                if configuration.homeScreenRowID == nil {
-                    chipSection(
-                        title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
-                        subtitle: L10n.string(
-                            "tvos_settings_topshelf_sources_subtitle",
-                            fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
-                        )
-                    ) {
+                chipSection(
+                    title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_sources_subtitle",
+                        fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
+                    )
+                ) {
+                    TopShelfChipButton(
+                        title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
+                        isSelected: configuration.includesContinueWatching
+                    ) { update { $0.includesContinueWatching.toggle() } }
+                    if !configuration.mergesUpNext {
                         TopShelfChipButton(
-                            title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
-                            isSelected: configuration.includesContinueWatching
-                        ) { update { $0.includesContinueWatching.toggle() } }
-                        if !configuration.mergesUpNext {
-                            TopShelfChipButton(
-                                title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
-                                isSelected: configuration.includesUpNext
-                            ) { update { $0.includesUpNext.toggle() } }
-                        }
-                        TopShelfChipButton(
-                            title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
-                            isSelected: configuration.includesToday
-                        ) { update { $0.includesToday.toggle() } }
-                        TopShelfChipButton(
-                            title: L10n.string("nav_library", fallback: "Library"),
-                            isSelected: configuration.includesLibrary
-                        ) { update { $0.includesLibrary.toggle() } }
+                            title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
+                            isSelected: configuration.includesUpNext
+                        ) { update { $0.includesUpNext.toggle() } }
                     }
+                    TopShelfChipButton(
+                        title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
+                        isSelected: configuration.includesToday
+                    ) { update { $0.includesToday.toggle() } }
+                    TopShelfChipButton(
+                        title: L10n.string("nav_library", fallback: "Library"),
+                        isSelected: configuration.includesLibrary
+                    ) { update { $0.includesLibrary.toggle() } }
+                }
 
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_topshelf_merge_up_next", fallback: "Up Next in Continue Watching"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_merge_up_next_subtitle",
+                        fallback: "One row, in the order Home shows them"
+                    ),
+                    isOn: Binding(
+                        get: { configuration.mergesUpNext },
+                        set: { isOn in update { $0.mergesUpNext = isOn } }
+                    ),
+                    accentColor: accentColor
+                )
+
+                if configuration.includesUpNext {
                     SettingsToggleRow(
                         title: L10n.string(
-                            "tvos_settings_topshelf_merge_up_next", fallback: "Up Next in Continue Watching"),
+                            "tvos_settings_topshelf_shuffle_up_next", fallback: "Shuffle Up Next"),
                         subtitle: L10n.string(
-                            "tvos_settings_topshelf_merge_up_next_subtitle",
-                            fallback: "One row, in the order Home shows them"
+                            "tvos_settings_topshelf_shuffle_up_next_subtitle",
+                            fallback: "Randomize the order of Up Next titles to surface different content"
                         ),
                         isOn: Binding(
-                            get: { configuration.mergesUpNext },
-                            set: { isOn in update { $0.mergesUpNext = isOn } }
+                            get: { configuration.shufflesUpNext },
+                            set: { isOn in
+                                update { $0.shufflesUpNext = isOn }
+                                ContinueWatchingStore.writeTopShelfFeed()
+                            }
                         ),
                         accentColor: accentColor
                     )
+                }
 
-                    if configuration.includesUpNext {
-                        SettingsToggleRow(
-                            title: L10n.string(
-                                "tvos_settings_topshelf_shuffle_up_next", fallback: "Shuffle Up Next"),
-                            subtitle: L10n.string(
-                                "tvos_settings_topshelf_shuffle_up_next_subtitle",
-                                fallback: "Randomize the order of Up Next titles to surface different content"
-                            ),
-                            isOn: Binding(
-                                get: { configuration.shufflesUpNext },
-                                set: { isOn in
-                                    update { $0.shufflesUpNext = isOn }
-                                    ContinueWatchingStore.writeTopShelfFeed()
-                                }
-                            ),
-                            accentColor: accentColor
+                if catalogs.isEmpty {
+                    SettingsInfoRow(
+                        title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                        value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
+                    )
+                } else {
+                    chipSection(
+                        title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                        subtitle: L10n.string(
+                            "tvos_settings_topshelf_catalogs_subtitle",
+                            fallback: "Shown in Home order. Until you choose, the first Home catalog."
                         )
-                    }
-
-                    if configuration.includesLibrary {
-                        SettingsOptionRow(
-                            title: L10n.string(
-                                "tvos_settings_topshelf_library_source", fallback: "Library Source"),
-                            subtitle: L10n.string(
-                                "tvos_settings_topshelf_library_source_subtitle",
-                                fallback:
-                                    "Choose whether Top Shelf pulls from your active library provider or a specific library"
-                            ),
-                            selection: Binding(
-                                get: { configuration.librarySource.rawValue },
-                                set: { raw in
-                                    guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else {
-                                        return
-                                    }
-                                    update { $0.librarySource = source }
-                                    TopShelfLibraryFeed.write()
-                                    TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded()
-                                }
-                            ),
-                            options: availableLibrarySources.map { $0.rawValue },
-                            accentColor: accentColor,
-                            optionLabel: { raw in
-                                guard let source = TopShelfConfiguration.LibrarySource(rawValue: raw) else {
-                                    return raw
-                                }
-                                return librarySourceLabel(source)
-                            }
-                        )
-                    }
-
-                    if catalogs.isEmpty {
-                        SettingsInfoRow(
-                            title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
-                            value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
-                        )
-                    } else {
-                        chipSection(
-                            title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
-                            subtitle: L10n.string(
-                                "tvos_settings_topshelf_catalogs_subtitle",
-                                fallback: "Shown in Home order. Until you choose, the first Home catalog."
-                            )
-                        ) {
-                            ForEach(catalogs, id: \.id) { catalog in
-                                TopShelfChipButton(
-                                    title: catalog.title ?? catalog.id,
-                                    isSelected: isCatalogSelected(catalog.id)
-                                ) { toggleCatalog(catalog.id) }
-                            }
+                    ) {
+                        ForEach(catalogs, id: \.id) { catalog in
+                            TopShelfChipButton(
+                                title: catalog.title ?? catalog.id,
+                                isSelected: isCatalogSelected(catalog.id)
+                            ) { toggleCatalog(catalog.id) }
                         }
                     }
-
                 }
             }
 
@@ -4994,30 +4954,6 @@ private struct TopShelfSettingsGroup: View {
             )
         }
         .onAppear(perform: loadCatalogs)
-    }
-
-    private var homeScreenRowOptions: [String] {
-        var options = ["continueWatching", "upNext", "today", "library"]
-        options += catalogs.map { "catalog:\($0.id)" }
-        if let selected = configuration.homeScreenRowID, !options.contains(selected) {
-            options.append(selected)
-        }
-        return options + ["custom"]
-    }
-
-    private func homeScreenRowLabel(_ id: String) -> String {
-        switch id {
-        case "continueWatching":
-            return L10n.string("home_continue_watching", fallback: "Continue Watching")
-        case "upNext": return L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized
-        case "today": return L10n.string("tvos_settings_topshelf_today", fallback: "Today")
-        case "library": return L10n.string("nav_library", fallback: "Library")
-        case "custom":
-            return L10n.string("tvos_settings_topshelf_custom", fallback: "Custom Source Mix")
-        default:
-            return catalogs.first { "catalog:\($0.id)" == id }?.title
-                ?? L10n.string("tvos_settings_topshelf_missing_row", fallback: "Selected Row (Unavailable)")
-        }
     }
 
     private var backgroundStatusText: String {
@@ -5065,44 +5001,6 @@ private struct TopShelfSettingsGroup: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.top, 8)
         .animation(.easeInOut(duration: 0.2), value: configuration)
-    }
-
-    private var availableLibrarySources: [TopShelfConfiguration.LibrarySource] {
-        var sources: [TopShelfConfiguration.LibrarySource] = [.active, .local]
-        let store = ProfileSettings.current
-        let profileId = ProfileSettings.activeProfileID
-        if TopShelfLibraryFeed.isSourceAvailable(.simkl, profileId: profileId, store: store) {
-            sources.append(.simkl)
-        }
-        if TopShelfLibraryFeed.isSourceAvailable(.trakt, profileId: profileId, store: store) {
-            sources.append(.trakt)
-        }
-        if TopShelfLibraryFeed.isSourceAvailable(.mdblist, profileId: profileId, store: store) {
-            sources.append(.mdblist)
-        }
-        if TopShelfLibraryFeed.isSourceAvailable(.wetrakr, profileId: profileId, store: store) {
-            sources.append(.wetrakr)
-        }
-        return sources
-    }
-
-    private func librarySourceLabel(_ source: TopShelfConfiguration.LibrarySource) -> String {
-        switch source {
-        case .active:
-            let effective = TopShelfLibraryFeed.effectiveSourceMode(for: .active)
-            return
-                "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
-        case .local:
-            return L10n.string("library_source_saved", fallback: "Nuvio Library")
-        case .simkl:
-            return "Simkl"
-        case .trakt:
-            return "Trakt"
-        case .mdblist:
-            return "MDBList"
-        case .wetrakr:
-            return "WeTrakr"
-        }
     }
 
     private func isCatalogSelected(_ id: String) -> Bool {
@@ -5402,6 +5300,7 @@ private struct IntegrationSettingsView: View {
     @State private var showingAddonsSettings = false
     @State private var addonSummaryCount = 0
     @State private var addonSummarySyncedAddons: [SyncedAddon]? = nil
+    @State private var topShelfLibrarySource = TopShelfConfigurationStore.load().librarySource.rawValue
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
@@ -5411,8 +5310,8 @@ private struct IntegrationSettingsView: View {
         let storedTraktRedirectURI = TraktConfig.redirectURI(in: profileStore)
         let trimmedProfileID = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let profileScope = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
-        let storedTraktClientID = profileStore.string(forKey: SettingsKey.traktClientID) ?? ""
-        let storedTraktClientSecret = profileStore.string(forKey: SettingsKey.traktClientSecret) ?? ""
+        let storedTraktClientID = TraktConfig.clientID(in: profileStore)
+        let storedTraktClientSecret = TraktConfig.clientSecret(in: profileStore)
         let storedSimklClientID = profileStore.string(forKey: SettingsKey.simklClientID) ?? ""
         let storedWeTrakrClientID = profileStore.string(forKey: SettingsKey.wetrakrClientID) ?? ""
         let storedWeTrakrClientSecret = profileStore.string(forKey: SettingsKey.wetrakrClientSecret) ?? ""
@@ -5429,12 +5328,12 @@ private struct IntegrationSettingsView: View {
             wrappedValue: WeTrakrSettingsViewModel(store: profileStore, profileScope: profileScope)
         )
         _traktClientID = AppStorage(
-            wrappedValue: "",
+            wrappedValue: storedTraktClientID,
             SettingsKey.traktClientID,
             store: profileStore
         )
         _traktClientSecret = AppStorage(
-            wrappedValue: "",
+            wrappedValue: storedTraktClientSecret,
             SettingsKey.traktClientSecret,
             store: profileStore
         )
@@ -5578,6 +5477,19 @@ private struct IntegrationSettingsView: View {
                         accentColor: accentColor
                     )
                 }
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_topshelf_library_source", fallback: "Library Source"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_library_source_subtitle",
+                        fallback:
+                            "Choose whether Top Shelf pulls from your active library provider or a specific library"
+                    ),
+                    selection: topShelfLibrarySourceSelection,
+                    options: availableTopShelfLibrarySources.map(\.rawValue),
+                    accentColor: accentColor,
+                    optionLabel: topShelfLibrarySourceLabel
+                )
             }
 
             SettingsGroup(
@@ -5661,7 +5573,9 @@ private struct IntegrationSettingsView: View {
                     text: $traktClientIDDraft,
                     onCommit: {
                         commitTraktRedirectURI()
-                        traktClientID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmed = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        traktClientID = trimmed
+                        TraktConfig.setClientID(trimmed, in: profileStore)
                         traktViewModel.credentialsDidChange()
                     }
                 )
@@ -5676,7 +5590,9 @@ private struct IntegrationSettingsView: View {
                     text: $traktClientSecretDraft,
                     isSecure: true,
                     onCommit: {
-                        traktClientSecret = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        let trimmed = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        traktClientSecret = trimmed
+                        TraktConfig.setClientSecret(trimmed, in: profileStore)
                         traktViewModel.credentialsDidChange()
                     }
                 )
@@ -6022,6 +5938,7 @@ private struct IntegrationSettingsView: View {
             if traktClientID != trimmed {
                 commitTraktRedirectURI()
                 traktClientID = trimmed
+                TraktConfig.setClientID(trimmed, in: profileStore)
                 traktViewModel.credentialsDidChange()
             }
         }
@@ -6029,6 +5946,7 @@ private struct IntegrationSettingsView: View {
             let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if traktClientSecret != trimmed {
                 traktClientSecret = trimmed
+                TraktConfig.setClientSecret(trimmed, in: profileStore)
                 traktViewModel.credentialsDidChange()
             }
         }
@@ -6164,10 +6082,76 @@ private struct IntegrationSettingsView: View {
         )
     }
 
+    private var topShelfLibrarySourceSelection: Binding<String> {
+        Binding(
+            get: { topShelfLibrarySource },
+            set: setTopShelfLibrarySource
+        )
+    }
+
+    private var availableTopShelfLibrarySources: [TopShelfConfiguration.LibrarySource] {
+        var sources: [TopShelfConfiguration.LibrarySource] = [.active, .local]
+        let store = ProfileSettings.current
+        let profileId = ProfileSettings.activeProfileID
+        if TopShelfLibraryFeed.isSourceAvailable(.simkl, profileId: profileId, store: store) {
+            sources.append(.simkl)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.trakt, profileId: profileId, store: store) {
+            sources.append(.trakt)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.mdblist, profileId: profileId, store: store) {
+            sources.append(.mdblist)
+        }
+        if TopShelfLibraryFeed.isSourceAvailable(.wetrakr, profileId: profileId, store: store) {
+            sources.append(.wetrakr)
+        }
+        return sources
+    }
+
+    private func topShelfLibrarySourceLabel(_ rawValue: String) -> String {
+        guard let source = TopShelfConfiguration.LibrarySource(rawValue: rawValue) else {
+            return rawValue
+        }
+        switch source {
+        case .active:
+            let effective = TopShelfLibraryFeed.effectiveSourceMode(for: .active)
+            return
+                "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
+        case .local:
+            return L10n.string("library_source_saved", fallback: "Nuvio Library")
+        case .simkl:
+            return "Simkl"
+        case .trakt:
+            return "Trakt"
+        case .mdblist:
+            return "MDBList"
+        case .wetrakr:
+            return "WeTrakr"
+        }
+    }
+
+    private func setTopShelfLibrarySource(_ rawValue: String) {
+        guard let source = TopShelfConfiguration.LibrarySource(rawValue: rawValue) else { return }
+        var configuration = TopShelfConfigurationStore.load()
+        guard configuration.librarySource != source else {
+            topShelfLibrarySource = source.rawValue
+            return
+        }
+        configuration.librarySource = source
+        topShelfLibrarySource = source.rawValue
+        TopShelfConfigurationStore.save(configuration)
+        TopShelfLibraryFeed.write()
+        TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded(force: true)
+    }
+
     private func connectTrakt() {
         commitTraktRedirectURI()
-        traktClientID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
-        traktClientSecret = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedSecret = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        traktClientID = trimmedID
+        traktClientSecret = trimmedSecret
+        TraktConfig.setClientID(trimmedID, in: profileStore)
+        TraktConfig.setClientSecret(trimmedSecret, in: profileStore)
         traktViewModel.credentialsDidChange()
         guard traktViewModel.credentialsConfigured else { return }
         showingTraktLogin = true
@@ -6241,7 +6225,7 @@ private struct TmdbOptionsSheet: View {
                             .font(.system(size: 36, weight: .bold))
                             .foregroundColor(.white)
 
-                        Text("Set up TMDB, then choose the metadata features to use.")
+                        Text(L10n.string("settings_tmdb_setup_hint", fallback: "Set up TMDB, then choose the metadata features to use."))
                             .font(.system(size: 20, weight: .medium))
                             .foregroundColor(.white.opacity(0.62))
                     }
@@ -8582,9 +8566,9 @@ private struct MdbListDeviceLoginSheet: View {
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.66))
                     .multilineTextAlignment(.center)
-                dialogButton(title: "Done", isPrimary: true) { dismiss() }
+                dialogButton(title: L10n.string("tvos_common_done", fallback: "Done"), isPrimary: true) { dismiss() }
             } else if let code = viewModel.deviceUserCode, !code.isEmpty {
-                Text("Scan the QR on your phone, or open the MDBList sign-in page and enter the code.")
+                Text(L10n.string("settings_mdblist_qr_hint", fallback: "Scan the QR on your phone, or open the MDBList sign-in page and enter the code."))
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.68))
                     .multilineTextAlignment(.center)
@@ -9040,55 +9024,55 @@ private struct SimklConnectedSettingsSheet: View {
             Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         }
         .confirmationDialog(
-            "Transfer Watch History to Simkl",
+            L10n.string("simkl_transfer_history_title", fallback: "Transfer Watch History to Simkl"),
             isPresented: $showingHistoryTransferSources,
             titleVisibility: .visible
         ) {
-            Button("From Nuvio Sync") {
+            Button(L10n.string("simkl_transfer_from_nuvio_sync", fallback: "From Nuvio Sync")) {
                 viewModel.transferWatchHistory(from: .nuvioSync)
             }
             if viewModel.isTraktTransferAvailable {
-                Button("From Trakt") {
+                Button(L10n.string("simkl_transfer_from_trakt", fallback: "From Trakt")) {
                     viewModel.transferWatchHistory(from: .trakt)
                 }
             }
             Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         } message: {
-            Text("This only adds watched history to Simkl. Existing Simkl history is not removed.")
+            Text(L10n.string("simkl_transfer_history_msg", fallback: "This only adds watched history to Simkl. Existing Simkl history is not removed."))
         }
         .confirmationDialog(
-            "Transfer Library to Simkl",
+            L10n.string("simkl_transfer_library_title", fallback: "Transfer Library to Simkl"),
             isPresented: $showingLibraryTransferSources,
             titleVisibility: .visible
         ) {
-            Button("From Nuvio Library") {
+            Button(L10n.string("simkl_transfer_from_nuvio_library", fallback: "From Nuvio Library")) {
                 viewModel.transferLibrary(from: .nuvioLibrary)
             }
             if viewModel.isTraktTransferAvailable {
-                Button("From Trakt") {
+                Button(L10n.string("simkl_transfer_from_trakt", fallback: "From Trakt")) {
                     viewModel.transferLibrary(from: .trakt)
                 }
             }
             Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         } message: {
-            Text("This adds library items to Simkl Plan to Watch. Existing Simkl lists and history are not removed.")
+            Text(L10n.string("simkl_transfer_library_msg", fallback: "This adds library items to Simkl Plan to Watch. Existing Simkl lists and history are not removed."))
         }
         .confirmationDialog(
-            "Transfer Continue Watching to Simkl",
+            L10n.string("simkl_transfer_cw_title", fallback: "Transfer Continue Watching to Simkl"),
             isPresented: $showingProgressTransferSources,
             titleVisibility: .visible
         ) {
-            Button("From Nuvio Sync") {
+            Button(L10n.string("simkl_transfer_from_nuvio_sync", fallback: "From Nuvio Sync")) {
                 viewModel.transferProgress(from: .nuvioSync)
             }
             if viewModel.isTraktTransferAvailable {
-                Button("From Trakt") {
+                Button(L10n.string("simkl_transfer_from_trakt", fallback: "From Trakt")) {
                     viewModel.transferProgress(from: .trakt)
                 }
             }
             Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         } message: {
-            Text("This saves unfinished playback positions in Simkl. Completed history and existing Simkl lists are unchanged.")
+            Text(L10n.string("simkl_transfer_cw_msg", fallback: "This saves unfinished playback positions in Simkl. Completed history and existing Simkl lists are unchanged."))
         }
     }
 
@@ -9367,7 +9351,7 @@ private struct SimklLoadingDebugReport: View {
             .padding(14)
             .background(Color.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 12))
 
-            Text("Read or screenshot this report and send it to the developer.")
+            Text(L10n.string("diagnostic_report_hint", fallback: "Read or screenshot this report and send it to the developer."))
                 .font(.system(size: 16, weight: .medium))
                 .foregroundColor(.white.opacity(0.58))
         }
@@ -9507,9 +9491,9 @@ private struct WeTrakrDeviceLoginSheet: View {
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.66))
                     .multilineTextAlignment(.center)
-                dialogButton(title: "Done", isPrimary: true) { dismiss() }
+                dialogButton(title: L10n.string("tvos_common_done", fallback: "Done"), isPrimary: true) { dismiss() }
             } else if let code = viewModel.deviceUserCode, !code.isEmpty {
-                Text("Scan the QR code on your phone, or open the link below and enter the activation code.")
+                Text(L10n.string("settings_qr_activation_hint", fallback: "Scan the QR code on your phone, or open the link below and enter the activation code."))
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.68))
                     .multilineTextAlignment(.center)
@@ -15656,10 +15640,10 @@ private struct CollectionTemplatesFlowSheet: View {
 
                     VStack(alignment: .leading, spacing: 20) {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Collection Templates")
+                            Text(L10n.string("collection_templates_title", fallback: "Collection Templates"))
                                 .font(.system(size: 38, weight: .bold))
                                 .foregroundColor(.white)
-                            Text("Choose a ready-made collection, customize it if you want, then add it to Home.")
+                            Text(L10n.string("collection_templates_subtitle", fallback: "Choose a ready-made collection, customize it if you want, then add it to Home."))
                                 .font(.system(size: 21, weight: .medium))
                                 .foregroundColor(.white.opacity(0.6))
                         }
@@ -15669,8 +15653,8 @@ private struct CollectionTemplatesFlowSheet: View {
                         }
 
                         CollectionTemplateSummaryCard(
-                            title: "Studios & Franchises",
-                            subtitle: "Production houses and cinematic universes",
+                            title: L10n.string("collection_template_studios_title", fallback: "Studios & Franchises"),
+                            subtitle: L10n.string("collection_template_studios_subtitle", fallback: "Production houses and cinematic universes"),
                             systemImage: "building.2.fill",
                             previews: ["A24", "HBO", "Pixar", "Warner", "Universal", "Marvel", "DC"]
                         ) {
@@ -15678,8 +15662,8 @@ private struct CollectionTemplatesFlowSheet: View {
                         }
 
                         CollectionTemplateSummaryCard(
-                            title: "Discover by Genre",
-                            subtitle: "Browse popular movies and series by genre",
+                            title: L10n.string("collection_template_genres_title", fallback: "Discover by Genre"),
+                            subtitle: L10n.string("collection_template_genres_subtitle", fallback: "Browse popular movies and series by genre"),
                             systemImage: "square.grid.2x2.fill",
                             previews: ["Action", "Comedy", "Drama", "Horror", "Sci-Fi", "Animation", "Crime", "More"]
                         ) {
@@ -15687,8 +15671,8 @@ private struct CollectionTemplatesFlowSheet: View {
                         }
 
                         CollectionTemplateSummaryCard(
-                            title: "Asian Film & Series",
-                            subtitle: "Korean, Chinese & Japanese dramas, Asian cinema, KissKH & MKV",
+                            title: L10n.string("collection_template_asian_title", fallback: "Asian Film & Series"),
+                            subtitle: L10n.string("collection_template_asian_subtitle", fallback: "Korean, Chinese & Japanese dramas, Asian cinema, KissKH & MKV"),
                             systemImage: "globe.asia.australia.fill",
                             previews: ["KissKH", "MKV Asian", "Asian OTT", "K-Drama", "C-Drama", "Anime & J-Drama", "Asian Cinema"]
                         ) {
@@ -15745,7 +15729,7 @@ private struct StreamingServicesTemplateCard: View {
                         .foregroundColor(isFocused ? .black : .white)
 
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("Streaming Services")
+                        Text(L10n.string("collection_streaming_services", fallback: "Streaming Services"))
                             .font(.system(size: 30, weight: .bold))
                             .foregroundColor(isFocused ? .black : .white)
                         Text("Netflix, Prime Video, Disney+, Max, Apple TV+, Hulu, Paramount+, Peacock and Crunchyroll")

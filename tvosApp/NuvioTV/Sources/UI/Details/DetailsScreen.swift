@@ -3534,7 +3534,8 @@ enum SmartPlaybackSelector {
         includeDebrid: Bool = false,
         cachedOnly: Bool = false,
         preserveAddonStreams: Bool = false,
-        includeUnavailable: Bool = false
+        includeUnavailable: Bool = false,
+        includeUnknownCacheStatus: Bool = false
     ) -> [NuvioStream] {
         let playable = streams.filter { stream in
             if stream.unavailabilityReason != nil { return includeUnavailable }
@@ -3555,7 +3556,12 @@ enum SmartPlaybackSelector {
             $0.unavailabilityReason != nil || selectedAvailableIDs.contains($0.id)
         }
         if cachedOnly {
-            result = result.filter { $0.unavailabilityReason != nil || $0.isNotPlayable || $0.isLikelyCached }
+            result = result.filter {
+                $0.unavailabilityReason != nil
+                    || $0.isNotPlayable
+                    || $0.isLikelyCached
+                    || (includeUnknownCacheStatus && $0.debridCacheStatusUnavailable == true)
+            }
         }
         if preserveAddonStreams {
             return result
@@ -3813,7 +3819,8 @@ enum StreamPickerListBuilder {
         selectedAddonId: String?,
         includeDebrid: Bool,
         cachedOnly: Bool = false,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        includeUnknownCacheStatus: Bool = false
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
         return SmartPlaybackSelector.playableStreams(
@@ -3821,7 +3828,8 @@ enum StreamPickerListBuilder {
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonStreams,
-            includeUnavailable: true
+            includeUnavailable: true,
+            includeUnknownCacheStatus: includeUnknownCacheStatus
         )
     }
 
@@ -3833,7 +3841,8 @@ enum StreamPickerListBuilder {
         sortOption: StreamSortOption,
         includeDebrid: Bool,
         cachedOnly: Bool = false,
-        preserveAddonStreams: Bool = false
+        preserveAddonStreams: Bool = false,
+        includeUnknownCacheStatus: Bool = false
     ) -> [NuvioStream] {
         let playable = playableStreams(
             streams: streams,
@@ -3841,7 +3850,8 @@ enum StreamPickerListBuilder {
             selectedAddonId: selectedAddonId,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
-            preserveAddonStreams: preserveAddonStreams
+            preserveAddonStreams: preserveAddonStreams,
+            includeUnknownCacheStatus: includeUnknownCacheStatus
         )
         return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
     }
@@ -4517,6 +4527,7 @@ struct TvDetailsContent: View {
                     entryLocked: focusedDetailsSection != .related,
                     onSelect: { item in
                         stopBackgroundTrailer(manual: false)
+                        CinemetaCatalogRepository.cacheCatalogMetadata(item.asMeta)
                         onOpenTitle?(item.id, item.type)
                     },
                     onBack: handleDetailsBack,
@@ -9252,7 +9263,8 @@ private struct TvStreamPickerOverlay: View {
             sortOption: sortOption,
             includeDebrid: includeDebrid,
             cachedOnly: effectiveCachedOnly,
-            preserveAddonStreams: preserveAddonOrder
+            preserveAddonStreams: preserveAddonOrder,
+            includeUnknownCacheStatus: true
         )
         displayedStreams = refreshedStreams
         displayedStreamsCacheKey = key
@@ -10298,6 +10310,17 @@ private struct TvStreamCard: View {
                             .lineSpacing(style.detailLineSpacing)
                             .lineLimit(descriptionLines)
                             .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    if stream.debridCacheStatusUnavailable == true {
+                        Text(L10n.string(
+                            "debrid_cache_status_unavailable",
+                            fallback: "Cache status unavailable"
+                        ))
+                        .font(.system(size: style.detailFont(22), weight: .medium))
+                        .foregroundColor(.white.opacity(0.52))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
                     }
 
                     if showImportedBadges && badgePlacement == .bottom {

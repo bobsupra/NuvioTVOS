@@ -232,6 +232,11 @@ final class ASSRenderCoordinator {
         requestRender(at: targetTime - subtitleDelaySeconds)
     }
 
+    /// Pipeline compensation lead (seconds). Compensates for AVPlayerLayer video presentation lead
+    /// over audio currentTime (~100ms) plus asynchronous SwiftAssRenderer workQueue rasterization,
+    /// image blending, main-thread hop, and CoreAnimation commit (~50ms).
+    static let presentationPipelineLeadSeconds: TimeInterval = 0.150
+
     /// Evaluates the true presentation time of the playing media.
     /// When AVPlayer is playing, reads its exact hardware timebase directly,
     /// eliminating the 50-150ms quantization and queue delay of periodic observer hops.
@@ -242,13 +247,16 @@ final class ASSRenderCoordinator {
                 // The playlist shift is piecewise constant across producer seams. Use the
                 // shift attached to this item-time position so buffered frames on either side
                 // of a seam stay aligned with source-PTS subtitle cues.
-                if let target = targetTimestamp, player.state == .playing {
-                    // Compensate for display scanout lead (link.targetTimestamp is when
-                    // the prepared frame will physically be scanned out by the display).
+                if player.state == .playing {
+                    // Compensate for:
+                    // 1. Display scanout lead (targetTimestamp is when the prepared frame will physically be scanned out).
+                    // 2. Async render pipeline latency (libass workQueue -> blending -> main hop -> CA commit: ~50ms).
+                    // 3. AVPlayerLayer video presentation lead over audio currentTime (~100ms).
                     let rate = Double(avPlayer.rate)
                     let playbackRate = rate.isFinite ? max(0, rate) : 0
-                    let lead = max(0, min(0.08, target - CACurrentMediaTime())) * playbackRate
-                    let ledItemTime = t.seconds + lead
+                    let vsyncLead = targetTimestamp.map { max(0, min(0.08, $0 - CACurrentMediaTime())) } ?? 0
+                    let totalLead = (vsyncLead + Self.presentationPipelineLeadSeconds) * playbackRate
+                    let ledItemTime = t.seconds + totalLead
                     return player.presentationAxisMap.sourceSeconds(forItemSeconds: ledItemTime)
                         ?? (ledItemTime + player.playlistShiftSeconds)
                 }
@@ -258,9 +266,9 @@ final class ASSRenderCoordinator {
         }
         let elapsed = CACurrentMediaTime() - lastSourceTimeWallClock
         var base = lastSourceTime + (elapsed >= 0 && elapsed < 0.5 ? elapsed : 0)
-        if let target = targetTimestamp, player.state == .playing {
-            let lead = max(0, min(0.08, target - CACurrentMediaTime()))
-            base += lead
+        if player.state == .playing {
+            let vsyncLead = targetTimestamp.map { max(0, min(0.08, $0 - CACurrentMediaTime())) } ?? 0
+            base += vsyncLead + Self.presentationPipelineLeadSeconds
         }
         return base
     }

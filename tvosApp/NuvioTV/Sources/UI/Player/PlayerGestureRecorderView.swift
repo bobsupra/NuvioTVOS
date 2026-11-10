@@ -40,7 +40,7 @@ struct PlayerGestureRecorderView: View {
 
             VStack(spacing: 34) {
                 VStack(spacing: 8) {
-                    Text("Do the gesture for")
+                    Text(L10n.string("player_do_gesture_for", fallback: "Do the gesture for"))
                         .font(.system(size: 26, weight: .semibold))
                         .foregroundColor(.white.opacity(0.55))
                     Text(action.title)
@@ -179,7 +179,7 @@ struct PlayerGestureRecorderView: View {
 
     private var hints: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("You can use")
+            Text(L10n.string("player_gesture_you_can_use", fallback: "You can use"))
                 .font(.system(size: 20, weight: .bold))
                 .foregroundColor(.white.opacity(0.45))
             HStack(alignment: .top, spacing: 26) {

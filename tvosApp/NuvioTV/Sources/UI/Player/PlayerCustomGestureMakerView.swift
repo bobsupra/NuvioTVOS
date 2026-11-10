@@ -39,10 +39,10 @@ struct PlayerCustomGestureMakerView: View {
 
             VStack(spacing: 34) {
                 VStack(spacing: 8) {
-                    Text("New custom gesture")
+                    Text(L10n.string("player_new_custom_gesture", fallback: "New custom gesture"))
                         .font(.system(size: 44, weight: .bold))
                         .foregroundColor(.white)
-                    Text("Draw a shape on the touchpad three times, the same way each time · Back cancels")
+                    Text(L10n.string("player_draw_custom_gesture_hint", fallback: "Draw a shape on the touchpad three times, the same way each time · Back cancels"))
                         .font(.system(size: 24, weight: .medium))
                         .foregroundColor(.white.opacity(0.55))
                 }
