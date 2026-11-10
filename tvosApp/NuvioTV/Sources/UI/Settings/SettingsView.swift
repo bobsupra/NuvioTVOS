@@ -418,7 +418,8 @@ enum SettingsKey {
     /// and never enter the account settings payload.
     static let deviceLocal = Set([
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
-        p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage
+        p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage,
+        aniListClientID, malClientID
     ])
 
     static let all = [

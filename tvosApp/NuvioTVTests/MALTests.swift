@@ -3,6 +3,16 @@ import XCTest
 
 /// MyAnimeList: catalogs from Tenrai, the phone login, writing watched episodes.
 final class MALTests: XCTestCase {
+    func testClientIDsStayOnTheAppleTVAndTheRestSyncs() {
+        // As Trakt's and Simkl's: never in the account settings payload.
+        XCTAssertTrue(SettingsKey.deviceLocal.contains(SettingsKey.aniListClientID))
+        XCTAssertTrue(SettingsKey.deviceLocal.contains(SettingsKey.malClientID))
+        for key in [SettingsKey.aniListEnabled, SettingsKey.aniListCatalogs, SettingsKey.malEnabled, SettingsKey.malCatalogs] {
+            XCTAssertTrue(SettingsKey.all.contains(key), key)
+            XCTAssertFalse(SettingsKey.deviceLocal.contains(key), key)
+        }
+    }
+
     func testCatalogIdsBecomeTenraiAddresses() async {
         let top = await MALCatalogs.url(for: "mal-top-airing", page: 1, limit: 25)?.absoluteString
         XCTAssertTrue(top?.hasPrefix("https://api.tenrai.org/v1/top/anime?filter=airing&page=1&limit=25") == true, top ?? "nil")
