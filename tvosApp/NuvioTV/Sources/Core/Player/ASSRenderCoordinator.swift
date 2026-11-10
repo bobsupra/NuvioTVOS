@@ -129,7 +129,7 @@ final class ASSRenderCoordinator {
                 if abs(sourceTime - self.lastSourceTime) > 1.0 {
                     // Seek or discontinuity: clear throttling so upcoming cues load immediately
                     self.lastReloadAt = .distantPast
-                    self.pendingRender = nil
+                    self.dropStalePendingRender(at: sourceTime - self.subtitleDelaySeconds)
                 }
                 self.lastSourceTime = sourceTime
                 self.lastSourceTimeWallClock = CACurrentMediaTime()
@@ -421,7 +421,37 @@ final class ASSRenderCoordinator {
         return !renderer.dialogues(at: time).isEmpty
     }
 
+    /// A frame queued for the time before a seek is stale and goes. A pass that a reload in
+    /// flight still needs does not: dropping it left the reload unfinished for good
+    /// (`reloadInFlightRevision` set, no pass coming), every frame was then held for it, no
+    /// track was ever loaded, and the subtitles stayed blank until the track was selected
+    /// again. Starting playback at a resume point jumps the clock this way, sometimes just
+    /// while the overlay's first canvas-size reload waits for its pass.
+    private func dropStalePendingRender(at offset: TimeInterval) {
+        guard let pending = pendingRender else { return }
+        if pending.isRequiredReloadRender {
+            pendingRender = (offset, pending.reloadRevision, true)
+        } else {
+            pendingRender = nil
+        }
+    }
+
+    /// Safety net for the same stall from any other path: a reload in flight that still
+    /// needs passes, with nothing rendering and nothing queued, gets its next pass.
+    private func resumeStalledReloadIfNeeded() {
+        guard let revision = reloadInFlightRevision,
+              requiredReloadPasses > 0,
+              !isRendering,
+              pendingRender == nil else { return }
+        requestRender(
+            at: currentPlaybackTime() - subtitleDelaySeconds,
+            reloadRevision: revision,
+            isRequiredReloadRender: true
+        )
+    }
+
     private func flushIfDue() {
+        resumeStalledReloadIfNeeded()
         guard pendingReload, let builder, let renderer else { return }
         guard reloadInFlightRevision == nil else { return }
         let elapsed = Date().timeIntervalSince(lastReloadAt)
