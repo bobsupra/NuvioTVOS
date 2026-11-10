@@ -74,7 +74,7 @@ private enum WatchPartyRecentRoomsStore {
             episode: party.media.episode,
             episodeTitle: party.media.episodeTitle,
             poster: party.media.poster,
-            hostName: hostName.flatMap { $0.isEmpty ? nil : $0 } ?? "Host",
+            hostName: hostName.flatMap { $0.isEmpty ? nil : $0 } ?? L10n.string("party_badge_host", fallback: "Host"),
             memberCount: snapshot.members.count,
             maxMembers: party.maxMembers,
             lastUsed: Date()

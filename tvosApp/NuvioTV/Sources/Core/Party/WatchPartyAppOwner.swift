@@ -108,11 +108,11 @@ final class WatchPartyAppOwner: ObservableObject {
         message = nil
         guard isCurrentPlayerSurface() else { return }
         guard let service, let runtime else {
-            message = "Watch Party isn't available right now."
+            message = L10n.string("party_error_unavailable_now", fallback: "Watch Party isn't available right now.")
             return
         }
         guard presentation == nil, lease == nil, runtime.currentContext == nil else {
-            message = "This player is already attached to a Watch Party."
+            message = L10n.string("party_error_already_attached", fallback: "This player is already attached to a Watch Party.")
             return
         }
 
@@ -123,7 +123,7 @@ final class WatchPartyAppOwner: ObservableObject {
             message = error.message
             return
         } catch {
-            message = "Playback isn't ready to host a Watch Party."
+            message = L10n.string("party_error_playback_not_ready", fallback: "Playback isn't ready to host a Watch Party.")
             return
         }
 
@@ -144,7 +144,7 @@ final class WatchPartyAppOwner: ObservableObject {
                 throw WatchPartyRoomCreationError.stalePlayback
             }
             guard room.connection == .ready else {
-                message = "Room created, but the connection isn't ready. The room remains open; playback isn't attached."
+                message = L10n.string("party_error_connection_not_ready", fallback: "Room created, but the connection isn't ready. The room remains open; playback isn't attached.")
                 return
             }
 
@@ -190,7 +190,7 @@ final class WatchPartyAppOwner: ObservableObject {
                     break
                 }
                 guard attempt < 2 else {
-                    message = "Room created, but playback kept changing. The room remains open; playback isn't attached."
+                    message = L10n.string("party_error_playback_kept_changing", fallback: "Room created, but playback kept changing. The room remains open; playback isn't attached.")
                     return
                 }
 
@@ -202,7 +202,7 @@ final class WatchPartyAppOwner: ObservableObject {
             }
 
             guard publicationIsStable else {
-                message = "Room created, but playback kept changing. The room remains open; playback isn't attached."
+                message = L10n.string("party_error_playback_kept_changing", fallback: "Room created, but playback kept changing. The room remains open; playback isn't attached.")
                 return
             }
 
@@ -225,17 +225,17 @@ final class WatchPartyAppOwner: ObservableObject {
             }
         } catch let error as WatchPartyRoomCreationError {
             if roomWasAccepted {
-                message = "Room created, but playback changed before it could attach. The room remains open; playback isn't attached."
+                message = L10n.string("party_error_playback_changed_before_attach", fallback: "Room created, but playback changed before it could attach. The room remains open; playback isn't attached.")
             } else {
                 message = error.message
             }
         } catch {
             if roomWasAccepted {
-                message = "Room created, but playback couldn't attach. The room is still open in Watch Party."
+                message = L10n.string("party_error_playback_attach_failed", fallback: "Room created, but playback couldn't attach. The room is still open in Watch Party.")
             } else if service.membershipOutcomeUncertain {
-                message = "Room status is uncertain. Check Watch Party before trying again."
+                message = L10n.string("party_error_status_uncertain", fallback: "Room status is uncertain. Check Watch Party before trying again.")
             } else if service.failure == nil {
-                message = "Could not create the room. Check your connection and try again."
+                message = L10n.string("party_error_create_failed", fallback: "Could not create the room. Check your connection and try again.")
             }
         }
     }
@@ -300,7 +300,7 @@ final class WatchPartyAppOwner: ObservableObject {
         transition.viewModel.clearWatchPartyTransitionCallbacks()
         // Keep the player through the presentation-nil callback; it consumes this flag.
         guard transition.viewModel.isSceneEnabled else {
-            message = "The room changed episodes. Choose a source from the Watch Party lobby."
+            message = L10n.string("party_error_room_changed_episodes", fallback: "The room changed episodes. Choose a source from the Watch Party lobby.")
             return false
         }
         transition.viewModel.openWatchPartyScene()
@@ -348,7 +348,7 @@ final class WatchPartyAppOwner: ObservableObject {
                   service.isCurrent(context.request), room.playbackContext == context,
                   self?.lease == nil else { return }
             do { try await room.setPresence(status: .browsing, mediaKey: nil, behindMs: nil) }
-            catch { if !Task.isCancelled { self?.message = "Could not update your room status." } }
+            catch { if !Task.isCancelled { self?.message = L10n.string("party_error_update_status_failed", fallback: "Could not update your room status.") } }
         }
     }
 
@@ -459,7 +459,7 @@ final class WatchPartyAppOwner: ObservableObject {
                 // Membership/media changes close the old player; source resolution is a later,
                 // explicit transition. No automatic reuse of its URL or host-provided link.
                 self.finishPlayback(reportBrowsing: false)
-                if room?.playbackContext != nil { self.message = "The room changed title. Choose your source again." }
+                if room?.playbackContext != nil { self.message = L10n.string("party_error_room_changed_title", fallback: "The room changed title. Choose your source again.") }
             }
         }
     }

@@ -167,11 +167,11 @@ struct WatchPartyLobbyView: View {
         .onChange(of: owner.presentation?.id) { _, _ in
             if canUseAccount { focusedAction = preferredRoomFocus }
         }
-        .confirmationDialog("End this room for everyone?", isPresented: $endingRoom) {
-            Button("End room", role: .destructive) {
+        .confirmationDialog(L10n.string("party_end_room_everyone_desc", fallback: "End this room for everyone?"), isPresented: $endingRoom) {
+            Button(L10n.string("party_end_room_confirm_title", fallback: "End room"), role: .destructive) {
                 leaveRoom(endForEveryone: true)
             }
-            Button("Cancel", role: .cancel) {}
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         }
     }
 
@@ -207,7 +207,7 @@ struct WatchPartyLobbyView: View {
                 .font(.system(size: 42, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
 
-            Text("Create a private room or join a friend with their room code.")
+            Text(L10n.string("party_lobby_header_subtitle", fallback: "Create a private room or join a friend with their room code."))
                 .font(.system(size: 20, weight: .regular))
                 .foregroundStyle(.white.opacity(0.72))
                 .fixedSize(horizontal: false, vertical: true)
@@ -216,16 +216,17 @@ struct WatchPartyLobbyView: View {
     }
 
     private func activeRoomHeader(room: WatchPartySession, party: WatchPartyInfo) -> some View {
-        let hostName = room.members.first(where: { $0.id == party.hostMemberID })?.displayName ?? "your friends"
+        let defaultHost = L10n.string("party_your_friends", fallback: "your friends")
+        let hostName = room.members.first(where: { $0.id == party.hostMemberID })?.displayName ?? defaultHost
         return VStack(alignment: .leading, spacing: 8) {
-            Text("Watch party")
+            Text(L10n.string("party_title", fallback: "Watch party"))
                 .font(.system(size: 52, weight: .regular))
                 .foregroundStyle(.white)
             VStack(alignment: .leading, spacing: 4) {
-                Text("Hosted by \(hostName)")
+                Text(L10n.format("party_hosted_by", fallback: "Hosted by %@", hostName))
                     .font(.system(size: 31, weight: .regular))
                     .foregroundStyle(.white.opacity(0.74))
-                Text("\(room.members.count) of \(party.maxMembers) seats")
+                Text(L10n.format("party_seats_count", fallback: "%d of %d seats", room.members.count, party.maxMembers))
                     .font(.system(size: 20, weight: .medium))
                     .foregroundStyle(.white.opacity(0.65))
             }
@@ -282,12 +283,12 @@ struct WatchPartyLobbyView: View {
     private var recentRoomsSection: some View {
         let rooms = service.recentRooms()
         return VStack(alignment: .leading, spacing: 14) {
-            Text("Recent rooms")
+            Text(L10n.string("party_recent_rooms", fallback: "Recent rooms"))
                 .font(.system(size: 27, weight: .bold, design: .rounded))
                 .foregroundStyle(.white)
 
             if rooms.isEmpty {
-                Text("Rooms you join or create will appear here.")
+                Text(L10n.string("party_recent_rooms_empty", fallback: "Rooms you join or create will appear here."))
                     .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(.white.opacity(0.62))
                     .padding(.vertical, 18)
@@ -319,7 +320,7 @@ struct WatchPartyLobbyView: View {
             recentRoomArtwork(room.poster, title: room.title)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text(room.title.isEmpty ? "Untitled room" : room.title)
+                Text(room.title.isEmpty ? L10n.string("party_untitled_room", fallback: "Untitled room") : room.title)
                     .font(.system(size: 21, weight: .bold, design: .rounded))
                     .foregroundStyle(.white)
                     .lineLimit(2)
@@ -332,12 +333,12 @@ struct WatchPartyLobbyView: View {
                         .lineLimit(2)
                 }
 
-                Text("Code · \(WatchPartyCode.formatted(room.code))")
+                Text(L10n.format("party_code_with_value", fallback: "Code · %@", WatchPartyCode.formatted(room.code)))
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.white.opacity(0.86))
                     .lineLimit(1)
 
-                Text("\(room.memberCount) of \(room.maxMembers) members")
+                Text(L10n.format("party_members_count", fallback: "%d of %d members", room.memberCount, room.maxMembers))
                     .font(.system(size: 14, weight: .medium))
                     .foregroundStyle(.white.opacity(0.64))
                     .lineLimit(1)
@@ -438,17 +439,17 @@ struct WatchPartyLobbyView: View {
     private func recentRoomPreviewFailureMessage(_ error: Error) -> String {
         guard let serviceError = error as? WatchPartyServiceError,
               case let .rejected(failure) = serviceError else {
-            return "Couldn't check this room. Showing saved room details."
+            return L10n.string("party_saved_details_fallback", fallback: "Couldn't check this room. Showing saved room details.")
         }
         switch failure {
         case .ended:
-            return "This room has ended. Showing saved session details."
+            return L10n.string("party_recent_room_ended", fallback: "This room has ended. Showing saved session details.")
         case .notFound:
-            return "This room is no longer available. Showing saved session details."
+            return L10n.string("party_recent_room_not_found", fallback: "This room is no longer available. Showing saved session details.")
         case .full:
-            return "This room is full. Showing saved room details."
+            return L10n.string("party_recent_room_full", fallback: "This room is full. Showing saved room details.")
         default:
-            return "Couldn't check this room. Showing saved room details."
+            return L10n.string("party_saved_details_fallback", fallback: "Couldn't check this room. Showing saved room details.")
         }
     }
 
@@ -456,13 +457,13 @@ struct WatchPartyLobbyView: View {
         VStack(alignment: .leading, spacing: 0) {
             cardHeading(
                 symbol: "plus.circle.fill",
-                title: "Create a room",
-                subtitle: "Choose a movie or episode, then invite everyone with your room code."
+                title: L10n.string("party_create_room_title", fallback: "Create a room"),
+                subtitle: L10n.string("party_create_room_subtitle", fallback: "Choose a movie or episode, then invite everyone with your room code.")
             )
 
             Spacer(minLength: 20)
 
-            Text("Rooms start paused. Press Play when your source is ready.")
+            Text(L10n.string("party_start_paused_hint", fallback: "Rooms start paused. Press Play when your source is ready."))
                 .font(.system(size: 17))
                 .foregroundStyle(.white.opacity(0.62))
                 .padding(.bottom, 12)
@@ -473,8 +474,8 @@ struct WatchPartyLobbyView: View {
             } label: {
                 primaryActionLabel(
                     symbol: "plus",
-                    title: "Choose a title",
-                    subtitle: "Start a new private room",
+                    title: L10n.string("party_choose_title", fallback: "Choose a title"),
+                    subtitle: L10n.string("party_start_private_room_subtitle", fallback: "Start a new private room"),
                     isFocused: focusedAction == "create",
                     emphasized: true
                 )
@@ -498,14 +499,14 @@ struct WatchPartyLobbyView: View {
         VStack(alignment: .leading, spacing: 0) {
             cardHeading(
                 symbol: "person.2.fill",
-                title: "Join a room",
-                subtitle: "Enter the six-character code shared by the room's host."
+                title: L10n.string("party_join_room_title", fallback: "Join a room"),
+                subtitle: L10n.string("party_join_room_subtitle", fallback: "Enter the six-character code shared by the room's host.")
             )
 
             Spacer(minLength: 16)
 
             HStack {
-                Text("ROOM CODE · 6 CHARACTERS")
+                Text(L10n.string("party_room_code_header", fallback: "ROOM CODE · 6 CHARACTERS"))
                     .font(.system(size: 15, weight: .bold, design: .rounded))
                     .tracking(1.2)
                     .foregroundStyle(.white.opacity(0.66))
@@ -522,7 +523,7 @@ struct WatchPartyLobbyView: View {
                 } label: {
                     SettingsGlassTextField(
                         text: $code,
-                        placeholder: "Room Code",
+                        placeholder: L10n.string("party_room_code_placeholder", fallback: "Room Code"),
                         focused: focusedAction == "room-code",
                         isEditing: $roomCodeIsEditing,
                         fieldWidth: geometry.size.width,
@@ -533,7 +534,7 @@ struct WatchPartyLobbyView: View {
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focusEffectDisabledIfAvailable()
-                .accessibilityLabel("Six-character room code")
+                .accessibilityLabel(L10n.string("party_room_code_accessibility", fallback: "Six-character room code"))
                 .focused($focusedAction, equals: "room-code")
                 .onMoveCommand { direction in
                     if direction == .right { focusedAction = "create" }
@@ -559,7 +560,7 @@ struct WatchPartyLobbyView: View {
                         guard previewRequestID == requestID,
                               WatchPartyCode.normalize(code) == requestedCode else { return }
                         guard result.error == nil, let media = result.media else {
-                            owner.message = "Room preview unavailable. Check the invitation code."
+                            owner.message = L10n.string("party_preview_unavailable", fallback: "Room preview unavailable. Check the invitation code.")
                             return
                         }
                         try WatchPartyLaunchPolicy.validate(media)
@@ -570,8 +571,8 @@ struct WatchPartyLobbyView: View {
                 } label: {
                     primaryActionLabel(
                         symbol: "eye",
-                        title: "Preview room",
-                        subtitle: "Check the host and exact movie or episode before joining",
+                        title: L10n.string("party_preview_room_title", fallback: "Preview room"),
+                        subtitle: L10n.string("party_preview_room_subtitle", fallback: "Check the host and exact movie or episode before joining"),
                         isFocused: focusedAction == "preview"
                     )
                 }
@@ -592,7 +593,7 @@ struct WatchPartyLobbyView: View {
 
     private func recentRoomPreviewCard(_ room: WatchPartyRecentRoom) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("SAVED SESSION DETAILS")
+            Text(L10n.string("party_saved_session_header", fallback: "SAVED SESSION DETAILS"))
                 .font(.system(size: 15, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.65))
 
@@ -600,7 +601,7 @@ struct WatchPartyLobbyView: View {
                 recentRoomArtwork(room.poster, title: room.title)
 
                 VStack(alignment: .leading, spacing: 7) {
-                    Text(room.title.isEmpty ? "Untitled room" : room.title)
+                    Text(room.title.isEmpty ? L10n.string("party_untitled_room", fallback: "Untitled room") : room.title)
                         .font(.system(size: 23, weight: .bold, design: .rounded))
                         .foregroundStyle(.white)
                         .lineLimit(2)
@@ -610,7 +611,7 @@ struct WatchPartyLobbyView: View {
                             .foregroundStyle(.white.opacity(0.8))
                             .lineLimit(2)
                     }
-                    Text("Hosted by \(room.hostName)")
+                    Text(L10n.format("party_hosted_by", fallback: "Hosted by %@", room.hostName))
                         .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(.white.opacity(0.75))
                         .lineLimit(1)
@@ -618,11 +619,11 @@ struct WatchPartyLobbyView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Text("\(room.memberCount) of \(room.maxMembers) participants when last joined")
+            Text(L10n.format("party_participants_when_last_joined", fallback: "%d of %d participants when last joined", room.memberCount, room.maxMembers))
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(.white.opacity(0.7))
                 .lineLimit(2)
-            Text("Last joined \(room.lastUsed.formatted(date: .abbreviated, time: .shortened))")
+            Text(L10n.format("party_last_joined", fallback: "Last joined %@", room.lastUsed.formatted(date: .abbreviated, time: .shortened)))
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.white.opacity(0.6))
 
@@ -639,8 +640,8 @@ struct WatchPartyLobbyView: View {
             } label: {
                 primaryActionLabel(
                     symbol: "pencil",
-                    title: "Enter another room code",
-                    subtitle: "Use a different invitation code",
+                    title: L10n.string("party_enter_another_code_title", fallback: "Enter another room code"),
+                    subtitle: L10n.string("party_enter_another_code_subtitle", fallback: "Use a different invitation code"),
                     isFocused: focusedAction == "recent-room-preview-change"
                 )
             }
@@ -654,7 +655,7 @@ struct WatchPartyLobbyView: View {
 
     private func roomPreviewCard(_ preview: WatchPartyPreview, media: WatchPartyMedia) -> some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("INVITATION PREVIEW")
+            Text(L10n.string("party_invitation_preview_header", fallback: "INVITATION PREVIEW"))
                 .font(.system(size: 15, weight: .bold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.65))
             HStack(alignment: .top, spacing: 14) {
@@ -671,7 +672,7 @@ struct WatchPartyLobbyView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 10))
                 }
                 VStack(alignment: .leading, spacing: 6) {
-                    Text(media.title.isEmpty ? "Untitled room" : media.title)
+                    Text(media.title.isEmpty ? L10n.string("party_untitled_room", fallback: "Untitled room") : media.title)
                         .font(.system(size: 24, weight: .bold))
                         .foregroundStyle(.white)
                         .lineLimit(2)
@@ -679,12 +680,13 @@ struct WatchPartyLobbyView: View {
                         Text(episode).font(.system(size: 17))
                             .foregroundStyle(.white.opacity(0.8))
                     }
-                    Text("Hosted by \(preview.host.flatMap { $0.displayName.isEmpty ? nil : $0.displayName } ?? "Host")")
+                    let hostName = preview.host.flatMap { $0.displayName.isEmpty ? nil : $0.displayName } ?? L10n.string("party_host_label", fallback: "Host")
+                    Text(L10n.format("party_hosted_by", fallback: "Hosted by %@", hostName))
                         .font(.system(size: 16))
                         .foregroundStyle(.white.opacity(0.75))
                 }
             }
-            Text("\(preview.members) of \(preview.maxMembers) participants")
+            Text(L10n.format("party_participants_count", fallback: "%d of %d participants", preview.members, preview.maxMembers))
                 .font(.system(size: 15))
                 .foregroundStyle(.white.opacity(0.7))
             Button {
@@ -709,20 +711,20 @@ struct WatchPartyLobbyView: View {
                        ) {
                         reviewRoomID = joined.id
                         reviewMediaKey = joined.media.key
-                        owner.message = "Room content changed since preview. Confirm the current title before choosing a source."
+                        owner.message = L10n.string("party_content_changed_notice", fallback: "Room content changed since preview. Confirm the current title before choosing a source.")
                         focusedAction = "review-room"
                     }
                 }
             } label: {
-                primaryActionLabel(symbol: "checkmark.circle", title: "Join this room",
-                                   subtitle: "Confirm this movie or episode",
+                primaryActionLabel(symbol: "checkmark.circle", title: L10n.string("party_join_this_room_title", fallback: "Join this room"),
+                                   subtitle: L10n.string("party_join_this_room_subtitle", fallback: "Confirm this movie or episode"),
                                    isFocused: focusedAction == "join")
             }
             .buttonStyle(PosterCardButtonStyle())
             .focusEffectDisabledIfAvailable()
             .focused($focusedAction, equals: "join")
             .disabled(service.busy || operation != nil || preview.isFull || service.membershipOutcomeUncertain)
-            Button("Change room code") {
+            Button(L10n.string("party_change_room_code", fallback: "Change room code")) {
                 previewRequestID = UUID()
                 roomPreview = nil
                 previewCode = nil
@@ -738,8 +740,8 @@ struct WatchPartyLobbyView: View {
         Button(action: onOpenProfile) {
             primaryActionLabel(
                 symbol: "person.crop.circle.badge.checkmark",
-                title: "Choose a profile to continue",
-                subtitle: "Sign in to create or join a Watch Party.",
+                title: L10n.string("party_profile_gate_title", fallback: "Choose a profile to continue"),
+                subtitle: L10n.string("party_profile_gate_subtitle", fallback: "Sign in to create or join a Watch Party."),
                 isFocused: accountGateFocused
             )
         }
@@ -807,7 +809,7 @@ struct WatchPartyLobbyView: View {
     }
 
     private func roomTitleFallback(_ title: String) -> some View {
-        Text(title.isEmpty ? "Watch Party" : title)
+        Text(title.isEmpty ? L10n.string("nav_watch_party", fallback: "Watch Party") : title)
             .font(.system(size: 58, weight: .heavy, design: .rounded))
             .foregroundStyle(.white)
             .lineLimit(2)
@@ -819,7 +821,7 @@ struct WatchPartyLobbyView: View {
     private func roomCodeDisplay(_ code: String) -> some View {
         let characters = Array(WatchPartyCode.normalize(code))
         return VStack(alignment: .leading, spacing: 14) {
-            Text("Party code")
+            Text(L10n.string("party_code_label", fallback: "Party code"))
                 .font(.system(size: 25, weight: .medium))
                 .foregroundStyle(.white.opacity(0.68))
             HStack(spacing: 14) {
@@ -838,13 +840,13 @@ struct WatchPartyLobbyView: View {
             }
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Party code \(WatchPartyCode.formatted(code))")
+        .accessibilityLabel(L10n.format("party_code_accessibility", fallback: "Party code %@", WatchPartyCode.formatted(code)))
     }
 
     private func membersList(_ room: WatchPartySession, party: WatchPartyInfo) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             if room.members.isEmpty {
-                Text("Waiting for viewers to join…")
+                Text(L10n.string("party_waiting_viewers", fallback: "Waiting for viewers to join…"))
                     .font(.system(size: 17))
                     .foregroundStyle(.white.opacity(0.65))
             } else {
@@ -899,7 +901,7 @@ struct WatchPartyLobbyView: View {
                             .font(.system(size: 19, weight: .semibold))
                             .foregroundStyle(Color(red: 0.98, green: 0.76, blue: 0.28))
                     }
-                    Text(member.displayName.isEmpty ? "Viewer" : member.displayName)
+                    Text(member.displayName.isEmpty ? L10n.string("party_viewer_label", fallback: "Viewer") : member.displayName)
                         .font(.system(size: 28, weight: .semibold))
                         .foregroundStyle(.white)
                         .lineLimit(1)
@@ -934,8 +936,10 @@ struct WatchPartyLobbyView: View {
             }
 
             if needsMediaReview {
+                let episodeSuffix = episodeDescription(party.media).map { " · " + $0 } ?? ""
+                let changedTitle = "\(party.media.title)\(episodeSuffix)"
                 statusRow(symbol: "exclamationmark.triangle.fill",
-                          title: "The room changed to \(party.media.title)\(episodeDescription(party.media).map { " · " + $0 } ?? ""). Confirm before choosing a source.",
+                          title: L10n.format("party_room_changed_status", fallback: "The room changed to %@. Confirm before choosing a source.", changedTitle),
                           tint: .orange)
             }
 
@@ -947,8 +951,8 @@ struct WatchPartyLobbyView: View {
                     } label: {
                         roomActionLabel(
                             symbol: "play.fill",
-                            title: "Use host's source · BETA",
-                            subtitle: "Play the compatible source shared by the host",
+                            title: L10n.string("party_use_host_source_title", fallback: "Use host's source · BETA"),
+                            subtitle: L10n.string("party_use_host_source_subtitle", fallback: "Play the compatible source shared by the host"),
                             isFocused: focusedAction == "use-host-source"
                         )
                     }
@@ -963,14 +967,14 @@ struct WatchPartyLobbyView: View {
                         run {
                             let sent = try await room.requestHostStreamRefresh()
                             owner.message = sent
-                                ? "Source refresh requested. If the host is online and sharing, the source should appear shortly."
-                                : "Please wait a few seconds before requesting the source again."
+                                ? L10n.string("party_source_refresh_requested", fallback: "Source refresh requested. If the host is online and sharing, the source should appear shortly.")
+                                : L10n.string("party_source_refresh_wait", fallback: "Please wait a few seconds before requesting the source again.")
                         }
                     } label: {
                         roomActionLabel(
                             symbol: "arrow.clockwise",
-                            title: "Refresh host's shared source · BETA",
-                            subtitle: "Ask the host to refresh the shared source",
+                            title: L10n.string("party_refresh_host_source_title", fallback: "Refresh host's shared source · BETA"),
+                            subtitle: L10n.string("party_refresh_host_source_subtitle", fallback: "Ask the host to refresh the shared source"),
                             isFocused: focusedAction == "refresh-host-source"
                         )
                     }
@@ -991,8 +995,8 @@ struct WatchPartyLobbyView: View {
                     } label: {
                         roomActionLabel(
                             symbol: "checkmark.shield",
-                            title: "Confirm current movie or episode",
-                            subtitle: "Verify this title before selecting a source",
+                            title: L10n.string("party_confirm_title_action", fallback: "Confirm current movie or episode"),
+                            subtitle: L10n.string("party_confirm_title_subtitle", fallback: "Verify this title before selecting a source"),
                             isFocused: focusedAction == "review-room"
                         )
                     }
@@ -1010,8 +1014,8 @@ struct WatchPartyLobbyView: View {
                 } label: {
                     roomActionLabel(
                         symbol: "qrcode",
-                        title: "Invite a friend",
-                        subtitle: "Share this room's code with someone",
+                        title: L10n.string("party_invite_friend", fallback: "Invite a friend"),
+                        subtitle: L10n.string("party_invite_friend_subtitle", fallback: "Share this room's code with someone"),
                         isFocused: focusedAction == "invite"
                     )
                 }
@@ -1025,8 +1029,8 @@ struct WatchPartyLobbyView: View {
                     } label: {
                         roomActionLabel(
                             symbol: "arrow.clockwise",
-                            title: "Reconnect",
-                            subtitle: "Restore the room connection",
+                            title: L10n.string("party_reconnect_title", fallback: "Reconnect"),
+                            subtitle: L10n.string("party_reconnect_subtitle", fallback: "Restore the room connection"),
                             isFocused: focusedAction == "reconnect"
                         )
                     }
@@ -1041,8 +1045,8 @@ struct WatchPartyLobbyView: View {
                 } label: {
                     roomActionLabel(
                         symbol: "rectangle.portrait.and.arrow.right",
-                        title: "Leave room",
-                        subtitle: "Leave this Watch Party",
+                        title: L10n.string("party_leave_room_title", fallback: "Leave room"),
+                        subtitle: L10n.string("party_leave_room_subtitle", fallback: "Leave this Watch Party"),
                         isFocused: focusedAction == "leave"
                     )
                 }
@@ -1057,8 +1061,8 @@ struct WatchPartyLobbyView: View {
                     } label: {
                         roomActionLabel(
                             symbol: "xmark.circle",
-                            title: "End room for everyone",
-                            subtitle: "Close this room for all members",
+                            title: L10n.string("party_end_room_everyone_title", fallback: "End room for everyone"),
+                            subtitle: L10n.string("party_end_room_everyone_subtitle", fallback: "Close this room for all members"),
                             isFocused: focusedAction == "end"
                         )
                     }
@@ -1082,8 +1086,8 @@ struct WatchPartyLobbyView: View {
             } label: {
                 roomActionLabel(
                     symbol: "play.rectangle.fill",
-                    title: "Return to player",
-                    subtitle: "Resume fullscreen playback",
+                    title: L10n.string("party_return_to_player_title", fallback: "Return to player"),
+                    subtitle: L10n.string("party_return_to_player_subtitle", fallback: "Resume fullscreen playback"),
                     isFocused: focusedAction == "return-to-player"
                 )
             }
@@ -1098,8 +1102,8 @@ struct WatchPartyLobbyView: View {
             } label: {
                 roomActionLabel(
                     symbol: "arrow.down.to.line",
-                    title: "Catch up with room",
-                    subtitle: "Return to the shared playback position",
+                    title: L10n.string("party_catch_up_title", fallback: "Catch up with room"),
+                    subtitle: L10n.string("party_catch_up_subtitle", fallback: "Return to the shared playback position"),
                     isFocused: focusedAction == "catch-up"
                 )
             }
@@ -1113,8 +1117,8 @@ struct WatchPartyLobbyView: View {
             } label: {
                 roomActionLabel(
                     symbol: "play.fill",
-                    title: "Choose my source",
-                    subtitle: "Pick any source you have for this title or episode",
+                    title: L10n.string("party_choose_my_source_title", fallback: "Choose my source"),
+                    subtitle: L10n.string("party_choose_my_source_subtitle", fallback: "Pick any source you have for this title or episode"),
                     isFocused: focusedAction == "choose-source"
                 )
             }
@@ -1132,7 +1136,7 @@ struct WatchPartyLobbyView: View {
                 if service.busy || operation != nil {
                     HStack(spacing: 14) {
                         ProgressView()
-                        Text("Contacting room…")
+                        Text(L10n.string("party_contacting_room", fallback: "Contacting room…"))
                             .font(.system(size: 19, weight: .medium))
                             .foregroundStyle(.white)
                     }
@@ -1154,7 +1158,7 @@ struct WatchPartyLobbyView: View {
                 if service.membershipOutcomeUncertain {
                     statusRow(
                         symbol: "questionmark.circle.fill",
-                        title: "The server may have accepted the last request. Check the room with its host before trying again.",
+                        title: L10n.string("party_uncertain_outcome_message", fallback: "The server may have accepted the last request. Check the room with its host before trying again."),
                         tint: .yellow
                     )
                     Button {
@@ -1162,7 +1166,7 @@ struct WatchPartyLobbyView: View {
                     } label: {
                         secondaryActionLabel(
                             symbol: "checkmark.circle",
-                            title: "I checked — allow a new attempt",
+                            title: L10n.string("party_uncertain_outcome_ack", fallback: "I checked — allow a new attempt"),
                             isFocused: focusedAction == "allow-retry"
                         )
                     }
@@ -1364,39 +1368,39 @@ struct WatchPartyLobbyView: View {
 
     private func episodeDescription(_ media: WatchPartyMedia) -> String? {
         guard let season = media.season, let episode = media.episode else { return nil }
-        let number = "Season \(season) · Episode \(episode)"
+        let number = L10n.format("party_season_episode_format", fallback: "Season %1$d · Episode %2$d", season, episode)
         guard let title = media.episodeTitle, !title.isEmpty else { return number }
         return "\(number) · \(title)"
     }
 
     private var membershipExitMessage: String {
         if service.session?.party != nil {
-            return "This membership ended. Leave this room before joining again."
+            return L10n.string("party_membership_ended_leave", fallback: "This membership ended. Leave this room before joining again.")
         }
-        return "Your previous room membership ended. Joining again requires a new request."
+        return L10n.string("party_membership_ended_new_request", fallback: "Your previous room membership ended. Joining again requires a new request.")
     }
 
     private func presenceLabel(_ status: WatchPartyMemberStatus?) -> String {
         switch status ?? .browsing {
-        case .browsing: return "Browsing"
-        case .loading: return "Choosing a source"
-        case .buffering: return "Buffering"
-        case .ready: return "Ready to watch"
-        case .behind: return "Catching up"
+        case .browsing: return L10n.string("party_status_browsing", fallback: "Browsing")
+        case .loading: return L10n.string("party_status_loading", fallback: "Choosing a source")
+        case .buffering: return L10n.string("party_status_buffering", fallback: "Buffering")
+        case .ready: return L10n.string("party_status_ready", fallback: "Ready to watch")
+        case .behind: return L10n.string("party_status_behind", fallback: "Catching up")
         }
     }
 
     private func failureText(_ failure: WatchPartyFailure?) -> String {
         switch failure {
-        case .invalidCode: return "Enter a valid room code."
-        case .notFound: return "Room not found. Check the invitation code."
-        case .full: return "This room is full."
-        case .removed: return "You were removed from this room."
-        case .ended: return "This room has ended."
-        case .rateLimited: return "Too many requests. Wait before trying again."
-        case .signInRequired: return "Sign in again to use Watch Party."
-        case .unavailable: return "Watch Party is unavailable on this server."
-        case .network, .none: return "The room request failed. Check your connection and room status before trying again."
+        case .invalidCode: return L10n.string("party_failure_invalid_code", fallback: "Enter a valid room code.")
+        case .notFound: return L10n.string("party_failure_not_found", fallback: "Room not found. Check the invitation code.")
+        case .full: return L10n.string("party_failure_full", fallback: "This room is full.")
+        case .removed: return L10n.string("party_failure_removed", fallback: "You were removed from this room.")
+        case .ended: return L10n.string("party_failure_ended", fallback: "This room has ended.")
+        case .rateLimited: return L10n.string("party_failure_rate_limited", fallback: "Too many requests. Wait before trying again.")
+        case .signInRequired: return L10n.string("party_failure_sign_in_required", fallback: "Sign in again to use Watch Party.")
+        case .unavailable: return L10n.string("party_failure_unavailable", fallback: "Watch Party is unavailable on this server.")
+        case .network, .none: return L10n.string("party_failure_network", fallback: "The room request failed. Check your connection and room status before trying again.")
         }
     }
 
@@ -1427,7 +1431,7 @@ struct WatchPartyLobbyView: View {
             do { try await action() }
             catch {
                 if !Task.isCancelled {
-                    owner.message = "Could not complete the room request. Review the room status before trying again."
+                    owner.message = L10n.string("party_error_room_request", fallback: "Could not complete the room request. Review the room status before trying again.")
                 }
             }
         }
@@ -1445,7 +1449,7 @@ private struct WatchPartyLobbyInvitation: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
-            Text("Invite a friend")
+            Text(L10n.string("party_invite_friend", fallback: "Invite a friend"))
                 .font(.system(size: 38, weight: .bold, design: .rounded))
             HStack(alignment: .center, spacing: 32) {
                 if let qr = QRCode.image(from: inviteLink, scale: 12) {
@@ -1456,16 +1460,16 @@ private struct WatchPartyLobbyInvitation: View {
                         .frame(width: 260, height: 260)
                         .padding(12)
                         .background(.white, in: RoundedRectangle(cornerRadius: 16))
-                        .accessibilityLabel("QR invitation for Watch Party room \(code)")
+                        .accessibilityLabel(L10n.format("party_invite_qr_accessibility", fallback: "QR invitation for Watch Party room %@", code))
                 }
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("Scan with a compatible Nuvio app")
+                    Text(L10n.string("party_invite_scan_hint", fallback: "Scan with a compatible Nuvio app"))
                         .font(.system(size: 22, weight: .semibold))
                     Text(WatchPartyCode.formatted(code))
                         .font(.system(size: 37, weight: .bold, design: .monospaced))
                         .lineLimit(1)
                         .minimumScaleFactor(0.75)
-                    Text("Or enter this code in Watch Party. Each guest selects a source before playback.")
+                    Text(L10n.string("party_invite_code_hint", fallback: "Or enter this code in Watch Party. Each guest selects a source before playback."))
                         .font(.system(size: 18))
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -1474,7 +1478,7 @@ private struct WatchPartyLobbyInvitation: View {
             }
             HStack {
                 Spacer()
-                Button("Done") { dismiss() }
+                Button(L10n.string("tvos_common_done", fallback: "Done")) { dismiss() }
                     .focused($doneFocused)
             }
         }

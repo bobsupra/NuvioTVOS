@@ -101,11 +101,20 @@ enum WatchPartySharedSourceNotice {
                      isGuest: Bool, connected: Bool) -> String? {
         guard isGuest, connected else { return nil }
         let raw = hostName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let name = raw.isEmpty ? "The host" : String(raw.prefix(48))
+        let defaultHost = L10n.string("party_the_host", fallback: "The host")
+        let name = raw.isEmpty ? defaultHost : String(raw.prefix(48))
         if let stream, stream.mediaKey == mediaKey {
-            return "\(name) shared a source (Beta). Select Use host's source to try it, or choose your own source. Provider restrictions may apply."
+            return L10n.format(
+                "party_shared_source_available",
+                fallback: "%@ shared a source (Beta). Select Use host's source to try it, or choose your own source. Provider restrictions may apply.",
+                name
+            )
         }
-        return "No shared source available right now. If \(name) already shared a link, ask them to share it again. Or choose your own source."
+        return L10n.format(
+            "party_shared_source_unavailable",
+            fallback: "No shared source available right now. If %@ already shared a link, ask them to share it again. Or choose your own source.",
+            name
+        )
     }
 }
 

@@ -109,20 +109,20 @@ struct PlayerWatchPartyPanel: View {
             if let current = focusedControlID, available.contains(current) { return }
             normalizeEntryFocusIfNeeded()
         }
-        .confirmationDialog("End this room for everyone?", isPresented: $endingRoom) {
-            Button("End room", role: .destructive) {
+        .confirmationDialog(L10n.string("party_end_room_everyone_desc", fallback: "End this room for everyone?"), isPresented: $endingRoom) {
+            Button(L10n.string("party_end_room_confirm_title", fallback: "End room"), role: .destructive) {
                 run { try await owner.leaveRoomPreservingPlayback(endForEveryone: true) }
             }
-            Button("Cancel", role: .cancel) {}
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         }
     }
 
     private var lobbyCard: some View {
-        glassCard(title: "WATCH PARTY", width: 380) {
+        glassCard(title: L10n.string("party_panel_watch_party_header", fallback: "WATCH PARTY"), width: 380) {
             VStack(alignment: .leading, spacing: 14) {
                 Text(service.membershipOutcomeUncertain
-                     ? "Check the room status before trying again."
-                     : "Create a room for this title. To join a room, use Watch Party in the sidebar.")
+                     ? L10n.string("party_uncertain_outcome_message", fallback: "Check the room status before trying again.")
+                     : L10n.string("party_panel_create_room_hint", fallback: "Create a room for this title. To join a room, use Watch Party in the sidebar."))
                     .font(.system(size: 18, weight: .medium))
                     .foregroundStyle(.white.opacity(0.72))
                     .fixedSize(horizontal: false, vertical: true)
@@ -143,8 +143,8 @@ struct PlayerWatchPartyPanel: View {
             }
         } label: {
             actionLabel(
-                title: "Create room for this title",
-                subtitle: "Share the current playback state",
+                title: L10n.string("party_panel_create_room_title", fallback: "Create room for this title"),
+                subtitle: L10n.string("party_panel_create_room_subtitle", fallback: "Share the current playback state"),
                 symbol: "person.3.sequence.fill",
                 isFocused: isFocused
             )
@@ -162,8 +162,8 @@ struct PlayerWatchPartyPanel: View {
         let isFocused = focusedControlID == "party.lobby"
         let button = Button(action: onOpenLobby) {
             actionLabel(
-                title: "Open Watch Party lobby",
-                subtitle: "Create or join a room",
+                title: L10n.string("party_panel_open_lobby_title", fallback: "Open Watch Party lobby"),
+                subtitle: L10n.string("party_panel_open_lobby_subtitle", fallback: "Create or join a room"),
                 symbol: "person.3.sequence.fill",
                 isFocused: isFocused
             )
@@ -181,7 +181,7 @@ struct PlayerWatchPartyPanel: View {
     }
 
     private func invitationCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
-        return glassCard(title: "ROOM INVITATION", width: 390) {
+        return glassCard(title: L10n.string("party_panel_room_invitation_header", fallback: "ROOM INVITATION"), width: 390) {
             HStack(spacing: 18) {
                 VStack(alignment: .leading, spacing: 10) {
                     Text(party.code)
@@ -208,7 +208,7 @@ struct PlayerWatchPartyPanel: View {
                         .frame(width: 104, height: 104)
                         .padding(8)
                         .background(.white, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .accessibilityLabel("QR code for room \(party.code)")
+                        .accessibilityLabel(L10n.format("party_panel_qr_accessibility", fallback: "QR code for room %@", party.code))
                 }
             }
         }
@@ -216,7 +216,11 @@ struct PlayerWatchPartyPanel: View {
 
     private func membersCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
         let isHost = party.hostMemberID == room.memberID
-        return glassCard(title: "MEMBERS", trailingHeader: "\(room.members.count) in this room", width: 540) {
+        return glassCard(
+            title: L10n.string("party_panel_members_header", fallback: "MEMBERS"),
+            trailingHeader: L10n.format("party_panel_members_in_room", fallback: "%d in this room", room.members.count),
+            width: 540
+        ) {
             ScrollView(.horizontal, showsIndicators: room.members.count > 3) {
                 HStack(alignment: .top, spacing: 18) {
                     ForEach(room.members, id: \.id) { member in
@@ -249,7 +253,9 @@ struct PlayerWatchPartyPanel: View {
                                     .foregroundStyle(isFocused ? Color.black.opacity(0.65) : Color.white.opacity(0.65))
                                     .lineLimit(1)
                                 if isYou || isRoomHost {
-                                    Text(isYou && isRoomHost ? "You · Host" : (isYou ? "You" : "Host"))
+                                    Text(isYou && isRoomHost
+                                        ? L10n.string("party_badge_you_host", fallback: "You · Host")
+                                        : (isYou ? L10n.string("party_badge_you", fallback: "You") : L10n.string("party_badge_host", fallback: "Host")))
                                         .font(.system(size: 13, weight: .bold))
                                         .foregroundStyle(isFocused ? Color.black.opacity(0.72) : Color.white.opacity(0.8))
                                         .lineLimit(1)
@@ -269,38 +275,38 @@ struct PlayerWatchPartyPanel: View {
                         .disabled(service.busy || operation != nil
                             || (focusContext.entryLocked && "party.member.\(member.id)" != effectiveEntryFocusTarget))
                         .accessibilityLabel(canRemove
-                            ? "Remove \(member.displayName) from the room"
+                            ? L10n.format("party_panel_remove_member_accessibility", fallback: "Remove %@ from the room", member.displayName)
                             : "\(member.displayName), \(memberStatus(room.presence[member.id]?.status))")
                     }
                 }
             }
             .frame(height: 154, alignment: .top)
             if room.members.count > 3 {
-                Text("← / → to browse members")
+                Text(L10n.string("party_panel_browse_members_hint", fallback: "← / → to browse members"))
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.white.opacity(0.62))
                     .frame(maxWidth: .infinity, alignment: .trailing)
             }
         }
         .confirmationDialog(
-            "Remove \(memberToRemove?.displayName ?? "member") from this room?",
+            L10n.format("party_panel_remove_member_confirm", fallback: "Remove %@ from this room?", memberToRemove?.displayName ?? L10n.string("party_viewer_label", fallback: "Viewer")),
             isPresented: $showingMemberRemovalConfirmation,
             titleVisibility: .visible
         ) {
-            Button("Remove member", role: .destructive) {
+            Button(L10n.string("party_panel_remove_member_button", fallback: "Remove member"), role: .destructive) {
                 guard let memberToRemove else { return }
                 let memberID = memberToRemove.id
                 self.memberToRemove = nil
                 run { try await service.removeMember(memberID: memberID) }
             }
-            Button("Cancel", role: .cancel) { memberToRemove = nil }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) { memberToRemove = nil }
         }
     }
 
     private func controlsCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
         let isHost = party.hostMemberID == room.memberID
         let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
-        return glassCard(title: "PLAYBACK & CONTROLS", width: 650) {
+        return glassCard(title: L10n.string("party_panel_controls_header", fallback: "PLAYBACK & CONTROLS"), width: 650) {
             VStack(alignment: .leading, spacing: 5) {
                 LazyVGrid(columns: columns, alignment: .leading, spacing: 5) {
                 if isHost {
@@ -309,10 +315,14 @@ struct PlayerWatchPartyPanel: View {
                         run { try await service.setHostOnly(enabled: !party.hostOnly) }
                     } label: {
                         actionLabel(
-                            title: "Host-only playback",
-                            subtitle: party.hostOnly ? "Only you control playback" : "Shared room control",
+                            title: L10n.string("party_panel_host_only_title", fallback: "Host-only playback"),
+                            subtitle: party.hostOnly
+                                ? L10n.string("party_panel_host_only_active_subtitle", fallback: "Only you control playback")
+                                : L10n.string("party_panel_host_only_inactive_subtitle", fallback: "Shared room control"),
                             symbol: party.hostOnly ? "lock.fill" : "lock.open",
-                            value: party.hostOnly ? "On" : "Off",
+                            value: party.hostOnly
+                                ? L10n.string("tvos_common_on", fallback: "On")
+                                : L10n.string("tvos_common_off", fallback: "Off"),
                             isFocused: focused
                         )
                     }
@@ -342,17 +352,19 @@ struct PlayerWatchPartyPanel: View {
                                     showingStreamWarning = true
                                 }
                             } catch {
-                                message = "This source can't be shared. Use a compatible HTTP source or let guests choose their own."
+                                message = L10n.string("party_panel_source_unshareable", fallback: "This source can't be shared. Use a compatible HTTP source or let guests choose their own.")
                             }
                         }
                     } label: {
                         actionLabel(
-                            title: "Share my stream · BETA",
+                            title: L10n.string("party_panel_share_stream_title", fallback: "Share my stream · BETA"),
                             subtitle: isSharing
-                                ? "Sharing this playback link with guests"
-                                : "Share this playback link with guests (may expose Debrid tokens)",
+                                ? L10n.string("party_panel_share_stream_active_subtitle", fallback: "Sharing this playback link with guests")
+                                : L10n.string("party_panel_share_stream_inactive_subtitle", fallback: "Share this playback link with guests (may expose Debrid tokens)"),
                             symbol: "antenna.radiowaves.left.and.right",
-                            value: isSharing ? "Sharing" : "Off",
+                            value: isSharing
+                                ? L10n.string("party_sharing_status", fallback: "Sharing")
+                                : L10n.string("tvos_common_off", fallback: "Off"),
                             isFocused: shareFocused
                         )
                     }
@@ -365,10 +377,14 @@ struct PlayerWatchPartyPanel: View {
                         || (focusContext.entryLocked && "party.shareStream" != effectiveEntryFocusTarget))
                 } else {
                     if room.sharedStream != nil {
-                        PlayerPanelRow(title: "Host stream available · BETA",
-                                       subtitle: "Return to Watch Party to choose the shared source.")
+                        PlayerPanelRow(
+                            title: L10n.string("party_panel_host_stream_available_title", fallback: "Host stream available · BETA"),
+                            subtitle: L10n.string("party_panel_host_stream_available_subtitle", fallback: "Return to Watch Party to choose the shared source.")
+                        )
                     }
-                    Text(party.hostOnly ? "Playback control is limited to the host." : "Playback control is shared with the room.")
+                    Text(party.hostOnly
+                        ? L10n.string("party_panel_host_only_guest_desc", fallback: "Playback control is limited to the host.")
+                        : L10n.string("party_panel_shared_guest_desc", fallback: "Playback control is shared with the room."))
                         .font(.system(size: 16, weight: .medium))
                         .foregroundStyle(.white.opacity(0.72))
                         .padding(.horizontal, 12)
@@ -378,7 +394,7 @@ struct PlayerWatchPartyPanel: View {
                 if owner.presentation?.mount.isCurrent == true {
                     catchUpButton(room: room, isTopRow: !isHost)
                 } else {
-                    PlayerPanelRow(title: "Choose a source in the Watch Party lobby to start playback.")
+                    PlayerPanelRow(title: L10n.string("party_panel_choose_source_hint", fallback: "Choose a source in the Watch Party lobby to start playback."))
                     openLobbyButton(isTopRow: !isHost)
                 }
 
@@ -388,10 +404,14 @@ struct PlayerWatchPartyPanel: View {
                     ProfileSettings.current.set(chatToastsEnabled, forKey: SettingsKey.partyChatToastsEnabled)
                 } label: {
                     actionLabel(
-                        title: "Chat message toasts",
-                        subtitle: chatToastsEnabled ? "Message bubbles appear during playback" : "Muted during playback",
+                        title: L10n.string("party_panel_chat_toasts_title", fallback: "Chat message toasts"),
+                        subtitle: chatToastsEnabled
+                            ? L10n.string("party_panel_chat_toasts_active_subtitle", fallback: "Message bubbles appear during playback")
+                            : L10n.string("party_panel_chat_toasts_inactive_subtitle", fallback: "Muted during playback"),
                         symbol: chatToastsEnabled ? "bubble.left.fill" : "bubble.left",
-                        value: chatToastsEnabled ? "On" : "Off",
+                        value: chatToastsEnabled
+                            ? L10n.string("tvos_common_on", fallback: "On")
+                            : L10n.string("tvos_common_off", fallback: "Off"),
                         isFocused: chatToastsFocused
                     )
                 }
@@ -412,8 +432,8 @@ struct PlayerWatchPartyPanel: View {
                     run { try await owner.leaveRoomPreservingPlayback() }
                 } label: {
                     actionLabel(
-                        title: "Leave room",
-                        subtitle: "Leave this room",
+                        title: L10n.string("party_leave_room_title", fallback: "Leave room"),
+                        subtitle: L10n.string("party_panel_leave_room_subtitle", fallback: "Leave this room"),
                         symbol: "rectangle.portrait.and.arrow.right",
                         isFocused: leaveFocused
                     )
@@ -428,8 +448,8 @@ struct PlayerWatchPartyPanel: View {
                     let endFocused = focusedControlID == "party.endRoom"
                     Button(role: .destructive) { endingRoom = true } label: {
                         actionLabel(
-                            title: "End room for everyone",
-                            subtitle: "Remove all members",
+                            title: L10n.string("party_end_room_everyone_title", fallback: "End room for everyone"),
+                            subtitle: L10n.string("party_panel_end_room_subtitle", fallback: "Remove all members"),
                             symbol: "xmark.circle.fill",
                             isFocused: endFocused
                         )
@@ -450,8 +470,8 @@ struct PlayerWatchPartyPanel: View {
     private func catchUpButton(room: WatchPartySession, isTopRow: Bool) -> some View {
         let button = Button { viewModel.catchUpWithWatchParty() } label: {
             actionLabel(
-                title: "Catch up with room",
-                subtitle: "Jump to room position",
+                title: L10n.string("party_catch_up_title", fallback: "Catch up with room"),
+                subtitle: L10n.string("party_catch_up_subtitle", fallback: "Jump to room position"),
                 symbol: "backward.end.fill",
                 isFocused: focusedControlID == "party.catchUp"
             )
@@ -594,7 +614,7 @@ struct PlayerWatchPartyPanel: View {
             if service.busy || operation != nil {
                 HStack(spacing: 9) {
                     ProgressView()
-                    Text("Contacting room…")
+                    Text(L10n.string("party_contacting_room", fallback: "Contacting room…"))
                 }
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(.white.opacity(0.82))
@@ -605,7 +625,7 @@ struct PlayerWatchPartyPanel: View {
             } else if let failure = service.failure {
                 statusText(failureText(failure))
             } else if service.session?.membershipExit != nil {
-                statusText("Your previous room membership ended. Joining again needs a new request.")
+                statusText(L10n.string("party_panel_membership_ended", fallback: "Your previous room membership ended. Joining again needs a new request."))
             } else {
                 Color.clear.accessibilityHidden(true)
             }
@@ -630,7 +650,7 @@ struct PlayerWatchPartyPanel: View {
         // A source switch between warning and confirmation must not share the old URL.
         do {
             guard try viewModel.watchPartyShareableStream(for: party.media) == candidate else {
-                message = "The source changed. Review the new source before sharing."
+                message = L10n.string("party_panel_source_changed", fallback: "The source changed. Review the new source before sharing.")
                 return
             }
             let consent = try room.approveStreamSharing(candidate, origin: .directHTTP)
@@ -639,7 +659,7 @@ struct PlayerWatchPartyPanel: View {
                 hasSharedStream = true
             }
         } catch {
-            message = "This playback source is no longer shareable. Choose a compatible source."
+            message = L10n.string("party_panel_source_no_longer_shareable", fallback: "This playback source is no longer shareable. Choose a compatible source.")
         }
     }
 
@@ -649,7 +669,7 @@ struct PlayerWatchPartyPanel: View {
         operation = Task { @MainActor in
             defer { operation = nil }
             do { try await action() }
-            catch { if !Task.isCancelled { message = "Could not complete the room request. Check its status before trying again." } }
+            catch { if !Task.isCancelled { message = L10n.string("party_error_room_request", fallback: "Could not complete the room request. Check its status before trying again.") } }
         }
     }
 
@@ -707,35 +727,35 @@ struct PlayerWatchPartyPanel: View {
 
     private func connectionText(_ state: WatchPartyConnectionState) -> String {
         switch state {
-        case .ready: return "Connected"
-        case .connecting, .reconciling: return "Synchronizing room…"
-        case .recovering: return service.busy || operation != nil ? "Updating room…" : "Reconnecting…"
-        case .stopped: return "Room disconnected"
+        case .ready: return L10n.string("party_conn_connected", fallback: "Connected")
+        case .connecting, .reconciling: return L10n.string("party_conn_syncing", fallback: "Synchronizing room…")
+        case .recovering: return service.busy || operation != nil ? L10n.string("party_conn_updating", fallback: "Updating room…") : L10n.string("party_conn_reconnecting", fallback: "Reconnecting…")
+        case .stopped: return L10n.string("party_conn_disconnected", fallback: "Room disconnected")
         }
     }
 
     private func memberStatus(_ status: WatchPartyMemberStatus?) -> String {
-        guard let status else { return "Connecting" }
+        guard let status else { return L10n.string("party_status_connecting", fallback: "Connecting") }
         switch status {
-        case .browsing: return "Browsing"
-        case .loading: return "Loading"
-        case .buffering: return "Buffering"
-        case .ready: return "Watching"
-        case .behind: return "Behind"
+        case .browsing: return L10n.string("party_status_browsing", fallback: "Browsing")
+        case .loading: return L10n.string("party_status_loading_short", fallback: "Loading")
+        case .buffering: return L10n.string("party_status_buffering", fallback: "Buffering")
+        case .ready: return L10n.string("party_status_watching", fallback: "Watching")
+        case .behind: return L10n.string("party_status_behind_short", fallback: "Behind")
         }
     }
 
     private func failureText(_ failure: WatchPartyFailure) -> String {
         switch failure {
-        case .invalidCode: return "Enter a valid room code."
-        case .notFound: return "Room not found. Check the invitation code."
-        case .full: return "This room is full."
-        case .removed: return "You were removed from this room."
-        case .ended: return "This room has ended."
-        case .rateLimited: return "Too many requests. Wait before trying again."
-        case .signInRequired: return "Sign in again to use Watch Party."
-        case .unavailable: return "Watch Party is unavailable on this server."
-        case .network: return "The room request failed. Check your connection and room status."
+        case .invalidCode: return L10n.string("party_failure_invalid_code", fallback: "Enter a valid room code.")
+        case .notFound: return L10n.string("party_failure_not_found", fallback: "Room not found. Check the invitation code.")
+        case .full: return L10n.string("party_failure_full", fallback: "This room is full.")
+        case .removed: return L10n.string("party_failure_removed", fallback: "You were removed from this room.")
+        case .ended: return L10n.string("party_failure_ended", fallback: "This room has ended.")
+        case .rateLimited: return L10n.string("party_failure_rate_limited", fallback: "Too many requests. Wait before trying again.")
+        case .signInRequired: return L10n.string("party_failure_sign_in_required", fallback: "Sign in again to use Watch Party.")
+        case .unavailable: return L10n.string("party_failure_unavailable", fallback: "Watch Party is unavailable on this server.")
+        case .network: return L10n.string("party_failure_network_short", fallback: "The room request failed. Check your connection and room status.")
         }
     }
 }
@@ -749,19 +769,19 @@ private struct WatchPartyStreamRiskSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Label("Share your stream? · EXPERIMENTAL BETA", systemImage: "exclamationmark.shield.fill")
+            Label(L10n.string("party_share_stream_title", fallback: "Share your stream? · EXPERIMENTAL BETA"), systemImage: "exclamationmark.shield.fill")
                 .font(.system(size: 30, weight: .bold))
-            Text("This shares your current playback URL and required HTTP headers with room members. The URL may contain Debrid tokens or other private access information. Guests may copy or reuse it. Stopping sharing cannot revoke a link already received, and your provider may restrict simultaneous use.")
+            Text(L10n.string("party_share_url_warning", fallback: "This shares your current playback URL and required HTTP headers with room members. The URL may contain Debrid tokens or other private access information. Guests may copy or reuse it. Stopping sharing cannot revoke a link already received, and your provider may restrict simultaneous use."))
                 .font(.system(size: 21))
                 .fixedSize(horizontal: false, vertical: true)
-            Text("Only share with people you trust. The link is not end-to-end encrypted by this feature. Some sources may fail on another device.")
+            Text(L10n.string("party_share_trust_warning", fallback: "Only share with people you trust. The link is not end-to-end encrypted by this feature. Some sources may fail on another device."))
                 .font(.system(size: 18, weight: .medium))
                 .foregroundStyle(.secondary)
-            Toggle("Don't show this warning again", isOn: $hideWarningNextTime)
+            Toggle(L10n.string("party_share_stream_hide_warning", fallback: "Don't show this warning again"), isOn: $hideWarningNextTime)
             HStack(spacing: 20) {
-                Button("Cancel") { dismiss() }
+                Button(L10n.string("common_cancel", fallback: "Cancel")) { dismiss() }
                     .focused($focusedCancel)
-                Button("I understand, share this source") {
+                Button(L10n.string("party_share_stream_approve", fallback: "I understand, share this source")) {
                     onApprove(hideWarningNextTime)
                     dismiss()
                 }
