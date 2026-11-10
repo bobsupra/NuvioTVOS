@@ -1,5 +1,169 @@
 import Foundation
 import SwiftUI
+import Security
+
+struct TraktStoredSession: Codable, Equatable {
+    var accessToken: String?
+    var refreshToken: String?
+    var tokenType: String?
+    var createdAt: Int?
+    var expiresIn: Int?
+    var username: String?
+    var userSlug: String?
+    var credentialClientID: String?
+    var accountBindingID: String?
+}
+
+/// Durable Keychain storage for Trakt tokens and credentials.
+/// Survived sideload and in-place updates when container UserDefaults suites are lost.
+final class TraktKeychainStorage {
+    static let shared = TraktKeychainStorage()
+    private let service = "com.nuvio.tv.trakt.auth"
+    private static let lock = NSLock()
+    private static var stringCache: [String: String] = [:]
+    private static var sessionCache: [String: TraktStoredSession] = [:]
+    private static var negativeCache: Set<String> = []
+
+    func clientID(for profileScope: String) -> String? {
+        readString(accountType: "clientID", profileScope: profileScope)
+    }
+
+    func setClientID(_ value: String?, for profileScope: String) {
+        writeString(value, accountType: "clientID", profileScope: profileScope)
+    }
+
+    func clientSecret(for profileScope: String) -> String? {
+        readString(accountType: "clientSecret", profileScope: profileScope)
+    }
+
+    func setClientSecret(_ value: String?, for profileScope: String) {
+        writeString(value, accountType: "clientSecret", profileScope: profileScope)
+    }
+
+    func redirectURI(for profileScope: String) -> String? {
+        readString(accountType: "redirectURI", profileScope: profileScope)
+    }
+
+    func setRedirectURI(_ value: String?, for profileScope: String) {
+        writeString(value, accountType: "redirectURI", profileScope: profileScope)
+    }
+
+    func session(for profileScope: String) -> TraktStoredSession? {
+        let (cached, isNegative) = Self.lock.withLock {
+            (Self.sessionCache[profileScope], Self.negativeCache.contains(profileScope))
+        }
+        if let cached { return cached }
+        if isNegative { return nil }
+
+        var query = keychainQuery(for: profileScope, accountType: "tokens")
+        query[kSecReturnData as String] = kCFBooleanTrue
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data,
+              let decoded = try? JSONDecoder().decode(TraktStoredSession.self, from: data) else {
+            Self.lock.withLock { _ = Self.negativeCache.insert(profileScope) }
+            return nil
+        }
+        Self.lock.withLock {
+            Self.sessionCache[profileScope] = decoded
+            Self.negativeCache.remove(profileScope)
+        }
+        return decoded
+    }
+
+    @discardableResult
+    func saveSession(_ session: TraktStoredSession, for profileScope: String) -> Bool {
+        guard let data = try? JSONEncoder().encode(session) else { return false }
+        var addQuery = keychainQuery(for: profileScope, accountType: "tokens")
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        addQuery[kSecValueData as String] = data
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            _ = SecItemUpdate(
+                keychainQuery(for: profileScope, accountType: "tokens") as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary
+            )
+        }
+        Self.lock.withLock {
+            Self.sessionCache[profileScope] = session
+            Self.negativeCache.remove(profileScope)
+        }
+        return true
+    }
+
+    func removeSession(for profileScope: String) {
+        Self.lock.withLock {
+            Self.sessionCache.removeValue(forKey: profileScope)
+            Self.negativeCache.insert(profileScope)
+        }
+        _ = SecItemDelete(keychainQuery(for: profileScope, accountType: "tokens") as CFDictionary)
+    }
+
+    func clearAll() {
+        Self.lock.withLock {
+            Self.stringCache.removeAll()
+            Self.sessionCache.removeAll()
+            Self.negativeCache.removeAll()
+        }
+        _ = SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service
+        ] as CFDictionary)
+    }
+
+    private func readString(accountType: String, profileScope: String) -> String? {
+        let cacheKey = "\(accountType):\(profileScope)"
+        if let cached = Self.lock.withLock({ Self.stringCache[cacheKey] }), !cached.isEmpty {
+            return cached
+        }
+
+        var query = keychainQuery(for: profileScope, accountType: accountType)
+        query[kSecReturnData as String] = kCFBooleanTrue
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var item: CFTypeRef?
+        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+           let data = item as? Data,
+           let str = String(data: data, encoding: .utf8), !str.isEmpty {
+            Self.lock.withLock { Self.stringCache[cacheKey] = str }
+            return str
+        }
+        return nil
+    }
+
+    private func writeString(_ value: String?, accountType: String, profileScope: String) {
+        let cacheKey = "\(accountType):\(profileScope)"
+        Self.lock.withLock {
+            if let value, !value.isEmpty {
+                Self.stringCache[cacheKey] = value
+            } else {
+                Self.stringCache.removeValue(forKey: cacheKey)
+            }
+        }
+        _ = SecItemDelete(keychainQuery(for: profileScope, accountType: accountType) as CFDictionary)
+        guard let value, !value.isEmpty, let data = value.data(using: .utf8) else { return }
+        var addQuery = keychainQuery(for: profileScope, accountType: accountType)
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        addQuery[kSecValueData as String] = data
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            _ = SecItemUpdate(
+                keychainQuery(for: profileScope, accountType: accountType) as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary
+            )
+        }
+    }
+
+    private func keychainQuery(for profileScope: String, accountType: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "\(accountType).\(profileScope)"
+        ]
+    }
+}
 
 enum TraktConfig {
     static let apiBaseURL = "https://api.trakt.tv"
@@ -9,10 +173,46 @@ enum TraktConfig {
     static let legacyRedirectURI = "urn:ietf:wg:oauth:2.0:oob"
     static let defaultRedirectURI = "http://localhost:5173/callback"
 
+    static func profileScope(in store: UserDefaults) -> String {
+        if let scope = store.string(forKey: "nuvio.tv.profile.settings.profileID")?.trimmingCharacters(in: .whitespacesAndNewlines), !scope.isEmpty {
+            return scope
+        }
+        let active = ProfileSettings.activeProfileScope
+        return active.isEmpty ? "default" : active
+    }
+
+    static func candidateScopes(for scope: String) -> [String] {
+        if scope == "1" || scope == "default" || scope == "guest" {
+            var scopes = [scope]
+            for fallback in ["1", "default", "guest"] where !scopes.contains(fallback) {
+                scopes.append(fallback)
+            }
+            return scopes
+        }
+        return [scope]
+    }
+
     static func redirectURI(in store: UserDefaults) -> String {
         let stored = store.string(forKey: SettingsKey.traktRedirectURI)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return stored.isEmpty ? inferredRedirectURI(in: store) : stored
+        if !stored.isEmpty { return stored }
+
+        let primaryScope = profileScope(in: store)
+        for scope in candidateScopes(for: primaryScope) {
+            if let keychainVal = TraktKeychainStorage.shared.redirectURI(for: scope), !keychainVal.isEmpty {
+                store.set(keychainVal, forKey: SettingsKey.traktRedirectURI)
+                return keychainVal
+            }
+        }
+
+        if store != .standard,
+           let standardVal = UserDefaults.standard.string(forKey: SettingsKey.traktRedirectURI)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !standardVal.isEmpty {
+            store.set(standardVal, forKey: SettingsKey.traktRedirectURI)
+            return standardVal
+        }
+
+        return inferredRedirectURI(in: store)
     }
 
     /// Pins the profile's legacy or new-app default before credentials are first
@@ -40,6 +240,13 @@ enum TraktConfig {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         let selected = trimmed.isEmpty ? redirectURI(in: store) : trimmed
         store.set(selected, forKey: SettingsKey.traktRedirectURI)
+        let scope = profileScope(in: store)
+        TraktKeychainStorage.shared.setRedirectURI(selected, for: scope)
+        if ProfileSettings.isPrimaryProfileStore(store) || store == .standard {
+            UserDefaults.standard.set(selected, forKey: SettingsKey.traktRedirectURI)
+            if scope != "default" { TraktKeychainStorage.shared.setRedirectURI(selected, for: "default") }
+            if scope != "1" { TraktKeychainStorage.shared.setRedirectURI(selected, for: "1") }
+        }
         return selected
     }
 
@@ -60,13 +267,89 @@ enum TraktConfig {
     }
 
     static func clientID(in store: UserDefaults) -> String {
-        store.string(forKey: SettingsKey.traktClientID)?
+        let stored = store.string(forKey: SettingsKey.traktClientID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !stored.isEmpty { return stored }
+
+        let primaryScope = profileScope(in: store)
+        for scope in candidateScopes(for: primaryScope) {
+            if let keychainVal = TraktKeychainStorage.shared.clientID(for: scope), !keychainVal.isEmpty {
+                store.set(keychainVal, forKey: SettingsKey.traktClientID)
+                return keychainVal
+            }
+        }
+
+        if store != .standard,
+           let standardVal = UserDefaults.standard.string(forKey: SettingsKey.traktClientID)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !standardVal.isEmpty {
+            store.set(standardVal, forKey: SettingsKey.traktClientID)
+            return standardVal
+        }
+
+        return ""
     }
 
     static func clientSecret(in store: UserDefaults) -> String {
-        store.string(forKey: SettingsKey.traktClientSecret)?
+        let stored = store.string(forKey: SettingsKey.traktClientSecret)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !stored.isEmpty { return stored }
+
+        let primaryScope = profileScope(in: store)
+        for scope in candidateScopes(for: primaryScope) {
+            if let keychainVal = TraktKeychainStorage.shared.clientSecret(for: scope), !keychainVal.isEmpty {
+                store.set(keychainVal, forKey: SettingsKey.traktClientSecret)
+                return keychainVal
+            }
+        }
+
+        if store != .standard,
+           let standardVal = UserDefaults.standard.string(forKey: SettingsKey.traktClientSecret)?
+            .trimmingCharacters(in: .whitespacesAndNewlines), !standardVal.isEmpty {
+            store.set(standardVal, forKey: SettingsKey.traktClientSecret)
+            return standardVal
+        }
+
+        return ""
+    }
+
+    static func setClientID(_ value: String, in store: UserDefaults) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            store.removeObject(forKey: SettingsKey.traktClientID)
+        } else {
+            store.set(trimmed, forKey: SettingsKey.traktClientID)
+        }
+        let scope = profileScope(in: store)
+        TraktKeychainStorage.shared.setClientID(trimmed.isEmpty ? nil : trimmed, for: scope)
+        if ProfileSettings.isPrimaryProfileStore(store) || store == .standard {
+            if trimmed.isEmpty {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.traktClientID)
+            } else {
+                UserDefaults.standard.set(trimmed, forKey: SettingsKey.traktClientID)
+            }
+            if scope != "default" { TraktKeychainStorage.shared.setClientID(trimmed.isEmpty ? nil : trimmed, for: "default") }
+            if scope != "1" { TraktKeychainStorage.shared.setClientID(trimmed.isEmpty ? nil : trimmed, for: "1") }
+        }
+    }
+
+    static func setClientSecret(_ value: String, in store: UserDefaults) {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty {
+            store.removeObject(forKey: SettingsKey.traktClientSecret)
+        } else {
+            store.set(trimmed, forKey: SettingsKey.traktClientSecret)
+        }
+        let scope = profileScope(in: store)
+        TraktKeychainStorage.shared.setClientSecret(trimmed.isEmpty ? nil : trimmed, for: scope)
+        if ProfileSettings.isPrimaryProfileStore(store) || store == .standard {
+            if trimmed.isEmpty {
+                UserDefaults.standard.removeObject(forKey: SettingsKey.traktClientSecret)
+            } else {
+                UserDefaults.standard.set(trimmed, forKey: SettingsKey.traktClientSecret)
+            }
+            if scope != "default" { TraktKeychainStorage.shared.setClientSecret(trimmed.isEmpty ? nil : trimmed, for: "default") }
+            if scope != "1" { TraktKeychainStorage.shared.setClientSecret(trimmed.isEmpty ? nil : trimmed, for: "1") }
+        }
     }
 
     static func isConfigured(in store: UserDefaults) -> Bool {
@@ -243,6 +526,18 @@ enum TraktAuthStore {
     }
 
     static func state(in defaults: UserDefaults) -> TraktAuthState {
+        let currentToken = defaults.string(forKey: Key.accessToken)
+        if (currentToken ?? "").isEmpty {
+            let primaryScope = TraktConfig.profileScope(in: defaults)
+            for candidate in TraktConfig.candidateScopes(for: primaryScope) {
+                if let session = TraktKeychainStorage.shared.session(for: candidate),
+                   let accessToken = session.accessToken, !accessToken.isEmpty {
+                    restoreSession(session, into: defaults)
+                    break
+                }
+            }
+        }
+
         return TraktAuthState(
             accessToken: defaults.string(forKey: Key.accessToken),
             refreshToken: defaults.string(forKey: Key.refreshToken),
@@ -258,6 +553,40 @@ enum TraktAuthStore {
             pollInterval: intIfPresent(Key.pollInterval, defaults: defaults),
             credentialClientID: defaults.string(forKey: Key.credentialClientID)
         )
+    }
+
+    private static func restoreSession(_ session: TraktStoredSession, into defaults: UserDefaults) {
+        if let accessToken = session.accessToken, !accessToken.isEmpty {
+            defaults.set(accessToken, forKey: Key.accessToken)
+        }
+        if let refreshToken = session.refreshToken, !refreshToken.isEmpty {
+            defaults.set(refreshToken, forKey: Key.refreshToken)
+        }
+        if let tokenType = session.tokenType {
+            defaults.set(tokenType, forKey: Key.tokenType)
+        }
+        if let createdAt = session.createdAt {
+            defaults.set(createdAt, forKey: Key.createdAt)
+        }
+        if let expiresIn = session.expiresIn {
+            defaults.set(normalizeTokenLifetime(expiresIn), forKey: Key.expiresIn)
+        }
+        if let username = session.username {
+            defaults.set(username, forKey: Key.username)
+        }
+        if let userSlug = session.userSlug {
+            defaults.set(userSlug, forKey: Key.userSlug)
+        }
+        if let credentialClientID = session.credentialClientID {
+            defaults.set(credentialClientID, forKey: Key.credentialClientID)
+            if defaults.string(forKey: SettingsKey.traktClientID)?.isEmpty != false {
+                defaults.set(credentialClientID, forKey: SettingsKey.traktClientID)
+            }
+        }
+        if let accountBindingID = session.accountBindingID {
+            defaults.set(accountBindingID, forKey: Key.accountBindingID)
+        }
+        defaults.set(true, forKey: SettingsKey.traktConnected)
     }
 
     static func beginDeviceFlowRequest(store: UserDefaults) -> String {
@@ -283,6 +612,12 @@ enum TraktAuthStore {
             ].forEach { defaults.removeObject(forKey: $0) }
             defaults.removeObject(forKey: Key.accountBindingID)
             defaults.removeObject(forKey: SettingsKey.traktConnected)
+            let scope = TraktConfig.profileScope(in: defaults)
+            TraktKeychainStorage.shared.removeSession(for: scope)
+            if ProfileSettings.isPrimaryProfileStore(defaults) || defaults == .standard {
+                if scope != "default" { TraktKeychainStorage.shared.removeSession(for: "default") }
+                if scope != "1" { TraktKeychainStorage.shared.removeSession(for: "1") }
+            }
         }
         defaults.set(response.deviceCode, forKey: Key.deviceCode)
         defaults.set(response.userCode, forKey: Key.userCode)
@@ -313,6 +648,25 @@ enum TraktAuthStore {
         defaults.set(normalizeTokenLifetime(response.expiresIn), forKey: Key.expiresIn)
         defaults.set(clientID, forKey: Key.credentialClientID)
         defaults.set(true, forKey: SettingsKey.traktConnected)
+
+        let session = TraktStoredSession(
+            accessToken: response.accessToken,
+            refreshToken: response.refreshToken,
+            tokenType: response.tokenType,
+            createdAt: response.createdAt,
+            expiresIn: normalizeTokenLifetime(response.expiresIn),
+            username: defaults.string(forKey: Key.username),
+            userSlug: defaults.string(forKey: Key.userSlug),
+            credentialClientID: clientID,
+            accountBindingID: defaults.string(forKey: Key.accountBindingID)
+        )
+        let scope = TraktConfig.profileScope(in: defaults)
+        TraktKeychainStorage.shared.saveSession(session, for: scope)
+        if ProfileSettings.isPrimaryProfileStore(defaults) || defaults == .standard {
+            if scope != "default" { TraktKeychainStorage.shared.saveSession(session, for: "default") }
+            if scope != "1" { TraktKeychainStorage.shared.saveSession(session, for: "1") }
+        }
+
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
@@ -323,6 +677,16 @@ enum TraktAuthStore {
     ) {
         setOptional(username, forKey: Key.username, defaults: defaults)
         setOptional(slug, forKey: Key.userSlug, defaults: defaults)
+        let scope = TraktConfig.profileScope(in: defaults)
+        if var session = TraktKeychainStorage.shared.session(for: scope) {
+            session.username = username
+            session.userSlug = slug
+            TraktKeychainStorage.shared.saveSession(session, for: scope)
+            if ProfileSettings.isPrimaryProfileStore(defaults) || defaults == .standard {
+                if scope != "default" { TraktKeychainStorage.shared.saveSession(session, for: "default") }
+                if scope != "1" { TraktKeychainStorage.shared.saveSession(session, for: "1") }
+            }
+        }
     }
 
     static func accountBindingID(in defaults: UserDefaults) -> String? {
@@ -366,6 +730,12 @@ enum TraktAuthStore {
             Key.expiresAt, Key.pollInterval, Key.credentialClientID, Key.cachedStats
         ].forEach { defaults.removeObject(forKey: $0) }
         defaults.removeObject(forKey: SettingsKey.traktConnected)
+        let scope = TraktConfig.profileScope(in: defaults)
+        TraktKeychainStorage.shared.removeSession(for: scope)
+        if ProfileSettings.isPrimaryProfileStore(defaults) || defaults == .standard {
+            if scope != "default" { TraktKeychainStorage.shared.removeSession(for: "default") }
+            if scope != "1" { TraktKeychainStorage.shared.removeSession(for: "1") }
+        }
         RemoteLibraryStore.clear(source: .trakt, profileId: ProfileSettings.activeProfileID)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
@@ -4287,6 +4657,7 @@ struct TraktLibraryService {
     static func fetchLibrary(
         repository: CatalogRepository,
         requireSelectedSource: Bool = true,
+        requireCompleteSnapshot: Bool = false,
         onSnapshot: LibraryMetadataHydrator.SnapshotHandler? = nil
     ) async -> [LibraryStoreItem]? {
         let (store, profileID, settingsProfileID, hasLibraryContext, isLibraryContextCurrent) = await MainActor.run {
@@ -4334,6 +4705,8 @@ struct TraktLibraryService {
         ) {
             receivedResponse = true
             seeds.append(contentsOf: movies.compactMap { seed(from: $0, type: "movie") })
+        } else if requireCompleteSnapshot {
+            return nil
         }
 
         guard await isCurrent() else { return nil }
@@ -4342,6 +4715,8 @@ struct TraktLibraryService {
         ) {
             receivedResponse = true
             seeds.append(contentsOf: shows.compactMap { seed(from: $0, type: "series") })
+        } else if requireCompleteSnapshot {
+            return nil
         }
 
         guard await isCurrent() else { return nil }
@@ -4351,12 +4726,17 @@ struct TraktLibraryService {
             receivedResponse = true
             for list in lists where list.type?.lowercased() == "personal" {
                 guard await isCurrent() else { return nil }
-                guard let identifier = listIdentifier(from: list.ids) else { continue }
+                guard let identifier = listIdentifier(from: list.ids) else {
+                    if requireCompleteSnapshot { return nil }
+                    continue
+                }
 
                 if let movies: [TraktLibraryItemDTO] = try? await service.authorizedGet(
                     path: "users/me/lists/\(identifier)/items/movie?extended=full&page=1&limit=1000"
                 ) {
                     seeds.append(contentsOf: movies.compactMap { seed(from: $0, type: "movie") })
+                } else if requireCompleteSnapshot {
+                    return nil
                 }
 
                 guard await isCurrent() else { return nil }
@@ -4364,9 +4744,13 @@ struct TraktLibraryService {
                     path: "users/me/lists/\(identifier)/items/show?extended=full&page=1&limit=1000"
                 ) {
                     seeds.append(contentsOf: shows.compactMap { seed(from: $0, type: "series") })
+                } else if requireCompleteSnapshot {
+                    return nil
                 }
                 guard await isCurrent() else { return nil }
             }
+        } else if requireCompleteSnapshot {
+            return nil
         }
 
         guard receivedResponse else { return nil }

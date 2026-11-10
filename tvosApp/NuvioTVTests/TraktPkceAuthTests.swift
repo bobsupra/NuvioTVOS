@@ -45,6 +45,10 @@ final class TraktPkceAuthTests: XCTestCase {
         } else {
             ProfileSettings.clearActiveProfile()
         }
+        TraktKeychainStorage.shared.removeSession(for: profileID)
+        TraktKeychainStorage.shared.setClientID(nil, for: profileID)
+        TraktKeychainStorage.shared.setClientSecret(nil, for: profileID)
+        TraktKeychainStorage.shared.setRedirectURI(nil, for: profileID)
         UserDefaults.standard.removePersistentDomain(forName: suiteName)
         super.tearDown()
     }
@@ -297,6 +301,69 @@ final class TraktPkceAuthTests: XCTestCase {
         XCTAssertEqual(TraktAuthStore.state(in: store).refreshToken, "rotated-refresh")
         XCTAssertEqual(TraktAuthStore.state(in: store).accessToken, "rotated-access")
         XCTAssertEqual(TraktConfig.redirectURI(in: store), "https://example.test/new-callback")
+    }
+
+    // MARK: - Keychain & Update Persistence Tests
+
+    func testTraktCredentialsAndTokensPersistAcrossStoreResetViaKeychain() {
+        let testClientID = "my-trakt-client-id"
+        let testClientSecret = "my-trakt-secret"
+        let testRedirectURI = "https://my.app/callback"
+
+        TraktConfig.setClientID(testClientID, in: store)
+        TraktConfig.setClientSecret(testClientSecret, in: store)
+        TraktConfig.setRedirectURI(testRedirectURI, in: store)
+
+        let tokenResponse = TraktTokenResponse(
+            accessToken: "surviving-access-token",
+            tokenType: "Bearer",
+            expiresIn: 7_776_000,
+            refreshToken: "surviving-refresh-token",
+            createdAt: 1000
+        )
+        TraktAuthStore.saveToken(tokenResponse, clientID: testClientID, store: store)
+        TraktAuthStore.saveUser(username: "manish", slug: "manish-slug", store: store)
+
+        XCTAssertTrue(TraktAuthStore.isAuthenticated(in: store))
+        XCTAssertEqual(TraktConfig.clientID(in: store), testClientID)
+        XCTAssertEqual(TraktConfig.clientSecret(in: store), testClientSecret)
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), testRedirectURI)
+
+        // Simulate sideload in-place update or suite plist wipe
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        let freshStore = UserDefaults(suiteName: suiteName)!
+        freshStore.set(profileID, forKey: "nuvio.tv.profile.settings.profileID")
+
+        // Suite is wiped, but Keychain restores credentials and session
+        XCTAssertEqual(TraktConfig.clientID(in: freshStore), testClientID)
+        XCTAssertEqual(TraktConfig.clientSecret(in: freshStore), testClientSecret)
+        XCTAssertEqual(TraktConfig.redirectURI(in: freshStore), testRedirectURI)
+
+        let restoredState = TraktAuthStore.state(in: freshStore)
+        XCTAssertEqual(restoredState.accessToken, "surviving-access-token")
+        XCTAssertEqual(restoredState.refreshToken, "surviving-refresh-token")
+        XCTAssertEqual(restoredState.username, "manish")
+        XCTAssertEqual(restoredState.userSlug, "manish-slug")
+        XCTAssertTrue(TraktAuthStore.isAuthenticated(in: freshStore))
+    }
+
+    func testTraktClearAuthRemovesKeychainTokensWithoutRemovingCredentials() {
+        let testClientID = "trakt-persisted-client-id"
+        let testClientSecret = "trakt-persisted-secret"
+
+        TraktConfig.setClientID(testClientID, in: store)
+        TraktConfig.setClientSecret(testClientSecret, in: store)
+        seedConnectedSession(clientID: testClientID)
+
+        XCTAssertTrue(TraktAuthStore.isAuthenticated(in: store))
+
+        TraktAuthStore.clearAuth(store: store)
+
+        XCTAssertFalse(TraktAuthStore.isAuthenticated(in: store))
+        XCTAssertNil(TraktKeychainStorage.shared.session(for: profileID))
+        // Credentials must NOT be wiped when user only disconnects account
+        XCTAssertEqual(TraktConfig.clientID(in: store), testClientID)
+        XCTAssertEqual(TraktConfig.clientSecret(in: store), testClientSecret)
     }
 
     // MARK: - Helpers
