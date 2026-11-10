@@ -82,12 +82,15 @@ final class TopShelfLayoutTests: XCTestCase {
                                        iconURL: nil, iconWidth: 68)
         let newer = TopShelfRatingBadge(source: "imdb", name: "IMDb", value: "8.2", iconAssetName: "rating_imdb",
                                         iconURL: nil, iconWidth: 68)
+        let iconChanged = TopShelfRatingBadge(source: "imdb", name: "IMDb", value: "8.1", iconAssetName: nil,
+                                              iconURL: "https://example.com/new-imdb-icon.png", iconWidth: 68)
         XCTAssertEqual(TopShelfFeedStore.carouselImageName(for: entry, badges: nil), "top-shelf-c1.jpg")
         XCTAssertEqual(TopShelfFeedStore.carouselImageName(for: entry, badges: []), "top-shelf-c1.jpg")
         let rated = TopShelfFeedStore.carouselImageName(for: entry, badges: [imdb])
         XCTAssertNotEqual(rated, "top-shelf-c1.jpg")
         XCTAssertEqual(rated, TopShelfFeedStore.carouselImageName(for: entry, badges: [imdb]))
         XCTAssertNotEqual(rated, TopShelfFeedStore.carouselImageName(for: entry, badges: [newer]))
+        XCTAssertNotEqual(rated, TopShelfFeedStore.carouselImageName(for: entry, badges: [iconChanged]))
     }
 
     func testRatingsAreFreshForADay() {
@@ -98,6 +101,29 @@ final class TopShelfLayoutTests: XCTestCase {
         // No rating at all is asked again after half an hour.
         XCTAssertFalse(TopShelfRatingsStore.isFresh(.init(badges: [], fetchedAt: now.addingTimeInterval(-3_600)), now: now))
         XCTAssertFalse(TopShelfRatingsStore.isFresh(nil, now: now))
+    }
+
+    func testLegacyTopShelfRatingRecordDecodesWithoutConfigurationIdentity() throws {
+        struct LegacyRecord: Encodable {
+            let badges: [TopShelfRatingBadge]
+            let fetchedAt: Date
+        }
+
+        let data = try JSONEncoder().encode(LegacyRecord(badges: [], fetchedAt: Date()))
+        let decoded = try JSONDecoder().decode(TopShelfRatingsStore.Record.self, from: data)
+        XCTAssertNil(decoded.ratingsConfigurationIdentity)
+    }
+
+    func testHeroRatingVisibilityInvalidatesTopShelfRatingIdentity() {
+        let suiteName = "TopShelfHeroRatings-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+        let enabled = TopShelfRatingsBridge.configurationIdentity(defaults: defaults)
+
+        defaults.set(false, forKey: SettingsKey.homeHeroRatingsEnabled)
+        let disabled = TopShelfRatingsBridge.configurationIdentity(defaults: defaults)
+
+        XCTAssertNotEqual(enabled, disabled)
     }
 
     // MARK: Carousel

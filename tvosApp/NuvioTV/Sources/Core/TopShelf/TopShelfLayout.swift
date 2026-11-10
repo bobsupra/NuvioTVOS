@@ -199,6 +199,7 @@ public enum TopShelfConfigurationStore {
     private static func customSourceMix(_ configuration: TopShelfConfiguration) -> TopShelfConfiguration {
         var updated = configuration
         updated.homeScreenRowID = nil
+        updated.librarySource = .active
         return updated
     }
 

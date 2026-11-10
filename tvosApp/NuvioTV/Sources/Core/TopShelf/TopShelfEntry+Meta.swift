@@ -414,15 +414,23 @@ enum TopShelfTodayFeed {
 enum TopShelfRatingsBridge {
     static let maximumBadges = 5
 
+    static func configurationIdentity(defaults: UserDefaults = ProfileSettings.current) -> String {
+        let visibility = AddonRatingsService.isHomeHeroRatingsEnabled(defaults: defaults) ? "on" : "off"
+        return "\(AddonRatingsService.heroRatingsConfigurationIdentity(defaults: defaults))|visible:\(visibility)"
+    }
+
     static func install() {
         TopShelfFeedStore.ratingsProvider = { entry in
             await badges(for: entry)
         }
+        TopShelfFeedStore.ratingsConfigurationIdentityProvider = {
+            configurationIdentity()
+        }
+        TopShelfRatingsConfigurationObserver.shared.install()
     }
 
     static func badges(for entry: TopShelfEntry) async -> [TopShelfRatingBadge] {
-        let source = (ProfileSettings.current.string(forKey: SettingsKey.homeHeroRatingSource) ?? "imdb")
-            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard AddonRatingsService.isHomeHeroRatingsEnabled() else { return [] }
         let meta = NuvioMeta(
             id: entry.contentId,
             name: entry.title,
@@ -430,20 +438,9 @@ enum TopShelfRatingsBridge {
             tmdbId: entry.tmdbId,
             type: entry.contentType,
             rating: entry.imdbRating)
-        let fetched = AddonRatingsService.heroNeedsFetchedRatings(source: source, meta: meta)
-            ? await AddonRatingsService.fetchHomeHeroRatings(for: meta)
-            : nil
+        let fetched = await AddonRatingsService.fetchHeroRatings(for: meta)
         let ratings = AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched)
-            .filter { AddonRatingsService.isSourceEnabled($0.source) }
-        var badges = TvRatingBadge.badges(from: ratings)
-        if !AddonRatingsService.heroShowsAllRatings(source) {
-            // One score, as the hero: the chosen source, else IMDb.
-            let wanted = AddonRatingsService.normalizedSourceKey(source.isEmpty ? "imdb" : source)
-            let imdb = AddonRatingsService.normalizedSourceKey(MdbListDetailsService.providerIMDb)
-            let chosen = badges.first { AddonRatingsService.normalizedSourceKey($0.rating.source) == wanted }
-                ?? badges.first { AddonRatingsService.normalizedSourceKey($0.rating.source) == imdb }
-            badges = chosen.map { [$0] } ?? []
-        }
+        let badges = TvRatingBadge.badges(from: ratings)
         return badges.prefix(maximumBadges).map { badge in
             TopShelfRatingBadge(
                 source: badge.rating.source,
@@ -453,6 +450,54 @@ enum TopShelfRatingsBridge {
                 iconURL: badge.visual.iconUrl?.absoluteString,
                 iconWidth: Double(badge.visual.iconWidth))
         }
+    }
+}
+
+private final class TopShelfRatingsConfigurationObserver: @unchecked Sendable {
+    static let shared = TopShelfRatingsConfigurationObserver()
+
+    private let lock = NSLock()
+    private var identity: String?
+    private var observers: [NSObjectProtocol] = []
+
+    func install() {
+        let shouldInstall = lock.withLock {
+            guard observers.isEmpty else { return false }
+            identity = TopShelfRatingsBridge.configurationIdentity()
+            return true
+        }
+        guard shouldInstall else { return }
+
+        let center = NotificationCenter.default
+        let configurationObserver = center.addObserver(
+            forName: AddonRatingsService.ratingsConfigurationChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.settingsDidChange()
+        }
+        let defaultsObserver = center.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.settingsDidChange()
+        }
+        lock.withLock { observers = [configurationObserver, defaultsObserver] }
+        // Refresh once after the bridge is installed so records written by the previous
+        // single-source hero behavior are replaced with the new enabled provider row.
+        TopShelfFeedStore.refreshArtwork()
+    }
+
+    private func settingsDidChange() {
+        let current = TopShelfRatingsBridge.configurationIdentity()
+        let changed = lock.withLock { () -> Bool in
+            guard identity != current else { return false }
+            identity = current
+            return true
+        }
+        guard changed else { return }
+        TopShelfFeedStore.refreshArtwork()
     }
 }
 

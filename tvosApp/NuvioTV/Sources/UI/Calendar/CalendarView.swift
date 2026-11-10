@@ -626,7 +626,6 @@ struct CalendarView: View {
         }
         #if os(tvOS)
         .toolbar(.hidden, for: .navigationBar)
-        .toolbar(.hidden, for: .tabBar)
         #endif
         .onAppear { model.loadIfNeeded() }
         .sheet(isPresented: $showingSkipped) {

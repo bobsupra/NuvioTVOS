@@ -495,7 +495,13 @@ class DetailsViewModel: ObservableObject {
     }
 
     @discardableResult
-    func loadDetails(id: String, type: String) -> Task<Void, Never> {
+    func loadDetails(
+        id: String,
+        type: String,
+        relatedItemsSnapshot: [RelatedTitle]? = nil,
+        relatedPeopleSnapshot: [TmdbPersonMetadata]? = nil,
+        simklRatingsSnapshot: SimklTitleRatings? = nil
+    ) -> Task<Void, Never> {
         TVHomeDebugTrace.log("details.load.begin id=\(id) type=\(type)")
         didLoadMetadataSuccessfully = false
         metadataLoadError = nil
@@ -510,6 +516,7 @@ class DetailsViewModel: ObservableObject {
         requestedStreamId = nil
         detailsRequestGeneration &+= 1
         let requestGeneration = detailsRequestGeneration
+        let hasRelatedItemsSnapshot = relatedItemsSnapshot != nil
 
         // Check if metadata is already in memory so we can render frame 0 instantly without showing a spinner.
         // Any cached catalog entry already has the title, artwork, rating, and description needed for frame 0,
@@ -526,15 +533,32 @@ class DetailsViewModel: ObservableObject {
                 meta: seedingCachedRatings(into: cached),
                 error: nil,
                 isInWatchlist: LibraryStore.contains(metaId: cached.id, type: cached.type),
-                isWatched: WatchedStore.contains(meta: cached)
+                isWatched: WatchedStore.contains(meta: cached),
+                moreLikeThis: relatedItemsSnapshot ?? [],
+                people: relatedPeopleSnapshot ?? [],
+                simklRatings: simklRatingsSnapshot
             )
             if let enrichmentStarter = injectedEnrichmentStarter {
                 enrichmentStarter(cached, requestGeneration)
             } else {
-                loadEnrichment(for: cached, generation: requestGeneration)
+                loadEnrichment(
+                    for: cached,
+                    generation: requestGeneration,
+                    skipMoreLikeThisFetch: hasRelatedItemsSnapshot
+                )
             }
         } else if uiState.meta?.id != id {
-            uiState = DetailsUiState(isLoading: true, error: nil)
+            uiState = DetailsUiState(
+                isLoading: true,
+                error: nil,
+                moreLikeThis: relatedItemsSnapshot ?? [],
+                people: relatedPeopleSnapshot ?? [],
+                simklRatings: simklRatingsSnapshot
+            )
+        } else {
+            if let relatedItemsSnapshot { uiState.moreLikeThis = relatedItemsSnapshot }
+            if let relatedPeopleSnapshot { uiState.people = relatedPeopleSnapshot }
+            if let simklRatingsSnapshot { uiState.simklRatings = simklRatingsSnapshot }
         }
 
         let task = Task { [weak self] in
@@ -584,7 +608,11 @@ class DetailsViewModel: ObservableObject {
                         if let enrichmentStarter = self.injectedEnrichmentStarter {
                             enrichmentStarter(meta, requestGeneration)
                         } else {
-                            self.loadEnrichment(for: meta, generation: requestGeneration)
+                            self.loadEnrichment(
+                                for: meta,
+                                generation: requestGeneration,
+                                skipMoreLikeThisFetch: hasRelatedItemsSnapshot
+                            )
                         }
                     }
                 }
@@ -704,7 +732,11 @@ class DetailsViewModel: ObservableObject {
 
     /// Loads More Like This, Production companies, and top Trakt comments
     /// progressively and concurrently as soon as each returns.
-    private func loadEnrichment(for meta: NuvioMeta, generation: UInt64) {
+    private func loadEnrichment(
+        for meta: NuvioMeta,
+        generation: UInt64,
+        skipMoreLikeThisFetch: Bool = false
+    ) {
         enrichmentTask?.cancel()
         enrichmentTask = Task { [weak self] in
             guard let self else { return }
@@ -724,13 +756,15 @@ class DetailsViewModel: ObservableObject {
                 // The ratings as for any title: AniList's own, then MDBList and the rating
                 // add-ons by the IMDb id it maps to.
                 async let ratingsTask = Self.combinedRatings(for: meta)
-                let extras = await AniListService.extras(metaID: meta.id)
-                guard self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
-                if !extras.people.isEmpty {
-                    self.uiState.people = extras.people
-                }
-                if !extras.recommendations.isEmpty {
-                    self.uiState.moreLikeThis = extras.recommendations
+                if !skipMoreLikeThisFetch {
+                    let extras = await AniListService.extras(metaID: meta.id)
+                    guard self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
+                    if !extras.people.isEmpty {
+                        self.uiState.people = extras.people
+                    }
+                    if !extras.recommendations.isEmpty {
+                        self.uiState.moreLikeThis = extras.recommendations
+                    }
                 }
                 let ratings = await ratingsTask
                 self.applyMdbRatings(ratings, for: meta.id, generation: generation)
@@ -824,7 +858,7 @@ class DetailsViewModel: ObservableObject {
                 }
 
                 // 6. Simkl Details & Ratings
-                if isSimklConfigured {
+                if isSimklConfigured && (!skipMoreLikeThisFetch || self.uiState.simklRatings == nil) {
                     group.addTask {
                         let simkl = await SimklDetailsService.fetchDetails(for: meta)
                         await MainActor.run { [weak self] in
@@ -841,16 +875,20 @@ class DetailsViewModel: ObservableObject {
                     }
                 }
 
-                // 8. More Like This
-                group.addTask {
-                    let moreLikeThis = await Self.fetchAndHydrateMoreLikeThis(
-                        for: meta,
-                        preferredSource: preferredSource,
-                        isTraktAuth: isTraktAuth,
-                        isSimklConfigured: isSimklConfigured
-                    )
-                    await MainActor.run { [weak self] in
-                        self?.applyMoreLikeThis(moreLikeThis, for: meta.id, generation: generation)
+                // 8. More Like This. A valid navigation snapshot already has
+                // the exact ordered row the user selected from, so reload only
+                // the other enrichment while restoring this title.
+                if !skipMoreLikeThisFetch {
+                    group.addTask {
+                        let moreLikeThis = await Self.fetchAndHydrateMoreLikeThis(
+                            for: meta,
+                            preferredSource: preferredSource,
+                            isTraktAuth: isTraktAuth,
+                            isSimklConfigured: isSimklConfigured
+                        )
+                        await MainActor.run { [weak self] in
+                            self?.applyMoreLikeThis(moreLikeThis, for: meta.id, generation: generation)
+                        }
                     }
                 }
             }

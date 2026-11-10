@@ -17,7 +17,7 @@ struct TvRatingBadge: Identifiable {
     static func badges(from externalRatings: [NuvioExternalRating]) -> [TvRatingBadge] {
         let ratings = Dictionary(
             externalRatings.map { rating in
-                let key = rating.source.lowercased() == "mal" ? MdbListDetailsService.providerMyAnimeList : rating.source
+                let key = AddonRatingsService.normalizedSourceKey(rating.source)
                 return (key, rating)
             },
             uniquingKeysWith: { first, _ in first }
@@ -30,8 +30,8 @@ struct TvRatingBadge: Identifiable {
         // 2. Extra rating badges provided by add-ons:
         let builtInSources = Set(TvRatingVisual.all.map { $0.source.lowercased() })
         let extraRatings = externalRatings.filter {
-            let lower = $0.source.lowercased()
-            return !builtInSources.contains(lower) && lower != "mal"
+            let normalized = AddonRatingsService.normalizedSourceKey($0.source)
+            return !builtInSources.contains(normalized)
         }
         for extra in extraRatings {
             let visual = TvRatingVisual(

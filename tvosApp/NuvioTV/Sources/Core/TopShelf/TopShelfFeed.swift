@@ -349,6 +349,17 @@ public enum TopShelfRatingsStore {
     public struct Record: Codable, Equatable, Sendable {
         public let badges: [TopShelfRatingBadge]
         public let fetchedAt: Date
+        public let ratingsConfigurationIdentity: String?
+
+        public init(
+            badges: [TopShelfRatingBadge],
+            fetchedAt: Date,
+            ratingsConfigurationIdentity: String? = nil
+        ) {
+            self.badges = badges
+            self.fetchedAt = fetchedAt
+            self.ratingsConfigurationIdentity = ratingsConfigurationIdentity
+        }
     }
 
     static let fileName = "ratings.json"
@@ -457,6 +468,9 @@ public enum TopShelfFeedStore {
     /// Set by the app: the ratings the carousel shows for a title, in Nuvio's
     /// own sources and order. Nil in the extension, which only reads them.
     public static var ratingsProvider: (@Sendable (TopShelfEntry) async -> [TopShelfRatingBadge])?
+    /// Set by the app so cached ratings refresh when providers, order or visibility change.
+    /// Nil in the extension, which only reads the stamped records.
+    public static var ratingsConfigurationIdentityProvider: (@Sendable () -> String)?
     /// Set by the app: better artwork and ids for an entry before it is written (an AniList
     /// title's backdrop, logo and IMDb id). Nil in the extension.
     public static var entryEnricher: (@Sendable (TopShelfEntry) async -> TopShelfEntry)?
@@ -598,9 +612,14 @@ public enum TopShelfFeedStore {
             var ratings = TopShelfRatingsStore.read(in: container)
             if configuration.style.isCarousel, let provider = ratingsProvider {
                 var changed = false
-                for entry in displayed where !TopShelfRatingsStore.isFresh(ratings[entry.contentId]) {
+                let ratingsIdentity = ratingsConfigurationIdentityProvider?()
+                for entry in displayed where needsRatingsRefresh(ratings[entry.contentId], identity: ratingsIdentity) {
                     let badges = await provider(entry)
-                    ratings[entry.contentId] = TopShelfRatingsStore.Record(badges: badges, fetchedAt: Date())
+                    ratings[entry.contentId] = TopShelfRatingsStore.Record(
+                        badges: badges,
+                        fetchedAt: Date(),
+                        ratingsConfigurationIdentity: ratingsIdentity
+                    )
                     changed = true
                 }
                 // Titles no longer on the shelf drop out, so the file stays small.
@@ -622,6 +641,15 @@ public enum TopShelfFeedStore {
             TopShelfArtworkPruner.prune(in: container)
             notifyTopShelfContentChanged()
         }
+    }
+
+    private static func needsRatingsRefresh(
+        _ record: TopShelfRatingsStore.Record?,
+        identity: String?
+    ) -> Bool {
+        guard TopShelfRatingsStore.isFresh(record) else { return true }
+        guard let identity else { return false }
+        return record?.ratingsConfigurationIdentity != identity
     }
 
     /// Resolves a rendered card that both the app and extension can read from
@@ -674,7 +702,17 @@ public enum TopShelfFeedStore {
     static func carouselImageName(for entry: TopShelfEntry, badges: [TopShelfRatingBadge]?) -> String? {
         guard let base = entry.carouselArtworkFileName else { return nil }
         guard let badges, !badges.isEmpty else { return base }
-        return generatedName(for: [base] + badges.map { "\($0.source)=\($0.value)" })
+        let badgeSignature = badges.flatMap { badge in
+            [
+                badge.source,
+                badge.name,
+                badge.value,
+                badge.iconAssetName ?? "",
+                badge.iconURL ?? "",
+                String(badge.iconWidth)
+            ]
+        }
+        return generatedName(for: [base] + badgeSignature)
     }
 
     private static func existingArtwork(named name: String?) -> URL? {

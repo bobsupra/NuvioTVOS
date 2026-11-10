@@ -166,6 +166,7 @@ enum SettingsKey {
     static let heroCatalogs = "nuvio.tv.settings.layout.heroCatalogs"
     static let fullscreenHeroBackdrop = "nuvio.tv.settings.layout.fullscreenHeroBackdrop"
     static let homeHeroRatingSource = "nuvio.tv.settings.layout.homeHeroRatingSource"
+    static let homeHeroRatingsEnabled = "nuvio.tv.settings.layout.homeHeroRatingsEnabled"
     static let continueWatchingLabels = "nuvio.tv.settings.layout.continueWatchingLabels"
     static let posterLabels = "nuvio.tv.settings.layout.posterLabels"
     static let catalogAddonNames = "nuvio.tv.settings.layout.catalogAddonNames"
@@ -426,7 +427,7 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
         accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
-        homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
+        homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, homeHeroRatingsEnabled, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
         showCalendarTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
@@ -2775,36 +2776,6 @@ private struct AppearanceSettingsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(
-                title: L10n.string("settings_sidebar_tabs", fallback: "Sidebar"),
-                subtitle: L10n.string("settings_sidebar_tabs_subtitle", fallback: "Choose which sections appear in the sidebar")
-            ) {
-                SettingsToggleRow(
-                    title: L10n.string("settings_top_navigation", fallback: "Top Navigation Bar"),
-                    subtitle: L10n.string("settings_top_navigation_subtitle", fallback: "Use the Apple TV top tab bar instead of the sidebar"),
-                    isOn: $useTopNavigation,
-                    accentColor: accentColor
-                )
-                SettingsToggleRow(
-                    title: L10n.string("nav_calendar", fallback: "Calendar"),
-                    subtitle: L10n.string(
-                        "settings_show_calendar_tab_subtitle",
-                        fallback: "Upcoming episodes and releases from your library"
-                    ),
-                    isOn: $showCalendarTab,
-                    accentColor: accentColor
-                )
-                SettingsToggleRow(
-                    title: L10n.string("nav_watch_party", fallback: "Watch Party"),
-                    subtitle: L10n.string(
-                        "settings_show_watch_party_tab_subtitle",
-                        fallback: "Show Watch Party in the sidebar"
-                    ),
-                    isOn: $showWatchPartyTab,
-                    accentColor: accentColor
-                )
-            }
-
-            SettingsGroup(
                 title: L10n.string("settings_poster_card_style", fallback: "Card & Poster Style"),
                 subtitle: L10n.string(
                     "settings_poster_description",
@@ -2867,6 +2838,36 @@ private struct AppearanceSettingsView: View {
                 if !customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     customPosterScreens
                 }
+            }
+
+            SettingsGroup(
+                title: L10n.string("settings_sidebar_tabs", fallback: "Sidebar"),
+                subtitle: L10n.string("settings_sidebar_tabs_subtitle", fallback: "Choose which sections appear in the sidebar")
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("settings_top_navigation", fallback: "Top Navigation Bar"),
+                    subtitle: L10n.string("settings_top_navigation_subtitle", fallback: "Use the Apple TV top tab bar instead of the sidebar"),
+                    isOn: $useTopNavigation,
+                    accentColor: accentColor
+                )
+                SettingsToggleRow(
+                    title: L10n.string("nav_calendar", fallback: "Calendar"),
+                    subtitle: L10n.string(
+                        "settings_show_calendar_tab_subtitle",
+                        fallback: "Upcoming episodes and releases from your library"
+                    ),
+                    isOn: $showCalendarTab,
+                    accentColor: accentColor
+                )
+                SettingsToggleRow(
+                    title: L10n.string("nav_watch_party", fallback: "Watch Party"),
+                    subtitle: L10n.string(
+                        "settings_show_watch_party_tab_subtitle",
+                        fallback: "Show Watch Party in the sidebar"
+                    ),
+                    isOn: $showWatchPartyTab,
+                    accentColor: accentColor
+                )
             }
 
             SettingsGroup(
@@ -3227,7 +3228,7 @@ private struct HomeLayoutLivePreview: View {
     let layout: String
     let heroEnabled: Bool
     var fullscreenHeroBackdrop: Bool = true
-    var heroRatingSource: String = "imdb"
+    var heroRatingsEnabled = true
     let posterLabels: Bool
     let catalogAddonNames: Bool
     var landscapePosters: Bool = false
@@ -3404,7 +3405,7 @@ private struct HomeLayoutLivePreview: View {
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: layout)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: heroEnabled)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: fullscreenHeroBackdrop)
-        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: heroRatingSource)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: heroRatingsEnabled)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: posterLabels)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: catalogAddonNames)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: cardCornerRadius)
@@ -3414,8 +3415,6 @@ private struct HomeLayoutLivePreview: View {
     // MARK: - Hero Details Section (Matches Modern Home reference)
 
     private var heroDetailsSection: some View {
-        let ratingPart = AddonRatingsService.sampleRatingString(for: heroRatingSource)
-
         return VStack(alignment: .leading, spacing: 4) {
             // Glowing stylized title logo
             Text("DUNE: PART TWO")
@@ -3430,7 +3429,7 @@ private struct HomeLayoutLivePreview: View {
 
             // Metadata line
             HStack(spacing: 5) {
-                Text("Movie · Sci-Fi · 2h 46m · Mar 1, 2024 · \(ratingPart)")
+                Text("Movie · Sci-Fi · 2h 46m · Mar 1, 2024\(heroRatingsEnabled ? " · IMDb 8.6 · TMDB 81 · RT 96%" : "")")
                     .font(.system(size: 9, weight: .medium))
                     .foregroundColor(.white.opacity(0.70))
             }
@@ -4044,12 +4043,11 @@ private struct LayoutDiscoverySettingsView: View {
     let accentColor: Color
 
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
-    @AppStorage(SettingsKey.sidebarClockFormat) private var sidebarClockFormat = SidebarClockFormat.automatic.rawValue
     @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.fullscreenHeroBackdrop) private var fullscreenHeroBackdrop = true
-    @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
+    @AppStorage(SettingsKey.homeHeroRatingsEnabled) private var homeHeroRatingsEnabled = true
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.always.rawValue
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
@@ -4062,7 +4060,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
     @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
-    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = true
+    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = AddonRatingsService.defaultEpisodeRatingsOption
     @AppStorage(SettingsKey.continueWatchingBlurNextUp) private var continueWatchingBlurNextUp = false
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
@@ -4088,9 +4086,6 @@ private struct LayoutDiscoverySettingsView: View {
     private let searchStyles = ["Netflix", "Classic", "Native", "Grid"]
     private let continueWatchingSorts = ["Default", "Streaming Style", "Separate Upcoming Row"]
 
-    @State private var heroRatingSourceOptions: [HeroRatingSourceOption] = AddonRatingsService.builtInHeroRatingSources
-
-
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(
@@ -4104,7 +4099,7 @@ private struct LayoutDiscoverySettingsView: View {
                     layout: homeLayout,
                     heroEnabled: heroEnabled,
                     fullscreenHeroBackdrop: fullscreenHeroBackdrop,
-                    heroRatingSource: homeHeroRatingSource,
+                    heroRatingsEnabled: homeHeroRatingsEnabled,
                     posterLabels: posterLabels,
                     catalogAddonNames: catalogAddonNames,
                     landscapePosters: landscapePosters,
@@ -4125,20 +4120,6 @@ private struct LayoutDiscoverySettingsView: View {
                 .settingsEntryAnchor()
                 .onAppear {
                     if homeLayout == "Classic" { homeLayout = "Modern" }
-                }
-
-                if #available(tvOS 27.0, *) {
-                    SettingsOptionRow(
-                        title: L10n.string("sidebar_clock_format_title", fallback: "Sidebar Clock"),
-                        subtitle: L10n.string(
-                            "sidebar_clock_format_subtitle",
-                            fallback: "Time format beside your profile"
-                        ),
-                        selection: $sidebarClockFormat,
-                        options: SidebarClockFormat.allCases.map(\.rawValue),
-                        accentColor: accentColor,
-                        optionLabel: { SidebarClockFormat.fromStored($0).title }
-                    )
                 }
 
                 SettingsToggleRow(
@@ -4191,15 +4172,13 @@ private struct LayoutDiscoverySettingsView: View {
                 .opacity(heroEnabled ? 1 : 0.46)
                 .disabled(!heroEnabled)
 
-                SettingsChoiceRow(
-                    title: L10n.string("tvos_layout_hero_rating_source", fallback: "Hero Rating Source"),
+                SettingsToggleRow(
+                    title: L10n.string("tvos_layout_hero_ratings", fallback: "Hero Ratings"),
                     subtitle: L10n.string(
-                        "tvos_layout_hero_rating_source_subtitle",
-                        fallback: "Choose which rating provider is displayed in the hero info"
+                        "tvos_layout_hero_ratings_subtitle",
+                        fallback: "Show enabled rating providers in the order set in Rating Providers & Order"
                     ),
-                    selection: $homeHeroRatingSource,
-                    options: heroRatingSourceOptions.map(\.id),
-                    optionLabels: Dictionary(uniqueKeysWithValues: heroRatingSourceOptions.map { ($0.id, $0.displayName) }),
+                    isOn: $homeHeroRatingsEnabled,
                     accentColor: accentColor
                 )
                 .opacity(heroEnabled ? 1 : 0.46)
@@ -4393,17 +4372,24 @@ private struct LayoutDiscoverySettingsView: View {
                 .opacity(continueWatchingVisible ? 1 : 0.46)
                 .disabled(!continueWatchingVisible)
 
-                SettingsToggleRow(
+                SettingsOptionRow(
                     title: L10n.string("tvos_layout_episode_ratings", fallback: "Episode Ratings"),
                     subtitle: L10n.string(
                         "tvos_layout_episode_ratings_subtitle",
                         fallback: "Show individual episode ratings instead of series ratings for in-progress and upcoming titles"
                     ),
-                    isOn: $continueWatchingEpisodeRatings,
+                    selection: $continueWatchingEpisodeRatings,
+                    options: AddonRatingsService.episodeRatingsOptions,
                     accentColor: accentColor
                 )
                 .opacity(continueWatchingVisible ? 1 : 0.46)
                 .disabled(!continueWatchingVisible)
+                .onAppear {
+                    continueWatchingEpisodeRatings = AddonRatingsService.episodeRatingsChoice()
+                }
+                .onChange(of: continueWatchingEpisodeRatings) { _, newValue in
+                    AddonRatingsService.setEpisodeRatingsChoice(newValue)
+                }
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -4596,9 +4582,6 @@ private struct LayoutDiscoverySettingsView: View {
             }
 
             TopShelfSettingsGroup(accentColor: accentColor)
-        }
-        .task {
-            heroRatingSourceOptions = await AddonRatingsService.availableHeroRatingSources()
         }
         .onAppear(perform: refreshSummaryCounts)
         .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.addonOrderChangedNotification).receive(on: RunLoop.main)) { _ in
@@ -5376,7 +5359,6 @@ private struct IntegrationSettingsView: View {
     @State private var showingAddonsSettings = false
     @State private var addonSummaryCount = 0
     @State private var addonSummarySyncedAddons: [SyncedAddon]? = nil
-    @State private var topShelfLibrarySource = TopShelfConfigurationStore.load().librarySource.rawValue
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
@@ -5554,17 +5536,12 @@ private struct IntegrationSettingsView: View {
                     )
                 }
 
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_topshelf_library_source", fallback: "Library Source"),
-                    subtitle: L10n.string(
-                        "tvos_settings_topshelf_library_source_subtitle",
-                        fallback:
-                            "Choose whether Top Shelf pulls from your active library provider or a specific library"
-                    ),
-                    selection: topShelfLibrarySourceSelection,
-                    options: availableTopShelfLibrarySources.map(\.rawValue),
-                    accentColor: accentColor,
-                    optionLabel: topShelfLibrarySourceLabel
+                SettingsChoiceRow(
+                    title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
+                    subtitle: L10n.string("tvos_settings_trakt_library_source_subtitle", fallback: "Choose which library to use for saving and viewing your collection"),
+                    selection: globalLibrarySourceSelection,
+                    options: RemoteTrackingState.availableLibrarySources().map(\.label),
+                    accentColor: accentColor
                 )
             }
 
@@ -6171,66 +6148,14 @@ private struct IntegrationSettingsView: View {
         )
     }
 
-    private var topShelfLibrarySourceSelection: Binding<String> {
+    private var globalLibrarySourceSelection: Binding<String> {
         Binding(
-            get: { topShelfLibrarySource },
-            set: setTopShelfLibrarySource
+            get: { TraktSettingsStore.librarySourceMode.label },
+            set: { label in
+                TraktSettingsStore.librarySourceMode =
+                    TraktLibrarySourceMode.allCases.first { $0.label == label } ?? .local
+            }
         )
-    }
-
-    private var availableTopShelfLibrarySources: [TopShelfConfiguration.LibrarySource] {
-        var sources: [TopShelfConfiguration.LibrarySource] = [.active, .local]
-        let store = ProfileSettings.current
-        let profileId = ProfileSettings.activeProfileID
-        if TopShelfLibraryFeed.isSourceAvailable(.simkl, profileId: profileId, store: store) {
-            sources.append(.simkl)
-        }
-        if TopShelfLibraryFeed.isSourceAvailable(.trakt, profileId: profileId, store: store) {
-            sources.append(.trakt)
-        }
-        if TopShelfLibraryFeed.isSourceAvailable(.mdblist, profileId: profileId, store: store) {
-            sources.append(.mdblist)
-        }
-        if TopShelfLibraryFeed.isSourceAvailable(.wetrakr, profileId: profileId, store: store) {
-            sources.append(.wetrakr)
-        }
-        return sources
-    }
-
-    private func topShelfLibrarySourceLabel(_ rawValue: String) -> String {
-        guard let source = TopShelfConfiguration.LibrarySource(rawValue: rawValue) else {
-            return rawValue
-        }
-        switch source {
-        case .active:
-            let effective = TopShelfLibraryFeed.effectiveSourceMode(for: .active)
-            return
-                "\(L10n.string("tvos_settings_topshelf_library_active", fallback: "Active Library")) (\(effective.label))"
-        case .local:
-            return L10n.string("library_source_saved", fallback: "Nuvio Library")
-        case .simkl:
-            return "Simkl"
-        case .trakt:
-            return "Trakt"
-        case .mdblist:
-            return "MDBList"
-        case .wetrakr:
-            return "WeTrakr"
-        }
-    }
-
-    private func setTopShelfLibrarySource(_ rawValue: String) {
-        guard let source = TopShelfConfiguration.LibrarySource(rawValue: rawValue) else { return }
-        var configuration = TopShelfConfigurationStore.load()
-        guard configuration.librarySource != source else {
-            topShelfLibrarySource = source.rawValue
-            return
-        }
-        configuration.librarySource = source
-        topShelfLibrarySource = source.rawValue
-        TopShelfConfigurationStore.save(configuration)
-        TopShelfLibraryFeed.write()
-        TopShelfLibraryFeed.prefetchRemoteLibraryIfNeeded(force: true)
     }
 
     private func connectTrakt() {
@@ -8798,7 +8723,7 @@ private struct TraktConnectionSettingsCard: View {
         case .awaitingApproval:
             return L10n.string("tvos_settings_waiting_for_approval", fallback: "Waiting for approval")
         case .connected:
-            let name = (viewModel.username?.isEmpty == false) ? (viewModel.username ?? "Trakt User") : "Trakt User"
+            let name = viewModel.resolvedDisplayName ?? "Trakt User"
             return L10n.format(
                 "tvos_settings_connected_as_user",
                 fallback: "Connected as %@",
@@ -8866,8 +8791,8 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("account_title", fallback: "Account"),
                             subtitle: L10n.string("tvos_settings_trakt_account_info_subtitle", fallback: "Account information returned by Trakt")
                         ) {
-                            if let username = viewModel.username, !username.isEmpty {
-                                SettingsInfoRow(title: L10n.string("account_username", fallback: "Username"), value: username)
+                            if let displayName = viewModel.resolvedDisplayName {
+                                SettingsInfoRow(title: L10n.string("account_username", fallback: "Username"), value: displayName)
                             }
                             SettingsInfoRow(
                                 title: "Auth Protocol",
@@ -9041,8 +8966,7 @@ private struct TraktConnectedSettingsSheet: View {
     }
 
     private var connectedUsername: String {
-        let username = viewModel.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return username.isEmpty ? "Trakt User" : username
+        viewModel.resolvedDisplayName ?? "Trakt User"
     }
 
     private func durationLabel(seconds: Int) -> String {
@@ -9226,17 +9150,20 @@ private struct TraktDeviceLoginSheet: View {
                 .foregroundColor(.white)
 
             if viewModel.mode == .connected {
-                Text(
-                    viewModel.username.map {
-                        L10n.format("tvos_settings_signed_in_as", fallback: "Signed in as %@", $0)
-                    } ?? L10n.string(
+                if let displayName = viewModel.resolvedDisplayName {
+                    Text(L10n.format("tvos_settings_signed_in_as", fallback: "Signed in as %@", displayName))
+                        .font(.system(size: 23, weight: .medium))
+                        .foregroundColor(.white.opacity(0.66))
+                        .multilineTextAlignment(.center)
+                } else {
+                    Text(L10n.string(
                         "tvos_settings_this_apple_tv_is_linked_to_trakt",
                         fallback: "This Apple TV is linked to Trakt."
-                    )
-                )
+                    ))
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.66))
                     .multilineTextAlignment(.center)
+                }
                 dialogButton(title: L10n.string("tvos_settings_done", fallback: "Done"), isPrimary: true) { dismiss() }
             } else if viewModel.deviceUserCode == nil && viewModel.errorMessage == nil {
                 ProgressView()

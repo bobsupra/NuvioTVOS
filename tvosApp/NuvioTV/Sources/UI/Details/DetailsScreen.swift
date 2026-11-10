@@ -5306,18 +5306,32 @@ struct TvDetailsContent: View {
         }
     }
 
-    private func finishRelatedFocusRestoration(_ targetID: String) {
+    private func finishRelatedFocusRestoration(_ targetID: String, using scrollProxy: ScrollViewProxy) {
         guard relatedFocusRestoreTargetID == targetID else { return }
         relatedFocusRestoreGeneration &+= 1
+        let generation = relatedFocusRestoreGeneration
         relatedFocusRestoreTargetID = nil
         relatedFocusRestoreAttemptID = nil
         onRelatedFocusRequestFinished?(targetID)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            guard relatedFocusRestoreGeneration == generation,
+                  relatedRowIsMounted,
+                  isEnabled,
+                  focusedDetailsSection == .related,
+                  relatedCardFocus == targetID else { return }
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+            }
+        }
     }
 
     private func cancelRelatedFocusRestoration() {
         detailsFocusMoveGeneration &+= 1
-        guard let targetID = relatedFocusRestoreTargetID else { return }
         relatedFocusRestoreGeneration &+= 1
+        guard let targetID = relatedFocusRestoreTargetID else { return }
         relatedFocusRestoreTargetID = nil
         relatedFocusRestoreAttemptID = nil
         if relatedCardFocus == targetID {
@@ -5515,7 +5529,7 @@ struct TvDetailsContent: View {
             } : nil,
             onItemFocus: restoresMoreLikeThisFocus ? { item in
                 guard relatedFocusRestoreTargetID == item.id else { return }
-                finishRelatedFocusRestoration(item.id)
+                finishRelatedFocusRestoration(item.id, using: scrollProxy)
             } : nil,
             onSelect: { item in
                 stopBackgroundTrailer(manual: false)

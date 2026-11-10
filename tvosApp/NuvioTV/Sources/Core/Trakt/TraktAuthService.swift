@@ -9,6 +9,7 @@ struct TraktStoredSession: Codable, Equatable {
     var createdAt: Int?
     var expiresIn: Int?
     var username: String?
+    var displayName: String?
     var userSlug: String?
     var credentialClientID: String?
     var accountBindingID: String?
@@ -435,6 +436,7 @@ struct TraktAuthState: Equatable {
     var createdAt: Int?
     var expiresIn: Int?
     var username: String?
+    var displayName: String?
     var userSlug: String?
     var deviceCode: String?
     var userCode: String?
@@ -493,6 +495,7 @@ enum TraktAuthStore {
         static let createdAt = "nuvio.tv.trakt.auth.createdAt"
         static let expiresIn = "nuvio.tv.trakt.auth.expiresIn"
         static let username = "nuvio.tv.trakt.auth.username"
+        static let displayName = "nuvio.tv.trakt.auth.displayName"
         static let userSlug = "nuvio.tv.trakt.auth.userSlug"
         static let accountBindingID = "nuvio.tv.trakt.auth.accountBindingID"
         static let deviceFlowRequestID = "nuvio.tv.trakt.auth.deviceFlowRequestID"
@@ -545,6 +548,7 @@ enum TraktAuthStore {
             createdAt: intIfPresent(Key.createdAt, defaults: defaults),
             expiresIn: intIfPresent(Key.expiresIn, defaults: defaults).map(normalizeTokenLifetime),
             username: defaults.string(forKey: Key.username),
+            displayName: defaults.string(forKey: Key.displayName),
             userSlug: defaults.string(forKey: Key.userSlug),
             deviceCode: defaults.string(forKey: Key.deviceCode),
             userCode: defaults.string(forKey: Key.userCode),
@@ -573,6 +577,9 @@ enum TraktAuthStore {
         }
         if let username = session.username {
             defaults.set(username, forKey: Key.username)
+        }
+        if let displayName = session.displayName {
+            defaults.set(displayName, forKey: Key.displayName)
         }
         if let userSlug = session.userSlug {
             defaults.set(userSlug, forKey: Key.userSlug)
@@ -608,7 +615,7 @@ enum TraktAuthStore {
         if defaults.string(forKey: Key.credentialClientID) != clientID {
             [
                 Key.accessToken, Key.refreshToken, Key.tokenType, Key.createdAt,
-                Key.expiresIn, Key.username, Key.userSlug, Key.cachedStats
+                Key.expiresIn, Key.username, Key.displayName, Key.userSlug, Key.cachedStats
             ].forEach { defaults.removeObject(forKey: $0) }
             defaults.removeObject(forKey: Key.accountBindingID)
             defaults.removeObject(forKey: SettingsKey.traktConnected)
@@ -636,6 +643,7 @@ enum TraktAuthStore {
         if isNewLogin {
             defaults.removeObject(forKey: Key.deviceFlowRequestID)
             defaults.removeObject(forKey: Key.username)
+            defaults.removeObject(forKey: Key.displayName)
             defaults.removeObject(forKey: Key.userSlug)
             defaults.set(UUID().uuidString, forKey: Key.accountBindingID)
         } else if defaults.string(forKey: Key.accountBindingID) == nil {
@@ -656,6 +664,7 @@ enum TraktAuthStore {
             createdAt: response.createdAt,
             expiresIn: normalizeTokenLifetime(response.expiresIn),
             username: defaults.string(forKey: Key.username),
+            displayName: defaults.string(forKey: Key.displayName),
             userSlug: defaults.string(forKey: Key.userSlug),
             credentialClientID: clientID,
             accountBindingID: defaults.string(forKey: Key.accountBindingID)
@@ -673,13 +682,16 @@ enum TraktAuthStore {
     static func saveUser(
         username: String?,
         slug: String?,
+        displayName: String? = nil,
         store defaults: UserDefaults = ProfileSettings.current
     ) {
         setOptional(username, forKey: Key.username, defaults: defaults)
+        setOptional(displayName, forKey: Key.displayName, defaults: defaults)
         setOptional(slug, forKey: Key.userSlug, defaults: defaults)
         let scope = TraktConfig.profileScope(in: defaults)
         if var session = TraktKeychainStorage.shared.session(for: scope) {
             session.username = username
+            session.displayName = displayName
             session.userSlug = slug
             TraktKeychainStorage.shared.saveSession(session, for: scope)
             if ProfileSettings.isPrimaryProfileStore(defaults) || defaults == .standard {
@@ -726,7 +738,7 @@ enum TraktAuthStore {
     static func clearAuth(store defaults: UserDefaults = ProfileSettings.current) {
         [
             Key.accessToken, Key.refreshToken, Key.tokenType, Key.createdAt, Key.expiresIn,
-            Key.username, Key.userSlug, Key.accountBindingID, Key.deviceFlowRequestID, Key.deviceCode, Key.userCode, Key.verificationURL,
+            Key.username, Key.displayName, Key.userSlug, Key.accountBindingID, Key.deviceFlowRequestID, Key.deviceCode, Key.userCode, Key.verificationURL,
             Key.expiresAt, Key.pollInterval, Key.credentialClientID, Key.cachedStats
         ].forEach { defaults.removeObject(forKey: $0) }
         defaults.removeObject(forKey: SettingsKey.traktConnected)
@@ -1252,6 +1264,7 @@ private struct TraktUserSettingsResponse: Decodable {
     struct User: Decodable {
         struct IDs: Decodable { let slug: String? }
         let username: String?
+        let name: String?
         let ids: IDs?
     }
     let user: User?
@@ -1503,8 +1516,9 @@ final class TraktAuthService {
             return nil
         }
         let username = response.user?.username
+        let displayName = response.user?.name
         let slug = response.user?.ids?.slug
-        TraktAuthStore.saveUser(username: username, slug: slug, store: store)
+        TraktAuthStore.saveUser(username: username, slug: slug, displayName: displayName, store: store)
         return username
     }
 
@@ -5035,6 +5049,7 @@ final class TraktSettingsViewModel: ObservableObject {
     @Published var isStatsLoading = false
     @Published var isPolling = false
     @Published var username: String?
+    @Published var displayName: String?
     @Published var deviceUserCode: String?
     @Published var verificationURL: String?
     @Published var deviceCodeExpiresAtMillis: Double?
@@ -5048,6 +5063,14 @@ final class TraktSettingsViewModel: ObservableObject {
     @Published var watchProgressSource = TraktSettingsStore.watchProgressSource
     @Published var librarySourceMode = TraktSettingsStore.librarySourceMode
     @Published var moreLikeThisSource = TraktSettingsStore.moreLikeThisSource
+
+    var resolvedDisplayName: String? {
+        for candidate in [displayName, username] {
+            let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !value.isEmpty { return value }
+        }
+        return nil
+    }
 
     private let store: UserDefaults
     private let service: TraktAuthService
@@ -5070,6 +5093,7 @@ final class TraktSettingsViewModel: ObservableObject {
         credentialsConfigured = service.hasRequiredCredentials()
         let state = service.currentState()
         username = state.username
+        displayName = state.displayName
         deviceUserCode = state.userCode
         verificationURL = state.verificationURL
         deviceCodeExpiresAtMillis = state.expiresAt
@@ -5222,7 +5246,9 @@ final class TraktSettingsViewModel: ObservableObject {
                 reload()
                 return
             }
-            if username?.isEmpty != false {
+            let usernameMissing = username?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+            let displayNameMissing = displayName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+            if usernameMissing || displayNameMissing {
                 _ = await service.fetchUserSettings()
             }
             if let stats = await service.fetchUserStats() {

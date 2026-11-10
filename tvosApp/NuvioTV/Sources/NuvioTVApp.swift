@@ -355,6 +355,85 @@ struct DetailsNavigationEntry {
     let id: String
     let type: String
     let libraryWatchedContext: LibraryWatchedContext?
+    let relatedFocusID: String?
+    let relatedItemsSnapshot: DetailsRelatedItemsSnapshot?
+
+    init(
+        id: String,
+        type: String,
+        libraryWatchedContext: LibraryWatchedContext?,
+        relatedFocusID: String? = nil,
+        relatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil
+    ) {
+        self.id = id
+        self.type = type
+        self.libraryWatchedContext = libraryWatchedContext
+        self.relatedFocusID = relatedFocusID
+        self.relatedItemsSnapshot = relatedItemsSnapshot
+    }
+}
+
+struct DetailsRelatedItemsSnapshot {
+    let parentID: String
+    let parentType: String
+    let items: [RelatedTitle]
+    let people: [TmdbPersonMetadata]
+    let simklRatings: SimklTitleRatings?
+    let profileID: String?
+    let source: String
+    let language: String
+    let aniListLanguage: String
+    let relatedSectionEnabled: Bool
+    let tmdbMoreLikeThisEnabled: Bool
+    let tmdbConfigurationIdentity: String
+    let traktAccountBindingID: String?
+    let traktAuthenticated: Bool
+    let simklConfigured: Bool
+
+    @MainActor
+    static func capture(
+        parentID: String,
+        parentType: String,
+        selectedRelatedID: String,
+        items: [RelatedTitle],
+        people: [TmdbPersonMetadata],
+        simklRatings: SimklTitleRatings?
+    ) -> DetailsRelatedItemsSnapshot? {
+        guard items.contains(where: { $0.id == selectedRelatedID }) else { return nil }
+        return DetailsRelatedItemsSnapshot(
+            parentID: parentID,
+            parentType: parentType,
+            items: items,
+            people: people,
+            simklRatings: simklRatings,
+            profileID: ProfileSettings.activeProfileID,
+            source: TraktSettingsStore.moreLikeThisSource.rawValue,
+            language: TmdbDetailsService.preferredLanguage,
+            aniListLanguage: AniListSettings.titleLanguage.rawValue,
+            relatedSectionEnabled: TVDetailsSectionOrder.isSectionEnabled(.related),
+            tmdbMoreLikeThisEnabled: TmdbDetailsService.useMoreLikeThis,
+            tmdbConfigurationIdentity: TmdbDetailsService.trailerResolutionConfigurationIdentity,
+            traktAccountBindingID: TraktAuthStore.accountBindingID(in: ProfileSettings.current),
+            traktAuthenticated: TraktAuthStore.isAuthenticated,
+            simklConfigured: SimklDetailsService.isConfigured
+        )
+    }
+
+    @MainActor
+    func isValid(for parentID: String, type parentType: String) -> Bool {
+        self.parentID == parentID
+            && self.parentType == parentType
+            && profileID == ProfileSettings.activeProfileID
+            && source == TraktSettingsStore.moreLikeThisSource.rawValue
+            && language == TmdbDetailsService.preferredLanguage
+            && aniListLanguage == AniListSettings.titleLanguage.rawValue
+            && relatedSectionEnabled == TVDetailsSectionOrder.isSectionEnabled(.related)
+            && tmdbMoreLikeThisEnabled == TmdbDetailsService.useMoreLikeThis
+            && tmdbConfigurationIdentity == TmdbDetailsService.trailerResolutionConfigurationIdentity
+            && traktAccountBindingID == TraktAuthStore.accountBindingID(in: ProfileSettings.current)
+            && traktAuthenticated == TraktAuthStore.isAuthenticated
+            && simklConfigured == SimklDetailsService.isConfigured
+    }
 }
 
 @MainActor
@@ -365,13 +444,17 @@ struct DetailsNavigationContextTransition {
     static func pushingCurrentDetails(
         id: String,
         type: String,
-        libraryWatchedContext: LibraryWatchedContext?
+        libraryWatchedContext: LibraryWatchedContext?,
+        relatedFocusID: String? = nil,
+        relatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil
     ) -> DetailsNavigationContextTransition {
         DetailsNavigationContextTransition(
             backStackEntry: DetailsNavigationEntry(
                 id: id,
                 type: type,
-                libraryWatchedContext: libraryWatchedContext
+                libraryWatchedContext: libraryWatchedContext,
+                relatedFocusID: relatedFocusID,
+                relatedItemsSnapshot: relatedItemsSnapshot
             ),
             activeLibraryWatchedContext: nil
         )
@@ -509,6 +592,9 @@ struct ContentView: View {
     /// this"). Empty means the current Details is the root of its chain and back
     /// belongs to its recorded return destination.
     @State private var detailsBackStack: [DetailsNavigationEntry] = []
+    /// One-shot recommendation focus request carried from a pushed title back
+    /// to the parent Details route.
+    @State private var pendingDetailsRelatedFocusRequest: DetailsNavigationEntry?
     @State private var nextDetailsPlaybackRequestID: UInt = 0
     @State private var pendingDetailsPlaybackRequestID: UInt?
     @State private var presentedAppNoticeDetails: AppNotice?
@@ -1155,7 +1241,15 @@ struct ContentView: View {
             if let previous = detailsBackStack.popLast() {
                 activeScreen = .details(id: previous.id, type: previous.type)
                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(previous)
+                if previous.relatedFocusID != nil,
+                   let snapshot = previous.relatedItemsSnapshot,
+                   snapshot.isValid(for: previous.id, type: previous.type) {
+                    pendingDetailsRelatedFocusRequest = previous
+                } else {
+                    pendingDetailsRelatedFocusRequest = nil
+                }
             } else {
+                pendingDetailsRelatedFocusRequest = nil
                 switch detailsReturnDestination {
                 case .main:
                     activeScreen = .main
@@ -1184,6 +1278,7 @@ struct ContentView: View {
             "details.open.root id=\(id) type=\(type) returnDest=\(returnDestination)"
         )
         detailsBackStack.removeAll()
+        pendingDetailsRelatedFocusRequest = nil
         detailsCollectionContext = collectionContext
         detailsFocusEpisode = focusEpisode
         detailsLibraryWatchedContext = libraryWatchedContext
@@ -3113,11 +3208,27 @@ struct ContentView: View {
 
     private func detailsScreen(contentId: String, contentType: String) -> some View {
         let provenance = detailsCollectionContext
+        let relatedRestoreEntry: DetailsNavigationEntry? = pendingDetailsRelatedFocusRequest.flatMap { entry in
+            guard entry.id == contentId,
+                  entry.type == contentType,
+                  entry.relatedFocusID != nil else {
+                return nil
+            }
+            return entry
+        }
         return DetailsScreen(
             id: contentId,
             type: contentType,
             libraryWatchedContext: detailsLibraryWatchedContext,
             repository: CinemetaCatalogRepository(),
+            initialRelatedItemsSnapshot: relatedRestoreEntry?.relatedItemsSnapshot,
+            initialRelatedFocusID: relatedRestoreEntry?.relatedFocusID,
+            onRelatedFocusRequestFinished: { focusedID in
+                guard pendingDetailsRelatedFocusRequest?.id == contentId,
+                      pendingDetailsRelatedFocusRequest?.type == contentType,
+                      pendingDetailsRelatedFocusRequest?.relatedFocusID == focusedID else { return }
+                pendingDetailsRelatedFocusRequest = nil
+            },
             initialPlaybackRequestID: pendingDetailsPlaybackRequestID,
             onInitialPlaybackRequestConsumed: { requestID in
                 guard pendingDetailsPlaybackRequestID == requestID else { return }
@@ -3177,11 +3288,25 @@ struct ContentView: View {
             onCreateWatchParty: WatchPartyConfiguration.isEnabled ? { meta, episode in
                 createWatchPartyFromDetails(meta: meta, episode: episode)
             } : nil,
-            onOpenTitle: { nextId, nextType in
+            onOpenTitle: { nextId, nextType, selectedRelatedID, displayedRelatedItems, displayedPeople, displayedSimklRatings in
+                pendingDetailsRelatedFocusRequest = nil
+                let relatedSnapshot: DetailsRelatedItemsSnapshot? = selectedRelatedID.flatMap { selectedID in
+                    guard let displayedRelatedItems else { return nil }
+                    return DetailsRelatedItemsSnapshot.capture(
+                        parentID: contentId,
+                        parentType: contentType,
+                        selectedRelatedID: selectedID,
+                        items: displayedRelatedItems,
+                        people: displayedPeople,
+                        simklRatings: displayedSimklRatings
+                    )
+                }
                 let transition = DetailsNavigationContextTransition.pushingCurrentDetails(
                     id: contentId,
                     type: contentType,
-                    libraryWatchedContext: detailsLibraryWatchedContext
+                    libraryWatchedContext: detailsLibraryWatchedContext,
+                    relatedFocusID: relatedSnapshot == nil ? nil : selectedRelatedID,
+                    relatedItemsSnapshot: relatedSnapshot
                 )
                 detailsBackStack.append(transition.backStackEntry)
                 detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
@@ -3190,6 +3315,7 @@ struct ContentView: View {
                 }
             },
             onOpenProduction: { company in
+                pendingDetailsRelatedFocusRequest = nil
                 productionBrowseReturn = DetailsNavigationEntry(
                     id: contentId,
                     type: contentType,
@@ -3200,6 +3326,7 @@ struct ContentView: View {
                 }
             },
             onOpenPerson: { person in
+                pendingDetailsRelatedFocusRequest = nil
                 personBrowseReturn = DetailsNavigationEntry(
                     id: contentId,
                     type: contentType,
@@ -12536,11 +12663,13 @@ private struct TVGridHeroSlideshowView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
-    @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
+    @AppStorage(SettingsKey.homeHeroRatingsEnabled) private var homeHeroRatingsEnabled = true
     @Environment(\.scenePhase) private var scenePhase
     @FocusState private var focusedTarget: GridHeroFocusTarget?
     @State private var isInLibraryCache = false
     @State private var gridHeroRatings: [String: [NuvioExternalRating]] = [:]
+    @State private var heroRatingConfigurationIdentity = AddonRatingsService.heroRatingsConfigurationIdentity()
+    @State private var heroRatingConfigurationRevision = 0
     @State private var lastFocusChangeTime: CFTimeInterval = 0
     @State private var activeTrailerPreviewIdentity: String?
     @State private var finishedTrailerPreviewIdentity: String?
@@ -12561,6 +12690,10 @@ private struct TVGridHeroSlideshowView: View {
 
     private var activeItem: NuvioMeta? {
         items.indices.contains(index) ? items[index] : nil
+    }
+
+    private var activeHeroRatingsCacheKey: String {
+        activeItem.map { AddonRatingsService.heroRatingsCacheKey(for: $0) } ?? ""
     }
 
     private var isAnyFocused: Bool {
@@ -12869,26 +13002,37 @@ private struct TVGridHeroSlideshowView: View {
         .onReceive(NotificationCenter.default.publisher(for: LibraryStore.changedNotification)) { _ in
             updateLibraryStatus()
         }
+        .onReceive(NotificationCenter.default.publisher(for: AddonRatingsService.ratingsConfigurationChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshHeroRatingConfigurationIdentity()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            refreshHeroRatingConfigurationIdentity()
+        }
         .focusSection()
-        .task(id: "\(activeItem?.id ?? "")-\(homeHeroRatingSource)-\(items.count)") {
-            guard let item = activeItem,
-                  AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: item) else { return }
+        .task(id: "\(activeItem?.id ?? "")-\(activeHeroRatingsCacheKey)-\(homeHeroRatingsEnabled)-\(profileID)-\(heroRatingConfigurationIdentity)-\(heroRatingConfigurationRevision)-\(items.count)") {
+            guard homeHeroRatingsEnabled, let item = activeItem,
+                  AddonRatingsService.heroNeedsFetchedRatings(source: AddonRatingsService.heroAllRatingsSource, meta: item) else { return }
+            let expectedProfileID = profileID
+            let cacheKey = AddonRatingsService.heroRatingsCacheKey(for: item)
             // The next slide's ratings, so the timer or Next shows them at once.
             if items.count > 1 {
                 let next = items[(index + 1) % items.count]
-                if AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: next) {
-                    AddonRatingsService.prefetchHomeHeroRatings(for: [next])
+                if AddonRatingsService.heroNeedsFetchedRatings(source: AddonRatingsService.heroAllRatingsSource, meta: next) {
+                    AddonRatingsService.prefetchHeroRatings(for: [next])
                 }
             }
-            guard gridHeroRatings[item.id] == nil else { return }
-            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: item) {
+            guard gridHeroRatings[cacheKey] == nil else { return }
+            if let cached = AddonRatingsService.cachedHeroRatings(for: item) {
                 // Keep them with the slide, so they survive the cache entry expiring.
-                gridHeroRatings[item.id] = cached
+                gridHeroRatings[cacheKey] = cached
                 return
             }
-            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: item)
-            guard !Task.isCancelled else { return }
-            gridHeroRatings[item.id] = ratings
+            let ratings = await AddonRatingsService.fetchHeroRatings(for: item)
+            guard !Task.isCancelled,
+                  homeHeroRatingsEnabled,
+                  ProfileSettings.activeProfileID == expectedProfileID,
+                  AddonRatingsService.heroRatingsCacheKey(for: item) == cacheKey else { return }
+            gridHeroRatings[cacheKey] = ratings
         }
         .task(id: playTargetTaskIdentity) {
             await resolveCurrentHeroPlayTarget()
@@ -13045,7 +13189,7 @@ private struct TVGridHeroSlideshowView: View {
                 .transition(.opacity)
 
             // 2b. "All" rating source: the Details ratings row with icons.
-            if AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) {
+            if homeHeroRatingsEnabled {
                 TvHeroRatingsRow(badges: gridRatingBadges(for: item), iconHeight: 22, fontSize: 19)
                     .shadow(color: .black.opacity(0.6), radius: 4, y: 2)
                     .id("hero-ratings-\(item.id)")
@@ -13123,9 +13267,20 @@ private struct TVGridHeroSlideshowView: View {
     }
 
     private func gridRatingBadges(for item: NuvioMeta) -> [TvRatingBadge] {
-        TvRatingBadge.badges(
-            from: AddonRatingsService.heroDisplayRatings(for: item, fetched: gridHeroRatings[item.id])
+        let cacheKey = AddonRatingsService.heroRatingsCacheKey(for: item)
+        return TvRatingBadge.badges(
+            from: AddonRatingsService.heroDisplayRatings(
+                for: item,
+                fetched: gridHeroRatings[cacheKey] ?? AddonRatingsService.cachedHeroRatings(for: item)
+            )
         )
+    }
+
+    private func refreshHeroRatingConfigurationIdentity() {
+        let current = AddonRatingsService.heroRatingsConfigurationIdentity()
+        guard current != heroRatingConfigurationIdentity else { return }
+        heroRatingConfigurationIdentity = current
+        heroRatingConfigurationRevision &+= 1
     }
 
     private func metadataStrings(for item: NuvioMeta) -> [String] {
@@ -13160,14 +13315,6 @@ private struct TVGridHeroSlideshowView: View {
                 heroBadge(cert)
             } else if let badge = item.statusBadgeLabel, !badge.isEmpty {
                 heroBadge(badge)
-            } else if !AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) {
-                // ("All" shows the full ratings row on its own line instead.)
-                let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil)
-                    ?? gridHeroRatings[item.id]
-                    ?? AddonRatingsService.cachedHomeHeroRatings(for: item)
-                if let ratingStr = AddonRatingsService.heroRatingString(for: item, source: homeHeroRatingSource, ratings: effectiveRatings) {
-                    heroBadge(ratingStr)
-                }
             }
         }
         .shadow(color: .black.opacity(0.6), radius: 4, y: 2)
@@ -13324,15 +13471,6 @@ private struct TVGridHeroSlideshowView: View {
         if isInLibraryCache {
             return L10n.string("details_in_library", fallback: "In your library")
         }
-        guard !AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) else {
-            return "4K Ultra HD • HDR • Dolby Atmos"
-        }
-        let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil)
-            ?? gridHeroRatings[item.id]
-            ?? AddonRatingsService.cachedHomeHeroRatings(for: item)
-        if let ratingStr = AddonRatingsService.heroRatingString(for: item, source: homeHeroRatingSource, ratings: effectiveRatings) {
-            return "\(ratingStr) • 4K Ultra HD • HDR"
-        }
         return "4K Ultra HD • HDR • Dolby Atmos"
     }
 
@@ -13474,15 +13612,23 @@ private struct TVHeroMetaLine: View {
     var episodeLine: String? = nil
     var continueItem: ContinueWatchingItem? = nil
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
-    @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
-    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = true
+    @AppStorage(SettingsKey.homeHeroRatingsEnabled) private var homeHeroRatingsEnabled = true
+    @AppStorage(SettingsKey.continueWatchingEpisodeRatings) private var continueWatchingEpisodeRatings = AddonRatingsService.defaultEpisodeRatingsOption
     @State private var fetchedRatings: [NuvioExternalRating]?
-    /// Which title/source `fetchedRatings` belong to, so a reused view never
+    /// Which profile/settings/title `fetchedRatings` belong to, so a reused view never
     /// shows the previous title's scores.
     @State private var fetchedRatingsKey: String?
+    @State private var fetchedTitleFallbackRatings: [NuvioExternalRating]?
+    @State private var fetchedTitleFallbackRatingsKey: String?
+    @State private var heroRatingConfigurationIdentity = AddonRatingsService.heroRatingsConfigurationIdentity()
+    @State private var heroRatingConfigurationRevision = 0
+
+    private var isEpisodeRatingsEnabled: Bool {
+        AddonRatingsService.episodeRatingsChoice() != "None"
+    }
 
     private var targetEpisodeVideo: NuvioVideo? {
-        guard continueWatchingEpisodeRatings, meta.isSeries, let continueItem else { return nil }
+        guard isEpisodeRatingsEnabled, meta.isSeries, let continueItem else { return nil }
         if let video = continueItem.episodeVideo, video.rating != nil {
             return video
         }
@@ -13495,7 +13641,7 @@ private struct TVHeroMetaLine: View {
     }
 
     private var episodeRatingsIdentifier: String? {
-        guard continueWatchingEpisodeRatings, meta.isSeries, let continueItem,
+        guard isEpisodeRatingsEnabled, meta.isSeries, let continueItem,
               let numbers = continueItem.episodeNumbers else { return nil }
         if let video = targetEpisodeVideo {
             return meta.canonicalEpisodeStreamId(for: video)
@@ -13515,55 +13661,38 @@ private struct TVHeroMetaLine: View {
         let badge = meta.statusBadgeLabel
         let isEpisodeMode = episodeRatingsIdentifier != nil
         let episodeId = episodeRatingsIdentifier
-        // Same key as the ratings cache: enrichment can add an IMDb id to a
-        // kitsu:/tmdb: item, which must re-run the lookup below.
+        // Include the active profile and rating settings: catalog enrichment can add IDs, and
+        // provider/order changes must not reuse a fetch made under the previous configuration.
         let ratingsKey = isEpisodeMode
-            ? "\(episodeId!)-\(homeHeroRatingSource)"
-            : "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
+            ? AddonRatingsService.heroEpisodeRatingsCacheKey(for: episodeId!)
+            : AddonRatingsService.heroRatingsCacheKey(for: meta)
+        let titleRatingsKey = AddonRatingsService.heroRatingsCacheKey(for: meta)
         let fetched = fetchedRatingsKey == ratingsKey ? fetchedRatings : nil
-        let cached = isEpisodeMode
-            ? episodeId.flatMap { HomeHeroRatingsCache.shared.cachedRatings(for: $0) }
-            : AddonRatingsService.cachedHomeHeroRatings(for: meta)
-        let showsAllRatings = AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource)
-        let ratingBadges: [TvRatingBadge] = {
-            guard showsAllRatings else { return [] }
+        let fetchedTitleFallback = fetchedTitleFallbackRatingsKey == titleRatingsKey ? fetchedTitleFallbackRatings : nil
+        let cached: [NuvioExternalRating]? = {
+            guard homeHeroRatingsEnabled else { return nil }
             if isEpisodeMode {
-                return TvRatingBadge.badges(from: AddonRatingsService.heroEpisodeDisplayRatings(for: meta, video: targetEpisodeVideo, fetched: fetched ?? cached))
-            } else {
-                return TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
+                return HomeHeroRatingsCache.shared.cachedRatings(for: ratingsKey)
             }
+            return AddonRatingsService.cachedHeroRatings(for: meta)
         }()
-        // Still waiting for MDBList/add-on scores: keep the ratings line.
-        let ratingsPending = showsAllRatings && fetched == nil && cached == nil
-        let rating: String? = {
-            if showsAllRatings {
-                return nil
-            } else if isEpisodeMode {
-                let epEffective = nonEmpty(fetched) ?? nonEmpty(cached)
-                return AddonRatingsService.heroEpisodeRatingString(
+        let cachedTitleFallback = homeHeroRatingsEnabled ? AddonRatingsService.cachedHeroRatings(for: meta) : nil
+        let ratingBadges: [TvRatingBadge] = {
+            guard homeHeroRatingsEnabled else { return [] }
+            if isEpisodeMode {
+                return TvRatingBadge.badges(from: AddonRatingsService.heroEpisodeDisplayRatings(
                     for: meta,
                     video: targetEpisodeVideo,
-                    source: homeHeroRatingSource,
-                    ratings: epEffective
-                )
+                    fetched: fetched ?? cached,
+                    fallbackRatings: fetchedTitleFallback ?? cachedTitleFallback
+                ))
             } else {
-                let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
-                    ?? nonEmpty(fetched)
-                    ?? nonEmpty(cached)
-                return AddonRatingsService.heroRatingString(
-                    for: meta,
-                    source: homeHeroRatingSource,
-                    ratings: effectiveRatings
-                )
+                return TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched ?? cached))
             }
         }()
-        // Movies have no status badge, so their rating would sit alone on the
-        // second line; ride it on the primary line right after the date instead.
-        let isMovie = !meta.isSeries
-        let primaryValues = isMovie ? values + [rating].compactMap { $0 } : values
-        let showSecondLine = showsAllRatings
-            ? (badge != nil || !ratingBadges.isEmpty || ratingsPending)
-            : (!isMovie && (badge != nil || rating != nil))
+        let ratingsPending = homeHeroRatingsEnabled && fetched == nil && cached == nil
+        let primaryValues = values
+        let showSecondLine = badge != nil || !ratingBadges.isEmpty || ratingsPending
         // An empty `Text("")` still consumes a full line height and, with the
         // hero VStack spacing, opens a dead gap between the title and the first
         // catalog row (e.g. "The Chi" → "gg"). Collapse entirely when blank.
@@ -13579,8 +13708,7 @@ private struct TVHeroMetaLine: View {
                             .lineLimit(1)
                     }
 
-                    // Second line, like the Android hero: "[ONGOING] • IMDb 7.4",
-                    // or with "All" the Details ratings row with icons.
+                    // Status metadata stays visible when ratings are disabled.
                     if showSecondLine {
                         HStack(spacing: 14) {
                             if let badge {
@@ -13595,57 +13723,88 @@ private struct TVHeroMetaLine: View {
                                     )
                             }
 
-                            if showsAllRatings {
+                            if homeHeroRatingsEnabled {
                                 TvHeroRatingsRow(badges: ratingBadges, iconHeight: 26, fontSize: 22)
-                            } else if let rating {
-                                Text(badge != nil ? "•  \(rating)" : rating)
-                                    .font(.appFont(size: 22, weight: .semibold))
-                                    .foregroundColor(.white.opacity(0.66))
-                                    .lineLimit(1)
                             }
                         }
-                        .frame(minHeight: showsAllRatings ? 34 : nil, alignment: .leading)
+                        .frame(minHeight: homeHeroRatingsEnabled ? 34 : nil, alignment: .leading)
                     }
                 }
             }
         }
-        .task(id: ratingsKey) {
+        .task(id: "\(ratingsKey)-\(titleRatingsKey)-\(homeHeroRatingsEnabled)-\(heroRatingConfigurationIdentity)-\(heroRatingConfigurationRevision)") {
+            guard homeHeroRatingsEnabled else { return }
+            let expectedProfileID = ProfileSettings.activeProfileID
+            let expectedRatingsKey = ratingsKey
             if isEpisodeMode, let episodeId {
-                if let cached = HomeHeroRatingsCache.shared.cachedRatings(for: episodeId) {
-                    fetchedRatings = cached
-                    fetchedRatingsKey = ratingsKey
-                    return
+                let episodeRatings: [NuvioExternalRating]
+                if let cached = HomeHeroRatingsCache.shared.cachedRatings(for: expectedRatingsKey) {
+                    episodeRatings = cached
+                } else {
+                    if let tmdbId = meta.tmdbId {
+                        await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: meta.id)
+                        if let imdb = meta.imdbId {
+                            await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: imdb)
+                        }
+                    }
+                    episodeRatings = await AddonRatingsService.fetchRatingsForEpisode(episodeId: episodeId)
+                    guard !Task.isCancelled,
+                          homeHeroRatingsEnabled,
+                          ProfileSettings.activeProfileID == expectedProfileID,
+                          AddonRatingsService.heroEpisodeRatingsCacheKey(for: episodeId) == expectedRatingsKey else { return }
+                    HomeHeroRatingsCache.shared.setRatings(episodeRatings, for: expectedRatingsKey)
                 }
-                if let tmdbId = meta.tmdbId {
-                    await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: meta.id)
-                    if let imdb = meta.imdbId {
-                        await SeriesGraphRatingsService.shared.registerTmdbId(tmdbId, forImdbId: imdb)
+                guard !Task.isCancelled,
+                      homeHeroRatingsEnabled,
+                      ProfileSettings.activeProfileID == expectedProfileID,
+                      AddonRatingsService.heroEpisodeRatingsCacheKey(for: episodeId) == expectedRatingsKey else { return }
+                fetchedRatings = episodeRatings
+                fetchedRatingsKey = expectedRatingsKey
+
+                if !AddonRatingsService.heroHasEnabledEpisodeRatings(video: targetEpisodeVideo, fetched: episodeRatings) {
+                    if let titleRatings = AddonRatingsService.cachedHeroRatings(for: meta) {
+                        fetchedTitleFallbackRatings = titleRatings
+                        fetchedTitleFallbackRatingsKey = titleRatingsKey
+                    } else {
+                        let titleRatings = await AddonRatingsService.fetchHeroRatings(for: meta)
+                        guard !Task.isCancelled,
+                              homeHeroRatingsEnabled,
+                              ProfileSettings.activeProfileID == expectedProfileID,
+                              AddonRatingsService.heroRatingsCacheKey(for: meta) == titleRatingsKey else { return }
+                        fetchedTitleFallbackRatings = titleRatings
+                        fetchedTitleFallbackRatingsKey = titleRatingsKey
                     }
                 }
-                let ratings = await AddonRatingsService.fetchRatingsForEpisode(episodeId: episodeId)
-                guard !Task.isCancelled else { return }
-                HomeHeroRatingsCache.shared.setRatings(ratings, for: episodeId)
-                fetchedRatings = ratings
-                fetchedRatingsKey = ratingsKey
             } else {
-                guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
-                if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
+                guard AddonRatingsService.heroNeedsFetchedRatings(source: AddonRatingsService.heroAllRatingsSource, meta: meta) else { return }
+                if let cached = AddonRatingsService.cachedHeroRatings(for: meta) {
                     // Keep them here too, so the row survives the cache entry expiring.
                     fetchedRatings = cached
-                    fetchedRatingsKey = ratingsKey
+                    fetchedRatingsKey = expectedRatingsKey
                     return
                 }
-                let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
-                guard !Task.isCancelled else { return }
+                let ratings = await AddonRatingsService.fetchHeroRatings(for: meta)
+                guard !Task.isCancelled,
+                      homeHeroRatingsEnabled,
+                      ProfileSettings.activeProfileID == expectedProfileID,
+                      AddonRatingsService.heroRatingsCacheKey(for: meta) == expectedRatingsKey else { return }
                 fetchedRatings = ratings
-                fetchedRatingsKey = ratingsKey
+                fetchedRatingsKey = expectedRatingsKey
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AddonRatingsService.ratingsConfigurationChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshHeroRatingConfigurationIdentity()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+            refreshHeroRatingConfigurationIdentity()
         }
     }
 
-    private func nonEmpty(_ ratings: [NuvioExternalRating]?) -> [NuvioExternalRating]? {
-        guard let ratings, !ratings.isEmpty else { return nil }
-        return ratings
+    private func refreshHeroRatingConfigurationIdentity() {
+        let current = AddonRatingsService.heroRatingsConfigurationIdentity()
+        guard current != heroRatingConfigurationIdentity else { return }
+        heroRatingConfigurationIdentity = current
+        heroRatingConfigurationRevision &+= 1
     }
 
     private var formattedRuntime: String? {
