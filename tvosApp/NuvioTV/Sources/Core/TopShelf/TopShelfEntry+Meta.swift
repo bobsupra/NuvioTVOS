@@ -277,3 +277,36 @@ enum TopShelfRatingsBridge {
         }
     }
 }
+
+/// AniList titles on the shelf (Settings → Integrations → AniList): the backdrop and logo Home's
+/// hero shows in place of AniList's cover, the name under the logo (a later season shows the
+/// series' logo), and the IMDb id the title maps to, by which the extension finds its trailer.
+enum TopShelfAniListBridge {
+    static func install() {
+        TopShelfFeedStore.entryEnricher = { entry in
+            await enriched(entry)
+        }
+    }
+
+    static func enriched(_ entry: TopShelfEntry) async -> TopShelfEntry {
+        guard AniListSettings.opensTitles, AniListMetaBuilder.isAniListID(entry.contentId) else { return entry }
+        let card = NuvioMeta(
+            id: entry.contentId,
+            name: entry.title,
+            posterUrl: entry.imageURL,
+            imdbId: entry.imdbId,
+            tmdbId: entry.tmdbId,
+            type: entry.contentType)
+        let artwork = await AniListService.heroArtwork(for: card)
+        var imdb = entry.imdbId
+        if imdb == nil { imdb = await AniListService.trailerIMDbID(metaID: entry.contentId) }
+        let logo = artwork?.logo ?? entry.logoURL
+        let earlier = card.isSeries ? await AniListService.earlierSeasonIMDbIDs(metaID: entry.contentId) : []
+        return entry.with(
+            backdropURL: artwork?.background ?? entry.backdropURL,
+            logoURL: logo,
+            imdbId: imdb,
+            logoCaption: logo == nil ? nil : AniListMetaBuilder.nameUnderLogo(card),
+            trailerFallbackIMDbIds: earlier.filter { $0 != imdb })
+    }
+}

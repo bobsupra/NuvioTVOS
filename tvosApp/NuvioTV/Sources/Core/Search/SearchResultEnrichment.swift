@@ -27,8 +27,17 @@ enum SearchResultEnrichment {
 
     static func hasIncompleteLeadingResults(_ results: [NuvioMeta]) -> Bool {
         results
+            .filter { !isAniListCard($0) }
             .prefix(maxResultsToEnrich)
             .contains { $0.needsSearchMetadataEnrichment }
+    }
+
+    /// Settings → Integrations → AniList: AniList's cards come complete from AniList and keep
+    /// their own ids. They are neither refreshed (each would cost AniList requests, which
+    /// AniList limits to 30 a minute) nor merged with another source's copy of the same
+    /// anime, which would hand them its IMDb id.
+    static func isAniListCard(_ meta: NuvioMeta) -> Bool {
+        AniListMetaBuilder.isAniListID(meta.id)
     }
 
     /// Returns `results` with the leading entries merged with their refreshed
@@ -42,10 +51,12 @@ enum SearchResultEnrichment {
     ) async -> [NuvioMeta] {
         guard !results.isEmpty else { return results }
 
-        let deduplicatedResults = CinemetaCatalogRepository.deduplicatedSearchResults(results)
+        // Search lists AniList's cards first; they stay first and as they are.
+        let aniListCards = results.filter(isAniListCard)
+        let deduplicatedResults = CinemetaCatalogRepository.deduplicatedSearchResults(results.filter { !isAniListCard($0) })
         let candidateIndices = Array(deduplicatedResults.indices.prefix(maxResultsToEnrich))
             .filter { deduplicatedResults[$0].needsSearchMetadataEnrichment }
-        guard !candidateIndices.isEmpty else { return deduplicatedResults }
+        guard !candidateIndices.isEmpty else { return aniListCards + deduplicatedResults }
 
         var enriched = deduplicatedResults
         var cursor = 0
@@ -89,6 +100,6 @@ enum SearchResultEnrichment {
             }
             cursor = end
         }
-        return CinemetaCatalogRepository.deduplicatedSearchResults(enriched)
+        return aniListCards + CinemetaCatalogRepository.deduplicatedSearchResults(enriched)
     }
 }

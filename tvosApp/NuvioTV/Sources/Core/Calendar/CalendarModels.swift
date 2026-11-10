@@ -182,6 +182,16 @@ struct CalendarEntry: Codable, Hashable, Identifiable, Sendable {
     /// Where `airTime` came from, to credit it.
     var airTimeSource: CalendarTimeSource?
 
+    /// Straight from AniList (`CalendarAniList`, which keeps the negative AniList id as
+    /// `tmdbId`): one entry per AniList season, numbered as AniList numbers it.
+    var isFromAniList: Bool { tmdbId < 0 }
+
+    /// "S2E6", or "E6" for an AniList entry.
+    var episodeCode: String? {
+        guard let season = seasonNumber, let episode = episodeNumber else { return nil }
+        return isFromAniList ? "E\(episode)" : "S\(season)E\(episode)"
+    }
+
     init(
         itemId: String,
         itemType: String = "",

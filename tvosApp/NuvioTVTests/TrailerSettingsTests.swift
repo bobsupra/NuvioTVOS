@@ -451,4 +451,66 @@ final class TrailerSettingsTests: XCTestCase {
         let deScoreEnglish = YouTubeTrailerResolver.scoreImdbVideoName("Official English Trailer", preferredLanguage: "de-DE")
         XCTAssertGreaterThan(deScoreGerman, deScoreEnglish, "German trailer must score higher than English trailer for German user")
     }
+
+    // MARK: AniList titles
+
+    private func aniListResolver(_ state: TrailerResolverTestState, youtubePlays: Bool, imdbID: String?) -> YouTubeTrailerResolver {
+        YouTubeTrailerResolver(
+            preferredLanguageProvider: { state.language },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return nil
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { imdb, _ in
+                state.calls.append("trailerio:\(imdb)")
+                return TrailerPlaybackSource(videoUrl: "https://trailerio.test/\(imdb).m3u8", audioUrl: nil)
+            },
+            imdbTrailerProvider: { imdb in
+                state.calls.append("imdb:\(imdb)")
+                return nil
+            },
+            youtubeSourceProvider: { videoID, _, _, _ in
+                state.calls.append("youtube:\(videoID)")
+                return youtubePlays ? TrailerPlaybackSource(videoUrl: "https://youtube.test/\(videoID).m3u8", audioUrl: nil) : nil
+            },
+            aniListIMDbIDProvider: { _ in
+                state.calls.append("ids")
+                return imdbID
+            }
+        )
+    }
+
+    func testAnAniListTitlePlaysItsOwnTrailerFirstInAnyLanguage() async {
+        let state = TrailerResolverTestState()
+        let meta = NuvioMeta(id: "anilist:146065", name: "Season 2", type: "series", trailerYtIds: ["dQw4w9WgXcQ"])
+
+        let source = await aniListResolver(state, youtubePlays: true, imdbID: "tt9335498").resolve(for: meta)
+
+        XCTAssertEqual(source?.videoUrl, "https://youtube.test/dQw4w9WgXcQ.m3u8")
+        XCTAssertEqual(state.calls, ["youtube:dQw4w9WgXcQ"])
+    }
+
+    func testAnAniListTitleWithoutAPlayableTrailerTriesTrailerio() async {
+        let withoutTrailer = TrailerResolverTestState()
+        let meta = NuvioMeta(id: "anilist:146065", name: "Season 2", type: "series")
+        let source = await aniListResolver(withoutTrailer, youtubePlays: true, imdbID: "tt9335498").resolve(for: meta)
+        XCTAssertEqual(source?.videoUrl, "https://trailerio.test/tt9335498.m3u8")
+        XCTAssertEqual(withoutTrailer.calls, ["ids", "trailerio:tt9335498"])
+
+        // The YouTube video is gone or blocked.
+        let blocked = TrailerResolverTestState()
+        blocked.language = "cs-CZ"
+        let withTrailer = NuvioMeta(id: "anilist:146065", name: "Season 2", type: "series", trailerYtIds: ["dQw4w9WgXcQ"])
+        let fallback = await aniListResolver(blocked, youtubePlays: false, imdbID: "tt9335498").resolve(for: withTrailer)
+        XCTAssertEqual(fallback?.videoUrl, "https://trailerio.test/tt9335498.m3u8")
+        XCTAssertEqual(blocked.calls, ["youtube:dQw4w9WgXcQ", "ids", "trailerio:tt9335498"])
+
+        // Without an IMDb id there is nothing more to try.
+        let unknown = TrailerResolverTestState()
+        let none = await aniListResolver(unknown, youtubePlays: false, imdbID: nil).resolve(for: meta)
+        XCTAssertNil(none)
+        XCTAssertEqual(unknown.calls, ["ids"])
+    }
 }

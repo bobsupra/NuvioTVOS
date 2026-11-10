@@ -40,7 +40,7 @@ struct CalendarHomeToday: Equatable {
             row.entries[entry.itemId] = entry
             row.metas.append(meta(for: entry))
             row.labels[entry.itemId] = CardLabel(
-                episode: entry.seasonNumber.flatMap { season in entry.episodeNumber.map { "S\(season)E\($0)" } },
+                episode: entry.episodeCode,
                 episodeTitle: hideSpoilers ? nil : entry.episodeName,
                 badge: badge(for: entry, time: time),
                 artworkURL: hideSpoilers ? nil : entry.stillURL?.absoluteString
@@ -71,7 +71,7 @@ struct CalendarHomeToday: Equatable {
             name: entry.title,
             posterUrl: entry.posterURL?.absoluteString,
             imdbId: imdb,
-            tmdbId: entry.tmdbId,
+            tmdbId: entry.isFromAniList ? nil : entry.tmdbId,
             type: entry.itemType.isEmpty ? (entry.kind == .series ? "series" : "movie") : entry.itemType
         )
     }

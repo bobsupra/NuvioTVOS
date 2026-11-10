@@ -199,6 +199,8 @@ enum SettingsKey {
     static let calendarHideSpoilers = "nuvio.tv.settings.calendar.hideSpoilers"
     static let calendarCheckAvailability = "nuvio.tv.settings.calendar.checkAvailability"
     static let calendarTvmazeTimes = "nuvio.tv.settings.calendar.tvmazeTimes"
+    static let calendarAniList = "nuvio.tv.settings.calendar.aniList"
+    static let calendarAniListPlanning = "nuvio.tv.settings.calendar.aniListPlanning"
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
     static let detailsActionsBelowInfo = "nuvio.tv.settings.layout.detailsActionsBelowInfo"
@@ -426,7 +428,7 @@ enum SettingsKey {
         homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
-        showCalendarTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes,
+        showCalendarTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -442,6 +444,10 @@ enum SettingsKey {
         tmdbUseTrailers, tmdbUseArtwork, tmdbUseBasicInfo, tmdbUseDetails, tmdbUseCredits,
         tmdbUseProductions, tmdbUseNetworks, tmdbUseEpisodes, tmdbUseSeasonPosters,
         tmdbUseMoreLikeThis, tmdbUseCollections, tmdbApplyToHome,
+        aniListEnabled, aniListTitleLanguage, aniListSeasonMode, aniListHomeRows, aniListSearch,
+        aniListHideCinemetaDuplicates, aniListEpisodeDetails, aniListAdult,
+        aniListClientID, aniListScrobble, aniListScrobbleCinemeta, aniListListRows, aniListOtherAddons, aniListCatalogs,
+        malEnabled, malClientID, malEpisodeRatings, malScrobble, malAdult, malCatalogs, malDetailsButton, aniListDetailsButton, malPlusStatus, aniListPlusStatus, malSeriesScore, aniListScore,
         mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
@@ -5248,6 +5254,11 @@ private func layoutVisibleHomeCatalogRows() -> [TVHomeCatalogOrder.SnapshotRow] 
             if row.settingsKey?.hasPrefix("simkl_") == true { return false }
             if ["addon_simkl_movie_plantowatch", "addon_simkl_series_plantowatch", "simkl_plantowatch_movie", "simkl_plantowatch_series"].contains(row.id) { return false }
         }
+        if row.addonId == AniListService.addonID || row.settingsKey?.hasPrefix(AniListService.addonID + "_") == true {
+            // Only the catalogs chosen in AniList Catalogs and MAL Catalogs.
+            let catalogID = AniListSettings.homeCatalogID(rowID: row.id, catalogId: row.catalogId)
+            if !AniListSettings.showsHomeRow(catalogId: catalogID) { return false }
+        }
         return true
     }
 
@@ -5314,6 +5325,67 @@ private func layoutVisibleHomeCatalogRows() -> [TVHomeCatalogOrder.SnapshotRow] 
                     addonId: "simkl",
                     contentType: row.type,
                     catalogId: row.catalogId,
+                    settingsKey: key
+                )
+            )
+        }
+    }
+
+    if AniListSettings.isEnabled, AniListSettings.showsHomeRows {
+        // Settings → Anime Integrations → AniList Catalogs: its rows can be ordered and hidden like any other.
+        let existingIDs = Set(merged.map(\.id))
+        for row in AniListHomeRow.all where !existingIDs.contains(AniListService.catalogRowID(row)) {
+            let key = AniListService.catalogSettingsKey(row)
+            guard !deletedKeys.contains(AniListService.catalogRowID(row)), !deletedKeys.contains(key) else { continue }
+            merged.append(
+                TVHomeCatalogOrder.SnapshotRow(
+                    id: AniListService.catalogRowID(row),
+                    title: AniListService.catalogDisplayTitle(row),
+                    addonName: AniListService.addonName,
+                    addonId: AniListService.addonID,
+                    contentType: AniListService.homeContentType,
+                    catalogId: row.id,
+                    settingsKey: key
+                )
+            )
+        }
+    }
+
+    if AniListSettings.showsListRows {
+        // The viewer's AniList lists, when logged in.
+        let existingIDs = Set(merged.map(\.id))
+        for row in AniListAccount.listRows where !existingIDs.contains(AniListService.listRowID(row.id)) {
+            let key = AniListService.listSettingsKey(row.id)
+            guard !deletedKeys.contains(AniListService.listRowID(row.id)), !deletedKeys.contains(key) else { continue }
+            merged.append(
+                TVHomeCatalogOrder.SnapshotRow(
+                    id: AniListService.listRowID(row.id),
+                    title: AniListService.listDisplayTitle(row.id, title: row.title),
+                    addonName: AniListService.addonName,
+                    addonId: AniListService.addonID,
+                    contentType: AniListService.homeContentType,
+                    catalogId: row.id,
+                    settingsKey: key
+                )
+            )
+        }
+    }
+
+    if MALSettings.isEnabled {
+        // Settings → Anime Integrations → MAL Catalogs (under AniList's add-on id: they open as AniList titles).
+        let existingIDs = Set(merged.map(\.id))
+        for choice in MALCatalogs.chosen() where !existingIDs.contains(MALCatalogs.rowID(choice.id)) {
+            guard !MALCatalogs.isList(choice.id) || MALAccount.isLoggedIn else { continue }
+            let key = MALCatalogs.settingsKey(choice.id)
+            guard !deletedKeys.contains(MALCatalogs.rowID(choice.id)), !deletedKeys.contains(key) else { continue }
+            merged.append(
+                TVHomeCatalogOrder.SnapshotRow(
+                    id: MALCatalogs.rowID(choice.id),
+                    title: MALCatalogs.displayTitle(choice),
+                    addonName: MALCatalogs.addonName,
+                    addonId: AniListService.addonID,
+                    contentType: AniListService.homeContentType,
+                    catalogId: choice.id,
                     settingsKey: key
                 )
             )
@@ -5396,6 +5468,9 @@ private struct IntegrationSettingsView: View {
     @State private var showingWeTrakrLogin = false
     @State private var showingWeTrakrSettings = false
     @State private var showingTmdbOptions = false
+    @State private var showingAniListOptions = false
+    @AppStorage(SettingsKey.malEnabled) private var malEnabledSetting = false
+    @AppStorage(SettingsKey.aniListEnabled) private var aniListEnabled = false
     @State private var showingMdbListOptions = false
     @State private var showingAISubtitleOptions = false
     @State private var showingP2PConsent = false
@@ -5730,6 +5805,15 @@ private struct IntegrationSettingsView: View {
                 }
 
                 SettingsActionRow(
+                    title: L10n.string("settings_anime_integrations", fallback: "Anime Integrations"),
+                    subtitle: L10n.string("settings_anime_integrations_subtitle", fallback: "AniList and MyAnimeList: catalogs, lists, ratings, and anime ids for add-ons"),
+                    value: aniListEnabled || malEnabledSetting ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingAniListOptions = true
+                }
+
+                SettingsActionRow(
                     title: L10n.string("settings_mdblist_ratings_title", fallback: "MDBList Ratings & Badges (API Key)"),
                     subtitle: L10n.string("tvos_settings_mdblist_integration_subtitle", fallback: "Get a free API key at mdblist.com/preferences for ratings and artwork badges"),
                     value: mdbListEnabled && mdbListHasApiKey ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
@@ -5969,6 +6053,10 @@ private struct IntegrationSettingsView: View {
             TmdbOptionsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .sheet(isPresented: $showingAniListOptions) {
+            AnimeIntegrationsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
         .sheet(isPresented: $showingMdbListOptions) {
             MdbListOptionsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
@@ -6203,6 +6291,1101 @@ private struct IntegrationSettingsView: View {
         if wetrakrViewModel.mode != .awaitingApproval {
             wetrakrViewModel.startLogin()
         }
+    }
+}
+
+/// A few paragraphs of explanation in a settings window (how to log in, which ids add-ons get);
+/// **bold** and *italic* as Markdown.
+private struct SettingsHelpText: View {
+    let title: String
+    let paragraphs: [String]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(.white.opacity(0.88))
+            ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, paragraph in
+                Text(LocalizedStringKey(paragraph))
+                    .font(.system(size: 19, weight: .regular))
+                    .foregroundColor(.white.opacity(0.62))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .background(RoundedRectangle(cornerRadius: 18, style: .continuous).fill(Color.white.opacity(0.05)))
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Settings → Integrations → Anime Integrations: AniList and MyAnimeList, each in its own window.
+private struct AnimeIntegrationsSheet: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.aniListEnabled) private var aniListEnabled = false
+    @AppStorage(SettingsKey.malEnabled) private var malEnabled = false
+    @State private var showingAniList = false
+    @State private var showingMAL = false
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(L10n.string("settings_anime_integrations", fallback: "Anime Integrations"))
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(L10n.string(
+                            "settings_anime_integrations_header",
+                            fallback: "MyAnimeList's titles open as the AniList titles they map to, so both share details, episodes, streams and the ids add-ons are asked with."
+                        ))
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("settings_anime_integrations_services", fallback: "Services"),
+                        subtitle: L10n.string("settings_anime_integrations_services_subtitle", fallback: "Open one to set it up")
+                    ) {
+                        SettingsActionRow(
+                            title: "AniList",
+                            subtitle: L10n.string("settings_anilist_integration_subtitle", fallback: "Anime catalogs, search and details straight from AniList, with AniList ids for add-ons"),
+                            value: status(on: aniListEnabled, name: aniListEnabled ? AniListAccount.login?.viewerName : nil),
+                            accentColor: accentColor
+                        ) {
+                            showingAniList = true
+                        }
+                        .sheet(isPresented: $showingAniList) {
+                            AniListOptionsSheet(accentColor: accentColor)
+                                .modifier(ClearPresentationBackgroundIfAvailable())
+                        }
+
+                        SettingsActionRow(
+                            title: "MyAnimeList",
+                            subtitle: L10n.string("settings_mal_integration_subtitle", fallback: "MAL catalogs and lists, MAL scores of series and episodes, watched episodes written to MAL"),
+                            value: status(on: malEnabled, name: malEnabled ? MALAccount.login?.userName : nil),
+                            accentColor: accentColor
+                        ) {
+                            showingMAL = true
+                        }
+                        .sheet(isPresented: $showingMAL) {
+                            MALOptionsSheet(accentColor: accentColor)
+                                .modifier(ClearPresentationBackgroundIfAvailable())
+                        }
+                    }
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+        }
+    }
+
+    private func status(on: Bool, name: String?) -> String {
+        guard on else { return L10n.string("tvos_common_off", fallback: "Off") }
+        guard let name else { return L10n.string("tvos_common_on", fallback: "On") }
+        return L10n.format("settings_anime_on_as", fallback: "On · %@", name)
+    }
+}
+
+/// Settings → Anime Integrations → MyAnimeList.
+private struct MALOptionsSheet: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.malEnabled) private var enabled = false
+    @AppStorage(SettingsKey.malClientID) private var clientID = ""
+    @AppStorage(SettingsKey.malEpisodeRatings) private var episodeRatingsSetting: Bool?
+    @AppStorage(SettingsKey.malSeriesScore) private var seriesScoreSetting: Bool?
+    @AppStorage(SettingsKey.malScrobble) private var scrobble = true
+    @AppStorage(SettingsKey.malAdult) private var adult = false
+    @AppStorage(SettingsKey.malDetailsButton) private var detailsButton = true
+    @AppStorage(SettingsKey.malPlusStatus) private var plusStatus = MALSettings.PlusStatus.planToWatch.rawValue
+    @State private var accountName: String? = MALAccount.login?.userName
+    /// The `state` and PKCE verifier of the QR code's address, so the Apple TV takes only its own login.
+    @State private var loginState = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    @State private var verifier = MALAccount.makeVerifier()
+    @State private var phoneLogin: AniListLoginServer.State?
+    @State private var showingCatalogs = false
+    /// Bumped when the Client ID is entered: the field writes it without redrawing this window,
+    /// so the QR code showed only after leaving and coming back.
+    @State private var clientIDRevision = 0
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("MyAnimeList")
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(L10n.string(
+                            "settings_mal_header_subtitle",
+                            fallback: "Catalogs and scores from Tenrai, a free API over MyAnimeList; your lists and what you watch through your own MAL API client. Titles open as the AniList titles they map to."
+                        ))
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: "MyAnimeList",
+                        subtitle: L10n.string("settings_mal_setup_subtitle", fallback: "Asked from this Apple TV, with answers kept for a while")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("settings_mal_enable", fallback: "Enable MyAnimeList"),
+                            subtitle: L10n.string("settings_mal_enable_subtitle", fallback: "MAL catalogs, lists and scores"),
+                            isOn: $enabled,
+                            accentColor: accentColor
+                        )
+                    }
+
+                    ratingsGroup
+
+                    homeGroup
+
+                    accountGroup
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+        }
+        .onChange(of: enabled) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: adult) { _, _ in AniListSettings.notifyHomeChanged() }
+        .sheet(isPresented: $showingCatalogs) {
+            AnimeCatalogPickerSheet(
+                title: L10n.string("settings_mal_catalogs", fallback: "MAL Catalogs"),
+                subtitle: L10n.string(
+                    "settings_anime_catalogs_header",
+                    fallback: "Each catalog switched on is a row on Home. Order, rename or hide the rows in Layout."
+                ),
+                accentColor: accentColor,
+                load: { MALCatalogs.sections(loggedIn: MALAccount.isLoggedIn, adult: MALSettings.showsAdult) },
+                read: { MALCatalogs.chosen() },
+                write: { MALCatalogs.save($0) }
+            )
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+
+    @ViewBuilder
+    private var ratingsGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_mal_section_ratings", fallback: "Ratings"),
+            subtitle: L10n.string("settings_mal_section_ratings_subtitle", fallback: "Shown where the MyAnimeList rating is on (Rating Providers & Order)")
+        ) {
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_series_score", fallback: "Series Score from MAL"),
+                subtitle: L10n.string(
+                    "settings_mal_series_score_subtitle",
+                    fallback: "MAL's score straight from MAL instead of MDBList's copy (MDBList's when MAL has none). Works with MyAnimeList off"
+                ),
+                isOn: Binding(get: { seriesScoreSetting ?? enabled }, set: { seriesScoreSetting = $0 }),
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_episode_ratings", fallback: "MAL Episode Ratings"),
+                subtitle: L10n.string(
+                    "settings_mal_episode_ratings_subtitle",
+                    fallback: "Each episode's MyAnimeList score (1–5) on episode cards, for AniList anime and anime from Cinemeta. Works with MyAnimeList off"
+                ),
+                isOn: Binding(get: { episodeRatingsSetting ?? enabled }, set: { episodeRatingsSetting = $0 }),
+                accentColor: accentColor
+            )
+        }
+    }
+
+    @ViewBuilder
+    private var homeGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_mal_section_home", fallback: "Home"),
+            subtitle: L10n.string("settings_anilist_section_discover_subtitle", fallback: "Order or hide each AniList row in Layout")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_mal_catalogs", fallback: "MAL Catalogs"),
+                subtitle: L10n.string(
+                    "settings_mal_catalogs_subtitle",
+                    fallback: "Top lists, seasons, airing days, genres, themes, studios, sources, dubs, streaming services and your lists"
+                ),
+                value: L10n.format("settings_anime_catalogs_count", fallback: "%d on", MALCatalogs.chosen().count),
+                accentColor: accentColor
+            ) {
+                showingCatalogs = true
+            }
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_adult", fallback: "Adult Titles"),
+                subtitle: L10n.string("settings_mal_adult_subtitle", fallback: "Show titles MAL rates as adult"),
+                isOn: $adult,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    @ViewBuilder
+    private var accountGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_account", fallback: "Account"),
+            subtitle: L10n.string("settings_mal_section_account_subtitle", fallback: "Your MAL lists on Home, \"+\" in details, and what you watch written to MAL")
+        ) {
+            if let name = accountName {
+                SettingsActionRow(
+                    title: L10n.format("settings_anilist_logged_in", fallback: "Logged in as %@", name),
+                    subtitle: L10n.string("settings_mal_logged_in_subtitle", fallback: "Renewed by itself; after a month unused, log in again"),
+                    value: L10n.string("settings_anilist_log_out", fallback: "Log Out"),
+                    accentColor: accentColor
+                ) {
+                    MALAccount.logOut()
+                    accountName = nil
+                    loginState = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+                    verifier = MALAccount.makeVerifier()
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string("settings_anilist_scrobble", fallback: "Write Watched Episodes"),
+                    subtitle: L10n.string("settings_mal_scrobble_subtitle", fallback: "After an episode is watched to the end, or marked in details. Progress only goes forward"),
+                    isOn: $scrobble,
+                    accentColor: accentColor
+                )
+
+                SettingsChoiceRow(
+                    title: L10n.string("settings_mal_plus_status", fallback: "\"+\" in Details Adds as"),
+                    subtitle: L10n.string("settings_mal_plus_status_subtitle", fallback: "What the library \"+\" writes to your MAL list; taken off again only while it is still that"),
+                    selection: Binding(
+                        get: { (MALSettings.PlusStatus(rawValue: plusStatus) ?? .planToWatch).label },
+                        set: { label in
+                            if let found = MALSettings.PlusStatus.allCases.first(where: { $0.label == label }) {
+                                plusStatus = found.rawValue
+                            }
+                        }
+                    ),
+                    options: MALSettings.PlusStatus.allCases.map(\.label),
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("settings_mal_details_button", fallback: "MAL Button in Details"),
+                    subtitle: L10n.string("settings_mal_details_button_subtitle", fallback: "Your MAL status beside Play: change it, score or remove the title"),
+                    isOn: $detailsButton,
+                    accentColor: accentColor
+                )
+            } else {
+                SettingsHelpText(
+                    title: L10n.string("settings_mal_why_title", fallback: "Why Log In?"),
+                    paragraphs: [
+                        L10n.string("settings_mal_why_1", fallback: "**Without logging in:** MAL catalogs on Home (top lists, seasons, airing days, genres, themes, studios, dubs, streaming services…) and MAL scores of series and episodes, from Tenrai, with no account or key needed."),
+                        L10n.string("settings_mal_why_2", fallback: "**Logged in, you also get:** your MAL lists as Home rows (Watching, Completed, On-Hold, Dropped, Plan to Watch); watched episodes written to your MAL by themselves, progress only forward; \"+\" in details adding to your list; the MAL button in details (status, score, remove)."),
+                        L10n.string("settings_mal_why_3", fallback: "**Good to know:** the account is free. The login stays on this Apple TV for this profile and renews itself; after a month without using Nuvio you log in again. Nuvio writes to your MAL only when you finish an episode, mark one, press \"+\" or use the MAL button.")
+                    ]
+                )
+
+                SettingsHelpText(
+                    title: L10n.string("settings_mal_howto_title", fallback: "How to Log In"),
+                    paragraphs: [
+                        L10n.string("settings_mal_howto_1", fallback: "1. Create a free account at **myanimelist.net/register.php**."),
+                        L10n.string("settings_mal_howto_2", fallback: "2. Open **myanimelist.net/apiconfig** → *Create ID*: App Type **other**, **App Redirect URL** = the address shown below, Homepage URL anything (e.g. github.com/david325345/NuvioTVOS), Non-Commercial, Hobbyist."),
+                        L10n.string("settings_mal_howto_3", fallback: "3. Copy the **Client ID** into the field below."),
+                        L10n.string("settings_mal_howto_4", fallback: "4. Scan the QR code with your phone on the same Wi-Fi, log in to MAL and tap *Allow*.")
+                    ]
+                )
+
+                SettingsTextFieldRow(
+                    title: L10n.string("settings_anilist_client_id", fallback: "Client ID"),
+                    subtitle: L10n.string(
+                        "settings_mal_client_id_subtitle",
+                        fallback: "myanimelist.net/apiconfig → Create ID, App Type \"other\", with the App Redirect URL below"
+                    ),
+                    placeholder: "0123456789abcdef",
+                    text: $clientID,
+                    onCommit: { clientIDRevision &+= 1 }
+                )
+                .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+                    let stored = MALSettings.clientID
+                    if stored != clientID.trimmingCharacters(in: .whitespacesAndNewlines) || clientIDRevision == 0 {
+                        clientIDRevision &+= 1
+                    }
+                }
+
+                SettingsInfoRow(
+                    title: L10n.string("settings_mal_redirect", fallback: "App Redirect URL"),
+                    value: redirect?.absoluteString ?? L10n.string("settings_anilist_redirect_none", fallback: "Connect this Apple TV to your home network")
+                )
+
+                let _ = clientIDRevision
+                if let redirect, !currentClientID.isEmpty,
+                   let url = MALAccount.authorizeURL(
+                       clientID: currentClientID,
+                       verifier: verifier, state: loginState, redirect: redirect
+                   ) {
+                    SettingsQRCodeCard(
+                        title: L10n.string("settings_mal_allow_phone", fallback: "Scan, then Allow: this Apple TV logs in by itself"),
+                        link: url.absoluteString
+                    )
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .task(id: currentClientID) { await runPhoneLogin(redirect: redirect) }
+
+                    SettingsInfoRow(
+                        title: L10n.string("settings_anilist_phone_login", fallback: "From Your Phone"),
+                        value: phoneLoginText,
+                        isDiagnostic: true
+                    )
+                }
+            }
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    private var redirect: URL? {
+        AniListLoginServer.redirectURL(path: AniListLoginServer.malPath)
+    }
+
+    /// The Client ID as typed, else as stored for this profile.
+    private var currentClientID: String {
+        let typed = clientID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return typed.isEmpty ? MALSettings.clientID : typed
+    }
+
+    private var phoneLoginText: String {
+        switch phoneLogin {
+        case nil:
+            return L10n.string("settings_anilist_phone_starting", fallback: "Starting…")
+        case .stopped?:
+            return L10n.string("settings_anilist_phone_stopped", fallback: "Stopped after ten minutes. Open this page again to log in from your phone")
+        case .waiting?:
+            return L10n.string("settings_anilist_phone_waiting", fallback: "Waiting for your phone, on the same Wi-Fi as this Apple TV")
+        case .loggingIn?:
+            return L10n.string("settings_anilist_phone_logging_in", fallback: "Logging in…")
+        case .loggedIn(let name)?:
+            return L10n.format("settings_anilist_logged_in", fallback: "Logged in as %@", name)
+        case .failed(let message)?:
+            return message
+        }
+    }
+
+    private func runPhoneLogin(redirect: URL) async {
+        phoneLogin = nil
+        let session = UUID()
+        let verifier = self.verifier
+        let client = currentClientID
+        AniListLoginServer.shared.start(
+            session: session,
+            expectedState: loginState,
+            exchange: { code in
+                try await MALAccount.logIn(code: code, verifier: verifier, redirect: redirect, clientID: client)
+            }
+        ) { state in
+            Task { @MainActor in
+                phoneLogin = state
+                if case .loggedIn(let name) = state {
+                    accountName = name
+                }
+            }
+        }
+        try? await Task.sleep(nanoseconds: UInt64(AniListLoginServer.lifetime * 1_000_000_000))
+        AniListLoginServer.shared.stop(session: session)
+    }
+}
+
+/// The catalog window of AniList Catalogs and MAL Catalogs: each catalog a switch; "…" rows open
+/// a longer list loaded when asked.
+private struct AnimeCatalogPickerSheet: View {
+    let title: String
+    let subtitle: String
+    let accentColor: Color
+    let load: @Sendable () async -> [AnimeCatalogSection]
+    let read: () -> [AnimeCatalogChoice]
+    let write: ([AnimeCatalogChoice]) -> Void
+
+    private struct MoreItem: Identifiable {
+        let more: AnimeCatalogMore
+        var id: String { more.title }
+    }
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @State private var sections: [AnimeCatalogSection]?
+    @State private var chosen: [AnimeCatalogChoice] = []
+    @State private var opened: MoreItem?
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(title)
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(subtitle)
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    if let sections {
+                        ForEach(sections) { section in
+                            SettingsGroup(title: section.title, subtitle: section.subtitle ?? "") {
+                                ForEach(section.choices) { choice in
+                                    SettingsToggleRow(
+                                        title: choice.title,
+                                        subtitle: "",
+                                        isOn: binding(for: choice),
+                                        accentColor: accentColor
+                                    )
+                                }
+                                if let more = section.more {
+                                    SettingsActionRow(
+                                        title: more.title,
+                                        subtitle: more.subtitle,
+                                        value: L10n.string("settings_open", fallback: "Open"),
+                                        accentColor: accentColor
+                                    ) {
+                                        opened = MoreItem(more: more)
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        ProgressView()
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 40)
+                    }
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+        }
+        .task {
+            chosen = read()
+            let loaded = await load()
+            sections = loaded
+        }
+        .sheet(item: $opened, onDismiss: { chosen = read() }) { item in
+            AnimeCatalogPickerSheet(
+                title: item.more.title.replacingOccurrences(of: "…", with: ""),
+                subtitle: item.more.subtitle,
+                accentColor: accentColor,
+                load: item.more.load,
+                read: read,
+                write: write
+            )
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+
+    private func binding(for choice: AnimeCatalogChoice) -> Binding<Bool> {
+        Binding(
+            get: { chosen.contains { $0.id == choice.id } },
+            set: { _ in
+                chosen = AnimeCatalogSelection.toggled(choice, in: read())
+                write(chosen)
+            }
+        )
+    }
+}
+
+/// Settings → Integrations → AniList.
+private struct AniListOptionsSheet: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.aniListEnabled) private var enabled = false
+    @AppStorage(SettingsKey.aniListTitleLanguage) private var titleLanguage = AniListSettings.TitleLanguage.romaji.rawValue
+    @AppStorage(SettingsKey.aniListSeasonMode) private var seasonMode = AniListSettings.SeasonMode.merged.rawValue
+    @AppStorage(SettingsKey.aniListHomeRows) private var homeRows = true
+    @AppStorage(SettingsKey.aniListSearch) private var search = true
+    @AppStorage(SettingsKey.aniListHideCinemetaDuplicates) private var hideCinemetaDuplicates = false
+    @AppStorage(SettingsKey.aniListEpisodeDetails) private var episodeDetails = true
+    @AppStorage(SettingsKey.malEnabled) private var malEnabled = false
+    @AppStorage(SettingsKey.aniListDetailsButton) private var detailsButton = true
+    @AppStorage(SettingsKey.aniListScore) private var aniListScoreSetting: Bool?
+    @AppStorage(SettingsKey.aniListPlusStatus) private var plusStatus = AniListSettings.PlusStatus.planning.rawValue
+    @State private var showingCatalogs = false
+    @AppStorage(SettingsKey.aniListAdult) private var adult = false
+    @AppStorage(SettingsKey.aniListClientID) private var clientID = ""
+    @AppStorage(SettingsKey.aniListScrobble) private var scrobble = true
+    @AppStorage(SettingsKey.aniListScrobbleCinemeta) private var scrobbleCinemeta = true
+    @AppStorage(SettingsKey.aniListListRows) private var listRows = true
+    @AppStorage(SettingsKey.aniListOtherAddons) private var otherAddons = true
+    @State private var offlineStatusText = ""
+    @State private var updatingOffline = false
+    @State private var cacheCleared = false
+    @State private var statusText = ""
+    @State private var homeStatusText = ""
+    @State private var searchStatusText = ""
+    @State private var accountStatusText = ""
+    @State private var accountName: String?
+    @State private var tokenDraft = ""
+    @State private var loginMessage: String?
+    @State private var loggingIn = false
+    /// The `state` the QR code's address carries, so the Apple TV takes only its own login.
+    @State private var phoneLoginState = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+    @State private var phoneLogin: AniListLoginServer.State?
+    @State private var testResult: String?
+    @State private var testing = false
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("AniList")
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+
+                        Text(L10n.string(
+                            "settings_anilist_header_subtitle",
+                            fallback: "Anime from AniList keep their AniList ids, so add-ons with the anilist prefix are asked with anilist:ID:episode, numbered as on AniList. No API key is needed."
+                        ))
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("settings_anilist_setup_title", fallback: "AniList"),
+                        subtitle: L10n.string("settings_anilist_setup_subtitle", fallback: "Asked from this Apple TV, with answers kept for a while")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("settings_anilist_enable", fallback: "Enable AniList"),
+                            subtitle: L10n.string("settings_anilist_enable_subtitle", fallback: "Catalogs, search and details of anime from AniList"),
+                            isOn: $enabled,
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: L10n.string("settings_anilist_score", fallback: "AniList Score"),
+                            subtitle: L10n.string(
+                                "settings_anilist_score_subtitle",
+                                fallback: "AniList's average score beside the other ratings, for anime from Cinemeta too. Works with AniList off; order it in Rating Providers & Order"
+                            ),
+                            isOn: Binding(get: { aniListScoreSetting ?? enabled }, set: { aniListScoreSetting = $0 }),
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: L10n.string("settings_anilist_convert_ids", fallback: "Convert IDs for Other Add-ons"),
+                            subtitle: L10n.string(
+                                "settings_anilist_other_addons_subtitle",
+                                fallback: "Add-ons without anilist ids get kitsu:ID:episode, or the IMDb id with TheTVDB's season and episode. An episode that can't be placed isn't asked by IMDb"
+                            ),
+                            isOn: $otherAddons,
+                            accentColor: accentColor,
+                            isAvailable: enabled || malEnabled
+                        )
+
+                        SettingsHelpText(
+                            title: L10n.string("settings_anilist_ids_title", fallback: "AniList IDs or Converted IDs?"),
+                            paragraphs: [
+                                L10n.string("settings_anilist_ids_1", fallback: "**Add-ons that take anilist: ids get exactly what you opened.** Every season, part, OVA and movie has its own AniList entry, and episodes are numbered the way AniList numbers them, so nothing has to be guessed."),
+                                L10n.string("settings_anilist_ids_2", fallback: "**AniList is the fastest and the widest.** New anime are usually on AniList within hours of their announcement, before IMDb, TheTVDB, TMDB or Kitsu. It also lists ONAs, shorts, specials, donghua and music videos that the others often don't have."),
+                                L10n.string("settings_anilist_ids_3", fallback: "**Converted ids are for add-ons that don't know AniList.** They get a Kitsu, MAL, AniDB, IMDb or TMDB id with season and episode, from the offline tables. That can miss brand-new seasons or number split seasons differently. An episode that can't be placed isn't asked at all rather than asked wrong."),
+                                L10n.string("settings_anilist_ids_4", fallback: "**Recommended:** prefer add-ons that take anilist: ids, and keep conversion on for the rest.")
+                            ]
+                        )
+                    }
+
+                    titlesGroup
+
+                    homeSearchGroup
+
+                    addonsGroup
+
+                    accountGroup
+
+                    statusGroup
+
+                    savedAnswersGroup
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+        }
+        .task { await refreshStatus() }
+        .onChange(of: enabled) { _, _ in
+            AniListSettings.notifyHomeChanged()
+            Task { await refreshStatus() }
+        }
+        .onChange(of: homeRows) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: search) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: hideCinemetaDuplicates) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: titleLanguage) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: adult) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: listRows) { _, _ in AniListSettings.notifyHomeChanged() }
+        .sheet(isPresented: $showingCatalogs) {
+            AnimeCatalogPickerSheet(
+                title: L10n.string("settings_anilist_catalogs", fallback: "AniList Catalogs"),
+                subtitle: L10n.string(
+                    "settings_anime_catalogs_header",
+                    fallback: "Each catalog switched on is a row on Home. Order, rename or hide the rows in Layout."
+                ),
+                accentColor: accentColor,
+                load: {
+                    AniListCatalogs.sections(loggedIn: AniListAccount.isLoggedIn, adult: AniListSettings.showsAdult)
+                },
+                read: { AniListCatalogs.chosen() },
+                write: { AniListCatalogs.save($0) }
+            )
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var titlesGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_titles", fallback: "Titles"),
+            subtitle: L10n.string("settings_anilist_section_titles_subtitle", fallback: "How AniList titles are named and grouped")
+        ) {
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_title_language", fallback: "Title Language"),
+                subtitle: L10n.string("settings_anilist_title_language_subtitle", fallback: "Romaji, English or the original Japanese title"),
+                selection: labelBinding($titleLanguage, AniListSettings.TitleLanguage.allCases, \.label),
+                options: AniListSettings.TitleLanguage.allCases.map(\.label),
+                accentColor: accentColor
+            )
+            .opacity(enabled ? 1 : 0.46)
+            .disabled(!enabled)
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_seasons", fallback: "Seasons"),
+                subtitle: L10n.string(
+                    "settings_anilist_seasons_subtitle",
+                    fallback: "One Title: a series with a tab per AniList entry. Each Entry: every season on its own, as on AniList. Progress is kept per choice."
+                ),
+                selection: labelBinding($seasonMode, AniListSettings.SeasonMode.allCases, \.label),
+                options: AniListSettings.SeasonMode.allCases.map(\.label),
+                accentColor: accentColor
+            )
+            .opacity(enabled ? 1 : 0.46)
+            .disabled(!enabled)
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_episode_details", fallback: "Episode Titles and Pictures"),
+                subtitle: L10n.string("settings_anilist_episode_details_subtitle", fallback: "From api.ani.zip, where AniList has none, with backgrounds and logos from TheTVDB, TMDB or Metahub"),
+                isOn: $episodeDetails,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_adult", fallback: "Adult Titles"),
+                subtitle: L10n.string("settings_anilist_adult_subtitle", fallback: "Show titles AniList marks as adult"),
+                isOn: $adult,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+        }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var homeSearchGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_discover", fallback: "Home and Search"),
+            subtitle: L10n.string("settings_anilist_section_discover_subtitle", fallback: "Order or hide each AniList row in Layout")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_catalogs", fallback: "AniList Catalogs"),
+                subtitle: L10n.string(
+                    "settings_anilist_catalogs_subtitle",
+                    fallback: "Which AniList catalogs are on Home: overviews, formats, genres, tags, countries, sources, studios and your lists"
+                ),
+                value: L10n.format("settings_anime_catalogs_count", fallback: "%d on", AniListCatalogs.chosen().count),
+                accentColor: accentColor
+            ) {
+                showingCatalogs = true
+            }
+            .opacity(enabled ? 1 : 0.46)
+            .disabled(!enabled)
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_search", fallback: "Search AniList"),
+                subtitle: L10n.string("settings_anilist_search_subtitle", fallback: "Anime from AniList among the search results"),
+                isOn: $search,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_hide_duplicates", fallback: "Hide Cinemeta Duplicates"),
+                subtitle: L10n.string("settings_anilist_hide_duplicates_subtitle", fallback: "Leave out Cinemeta's copy of an anime that AniList found too"),
+                isOn: $hideCinemetaDuplicates,
+                accentColor: accentColor,
+                isAvailable: enabled && search
+            )
+        }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var addonsGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_addons", fallback: "Add-ons and Offline Tables"),
+            subtitle: L10n.string("settings_anilist_section_addons_subtitle", fallback: "Which ids add-ons are asked by, converted on this Apple TV")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_offline_tables", fallback: "Offline Tables"),
+                subtitle: offlineStatusText.isEmpty
+                    ? L10n.string("settings_anilist_offline_tables_subtitle", fallback: "Fribb's anime-lists and anibridge from GitHub, weekly: ids, seasons and episodes without asking online")
+                    : offlineStatusText,
+                value: updatingOffline ? "…" : L10n.string("settings_anilist_offline_update", fallback: "Update"),
+                accentColor: accentColor
+            ) {
+                updateOfflineTables()
+            }
+            .disabled(!enabled)
+        }
+        .opacity(enabled ? 1 : 0.46)
+    }
+
+    private func updateOfflineTables() {
+        guard !updatingOffline else { return }
+        updatingOffline = true
+        offlineStatusText = L10n.string("settings_anilist_offline_downloading", fallback: "Downloading…")
+        Task { @MainActor in
+            await AniListOfflineMaps.shared.refreshNow()
+            offlineStatusText = await AniListOfflineMaps.shared.statusText()
+            updatingOffline = false
+        }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var accountGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_account", fallback: "Account"),
+            subtitle: L10n.string("settings_anilist_section_account_subtitle", fallback: "Your AniList lists on Home, and what you watch written to them")
+        ) {
+            if let accountName {
+                loggedInRows(name: accountName)
+            } else {
+                loginRows
+            }
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    @ViewBuilder
+    private func loggedInRows(name: String) -> some View {
+        SettingsActionRow(
+            title: L10n.format("settings_anilist_logged_in", fallback: "Logged in as %@", name),
+            subtitle: L10n.string("settings_anilist_logged_in_subtitle", fallback: "The token lasts a year; log in again when AniList stops taking it"),
+            value: L10n.string("settings_anilist_log_out", fallback: "Log Out"),
+            accentColor: accentColor
+        ) {
+            AniListAccount.logOut()
+            accountName = nil
+            Task { await refreshStatus() }
+        }
+
+        SettingsToggleRow(
+            title: L10n.string("settings_anilist_scrobble", fallback: "Write Watched Episodes"),
+            subtitle: L10n.string("settings_anilist_scrobble_subtitle", fallback: "After an episode is watched to the end, or marked in details. Progress only goes forward"),
+            isOn: $scrobble,
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
+            title: L10n.string("settings_anilist_scrobble_cinemeta", fallback: "Also Anime from Cinemeta"),
+            subtitle: L10n.string("settings_anilist_scrobble_cinemeta_subtitle", fallback: "Found on AniList by TMDB/IMDb id and air date, never by name"),
+            isOn: $scrobbleCinemeta,
+            accentColor: accentColor,
+            isAvailable: scrobble
+        )
+
+        SettingsChoiceRow(
+            title: L10n.string("settings_anilist_plus_status", fallback: "\"+\" in Details Adds as"),
+            subtitle: L10n.string("settings_anilist_plus_status_subtitle", fallback: "What the library \"+\" writes to your AniList list; taken off again only while it is still that"),
+            selection: labelBinding($plusStatus, AniListSettings.PlusStatus.allCases, \.label),
+            options: AniListSettings.PlusStatus.allCases.map(\.label),
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
+            title: L10n.string("settings_anilist_details_button", fallback: "AniList Button in Details"),
+            subtitle: L10n.string("settings_anilist_details_button_subtitle", fallback: "Your list status beside Play: change it, score, favourite or remove the title"),
+            isOn: $detailsButton,
+            accentColor: accentColor
+        )
+    }
+
+    @ViewBuilder
+    private var loginRows: some View {
+        SettingsHelpText(
+            title: L10n.string("settings_anilist_why_title", fallback: "Why Log In?"),
+            paragraphs: [
+                L10n.string("settings_anilist_why_1", fallback: "**Without logging in:** AniList catalogs on Home (trending, seasons, genres, tags, studios…), search, details with episodes and AniList scores, the calendar's AniList anime, and streams from add-ons by anilist: ids or converted ids. All of it works with AniList on, no account needed."),
+                L10n.string("settings_anilist_why_2", fallback: "**Logged in, you also get:** your lists as Home rows (Watching, Planning, Completed, Favourites, custom lists…); watched episodes written to your AniList by themselves, progress only forward; \"+\" in details adding to your list; the AniList button in details (status, score, favourite); the calendar following your lists, with premieres from Planning."),
+                L10n.string("settings_anilist_why_3", fallback: "**Good to know:** the account is free and setting it up takes a few minutes. The login stays on this Apple TV for this profile. Nuvio writes to your AniList only when you finish an episode, mark one, press \"+\" or use the AniList button.")
+            ]
+        )
+
+        SettingsHelpText(
+            title: L10n.string("settings_anilist_howto_title", fallback: "How to Log In"),
+            paragraphs: [
+                L10n.string("settings_anilist_howto_1", fallback: "1. Create a free account at **anilist.co/signup**."),
+                L10n.string("settings_anilist_howto_2", fallback: "2. Open **anilist.co/settings/developer** → *Create New Client*. Name it e.g. \"Nuvio\" and set **Redirect URL** to the address shown below."),
+                L10n.string("settings_anilist_howto_3", fallback: "3. Copy the **Client ID** into the field below."),
+                L10n.string("settings_anilist_howto_4", fallback: "4. Scan the QR code with your phone on the same Wi-Fi, log in to AniList and tap *Authorize*. This Apple TV logs in by itself.")
+            ]
+        )
+
+        SettingsTextFieldRow(
+            title: L10n.string("settings_anilist_client_id", fallback: "Client ID"),
+            subtitle: L10n.string(
+                "settings_anilist_client_id_subtitle_phone",
+                fallback: "anilist.co → Settings → Developer → Create New Client, with the Redirect URL below"
+            ),
+            placeholder: "12345",
+            text: $clientID
+        )
+
+        SettingsInfoRow(
+            title: L10n.string("settings_anilist_redirect", fallback: "Redirect URL"),
+            value: phoneRedirect ?? L10n.string("settings_anilist_redirect_none", fallback: "Connect this Apple TV to your home network")
+        )
+
+        if let previous = AniListAccount.lastLoginRedirect, let phoneRedirect, previous != phoneRedirect {
+            SettingsInfoRow(
+                title: L10n.string("settings_anilist_redirect_changed", fallback: "Address Changed"),
+                value: L10n.format(
+                    "settings_anilist_redirect_changed_value",
+                    fallback: "It was %@ at the last login: update the Redirect URL of your AniList client",
+                    previous
+                ),
+                isDiagnostic: true
+            )
+        }
+
+        if let url = AniListAccount.authorizeURL(clientID: clientID, state: phoneLoginState) {
+            SettingsQRCodeCard(
+                title: L10n.string("settings_anilist_allow_phone", fallback: "Scan, then Authorize: this Apple TV logs in by itself"),
+                link: url.absoluteString
+            )
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 8)
+            .task(id: clientID) { await runPhoneLogin() }
+
+            SettingsInfoRow(
+                title: L10n.string("settings_anilist_phone_login", fallback: "From Your Phone"),
+                value: phoneLoginText,
+                isDiagnostic: true
+            )
+
+            SettingsNativeTextFieldRow(
+                title: L10n.string("settings_anilist_token_paste", fallback: "Or Paste the Token"),
+                subtitle: L10n.string(
+                    "settings_anilist_token_paste_subtitle",
+                    fallback: "From a client whose Redirect URL is https://anilist.co/api/v2/oauth/pin. The number after the dots is its length: about 1,000"
+                ),
+                placeholder: L10n.string("settings_anilist_token_placeholder", fallback: "Paste token"),
+                text: $tokenDraft,
+                hidesText: true,
+                status: loginMessage,
+                onCommit: logIn
+            )
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_log_in", fallback: "Log In"),
+                subtitle: loginMessage ?? L10n.string("settings_anilist_log_in_subtitle", fallback: "Checks the token with AniList and keeps it on this Apple TV, for this profile"),
+                value: loggingIn ? "…" : L10n.string("settings_anilist_log_in", fallback: "Log In"),
+                accentColor: accentColor
+            ) {
+                logIn()
+            }
+        }
+    }
+
+    /// This Apple TV's Redirect URL in the home network.
+    private var phoneRedirect: String? {
+        AniListLoginServer.redirectURL()?.absoluteString
+    }
+
+    private var phoneLoginText: String {
+        switch phoneLogin {
+        case nil:
+            return L10n.string("settings_anilist_phone_starting", fallback: "Starting…")
+        case .stopped?:
+            return L10n.string("settings_anilist_phone_stopped", fallback: "Stopped after ten minutes. Open this page again to log in from your phone")
+        case .waiting?:
+            return L10n.string("settings_anilist_phone_waiting", fallback: "Waiting for your phone, on the same Wi-Fi as this Apple TV")
+        case .loggingIn?:
+            return L10n.string("settings_anilist_phone_logging_in", fallback: "Logging in…")
+        case .loggedIn(let name)?:
+            return L10n.format("settings_anilist_logged_in", fallback: "Logged in as %@", name)
+        case .failed(let message)?:
+            return message
+        }
+    }
+
+    /// Listens for the phone while the QR code is on screen, ten minutes at most.
+    private func runPhoneLogin() async {
+        phoneLogin = nil
+        let redirect = phoneRedirect
+        let session = UUID()
+        AniListLoginServer.shared.start(session: session, expectedState: phoneLoginState) { state in
+            Task { @MainActor in
+                phoneLogin = state
+                if case .loggedIn(let name) = state {
+                    AniListAccount.lastLoginRedirect = redirect
+                    accountName = name
+                    tokenDraft = ""
+                    loginMessage = nil
+                    await refreshStatus()
+                }
+            }
+        }
+        try? await Task.sleep(nanoseconds: UInt64(AniListLoginServer.lifetime * 1_000_000_000))
+        AniListLoginServer.shared.stop(session: session)
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var statusGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_status", fallback: "Status"),
+            subtitle: L10n.string("settings_anilist_section_status_subtitle", fallback: "The last answer from AniList, and what Home and Search last did with it")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_status", fallback: "AniList"),
+                subtitle: statusText,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_status_home", fallback: "Home Rows"),
+                subtitle: homeStatusText,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_status_search", fallback: "Search"),
+                subtitle: searchStatusText,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_status_account", fallback: "Your List"),
+                subtitle: accountStatusText,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_test", fallback: "Test Connection"),
+                subtitle: testResult ?? L10n.string("settings_anilist_test_subtitle", fallback: "Search AniList for Frieren now, past the saved answers"),
+                value: testing ? "…" : L10n.string("settings_anilist_test_action", fallback: "Test"),
+                accentColor: accentColor
+            ) {
+                guard !testing else { return }
+                testing = true
+                Task {
+                    testResult = await AniListService.testConnection()
+                    await refreshStatus()
+                    testing = false
+                }
+            }
+        }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var savedAnswersGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_cache", fallback: "Saved Answers"),
+            subtitle: L10n.string("settings_anilist_section_cache_subtitle", fallback: "Rows keep 6 hours, airing titles an hour, finished ones a week")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_clear_cache", fallback: "Clear Saved Answers"),
+                subtitle: L10n.string("settings_anilist_clear_cache_subtitle", fallback: "Ask AniList again for everything. Done by itself after each app update"),
+                value: cacheCleared ? L10n.string("settings_anilist_cleared", fallback: "Cleared") : L10n.string("settings_anilist_clear", fallback: "Clear"),
+                accentColor: accentColor
+            ) {
+                Task {
+                    await AniListService.clearCache()
+                    cacheCleared = true
+                    AniListSettings.notifyHomeChanged()
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func refreshStatus() async {
+        statusText = await AniListService.statusText()
+        homeStatusText = AniListService.homeStatusText()
+        searchStatusText = AniListService.searchStatusText()
+        accountStatusText = AniListSettings.isEnabled ? AniListDiagnostics.text(.account) : "Off"
+        accountName = AniListAccount.login?.viewerName
+        if AniListSettings.isEnabled, !updatingOffline {
+            offlineStatusText = await AniListOfflineMaps.shared.statusText()
+        }
+    }
+
+    private func logIn() {
+        guard !loggingIn else { return }
+        loggingIn = true
+        loginMessage = nil
+        let pasted = tokenDraft
+        Task { @MainActor in
+            do {
+                let login = try await AniListAccount.logIn(pasted: pasted)
+                tokenDraft = ""
+                loginMessage = nil
+                accountName = login.viewerName
+            } catch {
+                loginMessage = error.localizedDescription
+            }
+            loggingIn = false
+            await refreshStatus()
+        }
+    }
+
+    private func labelBinding<Option: RawRepresentable>(
+        _ stored: Binding<String>,
+        _ options: [Option],
+        _ label: KeyPath<Option, String>
+    ) -> Binding<String> where Option.RawValue == String {
+        Binding(
+            get: { (options.first { $0.rawValue == stored.wrappedValue } ?? options[0])[keyPath: label] },
+            set: { newLabel in
+                if let option = options.first(where: { $0[keyPath: label] == newLabel }) {
+                    stored.wrappedValue = option.rawValue
+                }
+            }
+        )
     }
 }
 
@@ -6610,7 +7793,7 @@ private struct MdbListOptionsSheet: View {
                                 RatingProviderOrderRow(
                                     item: item,
                                     accentColor: accentColor,
-                                    canToggle: item.isAddon ? true : mdbListControlsEnabled,
+                                    canToggle: item.isAddon || item.id == AniListMetaBuilder.ratingSource ? true : mdbListControlsEnabled,
                                     canMoveUp: index > 0,
                                     canMoveDown: index < ratingProviderRows.count - 1,
                                     onToggle: { toggleProvider(item) },
@@ -6700,6 +7883,20 @@ private struct MdbListOptionsSheet: View {
             )
         }
 
+        // AniList's own score (Settings → AniList → AniList Score), switched here like the others
+        // but without MDBList; listed whether or not AniList is on.
+        do {
+            items.append(
+                RatingProviderRowItem(
+                    id: AniListMetaBuilder.ratingSource,
+                    title: "AniList",
+                    subtitle: L10n.string("settings_rating_provider_anilist_subtitle", fallback: "AniList average score"),
+                    isAddon: false,
+                    isEnabled: AddonRatingsService.isSourceEnabled(AniListMetaBuilder.ratingSource)
+                )
+            )
+        }
+
         for source in addonRatingSources {
             items.append(
                 RatingProviderRowItem(
@@ -6712,7 +7909,7 @@ private struct MdbListOptionsSheet: View {
             )
         }
 
-        ratingProviderRows = AddonRatingsService.sortRatings(items, by: { $0.id })
+        ratingProviderRows = AddonRatingsService.sortRatings(items, by: { $0.id }, includesDisabled: true)
     }
 
     private func toggleProvider(_ item: RatingProviderRowItem) {
@@ -6720,8 +7917,12 @@ private struct MdbListOptionsSheet: View {
         if let idx = ratingProviderRows.firstIndex(where: { $0.id == item.id }) {
             ratingProviderRows[idx].isEnabled = newEnabled
         }
-        if item.isAddon {
+        if item.isAddon || item.id == AniListMetaBuilder.ratingSource {
             AddonRatingsService.setSourceEnabled(item.id, enabled: newEnabled)
+            if item.id == AniListMetaBuilder.ratingSource {
+                // Shown rows filter it out; let them redraw.
+                NotificationCenter.default.post(name: AddonRatingsService.ratingOrderChangedNotification, object: nil)
+            }
             if let idx = addonRatingSources.firstIndex(where: { $0.source.lowercased() == item.id }) {
                 addonRatingSources[idx].isEnabled = newEnabled
             }
@@ -19477,6 +20678,9 @@ private struct SettingsNativeTextFieldRow: View {
     let placeholder: String
     @Binding var text: String
     var isSecure: Bool = false
+    /// Shown as dots and a length, but edited in a plain field: a secure field clears itself
+    /// when typed into again, which can leave a long pasted token cut short.
+    var hidesText: Bool = false
     var fieldWidth: CGFloat = 300
     var status: String? = nil
     var statusColor: Color = .white.opacity(0.56)
@@ -19529,6 +20733,7 @@ private struct SettingsNativeTextFieldRow: View {
 
     private var displayText: String {
         guard !text.isEmpty else { return placeholder }
+        if hidesText { return "•••••• \(text.count)" }
         return isSecure ? String(repeating: "•", count: text.count) : text
     }
 }

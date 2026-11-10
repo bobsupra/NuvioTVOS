@@ -127,8 +127,11 @@ struct CalendarAnimeTimes: Sendable {
         return result
     }
 
-    /// nil = arm didn't answer (try again next load); [] = arm doesn't know it.
+    /// The AniList offline tables first (no request; anibridge knows new seasons arm doesn't),
+    /// then arm-server. nil = arm didn't answer (try again next load); [] = arm doesn't know it.
     func lookup(tmdbId: Int, imdbId: String?) async -> [Int]? {
+        let offline = await AniListOfflineMaps.shared.aniListIDs(tmdbTV: tmdbId, imdb: imdbId.flatMap(NuvioMeta.canonicalImdbID(from:)))
+        if !offline.isEmpty { return offline }
         let byTmdb = await armIds(path: "themoviedb", id: String(tmdbId))
         if let byTmdb, !byTmdb.isEmpty { return byTmdb }
         guard let imdbId, imdbId.hasPrefix("tt") else { return byTmdb }

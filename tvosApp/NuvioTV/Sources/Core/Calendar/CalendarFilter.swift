@@ -57,10 +57,36 @@ enum CalendarOptions {
     static let defaultHideSpoilers = false
     static let defaultCheckAvailability = true
     static let defaultTvmazeTimes = true
+    static let defaultAniList = true
+    static let defaultAniListPlanning = true
 
     /// Exact broadcast times for regular series from TVmaze.
     static func tvmazeTimes(in store: UserDefaults = ProfileSettings.current) -> Bool {
         (store.object(forKey: SettingsKey.calendarTvmazeTimes) as? Bool) ?? defaultTvmazeTimes
+    }
+
+    /// Anime straight from AniList (`CalendarAniList`), only with AniList switched on in Settings.
+    static func aniList(in store: UserDefaults = ProfileSettings.current) -> Bool {
+        AniListSettings.isEnabled(in: store)
+            && ((store.object(forKey: SettingsKey.calendarAniList) as? Bool) ?? defaultAniList)
+    }
+
+    /// With `aniList`: premieres of what is on the viewer's AniList Planning list too.
+    static func aniListPlanning(in store: UserDefaults = ProfileSettings.current) -> Bool {
+        (store.object(forKey: SettingsKey.calendarAniListPlanning) as? Bool) ?? defaultAniListPlanning
+    }
+
+    /// What of the AniList option changes the calendar: the switches, whose list, and the
+    /// language of the titles. Empty with the option off.
+    static func aniListSignature(in store: UserDefaults = ProfileSettings.current) -> String {
+        guard aniList(in: store) else { return "" }
+        let viewer = AniListAccount.isLoggedIn ? AniListAccount.login.map { String($0.viewerID) } ?? "" : ""
+        return [
+            "anilist",
+            aniListPlanning(in: store) ? "planning" : "",
+            viewer,
+            AniListSettings.titleLanguage.rawValue,
+        ].joined(separator: ":")
     }
 }
 

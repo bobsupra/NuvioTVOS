@@ -241,6 +241,7 @@ struct DetailsScreen: View {
                     libraryWatchedContext: libraryWatchedContext,
                     initialPlayRequestID: readyInitialPlaybackRequestID,
                     initialFocusEpisode: initialFocusEpisode,
+                    openedID: id,
                     onInitialPlayRequestConsumed: { requestID in
                         finishInitialPlaybackRequest(requestID)
                     },
@@ -1848,6 +1849,7 @@ actor YouTubeTrailerResolver {
     private let trailerioProvider: ((String, Bool) async -> TrailerPlaybackSource?)?
     private let imdbTrailerProvider: ((String) async -> TrailerPlaybackSource?)?
     private let youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)?
+    private let aniListIMDbIDProvider: ((NuvioMeta) async -> String?)?
 
     init(
         preferredLanguageProvider: @escaping () -> String = { TmdbDetailsService.preferredLanguage },
@@ -1856,7 +1858,8 @@ actor YouTubeTrailerResolver {
         refreshedTrailerIdsProvider: ((NuvioMeta) async -> [String]?)? = nil,
         trailerioProvider: ((String, Bool) async -> TrailerPlaybackSource?)? = nil,
         imdbTrailerProvider: ((String) async -> TrailerPlaybackSource?)? = nil,
-        youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)? = nil
+        youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)? = nil,
+        aniListIMDbIDProvider: ((NuvioMeta) async -> String?)? = nil
     ) {
         self.preferredLanguageProvider = preferredLanguageProvider
         self.configurationIdentityProvider = configurationIdentityProvider
@@ -1865,6 +1868,7 @@ actor YouTubeTrailerResolver {
         self.trailerioProvider = trailerioProvider
         self.imdbTrailerProvider = imdbTrailerProvider
         self.youtubeSourceProvider = youtubeSourceProvider
+        self.aniListIMDbIDProvider = aniListIMDbIDProvider
     }
 
     private struct TrailerioResponse: Decodable {
@@ -2348,6 +2352,10 @@ actor YouTubeTrailerResolver {
         _ meta: NuvioMeta,
         preview: Bool
     ) async -> TrailerPlaybackSource? {
+        if AniListMetaBuilder.aniListID(from: meta.id) != nil {
+            return await resolveAniListTrailer(meta, preview: preview)
+        }
+
         let isEnglish = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
             .split(separator: "-").first?.lowercased() == "en"
 
@@ -2362,29 +2370,9 @@ actor YouTubeTrailerResolver {
         }
 
         // 3. Fall back to TMDB / YouTube (allows localized trailers for non-English fullscreen playback)
-        if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta) {
-            let source: TrailerPlaybackSource?
-            if let youtubeSourceProvider {
-                source = await youtubeSourceProvider(
-                    ytId,
-                    meta.name,
-                    meta.year.map(String.init),
-                    preview
-                )
-            } else if preview {
-                source = await resolvePreview(
-                    youtubeVideoId: ytId,
-                    title: meta.name,
-                    year: meta.year.map(String.init)
-                )
-            } else {
-                source = await resolve(
-                    youtubeVideoId: ytId,
-                    title: meta.name,
-                    year: meta.year.map(String.init)
-                )
-            }
-            if let source { return source }
+        if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta),
+           let source = await youtubeSource(ytId, meta: meta, preview: preview) {
+            return source
         }
 
         // 4. Fallback for non-English if YouTube failed: try IMDb high-res, then Trailerio
@@ -2395,6 +2383,50 @@ actor YouTubeTrailerResolver {
         // The YouTube ID may be present while its stream is unavailable. Keep
         // Trailerio as a fallback for both language paths in that case.
         return isEnglish ? nil : await resolveTrailerio(for: meta)
+    }
+
+    private func youtubeSource(_ ytId: String, meta: NuvioMeta, preview: Bool) async -> TrailerPlaybackSource? {
+        if let youtubeSourceProvider {
+            return await youtubeSourceProvider(ytId, meta.name, meta.year.map(String.init), preview)
+        }
+        if preview {
+            return await resolvePreview(youtubeVideoId: ytId, title: meta.name, year: meta.year.map(String.init))
+        }
+        return await resolve(youtubeVideoId: ytId, title: meta.name, year: meta.year.map(String.init))
+    }
+
+    /// An AniList title: its own trailer on YouTube first, in any language, as it is the
+    /// season's own. Without one, or when YouTube won't play it, Trailerio's and then IMDb's,
+    /// by the IMDb id ani.zip or arm-server gives; for a later season those may be the series'
+    /// or its first season's, which beats no trailer. The IMDb id is used for this only: the
+    /// title keeps its AniList id for streams and ratings.
+    private func resolveAniListTrailer(_ meta: NuvioMeta, preview: Bool) async -> TrailerPlaybackSource? {
+        if let ytId = meta.trailerYtIds?
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { Self.isYouTubeVideoId($0) }),
+           let source = await youtubeSource(ytId, meta: meta, preview: preview) {
+            return source
+        }
+        guard !Task.isCancelled else { return nil }
+        let imdbID: String?
+        if let aniListIMDbIDProvider {
+            imdbID = await aniListIMDbIDProvider(meta)
+        } else {
+            imdbID = await AniListService.trailerIMDbID(metaID: meta.id)
+        }
+        guard let imdbID, !Task.isCancelled else { return nil }
+        let trailerio: TrailerPlaybackSource?
+        if let trailerioProvider {
+            trailerio = await trailerioProvider(imdbID, meta.isSeries)
+        } else {
+            trailerio = await resolveTrailerio(imdbId: imdbID, isSeries: meta.isSeries)
+        }
+        if let trailerio { return trailerio }
+        guard !Task.isCancelled else { return nil }
+        if let imdbTrailerProvider {
+            return await imdbTrailerProvider(imdbID)
+        }
+        return await resolveImdbTrailer(imdbId: imdbID)
     }
 
     private func resolveTrailerio(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
@@ -4073,6 +4105,9 @@ struct TvDetailsContent: View {
     var libraryWatchedContext: LibraryWatchedContext? = nil
     var initialPlayRequestID: UInt? = nil
     var initialFocusEpisode: DetailsEpisodeFocus? = nil
+    /// The id the screen was opened with. An AniList card of a later season opens the whole
+    /// series on that season's tab.
+    var openedID: String? = nil
     var onInitialPlayRequestConsumed: ((UInt) -> Void)? = nil
     let onPlayClick: () -> Void
     var onPlayManually: (() -> Void)? = nil
@@ -4102,6 +4137,14 @@ struct TvDetailsContent: View {
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
     @State private var isChoosingWatchPartyEpisode = false
+    /// Settings → Integrations → AniList: which AniList entry and episode the play target is.
+    @State private var aniListTarget: AniListScrobbler.Target?
+    @State private var showingAniListMenu = false
+    @State private var showingAniListScore = false
+    @State private var malID: Int?
+    @State private var malStatus: MALAccount.ListStatus?
+    @State private var showingMALMenu = false
+    @State private var showingMALScore = false
     @State private var consumedInitialPlayRequestID: UInt?
     @State private var detailsFocusMoveGeneration = 0
     @State private var pendingPlayFocusGeneration: Int?
@@ -4372,11 +4415,34 @@ struct TvDetailsContent: View {
                     scrollProxy: scrollProxy
                 )
             },
-            onWatchlistClick: onWatchlistClick,
+            onWatchlistClick: {
+                // An AniList title also goes onto (or off) the viewer's AniList and MAL lists.
+                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn,
+                   let entryID = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedID ?? meta.id) {
+                    let added = !uiState.isInWatchlist
+                    Task {
+                        if AniListAccount.isLoggedIn {
+                            await AniListAccount.libraryChanged(entryID: entryID, added: added)
+                        }
+                        await MALAccount.libraryChanged(aniListID: entryID, added: added)
+                    }
+                }
+                onWatchlistClick()
+            },
             onWatchedClick: onWatchedClick,
             onRateClick: onRateClick != nil ? {
                 stopBackgroundTrailer(manual: false)
                 onRateClick?()
+            } : nil,
+            aniListTitle: aniListButtonTitle,
+            onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget != nil) ? {
+                stopBackgroundTrailer(manual: false)
+                showingAniListMenu = true
+            } : nil,
+            malTitle: MALAccount.buttonTitle(malStatus),
+            onMALClick: (MALSettings.showsDetailsButton && malID != nil) ? {
+                stopBackgroundTrailer(manual: false)
+                showingMALMenu = true
             } : nil,
             onTrailerClick: {
                 presentFullscreenTrailer()
@@ -4477,6 +4543,8 @@ struct TvDetailsContent: View {
                     onPersonClick: { person in
                         let clean = person.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         guard !clean.isEmpty && clean != "cast" else { return }
+                        // AniList characters have no TMDB page to open.
+                        guard !AniListMetaBuilder.isAniListID(meta.id) else { return }
                         stopBackgroundTrailer(manual: false)
                         onOpenPerson?(person)
                     },
@@ -4510,31 +4578,25 @@ struct TvDetailsContent: View {
                 )
             }
         case .related:
-            if !uiState.moreLikeThis.isEmpty {
-                TvDetailsRelatedRow(
-                    title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
-                    items: uiState.moreLikeThis,
-                    entryLocked: focusedDetailsSection != .related,
-                    onSelect: { item in
-                        stopBackgroundTrailer(manual: false)
-                        onOpenTitle?(item.id, item.type)
-                    },
-                    onBack: handleDetailsBack,
-                    onFocus: {
-                        if focusedDetailsSection != .related {
-                            focusedDetailsSection = .related
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
-                            }
-                        }
+            if !relatedRowsAreEmpty(meta: meta) {
+                VStack(alignment: .leading, spacing: 34) {
+                    // Settings → Integrations → AniList: the title's OVAs, films and other
+                    // relations, above AniList's recommendations.
+                    if !AniListTitleIndex.related(metaID: meta.id).isEmpty {
+                        relatedTitlesRow(
+                            title: L10n.string("details_anilist_related", fallback: "Related"),
+                            items: AniListTitleIndex.related(metaID: meta.id),
+                            scrollProxy: scrollProxy
+                        )
                     }
-                )
+                    if !uiState.moreLikeThis.isEmpty {
+                        relatedTitlesRow(
+                            title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
+                            items: uiState.moreLikeThis,
+                            scrollProxy: scrollProxy
+                        )
+                    }
+                }
                 .padding(.top, 34)
                 .id(TvDetailsScrollID.moreLikeThisSection)
                 .disabled(
@@ -4691,12 +4753,24 @@ struct TvDetailsContent: View {
         }
     }
 
+    // MARK: AniList
+
+    /// "Watching 5/12", "Planning", "Add" (on no list yet).
+    private var aniListButtonTitle: String {
+        guard let target = aniListTarget else { return "AniList" }
+        guard let entry = AniListAccount.entry(for: target.entryID) else { return "Add" }
+        let label = AniListAccount.statusLabel(entry.status)
+        if entry.status == "PLANNING" || entry.status == "COMPLETED" { return label }
+        let progress = entry.progress ?? 0
+        return AniListAccount.mediaState(for: target.entryID)?.episodes.map { "\(label) \(progress)/\($0)" } ?? "\(label) \(progress)"
+    }
+
     var body: some View {
         if let meta = uiState.meta {
             let episodePresentation = episodeCache.resolve(
                 meta: meta,
                 progressRevision: progressRevision,
-                focusEpisode: initialFocusEpisode,
+                focusEpisode: initialFocusEpisode ?? aniListTabFocus(for: meta),
                 libraryWatchedContext: libraryWatchedContext,
                 continueItemProvider: { currentContinueWatchingItem(for: meta) },
                 playTargetBuilder: { episodes, continueItem, watchedKeys in
@@ -4954,6 +5028,29 @@ struct TvDetailsContent: View {
             .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
+            // Settings → Integrations → AniList: the viewer's entries of this title, for the
+            // watched episodes and the AniList button.
+            .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+                progressRevision &+= 1
+            }
+            .task(id: meta.id) {
+                await AniListAccount.refreshStates(for: meta)
+            }
+            .modifier(TvDetailsAniListMenus(
+                meta: meta,
+                episode: playTarget.episode,
+                target: $aniListTarget,
+                showingMenu: $showingAniListMenu,
+                showingScore: $showingAniListScore
+            ))
+            .modifier(TvDetailsMALMenus(
+                title: aniListTarget?.label ?? meta.name,
+                entryID: aniListTarget?.entryID,
+                malID: $malID,
+                status: $malStatus,
+                showingMenu: $showingMALMenu,
+                showingScore: $showingMALScore
+            ))
             .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
@@ -5129,6 +5226,49 @@ struct TvDetailsContent: View {
         }
     }
 
+    /// The tab of the AniList entry the screen was opened with, unless there is progress to
+    /// resume, which picks its own episode.
+    private func aniListTabFocus(for meta: NuvioMeta) -> DetailsEpisodeFocus? {
+        guard let openedID,
+              openedID.caseInsensitiveCompare(meta.id) != .orderedSame,
+              let season = AniListTitleIndex.season(ofEntry: openedID, inMeta: meta.id),
+              season > 1,
+              currentContinueWatchingItem(for: meta) == nil else { return nil }
+        return DetailsEpisodeFocus(metaID: meta.id, season: season, episode: 1)
+    }
+
+    private func relatedRowsAreEmpty(meta: NuvioMeta?) -> Bool {
+        uiState.moreLikeThis.isEmpty
+            && AniListTitleIndex.related(metaID: meta?.id ?? "").isEmpty
+    }
+
+    private func relatedTitlesRow(title: String, items: [RelatedTitle], scrollProxy: ScrollViewProxy) -> some View {
+        TvDetailsRelatedRow(
+            title: title,
+            items: items,
+            entryLocked: focusedDetailsSection != .related,
+            onSelect: { item in
+                stopBackgroundTrailer(manual: false)
+                onOpenTitle?(item.id, item.type)
+            },
+            onBack: handleDetailsBack,
+            onFocus: {
+                if focusedDetailsSection != .related {
+                    focusedDetailsSection = .related
+                    withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                        scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+                    }
+                } else {
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+                    }
+                }
+            }
+        )
+    }
+
     private var hasCastOrTrailer: Bool {
         guard let meta = uiState.meta else { return false }
         let hasPeople = !uiState.people.isEmpty
@@ -5153,7 +5293,7 @@ struct TvDetailsContent: View {
                     order.append(.cast)
                 }
             case .related:
-                if !uiState.moreLikeThis.isEmpty {
+                if !relatedRowsAreEmpty(meta: uiState.meta) {
                     order.append(.related)
                 }
             case .network:
@@ -5388,9 +5528,28 @@ private struct TvDetailsLogo: View {
                let url = URL(string: logoUrl) {
                 AsyncImage(url: url) { phase in
                     if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFit()
+                        if let nameBelow = AniListMetaBuilder.nameUnderLogo(meta, inDetails: true) {
+                            // The season's own name under the series' logo.
+                            VStack(alignment: alignment == .center ? .center : .leading, spacing: 8) {
+                                image
+                                    .resizable()
+                                    .scaledToFit()
+                                    .frame(maxHeight: 84, alignment: alignment)
+                                Text(nameBelow)
+                                    .font(.appFont(size: 26, weight: .semibold))
+                                    .foregroundColor(.white.opacity(0.92))
+                                    .lineLimit(2)
+                                    .minimumScaleFactor(0.75)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .shadow(color: .black.opacity(0.65), radius: 10, y: 4)
+                                    .multilineTextAlignment(alignment == .center ? .center : .leading)
+                            }
+                            .frame(maxWidth: 560, alignment: alignment)
+                        } else {
+                            image
+                                .resizable()
+                                .scaledToFit()
+                        }
                     } else {
                         titleFallback
                     }
@@ -5418,7 +5577,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, party, watchlist, watched, rate, trailer
+    case play, party, watchlist, watched, rate, anilist, mal, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -5438,6 +5597,12 @@ private struct TvDetailsActionRow: View {
     var mdbListUserRating: Int? = nil
     var showMdbListRating: Bool = false
     var onRateClick: (() -> Void)? = nil
+    /// Settings → Integrations → AniList: the viewer's list status of this title ("Watching 5/12").
+    var aniListTitle: String? = nil
+    var onAniListClick: (() -> Void)? = nil
+    /// Settings → Anime Integrations → MyAnimeList: the viewer's MAL status ("Watching 5/12").
+    var malTitle: String? = nil
+    var onMALClick: (() -> Void)? = nil
     let onTrailerClick: () -> Void
     var onBack: (() -> Void)? = nil
     var focus: FocusState<DetailsActionFocus?>.Binding
@@ -5510,6 +5675,42 @@ private struct TvDetailsActionRow: View {
                 .disabled(entryLocked)
             }
 
+            if let onAniListClick {
+                TvDetailsActionButton(
+                    title: aniListTitle,
+                    systemName: "a.circle.fill",
+                    iconURL: URL(string: AniListMetaBuilder.ratingIcon),
+                    accessibilityLabel: aniListTitle.map { "AniList: \($0)" } ?? "AniList",
+                    accessibilityHint: "Changes this title on your AniList list",
+                    isPrimary: false,
+                    isWide: true,
+                    focus: focus,
+                    tag: .anilist,
+                    action: onAniListClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
+
+            if let onMALClick {
+                TvDetailsActionButton(
+                    title: malTitle,
+                    systemName: "m.circle.fill",
+                    iconAsset: MALEpisodeRatings.assetName,
+                    accessibilityLabel: malTitle.map { "MyAnimeList: \($0)" } ?? "MyAnimeList",
+                    accessibilityHint: "Changes this title on your MyAnimeList list",
+                    isPrimary: false,
+                    isWide: true,
+                    focus: focus,
+                    tag: .mal,
+                    action: onMALClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
+
             TvDetailsActionButton(
                 title: nil,
                 systemName: isWatched ? "eye.fill" : "eye.slash.fill",
@@ -5549,6 +5750,179 @@ private struct TvDetailsActionRow: View {
     }
 }
 
+/// Settings → Integrations → AniList: finds which AniList entry the play target is, and the
+/// menus of the AniList button (list status, score, favourite). Kept out of the details body so
+/// the compiler checks it on its own.
+private struct TvDetailsAniListMenus: ViewModifier {
+    let meta: NuvioMeta
+    let episode: NuvioVideo?
+    @Binding var target: AniListScrobbler.Target?
+    @Binding var showingMenu: Bool
+    @Binding var showingScore: Bool
+
+    func body(content: Content) -> some View {
+        content
+            .task(id: "\(meta.id)|\(episode?.id ?? "")|\(AniListAccount.login?.viewerID ?? 0)|\(MALAccount.login?.userName ?? "")") {
+                target = await Self.findTarget(meta: meta, episode: episode)
+                if AniListAccount.isLoggedIn, let target, !AniListAccount.hasAsked(target.entryID) {
+                    await AniListAccount.refreshStates(ids: [target.entryID])
+                }
+            }
+            .confirmationDialog(dialogTitle, isPresented: $showingMenu, titleVisibility: .visible) {
+                menuButtons
+            } message: {
+                Text(dialogMessage)
+            }
+            .confirmationDialog("Score on AniList", isPresented: $showingScore, titleVisibility: .visible) {
+                scoreButtons
+            }
+    }
+
+    @ViewBuilder
+    private var menuButtons: some View {
+        if let target {
+            let current = AniListAccount.entry(for: target.entryID)?.status
+            ForEach(AniListAccount.statuses, id: \.self) { status in
+                Button(AniListAccount.statusLabel(status) + (current == status ? " ✓" : "")) {
+                    Task { await AniListAccount.setStatus(status, entryID: target.entryID) }
+                }
+            }
+            Button("Score…") { showingScore = true }
+            Button(AniListAccount.mediaState(for: target.entryID)?.isFavourite == true ? "Remove from Favourites" : "Add to Favourites") {
+                Task { await AniListAccount.toggleFavourite(entryID: target.entryID) }
+            }
+            if current != nil {
+                Button("Remove from List", role: .destructive) {
+                    Task { await AniListAccount.remove(entryID: target.entryID) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var scoreButtons: some View {
+        if let target {
+            ForEach(Array(stride(from: 10, through: 1, by: -1)), id: \.self) { score in
+                Button("\(score)/10") {
+                    Task { await AniListAccount.setScore(score * 10, entryID: target.entryID) }
+                }
+            }
+            Button("Remove Score", role: .destructive) {
+                Task { await AniListAccount.setScore(0, entryID: target.entryID) }
+            }
+        }
+    }
+
+    /// Which AniList entry the menu changes: the tab of an AniList series, or the entry a
+    /// Cinemeta episode was found to be ("Kono Subarashii Sekai ni Shukufuku wo! 2 E5").
+    private var dialogTitle: String {
+        guard let target else { return "AniList" }
+        if AniListMetaBuilder.isAniListID(meta.id) {
+            let season = meta.videos?.first(where: { AniListMetaBuilder.aniListID(from: $0.id) == target.entryID })?.season
+            let tab = season.flatMap { AniListTitleIndex.tabTitle(metaID: meta.id, season: $0) }
+            return "AniList: \(meta.name)" + (tab.map { " · \($0)" } ?? "")
+        }
+        return "AniList: \(target.label)"
+    }
+
+    private var dialogMessage: String {
+        guard let target else { return "" }
+        guard let entry = AniListAccount.entry(for: target.entryID) else { return "Not on your list yet" }
+        return AniListAccount.describe(entry)
+    }
+
+    /// The AniList entry and episode of the play target: an AniList title's own, a Cinemeta
+    /// anime's as AniList knows it, an AniList series' first entry before any episode.
+    private static func findTarget(meta: NuvioMeta, episode: NuvioVideo?) async -> AniListScrobbler.Target? {
+        guard AniListAccount.isLoggedIn || MALAccount.isLoggedIn else { return nil }
+        if let found = await AniListScrobbler.target(meta: meta, video: episode, season: episode?.season, episode: episode?.episode) {
+            return found
+        }
+        if AniListMetaBuilder.isAniListID(meta.id), let first = AniListAccount.entryIDs(of: meta).first {
+            return AniListScrobbler.Target(entryID: first, episode: 0, label: meta.name)
+        }
+        return nil
+    }
+}
+
+/// The MAL button's menus: status, score, remove; for the MAL entry of the AniList entry the
+/// AniList button works on.
+private struct TvDetailsMALMenus: ViewModifier {
+    let title: String
+    let entryID: Int?
+    @Binding var malID: Int?
+    @Binding var status: MALAccount.ListStatus?
+    @Binding var showingMenu: Bool
+    @Binding var showingScore: Bool
+    @State private var revision = 0
+
+    func body(content: Content) -> some View {
+        content
+            .task(id: "\(entryID ?? 0)|\(MALAccount.login?.userName ?? "")|\(revision)") {
+                guard MALSettings.showsDetailsButton, let entryID,
+                      let mal = await MALEpisodeRatings.malID(aniListID: entryID) else {
+                    malID = nil
+                    status = nil
+                    return
+                }
+                malID = mal
+                status = await MALAccount.listStatus(mal: mal)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: MALAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+                revision &+= 1
+            }
+            .confirmationDialog("MyAnimeList: \(title)", isPresented: $showingMenu, titleVisibility: .visible) {
+                menuButtons
+            } message: {
+                Text(message)
+            }
+            .confirmationDialog("Score on MyAnimeList", isPresented: $showingScore, titleVisibility: .visible) {
+                scoreButtons
+            }
+    }
+
+    @ViewBuilder
+    private var menuButtons: some View {
+        if let malID {
+            let current = status?.status
+            ForEach(MALAccount.statuses, id: \.self) { value in
+                Button(MALAccount.statusLabel(value) + (current == value ? " ✓" : "")) {
+                    let known = status
+                    Task { await MALAccount.setStatus(value, mal: malID, current: known) }
+                }
+            }
+            Button("Score…") { showingScore = true }
+            if current != nil {
+                Button("Remove from List", role: .destructive) {
+                    Task { await MALAccount.remove(mal: malID) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var scoreButtons: some View {
+        if let malID {
+            ForEach(Array(stride(from: 10, through: 1, by: -1)), id: \.self) { score in
+                Button("\(score)/10" + (status?.score == score ? " ✓" : "")) {
+                    Task { await MALAccount.setScore(score, mal: malID) }
+                }
+            }
+            Button("Remove Score", role: .destructive) {
+                Task { await MALAccount.setScore(0, mal: malID) }
+            }
+        }
+    }
+
+    private var message: String {
+        guard let status, let current = status.status else { return "Not on your list yet" }
+        var parts = [MALAccount.statusLabel(current)]
+        parts.append(status.episodes > 0 ? "\(status.watched)/\(status.episodes) episodes" : "\(status.watched) episodes")
+        if status.score > 0 { parts.append("Score \(status.score)/10") }
+        return parts.joined(separator: " · ")
+    }
+}
+
 private struct TvPlayActionButtonStyle: ButtonStyle {
     let onHold: (() -> Void)?
     @Binding var didTriggerHold: Bool
@@ -5582,12 +5956,51 @@ private struct TvPlayActionButtonStyle: ButtonStyle {
     }
 }
 
+/// A service's icon on a Details action button, in its own colours; `systemName` until it loads.
+private struct TvDetailsServiceIcon: View {
+    let url: URL?
+    var assetName: String? = nil
+    let systemName: String
+    let size: CGFloat
+    @State private var image: UIImage?
+
+    var body: some View {
+        ZStack {
+            if let assetName {
+                Image(assetName)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            } else if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .clipShape(RoundedRectangle(cornerRadius: size * 0.22, style: .continuous))
+            } else {
+                Image(systemName: systemName)
+                    .font(.system(size: size * 0.82, weight: .bold))
+            }
+        }
+        .frame(width: size, height: size)
+        .task(id: url) {
+            guard let url else { return }
+            image = await PosterArtworkCache.shared.image(for: url, maxPixelSize: 160)
+        }
+    }
+}
+
 private struct TvDetailsActionButton: View {
     let title: String?
     let systemName: String
+    /// A service's own icon in place of the symbol (AniList), the symbol until it has loaded.
+    var iconURL: URL? = nil
+    /// The same from the app's own images (MyAnimeList).
+    var iconAsset: String? = nil
     let accessibilityLabel: String
     var accessibilityHint: String? = nil
     let isPrimary: Bool
+    /// As wide as its title, like Play, without being filled.
+    var isWide: Bool = false
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
     let action: () -> Void
@@ -5607,9 +6020,14 @@ private struct TvDetailsActionButton: View {
             action()
         }) {
             HStack(spacing: 16) {
-                Image(systemName: systemName)
-                    .font(.system(size: isPrimary ? 30 : 36, weight: .bold))
-                    .accessibilityHidden(true)
+                if iconURL != nil || iconAsset != nil {
+                    TvDetailsServiceIcon(url: iconURL, assetName: iconAsset, systemName: systemName, size: 44)
+                        .accessibilityHidden(true)
+                } else {
+                    Image(systemName: systemName)
+                        .font(.system(size: isPrimary ? 30 : 36, weight: .bold))
+                        .accessibilityHidden(true)
+                }
 
                 if let title {
                     Text(title)
@@ -5619,8 +6037,8 @@ private struct TvDetailsActionButton: View {
                 }
             }
             .foregroundColor(foregroundColor)
-            .padding(.horizontal, isPrimary ? 44 : 0)
-            .frame(minWidth: isPrimary ? 228 : 98, maxWidth: isPrimary ? nil : 98, minHeight: 98)
+            .padding(.horizontal, isPrimary ? 44 : (isWide && title != nil ? 32 : 0))
+            .frame(minWidth: isPrimary ? 228 : 98, maxWidth: (isPrimary || isWide) ? nil : 98, minHeight: 98)
             .frame(height: 98)
             .modifier(TvDetailsGlassBackground(filled: isPrimary || isFocused, shape: Capsule()))
             .shadow(color: .black.opacity(isFocused ? 0.35 : 0.18), radius: isFocused ? 18 : 7, y: 8)
@@ -7548,7 +7966,7 @@ enum TvDetailsPlayTargetBuilder {
                 : L10n.string("action_resume", fallback: "Resume")
             return TvDetailsPlayTarget(
                 episode: target,
-                label: "\(verb) S\(target.season) E\(target.episode)",
+                label: "\(verb) \(AniListMetaBuilder.episodeCode(target))",
                 isPlayable: true
             )
         }
@@ -7571,7 +7989,7 @@ enum TvDetailsPlayTargetBuilder {
                     : L10n.string("details_upcoming", fallback: "Upcoming")
                 return TvDetailsPlayTarget(
                     episode: next,
-                    label: "\(verb) S\(next.season) E\(next.episode)",
+                    label: "\(verb) \(AniListMetaBuilder.episodeCode(next))",
                     isPlayable: EpisodeReleasePolicy.hasAired(next.released)
                 )
             }
@@ -7580,7 +7998,7 @@ enum TvDetailsPlayTargetBuilder {
             }) {
                 return TvDetailsPlayTarget(
                     episode: firstUnwatched,
-                    label: "\(L10n.string("details_next", fallback: "Next")) S\(firstUnwatched.season) E\(firstUnwatched.episode)",
+                    label: "\(L10n.string("details_next", fallback: "Next")) \(AniListMetaBuilder.episodeCode(firstUnwatched))",
                     isPlayable: true
                 )
             }
@@ -7589,7 +8007,7 @@ enum TvDetailsPlayTargetBuilder {
         let first = episodes.first(where: { $0.season > 0 }) ?? episodes.first
         return TvDetailsPlayTarget(
             episode: first,
-            label: first.map { "\(L10n.string("action_play", fallback: "Play")) S\($0.season) E\($0.episode)" }
+            label: first.map { "\(L10n.string("action_play", fallback: "Play")) \(AniListMetaBuilder.episodeCode($0))" }
                 ?? L10n.string("action_play", fallback: "Play"),
             isPlayable: true
         )
@@ -7619,8 +8037,10 @@ struct TvDetailsEpisodeWatchedKeys {
     let playTarget: Set<String>
 
     init(meta: NuvioMeta, progressSnapshot: WatchedSnapshot, librarySnapshot: WatchedSnapshot?) {
-        playTarget = progressSnapshot.watchedEpisodeKeys(meta: meta)
-        display = librarySnapshot?.catalogWatchedEpisodeKeys(meta: meta) ?? playTarget
+        // Settings → Integrations → AniList: episodes as far as the viewer's AniList progress.
+        let aniList = AniListAccount.watchedEpisodeKeys(meta: meta)
+        playTarget = progressSnapshot.watchedEpisodeKeys(meta: meta).union(aniList)
+        display = (librarySnapshot?.catalogWatchedEpisodeKeys(meta: meta) ?? playTarget).union(aniList)
     }
 }
 
@@ -7861,6 +8281,9 @@ private struct TvDetailsEpisodes: View {
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
         }
+        .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshWatchedState()
+        }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
         }
@@ -7932,9 +8355,10 @@ private struct TvDetailsEpisodes: View {
             WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
         } ?? WatchedStore.currentSnapshot()
         refreshWatchedState(
-            using: libraryWatchedContext == nil
+            using: (libraryWatchedContext == nil
                 ? snapshot.watchedEpisodeKeys(meta: meta)
-                : snapshot.catalogWatchedEpisodeKeys(meta: meta),
+                : snapshot.catalogWatchedEpisodeKeys(meta: meta))
+                .union(AniListAccount.watchedEpisodeKeys(meta: meta)),
             episodeWatchCounts: snapshot.catalogEpisodeWatchCounts(meta: meta)
         )
     }
@@ -8066,6 +8490,7 @@ private struct TvDetailsEpisodes: View {
                         },
                         onToggleWatched: {
                             let isWatched = watchedEpisodeKeys.contains(watchKey)
+                            AniListScrobbler.markEpisode(meta: meta, video: video, watched: !isWatched)
                             if let libraryWatchedContext {
                                 _ = libraryWatchedContext.setWatched(
                                     meta,
@@ -8082,6 +8507,7 @@ private struct TvDetailsEpisodes: View {
                             }
                         },
                         onMarkWatchedUpTo: {
+                            AniListScrobbler.markEpisode(meta: meta, video: video, watched: true)
                             if let libraryWatchedContext {
                                 _ = libraryWatchedContext.setWatchedUpTo(
                                     meta,
@@ -8097,6 +8523,7 @@ private struct TvDetailsEpisodes: View {
                             }
                         },
                         onToggleSeasonWatched: {
+                            AniListScrobbler.markSeason(meta: meta, videos: seasonEpisodes, watched: !isSeasonWatched)
                             if let libraryWatchedContext {
                                 _ = libraryWatchedContext.setSeasonWatched(
                                     meta,
@@ -8237,7 +8664,15 @@ private struct TvDetailsEpisodes: View {
     }
 
     private func seasonTitle(_ season: Int) -> String {
-        season <= 0 ? "Specials" : "Season \(season)"
+        // AniList titles name each tab after its AniList entry.
+        if let name = AniListTitleIndex.tabTitle(metaID: meta.id, season: season) {
+            return name
+        }
+        if AniListMetaBuilder.isAniListID(meta.id) {
+            // AniList's entries aren't seasons.
+            return seasons.count > 1 ? "Part \(season)" : "Episodes"
+        }
+        return season <= 0 ? "Specials" : "Season \(season)"
     }
 
     private func continueProgress(for video: NuvioVideo) -> Double? {
@@ -8367,6 +8802,25 @@ private struct TvEpisodeRatingItem: Identifiable {
     let iconUrl: URL?
     let assetName: String?
     let color: Color
+}
+
+extension TvEpisodeRatingItem {
+    /// An add-on's rating, or an anime episode's MyAnimeList score as MAL shows it ("4.76").
+    init(_ rating: NuvioExternalRating) {
+        let isMAL = rating.source == MALEpisodeRatings.source
+        let visual = isMAL ? nil : TvRatingVisual.visual(for: rating.source)
+        self.init(
+            id: rating.source,
+            source: rating.source,
+            displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
+            valueText: isMAL
+                ? MALEpisodeRatings.formatted(rating.value)
+                : AddonRatingsService.formatRating(value: rating.value, max: rating.max),
+            iconUrl: isMAL ? nil : rating.iconUrl.flatMap { URL(string: $0) },
+            assetName: isMAL ? MALEpisodeRatings.assetName : visual?.assetName,
+            color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
+        )
+    }
 }
 
 private struct TvEpisodeCard: View {
@@ -8754,19 +9208,7 @@ private struct TvEpisodeCard: View {
         var items: [TvEpisodeRatingItem] = []
 
         for rating in episodeRatings {
-            let formatted = AddonRatingsService.formatRating(value: rating.value, max: rating.max)
-            let visual = TvRatingVisual.visual(for: rating.source)
-            items.append(
-                TvEpisodeRatingItem(
-                    id: rating.source,
-                    source: rating.source,
-                    displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
-                    valueText: formatted,
-                    iconUrl: rating.iconUrl.flatMap { URL(string: $0) },
-                    assetName: visual?.assetName,
-                    color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
-                )
-            )
+            items.append(TvEpisodeRatingItem(rating))
         }
 
         if let ratingText,
@@ -9331,7 +9773,7 @@ private struct TvStreamPickerOverlay: View {
 
             if let episode {
                 VStack(spacing: 12) {
-                    Text(L10n.format("details_season_episode", fallback: "Season %1$d · Episode %2$d", episode.season, episode.episode))
+                    Text(AniListMetaBuilder.episodeHeading(episode))
                         .font(.system(size: 36, weight: .semibold))
                         .foregroundColor(.white)
                         .multilineTextAlignment(.center)
@@ -9413,19 +9855,7 @@ private struct TvStreamPickerOverlay: View {
         var items: [TvEpisodeRatingItem] = []
 
         for rating in episodeRatings {
-            let formatted = AddonRatingsService.formatRating(value: rating.value, max: rating.max)
-            let visual = TvRatingVisual.visual(for: rating.source)
-            items.append(
-                TvEpisodeRatingItem(
-                    id: rating.source,
-                    source: rating.source,
-                    displayName: rating.name ?? visual?.displayName ?? rating.source.capitalized,
-                    valueText: formatted,
-                    iconUrl: rating.iconUrl.flatMap { URL(string: $0) },
-                    assetName: visual?.assetName,
-                    color: visual?.color ?? Color(red: 0.96, green: 0.77, blue: 0.22)
-                )
-            )
+            items.append(TvEpisodeRatingItem(rating))
         }
 
         if let ratingText = episode.rating?.trimmingCharacters(in: .whitespaces), !ratingText.isEmpty,

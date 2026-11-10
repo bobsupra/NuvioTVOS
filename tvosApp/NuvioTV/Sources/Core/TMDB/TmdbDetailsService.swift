@@ -817,6 +817,21 @@ enum TmdbDetailsService {
         )
     }
 
+    /// The backdrop and title logo of a TMDB title, by id and nothing else
+    /// (no titles or descriptions). Used for AniList films that TheTVDB has
+    /// no pictures of. nil without TMDB, its key, or TMDB artwork turned on.
+    static func artwork(tmdbId: Int, mediaType: String) async -> (background: String?, logo: String?)? {
+        if requestContext == nil {
+            return await withRequestContext { await artwork(tmdbId: tmdbId, mediaType: mediaType) }
+        }
+        guard isEnabled, apiKey != nil, useArtwork, tmdbId > 0,
+              let details = await fetchLocalizedDetails(tmdbId: tmdbId, mediaType: mediaType) else { return nil }
+        let background = imageURL(details.backdropPath, size: "w1280")
+        let logo = imageURL(preferredLogoPath(from: details.images?.logos), size: "w500")
+        guard background != nil || logo != nil else { return nil }
+        return (background, logo)
+    }
+
     /// Applies the lightweight TMDB title/description/artwork enrichment to
     /// catalog cards while preserving their source order. The details screen
     /// remains the only place that requests credits and episode data.
@@ -2081,7 +2096,28 @@ enum MdbListDetailsService {
         }
     }
 
+    /// MDBList's ratings; with MyAnimeList on, the MAL score straight from MAL instead of
+    /// MDBList's copy (MDBList's stays when MAL has none to give).
     static func fetchRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
+        let defaults = ProfileSettings.current
+        let malKey = providerSettings[providerMyAnimeList] ?? ""
+        let showsMAL = defaults.object(forKey: malKey) == nil || defaults.bool(forKey: malKey)
+        async let ownMAL = ownMALScore(for: meta, shows: showsMAL)
+        var ratings = await mdbListRatings(for: meta)
+        guard let mal = await ownMAL else { return ratings }
+        ratings.removeAll { $0.source == providerMyAnimeList }
+        ratings.append(mal)
+        return ratings.sorted {
+            (providerPriorityOrder.firstIndex(of: $0.source) ?? Int.max) < (providerPriorityOrder.firstIndex(of: $1.source) ?? Int.max)
+        }
+    }
+
+    private static func ownMALScore(for meta: NuvioMeta, shows: Bool) async -> NuvioExternalRating? {
+        guard shows else { return nil }
+        return await MALCatalogs.seriesScore(for: meta)
+    }
+
+    private static func mdbListRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
         let defaults = ProfileSettings.current
         guard defaults.bool(forKey: SettingsKey.mdbListEnabled),
               let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey)?
@@ -2108,6 +2144,12 @@ enum MdbListDetailsService {
             guard providers.contains(provider), let value = all[provider] else { return nil }
             return NuvioExternalRating(source: provider, value: value)
         }
+    }
+
+    /// `fetchRatings(for:)`, or nothing without a title to ask about.
+    static func fetchRatings(forOptional meta: NuvioMeta?) async -> [NuvioExternalRating] {
+        guard let meta else { return [] }
+        return await fetchRatings(for: meta)
     }
 
     private static func extractImdbID(from meta: NuvioMeta) -> String? {

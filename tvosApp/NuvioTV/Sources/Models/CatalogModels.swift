@@ -2372,7 +2372,7 @@ struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
     /// "S1 E3" label for the episode in progress; nil when unknown.
     var episodeLabel: String? {
         guard let numbers = resolvedNumbers else { return nil }
-        return "S\(numbers.season) E\(numbers.episode)"
+        return AniListMetaBuilder.episodeCode(id: meta.id, season: numbers.season, episode: numbers.episode)
     }
 
     /// The full episode entry from the stored series meta, carrying the
@@ -3620,7 +3620,7 @@ enum ContinueWatchingStore {
         let fraction = item.duration > 0 ? min(max(item.position / item.duration, 0), 1) : nil
         var subtitleParts: [String] = []
         if let season = item.season, let episode = item.episode {
-            subtitleParts.append("S\(season) · E\(episode)")
+            subtitleParts.append(AniListMetaBuilder.episodeCode(id: item.meta.id, season: season, episode: episode, separator: " · "))
         } else if let year = item.meta.year {
             subtitleParts.append(String(year))
         }

@@ -515,8 +515,10 @@ class DetailsViewModel: ObservableObject {
         // Any cached catalog entry already has the title, artwork, rating, and description needed for frame 0,
         // allowing the details screen to appear immediately while full details and episode guides load in the background.
         var cachedHadImdbId = false
+        var cachedSeedID: String?
         if let cached = repository.cachedMetadata(for: id),
            !cached.name.isEmpty {
+            cachedSeedID = cached.id
             cachedHadImdbId = NuvioMeta.canonicalImdbID(from: cached.imdbId ?? "") != nil
                 || NuvioMeta.canonicalImdbID(from: cached.id) != nil
             uiState = DetailsUiState(
@@ -575,7 +577,10 @@ class DetailsViewModel: ObservableObject {
                     let metaHasImdbId = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? "") != nil
                         || NuvioMeta.canonicalImdbID(from: meta.id) != nil
                     let needsEnrichmentRetry = !cachedHadImdbId && metaHasImdbId
-                    if self.enrichmentTask == nil || needsEnrichmentRetry {
+                    // An AniList card of a later season loads as the whole series, under the
+                    // first season's id: enrich that title, not the card.
+                    let titleChanged = cachedSeedID.map { $0 != meta.id } ?? false
+                    if self.enrichmentTask == nil || needsEnrichmentRetry || titleChanged {
                         if let enrichmentStarter = self.injectedEnrichmentStarter {
                             enrichmentStarter(meta, requestGeneration)
                         } else {
@@ -665,6 +670,36 @@ class DetailsViewModel: ObservableObject {
         prepareStreams(forId: targetStreamId, type: contentType)
     }
 
+    /// AniList's score first (an AniList title's own, or a Cinemeta anime's), then MDBList and the
+    /// rating add-ons, which ask about an AniList title by the IMDb id it maps to.
+    nonisolated static func combinedRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
+        async let aniListTask = AniListService.ratings(for: meta)
+        let asked = await AniListService.ratingsMeta(for: meta)
+        async let mdbTask = MdbListDetailsService.fetchRatings(forOptional: asked)
+        async let addonTask = AddonRatingsService.fetchRatings(forOptional: asked)
+        let (aniListRatings, mdbRatings, addonRatings) = await (aniListTask, mdbTask, addonTask)
+        var seen = Set<String>()
+        return (aniListRatings + mdbRatings + addonRatings).filter { seen.insert($0.source.lowercased()).inserted }
+    }
+
+    /// Whether an AniList title is in the selected library (Trakt, Simkl, MDBList, WeTrakr), which
+    /// keeps it under the IMDb/TMDB ids it maps to. nil = not known (or the local library).
+    nonisolated static func aniListLibraryMembership(for meta: NuvioMeta) async -> Bool? {
+        let mode = await MainActor.run { TraktSettingsStore.librarySourceMode }
+        guard mode != .local else { return nil }
+        let libraryMeta = await AniListService.libraryMeta(for: meta)
+        switch mode {
+        case .mdblist:
+            return await MdbListLibraryService.isInWatchlist(libraryMeta)
+        case .wetrakr:
+            return await WeTrakrLibraryService.isInWatchlist(libraryMeta)
+        default:
+            if LibraryStore.contains(metaId: meta.id, type: meta.type) { return true }
+            guard let imdb = libraryMeta.imdbId else { return nil }
+            return LibraryStore.contains(metaId: imdb, type: meta.type) ? true : nil
+        }
+    }
+
     /// Loads More Like This, Production companies, and top Trakt comments
     /// progressively and concurrently as soon as each returns.
     private func loadEnrichment(for meta: NuvioMeta, generation: UInt64) {
@@ -679,6 +714,29 @@ class DetailsViewModel: ObservableObject {
                 if self.detailsRequestGeneration == generation {
                     self.uiState.isLoadingEnrichment = false
                 }
+            }
+
+            // Settings → Integrations → AniList: characters and recommendations from AniList;
+            // TMDB, Trakt and Simkl know no AniList ids.
+            if AniListService.isAniListTitle(meta.id) {
+                // The ratings as for any title: AniList's own, then MDBList and the rating
+                // add-ons by the IMDb id it maps to.
+                async let ratingsTask = Self.combinedRatings(for: meta)
+                let extras = await AniListService.extras(metaID: meta.id)
+                guard self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
+                if !extras.people.isEmpty {
+                    self.uiState.people = extras.people
+                }
+                if !extras.recommendations.isEmpty {
+                    self.uiState.moreLikeThis = extras.recommendations
+                }
+                let ratings = await ratingsTask
+                self.applyMdbRatings(ratings, for: meta.id, generation: generation)
+                // In the selected library under the IMDb/TMDB ids it maps to.
+                if let member = await Self.aniListLibraryMembership(for: meta) {
+                    self.applyMdbListWatchlistMembership(member, for: meta.id, generation: generation)
+                }
+                return
             }
 
             let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
@@ -735,10 +793,7 @@ class DetailsViewModel: ObservableObject {
 
                 // 4. External Ratings (MDBList & Add-ons)
                 group.addTask {
-                    async let mdbTask = MdbListDetailsService.fetchRatings(for: meta)
-                    async let addonTask = AddonRatingsService.fetchRatings(for: meta)
-                    let (mdbRatings, addonRatings) = await (mdbTask, addonTask)
-                    let combinedRatings = mdbRatings + addonRatings
+                    let combinedRatings = await Self.combinedRatings(for: meta)
                     await MainActor.run { [weak self] in
                         self?.applyMdbRatings(combinedRatings, for: meta.id, generation: generation)
                     }
