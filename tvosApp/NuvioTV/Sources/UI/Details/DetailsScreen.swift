@@ -10404,7 +10404,9 @@ private struct TvStreamPickerOverlay: View {
                                     Text(L10n.string("stream_recommended_criteria", fallback: "Based on reported resolution, HDR, release, audio, codec, availability and size"))
                                         .font(.system(size: 18))
                                         .foregroundColor(.white.opacity(0.65))
-                                    ForEach(picks.map { $0.resolution }, id: \.self) { resolution in
+                                    // The overall pick already has its own card; its resolution's card
+                                    // would repeat the same source.
+                                    ForEach(picks.filter { $0.stream.id != recommendedStream.id }.map { $0.resolution }, id: \.self) { resolution in
                                         if let pick = picks.first(where: { $0.resolution == resolution }) {
                                             let resolutionLabel = resolution == 2160 ? "4K" : "\(resolution)p"
                                             TvStreamRecommendationCard(
