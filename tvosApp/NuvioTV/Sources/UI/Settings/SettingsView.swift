@@ -323,6 +323,8 @@ enum SettingsKey {
     static let preferHardwareDecodedStreams = "nuvio.tv.settings.playback.preferHardwareDecodedStreams"
     static let preserveAddonStreamOrder = "nuvio.tv.settings.playback.preserveAddonStreamOrder"
     static let streamSortOption = "nuvio.tv.settings.playback.streamSortOption"
+    /// Local picker preference; the shared stream sort contract does not know this mode.
+    static let recommendedStreamSort = "nuvio.tv.streamPicker.recommendedSort"
     static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
     static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
     static let showAddonLogo = "nuvio.tv.settings.playback.showAddonLogo"
@@ -11011,6 +11013,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.preferHardwareDecodedStreams) private var preferHardwareDecodedStreams = true
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonStreamOrder = false
     @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
+    @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedStreamSort = false
     @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
@@ -11724,6 +11727,14 @@ private struct PlaybackSettingsView: View {
                     subtitle: L10n.string("tvos_settings_stream_sort_subtitle", fallback: "Default ordering when opening sources (Quality merges all add-ons and ranks by 4K/1080p)"),
                     selection: $streamSortOption,
                     options: streamSortModes,
+                    accentColor: accentColor
+                )
+                .disabled(recommendedStreamSort)
+
+                SettingsToggleRow(
+                    title: L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended"),
+                    subtitle: L10n.string("stream_sort_recommended_setting_subtitle", fallback: "Ranks available sources using information reported by add-ons. Metadata may be incomplete or inaccurate; playback quality is not guaranteed."),
+                    isOn: $recommendedStreamSort,
                     accentColor: accentColor
                 )
 

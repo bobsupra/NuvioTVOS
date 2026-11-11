@@ -9681,7 +9681,7 @@ private struct TvStreamPickerOverlay: View {
     /// Filter by stable add-on id (not display name).
     @State private var selectedAddonId: String?
     @AppStorage(SettingsKey.streamSortOption) private var sortOption: StreamSortOption = .quality
-    @AppStorage("nuvio.tv.streamPicker.recommendedSort") private var recommendedSort = false
+    @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedSort = false
     private var pickerSortOption: StreamSortOption { recommendedSort ? .recommended : sortOption }
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
