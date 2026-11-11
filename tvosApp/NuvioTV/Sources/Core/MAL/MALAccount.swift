@@ -355,12 +355,29 @@ actor MALListCache {
     func forget() { kept = [:] }
 }
 
-/// The MAL login in the Keychain, one per profile, never synced.
+/// Where MAL logins are kept: the Keychain in the app, memory in tests (the simulator test host
+/// has no usable Keychain).
+protocol MALLoginStorage: AnyObject {
+    func login(for profileScope: String) -> MALAccount.Login?
+    func save(_ login: MALAccount.Login, for profileScope: String)
+    func remove(for profileScope: String)
+}
+
+/// The MAL login, one per profile, never synced.
 enum MALKeychain {
+    static var storage: MALLoginStorage = MALKeychainLoginStorage()
+
+    static func login(for profileScope: String) -> MALAccount.Login? { storage.login(for: profileScope) }
+    static func save(_ login: MALAccount.Login, for profileScope: String) { storage.save(login, for: profileScope) }
+    static func remove(for profileScope: String) { storage.remove(for: profileScope) }
+}
+
+/// The MAL login in the Keychain, one per profile, never synced.
+final class MALKeychainLoginStorage: MALLoginStorage {
     private static let service = "com.nuvio.tv.mal.auth"
 
-    static func login(for profileScope: String) -> MALAccount.Login? {
-        var query = base(profileScope)
+    func login(for profileScope: String) -> MALAccount.Login? {
+        var query = Self.base(profileScope)
         query[kSecReturnData as String] = true
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var result: AnyObject?
@@ -368,9 +385,9 @@ enum MALKeychain {
         return try? JSONDecoder().decode(MALAccount.Login.self, from: data)
     }
 
-    static func save(_ login: MALAccount.Login, for profileScope: String) {
+    func save(_ login: MALAccount.Login, for profileScope: String) {
         guard let data = try? JSONEncoder().encode(login) else { return }
-        let query = base(profileScope)
+        let query = Self.base(profileScope)
         let attributes: [String: Any] = [kSecValueData as String: data]
         if SecItemUpdate(query as CFDictionary, attributes as CFDictionary) == errSecItemNotFound {
             var item = query
@@ -380,8 +397,8 @@ enum MALKeychain {
         }
     }
 
-    static func remove(for profileScope: String) {
-        SecItemDelete(base(profileScope) as CFDictionary)
+    func remove(for profileScope: String) {
+        SecItemDelete(Self.base(profileScope) as CFDictionary)
     }
 
     private static func base(_ profileScope: String) -> [String: Any] {
@@ -392,4 +409,11 @@ enum MALKeychain {
             kSecAttrSynchronizable as String: false,
         ]
     }
+}
+
+final class MALMemoryLoginStorage: MALLoginStorage {
+    private var values: [String: MALAccount.Login] = [:]
+    func login(for profileScope: String) -> MALAccount.Login? { values[profileScope] }
+    func save(_ login: MALAccount.Login, for profileScope: String) { values[profileScope] = login }
+    func remove(for profileScope: String) { values[profileScope] = nil }
 }

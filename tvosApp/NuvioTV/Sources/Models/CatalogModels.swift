@@ -12446,10 +12446,21 @@ enum ProfileSettings {
             AISubtitleKeyStore.remove(profileScope: id)
             Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: id) }
             StreamBadgeSettingsStore.removeRules(for: id)
+            AniListAccount.storage.remove(for: id)
+            MALKeychain.remove(for: id)
             UserDefaults.standard.removePersistentDomain(forName: "\(suitePrefix).\(id)")
         }
         HomeCatalogPayloadStore.removeAll(in: .standard)
         AISubtitleKeyStore.remove(profileScope: "default")
+        // Keychain logins outlive the removed suites. Profile ids 1-6 and
+        // "guest" are reused by the next account, and Trakt falls back across
+        // "guest", "1" and "default", so the previous user's sessions would be
+        // restored without these.
+        TraktKeychainStorage.shared.clearAll()
+        AniListAccount.storage.remove(for: "default")
+        AniListAccount.clearStates()
+        MALKeychain.remove(for: "default")
+        Task { await MALAccount.lists.forget() }
         Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: "default") }
         StreamBadgeSettingsStore.removeRules(for: "default")
         SimklAuthStore.clearAuth(
