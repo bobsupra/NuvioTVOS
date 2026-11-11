@@ -1000,7 +1000,8 @@ struct LibraryItemButton: View {
                     LiquidGlassCardModifier(
                         cornerRadius: cardCornerRadius,
                         isFocused: showsFocusedAppearance,
-                        isEnabled: liquidGlassCards
+                        isEnabled: liquidGlassCards,
+                        coveredByArtwork: true
                     )
                 )
                 .overlay(alignment: .topTrailing) {
@@ -1014,7 +1015,7 @@ struct LibraryItemButton: View {
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                         .stroke(showsFocusedAppearance ? focusBorderColor : Color.clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
-                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2), radius: showsFocusedAppearance ? 16 : 6)
+                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0), radius: showsFocusedAppearance ? 16 : 0)
                 
                 if posterLabels {
                     VStack(alignment: .leading, spacing: 3) {

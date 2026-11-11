@@ -709,6 +709,22 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// The last answer, kept for the last question: for a lookup every card makes in its body,
+/// each time with the same setting.
+final class LastValueMemo<Input: Equatable, Output>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: (input: Input, output: Output)?
+
+    func value(for input: Input, compute: (Input) -> Output) -> Output {
+        lock.lock()
+        defer { lock.unlock() }
+        if let last, last.input == input { return last.output }
+        let output = compute(input)
+        last = (input, output)
+        return output
+    }
+}
+
 enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable {
     case home
     case continueWatching = "continue_watching"
@@ -732,7 +748,15 @@ enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable {
         }
     }
 
+    /// Every poster card asks this in its body, with the same setting each time: answered once
+    /// per setting, not split and lowercased for every card on every redraw.
+    private static let storageValueMemo = LastValueMemo<String?, Set<CustomPosterScreen>>()
+
     static func fromStorageValue(_ rawValue: String?) -> Set<CustomPosterScreen> {
+        storageValueMemo.value(for: rawValue, compute: parseStorageValue)
+    }
+
+    private static func parseStorageValue(_ rawValue: String?) -> Set<CustomPosterScreen> {
         guard let rawValue else { return Set(allCases) }
         let keys = rawValue
             .split(separator: ",", omittingEmptySubsequences: false)
@@ -867,6 +891,8 @@ enum CustomPosterURLResolver {
         meta: NuvioMeta,
         shape: String = "poster"
     ) -> String? {
+        // No usable pattern (most often none is set): nothing to read from the title.
+        guard preparedPatternMemo.value(for: pattern, compute: preparePattern) != nil else { return nil }
         let ids = extractIDs(from: meta)
         let contentType = meta.isSeries ? "series" : "movie"
         return resolve(pattern: pattern, ids: ids, type: contentType, shape: shape)
@@ -936,17 +962,31 @@ enum CustomPosterURLResolver {
         type: String,
         shape: String = "poster"
     ) -> String? {
+        guard let prepared = preparedPatternMemo.value(for: pattern, compute: preparePattern) else { return nil }
+        if prepared.isRPDBFamily {
+            return resolveRPDBWithFallback(pattern: prepared.decoded, ids: ids, type: type, shape: shape)
+        } else {
+            return resolvePattern(pattern: prepared.decoded, ids: ids, type: type, shape: shape)
+        }
+    }
+
+    private struct PreparedPattern {
+        let decoded: String
+        let isRPDBFamily: Bool
+    }
+
+    /// The pattern as cards use it, made once per pattern: every poster card resolves its
+    /// artwork in its body, and made each time it was trimmed, decoded and matched against a
+    /// regular expression (built anew) for every card on every redraw.
+    private static let preparedPatternMemo = LastValueMemo<String, PreparedPattern?>()
+
+    private static func preparePattern(_ pattern: String) -> PreparedPattern? {
         let trimmedPattern = sanitizePattern(pattern)
         if trimmedPattern.isEmpty { return nil }
 
         let decoded = decodePatternPlaceholders(trimmedPattern)
         if !containsPlaceholder(decoded) { return nil }
-
-        if isRPDBFamily(decoded) {
-            return resolveRPDBWithFallback(pattern: decoded, ids: ids, type: type, shape: shape)
-        } else {
-            return resolvePattern(pattern: decoded, ids: ids, type: type, shape: shape)
-        }
+        return PreparedPattern(decoded: decoded, isRPDBFamily: isRPDBFamily(decoded))
     }
 
     private static func resolvePattern(
@@ -1405,7 +1445,9 @@ enum EpisodeReleasePolicy {
         }
 
         let parsed: Date?
-        if !raw.contains("T"), let day = isoDay(raw) {
+        if let date = fastUTCDate(raw) {
+            parsed = date
+        } else if !raw.contains("T"), let day = isoDay(raw) {
             let parts = day.split(separator: "-").compactMap { Int($0) }
             if parts.count == 3 {
                 var calendar = Calendar(identifier: .gregorian)
@@ -1442,6 +1484,58 @@ enum EpisodeReleasePolicy {
 
         cacheReleaseDate(parsed, for: raw)
         return parsed
+    }
+
+    /// "2008-01-20", "2008-01-20T19:00:00Z" and "2008-01-20T19:00:00.000Z", the shapes addons
+    /// send, read by hand (a day alone is midnight UTC, as below). Through the system's date
+    /// formatters, a long series' episodes, each looked at for the first time, held the main
+    /// thread for 400 ms as Details opened. Any other shape (an offset, a space instead of "T")
+    /// is nil here and left to the formatters.
+    static func fastUTCDate(_ raw: String) -> Date? {
+        let bytes = Array(raw.utf8)
+        func number(_ start: Int, _ count: Int) -> Int? {
+            guard start + count <= bytes.count else { return nil }
+            var value = 0
+            for index in start..<(start + count) {
+                let byte = bytes[index]
+                guard byte >= 48, byte <= 57 else { return nil }
+                value = value * 10 + Int(byte - 48)
+            }
+            return value
+        }
+        guard bytes.count >= 10, bytes[4] == 45, bytes[7] == 45,
+              let year = number(0, 4), let month = number(5, 2), let day = number(8, 2),
+              (1...12).contains(month), (1...31).contains(day) else { return nil }
+        var seconds = 0
+        var fraction = 0.0
+        if bytes.count > 10 {
+            // "T", ":" twice, then the seconds, an optional fraction, and "Z".
+            guard bytes.count >= 20, bytes[10] == 84, bytes[13] == 58, bytes[16] == 58,
+                  let hour = number(11, 2), let minute = number(14, 2), let second = number(17, 2),
+                  hour < 24, minute < 60, second < 60 else { return nil }
+            var index = 19
+            if bytes[index] == 46 {
+                index += 1
+                let digitsStart = index
+                var scale = 0.1
+                while index < bytes.count, bytes[index] >= 48, bytes[index] <= 57 {
+                    fraction += Double(bytes[index] - 48) * scale
+                    scale /= 10
+                    index += 1
+                }
+                guard index > digitsStart else { return nil }
+            }
+            guard index == bytes.count - 1, bytes[index] == 90 else { return nil }
+            seconds = hour * 3_600 + minute * 60 + second
+        }
+        // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+        let shiftedYear = month <= 2 ? year - 1 : year
+        let era = (shiftedYear >= 0 ? shiftedYear : shiftedYear - 399) / 400
+        let yearOfEra = shiftedYear - era * 400
+        let dayOfYear = (153 * ((month + 9) % 12) + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        let days = era * 146_097 + dayOfEra - 719_468
+        return Date(timeIntervalSince1970: Double(days * 86_400 + seconds) + fraction)
     }
 
     private static func cacheReleaseDate(_ value: Date?, for raw: String) {
@@ -2832,6 +2926,24 @@ enum ContinueWatchingStore {
         guard let data = data(for: storageKey) else {
             return "stored file missing (rebuilds from ledger on next Home load)"
         }
+        return rowDiagnostic(decoding: data, persistence: persistenceDiagnostic)
+    }
+
+    /// `rowDiagnostic()` with the decoding (every entry, with its title's episodes) away from
+    /// the main thread: Settings showing it read it in its body, and it took 30-170 ms on each
+    /// redraw as Settings opened. (The file is read where the rest of the store runs.)
+    @MainActor
+    static func rowDiagnosticInBackground() async -> String {
+        guard let data = data(for: storageKey) else {
+            return "stored file missing (rebuilds from ledger on next Home load)"
+        }
+        let persistence = persistenceDiagnostic
+        return await Task.detached(priority: .utility) {
+            ContinueWatchingStore.rowDiagnostic(decoding: data, persistence: persistence)
+        }.value
+    }
+
+    private static func rowDiagnostic(decoding data: Data, persistence: String) -> String {
         let decoded: [ContinueWatchingItem]
         do {
             decoded = try makeDecoder().decode([ContinueWatchingItem].self, from: data)
@@ -2842,7 +2954,7 @@ enum ContinueWatchingStore {
         let upNext = kept.filter(\.isUpNextEntry).count
         let unaired = kept.filter { $0.isUpNextEntry && !$0.hasAired }.count
         return "cap \(maxItems); stored \(decoded.count), passing filter \(kept.count), "
-            + "of those up-next \(upNext) (unaired \(unaired)); \(persistenceDiagnostic)"
+            + "of those up-next \(upNext) (unaired \(unaired)); \(persistence)"
     }
 
     /// Exact per-episode resume lookup. A series request never falls back to

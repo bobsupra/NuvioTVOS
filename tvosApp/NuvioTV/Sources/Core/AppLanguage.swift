@@ -284,6 +284,7 @@ enum L10n {
     private static var activeTable: [String: String] = [:]
 
     static func reload(languageTag: String?) {
+        formatTemplates.removeAllObjects()
         activeTag = languageTag
         let english = catalog["en"] ?? [:]
         let selected: [String: String]
@@ -320,6 +321,17 @@ enum L10n {
 
     /// Formats Android-style templates (`%1$s`, `%d`) with the active locale.
     static func format(_ key: String, fallback: String, _ args: CVarArg...) -> String {
+        String(format: formatTemplate(key, fallback: fallback), locale: AppLocaleManager.shared.locale, arguments: args)
+    }
+
+    /// Converted templates by key, for the active table. Cards format their labels ("12m left")
+    /// every time they redraw; the nine replacements per call showed up in main-thread samples
+    /// on an Apple TV.
+    private static let formatTemplates = NSCache<NSString, NSString>()
+
+    private static func formatTemplate(_ key: String, fallback: String) -> String {
+        let cacheKey = (key + "\u{1}" + fallback) as NSString
+        if let cached = formatTemplates.object(forKey: cacheKey) { return cached as String }
         var template = string(key, fallback: fallback)
         for index in 1...9 {
             // Keep positional indices so translators can reorder arguments for
@@ -328,7 +340,8 @@ enum L10n {
             // conversion specifier.
             template = template.replacingOccurrences(of: "%\(index)$s", with: "%\(index)$@")
         }
-        return String(format: template, locale: AppLocaleManager.shared.locale, arguments: args)
+        formatTemplates.setObject(template as NSString, forKey: cacheKey)
+        return template
     }
 
     /// Localized *display* label for stored settings option values.

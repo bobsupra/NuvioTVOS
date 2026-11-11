@@ -602,6 +602,9 @@ struct ContentView: View {
     /// Where the root Details screen should return. This is normally Home, but
     /// a title opened from a collection must return to that collection.
     @State private var detailsReturnDestination: DetailsReturnDestination = .main
+    /// Going back from Details to Home, the step before Details fades out: Details is out of
+    /// focus and Home catches up with what changed while it was covered, both still unseen.
+    @State private var isLeavingDetailsForHome = false
     /// Bumped only after the Details view has actually left the hierarchy.
     /// Home uses this lifecycle signal to request focus at the first moment
     /// tvOS can accept it, instead of guessing with delayed timers.
@@ -758,6 +761,9 @@ struct ContentView: View {
                 .allowsHitTesting(false)
                 .frame(width: 0, height: 0)
         }
+        // The card settings, read once here for every card below (inside the
+        // profile store that follows).
+        .modifier(CardAppearanceProvider())
         // Resolve every @AppStorage in the app against the active profile's
         // settings suite, so each profile keeps its own theme, layout, playback
         // preferences, etc. Falls back to the shared store before a profile is picked.
@@ -1144,6 +1150,11 @@ struct ContentView: View {
         }
     }
 
+    private var isDetailsScreenShown: Bool {
+        if case .details = activeScreen { return true }
+        return false
+    }
+
     private var isDetailsOrPlayerOverlayPresented: Bool {
         switch activeScreen {
         case .details, .player: return true
@@ -1232,7 +1243,28 @@ struct ContentView: View {
 
     /// Backs out of Details to the title it was opened from (a "More like this"
     /// chain), or to the screen that opened the root Details.
+    ///
+    /// Back to Home it goes in two steps. Home, kept still while Details covered it, catches up
+    /// as it shows again, and Details out of focus redraws (80-130 ms of the main thread in all,
+    /// more with a long series); done as Details began to fade, the fade's first frames were
+    /// lost and Details jumped from whole to half gone, a blink. So that work is done first,
+    /// with Details still whole over Home, and Details fades out on the next turn of the run
+    /// loop.
     private func leaveDetails() {
+        if isLeavingDetailsForHome { return }
+        if detailsBackStack.isEmpty, case .main = detailsReturnDestination {
+            isLeavingDetailsForHome = true
+            DispatchQueue.main.async {
+                defer { isLeavingDetailsForHome = false }
+                guard case .details = activeScreen else { return }
+                fadeOutDetails()
+            }
+            return
+        }
+        fadeOutDetails()
+    }
+
+    private func fadeOutDetails() {
         pendingDetailsPlaybackRequestID = nil
         TVHomeDebugTrace.log(
             "details.leave backStackRemaining=\(detailsBackStack.count) returnDest=\(detailsReturnDestination)"
@@ -2759,11 +2791,19 @@ struct ContentView: View {
                 // nothing to refract) — it's only `.disabled` so its cards can't
                 // steal focus, and the menu re-grabs focus if the engine drifts.
                 .opacity(fullScreenOverlayPresented ? 0 : 1)
+                // Going back from Details, Home is there again at once, under Details as it
+                // fades out. Fading in while Details faded out, both were half see-through
+                // midway and the dark background showed through: a blink. (Going in, Details
+                // covers Home at once anyway.)
+                .transaction(value: isDetailsScreenShown) { transaction in
+                    transaction.animation = nil
+                }
 
             if case .details(let contentId, let contentType) = activeScreen {
                 detailsScreen(contentId: contentId, contentType: contentType)
                     .id("\(contentType):\(contentId)")
-                    .transition(.leavingScreen)
+                    .modifier(LeavingScreenModifier(isLeaving: isLeavingDetailsForHome))
+                    .transition(.steadyDetailsScreen)
                     .onDisappear {
                         detailsDidDisappearGeneration &+= 1
                     }
@@ -2970,6 +3010,7 @@ struct ContentView: View {
             isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
             isVisibleCardMenuPresented: cardMenuMeta != nil,
             detailsDidDisappearGeneration: detailsDidDisappearGeneration,
+            homeCatchesUp: isLeavingDetailsForHome,
             accountEmail: authManager.currentEmail,
             isAuthenticated: authManager.isAuthenticated,
             sessionNeedsReauthentication: authManager.sessionNeedsReauthentication,
@@ -4496,6 +4537,23 @@ final class ProfileTabAvatarRenderer: ObservableObject {
     }
 }
 
+/// Home, not redrawn from above while Details or the player (any full-screen overlay) covers
+/// it: it is see-through then and draws nothing, and redrawn as Details opened, loaded, took
+/// focus and closed, it was 9-22 times in 5 s (and its rows 16-41), 50-150 ms of the main
+/// thread each, under Details' own first moves. Its inputs catch up at once as it shows again
+/// (and on the change that covers it, which it handles). Its own state and store still update
+/// it meanwhile.
+private struct TVHomeCoveredFreeze<Content: View>: View, Equatable {
+    let isCovered: Bool
+    let content: Content
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.isCovered && rhs.isCovered
+    }
+
+    var body: some View { content }
+}
+
 private struct TVMainTabView: View {
     @Binding var selectedTab: TVTab
     let activeProfile: Profile?
@@ -4509,6 +4567,9 @@ private struct TVMainTabView: View {
     let isDetailsOrPlayerOverlayPresented: Bool
     let isVisibleCardMenuPresented: Bool
     let detailsDidDisappearGeneration: UInt
+    /// Home catches up though still covered: Details is about to fade out (see
+    /// `ContentView.leaveDetails`).
+    var homeCatchesUp = false
     let accountEmail: String?
     let isAuthenticated: Bool
     let sessionNeedsReauthentication: Bool
@@ -4676,7 +4737,7 @@ private struct TVMainTabView: View {
     }
 
     private var homeTabContent: some View {
-        TVHomeView(
+        TVHomeCoveredFreeze(isCovered: isFullScreenOverlayPresented && !homeCatchesUp, content: TVHomeView(
             store: homeStore,
             repository: CinemetaCatalogRepository(),
             isActive: selectedTab == .home,
@@ -4706,7 +4767,8 @@ private struct TVMainTabView: View {
             onRequestAccountRefresh: onRequestAccountRefresh,
             onRequestReauth: { showingReauthSheet = true },
             onOpenCalendarEntry: onOpenCalendarEntry
-        )
+        ))
+            .equatable()
             .id(activeProfile?.id ?? "none")
     }
 
@@ -5087,6 +5149,23 @@ enum ProfileDisplayName {
     }
 }
 
+/// Follows Home's focused card for `TVHomeView`. Only this empty view reads it, so a move from
+/// card to card redraws it instead of all of Home.
+private struct TVHomeFocusedCardObserver: View {
+    let focus: FocusState<String?>.Binding
+    let onChange: (String?, String?) -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: focus.wrappedValue) { oldValue, newValue in
+                onChange(oldValue, newValue)
+            }
+    }
+}
+
 private final class TVHomeFocusWork {
     struct VisibleSectionsSignature: Equatable {
         let cwVisible: Bool
@@ -5107,7 +5186,25 @@ private final class TVHomeFocusWork {
         let sections: [TVHomeSection]
     }
     var cachedVisibleSections: CachedVisibleSections?
+    /// Every card's focus key, worked out again only when the rows change: Home's body asks for
+    /// them on each redraw (to notice a row change), and building a key for each card of every
+    /// row cost several milliseconds on every move.
+    struct CachedFocusRows {
+        let sectionsSignature: VisibleSectionsSignature
+        let layout: String
+        let gridRows: Int
+        let rows: [TVHomeFocusRow]
+    }
+    var cachedFocusRows: CachedFocusRows?
     var defersOverlayPreparation = false
+    /// Bumped when focus leaves the card Home is putting it back on (after Details or the
+    /// player), for the Back press that checks whether it stayed. Kept here, out of Home's state:
+    /// bumped on every move after a return from Details, it redrew Home two more times a move.
+    var focusMovedAwayGeneration = 0
+    /// The card the rows last reported focused (nil: off the cards), and a count that tells a
+    /// pending "off the cards" whether a card took focus meanwhile.
+    var rowFocusedCardID: String?
+    var rowFocusBlurGeneration = 0
     var pendingOverlayRestoreCardID: String?
     /// Remains set until the restored card's actual focus callback runs. The
     /// shared FocusState can be updated before that callback, so it cannot be
@@ -5128,6 +5225,10 @@ private final class TVHomeFocusWork {
     /// Deferred fallback for the one direction the outer vertical ScrollView
     /// can consume before the previous lazy row is materialized.
     var upwardFocusTask: Task<Void, Never>?
+    /// The rows coming back a step at a time after Back jumped Home to the top; meanwhile the
+    /// rows around where focus was stay built (not all taken down in the jump's frame either).
+    var rowStageTask: Task<Void, Never>?
+    var isStagingRowsAfterJump = false
     var focusedRowIndex: Int = 0
 
     func cancelAll() {
@@ -5649,9 +5750,18 @@ struct TVHomeView: View {
     @State private var detailsPlayerRestoreNativeFocusLostTarget = false
     @State private var detailsPlayerRestoreGeneration: Int?
     @State private var detailsPlayerRestorePresentationID: Int?
-    @State private var focusMovedAwayGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
     @State private var focusedRowIndex: Int = 0
+    /// The row focus rested on last. Rows up to three away from it stay built, so a move up or
+    /// down finds the rows it shows already there and the next one is built once the move has
+    /// finished, not while it animates.
+    @State private var settledRowIndex: Int = 0
+    /// How far around the focused row Home builds its rows. Each time Home is built (another
+    /// tab's return builds it anew), it starts with the focused row and the one below it, and
+    /// widens to the usual window a step at a time: all of them at once, 5-7 rows and up to 146
+    /// cards, held the switch back to Home up for 290-430 ms, and the four rows around focus
+    /// (56 cards) still for 256-280 ms.
+    @State private var rowBuildReach = 0
     @State private var browsingSection: TVHomeSection?
     @State private var browsePresentationGeneration = 0
     @State private var gridHeroIndex = 0
@@ -5678,11 +5788,105 @@ struct TVHomeView: View {
         overlayRestoreCardID
     }
 
+    /// The restore lock as one row sees it: the card focus is being put back on, when it is in
+    /// this row. A row without it is locked out as a whole, from outside (`homeSectionRow`):
+    /// handed the lock, every one of its cards changed, and returning to Home (from Details,
+    /// Settings…) rebuilt every card of every row on screen each time the lock or the pause
+    /// of focus animations switched, up to 146 cards and a 350 ms stall.
+    private func rowFocusRestriction(_ sectionID: String) -> String? {
+        guard let key = activeFocusRestrictionCardID, key.hasPrefix("\(sectionID)\u{1}") else { return nil }
+        return key
+    }
+
+    /// The card Home puts focus on first, for the row it is in (nil for the others). Handed to
+    /// every row, it rebuilt every card on screen each time it was set and cleared (on every
+    /// return to Home's tab), though only that row uses it.
+    private func rowInitialFocusCardKey(_ sectionID: String) -> String? {
+        guard let key = initialFocusCardKey, key.hasPrefix("\(sectionID)\u{1}") else { return nil }
+        return key
+    }
+
+    private func isRowLockedOut(_ sectionID: String) -> Bool {
+        activeFocusRestrictionCardID != nil && rowFocusRestriction(sectionID) == nil
+    }
+
+    /// The pause of focus animations while focus comes back, for the row it comes back to
+    /// (every row when Home can't tell which). The others can't take focus meanwhile.
+    private func rowSuppressesReturnFocusAnimations(_ sectionID: String) -> Bool {
+        guard suppressReturnFocusAnimations else { return false }
+        guard let key = activeFocusRestrictionCardID ?? currentFocusedCardID ?? store.lastFocusedCardID else { return true }
+        return key.hasPrefix("\(sectionID)\u{1}")
+    }
+
     private var tmdbHomeSettingsKey: String {
         "\(tmdbEnabled)|\(tmdbLanguage)|\(tmdbFollowAppLanguage)|\(TmdbDetailsService.preferredLanguage)|\(tmdbUseArtwork)|\(tmdbUseBasicInfo)|\(tmdbApplyToHome)"
     }
     @FocusState private var isLoadingFocusActive: Bool
     @FocusState private var focusedCardID: String?
+    /// Home asking a row to put focus on one of its cards.
+    @State private var rowFocusRequest = TVHomeRowFocusRequest()
+
+    /// Each row holds its cards' focus and Home only hears of it, so a move from card to card
+    /// redraws that row, not all of Home: a change of `focusedCardID` redrew Home on every move,
+    /// though its body doesn't read it. Grid View keeps Home's.
+    private var usesRowFocus: Bool {
+        homeLayout != "Grid View"
+    }
+
+    /// The card holding focus: what the rows reported, or (Grid View) Home's focus state.
+    private var currentFocusedCardID: String? {
+        usesRowFocus ? focusWork.rowFocusedCardID : focusedCardID
+    }
+
+    /// What the rows' cards bind their focus to: none, the rows' own, or (Grid View) Home's
+    /// focus state.
+    private var cardFocusBinding: FocusState<String?>.Binding? {
+        usesRowFocus ? nil : $focusedCardID
+    }
+
+    /// Puts focus on `key` (nil: off the cards): by asking the row it is in, or (Grid View)
+    /// through Home's focus state.
+    private func setFocusedCardID(_ key: String?) {
+        guard usesRowFocus else {
+            focusedCardID = key
+            return
+        }
+        guard let key, focusWork.rowFocusedCardID != key else { return }
+        rowFocusRequest = TVHomeRowFocusRequest(cardKey: key, generation: rowFocusRequest.generation &+ 1)
+    }
+
+    /// A card's focus callback, where Home's focus state already says so (with the rows' focus,
+    /// nothing to do: `noteRowCardFocus` has it).
+    private func noteCardFocusEcho(_ key: String) {
+        guard !usesRowFocus else { return }
+        focusedCardID = key
+    }
+
+    /// A row's card took focus. Does what a change of Home's focus state did.
+    private func noteRowCardFocus(_ key: String) {
+        guard usesRowFocus else { return }
+        focusWork.rowFocusBlurGeneration &+= 1
+        let old = focusWork.rowFocusedCardID
+        guard old != key else { return }
+        focusWork.rowFocusedCardID = key
+        if rowFocusRequest.cardKey == key {
+            rowFocusRequest.cardKey = nil
+        }
+        handleFocusedCardIDChange(oldValue: old, newValue: key)
+    }
+
+    /// A row's card lost focus. Focus is off the cards only if no card took it by the
+    /// next turn of the run loop (the two callbacks come in either order).
+    private func noteRowCardBlur(_ key: String) {
+        guard usesRowFocus, focusWork.rowFocusedCardID == key else { return }
+        focusWork.rowFocusBlurGeneration &+= 1
+        let generation = focusWork.rowFocusBlurGeneration
+        DispatchQueue.main.async {
+            guard focusWork.rowFocusBlurGeneration == generation, focusWork.rowFocusedCardID == key else { return }
+            focusWork.rowFocusedCardID = nil
+            handleFocusedCardIDChange(oldValue: key, newValue: nil)
+        }
+    }
 
     // Split out of `body` so the Swift 26.6 type-checker doesn't have to solve the
     // ZStack content plus all ~24 lifecycle modifiers as one expression (it times
@@ -5871,7 +6075,10 @@ struct TVHomeView: View {
                                         }
 
                                         ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                                            let isNearFocusedRow = abs(index - focusedRowIndex) <= 2
+                                            let isNearFocusedRow = (index >= focusedRowIndex - min(2, max(0, rowBuildReach))
+                                                    && index <= focusedRowIndex + min(2, rowBuildReach + 1))
+                                                || ((rowBuildReach >= 3 || focusWork.isStagingRowsAfterJump)
+                                                    && abs(index - settledRowIndex) <= 3)
                                             if isNearFocusedRow {
                                                 homeSectionRow(
                                                     index: index,
@@ -5893,6 +6100,22 @@ struct TVHomeView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.top, TVHomeLayout.rowsTopPadding)
                                     .padding(.bottom, 80)
+                                    .task(id: focusedRowIndex) {
+                                        let row = focusedRowIndex
+                                        // Past the vertical scroll's spring (0.28 s).
+                                        try? await Task.sleep(nanoseconds: 380_000_000)
+                                        guard !Task.isCancelled, row == focusedRowIndex, settledRowIndex != row else { return }
+                                        var transaction = Transaction(animation: nil)
+                                        transaction.disablesAnimations = true
+                                        withTransaction(transaction) {
+                                            settledRowIndex = focusedRowIndex
+                                            // A row far above may have turned back into its estimated-height
+                                            // placeholder; keep the focused row where it is.
+                                            if let focusedSectionId {
+                                                verticalScrollProxy.scrollTo(focusedSectionId, anchor: .top)
+                                            }
+                                        }
+                                    }
                                     #if os(tvOS)
                                     // Place the configurator inside the scroll content so its
                                     // ancestor is the UIScrollView that owns the row offset.
@@ -6046,11 +6269,11 @@ struct TVHomeView: View {
                     didRequestInitialCardFocus = false
                     didPrepareInitialFocusViewport = false
                     restoreFocusState(for: lastFocused)
-                    if focusedCardID != lastFocused {
-                        focusedCardID = lastFocused
+                    if currentFocusedCardID != lastFocused {
+                        setFocusedCardID(lastFocused)
                     }
-                } else if focusedCardID == nil, let defaultFocus = initialDefaultFocusCardID {
-                    focusedCardID = defaultFocus
+                } else if currentFocusedCardID == nil, let defaultFocus = initialDefaultFocusCardID {
+                    setFocusedCardID(defaultFocus)
                 }
             }
             // Classic was never a distinct layout; collapse legacy values to Modern.
@@ -6111,7 +6334,7 @@ struct TVHomeView: View {
         .onChange(of: isActive) { oldActive, active in
             TVHomeDebugTrace.log(
                 "home.isActive changed from \(oldActive) to \(active) "
-                    + "(focusedCardID=\(focusedCardID ?? "nil"), "
+                    + "(focusedCardID=\(currentFocusedCardID ?? "nil"), "
                     + "storeLastFocused=\(store.lastFocusedCardID ?? "nil"), "
                     + "pendingInitial=\(pendingInitialFocusCardKey ?? "nil"), "
                     + "suppressAnimations=\(suppressReturnFocusAnimations))"
@@ -6135,11 +6358,11 @@ struct TVHomeView: View {
                     didRequestInitialCardFocus = false
                     didPrepareInitialFocusViewport = false
                     restoreFocusState(for: lastFocused)
-                    if focusedCardID != lastFocused {
-                        focusedCardID = lastFocused
+                    if currentFocusedCardID != lastFocused {
+                        setFocusedCardID(lastFocused)
                     }
                 }
-                if focusedCardID != nil {
+                if currentFocusedCardID != nil {
                     releaseReturnFocusAnimationSuppression()
                 } else {
                     // Fallback release: returning from Settings finds focusedCardID == nil
@@ -6405,8 +6628,25 @@ struct TVHomeView: View {
             focusWork.landscapeFocusTask?.cancel()
             landscapeFocusedId = nil
         }
-        .onChange(of: focusedCardID) { oldValue, newValue in
-            handleFocusedCardIDChange(oldValue: oldValue, newValue: newValue)
+        // Followed by an empty view of its own: read here, the focused card made all of Home
+        // redraw on every move from card to card.
+        .background(
+            TVHomeFocusedCardObserver(focus: $focusedCardID) { oldValue, newValue in
+                handleFocusedCardIDChange(oldValue: oldValue, newValue: newValue)
+            }
+        )
+        .task {
+            // The rows past the screen come once Home is up, a step at a time (see
+            // `rowBuildReach`).
+            guard rowBuildReach < 3 else { return }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            for reach in 1...3 {
+                guard !Task.isCancelled else { return }
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { rowBuildReach = reach }
+                try? await Task.sleep(nanoseconds: 120_000_000)
+            }
         }
         // Visible menus still toggle Home's disabled environment. Full-screen
         // overlays do not: their opacity-zero Home tree is already unfocusable,
@@ -6508,7 +6748,7 @@ struct TVHomeView: View {
         if let newValue,
            let expected = detailsPlayerRestoreExpectedFocusCardID,
            newValue != expected {
-            focusMovedAwayGeneration &+= 1
+            focusWork.focusMovedAwayGeneration &+= 1
         }
         TVHomeDebugTrace.measure("home.focusedCardID.onChange") {
             TVHomeDebugTrace.log(
@@ -6881,7 +7121,16 @@ struct TVHomeView: View {
     }
 
     private var focusRows: [TVHomeFocusRow] {
-        visibleSections.map { section in
+        let sections = visibleSections
+        let sectionsSignature = focusWork.cachedVisibleSections?.signature
+        if let sectionsSignature,
+           let cached = focusWork.cachedFocusRows,
+           cached.sectionsSignature == sectionsSignature,
+           cached.layout == homeLayout,
+           cached.gridRows == gridRows {
+            return cached.rows
+        }
+        let rows = sections.map { section in
             let keys: [String]
             if section.isLoadingPlaceholder {
                 keys = (0..<12).map {
@@ -6903,6 +7152,15 @@ struct TVHomeView: View {
             }
             return TVHomeFocusRow(id: section.id, keys: keys)
         }
+        if let sectionsSignature {
+            focusWork.cachedFocusRows = TVHomeFocusWork.CachedFocusRows(
+                sectionsSignature: sectionsSignature,
+                layout: homeLayout,
+                gridRows: gridRows,
+                rows: rows
+            )
+        }
+        return rows
     }
 
     private func validRestoreTarget(_ saved: String) -> String? {
@@ -6947,7 +7205,7 @@ struct TVHomeView: View {
               let presentationID = detailsPlayerRestorePresentationID,
               source == overlayRestoreCardID,
               detailsPlayerRestoreExpectedFocusCardID == source,
-              focusedCardID == nil || focusedCardID == source,
+              currentFocusedCardID == nil || currentFocusedCardID == source,
               restoreGeneration == overlayRestoreGeneration,
               presentationID == fullScreenOverlayPresentationID,
               let predecessor = previousHorizontalCardID(before: source)
@@ -6960,13 +7218,13 @@ struct TVHomeView: View {
             fullScreenPresentationID: presentationID,
             visibleOverlayPresentationID: visibleOverlayPresentationID,
             browsePresentationGeneration: browsePresentationGeneration,
-            focusMovedAwayGeneration: focusMovedAwayGeneration
+            focusMovedAwayGeneration: focusWork.focusMovedAwayGeneration
         )
     }
 
     private func handleOverlayRestoreLeftPress(_ snapshot: TVHomeRestoreLeftPressSnapshot) {
-        let focusStayedOnRestoreSource = focusMovedAwayGeneration == snapshot.focusMovedAwayGeneration
-            && (focusedCardID == nil || focusedCardID == snapshot.sourceCardID)
+        let focusStayedOnRestoreSource = focusWork.focusMovedAwayGeneration == snapshot.focusMovedAwayGeneration
+            && (currentFocusedCardID == nil || currentFocusedCardID == snapshot.sourceCardID)
         let restoreStillPending = detailsPlayerRestoreTargetCardID == snapshot.sourceCardID
             && detailsPlayerRestoreExpectedFocusCardID == snapshot.sourceCardID
             && detailsPlayerRestoreGeneration == snapshot.restoreGeneration
@@ -7041,7 +7299,7 @@ struct TVHomeView: View {
         focusWork.acknowledgedNativeOverlayFocusCardID = nil
         guard let target else {
             clearDetailsPlayerReturnRestore()
-            focusedCardID = nil
+            setFocusedCardID(nil)
             return
         }
         if wasRestoring {
@@ -7056,7 +7314,7 @@ struct TVHomeView: View {
             }
             restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
         } else {
-            focusedCardID = target
+            setFocusedCardID(target)
         }
     }
 
@@ -7105,7 +7363,7 @@ struct TVHomeView: View {
             // first card.
             armReturnFocusAnimationSuppression()
             overlayRestoreGeneration &+= 1
-            let target = focusedCardID ?? store.lastFocusedCardID
+            let target = currentFocusedCardID ?? store.lastFocusedCardID
             TVHomeDebugTrace.log("home.overlay.presentation setting target=\(target ?? "nil")")
             overlayRestoreCardID = target
         } else if focusWork.defersOverlayPreparation {
@@ -7265,7 +7523,7 @@ struct TVHomeView: View {
         focusWork.restoringOverlayCardID = target
         focusWork.acknowledgedNativeOverlayFocusCardID = nil
 
-        focusedCardID = target
+        setFocusedCardID(target)
         // Home and the outgoing overlay can overlap briefly during the opacity
         // transition. Retry after the target modifier is mounted instead of
         // depending on a single lifecycle callback ordering.
@@ -7273,7 +7531,7 @@ struct TVHomeView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
                     TVHomeDebugTrace.log("home.restoreOverlayFocus fire target=\(target) delay=\(delay)")
-                    focusedCardID = target
+                    setFocusedCardID(target)
                 }
             }
         }
@@ -7287,11 +7545,11 @@ struct TVHomeView: View {
             if overlayRestoreGeneration == generation,
                overlayRestoreCardID == target {
                 TVHomeDebugTrace.log("home.restoreOverlayFocus safety cleanup target=\(target)")
-                if focusedCardID != target {
+                if currentFocusedCardID != target {
                     var transaction = Transaction()
                     transaction.animation = nil
                     withTransaction(transaction) {
-                        focusedCardID = target
+                        setFocusedCardID(target)
                     }
                 }
                 overlayRestoreCardID = nil
@@ -7314,7 +7572,7 @@ struct TVHomeView: View {
             if cardKey == expected {
                 detailsPlayerRestoreNativeFocusReachedTarget = true
             } else {
-                focusMovedAwayGeneration &+= 1
+                focusWork.focusMovedAwayGeneration &+= 1
                 if detailsPlayerRestoreNativeFocusReachedTarget {
                     detailsPlayerRestoreNativeFocusLostTarget = true
                 }
@@ -7325,7 +7583,7 @@ struct TVHomeView: View {
         focusWork.acknowledgedNativeOverlayFocusCardID = cardKey
         // A programmatic FocusState request may already contain the target,
         // in which case assigning it again will not emit another onChange.
-        if focusedCardID == cardKey {
+        if currentFocusedCardID == cardKey {
             completeOverlayFocusRestore(for: cardKey)
         }
     }
@@ -7358,7 +7616,7 @@ struct TVHomeView: View {
             transaction.animation = nil
             withTransaction(transaction) {
                 overlayRestoreCardID = nil
-                focusedCardID = cardKey
+                setFocusedCardID(cardKey)
                 focusWork.acknowledgedNativeOverlayFocusCardID = nil
                 if detailsPlayerRestoreGeneration == generation,
                    detailsPlayerRestoreTargetCardID == cardKey {
@@ -7470,7 +7728,7 @@ struct TVHomeView: View {
            detailsPlayerRestoreNativeFocusReachedTarget,
            !detailsPlayerRestoreNativeFocusLostTarget {
             detailsPlayerRestoreNativeFocusLostTarget = true
-            focusMovedAwayGeneration &+= 1
+            focusWork.focusMovedAwayGeneration &+= 1
         }
         guard nativeProfileFocusedCardKey == cardKey else { return }
         nativeProfileFocusedCardKey = nil
@@ -7545,12 +7803,12 @@ struct TVHomeView: View {
                 focusedRowIndex = sectionIndex
                 focusedSectionId = sectionID
                 rowScrollStore.setIndex(0, for: sectionID)
-                if focusedCardID != key {
+                if currentFocusedCardID != key {
                     var transaction = Transaction()
                     transaction.animation = nil
                     withTransaction(transaction) {
                         proxy.scrollTo(sectionID, anchor: .top)
-                        focusedCardID = key
+                        setFocusedCardID(key)
                     }
                 }
             }
@@ -7567,7 +7825,7 @@ struct TVHomeView: View {
         let hasHero = (homeLayout == "Grid View" && heroEnabled && !gridHeroItems.isEmpty)
 
         let currentSection: TVHomeSection? = {
-            if let focusedCardID,
+            if let focusedCardID = currentFocusedCardID,
                let matched = visibleSections.first(where: { focusedCardID.hasPrefix("\($0.id)\u{1}") }) {
                 return matched
             }
@@ -7615,7 +7873,7 @@ struct TVHomeView: View {
         }()
 
         return TVHomeBackNavigation.determineAction(
-            focusedCardID: focusedCardID,
+            focusedCardID: currentFocusedCardID,
             currentSectionID: currentSection?.id,
             currentRowFirstCardKey: currentRowFirstCardKey,
             currentRowScrollIndex: currentRowScrollIndex,
@@ -7700,11 +7958,13 @@ struct TVHomeView: View {
         targetScrollToTopSectionId = sectionID
         scrollToTopGeneration &+= 1
 
+        let previousRowIndex = focusedRowIndex
         if let rowIndex = visibleSections.firstIndex(where: { $0.id == sectionID }) {
             focusedRowIndex = rowIndex
         } else {
             focusedRowIndex = 0
         }
+        stageRowBuildsAfterJump(from: previousRowIndex, to: focusedRowIndex)
         focusedSectionId = sectionID
 
         store.lastFocusedCardID = cardKey
@@ -7727,6 +7987,28 @@ struct TVHomeView: View {
         }
     }
 
+    /// Back from a row far down jumps Home to the top, where none of the rows near it is built.
+    /// Built at once (the focused row and up to three more), they held the main thread for 350 ms;
+    /// now the focused row comes first and a row more every 120 ms, as when Home comes up.
+    private func stageRowBuildsAfterJump(from oldIndex: Int, to newIndex: Int) {
+        guard abs(oldIndex - newIndex) > 3 else { return }
+        focusWork.rowStageTask?.cancel()
+        focusWork.isStagingRowsAfterJump = true
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { rowBuildReach = -1 }
+        focusWork.rowStageTask = Task { @MainActor in
+            for reach in 0...3 {
+                try? await Task.sleep(nanoseconds: 120_000_000)
+                guard !Task.isCancelled else { return }
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) { rowBuildReach = reach }
+            }
+            focusWork.isStagingRowsAfterJump = false
+        }
+    }
+
     private func focusGridHeroSlideshow() {
         TVHomeDebugTrace.log("home.focusGridHeroSlideshow")
         focusWork.upwardFocusTask?.cancel()
@@ -7738,7 +8020,7 @@ struct TVHomeView: View {
         targetScrollToTopSectionId = nil
         focusedRowIndex = 0
         focusedSectionId = nil
-        focusedCardID = nil
+        setFocusedCardID(nil)
         store.lastFocusedCardID = nil
         gridHeroIndex = 0
         isGridHeroFocused = true
@@ -7797,7 +8079,7 @@ struct TVHomeView: View {
                   !self.isFullScreenOverlayPresented,
                   self.focusWork.restoringOverlayCardID == nil,
                   self.focusedSectionId == sectionID,
-                  expectedCardKey == nil || self.focusedCardID == expectedCardKey
+                  expectedCardKey == nil || self.currentFocusedCardID == expectedCardKey
             else { return }
 
             self.moveFocusToPreviousHomeRow(from: rowIndex, using: proxy)
@@ -7852,7 +8134,7 @@ struct TVHomeView: View {
 
         if let targetCardKey {
             store.lastFocusedCardID = targetCardKey
-            focusedCardID = targetCardKey
+            setFocusedCardID(targetCardKey)
         }
     }
 
@@ -7876,8 +8158,9 @@ struct TVHomeView: View {
                 onScrollIndexChange: { newIndex in
                     rowScrollStore.setIndex(newIndex, for: section.id)
                 },
-                externalFocus: $focusedCardID,
+                externalFocus: cardFocusBinding,
                 onFocus: { placeholderIndex in
+                    noteRowCardFocus(TVHomeCardIdentity.placeholderKey(rowID: section.id, index: placeholderIndex))
                     focusWork.upwardFocusTask?.cancel()
                     recordFocusTransition()
                     let changedRow = focusedSectionId != section.id || focusedRowIndex != index
@@ -7902,7 +8185,7 @@ struct TVHomeView: View {
                         }
                     }
                     let cardKey = TVHomeCardIdentity.placeholderKey(rowID: section.id, index: placeholderIndex)
-                    focusedCardID = cardKey
+                    noteCardFocusEcho(cardKey)
                     store.lastFocusedCardID = cardKey
                 },
             )
@@ -7923,11 +8206,13 @@ struct TVHomeView: View {
                 onScrollIndexChange: { newIndex in
                     rowScrollStore.setIndex(newIndex, for: section.id)
                 },
-                initialFocusCardKey: initialFocusCardKey,
-                externalFocus: $focusedCardID,
-                restrictFocusToCardKey: activeFocusRestrictionCardID,
+                initialFocusCardKey: rowInitialFocusCardKey(section.id),
+                externalFocus: cardFocusBinding,
+                ownsCardFocus: usesRowFocus,
+                focusRequest: rowFocusRequest.forRow(section.id),
+                restrictFocusToCardKey: rowFocusRestriction(section.id),
                 retainFocusAppearanceForCardKey: activeFocusRestrictionCardID,
-                suppressFocusAnimations: suppressReturnFocusAnimations,
+                suppressFocusAnimations: rowSuppressesReturnFocusAnimations(section.id),
                 onInitialFocusRequested: {
                     didRequestInitialCardFocus = true
                 },
@@ -7935,6 +8220,7 @@ struct TVHomeView: View {
                     focusWork.upwardFocusTask?.cancel()
                     recordFocusTransition()
                     let cardKey = TVHomeCardIdentity.folderKey(rowID: section.id, folder: folder)
+                    noteRowCardFocus(cardKey)
                     acknowledgeNativeProfileCardFocus(cardKey)
                     if let pending = pendingInitialFocusCardKey, pending != cardKey {
                         TVHomeDebugTrace.log(
@@ -7972,10 +8258,11 @@ struct TVHomeView: View {
                             verticalScrollProxy.scrollTo(section.id, anchor: .top)
                         }
                     }
-                    focusedCardID = cardKey
+                    noteCardFocusEcho(cardKey)
                     settleFolderFocus(folder, in: section.id)
                 },
                 onBlur: { folder in
+                    noteRowCardBlur(TVHomeCardIdentity.folderKey(rowID: section.id, folder: folder))
                     clearNativeProfileCardFocus(
                         TVHomeCardIdentity.folderKey(rowID: section.id, folder: folder)
                     )
@@ -7989,6 +8276,9 @@ struct TVHomeView: View {
                 },
             )
             .equatable()
+            // Outside the row: while focus is put back on a card in another row, this row
+            // is locked out as a whole instead of each of its cards (see `rowFocusRestriction`).
+            .disabled(isRowLockedOut(section.id))
             .frame(
                 height: estimatedHeight(for: section),
                 alignment: .topLeading
@@ -8014,13 +8304,17 @@ struct TVHomeView: View {
                 onScrollIndexChange: { newIndex in
                     rowScrollStore.setIndex(newIndex, for: section.id)
                 },
-                            initialFocusCardKey: initialFocusCardKey,
+                            initialFocusCardKey: rowInitialFocusCardKey(section.id),
                             landscapeFocusedId: landscapeFocusedId(for: section.id),
                             explicitTileShape: effectiveTileShape(for: section),
-                            externalFocus: $focusedCardID,
-                            restrictFocusToCardKey: activeFocusRestrictionCardID,
+                            externalFocus: cardFocusBinding,
+                            ownsCardFocus: usesRowFocus,
+                            focusRequest: rowFocusRequest.forRow(section.id),
+                            stagesCardBuild: abs(index - focusedRowIndex) > 2
+                                || (index != focusedRowIndex && (isFastScrolling || focusWork.isStagingRowsAfterJump)),
+                            restrictFocusToCardKey: rowFocusRestriction(section.id),
                             retainFocusAppearanceForCardKey: activeFocusRestrictionCardID,
-                suppressFocusAnimations: suppressReturnFocusAnimations,
+                suppressFocusAnimations: rowSuppressesReturnFocusAnimations(section.id),
                 onInitialFocusRequested: {
                     didRequestInitialCardFocus = true
                 },
@@ -8029,6 +8323,7 @@ struct TVHomeView: View {
                     recordFocusTransition()
                     let focusStarted = TVHomeDebugTrace.now()
                     let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
+                    noteRowCardFocus(cardKey)
                     acknowledgeNativeProfileCardFocus(cardKey)
                     if let pending = pendingInitialFocusCardKey, pending != cardKey {
                         TVHomeDebugTrace.log(
@@ -8068,7 +8363,7 @@ struct TVHomeView: View {
                             verticalScrollProxy.scrollTo(section.id, anchor: .top)
                         }
                     }
-                    focusedCardID = cardKey
+                    noteCardFocusEcho(cardKey)
                     settleCatalogFocus(on: meta, in: section.id)
                     scheduleLandscapeFocus(cardKey: cardKey)
                     TVHomeDebugTrace.log(
@@ -8076,6 +8371,7 @@ struct TVHomeView: View {
                     )
                 },
                 onBlur: { meta in
+                    noteRowCardBlur(TVHomeCardIdentity.key(rowID: section.id, item: meta))
                     clearLandscapeFocus(cardKey: TVHomeCardIdentity.key(rowID: section.id, item: meta))
                     clearNativeProfileCardFocus(TVHomeCardIdentity.key(rowID: section.id, item: meta))
                 },
@@ -8137,6 +8433,9 @@ struct TVHomeView: View {
                 onRefreshCatalog: { refreshHomeSection(sectionId: section.id) }
             )
             .equatable()
+            // Outside the row: while focus is put back on a card in another row, this row
+            // is locked out as a whole instead of each of its cards (see `rowFocusRestriction`).
+            .disabled(isRowLockedOut(section.id))
             .frame(
                 height: estimatedHeight(for: section),
                 alignment: .topLeading
@@ -8228,7 +8527,7 @@ struct TVHomeView: View {
         if let preparedFocusLayout, preparedFocusLayout != homeLayout {
             didPrepareInitialFocusViewport = false
             didRequestInitialCardFocus = false
-            if let savedTarget = focusedCardID ?? store.lastFocusedCardID {
+            if let savedTarget = currentFocusedCardID ?? store.lastFocusedCardID {
                 let target = validRestoreTarget(savedTarget) ?? savedTarget
                 pendingInitialFocusCardKey = target
                 store.lastFocusedCardID = target
@@ -8339,7 +8638,7 @@ struct TVHomeView: View {
     private func prepareForOverlayPresentation(restoreCardID: String? = nil) {
         focusWork.defersOverlayPreparation = true
         focusWork.pendingOverlayRestoreCardID = restoreCardID
-            ?? focusedCardID
+            ?? currentFocusedCardID
             ?? store.lastFocusedCardID
     }
 
@@ -9019,7 +9318,7 @@ struct TVHomeView: View {
                 if let targetCardKey, store.lastFocusedCardID != targetCardKey {
                     TVHomeDebugTrace.log("home.publishHomeSections maintaining focus on newly loaded section=\(currentSectionId) target=\(targetCardKey)")
                     store.lastFocusedCardID = targetCardKey
-                    focusedCardID = targetCardKey
+                    setFocusedCardID(targetCardKey)
                 }
             }
 
@@ -9698,7 +9997,7 @@ struct TVHomeView: View {
             // from Settings does not emit PosterCard's normal onFocus callback.
             // Restart the landscape settle timer for that retained card once
             // the no-animation restoration window has finished.
-            if let focusedCardID {
+            if let focusedCardID = currentFocusedCardID {
                 scheduleLandscapeFocus(cardKey: focusedCardID)
             }
         }

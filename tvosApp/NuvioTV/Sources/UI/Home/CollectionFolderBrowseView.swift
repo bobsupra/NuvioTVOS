@@ -1120,13 +1120,14 @@ struct CollectionFolderResultCard: View {
     let action: () -> Void
 
     @FocusState private var focused: Bool
-    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
-    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
-    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
-    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
-    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
-    @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
-    @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @Environment(\.cardAppearance) private var cardAppearance
+    private var posterLabels: Bool { cardAppearance.posterLabels }
+    private var smoothFocus: Bool { cardAppearance.smoothFocus }
+    private var focusHighlighter: Bool { cardAppearance.focusHighlighter }
+    private var cardCornerRadiusSetting: String { cardAppearance.cardCornerRadius }
+    private var liquidGlassCards: Bool { cardAppearance.liquidGlassCards }
+    private var customPosterURLPattern: String { cardAppearance.customPosterURLPattern }
+    private var customPosterEnabledScreens: String { cardAppearance.customPosterEnabledScreens }
 
     private var customPosterArtworkURL: String? {
         CustomPosterURLResolver.resolve(
@@ -1172,7 +1173,8 @@ struct CollectionFolderResultCard: View {
                     LiquidGlassCardModifier(
                         cornerRadius: cardCornerRadius,
                         isFocused: focused,
-                        isEnabled: liquidGlassCards
+                        isEnabled: liquidGlassCards,
+                        coveredByArtwork: true
                     )
                 )
                 .overlay(alignment: .topTrailing) {
@@ -1184,9 +1186,10 @@ struct CollectionFolderResultCard: View {
                         lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
                     )
                 )
+                // Only the focused card casts a shadow (see PosterCard).
                 .shadow(
-                    color: .black.opacity(focused ? 0.5 : 0.2),
-                    radius: focused ? 16 : 6
+                    color: .black.opacity(focused ? 0.5 : 0),
+                    radius: focused ? 16 : 0
                 )
 
                 if posterLabels {

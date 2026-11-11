@@ -20,6 +20,22 @@ extension AnyTransition {
             )
         )
     }
+
+    /// Details comes in without fading: its backdrop covers Home at once and only its content
+    /// fades in. Faded in as a whole, Home and Details were both half see-through midway and the
+    /// dark background showed through, a blink. It leaves as `leavingScreen` does (going back
+    /// to Home, after Home has caught up: see `ContentView.leaveDetails`).
+    static var steadyDetailsScreen: AnyTransition {
+        .asymmetric(
+            insertion: .identity,
+            removal: .opacity.combined(
+                with: .modifier(
+                    active: LeavingScreenModifier(isLeaving: true),
+                    identity: LeavingScreenModifier(isLeaving: false)
+                )
+            )
+        )
+    }
 }
 
 /// Takes a leaving screen out of focus (see `AnyTransition.leavingScreen`).

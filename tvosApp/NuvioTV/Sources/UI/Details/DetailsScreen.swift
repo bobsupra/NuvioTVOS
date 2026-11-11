@@ -10,6 +10,7 @@ import SwiftUI
 import UIKit
 import Combine
 import ImageIO
+import CoreImage
 import AVFoundation
 import AVKit
 
@@ -242,12 +243,22 @@ struct DetailsScreen: View {
     }
 
     @FocusState private var isLoadingInitialFocusActive: Bool
+    /// Details comes in without fading, so the spinner of its first frame (before the cached
+    /// title is read, a moment later) would flash; it shows only if loading takes longer.
+    @State private var showsLoadingSpinner = false
 
     var body: some View {
         ZStack {
             if viewModel.uiState.isLoading {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .opacity(showsLoadingSpinner ? 1 : 0)
+                    .task {
+                        guard !showsLoadingSpinner else { return }
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        guard !Task.isCancelled else { return }
+                        showsLoadingSpinner = true
+                    }
                 #if os(tvOS)
                 Color.clear
                     .frame(width: 1, height: 1)
@@ -4197,10 +4208,22 @@ struct TvDetailsContent: View {
 
     @FocusState private var actionFocus: DetailsActionFocus?
     @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
-    /// Which episode control holds focus, as `TvEpisodeFocus` keys. Owned here
-    /// rather than per card so focus can be put back on a specific episode.
-    @FocusState private var episodeFocus: String?
     @FocusState private var relatedCardFocus: String?
+    /// Whether an episode control holds focus. Read by the body instead of the focused
+    /// episode, which changes on every move along the strip and would redraw all of Details
+    /// with it.
+    @State private var isEpisodeFocused = false
+    /// The content fades in over a backdrop shown at once.
+    @State private var isContentRevealed = false
+    /// Counts episode focus changes, so a delayed "focus left the episodes" can tell whether
+    /// focus came back meanwhile, and holds the episode control the strip last reported focused.
+    /// A reference, so neither redraws anything.
+    @State private var episodeFocusMemory = TvDetailsEpisodeFocusMemory()
+    /// The episode strip holds its episodes' focus and Details only hears of it, so a move along
+    /// the strip redraws the strip, not all of Details (a change of a focus state of Details'
+    /// own redrew Details on every move, though its body doesn't read it). Details puts focus on
+    /// an episode (back from the player, a Watch Party pick) by asking the strip.
+    @State private var episodeFocusRequest = TvEpisodeFocusRequest()
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
@@ -4235,13 +4258,41 @@ struct TvDetailsContent: View {
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    /// The sections below the first screen (episodes, cast, more like this…) are built a moment
+    /// after Details opens, once its transition is over: the top part fills the first screen,
+    /// and building everything at once held the opening transition up for 150-250 ms. Opened
+    /// with focus going to an episode (calendar, Continue Watching), they are built at once.
+    ///
+    /// They then come one at a time, a short step apart: all of them in one frame (the episode
+    /// cards, the cast, the posters of More Like This, the companies, the comments) held Details
+    /// up for 260-320 ms just as focus landed on Play. `Int.max` once all are built.
+    ///
+    /// They start once focus has landed in the action row and its animation is over: started
+    /// at a fixed 300 ms, they came just as focus landed on Play (380-650 ms after opening) and
+    /// made it jerk. At the latest `lowerSectionsLatest` after opening.
+    ///
+    /// After the first one, a section is built only while focus rests: built while focus moved
+    /// down (often within a second of opening), they made that scroll carry 30-47 cards. The
+    /// section below the one focus moves into is built at once, so there is always somewhere to
+    /// go down to.
+    @State private var builtLowerSectionCount = 0
+    private static let lowerSectionsAfterFocus: UInt64 = 160_000_000
+    private static let lowerSectionsFocusRest: CFTimeInterval = 0.3
+    private static let lowerSectionsLatest: UInt64 = 900_000_000
+    private static let lowerSectionStep: UInt64 = 45_000_000
     @State private var configuredDetailsSections: [TVDetailsSection] = TVDetailsSectionOrder.currentOrder()
     @State private var disabledDetailsSections: Set<TVDetailsSection> = TVDetailsSectionOrder.disabledSections()
 
     private var activeDetailsSections: [TVDetailsSection] {
         configuredDetailsSections.filter { !disabledDetailsSections.contains($0) }
     }
-    @State private var trailerPlayer = AVPlayer()
+    /// The background trailer's player, made once. As `@State private var trailerPlayer = AVPlayer()`
+    /// a new player was made (and thrown away) every time Details' content was rebuilt, trailers
+    /// on or off.
+    @StateObject private var trailerPlayerHolder = TvDetailsTrailerPlayerHolder()
+    private var trailerPlayer: AVPlayer { trailerPlayerHolder.player }
+    /// The trailer paused because Details scrolled down (see `updateTrailerParkingForScroll`).
+    @State private var isTrailerParkedForScroll = false
     @State private var isTrailerPlaying = false
     @State private var isTrailerRenderReady = false
     @State private var isFullscreenTrailerPresented = false
@@ -4314,6 +4365,7 @@ struct TvDetailsContent: View {
     }
 
     private func presentFullscreenTrailer() {
+        isTrailerParkedForScroll = false
         if isTrailerPlaying && trailerPlayer.currentItem != nil {
             applySoundPreference(true)
             trailerPlayer.play()
@@ -4336,6 +4388,7 @@ struct TvDetailsContent: View {
         if !isBackgroundTrailerAllowed() {
             stopBackgroundTrailer(manual: false)
         }
+        DispatchQueue.main.async { updateTrailerParkingForScroll() }
         DispatchQueue.main.async {
             actionFocus = .trailer
         }
@@ -4385,6 +4438,7 @@ struct TvDetailsContent: View {
         }
         isTrailerPlaying = false
         isTrailerRenderReady = false
+        isTrailerParkedForScroll = false
         trailerPlayer.pause()
         trailerPlayer.replaceCurrentItem(with: nil)
     }
@@ -4410,12 +4464,39 @@ struct TvDetailsContent: View {
                 }
             }
         }
-        stopBackgroundTrailer(manual: false)
+        // Only paused here: releasing the player's item takes time on the main thread just as
+        // Details starts to leave. `onDisappear` releases it once Details has faded out.
+        pauseBackgroundTrailerForExit()
         onBack()
     }
 
+    /// A background trailer behind the lower sections was drawn blurred, every video frame
+    /// across the screen. Scrolled down, it now pauses and gives way to the backdrop blurred
+    /// once; back at the top it goes on where it was.
+    private func updateTrailerParkingForScroll() {
+        let shouldPark = isScrolledDown
+            && isTrailerPlaying
+            && !isFullscreenTrailerPresented
+        guard shouldPark != isTrailerParkedForScroll else { return }
+        isTrailerParkedForScroll = shouldPark
+        if shouldPark {
+            trailerPlayer.pause()
+        } else if isTrailerPlaying, !isFullscreenTrailerPresented {
+            trailerPlayer.play()
+        }
+    }
+
+    private func pauseBackgroundTrailerForExit() {
+        trailerTask?.cancel()
+        trailerTask = nil
+        isTrailerPlaying = false
+        isTrailerRenderReady = false
+        isTrailerParkedForScroll = false
+        trailerPlayer.pause()
+    }
+
     private var isScrolledDown: Bool {
-        focusedDetailsSection != .actions || episodeFocus != nil || castHeaderFocus != nil || scrollOffset > 30
+        focusedDetailsSection != .actions || isEpisodeFocused || castHeaderFocus != nil || scrollOffset > 30
     }
 
     private var backdropBlurRadius: CGFloat {
@@ -4439,7 +4520,7 @@ struct TvDetailsContent: View {
             meta: meta,
             blurRadius: backdropBlurRadius,
             player: isFullscreenTrailerPresented ? nil : trailerPlayer,
-            isTrailerVisible: isTrailerPlaying && isTrailerRenderReady && !isFullscreenTrailerPresented,
+            isTrailerVisible: isTrailerPlaying && isTrailerRenderReady && !isFullscreenTrailerPresented && !isTrailerParkedForScroll,
             onTrailerReadyForDisplay: handleTrailerReady
         )
     }
@@ -4463,11 +4544,7 @@ struct TvDetailsContent: View {
     }
 
     @ViewBuilder
-    private func actionRowView(
-        meta: NuvioMeta,
-        playTarget: TvDetailsPlayTarget,
-        scrollProxy: ScrollViewProxy
-    ) -> some View {
+    private func actionRowView(meta: NuvioMeta, playTarget: TvDetailsPlayTarget) -> some View {
         let canBypassPicker = smartStreamSelection || (reuseLastLink && hasStoredPlaybackStream(for: playTarget))
         TvDetailsActionRow(
             isInWatchlist: uiState.isInWatchlist,
@@ -4483,11 +4560,7 @@ struct TvDetailsContent: View {
                 handlePlayLongPress(playTarget: playTarget)
             } : nil,
             onHostWatchParty: onHostWatchParty == nil ? nil : {
-                beginWatchPartyEpisodeSelection(
-                    meta: meta,
-                    playTarget: playTarget,
-                    scrollProxy: scrollProxy
-                )
+                beginWatchPartyEpisodeSelection(meta: meta, playTarget: playTarget)
             },
             onWatchlistClick: {
                 cancelRelatedFocusRestoration()
@@ -4536,15 +4609,6 @@ struct TvDetailsContent: View {
                 guard relatedFocusRestoreAttemptID == nil else { return }
                 if focusedDetailsSection != .actions {
                     focusedDetailsSection = .actions
-                    withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                        scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
-                    }
-                } else {
-                    var transaction = Transaction(animation: nil)
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) {
-                        scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
-                    }
                 }
             }
         )
@@ -4585,9 +4649,6 @@ struct TvDetailsContent: View {
                         cancelPendingFocusHandoff()
                         if focusedDetailsSection != .episodes {
                             focusedDetailsSection = .episodes
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-                            }
                         }
                     },
                     onSelect: { video in
@@ -4610,16 +4671,30 @@ struct TvDetailsContent: View {
                         onEpisodeMenuPresented?(isPresented)
                     },
                     onBack: handleDetailsBack,
-                    episodeFocus: $episodeFocus,
                     restrictFocusToKey: restoreEpisodeKey,
                     entryLocked: focusedDetailsSection != .episodes,
                     onMoveUpFromSeason: {
-                        handleMoveUpFromEpisodes(using: scrollProxy)
+                        handleMoveUpFromEpisodes()
                     },
                     onMoveDownFromEpisode: {
-                        handleMoveDownFromEpisodes(using: scrollProxy)
+                        handleMoveDownFromEpisodes()
+                    },
+                    episodeFocusRequest: episodeFocusRequest,
+                    onEpisodeFocusChange: { key in
+                        episodeFocusMemory.focusedKey = key
+                        handleEpisodeFocusChange(key)
                     }
                 )
+                .detailsSnapshot(TvDetailsEpisodesSnapshotKey(
+                    meta: meta,
+                    revision: episodePresentation.revision,
+                    continueItem: continueItem,
+                    choosingWatchPartyEpisode: isChoosingWatchPartyEpisode,
+                    restoreEpisodeKey: restoreEpisodeKey,
+                    entryLocked: focusedDetailsSection != .episodes,
+                    hasManualPlay: onEpisodePlayManually != nil,
+                    episodeFocusRequest: episodeFocusRequest
+                ))
                 .padding(.top, 40)
                 .id(TvDetailsScrollID.episodesSection)
                 .disabled(!isDetailsFocusReachable(.episodes))
@@ -4647,18 +4722,19 @@ struct TvDetailsContent: View {
                         guard relatedFocusRestoreAttemptID == nil else { return }
                         if focusedDetailsSection != .cast {
                             focusedDetailsSection = .cast
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-                            }
                         }
                     }
                 )
+                .detailsSnapshot(TvDetailsRowSnapshotKey(
+                    content: TvDetailsCastSnapshot(
+                        metaID: meta.id,
+                        cast: meta.cast,
+                        director: meta.director,
+                        writer: meta.writer,
+                        people: uiState.people
+                    ),
+                    entryLocked: focusedDetailsSection != .cast
+                ))
                 .padding(.top, 34)
                 .padding(.bottom, 52)
                 .id(TvDetailsScrollID.castSection)
@@ -4709,18 +4785,13 @@ struct TvDetailsContent: View {
                         guard relatedFocusRestoreAttemptID == nil else { return }
                         if focusedDetailsSection != .network {
                             focusedDetailsSection = .network
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
-                            }
                         }
                     }
                 )
+                .detailsSnapshot(TvDetailsRowSnapshotKey(
+                    content: networks,
+                    entryLocked: focusedDetailsSection != .network
+                ))
                 .padding(.top, 40)
                 .id(TvDetailsScrollID.networkSection)
                 .disabled(
@@ -4742,18 +4813,13 @@ struct TvDetailsContent: View {
                         guard relatedFocusRestoreAttemptID == nil else { return }
                         if focusedDetailsSection != .production {
                             focusedDetailsSection = .production
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
-                            }
                         }
                     }
                 )
+                .detailsSnapshot(TvDetailsRowSnapshotKey(
+                    content: productionCompanies,
+                    entryLocked: focusedDetailsSection != .production
+                ))
                 .padding(.top, 40)
                 .id(TvDetailsScrollID.productionSection)
                 .disabled(
@@ -4774,18 +4840,13 @@ struct TvDetailsContent: View {
                         guard relatedFocusRestoreAttemptID == nil else { return }
                         if focusedDetailsSection != .comments {
                             focusedDetailsSection = .comments
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
-                            }
                         }
                     }
                 )
+                .detailsSnapshot(TvDetailsRowSnapshotKey(
+                    content: uiState.comments,
+                    entryLocked: focusedDetailsSection != .comments
+                ))
                 .padding(.top, 40)
                 .id(TvDetailsScrollID.commentsSection)
                 .disabled(
@@ -4824,11 +4885,7 @@ struct TvDetailsContent: View {
         }
     }
 
-    private func beginWatchPartyEpisodeSelection(
-        meta: NuvioMeta,
-        playTarget: TvDetailsPlayTarget,
-        scrollProxy: ScrollViewProxy
-    ) {
+    private func beginWatchPartyEpisodeSelection(meta: NuvioMeta, playTarget: TvDetailsPlayTarget) {
         cancelRelatedFocusRestoration()
         stopBackgroundTrailer(manual: false)
         guard meta.isSeries else {
@@ -4840,13 +4897,10 @@ struct TvDetailsContent: View {
         isChoosingWatchPartyEpisode = true
         cancelPendingFocusHandoff()
         focusedDetailsSection = .episodes
-        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-            scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-        }
         let target = TvEpisodeFocus.card(episode.id)
         DispatchQueue.main.asyncAfter(deadline: .now() + TvDetailsScrollTiming.duration) {
             guard isChoosingWatchPartyEpisode else { return }
-            episodeFocus = target
+            setEpisodeFocus(target)
         }
     }
 
@@ -4915,9 +4969,9 @@ struct TvDetailsContent: View {
                                             isSynopsisFocused: false
                                         )
 
-                                        actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
+                                        actionRowView(meta: meta, playTarget: playTarget)
                                     } else {
-                                        actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
+                                        actionRowView(meta: meta, playTarget: playTarget)
 
                                         TvDetailsSummary(
                                             meta: meta,
@@ -4933,19 +4987,49 @@ struct TvDetailsContent: View {
                             let productionCompanies = uiState.companies.filter { $0.kind == .production && $0.tmdbId != nil }
                             let networks = uiState.companies.filter { $0.kind == .network && $0.tmdbId != nil }
 
-                            ForEach(activeDetailsSections, id: \.self) { section in
-                                renderDetailsSection(
-                                    section,
-                                    meta: meta,
-                                    episodes: episodes,
-                                    episodeGuide: episodeGuide,
-                                    episodePresentation: episodePresentation,
-                                    continueItem: continueItem,
-                                    networks: networks,
-                                    productionCompanies: productionCompanies,
-                                    scrollProxy: scrollProxy
-                                )
+                            let lowerSections = activeDetailsSections
+                            let builtSections = initialFocusEpisode != nil ? lowerSections.count : builtLowerSectionCount
+                            if builtSections > 0 {
+                                ForEach(Array(lowerSections.prefix(builtSections)), id: \.self) { section in
+                                    renderDetailsSection(
+                                        section,
+                                        meta: meta,
+                                        episodes: episodes,
+                                        episodeGuide: episodeGuide,
+                                        episodePresentation: episodePresentation,
+                                        continueItem: continueItem,
+                                        networks: networks,
+                                        productionCompanies: productionCompanies,
+                                        scrollProxy: scrollProxy
+                                    )
+                                }
                             }
+                            }
+                            // The hero and each section are where the scroll can settle.
+                            .scrollTargetLayout()
+                            .task {
+                                guard builtLowerSectionCount == 0 else { return }
+                                TvDetailsFocusActivity.start()
+                                // The section right below the actions is there from the start
+                                // (built in the frame after Details' first): built only once
+                                // focus had settled on Play, a press down before that found
+                                // nothing below Play and was lost, and it took two.
+                                buildLowerSections(upTo: 1)
+                                await waitForActionFocusToSettle()
+                                let count = activeDetailsSections.count
+                                for built in 2..<max(count, 2) {
+                                    await waitForFocusToRest()
+                                    guard !Task.isCancelled else { return }
+                                    // Already built: focus moved into the section above.
+                                    if builtLowerSectionCount < built { buildLowerSections(upTo: built) }
+                                    try? await Task.sleep(nanoseconds: Self.lowerSectionStep)
+                                }
+                                await waitForFocusToRest()
+                                guard !Task.isCancelled else { return }
+                                buildLowerSections(upTo: .max)
+                            }
+                            .onChange(of: focusedDetailsSection) { _, section in
+                                buildSectionBelow(section)
                             }
                             // Inset and layout metrics matching Android TV.
                             .padding(.leading, 56)
@@ -4954,33 +5038,11 @@ struct TvDetailsContent: View {
                             .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .topLeading)
                         }
                         .scrollClipDisabledIfAvailable()
+                        // Details' up and down is left to the scroll view: tvOS scrolls to what
+                        // focus goes to, and the scroll settles with a section's top at the top of
+                        // the screen (instead of Details scrolling there with its own animation).
+                        .scrollTargetBehavior(.viewAligned)
                         .coordinateSpace(name: "tv-details-scroll")
-                        .onChange(of: actionFocus) { _, newFocus in
-                            guard newFocus != nil, relatedFocusRestoreAttemptID == nil else { return }
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
-                            }
-                        }
-                        .onChange(of: castHeaderFocus) { _, newFocus in
-                            guard newFocus != nil, relatedFocusRestoreAttemptID == nil else { return }
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-                            }
-                        }
-                        .onChange(of: episodeFocus) { _, newFocus in
-                            guard newFocus != nil,
-                                  relatedFocusRestoreAttemptID == nil,
-                                  focusedDetailsSection == .episodes else { return }
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-                            }
-                        }
                         .onAppear {
                             if let initialRelatedFocusID {
                                 beginRelatedFocusRestoration(initialRelatedFocusID, using: scrollProxy)
@@ -4989,6 +5051,11 @@ struct TvDetailsContent: View {
                         .onChange(of: uiState.moreLikeThis.map(\.id)) { _, _ in
                             restoreRelatedFocusWhenAvailable(using: scrollProxy)
                         }
+                    }
+                    .opacity(isContentRevealed ? 1 : 0)
+                    .onAppear {
+                        guard !isContentRevealed else { return }
+                        withAnimation(.easeOut(duration: 0.28)) { isContentRevealed = true }
                     }
 
                     if isFullscreenTrailerPresented {
@@ -5133,23 +5200,23 @@ struct TvDetailsContent: View {
             // episode on the way out, and while that capture stands every other
             // control here is unfocusable, so the engine can only put focus back
             // where it was.
+            .onChange(of: isScrolledDown) { _, _ in
+                updateTrailerParkingForScroll()
+            }
+            .onChange(of: isTrailerPlaying) { _, _ in
+                updateTrailerParkingForScroll()
+            }
             .onChange(of: isEnabled) { _, enabled in
                 if !enabled {
                     cancelRelatedFocusRestoration()
                     restoreGeneration &+= 1
-                    restoreEpisodeKey = episodeFocus
+                    restoreEpisodeKey = currentEpisodeFocus
                     stopBackgroundTrailer(manual: false)
                 } else {
                     refreshProgressAfterReturn()
                     if let target = restoreEpisodeKey {
                         restoreEpisodeFocus(to: target, generation: restoreGeneration)
                     }
-                }
-            }
-            .onChange(of: episodeFocus) { _, newValue in
-                // Restoration landed — lift the restriction.
-                if let newValue, newValue == restoreEpisodeKey {
-                    restoreEpisodeKey = nil
                 }
             }
             // Marking an episode watched clears its progress across three
@@ -5376,7 +5443,7 @@ struct TvDetailsContent: View {
         for delay in [0.12, 0.45] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if restoreGeneration == generation, restoreEpisodeKey == target {
-                    episodeFocus = target
+                    setEpisodeFocus(target)
                 }
             }
         }
@@ -5389,6 +5456,91 @@ struct TvDetailsContent: View {
 
     /// Cancel a scroll-first handoff when a newly focused episode control
     /// indicates that the user changed direction.
+    private func buildLowerSections(upTo count: Int) {
+        guard builtLowerSectionCount < count else { return }
+        var transaction = Transaction()
+        transaction.disablesAnimations = true
+        withTransaction(transaction) { builtLowerSectionCount = count }
+    }
+
+    /// The section below the one focus moved into, built now if it isn't yet.
+    private func buildSectionBelow(_ section: TvDetailsFocusSection) {
+        guard builtLowerSectionCount != .max else { return }
+        let order = detailsFocusOrder
+        guard let index = order.firstIndex(of: section), index + 1 < order.count,
+              let below = Self.lowerSection(for: order[index + 1]),
+              let position = activeDetailsSections.firstIndex(of: below) else { return }
+        buildLowerSections(upTo: position + 1)
+    }
+
+    private static func lowerSection(for section: TvDetailsFocusSection) -> TVDetailsSection? {
+        switch section {
+        case .actions: return nil
+        case .episodes: return .episodes
+        case .cast: return .cast
+        case .related: return .related
+        case .network: return .network
+        case .production: return .production
+        case .comments: return .comments
+        }
+    }
+
+    /// Until focus has not moved for `lowerSectionsFocusRest`.
+    private func waitForFocusToRest() async {
+        while TvDetailsFocusActivity.timeSinceLastMove < Self.lowerSectionsFocusRest {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            if Task.isCancelled { return }
+        }
+    }
+
+    /// Until focus has landed in the action row (at most `lowerSectionsLatest` after opening),
+    /// then `lowerSectionsAfterFocus` more, past its animation.
+    private func waitForActionFocusToSettle() async {
+        let start = DispatchTime.now().uptimeNanoseconds
+        while actionFocus == nil,
+              DispatchTime.now().uptimeNanoseconds - start < Self.lowerSectionsLatest {
+            try? await Task.sleep(nanoseconds: 30_000_000)
+            if Task.isCancelled { return }
+        }
+        guard actionFocus != nil else { return }
+        try? await Task.sleep(nanoseconds: Self.lowerSectionsAfterFocus)
+    }
+
+    private func handleEpisodeFocusChange(_ newFocus: String?) {
+        episodeFocusMemory.generation &+= 1
+        if newFocus != nil {
+            setEpisodeFocused(true)
+        } else if isEpisodeFocused {
+            // A move along the strip passes through "no episode focused" for a moment, which
+            // redrew all of Details twice per move; only an exit that lasts counts.
+            let generation = episodeFocusMemory.generation
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                guard episodeFocusMemory.generation == generation else { return }
+                setEpisodeFocused(false)
+            }
+        }
+        // Restoration landed — lift the restriction.
+        if let newFocus, newFocus == restoreEpisodeKey {
+            restoreEpisodeKey = nil
+        }
+    }
+
+    private func setEpisodeFocused(_ focused: Bool) {
+        guard isEpisodeFocused != focused else { return }
+        isEpisodeFocused = focused
+    }
+
+    /// The episode control holding focus, as the strip reported it.
+    private var currentEpisodeFocus: String? {
+        episodeFocusMemory.focusedKey
+    }
+
+    /// Puts focus on episode control `key`, by asking the strip.
+    private func setEpisodeFocus(_ key: String?) {
+        guard let key, episodeFocusMemory.focusedKey != key else { return }
+        episodeFocusRequest = TvEpisodeFocusRequest(key: key, generation: episodeFocusRequest.generation &+ 1)
+    }
+
     private func cancelPendingFocusHandoff() {
         guard pendingPlayFocusGeneration != nil else { return }
         pendingPlayFocusGeneration = nil
@@ -5398,15 +5550,12 @@ struct TvDetailsContent: View {
     /// Route the season strip back to the primary action explicitly. tvOS has
     /// no spatial candidate above later season pills because Play sits at the
     /// far-left edge, so geometry alone can leave focus stuck on Season 2/3.
-    private func focusPlayFromEpisodes(using scrollProxy: ScrollViewProxy) {
+    private func focusPlayFromEpisodes() {
         detailsFocusMoveGeneration &+= 1
         let generation = detailsFocusMoveGeneration
         pendingPlayFocusGeneration = nil
         focusedDetailsSection = .actions
         actionFocus = .play
-        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-            scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
-        }
 
         // tvOS may reassert its spatial choice on the next run-loop turn.
         DispatchQueue.main.async {
@@ -5432,43 +5581,25 @@ struct TvDetailsContent: View {
         }
     }
 
-    private func scrollID(for section: TvDetailsFocusSection) -> String {
-        switch section {
-        case .actions: return TvDetailsScrollID.topSection
-        case .episodes: return TvDetailsScrollID.episodesSection
-        case .cast: return TvDetailsScrollID.castSection
-        case .related: return TvDetailsScrollID.moreLikeThisSection
-        case .network: return TvDetailsScrollID.networkSection
-        case .production: return TvDetailsScrollID.productionSection
-        case .comments: return TvDetailsScrollID.commentsSection
-        }
-    }
-
-    private func handleMoveUpFromEpisodes(using scrollProxy: ScrollViewProxy) {
+    private func handleMoveUpFromEpisodes() {
         guard let currentIndex = detailsFocusOrder.firstIndex(of: .episodes), currentIndex > 0 else {
-            focusPlayFromEpisodes(using: scrollProxy)
+            focusPlayFromEpisodes()
             return
         }
         let targetSection = detailsFocusOrder[currentIndex - 1]
         switch targetSection {
         case .actions:
-            focusPlayFromEpisodes(using: scrollProxy)
+            focusPlayFromEpisodes()
         case .cast:
             focusCastHeaderFromEpisodes()
-            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-            }
         default:
             detailsFocusMoveGeneration &+= 1
             pendingPlayFocusGeneration = nil
             focusedDetailsSection = targetSection
-            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                scrollProxy.scrollTo(scrollID(for: targetSection), anchor: .top)
-            }
         }
     }
 
-    private func handleMoveDownFromEpisodes(using scrollProxy: ScrollViewProxy) {
+    private func handleMoveDownFromEpisodes() {
         guard let currentIndex = detailsFocusOrder.firstIndex(of: .episodes),
               currentIndex + 1 < detailsFocusOrder.count else {
             return
@@ -5477,18 +5608,12 @@ struct TvDetailsContent: View {
         switch targetSection {
         case .cast:
             focusCastHeaderFromEpisodes()
-            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
-            }
         case .actions:
-            focusPlayFromEpisodes(using: scrollProxy)
+            focusPlayFromEpisodes()
         default:
             detailsFocusMoveGeneration &+= 1
             pendingPlayFocusGeneration = nil
             focusedDetailsSection = targetSection
-            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                scrollProxy.scrollTo(scrollID(for: targetSection), anchor: .top)
-            }
         }
     }
 
@@ -5640,6 +5765,109 @@ private enum TvDetailsScrollTiming {
     static let duration = 0.3
 }
 
+/// Keeps a Details section as it was while `key` stays the same. A move between sections
+/// changes which section owns focus, and that rebuilt every section of Details (the poster
+/// cards of More Like This, the cast...) just as the scroll began; now only the two sections
+/// whose lock changed redraw. The key holds what a section shows and its lock; its actions
+/// read Details' state when they run, so a kept section still acts on the current screen.
+private struct TvDetailsSectionSnapshot<Key: Equatable, Content: View>: View, Equatable {
+    let key: Key
+    let content: Content
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.key == rhs.key }
+
+    var body: some View { content }
+}
+
+extension View {
+    fileprivate func detailsSnapshot<Key: Equatable>(_ key: Key) -> some View {
+        TvDetailsSectionSnapshot(key: key, content: self).equatable()
+    }
+}
+
+private struct TvDetailsRowSnapshotKey<Content: Equatable>: Equatable {
+    let content: Content
+    let entryLocked: Bool
+}
+
+/// One card of a Details row, kept as it was while it shows the same thing at the same place.
+/// A row redraws when its lock switches (focus comes into it or leaves it) and when it scrolls;
+/// that used to rebuild every card in it, just as the move began. Now only the lock, outside
+/// the card, changes. `style` holds the settings the row hands the card.
+private struct TvDetailsCardSnapshotKey<Item: Equatable>: Equatable {
+    let item: Item
+    let index: Int
+    var style: String = ""
+}
+
+private struct TvDetailsCastSnapshot: Equatable {
+    let metaID: String
+    let cast: [String]?
+    let director: [String]?
+    let writer: [String]?
+    let people: [TmdbPersonMetadata]
+}
+
+private struct TvDetailsEpisodesSnapshotKey: Equatable {
+    let meta: NuvioMeta
+    let revision: TvDetailsEpisodePresentationRevision
+    let continueItem: ContinueWatchingItem?
+    let choosingWatchPartyEpisode: Bool
+    let restoreEpisodeKey: String?
+    let entryLocked: Bool
+    let hasManualPlay: Bool
+    let episodeFocusRequest: TvEpisodeFocusRequest?
+}
+
+private struct TvDetailsSeasonSnapshot: Equatable {
+    let seasons: [Int]
+    let selectedSeason: Int
+    let locked: Bool
+}
+
+/// Holds Details' background trailer player for the life of the screen.
+private final class TvDetailsTrailerPlayerHolder: ObservableObject {
+    let player = AVPlayer()
+}
+
+/// When focus last moved anywhere, for Details' lower sections (built while it rests).
+@MainActor
+private enum TvDetailsFocusActivity {
+    private static var observer: NSObjectProtocol?
+    private static var lastMoveAt: CFTimeInterval = 0
+
+    static func start() {
+        guard observer == nil else { return }
+        observer = NotificationCenter.default.addObserver(
+            forName: UIFocusSystem.didUpdateNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated { lastMoveAt = CACurrentMediaTime() }
+        }
+    }
+
+    static var timeSinceLastMove: CFTimeInterval {
+        CACurrentMediaTime() - lastMoveAt
+    }
+}
+
+private final class TvDetailsEpisodeFocusMemory {
+    var generation = 0
+    /// The episode control the strip last reported focused.
+    var focusedKey: String?
+}
+
+/// Details asking the episode strip to put focus on an episode control, a new generation each
+/// time. One that a strip only now built finds is applied if it is under a second old.
+private struct TvEpisodeFocusRequest: Equatable {
+    var key: String?
+    var generation = 0
+    var issuedAt = ProcessInfo.processInfo.systemUptime
+
+    var isFresh: Bool { ProcessInfo.processInfo.systemUptime - issuedAt < 1 }
+}
+
 private enum TvDetailsScrollID {
     static let topSection = "tv-details-top-section"
     static let castSection = "tv-details-cast-section"
@@ -5708,6 +5936,9 @@ private struct TvDetailsBackdrop: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
     @State private var backdropImage: UIImage?
+    /// The backdrop blurred once, faded in over the sharp one instead of blurring it live (a
+    /// full-screen blur worked out again on every frame).
+    @State private var blurredBackdrop: UIImage?
 
     private var targetArtworkURL: URL? {
         for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
@@ -5750,12 +5981,24 @@ private struct TvDetailsBackdrop: View {
 
         ZStack {
             if let backdropImage {
+                // One sharp image throughout (switching between two versions of it when the
+                // blurred copy arrived could flash as Details opened); live blur only until the
+                // blurred copy is ready.
                 Image(uiImage: backdropImage)
                     .resizable()
                     .scaledToFill()
-                    .blur(radius: blurRadius, opaque: true)
+                    .blur(radius: blurredBackdrop != nil ? 0 : blurRadius, opaque: true)
                     .animation(.easeInOut(duration: 0.35), value: blurRadius)
                     .ignoresSafeArea()
+                if let blurredBackdrop {
+                    Image(uiImage: blurredBackdrop)
+                        .resizable()
+                        .scaledToFill()
+                        .opacity(blurRadius > 0 ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
             } else {
                 backdropColor.ignoresSafeArea()
             }
@@ -5802,7 +6045,58 @@ private struct TvDetailsBackdrop: View {
                 backdropImage = loaded
             }
         }
+        .task(id: BlurredBackdropKey(url: targetArtworkURL, hasImage: backdropImage != nil)) {
+            guard let url = targetArtworkURL, let backdropImage else {
+                if blurredBackdrop != nil { blurredBackdrop = nil }
+                return
+            }
+            let blurred = await TvDetailsBlurredBackdrop.image(for: url, from: backdropImage)
+            guard !Task.isCancelled else { return }
+            blurredBackdrop = blurred
+        }
         .ignoresSafeArea()
+    }
+
+    private struct BlurredBackdropKey: Equatable {
+        let url: URL?
+        let hasImage: Bool
+    }
+}
+
+/// The Details backdrop blurred once, small (the blur leaves no detail to keep), off the main
+/// thread, as the live blur would draw it at 22 points over a 1920-point-wide screen.
+enum TvDetailsBlurredBackdrop {
+    static let radius: CGFloat = 22
+    private static let pixelWidth: CGFloat = 640
+    private static let cache: NSCache<NSURL, UIImage> = {
+        let cache = NSCache<NSURL, UIImage>()
+        cache.countLimit = 12
+        return cache
+    }()
+    private static let context = CIContext(options: [.cacheIntermediates: false])
+
+    static func image(for url: URL, from image: UIImage) async -> UIImage? {
+        if let cached = cache.object(forKey: url as NSURL) { return cached }
+        let blurred = await Task.detached(priority: .userInitiated) {
+            TvDetailsBlurredBackdrop.render(image)
+        }.value
+        if let blurred { cache.setObject(blurred, forKey: url as NSURL) }
+        return blurred
+    }
+
+    static func render(_ image: UIImage, screenWidth: CGFloat = 1920) -> UIImage? {
+        guard let cgImage = image.cgImage, cgImage.width > 0, cgImage.height > 0 else { return nil }
+        let scale = min(1, pixelWidth / CGFloat(cgImage.width))
+        let input = CIImage(cgImage: cgImage).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let extent = input.extent.integral
+        // The image is shown filling the screen's width, so a point there is this many pixels here.
+        let pixelsPerPoint = extent.width / screenWidth
+        guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
+        filter.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
+        filter.setValue(radius * pixelsPerPoint, forKey: kCIInputRadiusKey)
+        guard let output = filter.outputImage?.cropped(to: extent),
+              let rendered = context.createCGImage(output, from: extent) else { return nil }
+        return UIImage(cgImage: rendered)
     }
 }
 
@@ -6591,6 +6885,14 @@ private struct TvDetailsCastAndTrailer: View {
     let onFocus: () -> Void
 
     @State private var focusedPersonIndex = 0
+    /// The row's people come a few at a time, empty space of their width until then: built all
+    /// at once as focus moved down into the episodes (Details builds the section below the one
+    /// focus goes into), the whole row came in the frame of the move, a 120-145 ms frame. All
+    /// of them once focus comes into the row.
+    @State private var builtCount = Self.firstCards
+
+    private static let firstCards = 3
+    private static let cardsPerStep = 3
 
     var body: some View {
         let items = displayPeople
@@ -6625,16 +6927,23 @@ private struct TvDetailsCastAndTrailer: View {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 58) {
                         ForEach(Array(items.enumerated()), id: \.element.id) { index, person in
-                            TvDetailsPersonCard(
-                                person: person,
-                                onSelect: { onPersonClick(person) },
-                                onFocus: {
-                                    focusedPersonIndex = index
-                                    onFocus()
-                                },
-                                onBack: onBack
-                            )
-                            .disabled(entryLocked)
+                            if index < builtCount {
+                                TvDetailsPersonCard(
+                                    person: person,
+                                    onSelect: { onPersonClick(person) },
+                                    onFocus: {
+                                        focusedPersonIndex = index
+                                        if builtCount < items.count { builtCount = items.count }
+                                        onFocus()
+                                    },
+                                    onBack: onBack
+                                )
+                                .detailsSnapshot(TvDetailsCardSnapshotKey(item: person, index: index))
+                                .disabled(entryLocked)
+                            } else {
+                                Color.clear
+                                    .frame(width: TvDetailsPersonCard.width, height: 1)
+                            }
                         }
                     }
                     .padding(.trailing, 80)
@@ -6644,6 +6953,17 @@ private struct TvDetailsCastAndTrailer: View {
             .focusSection()
             .onExitCommand {
                 onBack?()
+            }
+            .task(id: items.count) {
+                while builtCount < items.count {
+                    try? await Task.sleep(nanoseconds: 40_000_000)
+                    guard !Task.isCancelled else { return }
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        builtCount = min(items.count, builtCount + Self.cardsPerStep)
+                    }
+                }
             }
         }
     }
@@ -6680,7 +7000,11 @@ private struct TvDetailsSectionButton: View {
     var onBack: (() -> Void)? = nil
     let action: () -> Void
 
-    private var isFocused: Bool { focus.wrappedValue == tag }
+    /// The heading's own focus. Read from Details' header focus binding, it noticed gaining
+    /// focus only when the cast section was redrawn, so the section had to redraw on every move
+    /// between its headings; a section kept as it was left the heading unaware. The binding
+    /// still follows (and restores) focus, see `.focused(focus, …)`.
+    @FocusState private var isFocused: Bool
 
     var body: some View {
         Button(action: action) {
@@ -6691,6 +7015,7 @@ private struct TvDetailsSectionButton: View {
                 .frame(height: 64)
         }
         .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
         .focused(focus, equals: tag)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.035 : 1)
@@ -6727,10 +7052,17 @@ private struct TvDetailsRelatedRow: View {
     let onFocus: () -> Void
 
     @State private var scrollIndex = 0
+    /// The row's posters come a few at a time, empty space of their size until then: built all
+    /// at once (16 or more) as Details built this section, half a second after focus went into
+    /// the episodes, they were a 90-150 ms frame. All of them once focus comes into the row.
+    @State private var builtCount = Self.firstCards
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private static let firstCards = 3
+    private static let cardsPerStep = 3
 
     private var cardWidth: CGFloat { homeLayout == "Compact" ? 170 : 210 }
     private var cardHeight: CGFloat { homeLayout == "Compact" ? 255 : 315 }
@@ -6748,11 +7080,13 @@ private struct TvDetailsRelatedRow: View {
 
             HStack(alignment: .bottom, spacing: spacing) {
                 ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    let buildsLater = index >= builtCount
                     PosterCard(
                         meta: item.asMeta,
                         customPosterScreen: .details,
                         onFocus: { _ in
                             if scrollIndex != index { scrollIndex = index }
+                            if builtCount < items.count { builtCount = items.count }
                             onFocus()
                             onItemFocus?(item)
                         },
@@ -6761,10 +7095,16 @@ private struct TvDetailsRelatedRow: View {
                         layoutMode: homeLayout,
                         showPosterLabels: posterLabels,
                         smoothFocusAnimations: smoothFocus,
-                        focusHighlighterEnabled: focusHighlighter
+                        focusHighlighterEnabled: focusHighlighter,
+                        buildsLater: buildsLater
                     ) {
                         onSelect(item)
                     }
+                    .detailsSnapshot(TvDetailsCardSnapshotKey(
+                        item: item,
+                        index: index,
+                        style: "\(homeLayout)|\(posterLabels)|\(smoothFocus)|\(focusHighlighter)|\(buildsLater)"
+                    ))
                     .disabled(
                         focusRequestID.map { $0 != item.id }
                             ?? (entryLocked && index != scrollIndex)
@@ -6785,6 +7125,17 @@ private struct TvDetailsRelatedRow: View {
         .onExitCommand {
             onBack?()
         }
+        .task {
+            while builtCount < items.count {
+                try? await Task.sleep(nanoseconds: 40_000_000)
+                guard !Task.isCancelled else { return }
+                var transaction = Transaction(animation: nil)
+                transaction.disablesAnimations = true
+                withTransaction(transaction) {
+                    builtCount = min(items.count, builtCount + Self.cardsPerStep)
+                }
+            }
+        }
         .onAppear {
             positionAtRequestedItem()
             onMounted?()
@@ -6804,6 +7155,8 @@ private struct TvDetailsRelatedRow: View {
         guard let focusRequestID,
               let index = items.firstIndex(where: { $0.id == focusRequestID }) else { return }
         if scrollIndex != index { scrollIndex = index }
+        // Focus goes back to that poster: it must be built.
+        if builtCount <= index { builtCount = items.count }
     }
 }
 
@@ -6851,6 +7204,7 @@ private struct TvDetailsProductionRow: View {
                         },
                         onBack: onBack
                     )
+                    .detailsSnapshot(TvDetailsCardSnapshotKey(item: company, index: index))
                     .disabled(entryLocked && index != entryCompanyIndex)
                 }
             }
@@ -6922,7 +7276,8 @@ private struct TvDetailsCompanyCard: View {
                     LiquidGlassCardModifier(
                         cornerRadius: cardCornerRadius,
                         isFocused: isFocused,
-                        isEnabled: liquidGlassCards
+                        isEnabled: liquidGlassCards,
+                        coveredByArtwork: true
                     )
                 )
                 .overlay(
@@ -6993,6 +7348,7 @@ private struct TvDetailsCommentsRow: View {
                         },
                         onBack: onBack
                     )
+                    .detailsSnapshot(TvDetailsCardSnapshotKey(item: comment, index: index))
                     .disabled(entryLocked && index != scrollIndex)
                 }
             }
@@ -8001,6 +8357,9 @@ private struct TvDetailsPersonCard: View {
     let onFocus: () -> Void
     var onBack: (() -> Void)? = nil
 
+    /// The card's width, also kept by the cast row for a card not built yet.
+    static let width: CGFloat = 220
+
     @FocusState private var isFocused: Bool
     @State private var profileImage: UIImage?
 
@@ -8041,7 +8400,7 @@ private struct TvDetailsPersonCard: View {
                         .frame(width: 210)
                 }
             }
-            .frame(width: 220)
+            .frame(width: Self.width)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)
@@ -8093,32 +8452,37 @@ private struct TvDetailsPersonCard: View {
             return
         }
 
-        let targetPixelSize: CGFloat = 376
-        let downsampledImage: UIImage? = {
-            let options: [CFString: Any] = [
-                kCGImageSourceShouldCache: false
-            ]
-            guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
-                return UIImage(data: data)
-            }
-            guard CGImageSourceGetCount(source) > 0, CGImageSourceGetType(source) != nil else {
-                return UIImage(data: data)
-            }
-            let thumbnailOptions: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceShouldCacheImmediately: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: targetPixelSize
-            ]
-            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
-                return UIImage(data: data)
-            }
-            return UIImage(cgImage: cgImage)
-        }()
+        // Decoded off the main thread: a cast row's photos decoded there held Details up for
+        // over a hundred milliseconds while it opened.
+        let downsampledImage = await Task.detached(priority: .userInitiated) {
+            Self.downsampledProfileImage(from: data, maxPixelSize: 376)
+        }.value
 
         guard let image = downsampledImage, !Task.isCancelled else { return }
         await PersonProfileImageCache.shared.insert(image, for: cacheKey)
         profileImage = image
+    }
+
+    nonisolated private static func downsampledProfileImage(from data: Data, maxPixelSize: CGFloat) -> UIImage? {
+        let options: [CFString: Any] = [
+            kCGImageSourceShouldCache: false
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
+            return UIImage(data: data)
+        }
+        guard CGImageSourceGetCount(source) > 0, CGImageSourceGetType(source) != nil else {
+            return UIImage(data: data)
+        }
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
+            return UIImage(data: data)
+        }
+        return UIImage(cgImage: cgImage)
     }
 }
 
@@ -8501,18 +8865,39 @@ private struct TvDetailsEpisodes: View {
     var onPlayManually: ((NuvioVideo) -> Void)? = nil
     let onEpisodeMenuPresented: (Bool) -> Void
     var onBack: (() -> Void)? = nil
-    var episodeFocus: FocusState<String?>.Binding
     /// While set, only the control with this key can take focus — see the
     /// restore in `TvDetailsContent`.
     let restrictFocusToKey: String?
     let entryLocked: Bool
     let onMoveUpFromSeason: () -> Void
     let onMoveDownFromEpisode: () -> Void
+    /// The strip holds its episodes' focus itself (`ownEpisodeFocus`), reports where it is and
+    /// puts it where Details asks.
+    var episodeFocusRequest: TvEpisodeFocusRequest? = nil
+    var onEpisodeFocusChange: ((String?) -> Void)? = nil
 
+    @FocusState private var ownEpisodeFocus: String?
+    /// Where the strip starts on screen (its distance from the screen's left edge), as last
+    /// measured. Read from the geometry reader's global frame on every pass, it tied the strip to
+    /// the strip's place on screen: each frame of Details scrolling between sections rebuilt the
+    /// strip and its cards.
+    @State private var stripEdgeInset: CGFloat?
     @State private var selectedSeason: Int
     @State private var seasonEpisodes: [NuvioVideo]
     @State private var seasonEpisodeIndexByID: [String: Int]
     @State private var episodeScrollIndex: Int
+    /// The first episode wholly on screen in the system strip, from where it is scrolled; nil
+    /// until it has reported, or after another season was picked. Details redraws when it
+    /// changes, once a card has gone past, and not for the last one on screen too.
+    @State private var systemStripFirstWhole: Int?
+    /// The episodes wholly on screen, as the strip last reported, to look at, never redrawn for.
+    @State private var systemStripScreenBox = TvEpisodeStripScreenBox()
+    /// The episode the system strip still has to be scrolled to (put on screen as Details opens,
+    /// or focus put back on it), checked again until it is on screen.
+    @State private var systemStripScrollTarget: Int?
+    @State private var systemStripScrollGeneration = 0
+    /// What the system strip is to scroll to, a new count each time.
+    @State private var systemStripScrollRequest = TvEpisodeStripScrollRequest()
     @State private var watchedEpisodeKeys: Set<String>
     @State private var episodeWatchCounts: [String: Int]
     @State private var watchedSummary: WatchedEpisodeSummary?
@@ -8520,7 +8905,6 @@ private struct TvDetailsEpisodes: View {
     @State private var userDidSelectSeason = false
     @State private var episodeRatings: [String: [NuvioExternalRating]] = [:]
     @State private var ratingOrderRevision: UInt64 = 0
-    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.reuseLastLink) private var reuseLastLink = false
 
@@ -8539,13 +8923,16 @@ private struct TvDetailsEpisodes: View {
         onPlayManually: ((NuvioVideo) -> Void)? = nil,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         onBack: (() -> Void)? = nil,
-        episodeFocus: FocusState<String?>.Binding,
         restrictFocusToKey: String?,
         entryLocked: Bool,
         onMoveUpFromSeason: @escaping () -> Void,
-        onMoveDownFromEpisode: @escaping () -> Void
+        onMoveDownFromEpisode: @escaping () -> Void,
+        episodeFocusRequest: TvEpisodeFocusRequest? = nil,
+        onEpisodeFocusChange: ((String?) -> Void)? = nil
     ) {
         self.meta = meta
+        self.episodeFocusRequest = episodeFocusRequest
+        self.onEpisodeFocusChange = onEpisodeFocusChange
         self.libraryWatchedContext = libraryWatchedContext
         self.episodeGuide = episodeGuide
         self.initialState = initialState
@@ -8559,7 +8946,6 @@ private struct TvDetailsEpisodes: View {
         self.onPlayManually = onPlayManually
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.onBack = onBack
-        self.episodeFocus = episodeFocus
         self.restrictFocusToKey = restrictFocusToKey
         self.entryLocked = entryLocked
         self.onMoveUpFromSeason = onMoveUpFromSeason
@@ -8586,8 +8972,16 @@ private struct TvDetailsEpisodes: View {
             if isChoosingWatchPartyEpisode {
                 watchPartySelectionPrompt
             }
+            // Kept as they are while the strip moves (see `detailsSnapshot`): only the strip
+            // follows the episode index.
             watchedProgressSummary
+                .detailsSnapshot(watchedSummary)
             seasonSelector
+                .detailsSnapshot(TvDetailsSeasonSnapshot(
+                    seasons: seasons,
+                    selectedSeason: selectedSeason,
+                    locked: seasonPillsLocked
+                ))
             episodeCardStrip
         }
         .focusSection()
@@ -8636,6 +9030,27 @@ private struct TvDetailsEpisodes: View {
                 episodeScrollIndex = targetIndex
             }
         }
+        .onChange(of: ownEpisodeFocus) { _, key in
+            onEpisodeFocusChange?(key)
+        }
+        .onChange(of: episodeFocusRequest) { _, request in
+            applyEpisodeFocusRequest(request)
+        }
+        .onAppear {
+            if let episodeFocusRequest, episodeFocusRequest.isFresh {
+                applyEpisodeFocusRequest(episodeFocusRequest)
+            }
+        }
+    }
+
+    /// What the episode cards bind their focus to: the strip's own.
+    private var cardFocus: FocusState<String?>.Binding {
+        $ownEpisodeFocus
+    }
+
+    private func applyEpisodeFocusRequest(_ request: TvEpisodeFocusRequest?) {
+        guard let key = request?.key, ownEpisodeFocus != key else { return }
+        ownEpisodeFocus = key
     }
 
     private var watchPartySelectionPrompt: some View {
@@ -8766,124 +9181,29 @@ private struct TvDetailsEpisodes: View {
 
     private func materializedEpisodeIndices(visibleCardCount: Int) -> [Int] {
         guard !seasonEpisodes.isEmpty else { return [] }
-        let targetIndex: Int? = {
-            guard let restriction = effectiveFocusRestriction,
-                  restriction.hasPrefix("episode-card\u{1}") else { return nil }
-            let targetID = String(restriction.dropFirst("episode-card\u{1}".count))
-            return seasonEpisodeIndexByID[targetID]
-        }()
         return TvDetailsEpisodeIndex.windowIndices(
             totalEpisodes: seasonEpisodes.count,
             scrollIndex: episodeScrollIndex,
-            targetIndex: targetIndex,
+            targetIndex: focusTargetEpisodeIndex,
             visibleCardCount: visibleCardCount
         )
     }
 
     private var episodeCardStrip: some View {
         GeometryReader { geo in
-            let edgeInset = max(0, geo.frame(in: .global).minX)
+            // Measured once and then only when it changes (below); until then, read here.
+            let edgeInset = stripEdgeInset ?? max(0, geo.frame(in: .global).minX)
             let stripWidth = geo.size.width + edgeInset * 2
-            let visibleCardCount = max(1, Int(ceil(stripWidth / TvEpisodeCardLayout.step)) + 1)
-            let materializedIndices = materializedEpisodeIndices(visibleCardCount: visibleCardCount)
-            let materializedEpisodes = materializedIndices.map { seasonEpisodes[$0] }
-            let currentSeasonEpisodeNumbers = seasonEpisodes.map(\.episode)
-
-            HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
-                ForEach(materializedEpisodes) { video in
-                    let itemIndex = seasonEpisodeIndexByID[video.id] ?? 0
-                    let watchKey = "\(video.season):\(video.episode)"
-                    let episodeWatchCount = episodeWatchCounts[watchKey]
-                        ?? (watchedEpisodeKeys.contains(watchKey) ? 1 : 0)
-                    let epRating = episodeRatings[meta.canonicalEpisodeStreamId(for: video)] ?? []
-                    TvEpisodeCard(
-                        video: video,
-                        fallbackArtworkURL: meta.backdropUrl,
-                        continueProgress: continueProgress(for: video),
-                        isWatched: watchedEpisodeKeys.contains(watchKey),
-                        watchCount: episodeWatchCount,
-                        isSeasonWatched: isSeasonWatched,
-                        episodeRatings: epRating,
-                        onFocus: {
-                            episodeScrollIndex = itemIndex
-                            onFocus()
-                        },
-                        onToggleWatched: {
-                            let isWatched = watchedEpisodeKeys.contains(watchKey)
-                            AniListScrobbler.markEpisode(meta: meta, video: video, watched: !isWatched)
-                            if let libraryWatchedContext {
-                                _ = libraryWatchedContext.setWatched(
-                                    meta,
-                                    season: video.season,
-                                    episode: video.episode,
-                                    isWatched: !isWatched
-                                )
-                            } else {
-                                _ = WatchedStore.toggleEpisode(
-                                    meta: meta,
-                                    season: video.season,
-                                    episode: video.episode
-                                )
-                            }
-                        },
-                        onMarkWatchedUpTo: {
-                            AniListScrobbler.markEpisode(meta: meta, video: video, watched: true)
-                            if let libraryWatchedContext {
-                                _ = libraryWatchedContext.setWatchedUpTo(
-                                    meta,
-                                    season: video.season,
-                                    episode: video.episode
-                                )
-                            } else {
-                                WatchedStore.markWatchedUpTo(
-                                    meta: meta,
-                                    season: video.season,
-                                    episode: video.episode
-                                )
-                            }
-                        },
-                        onToggleSeasonWatched: {
-                            AniListScrobbler.markSeason(meta: meta, videos: seasonEpisodes, watched: !isSeasonWatched)
-                            if let libraryWatchedContext {
-                                _ = libraryWatchedContext.setSeasonWatched(
-                                    meta,
-                                    season: selectedSeason,
-                                    episodes: currentSeasonEpisodeNumbers,
-                                    isWatched: !isSeasonWatched
-                                )
-                            } else {
-                                WatchedStore.setSeasonWatched(
-                                    meta: meta,
-                                    season: selectedSeason,
-                                    episodes: currentSeasonEpisodeNumbers,
-                                    isWatched: !isSeasonWatched
-                                )
-                            }
-                        },
-                        onMenuOpened: { onEpisodeMenuPresented(true) },
-                        onMenuClosed: { onEpisodeMenuPresented(false) },
-                        action: { onSelect(video) },
-                        onPlayManually: onPlayManually != nil ? { onPlayManually?(video) } : nil,
-                        smartStreamSelection: smartStreamSelection || (reuseLastLink && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, meta: meta, profileId: ProfileSettings.activeProfileID) != nil),
-                        onBack: onBack,
-                        focus: episodeFocus,
-                        restrictFocusToKey: effectiveFocusRestriction,
-                        onMoveDown: onMoveDownFromEpisode,
-                        onMoveUp: seasons.count <= 1 ? onMoveUpFromSeason : nil
-                    )
-                }
-            }
-            .padding(.leading, CGFloat(materializedIndices.first ?? 0) * TvEpisodeCardLayout.step)
-            .padding(.vertical, TvEpisodeCardLayout.verticalPadding)
-            .offset(x: edgeInset - CGFloat(episodeScrollIndex) * TvEpisodeCardLayout.step)
-            .frame(width: stripWidth, height: TvEpisodeCardLayout.stripHeight, alignment: .leading)
-            // Match the cast rail: episode cards may draw through the details
-            // column up to the screen edge instead of being cut off early.
-            .offset(x: -edgeInset)
-            // Critically damped — same no-bounce Home strip feel.
-            .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: episodeScrollIndex)
+            systemEpisodeStrip(edgeInset: edgeInset, stripWidth: stripWidth)
         }
         .frame(height: TvEpisodeCardLayout.stripHeight)
+        .onGeometryChange(for: CGFloat.self) { proxy in
+            max(0, proxy.frame(in: .global).minX).rounded()
+        } action: { edgeInset in
+            if stripEdgeInset != edgeInset {
+                stripEdgeInset = edgeInset
+            }
+        }
         .task(id: "\(selectedSeason)-\((materializedEpisodeIndices(visibleCardCount: 6).first ?? 0) / 6)") {
             // Debounce to keep rapid D-pad navigation butter-smooth without spamming network/state passes
             do {
@@ -8918,6 +9238,258 @@ private struct TvDetailsEpisodes: View {
         }
     }
 
+    /// The strip as a system scroll view, as Home's rows. tvOS scrolls it as focus moves, outside
+    /// the main thread, so a move that costs some work no longer holds the scroll up as the
+    /// strip's own animation (an offset of its cards) was.
+    ///
+    /// Not lazy: the cards near the screen, near the remembered episode and near where focus
+    /// is being put back are built, and the rest of the strip is empty space of the same width.
+    /// Every episode has its place, so the strip can always be scrolled to the one focus goes
+    /// back to (a lazy strip could not reach one it hadn't built yet, and focus put back on a
+    /// later episode found no card and went back to Play).
+    private func systemEpisodeStrip(edgeInset: CGFloat, stripWidth: CGFloat) -> some View {
+        let visibleCardCount = max(1, Int(ceil(stripWidth / TvEpisodeCardLayout.step)) + 1)
+        let indices = systemEpisodeIndices(visibleCardCount: visibleCardCount)
+        let first = indices.first ?? 0
+        let after = max(0, seasonEpisodes.count - 1 - (indices.last ?? -1))
+        let restoreIndex = restoreEpisodeIndex
+        return TvSystemEpisodeStripScroller(
+            edgeInset: edgeInset,
+            viewportWidth: min(stripWidth, 1920),
+            season: seasonEpisodes.first?.id ?? "",
+            request: systemStripScrollRequest,
+            onScreenChange: { screen in
+                // A report from the season shown before is no longer where this one is.
+                guard screen.season == (seasonEpisodes.first?.id ?? "") else { return }
+                systemStripScreenBox.cards = screen.cards
+                if systemStripFirstWhole != screen.cards.lowerBound {
+                    systemStripFirstWhole = screen.cards.lowerBound
+                }
+            }
+        ) {
+            HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
+                ForEach(indices.map { seasonEpisodes[$0] }) { video in
+                    episodeCard(video)
+                }
+            }
+            .padding(.leading, edgeInset + CGFloat(first) * TvEpisodeCardLayout.step)
+            .padding(.trailing, edgeInset + TVLayout.rowLeading + CGFloat(after) * TvEpisodeCardLayout.step)
+            .padding(.vertical, TvEpisodeCardLayout.verticalPadding)
+        }
+        .frame(width: stripWidth, height: TvEpisodeCardLayout.stripHeight, alignment: .leading)
+        .offset(x: -edgeInset)
+        .onAppear {
+            // Where the strip was left, or the card focus goes back to.
+            keepScrolling(to: restoreIndex ?? episodeScrollIndex)
+        }
+        .onChange(of: restoreIndex) { _, index in
+            // Already on screen (focus is put back on the card it left), scrolling to it would
+            // jolt the strip as Details closes.
+            guard let index, !isOnSystemStripScreen(index) else { return }
+            keepScrolling(to: index)
+        }
+        .task(id: systemStripScrollGeneration) {
+            // Opened with everything built at once (Continue Watching, the calendar), the strip
+            // was scrolled before it was laid out, and stayed at its start: the episode focus
+            // was to go to was off screen. Checked again until that episode is on screen; until
+            // it is, the strip's lock goes to a card that is.
+            for delay: UInt64 in [80, 180, 350, 600] {
+                try? await Task.sleep(nanoseconds: delay * 1_000_000)
+                guard !Task.isCancelled, let target = systemStripScrollTarget else { return }
+                if isOnSystemStripScreen(target) {
+                    systemStripScrollTarget = nil
+                    return
+                }
+                requestStripScroll(to: target)
+            }
+            systemStripScrollTarget = nil
+        }
+        .onChange(of: seasonEpisodes.first?.id) { _, _ in
+            // Another season: start where its index points (the first episode after a pick).
+            systemStripScreenBox.cards = nil
+            systemStripFirstWhole = nil
+            DispatchQueue.main.async {
+                requestStripScroll(to: episodeScrollIndex)
+            }
+        }
+    }
+
+    /// The cards the system strip builds: those on screen, two more on each side, and the
+    /// focused episode and the one focus is being put back on. Where the screen is comes from
+    /// the strip's scroll (until it reports, from where it is put as it appears: that episode
+    /// at the column's start). Built for a screen on either side of focus, as it was, the strip
+    /// made 15 or more cards at once as Details opened, a stall of 250-335 ms.
+    private func systemEpisodeIndices(visibleCardCount: Int) -> [Int] {
+        guard !seasonEpisodes.isEmpty else { return [] }
+        let last = seasonEpisodes.count - 1
+        let focused = min(max(episodeScrollIndex, 0), last)
+        var lower = focused
+        var upper = focused
+        if let target = focusTargetEpisodeIndex {
+            lower = min(lower, target)
+            upper = max(upper, target)
+        }
+        let appearStart = restoreEpisodeIndex ?? focused
+        // The card partly shown before the first whole one. While the strip is still on its
+        // way to an episode, it is where it is going: where it reports being (its start, before
+        // the scroll lands) built every card between there and that episode at once, a stall
+        // of 277-315 ms as Details opened at a later episode.
+        let reportedStart = systemStripFirstWhole.flatMap { first -> Int? in
+            if let target = systemStripScrollTarget, !isOnSystemStripScreen(target) { return nil }
+            return first - 1
+        }
+        let screenStart = min(
+            max(reportedStart ?? systemStripScrollTarget ?? appearStart, 0),
+            max(0, last - visibleCardCount + 1)
+        )
+        lower = min(lower, screenStart)
+        upper = max(upper, screenStart + visibleCardCount - 1)
+        return Array(max(0, lower - 2)...min(last, upper + 2))
+    }
+
+    /// Scrolls the system strip to an episode, and checks again until it is on screen.
+    private func keepScrolling(to index: Int) {
+        requestStripScroll(to: index)
+        systemStripScrollTarget = index
+        systemStripScrollGeneration &+= 1
+    }
+
+    private func requestStripScroll(to index: Int) {
+        guard seasonEpisodes.indices.contains(index) else { return }
+        systemStripScrollRequest = TvEpisodeStripScrollRequest(
+            index: index,
+            count: systemStripScrollRequest.count &+ 1
+        )
+    }
+
+    /// Cards wholly on screen in the system strip (from its start until it has reported).
+    private var systemStripScreenRange: ClosedRange<Int> {
+        systemStripScreenBox.cards ?? TvEpisodeStripScreen.cards(offset: 0, edgeInset: 0, viewportWidth: 1920)
+    }
+
+    private func isOnSystemStripScreen(_ index: Int) -> Bool {
+        systemStripScreenRange.contains(index)
+    }
+
+    /// The episode Details is putting focus back on, if it is putting it on one. (Not the entry
+    /// lock's card: that is the one focus left, already on screen, and scrolling to it as focus
+    /// leaves the strip would jolt it.)
+    private var restoreEpisodeIndex: Int? {
+        guard let restriction = restrictFocusToKey,
+              restriction.hasPrefix("episode-card\u{1}") else { return nil }
+        return seasonEpisodeIndexByID[String(restriction.dropFirst("episode-card\u{1}".count))]
+    }
+
+    /// The episode focus is kept to (being put back on one, or the strip's entry lock), if any.
+    private var focusTargetEpisodeIndex: Int? {
+        guard let restriction = effectiveFocusRestriction,
+              restriction.hasPrefix("episode-card\u{1}") else { return nil }
+        return seasonEpisodeIndexByID[String(restriction.dropFirst("episode-card\u{1}".count))]
+    }
+
+    /// One episode card. Cards compare equal when what they show is the same, so a move redraws
+    /// only the two cards focus passed between (each card follows its own focus).
+    private func episodeCard(_ video: NuvioVideo) -> some View {
+        let itemIndex = seasonEpisodeIndexByID[video.id] ?? 0
+        let videoID = video.id
+        let watchKey = "\(video.season):\(video.episode)"
+        let episodeWatchCount = episodeWatchCounts[watchKey]
+            ?? (watchedEpisodeKeys.contains(watchKey) ? 1 : 0)
+        let epRating = episodeRatings[meta.canonicalEpisodeStreamId(for: video)] ?? []
+        return TvEpisodeCard(
+            video: video,
+            fallbackArtworkURL: meta.backdropUrl,
+            continueProgress: continueProgress(for: video),
+            isWatched: watchedEpisodeKeys.contains(watchKey),
+            watchCount: episodeWatchCount,
+            isSeasonWatched: isSeasonWatched,
+            episodeRatings: epRating,
+            onFocus: {
+                // Read when focus lands: the card may keep this closure across renders (it is
+                // compared without it, see TvEpisodeCard's ==).
+                if let index = seasonEpisodeIndexByID[videoID], episodeScrollIndex != index {
+                    episodeScrollIndex = index
+                }
+                onFocus()
+            },
+            onToggleWatched: {
+                let isWatched = watchedEpisodeKeys.contains(watchKey)
+                AniListScrobbler.markEpisode(meta: meta, video: video, watched: !isWatched)
+                if let libraryWatchedContext {
+                    _ = libraryWatchedContext.setWatched(
+                        meta,
+                        season: video.season,
+                        episode: video.episode,
+                        isWatched: !isWatched
+                    )
+                } else {
+                    _ = WatchedStore.toggleEpisode(
+                        meta: meta,
+                        season: video.season,
+                        episode: video.episode
+                    )
+                }
+            },
+            onMarkWatchedUpTo: {
+                AniListScrobbler.markEpisode(meta: meta, video: video, watched: true)
+                if let libraryWatchedContext {
+                    _ = libraryWatchedContext.setWatchedUpTo(
+                        meta,
+                        season: video.season,
+                        episode: video.episode
+                    )
+                } else {
+                    WatchedStore.markWatchedUpTo(
+                        meta: meta,
+                        season: video.season,
+                        episode: video.episode
+                    )
+                }
+            },
+            onToggleSeasonWatched: {
+                AniListScrobbler.markSeason(meta: meta, videos: seasonEpisodes, watched: !isSeasonWatched)
+                if let libraryWatchedContext {
+                    _ = libraryWatchedContext.setSeasonWatched(
+                        meta,
+                        season: selectedSeason,
+                        episodes: seasonEpisodes.map(\.episode),
+                        isWatched: !isSeasonWatched
+                    )
+                } else {
+                    WatchedStore.setSeasonWatched(
+                        meta: meta,
+                        season: selectedSeason,
+                        episodes: seasonEpisodes.map(\.episode),
+                        isWatched: !isSeasonWatched
+                    )
+                }
+            },
+            onMenuOpened: { onEpisodeMenuPresented(true) },
+            onMenuClosed: { onEpisodeMenuPresented(false) },
+            action: { onSelect(video) },
+            onPlayManually: onPlayManually != nil ? { onPlayManually?(video) } : nil,
+            // Only the focused card's menu can open, so only it looks for a saved link (a file read
+            // and a decode, which every card used to do on every move).
+            smartStreamSelection: smartStreamSelection || (reuseLastLink && itemIndex == episodeScrollIndex && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, meta: meta, profileId: ProfileSettings.activeProfileID) != nil),
+            onBack: onBack,
+            focus: cardFocus,
+            onMoveDown: onMoveDownFromEpisode,
+            onMoveUp: seasons.count <= 1 ? onMoveUpFromSeason : nil
+        )
+        .equatable()
+        // The entry lock stays outside the card: it switches every time focus comes into the
+        // strip or leaves it, and as part of the card it made every card of the strip rebuild
+        // on each of those moves. Out here only whether the card can take focus changes.
+        .disabled(isEpisodeCardBlocked(videoID))
+    }
+
+    /// Whether focus is kept off this card: while it is put back on another episode, or while
+    /// the strip is entered (focus goes to the remembered card).
+    private func isEpisodeCardBlocked(_ videoID: String) -> Bool {
+        guard let restriction = effectiveFocusRestriction else { return false }
+        return restriction != TvEpisodeFocus.card(videoID)
+    }
+
     @ViewBuilder
     private var seasonSelector: some View {
         if seasons.count > 1 {
@@ -8946,7 +9518,7 @@ private struct TvDetailsEpisodes: View {
                 .scrollClipDisabledIfAvailable()
                 // The pills are the strip's other focus target, and the one the
                 // engine picked when an episode's picker closed.
-                .disabled(effectiveFocusRestriction != nil)
+                .disabled(seasonPillsLocked)
                 .onAppear {
                     scrollProxy.scrollTo(selectedSeason, anchor: .center)
                 }
@@ -8973,8 +9545,21 @@ private struct TvDetailsEpisodes: View {
     private var effectiveFocusRestriction: String? {
         if let restrictFocusToKey { return restrictFocusToKey }
         guard entryLocked, !seasonEpisodes.isEmpty else { return nil }
-        let index = min(max(episodeScrollIndex, 0), seasonEpisodes.count - 1)
+        var index = min(max(episodeScrollIndex, 0), seasonEpisodes.count - 1)
+        // The system strip can leave the remembered episode off screen, and focus coming down
+        // could not find it: the lock goes to the nearest card on screen instead. (Not while
+        // it is still being scrolled there: the lock would pull every card in between in.)
+        if systemStripScrollTarget == nil, !isOnSystemStripScreen(index) {
+            let range = systemStripScreenRange
+            index = max(0, min(max(index, range.lowerBound), min(range.upperBound, seasonEpisodes.count - 1)))
+        }
         return TvEpisodeFocus.card(seasonEpisodes[index].id)
+    }
+
+    /// The season pills stay out of focus while the strip is entered (focus goes from Play
+    /// straight to an episode) or while focus is being put back on one.
+    private var seasonPillsLocked: Bool {
+        restrictFocusToKey != nil || (entryLocked && !seasonEpisodes.isEmpty)
     }
 
     /// A season counts as watched only when every episode in it is, which is
@@ -9058,6 +9643,25 @@ private enum TvEpisodeFocus {
     static func card(_ videoID: String) -> String { "episode-card\u{1}\(videoID)" }
 }
 
+extension TvEpisodeCard: Equatable {
+    /// What the card shows; the actions are left out (closures can't be compared). The strip's
+    /// actions read its state when they run, so a card kept from an earlier render still acts on
+    /// the current episode list.
+    static func == (lhs: TvEpisodeCard, rhs: TvEpisodeCard) -> Bool {
+        lhs.video == rhs.video
+            && lhs.fallbackArtworkURL == rhs.fallbackArtworkURL
+            && lhs.continueProgress == rhs.continueProgress
+            && lhs.isWatched == rhs.isWatched
+            && lhs.watchCount == rhs.watchCount
+            && lhs.isSeasonWatched == rhs.isSeasonWatched
+            && lhs.episodeRatings == rhs.episodeRatings
+            && lhs.smartStreamSelection == rhs.smartStreamSelection
+            && (lhs.onPlayManually == nil) == (rhs.onPlayManually == nil)
+            && (lhs.onBack == nil) == (rhs.onBack == nil)
+            && (lhs.onMoveUp == nil) == (rhs.onMoveUp == nil)
+    }
+}
+
 private enum TvEpisodeCardLayout {
     static let width: CGFloat = 660
     static let height: CGFloat = 430
@@ -9065,6 +9669,124 @@ private enum TvEpisodeCardLayout {
     static let verticalPadding: CGFloat = 28
     static let stripHeight: CGFloat = height + verticalPadding * 2
     static let step: CGFloat = width + spacing
+}
+
+/// An episode the system strip is to scroll to; `count` changes with every request, so one to
+/// the same episode again still scrolls.
+private struct TvEpisodeStripScrollRequest: Equatable {
+    var index = 0
+    var count = 0
+}
+
+/// Where the system strip last reported being, kept where Details can look at it without
+/// redrawing for it.
+private final class TvEpisodeStripScreenBox {
+    var cards: ClosedRange<Int>?
+}
+
+/// The episodes wholly on screen in the system strip, and the season they belong to.
+private struct TvEpisodeStripScreen: Equatable {
+    var cards: ClosedRange<Int>
+    var season: String
+
+    /// Episode i starts `edgeInset + i * step` into the strip; of those, the ones between the
+    /// screen's edges (give or take a little) at this scroll offset.
+    static func cards(offset: CGFloat, edgeInset: CGFloat, viewportWidth: CGFloat) -> ClosedRange<Int> {
+        let step = TvEpisodeCardLayout.step
+        let slack: CGFloat = 24
+        let first = max(0, Int(ceil((offset - edgeInset - slack) / step)))
+        let last = Int(floor((offset + viewportWidth + slack - edgeInset - TvEpisodeCardLayout.width) / step))
+        return first...max(first, last)
+    }
+}
+
+/// The episode strip's scroll view. It is scrolled to an episode
+/// by that episode's place, which never moves (episode i starts `i * step` in), rather than by
+/// finding its card: opened from Continue Watching or the calendar, scrolling to the card never
+/// took, and the strip stayed at its start. Where it is reads from where its content is, which
+/// also comes as it first appears (a scroll's report comes only when it has moved).
+private struct TvSystemEpisodeStripScroller<Content: View>: View {
+    let edgeInset: CGFloat
+    let viewportWidth: CGFloat
+    let season: String
+    let request: TvEpisodeStripScrollRequest
+    let onScreenChange: (TvEpisodeStripScreen) -> Void
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        let edgeInset = edgeInset
+        let viewportWidth = viewportWidth
+        let season = season
+        return ScrollView(.horizontal, showsIndicators: false) {
+            content
+                .onGeometryChange(for: TvEpisodeStripScreen.self) { proxy in
+                    TvEpisodeStripScreen(
+                        cards: TvEpisodeStripScreen.cards(
+                            offset: -proxy.frame(in: .named("tvEpisodeStrip")).minX,
+                            edgeInset: edgeInset,
+                            viewportWidth: viewportWidth
+                        ),
+                        season: season
+                    )
+                } action: { screen in
+                    onScreenChange(screen)
+                }
+                .background(alignment: .topLeading) {
+                    TvStripOffsetSetter(request: request)
+                        .frame(width: 1, height: 1)
+                }
+        }
+        .coordinateSpace(.named("tvEpisodeStrip"))
+        .scrollClipDisabledIfAvailable()
+    }
+}
+
+/// Puts the strip's scroll where a request asks, on the UIKit scroll view SwiftUI draws the
+/// strip in: once for each request, and nothing while focus moves along the strip. (A SwiftUI
+/// scroll position is state the strip is redrawn for as focus scrolls it; with one, moving along
+/// the episodes dropped 9-10% of frames, 6% before.)
+private struct TvStripOffsetSetter: UIViewRepresentable {
+    let request: TvEpisodeStripScrollRequest
+
+    final class Coordinator {
+        var appliedCount: Int?
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        // Count 0: nothing asked for yet (the strip starts at its start).
+        guard request.count > 0, context.coordinator.appliedCount != request.count else { return }
+        context.coordinator.appliedCount = request.count
+        let x = CGFloat(request.index) * TvEpisodeCardLayout.step
+        // Once this update is laid out, when the scroll view knows how wide its content is. If
+        // it doesn't yet, the strip's next check asks again.
+        DispatchQueue.main.async { [weak view] in
+            guard let scrollView = view?.nearestEnclosingScrollView else { return }
+            let maxX = max(0, scrollView.contentSize.width - scrollView.bounds.width)
+            let target = min(x, maxX)
+            guard abs(scrollView.contentOffset.x - target) > 0.5 else { return }
+            scrollView.setContentOffset(CGPoint(x: target, y: scrollView.contentOffset.y), animated: false)
+        }
+    }
+}
+
+private extension UIView {
+    var nearestEnclosingScrollView: UIScrollView? {
+        var current = superview
+        while let view = current {
+            if let scrollView = view as? UIScrollView { return scrollView }
+            current = view.superview
+        }
+        return nil
+    }
 }
 
 private struct TvSeasonPill: View {
@@ -9164,18 +9886,23 @@ private struct TvEpisodeCard: View {
     var smartStreamSelection: Bool = false
     var onBack: (() -> Void)? = nil
     var focus: FocusState<String?>.Binding
-    let restrictFocusToKey: String?
     let onMoveDown: () -> Void
     var onMoveUp: (() -> Void)? = nil
 
-    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
-    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
-    @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
-    @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
-    @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @Environment(\.cardAppearance) private var cardAppearance
+    private var cardCornerRadiusSetting: String { cardAppearance.cardCornerRadius }
+    /// Every card of a long season used to carry two live glass views, focused or not: its
+    /// background, hidden under the still, and its episode badge. Neither has one now.
+    private var liquidGlassCards: Bool { cardAppearance.liquidGlassCards }
+    private var blurUnwatchedEpisodes: Bool { cardAppearance.blurUnwatchedEpisodes }
+    private var hideUnwatchedEpisodeDescriptions: Bool { cardAppearance.hideUnwatchedEpisodeDescriptions }
+    private var hideUnwatchedEpisodeTitles: Bool { cardAppearance.hideUnwatchedEpisodeTitles }
 
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
-    private var isFocused: Bool { focus.wrappedValue == cardKey }
+    /// The card's own focus. It used to be read from the strip's shared focus binding, which made
+    /// every card of the strip redraw on every move; now only the two cards focus passes between
+    /// do. The shared binding still follows (and restores) focus, see `.focused(focus, …)`.
+    @FocusState private var isFocused: Bool
 
     private var isCurrentlyWatching: Bool {
         (continueProgress ?? 0) > 0
@@ -9233,9 +9960,11 @@ private struct TvEpisodeCard: View {
                         .padding(.vertical, 8)
                         .background {
                             if liquidGlassCards {
+                                // No live glass, and no thin gradient border either: inside the
+                                // card's scale effect, as the strip moved, both shimmered and
+                                // swam. A translucent fill, a little brighter on focus.
                                 Capsule()
-                                    .fill(Color.white.opacity(0.14))
-                                    .modifier(LiquidGlassBadgeModifier(cornerRadius: 16))
+                                    .fill(Color.white.opacity(isFocused ? 0.22 : 0.14))
                             } else {
                                 Capsule()
                                     .fill(Color.black.opacity(0.52))
@@ -9303,31 +10032,21 @@ private struct TvEpisodeCard: View {
                     continueProgressOverlay
                 }
                 .frame(width: cardWidth, height: cardHeight)
+                // No live glass behind the card: the still covers it.
                 .background {
-                    if liquidGlassCards {
-                        #if os(tvOS)
-                        if #available(tvOS 26.0, *) {
-                            shape
-                                .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                                .glassEffect(.regular, in: shape)
-                        } else {
-                            shape
-                                .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                        }
-                        #else
-                        shape.fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                        #endif
-                    } else {
-                        shape
-                            .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                    }
+                    shape
+                        .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
                 }
                 .clipShape(shape)
+                // Without glass's thin gradient border on the focused card (`isEnabled: false`):
+                // drawn beside the focus outline, it swam as the card grew and the strip moved.
+                // Only the AMOLED surfaces style applies.
                 .modifier(
                     LiquidGlassCardModifier(
                         cornerRadius: episodeCornerRadius,
                         isFocused: isFocused,
-                        isEnabled: liquidGlassCards
+                        isEnabled: false,
+                        coveredByArtwork: true
                     )
                 )
                 .overlay(alignment: .topTrailing) {
@@ -9341,16 +10060,17 @@ private struct TvEpisodeCard: View {
                         lineWidth: isFocused ? AppFocusOutline.width : 0
                     )
                 )
+                // Only the focused card casts a shadow (see PosterCard).
                 .shadow(
-                    color: Color.black.opacity(isFocused ? 0.45 : 0.22),
-                    radius: isFocused ? 20 : 10,
-                    y: isFocused ? 14 : 6
+                    color: Color.black.opacity(isFocused ? 0.45 : 0),
+                    radius: isFocused ? 20 : 0,
+                    y: isFocused ? 14 : 0
                 )
             }
             .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
             .focused(focus, equals: cardKey)
             .focusEffectDisabledIfAvailable()
-            .disabled(restrictFocusToKey != nil && restrictFocusToKey != cardKey)
             .scaleEffect(isFocused ? 1.05 : 1)
             .animation(.easeOut(duration: 0.14), value: isFocused)
             .onChange(of: isFocused) { _, focused in

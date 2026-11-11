@@ -42,6 +42,8 @@ struct DiscoverSection: View {
     @State private var overlayRestoreGeneration = 0
     @State private var scrollToTopGeneration = 0
     @State private var filterResultHandoffGeneration = 0
+    /// The items without unreleased titles, worked out once per list.
+    @State private var itemsMemo = ReleasedTitlesMemo()
     @Environment(\.isEnabled) private var isEnabled
     @Binding private var parentTransitionActive: Bool
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
@@ -270,8 +272,8 @@ struct DiscoverSection: View {
     // MARK: - Content
 
     private var visibleItems: [NuvioMeta] {
-        guard hideUnreleased else { return viewModel.items }
-        return viewModel.items.filter { !ContentReleasePolicy.isUnreleased($0) }
+        itemsMemo.update(viewModel.items, revision: viewModel.itemsRevision, hideUnreleased: hideUnreleased)
+        return itemsMemo.titles
     }
 
     @ViewBuilder
@@ -329,6 +331,17 @@ struct DiscoverSection: View {
                             lastFocusedCardID = item.id
                             onContentClick(item.id, item.type)
                         }
+                        // Kept as it was while it shows the same: every move in the grid redraws
+                        // Discover, which rebuilt every card on screen. The lock for putting
+                        // focus back stays outside it.
+                        .cardSnapshot(GridCardSnapshotKey(
+                            meta: item,
+                            index: index,
+                            columns: columnCount ?? 0,
+                            mode: isBesideKeyboard ? 1 : 0,
+                            retainsFocusAppearance: overlayRestoreCardID == item.id,
+                            width: posterWidth
+                        ))
                         .disabled(overlayRestoreCardID != nil && overlayRestoreCardID != item.id)
                         .onAppear { viewModel.loadMoreIfNeeded(currentItem: item) }
                     }
@@ -546,7 +559,8 @@ private struct DiscoverCard: View {
                     LiquidGlassCardModifier(
                         cornerRadius: cardCornerRadius,
                         isFocused: showsFocusedAppearance,
-                        isEnabled: liquidGlassCards
+                        isEnabled: liquidGlassCards,
+                        coveredByArtwork: true
                     )
                 )
                 .overlay(alignment: .topTrailing) {

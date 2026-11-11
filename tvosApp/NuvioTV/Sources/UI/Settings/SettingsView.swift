@@ -13383,6 +13383,7 @@ private struct AdvancedSettingsView: View {
     @State private var isClearingCache = false
     @State private var clearedCacheStatus: String?
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @State private var continueWatchingRowDiagnostic: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -13487,9 +13488,14 @@ private struct AdvancedSettingsView: View {
                 // each stage between the ledger and the screen.
                 SettingsInfoRow(
                     title: L10n.string("tvos_settings_continue_watching_row", fallback: "Continue Watching Row"),
-                    value: ContinueWatchingStore.rowDiagnostic(),
+                    value: continueWatchingRowDiagnostic ?? "…",
                     isDiagnostic: true
                 )
+                .task {
+                    // Read once as the row appears, away from the main thread: read in the
+                    // body, every Continue Watching entry was decoded on each redraw.
+                    continueWatchingRowDiagnostic = await ContinueWatchingStore.rowDiagnosticInBackground()
+                }
 
                 // Scrobbles fail silently by design (the caller ignores the
                 // result), so this is the only place a rejected one is visible.
