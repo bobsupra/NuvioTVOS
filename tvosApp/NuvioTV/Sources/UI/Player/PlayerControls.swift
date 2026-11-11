@@ -93,6 +93,20 @@ struct PlayerControls: View {
                 .transition(.opacity)
             }
         }
+        .overlay(alignment: .topTrailing) {
+            if !viewModel.isLiveStream && !isNamingSubtitlePreset {
+                PlayerEstimatedFinishTime(
+                    clock: viewModel.clock,
+                    playbackSpeed: Double(viewModel.playbackSpeed.rawValue),
+                    status: viewModel.status,
+                    isScrubbing: viewModel.isScrubbing,
+                    pendingSeekDelta: viewModel.pendingSeekDelta
+                )
+                .padding(.top, 50)
+                .padding(.horizontal, 60)
+                .allowsHitTesting(false)
+            }
+        }
         .onExitCommand(perform: handleExit)
         .onChange(of: requestedFocus) { _, target in
             guard let target,
@@ -560,15 +574,6 @@ struct PlayerControls: View {
                     transportRow
                 }
                     .transition(.opacity)
-            }
-            if !viewModel.isLiveStream {
-                PlayerEstimatedFinishTime(
-                    clock: viewModel.clock,
-                    playbackSpeed: Double(viewModel.playbackSpeed.rawValue),
-                    status: viewModel.status,
-                    isScrubbing: viewModel.isScrubbing,
-                    pendingSeekDelta: viewModel.pendingSeekDelta
-                )
             }
             timelineBar
         }
@@ -1537,6 +1542,7 @@ private struct PlayerEstimatedFinishTime: View {
                     Text(label)
                         .font(.system(size: 19, weight: .medium))
                         .foregroundColor(.white.opacity(0.76))
+                        .shadow(color: .black.opacity(0.9), radius: 4)
                         .frame(maxWidth: .infinity, alignment: .trailing)
                         .accessibilityLabel(label)
                 }
