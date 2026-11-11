@@ -49,6 +49,7 @@ struct PlayerControls: View {
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
+    @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
 
     var body: some View {
         ZStack {
@@ -94,7 +95,7 @@ struct PlayerControls: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            if !viewModel.isLiveStream && !isNamingSubtitlePreset {
+            if playerShowFinishTime && !viewModel.isLiveStream && !isNamingSubtitlePreset {
                 PlayerEstimatedFinishTime(
                     clock: viewModel.clock,
                     playbackSpeed: Double(viewModel.playbackSpeed.rawValue),

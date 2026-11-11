@@ -375,6 +375,7 @@ enum SettingsKey {
     static let playerShowSubtitles = "nuvio.tv.settings.playback.showSubtitles"
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
     static let playerShowSpeed = "nuvio.tv.settings.playback.showSpeed"
+    static let playerShowFinishTime = "nuvio.tv.settings.playback.showFinishTime"
     /// JSON `[String]` of player transport button ids in preferred order.
     static let playerButtonOrder = "nuvio.tv.settings.playback.playerButtonOrder"
     /// JSON `[String]` of InSight tab ids in preferred order.
@@ -475,7 +476,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerShowFinishTime, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
         subtitleAutoSync, subtitleAutoSyncToleranceMs,
         audioDelayPersistEnabled, persistentAudioDelayMs,
@@ -11057,6 +11058,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
+    @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
     @AppStorage(SettingsKey.sceneFeatureEnabled) private var sceneFeatureEnabled = true
 
     @State private var streamBadgeURL = ""
@@ -11493,6 +11495,12 @@ private struct PlaybackSettingsView: View {
                     fallback: "Automatic playback and segment controls"
                 )
             ) {
+                SettingsToggleRow(
+                    title: L10n.string("player_show_finish_time", fallback: "Show estimated finish time"),
+                    subtitle: L10n.string("player_show_finish_time_subtitle", fallback: "Show when the current video is expected to finish in the player controls."),
+                    isOn: $playerShowFinishTime,
+                    accentColor: accentColor
+                )
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
                     subtitle: L10n.string(
