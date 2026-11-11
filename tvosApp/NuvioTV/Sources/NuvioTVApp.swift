@@ -5354,6 +5354,11 @@ private struct TVTopBarScrollLink: UIViewRepresentable {
             scheduleUpdate()
         }
 
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            scheduleUpdate()
+        }
+
         func setEnabled(_ value: Bool) {
             enabled = value
             if !value { unlink() }
@@ -5368,11 +5373,11 @@ private struct TVTopBarScrollLink: UIViewRepresentable {
             guard enabled, window != nil else { unlink(); return }
             var ancestor = superview
             while ancestor != nil && !(ancestor is UIScrollView) { ancestor = ancestor?.superview }
-            guard let scroll = ancestor as? UIScrollView else { return }
+            guard let scroll = ancestor as? UIScrollView else { unlink(); return }
             var responder: UIResponder? = self
             while let current = responder, !(current is UIViewController) { responder = current.next }
             guard let controller = responder as? UIViewController,
-                  !(controller is UINavigationController), !(controller is UITabBarController) else { return }
+                  !(controller is UINavigationController), !(controller is UITabBarController) else { unlink(); return }
             if linkedController === controller && linkedScroll === scroll { return }
             unlink()
             controller.setContentScrollView(scroll, for: .top)
