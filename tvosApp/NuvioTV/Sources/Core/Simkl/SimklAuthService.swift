@@ -631,6 +631,39 @@ enum SimklPollResult {
 
 // MARK: - Auth service
 
+/// One Simkl token refresh per client and profile at a time. Simkl rotates refresh tokens and
+/// answers a reused one with 400 `invalid_grant`, which clears the session; without this, two
+/// refreshes started together (Home rows, settings, sync) could have the second one's rejection
+/// sign out the account the first one had just renewed.
+private actor SimklRefreshCoordinator {
+    static let shared = SimklRefreshCoordinator()
+
+    private struct Entry {
+        let generation: Int
+        let task: Task<Bool, Never>
+    }
+
+    private var nextGeneration = 0
+    private var entries: [String: Entry] = [:]
+
+    /// `joined` is true when the caller waited for a refresh another caller started.
+    func refresh(key: String, operation: @escaping () async -> Bool) async -> (succeeded: Bool, joined: Bool) {
+        if let existing = entries[key] {
+            return (await existing.task.value, true)
+        }
+        nextGeneration &+= 1
+        let generation = nextGeneration
+        let task = Task { await operation() }
+        entries[key] = Entry(generation: generation, task: task)
+
+        let result = await task.value
+        if entries[key]?.generation == generation {
+            entries.removeValue(forKey: key)
+        }
+        return (result, false)
+    }
+}
+
 final class SimklAuthService {
     private let client: SimklAPIClient
     private let store: UserDefaults
@@ -968,8 +1001,29 @@ final class SimklAuthService {
     /// AUTH V1 legacy tokens (which have no refresh grant) return `true` immediately.
     func refreshTokenIfNeeded(
         force: Bool = false,
-        shouldCommit: () -> Bool = { true },
-        didRefreshToken: (String) -> Void = { _ in }
+        shouldCommit: @escaping () -> Bool = { true },
+        didRefreshToken: @escaping (String) -> Void = { _ in }
+    ) async -> Bool {
+        let outcome = await SimklRefreshCoordinator.shared.refresh(key: "\(clientID):\(profileScope)") { [weak self] in
+            guard let self else { return false }
+            return await self.refreshTokenIfNeededUncoordinated(
+                force: force,
+                shouldCommit: shouldCommit,
+                didRefreshToken: didRefreshToken
+            )
+        }
+        // Another caller's refresh saved the new token: hand it on as if this caller had refreshed.
+        if outcome.joined, outcome.succeeded, shouldCommit(),
+           let token = currentState().accessToken, !token.isEmpty {
+            didRefreshToken(token)
+        }
+        return outcome.succeeded
+    }
+
+    private func refreshTokenIfNeededUncoordinated(
+        force: Bool,
+        shouldCommit: () -> Bool,
+        didRefreshToken: (String) -> Void
     ) async -> Bool {
         guard shouldCommit(), ProfileSettings.isActiveStore(store), hasRequiredCredentials() else { return false }
         let state = currentState()

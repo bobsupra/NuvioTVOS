@@ -2676,6 +2676,49 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertEqual(tokenStorage.refreshToken(for: "profile-1"), "simkl_rt_refreshed_888")
     }
 
+    func testConcurrentRefreshesShareOneTokenRequestAndKeepTheSession() async throws {
+        SimklAuthStore.saveToken(
+            "simkl_at_old",
+            refreshToken: "simkl_rt_old",
+            expiresIn: 3600,
+            clientID: "client-id",
+            profileScope: "profile-1",
+            store: defaults,
+            tokenStorage: tokenStorage
+        )
+        let lock = NSLock()
+        var tokenRequests = 0
+        SimklURLProtocolStub.handler = { request in
+            let count: Int = lock.withLock {
+                tokenRequests += 1
+                return tokenRequests
+            }
+            // Simkl rotates refresh tokens: a second use of the old one is invalid_grant.
+            guard count == 1 else {
+                return Self.response(for: request, status: 400, json: #"{"error":"invalid_grant"}"#)
+            }
+            Thread.sleep(forTimeInterval: 0.2)
+            return Self.response(
+                for: request,
+                json: #"{"access_token":"simkl_at_new","token_type":"Bearer","expires_in":604800,"refresh_token":"simkl_rt_new"}"#
+            )
+        }
+
+        var handedOn: [String] = []
+        async let first = makeService().refreshTokenIfNeeded(force: true)
+        async let second = makeService().refreshTokenIfNeeded(
+            force: true,
+            didRefreshToken: { token in lock.withLock { handedOn.append(token) } }
+        )
+        let results = await [first, second]
+
+        XCTAssertEqual(results, [true, true])
+        XCTAssertEqual(lock.withLock { tokenRequests }, 1, "parallel refreshes must share one token request")
+        XCTAssertEqual(tokenStorage.accessToken(for: "profile-1"), "simkl_at_new")
+        XCTAssertEqual(tokenStorage.refreshToken(for: "profile-1"), "simkl_rt_new")
+        XCTAssertEqual(lock.withLock { handedOn }, ["simkl_at_new"])
+    }
+
     func testLogoutV2RevokesToken() async throws {
         SimklAuthStore.saveToken(
             "simkl_at_v2_to_revoke",
