@@ -195,6 +195,8 @@ enum AniListAccount {
     static func logIn(pasted: String, now: Date = Date()) async throws -> Login {
         let token = token(fromPasted: pasted)
         guard !token.isEmpty else { throw AccountError.emptyToken }
+        // The profile that started the login, not whichever is active once AniList answers.
+        let profileScope = ProfileSettings.activeProfileScope
         let (facts, problem) = inspect(token, now: now)
         if let problem {
             AniListDiagnostics.note(.account, "Log in stopped: \(problem.message) · \(facts.summary)")
@@ -213,7 +215,7 @@ enum AniListAccount {
             throw AccountError.notAccepted("no account in its answer")
         }
         let login = Login(token: token, viewerID: viewer.id, viewerName: viewer.name, avatar: viewer.avatar?.large, savedAt: Date())
-        storage.save(login, for: ProfileSettings.activeProfileScope)
+        storage.save(login, for: profileScope)
         clearStates()
         AniListDiagnostics.note(.account, "Logged in as \(viewer.name)")
         changed(homeToo: true)
