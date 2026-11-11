@@ -9,6 +9,7 @@ final class SignOutIntegrationLoginTests: XCTestCase {
     private var previousSettingsProfileID: String?
     private var previousSettingsProfileIsPrimary = false
     private var previousAniListStorage: AniListTokenStorage!
+    private var previousMALStorage: MALLoginStorage!
 
     override func setUp() {
         super.setUp()
@@ -16,6 +17,9 @@ final class SignOutIntegrationLoginTests: XCTestCase {
         previousSettingsProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
         previousAniListStorage = AniListAccount.storage
         AniListAccount.storage = AniListMemoryTokenStorage()
+        // The simulator test host has no usable Keychain for these logins.
+        previousMALStorage = MALKeychain.storage
+        MALKeychain.storage = MALMemoryLoginStorage()
         profileID = "signout-logins-\(UUID().uuidString)"
     }
 
@@ -23,6 +27,7 @@ final class SignOutIntegrationLoginTests: XCTestCase {
         TraktKeychainStorage.shared.removeSession(for: profileID)
         MALKeychain.remove(for: profileID)
         AniListAccount.storage = previousAniListStorage
+        MALKeychain.storage = previousMALStorage
         if let previousSettingsProfileID {
             ProfileSettings.setActiveProfile(
                 previousSettingsProfileID,
@@ -68,10 +73,12 @@ final class SignOutIntegrationLoginTests: XCTestCase {
             clientID: "client"
         )
         MALKeychain.save(login, for: profileID)
+        MALKeychain.save(login, for: "default")
         XCTAssertNotNil(MALKeychain.login(for: profileID))
 
         ProfileSettings.eraseAll(profileIds: [profileID])
 
         XCTAssertNil(MALKeychain.login(for: profileID))
+        XCTAssertNil(MALKeychain.login(for: "default"))
     }
 }
