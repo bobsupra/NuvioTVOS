@@ -281,6 +281,7 @@ public enum PlaybackOrigin {
     case main
     case details
     case cloudLibrary
+    case liveTV
 }
 
 private enum DetailsReturnDestination {
@@ -289,13 +290,14 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, party, search, library, calendar, settings
+    case profile, home, party, search, library, calendar, settings, liveTV
     case collection(CollectionHomeID)
 
     static var allCases: [Self] {
         var tabs: [Self] = [.profile, .home]
         if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
+        if ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
         if isCalendarEnabled { tabs.append(.calendar) }
         tabs.append(.settings)
         return tabs
@@ -321,6 +323,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .calendar: return "Calendar"
         case .settings: return "Settings"
         case .party: return "Watch Party"
+        case .liveTV: return "Live TV"
         case .collection(let id): return "Collection:\(id.key)"
         }
     }
@@ -333,6 +336,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
         case .party: return L10n.string("nav_watch_party", fallback: "Watch Party")
+        case .liveTV: return L10n.string("nav_live_tv", fallback: "Live TV")
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
         }
     }
@@ -345,6 +349,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .calendar: return "calendar"
         case .settings: return "gearshape"
         case .party: return "person.2.fill"
+        case .liveTV: return "tv"
         case .collection: return "rectangle.stack.fill"
         }
     }
@@ -3186,6 +3191,12 @@ struct ContentView: View {
                     filename: meta.name
                 )
             },
+            onPlayLiveChannel: { url, meta, headers in
+                playbackEpisodes = []
+                playbackCurrentEpisode = nil
+                presentPlayback(url: url, meta: meta, subtitle: "", externalSubtitles: [],
+                                resumeFrom: nil, httpHeaders: headers, origin: .liveTV, filename: meta.name)
+            },
             onOpenCalendarEntry: { entry in
                 openCalendarEntry(entry)
             }
@@ -4078,6 +4089,8 @@ struct ContentView: View {
                     dismissalTarget = .details(id: meta.id, type: meta.type)
                 case .cloudLibrary:
                     dismissalTarget = .cloudLibrary
+                case .liveTV:
+                    dismissalTarget = .main
                 case .main:
                     dismissalTarget = (isTrailer || isActionPlaybackSession || meta.isSeries)
                         ? .details(id: meta.id, type: meta.type)
@@ -4114,6 +4127,10 @@ struct ContentView: View {
             case .cloudLibrary:
                 detailsLibraryWatchedContext = nil
                 activeScreen = .cloudLibrary
+            case .liveTV:
+                detailsLibraryWatchedContext = nil
+                selectedTab = ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) ? .liveTV : .home
+                activeScreen = .main
             case .main:
                 detailsLibraryWatchedContext = nil
                 activeScreen = (isTrailer || isActionPlaybackSession || meta.isSeries)
@@ -4549,6 +4566,7 @@ private struct TVMainTabView: View {
     let onLongPressContinueWatching: (ContinueWatchingItem) -> Void
     let onOpenCloudLibrary: () -> Void
     let onPlayCloudFile: (URL, NuvioMeta) -> Void
+    let onPlayLiveChannel: (URL, NuvioMeta, [String: String]) -> Void
     var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -4556,6 +4574,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
@@ -4592,6 +4611,9 @@ private struct TVMainTabView: View {
         }
         .onChange(of: showWatchPartyTab) { _, isShown in
             if !isShown, selectedTab == .party { selectedTab = .home }
+        }
+        .onChange(of: nativeIPTVEnabled) { _, enabled in
+            if !enabled, selectedTab == .liveTV { selectedTab = .home }
         }
     }
 
@@ -4739,6 +4761,11 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    private var liveTVTabContent: some View {
+        IPTVLiveView(profileID: activeProfile?.id ?? "", onPlay: onPlayLiveChannel)
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var settingsTabContent: some View {
         SettingsView(
             selectedCategory: $selectedSettingsCategory,
@@ -4816,6 +4843,11 @@ private struct TVMainTabView: View {
             libraryTabContent
                 .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
                 .tag(TVTab.library)
+            if nativeIPTVEnabled {
+                liveTVTabContent
+                    .tabItem { Label(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol) }
+                    .tag(TVTab.liveTV)
+            }
             if showCalendarTab {
                 calendarTabContent
                     .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
@@ -4871,6 +4903,11 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.library.title, systemImage: TVTab.library.symbol, value: TVTab.library) {
                 libraryTabContent
+            }
+            if nativeIPTVEnabled {
+                Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
+                    liveTVTabContent
+                }
             }
             if showCalendarTab {
                 Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {

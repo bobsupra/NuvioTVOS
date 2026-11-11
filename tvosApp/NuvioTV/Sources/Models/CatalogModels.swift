@@ -12433,6 +12433,8 @@ enum ProfileSettings {
     static func eraseAll(profileIds: [String]) {
         current = .standard
         activeProfileID = nil
+        do { try IPTVKeychainStorage.removeAll() }
+        catch { print("Failed to clear IPTV sources from Keychain") }
         let simklTokenStorage = SimklKeychainTokenStorage()
         let mdbListTokenStorage = MdbListKeychainTokenStorage()
         for id in Set(profileIds) where !id.isEmpty {
