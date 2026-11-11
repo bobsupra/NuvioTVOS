@@ -606,6 +606,25 @@ final class MPVStreamSession: NSObject, URLSessionDataDelegate, @unchecked Senda
 
     // MARK: - URLSessionDataDelegate
 
+    /// The add-on's headers (tokens, cookies, Authorization) go only to the source's own origin,
+    /// the same policy the Aether cache applies: a redirect to another host (a CDN) gets the
+    /// request without them, and keeps the byte range asked for.
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(PlaybackStreamCacheRedirectPolicy.redirectedRequest(
+            request,
+            response: response,
+            originalURL: url,
+            range: task.originalRequest?.value(forHTTPHeaderField: "Range"),
+            customHeaders: headers
+        ))
+    }
+
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse, completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
         condition.lock()
         defer {
