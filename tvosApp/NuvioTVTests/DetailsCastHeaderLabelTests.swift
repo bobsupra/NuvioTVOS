@@ -5,6 +5,8 @@ final class DetailsCastHeaderLabelTests: XCTestCase {
     func testMovieAndSeriesUseTheirRespectiveLabels() {
         XCTAssertEqual(DetailsCastHeaderLabel.localizationKey(for: " Movie "), "details_director_and_cast")
         XCTAssertEqual(DetailsCastHeaderLabel.localizationKey(for: "FILM"), "details_director_and_cast")
+        XCTAssertEqual(DetailsCastHeaderLabel.localizationKey(for: "movies"), "details_director_and_cast")
+        XCTAssertEqual(DetailsCastHeaderLabel.localizationKey(for: "Films"), "details_director_and_cast")
         XCTAssertEqual(DetailsCastHeaderLabel.localizationKey(for: "series"), "details_creator_and_cast")
         XCTAssertEqual(DetailsCastHeaderLabel.localizationKey(for: "tv_show"), "details_creator_and_cast")
     }

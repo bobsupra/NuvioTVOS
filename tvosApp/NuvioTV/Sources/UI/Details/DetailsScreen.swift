@@ -6583,7 +6583,7 @@ private struct TvDetailsRatingsRow: View {
 enum DetailsCastHeaderLabel {
     static func localizationKey(for type: String) -> String {
         let normalized = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        if normalized == "movie" || normalized == "film" { return "details_director_and_cast" }
+        if ["movie", "movies", "film", "films"].contains(normalized) { return "details_director_and_cast" }
         if NuvioMeta.isSeriesType(normalized) { return "details_creator_and_cast" }
         return "details_cast_and_crew"
     }
