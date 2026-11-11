@@ -484,7 +484,7 @@ struct DetailsNavigationContextTransition {
     ) -> LibraryWatchedContext? {
         switch origin {
         case .details: return currentLibraryWatchedContext
-        case .main, .cloudLibrary: return nil
+        case .main, .cloudLibrary, .liveTV: return nil
         }
     }
 }
