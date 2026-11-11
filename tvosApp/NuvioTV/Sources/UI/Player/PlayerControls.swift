@@ -99,6 +99,7 @@ struct PlayerControls: View {
                     clock: viewModel.clock,
                     playbackSpeed: Double(viewModel.playbackSpeed.rawValue),
                     status: viewModel.status,
+                    isMovie: viewModel.activeMeta?.type.lowercased() == "movie",
                     isScrubbing: viewModel.isScrubbing,
                     pendingSeekDelta: viewModel.pendingSeekDelta
                 )
@@ -1527,6 +1528,7 @@ private struct PlayerEstimatedFinishTime: View {
     @ObservedObject var clock: PlaybackClock
     let playbackSpeed: Double
     let status: PlayerStatus
+    let isMovie: Bool
     let isScrubbing: Bool
     let pendingSeekDelta: Double
 
@@ -1536,9 +1538,15 @@ private struct PlayerEstimatedFinishTime: View {
                 let position = isScrubbing ? (clock.scrubTarget ?? clock.position) : clock.position + pendingSeekDelta
                 if let end = PlayerFinishEstimate.date(now: context.date, position: position, duration: clock.duration, speed: playbackSpeed) {
                     let time = end.formatted(date: .omitted, time: .shortened)
-                    let label = status == .paused
-                        ? L10n.format("player_ends_if_resumed", fallback: "If resumed now, ends at %@", time)
-                        : L10n.format("player_ends_at", fallback: "Ends at %@", time)
+                    let label: String = {
+                        if status == .paused {
+                            return L10n.format("player_ends_if_resumed", fallback: "If resumed now, ends at %@", time)
+                        }
+                        if isMovie {
+                            return L10n.format("player_movie_ends_at", fallback: "The movie will end at %@", time)
+                        }
+                        return L10n.format("player_ends_at", fallback: "Ends at %@", time)
+                    }()
                     Text(label)
                         .font(.system(size: 19, weight: .medium))
                         .foregroundColor(.white.opacity(0.76))
