@@ -3939,7 +3939,7 @@ enum StreamPickerListBuilder {
             selectedAddonId: selectedAddonId,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
-            preserveAddonStreams: preserveAddonStreams,
+            preserveAddonStreams: preserveAddonStreams || sortOption == .recommended,
             includeUnknownCacheStatus: includeUnknownCacheStatus
         )
         return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
@@ -4014,7 +4014,7 @@ enum StreamPickerListBuilder {
             let resolutionValue = needsResolution ? resolution(for: stream) : 0
             let tags = option == .recommended ? StreamQualityTags.parse(stream: stream) : StreamQualityTags()
             let hasKnownCodec = tags.isAV1 || tags.isHEVC || tags.isAVC
-            let isBad = (!preserveAddonStreams || option == .default)
+            let isBad = (!preserveAddonStreams || option == .default || option == .recommended)
                 && (SmartPlaybackSelector.isLowQualityOrTicketStream(stream) || resolutionValue == 0)
             return (
                 offset: entry.offset,
@@ -4150,6 +4150,19 @@ enum StreamPickerListBuilder {
         if matches(#"\bac[ ._-]?3\b|\bdts\b|\baac\b|\bdolby[ ._-]+digital\b"#) { return 2 }
         if matches(#"\bstereo\b|\b2[.]0\b"#) { return 1 }
         return 0
+    }
+
+    /// One candidate per known resolution, in descending resolution order.
+    /// Input is already ranked and filtered for the current source scope.
+    static func recommendedByResolution(from streams: [NuvioStream]) -> [(resolution: Int, stream: NuvioStream)] {
+        var seen = Set<Int>()
+        var picks: [(resolution: Int, stream: NuvioStream)] = []
+        for stream in streams where !stream.isNotPlayable && stream.unavailabilityReason == nil {
+            let value = resolution(for: stream)
+            guard value > 0, seen.insert(value).inserted else { continue }
+            picks.append((value, stream))
+        }
+        return picks.sorted { $0.resolution > $1.resolution }
     }
 
     /// Best-effort resolution parsed from a stream's release metadata (2160/1440/1080/720/576/480/360),
@@ -10322,9 +10335,13 @@ private struct TvStreamPickerOverlay: View {
         let totalCount = activeDisplayedStreams.count
         let badgeSettings = streamBadgeSettings
         let hasMore = totalCount > streamsToShow.count
-        let recommendedID = pickerSortOption == .recommended
-            ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })?.id
+        let picks = pickerSortOption == .recommended
+            ? StreamPickerListBuilder.recommendedByResolution(from: activeDisplayedStreams)
+            : []
+        let recommendedStream = pickerSortOption == .recommended
+            ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })
             : nil
+        let recommendedID = recommendedStream?.id
         return ZStack {
             if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
@@ -10368,6 +10385,46 @@ private struct TvStreamPickerOverlay: View {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVStack(spacing: style.metrics.cardSpacing) {
+                            if let recommendedStream {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(isLoading || selectedGroupIsLoading
+                                         ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
+                                         : L10n.string("stream_best_overall", fallback: "Best overall"))
+                                        .font(.system(size: 20, weight: .semibold))
+                                        .foregroundColor(.white.opacity(0.8))
+                                    Text(selectedAddonId == nil
+                                         ? L10n.string("stream_recommendation_all_addons", fallback: "Among available results from all add-ons")
+                                         : L10n.string("stream_recommendation_selected_addon", fallback: "Among results from the selected add-on"))
+                                        .font(.system(size: 16))
+                                        .foregroundColor(.white.opacity(0.65))
+                                    TvStreamFilterButton(
+                                        title: L10n.string("stream_play_best_overall", fallback: "Play best overall"),
+                                        isSelected: false,
+                                        focusBinding: $focusedItem,
+                                        focusValue: "recommended::overall",
+                                        action: { select(recommendedStream, player: nil) }
+                                    )
+                                    ScrollView(.horizontal, showsIndicators: false) {
+                                        HStack(spacing: 12) {
+                                            ForEach(picks.map { $0.resolution }, id: \.self) { resolution in
+                                                if let pick = picks.first(where: { $0.resolution == resolution }) {
+                                                    let resolutionLabel = resolution == 2160 ? "4K" : "\(resolution)p"
+                                                    TvStreamFilterButton(
+                                                        title: L10n.format("stream_best_resolution", fallback: "Best %@", resolutionLabel),
+                                                        isSelected: false,
+                                                        focusBinding: $focusedItem,
+                                                        focusValue: "recommended::\(resolution)",
+                                                        action: { select(pick.stream, player: nil) }
+                                                    )
+                                                }
+                                            }
+                                        }
+                                        .padding(.vertical, 12)
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .focusSection()
+                            }
                             ForEach(streamsToShow) { stream in
                                 if stream.id == recommendedID {
                                     VStack(alignment: .leading, spacing: 4) {

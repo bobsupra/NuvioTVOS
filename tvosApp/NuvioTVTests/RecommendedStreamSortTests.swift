@@ -27,4 +27,17 @@ final class RecommendedStreamSortTests: XCTestCase {
                              StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p AAC")))
         XCTAssertEqual(StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p")), 0)
     }
+
+    func testBestPerResolutionKeepsLowerResolutionsAvailable() {
+        let high = NuvioStream(url: "https://example.test/4k", name: "2160p", description: nil, addonName: "A")
+        let standard = NuvioStream(url: "https://example.test/1080", name: "1080p", description: nil, addonName: "B")
+        let low = NuvioStream(url: "https://example.test/480", name: "480p", description: nil, addonName: "B")
+        let sorted = StreamPickerListBuilder.displayedStreams(
+            streams: [low, standard, high], groups: [], selectedAddonId: nil,
+            sortOption: .recommended, includeDebrid: false
+        )
+        let picks = StreamPickerListBuilder.recommendedByResolution(from: sorted)
+        XCTAssertEqual(picks.map { $0.resolution }, [2160, 1080, 480])
+        XCTAssertEqual(picks.map { $0.stream.id }, [high.id, standard.id, low.id])
+    }
 }
