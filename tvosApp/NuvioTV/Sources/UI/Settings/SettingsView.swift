@@ -11077,7 +11077,7 @@ private struct PlaybackSettingsView: View {
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max", "Ultra"]
     private let assModes = ["Off", "Strip", "Scale", "Force"]
     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
-    private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
+    private let streamSortModes = StreamSortOption.allCases.filter { $0 != .recommended }.map(\.rawValue)
     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
 
     private enum SeekrKeyCheck {

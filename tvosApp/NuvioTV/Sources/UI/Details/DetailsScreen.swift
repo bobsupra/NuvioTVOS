@@ -3833,6 +3833,8 @@ enum StreamSortOption: String, CaseIterable, Identifiable, Sendable {
     case quality = "Quality"
     case size = "Size"
     case name = "Name"
+    /// Used only by the local picker; not persisted as a shared sync sort mode.
+    case recommended = "Nuvio Recommended"
 
     var id: String { rawValue }
 
@@ -4003,7 +4005,7 @@ enum StreamPickerListBuilder {
     ) -> [NuvioStream] {
         // Parse sort facts once per stream, not on every O(n log n) comparison.
         // Keep mode-specific work out of modes that do not use it.
-        let needsResolution = !preserveAddonStreams || option == .quality || option == .default
+        let needsResolution = !preserveAddonStreams || option == .quality || option == .default || option == .recommended
         let needsHardwareCheck = option == .quality && !AppleTVCapability.current.supportsAV1HardwareDecode
         let entries = streams.enumerated().map { entry in
             let stream = entry.element
@@ -4016,13 +4018,31 @@ enum StreamPickerListBuilder {
                 resolution: resolutionValue,
                 isBad: isBad,
                 quality: option == .quality ? streamQuality(for: stream) : DebridStreamQuality.unknown,
-                size: option == .quality || option == .size ? sizeBytes(for: stream) : 0,
+                size: option == .quality || option == .size || option == .recommended ? sizeBytes(for: stream) : 0,
+                recommendedTags: option == .recommended ? StreamQualityTags.parse(stream: stream) : StreamQualityTags(),
+                recommendedCached: option == .recommended && stream.isLikelyCached,
                 hardwareAccelerated: needsHardwareCheck && resolutionValue >= 2160
                     ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
             )
         }
 
         switch option {
+        case .recommended:
+            return entries.sorted {
+                let available0 = $0.element.unavailabilityReason == nil
+                let available1 = $1.element.unavailabilityReason == nil
+                if available0 != available1 { return available0 && !available1 }
+                if $0.isBad != $1.isBad { return !$0.isBad && $1.isBad }
+                if $0.resolution != $1.resolution { return $0.resolution > $1.resolution }
+                let hdr0 = $0.recommendedTags.isDolbyVision ? 2 : ($0.recommendedTags.isHDR ? 1 : 0)
+                let hdr1 = $1.recommendedTags.isDolbyVision ? 2 : ($1.recommendedTags.isHDR ? 1 : 0)
+                if hdr0 != hdr1 { return hdr0 > hdr1 }
+                let cached0 = $0.recommendedCached
+                let cached1 = $1.recommendedCached
+                if cached0 != cached1 { return cached0 && !cached1 }
+                if $0.size != $1.size { return $0.size > $1.size }
+                return $0.offset < $1.offset
+            }.map(\.element)
         case .default:
             return entries.sorted {
                 let bad0 = $0.isBad
@@ -9633,6 +9653,8 @@ private struct TvStreamPickerOverlay: View {
     /// Filter by stable add-on id (not display name).
     @State private var selectedAddonId: String?
     @AppStorage(SettingsKey.streamSortOption) private var sortOption: StreamSortOption = .quality
+    @AppStorage("nuvio.tv.streamPicker.recommendedSort") private var recommendedSort = false
+    private var pickerSortOption: StreamSortOption { recommendedSort ? .recommended : sortOption }
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
@@ -9704,7 +9726,7 @@ private struct TvStreamPickerOverlay: View {
         StreamPickerListBuilder.cacheKey(
             revision: streamsRevision,
             selectedAddonId: selectedAddonId,
-            sortOption: sortOption,
+            sortOption: pickerSortOption,
             includeDebrid: includeDebrid,
             cachedOnly: effectiveCachedOnly,
             preserveAddonStreams: preserveAddonOrder
@@ -10011,7 +10033,7 @@ private struct TvStreamPickerOverlay: View {
             streams: streams,
             groups: groups,
             selectedAddonId: selectedAddonId,
-            sortOption: sortOption,
+            sortOption: pickerSortOption,
             includeDebrid: includeDebrid,
             cachedOnly: effectiveCachedOnly,
             preserveAddonStreams: preserveAddonOrder,
@@ -10243,8 +10265,8 @@ private struct TvStreamPickerOverlay: View {
             // Sort remains pinned to the trailing edge instead of moving with
             // the add-on scroller.
             TvStreamFilterButton(
-                title: L10n.format("details_sort_format", fallback: "Sort: %@", L10n.optionLabel(sortOption.rawValue)),
-                isSelected: sortOption != .quality,
+                title: L10n.format("details_sort_format", fallback: "Sort: %@", pickerSortOption == .recommended ? L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended") : L10n.optionLabel(sortOption.rawValue)),
+                isSelected: pickerSortOption != .quality,
                 focusBinding: $focusedItem,
                 focusValue: sortKey,
                 action: { showSortOptions = true }
@@ -10255,9 +10277,10 @@ private struct TvStreamPickerOverlay: View {
                 isPresented: $showSortOptions,
                 titleVisibility: .visible
             ) {
-                ForEach(StreamSortOption.allCases) { option in
-                    Button(L10n.optionLabel(option.rawValue)) { sortOption = option }
+                ForEach(StreamSortOption.allCases.filter { $0 != .recommended }) { option in
+                    Button(L10n.optionLabel(option.rawValue)) { recommendedSort = false; sortOption = option }
                 }
+                Button(L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended")) { recommendedSort = true }
             }
         }
         .padding(.vertical, 4)
@@ -10271,6 +10294,9 @@ private struct TvStreamPickerOverlay: View {
         let totalCount = activeDisplayedStreams.count
         let badgeSettings = streamBadgeSettings
         let hasMore = totalCount > streamsToShow.count
+        let recommendedID = pickerSortOption == .recommended
+            ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })?.id
+            : nil
         return ZStack {
             if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
@@ -10315,6 +10341,15 @@ private struct TvStreamPickerOverlay: View {
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVStack(spacing: style.metrics.cardSpacing) {
                             ForEach(streamsToShow) { stream in
+                                if stream.id == recommendedID {
+                                    Text(isLoading || selectedGroupIsLoading
+                                         ? L10n.string("stream_recommended_so_far", fallback: "Recommended so far")
+                                         : L10n.string("stream_recommended", fallback: "Recommended"))
+                                        .font(.system(size: 20, weight: .semibold))
+                                        .foregroundColor(.white.opacity(0.8))
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                        .accessibilityAddTraits(.isHeader)
+                                }
                                 // Focus appearance is owned by the card via local
                                 // @FocusState + ExternalFocusBinding so only the
                                 // old/new cards pay for outline/scale updates.
