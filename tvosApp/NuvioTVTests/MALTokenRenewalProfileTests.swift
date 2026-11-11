@@ -6,9 +6,12 @@ import XCTest
 final class MALTokenRenewalProfileTests: XCTestCase {
     private var askingProfile = ""
     private var otherProfile = ""
+    private var previousStorage: MALLoginStorage!
 
     override func setUp() {
         super.setUp()
+        previousStorage = MALKeychain.storage
+        MALKeychain.storage = MALMemoryLoginStorage()
         askingProfile = "mal-renew-a-\(UUID().uuidString)"
         otherProfile = "mal-renew-b-\(UUID().uuidString)"
     }
@@ -16,6 +19,7 @@ final class MALTokenRenewalProfileTests: XCTestCase {
     override func tearDown() {
         MALKeychain.remove(for: askingProfile)
         MALKeychain.remove(for: otherProfile)
+        MALKeychain.storage = previousStorage
         super.tearDown()
     }
 
