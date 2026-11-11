@@ -1534,9 +1534,9 @@ private struct PlayerEstimatedFinishTime: View {
 
     var body: some View {
         if status == .playing || status == .paused {
-            TimelineView(.periodic(from: .now, by: 30)) { context in
+            TimelineView(.periodic(from: .now, by: 30)) { _ in
                 let position = isScrubbing ? (clock.scrubTarget ?? clock.position) : clock.position + pendingSeekDelta
-                if let end = PlayerFinishEstimate.date(now: context.date, position: position, duration: clock.duration, speed: playbackSpeed) {
+                if let end = PlayerFinishEstimate.date(now: Date(), position: position, duration: clock.duration, speed: playbackSpeed) {
                     let time = end.formatted(date: .omitted, time: .shortened)
                     let label: String = {
                         if status == .paused {
