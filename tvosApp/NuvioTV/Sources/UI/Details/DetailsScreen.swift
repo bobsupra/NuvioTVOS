@@ -10341,7 +10341,6 @@ private struct TvStreamPickerOverlay: View {
         let recommendedStream = pickerSortOption == .recommended
             ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })
             : nil
-        let recommendedID = recommendedStream?.id
         return ZStack {
             if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
@@ -10387,58 +10386,42 @@ private struct TvStreamPickerOverlay: View {
                         LazyVStack(spacing: style.metrics.cardSpacing) {
                             if let recommendedStream {
                                 VStack(alignment: .leading, spacing: 8) {
-                                    Text(isLoading || selectedGroupIsLoading
-                                         ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
-                                         : L10n.string("stream_best_overall", fallback: "Best overall"))
-                                        .font(.system(size: 20, weight: .semibold))
-                                        .foregroundColor(.white.opacity(0.8))
                                     Text(selectedAddonId == nil
                                          ? L10n.string("stream_recommendation_all_addons", fallback: "Among available results from all add-ons")
                                          : L10n.string("stream_recommendation_selected_addon", fallback: "Among results from the selected add-on"))
                                         .font(.system(size: 16))
                                         .foregroundColor(.white.opacity(0.65))
-                                    TvStreamFilterButton(
-                                        title: L10n.string("stream_play_best_overall", fallback: "Play best overall"),
-                                        isSelected: false,
+                                    TvStreamRecommendationCard(
+                                        stream: recommendedStream,
+                                        title: isLoading || selectedGroupIsLoading
+                                            ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
+                                            : L10n.string("stream_best_overall", fallback: "Best overall"),
+                                        prominent: true,
                                         focusBinding: $focusedItem,
                                         focusValue: "recommended::overall",
                                         action: { select(recommendedStream, player: nil) }
                                     )
-                                    ScrollView(.horizontal, showsIndicators: false) {
-                                        HStack(spacing: 12) {
-                                            ForEach(picks.map { $0.resolution }, id: \.self) { resolution in
-                                                if let pick = picks.first(where: { $0.resolution == resolution }) {
-                                                    let resolutionLabel = resolution == 2160 ? "4K" : "\(resolution)p"
-                                                    TvStreamFilterButton(
-                                                        title: L10n.format("stream_best_resolution", fallback: "Best %@", resolutionLabel),
-                                                        isSelected: false,
-                                                        focusBinding: $focusedItem,
-                                                        focusValue: "recommended::\(resolution)",
-                                                        action: { select(pick.stream, player: nil) }
-                                                    )
-                                                }
-                                            }
+                                    Text(L10n.string("stream_recommended_criteria", fallback: "Based on reported resolution, HDR, release, audio, codec, availability and size"))
+                                        .font(.system(size: 18))
+                                        .foregroundColor(.white.opacity(0.65))
+                                    ForEach(picks.map { $0.resolution }, id: \.self) { resolution in
+                                        if let pick = picks.first(where: { $0.resolution == resolution }) {
+                                            let resolutionLabel = resolution == 2160 ? "4K" : "\(resolution)p"
+                                            TvStreamRecommendationCard(
+                                                stream: pick.stream,
+                                                title: L10n.format("stream_best_resolution", fallback: "Best %@", resolutionLabel),
+                                                prominent: false,
+                                                focusBinding: $focusedItem,
+                                                focusValue: "recommended::\(resolution)",
+                                                action: { select(pick.stream, player: nil) }
+                                            )
                                         }
-                                        .padding(.vertical, 12)
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .focusSection()
                             }
                             ForEach(streamsToShow) { stream in
-                                if stream.id == recommendedID {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text(isLoading || selectedGroupIsLoading
-                                             ? L10n.string("stream_recommended_so_far", fallback: "Recommended so far")
-                                             : L10n.string("stream_recommended", fallback: "Recommended"))
-                                            .font(.system(size: 20, weight: .semibold))
-                                            .accessibilityAddTraits(.isHeader)
-                                        Text(L10n.string("stream_recommended_criteria", fallback: "Based on reported resolution, HDR, release, audio, codec, availability and size"))
-                                            .font(.system(size: 16))
-                                    }
-                                    .foregroundColor(.white.opacity(0.8))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                                }
                                 // Focus appearance is owned by the card via local
                                 // @FocusState + ExternalFocusBinding so only the
                                 // old/new cards pay for outline/scale updates.
@@ -10788,6 +10771,66 @@ private final class UpHoldPressHostView: UIView, UIGestureRecognizerDelegate {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
         isActive
+    }
+}
+
+/// A shortcut to a ranked source. Display only metadata supplied by its add-on;
+/// the full source list below remains available, including its player menu.
+private struct TvStreamRecommendationCard: View {
+    let stream: NuvioStream
+    let title: String
+    let prominent: Bool
+    let focusBinding: FocusState<String?>.Binding
+    let focusValue: String
+    let action: () -> Void
+
+    private var isFocused: Bool { focusBinding.wrappedValue == focusValue }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 18) {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: prominent ? 42 : 30))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(title)
+                        .font(.system(size: prominent ? 24 : 20, weight: .bold))
+                    if let name = stream.name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(name.replacingOccurrences(of: "\n", with: " · "))
+                            .font(.system(size: prominent ? 27 : 22, weight: .semibold))
+                            .lineLimit(2)
+                    }
+                    if let description = stream.description, !description.isEmpty {
+                        Text(description.replacingOccurrences(of: "\n", with: " · "))
+                            .font(.system(size: 19))
+                            .lineLimit(prominent ? 2 : 1)
+                    }
+                    HStack(spacing: 12) {
+                        if let size = StreamBadgeSizing.fileSizeLabel(for: stream) {
+                            Text(size)
+                        }
+                        if let addon = stream.addonName, !addon.isEmpty {
+                            Text(addon)
+                        }
+                    }
+                    .font(.system(size: 18, weight: .medium))
+                    .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .foregroundColor(.white)
+            .padding(prominent ? 24 : 18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white.opacity(isFocused ? 0.16 : 0.07)))
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.12),
+                        lineWidth: isFocused ? AppFocusOutline.width : 1))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused(focusBinding, equals: focusValue)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.025 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
     }
 }
 
