@@ -11380,7 +11380,7 @@ enum TVDetailsSection: String, CaseIterable, Identifiable, Codable {
         case .episodes:
             return L10n.string("settings_meta_episodes", fallback: "Episodes")
         case .cast:
-            return L10n.string("details_creator_and_cast", fallback: "Cast & Crew")
+            return L10n.string("details_cast_and_crew", fallback: "Cast & Crew")
         case .related:
             return L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This")
         case .network:

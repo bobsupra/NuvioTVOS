@@ -6580,6 +6580,23 @@ private struct TvDetailsRatingsRow: View {
     }
 }
 
+enum DetailsCastHeaderLabel {
+    static func localizationKey(for type: String) -> String {
+        let normalized = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if normalized == "movie" || normalized == "film" { return "details_director_and_cast" }
+        if NuvioMeta.isSeriesType(normalized) { return "details_creator_and_cast" }
+        return "details_cast_and_crew"
+    }
+
+    static func title(for type: String) -> String {
+        switch localizationKey(for: type) {
+        case "details_director_and_cast": return L10n.string("details_director_and_cast", fallback: "Director and Cast")
+        case "details_creator_and_cast": return L10n.string("details_creator_and_cast", fallback: "Creator and Cast")
+        default: return L10n.string("details_cast_and_crew", fallback: "Cast & Crew")
+        }
+    }
+}
+
 private struct TvDetailsCastAndTrailer: View {
     let meta: NuvioMeta
     let people: [TmdbPersonMetadata]
@@ -6598,7 +6615,7 @@ private struct TvDetailsCastAndTrailer: View {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(spacing: 18) {
                     TvDetailsSectionButton(
-                        title: L10n.string("details_creator_and_cast", fallback: "Cast & Crew"),
+                        title: DetailsCastHeaderLabel.title(for: meta.type),
                         isSelected: false,
                         focus: headerFocus,
                         tag: .creatorAndCast,
