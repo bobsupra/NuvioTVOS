@@ -219,8 +219,15 @@ final class SubtitleFontUploadServer: @unchecked Sendable {
                     self.send(.text("Bad request", status: 400), on: connection, id: id)
                     return
                 }
-                guard head.contentLength <= SubtitleFontLimits.downloadBytes else {
-                    self.send(.json(["error": SubtitleFontError.tooLarge(SubtitleFontLimits.downloadBytes).errorDescription ?? ""], status: 413), on: connection, id: id)
+                // Route (and so the key) is checked before any body is buffered: a request
+                // without the page's key must not make the Apple TV hold up to the upload limit.
+                let bodyLimit = Self.maximumBodyBytes(for: Self.route(head, key: self.key))
+                guard head.contentLength <= bodyLimit else {
+                    if bodyLimit == 0 {
+                        self.send(.text("Not found", status: 404), on: connection, id: id)
+                    } else {
+                        self.send(.json(["error": SubtitleFontError.tooLarge(bodyLimit).errorDescription ?? ""], status: 413), on: connection, id: id)
+                    }
                     return
                 }
                 self.heads[id] = head
@@ -291,6 +298,16 @@ final class SubtitleFontUploadServer: @unchecked Sendable {
             }
         }
         return Head(method: String(parts[0]), path: components.path, query: query, contentLength: length)
+    }
+
+    /// The largest body a route accepts: a font upload up to the download limit, a pasted link
+    /// or a small form otherwise, and nothing for an unknown path or a wrong key.
+    static func maximumBodyBytes(for route: Route) -> Int {
+        switch route {
+        case .upload: return SubtitleFontLimits.downloadBytes
+        case .notFound: return 0
+        case .page, .list, .link, .delete: return headerLimit
+        }
     }
 
     static func route(_ head: Head, key: String) -> Route {
