@@ -341,6 +341,8 @@ actor StremioManifestDataCache {
         config.waitsForConnectivity = false
         config.urlCache = manifestURLCache
         config.requestCachePolicy = .useProtocolCachePolicy
+        // Plugins with catalogs, metadata or ratings (virtual add-ons).
+        PluginAddonURLProtocol.install(in: config)
         return URLSession(configuration: config)
     }()
 
@@ -666,6 +668,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
         config.timeoutIntervalForRequest = 8
         config.timeoutIntervalForResource = 10
         config.waitsForConnectivity = false
+        // Plugins with catalogs, metadata or ratings (virtual add-ons).
+        PluginAddonURLProtocol.install(in: config)
         return URLSession(configuration: config)
     }()
     private static var networkSessionOverrideForTesting: URLSession?
@@ -1597,10 +1601,14 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     static func configuredStreamAddonManifestURLs(in defaults: UserDefaults) -> [URL] {
-        configuredStreamAddonPreferences(in: defaults).compactMap { preference in
+        let installed = configuredStreamAddonPreferences(in: defaults).compactMap { preference -> URL? in
             guard preference.enabled else { return nil }
             return normalizedManifestURL(from: preference.url)
         }
+        // Plugins with catalogs, metadata or ratings act as add-ons that exist
+        // only on this Apple TV, and the AIOStreams addon
+        // running on it; never part of the synced add-on list.
+        return installed + PluginAddonRegistry.shared.manifestURLs + AIOStreamsHost.aioAddonURLs(besides: installed)
     }
 
     static func configuredStreamAddonPreferences(in defaults: UserDefaults = ProfileSettings.current) -> [StreamAddonPreference] {
@@ -1852,9 +1860,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
                 let addons = await self.configuredSubtitleAddons(id: id, type: type)
+                let pluginQuery = PluginSubtitleDiscovery.Query(
+                    type: subtitleType,
+                    videoID: id,
+                    videoHash: videoHash,
+                    videoSize: videoSize,
+                    filename: filename
+                )
+                let pluginProviders = await PluginSubtitleDiscovery.providers(for: pluginQuery)
                 var accumulated: [NuvioSubtitle] = []
 
                 await withTaskGroup(of: [NuvioSubtitle].self) { group in
+                    // Subtitle plugins (Settings → Plugins) beside the add-ons.
+                    for provider in pluginProviders {
+                        group.addTask { await PluginSubtitleDiscovery.subtitles(from: provider, query: pluginQuery) }
+                    }
+
                     for addon in addons {
                         // 1. Fast base ID-query endpoint (instant cache response < 300ms)
                         if let baseURL = addon.subtitleURL(type: subtitleType, id: id) {
