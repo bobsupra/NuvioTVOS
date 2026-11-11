@@ -9,7 +9,8 @@ struct NativeTopBarClock: View {
     @AppStorage(SettingsKey.sidebarClockFormat) private var format = SidebarClockFormat.automatic.rawValue
 
     var body: some View {
-        TimelineView(.periodic(from: .now, by: 30)) { context in
+        // Ticks on each minute boundary, like the sidebar clock, instead of up to 30 s late.
+        TimelineView(.everyMinute) { context in
             let text = SidebarClockFormat.fromStored(format).formatter().string(from: context.date)
             NativeTopBarClockMarker(text: text, enabled: enabled && scenePhase == .active)
         }
