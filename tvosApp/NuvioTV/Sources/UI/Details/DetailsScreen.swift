@@ -6598,7 +6598,7 @@ private struct TvDetailsCastAndTrailer: View {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(spacing: 18) {
                     TvDetailsSectionButton(
-                        title: L10n.string("details_creator_and_cast", fallback: "Creator and Cast"),
+                        title: L10n.string("details_creator_and_cast", fallback: "Cast & Crew"),
                         isSelected: false,
                         focus: headerFocus,
                         tag: .creatorAndCast,
