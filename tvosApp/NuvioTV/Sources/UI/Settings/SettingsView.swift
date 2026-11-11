@@ -268,6 +268,7 @@ enum SettingsKey {
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
     static let debridEnabled = "nuvio.tv.settings.integrations.debridEnabled"
     static let p2pEnabled = "nuvio.tv.settings.integrations.p2pEnabled"
+    static let nativeIPTVEnabled = "nuvio.tv.settings.integrations.nativeIPTVEnabled"
     /// Device/profile-local acknowledgement for direct peer-to-peer playback.
     static let p2pConsentAccepted = "nuvio.tv.settings.integrations.p2pConsentAccepted"
     static let p2pHideTorrentStats = "nuvio.tv.settings.integrations.p2pHideTorrentStats"
@@ -454,7 +455,7 @@ enum SettingsKey {
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
         mdbListUseMyAnimeList, mdbListUseTvdb,
-        debridProvider, debridApiKey, debridEnabled, p2pEnabled, p2pConsentAccepted,
+        debridProvider, debridApiKey, debridEnabled, p2pEnabled, p2pConsentAccepted, nativeIPTVEnabled,
         p2pHideTorrentStats, p2pCacheLimitGB, cloudLibraryEnabled,
         torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
         aiSubtitlesEnabled, aiSubtitlesProvider, aiSubtitlesGeminiAPIKey, aiSubtitlesGeminiModel,
@@ -5331,6 +5332,7 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
     @AppStorage(SettingsKey.debridEnabled) private var debridEnabled = true
     @AppStorage(SettingsKey.cloudLibraryEnabled) private var cloudLibraryEnabled = true
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
     @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
     @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
@@ -5715,6 +5717,13 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingMdbListOptions = true
                 }
+            }
+
+            SettingsGroup(title: L10n.string("iptv_settings_title", fallback: "Live TV"),
+                          subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")) {
+                SettingsToggleRow(title: L10n.string("iptv_enable_title", fallback: "Native IPTV"),
+                                  subtitle: L10n.string("iptv_enable_subtitle", fallback: "Show Live TV in navigation"),
+                                  isOn: $nativeIPTVEnabled, accentColor: accentColor)
             }
 
             SettingsGroup(
@@ -13908,8 +13917,26 @@ private struct LicensesAttributionsSheet: View {
             title: L10n.string("tvos_settings_nuviotv", fallback: "NuvioTV"),
             body: "Native Apple TV app for browsing Stremio-compatible catalogs and playing streams.",
             license: "GPL-3.0"
+        ),
+        LicenseEntry(
+            id: "bro-iptv",
+            title: "Bro IPTV Player",
+            body: Self.licenseText(named: "BroIPTV-LICENSE", fallback: "Copyright (c) 2026 Mikhail Demidov. See the included MIT license."),
+            license: "MIT"
+        ),
+        LicenseEntry(
+            id: "open-iptv",
+            title: "OpenIPTV",
+            body: Self.licenseText(named: "OpenIPTV-LICENSE", fallback: "Copyright (c) 2026 Paulo Batista. See the included MIT license."),
+            license: "MIT"
         )
     ]
+
+    private static func licenseText(named name: String, fallback: String) -> String {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return fallback }
+        return text
+    }
 
     private let dataEntries: [LicenseEntry] = [
         LicenseEntry(

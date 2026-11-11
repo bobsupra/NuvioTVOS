@@ -481,6 +481,7 @@ final class CatalogWatchedMemoryTests: XCTestCase {
         )
         XCTAssertNil(DetailsNavigationContextTransition.playbackContext(origin: .main, currentLibraryWatchedContext: libraryContext))
         XCTAssertNil(DetailsNavigationContextTransition.playbackContext(origin: .cloudLibrary, currentLibraryWatchedContext: libraryContext))
+        XCTAssertNil(DetailsNavigationContextTransition.playbackContext(origin: .liveTV, currentLibraryWatchedContext: libraryContext))
     }
 
     func testSameProfileNuvioSyncRelinkInvalidatesCapturedLibraryMutation() {
