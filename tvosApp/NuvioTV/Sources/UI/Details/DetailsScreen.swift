@@ -4007,9 +4007,13 @@ enum StreamPickerListBuilder {
         // Keep mode-specific work out of modes that do not use it.
         let needsResolution = !preserveAddonStreams || option == .quality || option == .default || option == .recommended
         let needsHardwareCheck = option == .quality && !AppleTVCapability.current.supportsAV1HardwareDecode
+        let preferRecommendedHardware = option == .recommended
+            && (ProfileSettings.current.object(forKey: SettingsKey.preferHardwareDecodedStreams) as? Bool ?? true)
         let entries = streams.enumerated().map { entry in
             let stream = entry.element
             let resolutionValue = needsResolution ? resolution(for: stream) : 0
+            let tags = option == .recommended ? StreamQualityTags.parse(stream: stream) : StreamQualityTags()
+            let hasKnownCodec = tags.isAV1 || tags.isHEVC || tags.isAVC
             let isBad = (!preserveAddonStreams || option == .default)
                 && (SmartPlaybackSelector.isLowQualityOrTicketStream(stream) || resolutionValue == 0)
             return (
@@ -4017,10 +4021,12 @@ enum StreamPickerListBuilder {
                 element: stream,
                 resolution: resolutionValue,
                 isBad: isBad,
-                quality: option == .quality ? streamQuality(for: stream) : DebridStreamQuality.unknown,
+                quality: option == .quality || option == .recommended ? streamQuality(for: stream) : DebridStreamQuality.unknown,
                 size: option == .quality || option == .size || option == .recommended ? sizeBytes(for: stream) : 0,
-                recommendedTags: option == .recommended ? StreamQualityTags.parse(stream: stream) : StreamQualityTags(),
+                recommendedTags: tags,
+                recommendedHardware: hasKnownCodec ? (tags.isHardwareAccelerated() ? 1 : -1) : 0,
                 recommendedCached: option == .recommended && stream.isLikelyCached,
+                recommendedAudio: option == .recommended ? recommendedAudioRank(for: stream) : 0,
                 hardwareAccelerated: needsHardwareCheck && resolutionValue >= 2160
                     ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
             )
@@ -4037,6 +4043,13 @@ enum StreamPickerListBuilder {
                 let hdr0 = $0.recommendedTags.isDolbyVision ? 2 : ($0.recommendedTags.isHDR ? 1 : 0)
                 let hdr1 = $1.recommendedTags.isDolbyVision ? 2 : ($1.recommendedTags.isHDR ? 1 : 0)
                 if hdr0 != hdr1 { return hdr0 > hdr1 }
+                if $0.quality != $1.quality { return $0.quality > $1.quality }
+                if $0.recommendedAudio != $1.recommendedAudio { return $0.recommendedAudio > $1.recommendedAudio }
+                if preferRecommendedHardware {
+                    let hw0 = $0.recommendedHardware
+                    let hw1 = $1.recommendedHardware
+                    if hw0 != hw1 { return hw0 > hw1 }
+                }
                 let cached0 = $0.recommendedCached
                 let cached1 = $1.recommendedCached
                 if cached0 != cached1 { return cached0 && !cached1 }
@@ -4122,6 +4135,21 @@ enum StreamPickerListBuilder {
                 return $0.offset < $1.offset
             }.map(\.element)
         }
+    }
+
+    /// A best-effort ranking of *declared* audio formats. Metadata can be
+    /// missing or incorrect and does not describe the user's sound system.
+    static func recommendedAudioRank(for stream: NuvioStream) -> Int {
+        let text = [stream.name, stream.description, stream.filename].compactMap { $0 }.joined(separator: " ").lowercased()
+        func matches(_ pattern: String) -> Bool {
+            text.range(of: pattern, options: .regularExpression) != nil
+        }
+        if matches(#"\batmos\b"#) { return 5 }
+        if matches(#"\btrue[ ._-]*hd\b|\bdts[ ._-]*hd\b|\bdts[ ._-]*x\b"#) { return 4 }
+        if matches(#"\bddp(?:[ ._-]?[0-9])?\b|\be[ ._-]?ac[ ._-]?3\b|\bdd\+"#) { return 3 }
+        if matches(#"\bac[ ._-]?3\b|\bdts\b|\baac\b|\bdolby[ ._-]+digital\b"#) { return 2 }
+        if matches(#"\bstereo\b|\b2[.]0\b"#) { return 1 }
+        return 0
     }
 
     /// Best-effort resolution parsed from a stream's release metadata (2160/1440/1080/720/576/480/360),
@@ -10342,13 +10370,17 @@ private struct TvStreamPickerOverlay: View {
                         LazyVStack(spacing: style.metrics.cardSpacing) {
                             ForEach(streamsToShow) { stream in
                                 if stream.id == recommendedID {
-                                    Text(isLoading || selectedGroupIsLoading
-                                         ? L10n.string("stream_recommended_so_far", fallback: "Recommended so far")
-                                         : L10n.string("stream_recommended", fallback: "Recommended"))
-                                        .font(.system(size: 20, weight: .semibold))
-                                        .foregroundColor(.white.opacity(0.8))
-                                        .frame(maxWidth: .infinity, alignment: .leading)
-                                        .accessibilityAddTraits(.isHeader)
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(isLoading || selectedGroupIsLoading
+                                             ? L10n.string("stream_recommended_so_far", fallback: "Recommended so far")
+                                             : L10n.string("stream_recommended", fallback: "Recommended"))
+                                            .font(.system(size: 20, weight: .semibold))
+                                            .accessibilityAddTraits(.isHeader)
+                                        Text(L10n.string("stream_recommended_criteria", fallback: "Based on reported resolution, HDR, release, audio, codec, availability and size"))
+                                            .font(.system(size: 16))
+                                    }
+                                    .foregroundColor(.white.opacity(0.8))
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
                                 // Focus appearance is owned by the card via local
                                 // @FocusState + ExternalFocusBinding so only the

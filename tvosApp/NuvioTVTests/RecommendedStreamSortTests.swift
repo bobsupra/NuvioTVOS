@@ -16,4 +16,15 @@ final class RecommendedStreamSortTests: XCTestCase {
         let sorted = StreamPickerListBuilder.sorted([first, second], by: .recommended)
         XCTAssertEqual(sorted.map(\.id), [first.id, second.id])
     }
+
+    func testAudioRankingUsesDeclaredMetadataOnly() {
+        func stream(_ name: String) -> NuvioStream {
+            NuvioStream(url: "https://example.test/movie", name: name, description: nil, addonName: "A")
+        }
+        XCTAssertGreaterThan(StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p Atmos")),
+                             StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p DD+")))
+        XCTAssertGreaterThan(StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p DTS-HD MA 5.1")),
+                             StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p AAC")))
+        XCTAssertEqual(StreamPickerListBuilder.recommendedAudioRank(for: stream("1080p")), 0)
+    }
 }
