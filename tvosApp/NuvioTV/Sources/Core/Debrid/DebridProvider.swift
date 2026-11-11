@@ -131,6 +131,12 @@ enum DebridVideo {
         return extensions.contains(ext)
     }
 
+    /// A release's sample clip (`Show.S01E05.1080p-GRP-sample.mkv`, `Sample/show.s01e05.mkv`):
+    /// `sample` as a whole word anywhere in the path.
+    static func isSample(_ path: String) -> Bool {
+        path.range(of: "(?<![a-z0-9])sample(?![a-z0-9])", options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     /// Matches complete episode tokens such as S01E05, S1E5 or 1x05. The
     /// trailing digit boundary is essential: S1E2 must not select S1E20.
     static func matchesEpisode(_ path: String, season: Int?, episode: Int?) -> Bool {
@@ -158,17 +164,23 @@ enum DebridFileSelection {
     ) -> File? {
         let playable = files.filter { DebridVideo.isPlayable(name($0)) }
         guard !playable.isEmpty else { return nil }
+        // A release's sample clip also carries the episode token; it is picked only when the
+        // torrent holds nothing else.
+        let features = playable.filter { !DebridVideo.isSample(name($0)) }
+        let candidates = features.isEmpty ? playable : features
 
-        // Series: a filename that matches the season/episode wins.
+        // Series: a filename that matches the season/episode wins; the largest one if several do.
         if request.season != nil,
            request.episode != nil,
-           let match = playable.first(where: { file in
-               DebridVideo.matchesEpisode(
-                   name(file),
-                   season: request.season,
-                   episode: request.episode
-               )
-           }) {
+           let match = candidates
+               .filter({ file in
+                   DebridVideo.matchesEpisode(
+                       name(file),
+                       season: request.season,
+                       episode: request.episode
+                   )
+               })
+               .max(by: { (size($0) ?? 0) < (size($1) ?? 0) }) {
             return match
         }
 
@@ -184,6 +196,6 @@ enum DebridFileSelection {
         }
 
         // Fallback: the largest video file (usually the feature/episode).
-        return playable.max(by: { (size($0) ?? 0) < (size($1) ?? 0) })
+        return candidates.max(by: { (size($0) ?? 0) < (size($1) ?? 0) })
     }
 }
