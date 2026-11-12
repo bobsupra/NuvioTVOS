@@ -245,6 +245,11 @@ final class JellyfinClientTests: XCTestCase {
                 """
                 return (response, Data(json.utf8))
             } else if path == "/Users/user-1/Items" {
+                let startIndex = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems?
+                    .first(where: { $0.name == "StartIndex" })?.value ?? "0"
+                guard startIndex == "0" else {
+                    return (response, Data(#"{"Items":[]}"#.utf8))
+                }
                 let json = """
                 {
                     "Items": [
@@ -362,6 +367,64 @@ final class JellyfinClientTests: XCTestCase {
         XCTAssertEqual(progressUpdates, [24, 48, 50])
         XCTAssertEqual(items.first?.id, "item-0")
         XCTAssertEqual(items.last?.id, "item-49")
+    }
+
+    func testBareArrayPaginationContinuesUntilAnEmptyPage() async throws {
+        var requestedStartIndices: [String] = []
+        JellyfinMockURLProtocol.requestHandler = { request in
+            let url = request.url!
+            let startIndex = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "StartIndex" })?.value ?? "0"
+            requestedStartIndices.append(startIndex)
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let start = Int(startIndex) ?? 0
+            let items = (start..<min(start + 24, 50)).map { index in
+                ["Id": "movie-\(index)", "Name": "Movie \(index)", "Type": "Movie"]
+            }
+            return (response, try JSONSerialization.data(withJSONObject: items))
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "test-token", session: session)
+        let items = try await client.items(userId: "user-1", libraryId: "lib-1")
+
+        XCTAssertEqual(items.count, 50)
+        XCTAssertEqual(requestedStartIndices, ["0", "24", "48", "50"], "Short bare-array pages may be server-capped")
+    }
+
+    func testItemsRejectMalformedItemsArray() async throws {
+        JellyfinMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"Items":"not-an-array"}"#.utf8))
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "test-token", session: session)
+        do {
+            _ = try await client.items(userId: "user-1", libraryId: "lib-1")
+            XCTFail("Malformed Items must fail instead of looking like an empty library")
+        } catch {
+            XCTAssertFalse(error.localizedDescription.isEmpty)
+        }
+    }
+
+    func testItemsRejectRepeatedPageWithoutForwardProgress() async throws {
+        var requestedStartIndices: [String] = []
+        JellyfinMockURLProtocol.requestHandler = { request in
+            let url = request.url!
+            let startIndex = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "StartIndex" })?.value ?? "0"
+            requestedStartIndices.append(startIndex)
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            return (response, Data(#"{"Items":[{"Id":"same","Name":"Same","Type":"Movie"}]}"#.utf8))
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "test-token", session: session)
+        do {
+            _ = try await client.items(userId: "user-1", libraryId: "lib-1")
+            XCTFail("A repeated page should stop the pagination loop")
+        } catch let error as JellyfinClient.ClientError {
+            XCTAssertTrue(error.message.contains("repeated"))
+        }
+        XCTAssertEqual(requestedStartIndices, ["0", "1"])
     }
 
     func testEpisodesFetchesAndPaginatesShowsEpisodes() async throws {
