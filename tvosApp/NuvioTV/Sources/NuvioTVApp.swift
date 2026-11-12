@@ -4271,7 +4271,10 @@ private struct CrossfadingBackdrop: View {
         // depends on it. Reads that only happen inside the reader's content
         // closure did not re-render when a load finished, so the new image
         // only appeared on the next focus change (one title late).
-        let currentImage = image
+        // A backdrop built anew (nothing loaded into it yet) shows its image straight from memory
+        // when it is there, instead of the bare background for the frame or two its load takes:
+        // that frame was a blink of the whole screen.
+        let currentImage = image ?? memoryCachedImage
         let currentOutgoingImage = outgoingImage
         let currentImageOpacity = imageOpacity
         let currentOutgoingOpacity = outgoingOpacity
@@ -4326,6 +4329,15 @@ private struct CrossfadingBackdrop: View {
             outgoingImage = nil
             outgoingOpacity = 0
         }
+    }
+
+    /// The current URL's image when it is already decoded in memory; read only while nothing
+    /// is loaded into the backdrop yet.
+    private var memoryCachedImage: UIImage? {
+        guard image == nil,
+              let url,
+              let imageURL = URL(string: url) else { return nil }
+        return BackdropImageCache.shared.cachedImage(for: imageURL)
     }
 
     @ViewBuilder
@@ -5230,6 +5242,15 @@ private final class TVHomeFocusWork {
     var rowStageTask: Task<Void, Never>?
     var isStagingRowsAfterJump = false
     var focusedRowIndex: Int = 0
+    /// Each row's height as last laid out, for the empty space that stands in for it while it
+    /// is not built. A guessed height there moved every row below it when a row was taken down
+    /// or built again, and with rows of other shapes (wide cards, a label under each card) Home
+    /// jumped in the middle of a run of moves.
+    var rowHeights: [String: CGFloat] = [:]
+    /// Rows built since focus last rested on a row. They stay built until it rests again: in a
+    /// fast run of moves the scroll is still on its way and can show a row two or three behind
+    /// the focused one, which vanished when the rows around focus moved on without it.
+    var rowsBuiltDuringRun: Set<String> = []
 
     func cancelAll() {
         cachedVisibleSections = nil
@@ -5255,6 +5276,7 @@ private final class TVHomeFocusWork {
         acknowledgedNativeOverlayFocusCardID = nil
         lastFocusTransitionTime = 0
         focusedRowIndex = 0
+        rowsBuiltDuringRun = []
     }
 }
 
@@ -6075,21 +6097,36 @@ struct TVHomeView: View {
                                         }
 
                                         ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                                            let isNearFocusedRow = (index >= focusedRowIndex - min(2, max(0, rowBuildReach))
+                                            let isInBuildWindow = (index >= focusedRowIndex - min(2, max(0, rowBuildReach))
                                                     && index <= focusedRowIndex + min(2, rowBuildReach + 1))
                                                 || ((rowBuildReach >= 3 || focusWork.isStagingRowsAfterJump)
                                                     && abs(index - settledRowIndex) <= 3)
+                                            // A row this run built stays until focus rests (see
+                                            // `rowsBuiltDuringRun`); the six-row bound keeps a long run
+                                            // from holding every row it passed.
+                                            let isNearFocusedRow = isInBuildWindow
+                                                || (abs(index - focusedRowIndex) <= 6
+                                                    && focusWork.rowsBuiltDuringRun.contains(section.id))
                                             if isNearFocusedRow {
+                                                let _ = focusWork.rowsBuiltDuringRun.insert(section.id)
                                                 homeSectionRow(
                                                     index: index,
                                                     section: section,
                                                     horizontalEdgeInset: horizontalEdgeInset,
                                                     verticalScrollProxy: verticalScrollProxy
                                                 )
+                                                .onGeometryChange(for: CGFloat.self) { proxy in
+                                                    proxy.size.height
+                                                } action: { height in
+                                                    if height > 0 {
+                                                        focusWork.rowHeights[section.id] = height
+                                                    }
+                                                }
                                             } else {
                                                 Color.clear
                                                     .frame(
-                                                        height: estimatedHeight(for: section),
+                                                        height: focusWork.rowHeights[section.id]
+                                                            ?? estimatedHeight(for: section),
                                                         alignment: .topLeading
                                                     )
                                                     .id(section.id)
@@ -6104,7 +6141,11 @@ struct TVHomeView: View {
                                         let row = focusedRowIndex
                                         // Past the vertical scroll's spring (0.28 s).
                                         try? await Task.sleep(nanoseconds: 380_000_000)
-                                        guard !Task.isCancelled, row == focusedRowIndex, settledRowIndex != row else { return }
+                                        guard !Task.isCancelled, row == focusedRowIndex else { return }
+                                        // Focus rests: the rows the run kept go with the redraw below
+                                        // (or the next one, when focus came back to the row it left).
+                                        focusWork.rowsBuiltDuringRun.removeAll()
+                                        guard settledRowIndex != row else { return }
                                         var transaction = Transaction(animation: nil)
                                         transaction.disablesAnimations = true
                                         withTransaction(transaction) {
