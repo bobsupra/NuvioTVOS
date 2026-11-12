@@ -1764,6 +1764,7 @@ struct SettingsView: View {
                             .padding(.leading, 44)
                             .padding(.trailing, 72)
                             .padding(.vertical, 56)
+                            .background(TVTopBarScrollAnchor())
                         }
                         // Every category shares this one ScrollView, so without a
                         // per-category identity SwiftUI reuses it and carries the
@@ -12665,6 +12666,7 @@ struct SubtitleStyleEditor: View {
                     // the scroll view's bottom clip edge — without it, focusing the
                     // final stepper leaves its +/- controls sliced off the bottom.
                     .padding(.bottom, 140)
+                    .background(TVTopBarScrollAnchor())
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .focusSection()

@@ -654,6 +654,7 @@ public struct LibraryView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 90)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(TVTopBarScrollAnchor())
             }
             .focusSection()
             .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
@@ -744,6 +745,7 @@ public struct LibraryView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 90)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(TVTopBarScrollAnchor())
         }
         .focusSection()
         .defaultFocusIfAvailable($cloudFocusedKey, lastFocusedCloudItemID ?? cloudViewModel.filteredItems.first?.stableKey)
@@ -798,6 +800,7 @@ public struct LibraryView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 90)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(TVTopBarScrollAnchor())
         }
         .focusSection()
         .defaultFocusIfAvailable($cloudFocusedKey, lastFocusedCloudItemID ?? defaultFileKey)

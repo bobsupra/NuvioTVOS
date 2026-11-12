@@ -4845,9 +4845,11 @@ private struct TVMainTabView: View {
                     .tag(TVTab.party)
             }
             searchTab
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .search)
                 .tabItem { Label(TVTab.search.title, systemImage: TVTab.search.symbol) }
                 .tag(TVTab.search)
             libraryTabContent
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .library)
                 .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
                 .tag(TVTab.library)
             if nativeIPTVEnabled {
@@ -4860,7 +4862,9 @@ private struct TVMainTabView: View {
                     .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
                     .tag(TVTab.calendar)
             }
-            settingsTabContent.tabItem { settingsTabLabel }.tag(TVTab.settings)
+            settingsTabContent
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .settings)
+                .tabItem { settingsTabLabel }.tag(TVTab.settings)
             ForEach(directCollectionDestinations + genreCollectionDestinations) { destination in
                 collectionTabContent(destination)
                     .tabItem { collectionTabLabel(destination) }
@@ -5322,6 +5326,24 @@ struct TVReauthBannerView: View {
 }
 
 #if os(tvOS)
+private struct TVTopBarScrollEnabledKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var tvTopBarScrollEnabled: Bool {
+        get { self[TVTopBarScrollEnabledKey.self] }
+        set { self[TVTopBarScrollEnabledKey.self] = newValue }
+    }
+}
+
+/// Place inside the primary vertical scroll content of a top-level tab.
+struct TVTopBarScrollAnchor: View {
+    @Environment(\.tvTopBarScrollEnabled) private var enabled
+    var isActive = true
+    var body: some View { TVTopBarScrollLink(enabled: enabled && isActive) }
+}
+
 struct TVScrollViewFocusConfigurator: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: .zero)
@@ -5362,6 +5384,79 @@ struct TVScrollViewFocusConfigurator: UIViewRepresentable {
             current = c.superview
         }
         return nil
+    }
+}
+
+/// Experimental: associate Home's vertical rows with the system's top bar.
+/// The marker lives inside the scroll content, so its closest scroll ancestor
+/// is the intended vertical container rather than one of the horizontal rows.
+private struct TVTopBarScrollLink: UIViewRepresentable {
+    let enabled: Bool
+
+    func makeUIView(context: Context) -> Marker {
+        let marker = Marker()
+        marker.isUserInteractionEnabled = false
+        marker.backgroundColor = .clear
+        return marker
+    }
+
+    func updateUIView(_ view: Marker, context: Context) {
+        view.setEnabled(enabled)
+    }
+
+    static func dismantleUIView(_ view: Marker, coordinator: ()) {
+        view.setEnabled(false)
+    }
+
+    final class Marker: UIView {
+        private weak var linkedController: UIViewController?
+        private weak var linkedScroll: UIScrollView?
+        private var enabled = false
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            scheduleUpdate()
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            scheduleUpdate()
+        }
+
+        func setEnabled(_ value: Bool) {
+            enabled = value
+            if !value { unlink() }
+            else { scheduleUpdate() }
+        }
+
+        private func scheduleUpdate() {
+            DispatchQueue.main.async { [weak self] in self?.updateLink() }
+        }
+
+        private func updateLink() {
+            guard enabled, window != nil else { unlink(); return }
+            var ancestor = superview
+            while ancestor != nil && !(ancestor is UIScrollView) { ancestor = ancestor?.superview }
+            guard let scroll = ancestor as? UIScrollView else { unlink(); return }
+            var responder: UIResponder? = self
+            while let current = responder, !(current is UIViewController) { responder = current.next }
+            guard let controller = responder as? UIViewController,
+                  !(controller is UINavigationController), !(controller is UITabBarController) else { unlink(); return }
+            if linkedController === controller && linkedScroll === scroll { return }
+            unlink()
+            controller.setContentScrollView(scroll, for: .top)
+            linkedController = controller
+            linkedScroll = scroll
+        }
+
+        private func unlink() {
+            if let controller = linkedController, let scroll = linkedScroll,
+               controller.contentScrollView(for: .top) === scroll {
+                controller.setContentScrollView(nil, for: .top)
+            }
+            linkedController = nil
+            linkedScroll = nil
+        }
     }
 }
 #endif
@@ -5620,6 +5715,7 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
@@ -5961,6 +6057,7 @@ struct TVHomeView: View {
                                     // Place the configurator inside the scroll content so its
                                     // ancestor is the UIScrollView that owns the row offset.
                                     .background(TVScrollViewFocusConfigurator())
+                                    .background(TVTopBarScrollLink(enabled: useTopNavigation && isActive))
                                     #endif
                                     .onAppear {
                                         prepareInitialFocusViewport(
@@ -6886,6 +6983,7 @@ struct TVHomeView: View {
                     heroEnabled && !heroItems.isEmpty ? 0 : TVHomeLayout.rowsTopPadding
                 )
                 .padding(.bottom, 80)
+                .background(TVTopBarScrollLink(enabled: useTopNavigation && isActive))
                 .onAppear {
                     prepareInitialFocusViewport(
                         for: sections,

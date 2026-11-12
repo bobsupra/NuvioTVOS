@@ -951,6 +951,7 @@ struct NetflixSearchView: View {
                 }
                 .padding(.top, 6)
                 .padding(.bottom, 40)
+                .background(TVTopBarScrollAnchor(isActive: focusedItemID?.hasPrefix("list:") == true))
             }
             .background {
                 GeometryReader { geometry in
@@ -1026,6 +1027,7 @@ struct NetflixSearchView: View {
                 .padding(.top, 12)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 40)
+                .background(TVTopBarScrollAnchor(isActive: focusedItemID?.hasPrefix("list:") != true))
             }
             .background {
                 GeometryReader { geometry in

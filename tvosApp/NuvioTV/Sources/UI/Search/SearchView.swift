@@ -314,6 +314,7 @@ struct SearchView: View {
             }
             .padding(.top, 16)
             .padding(.horizontal, SearchGridMetrics.gridContentInset)
+            .background(TVTopBarScrollAnchor())
         }
         .focusSection()
         .defaultFocusIfAvailable($focusedResultID, defaultResultFocusID)
