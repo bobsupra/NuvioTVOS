@@ -4828,7 +4828,14 @@ private struct TVMainTabView: View {
     // Compatibility shell for systems predating native tab sections.
     private var standardTabs: some View {
         TabView(selection: $selectedTab) {
-            Color.clear.tabItem { profileTabLabel }.tag(TVTab.profile)
+            Group {
+                if useTopNavigation {
+                    topBarProfileContent
+                } else {
+                    Color.clear
+                }
+            }
+            .tabItem { profileTabLabel }.tag(TVTab.profile)
             homeTabContent
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
@@ -4860,6 +4867,26 @@ private struct TVMainTabView: View {
                     .tag(TVTab.collection(destination.id))
             }
         }
+    }
+
+    private var topBarProfileContent: some View {
+        VStack(spacing: 24) {
+            ProfileAvatarView(
+                avatarId: displayedProfile?.avatarId ?? ProfileAvatarCatalog.defaultId,
+                size: 144,
+                showsFocusOutline: false
+            )
+            Text(profileTabTitle)
+                .font(.title2.bold())
+            Button {
+                guard !isProfileFocusPending else { return }
+                onSwitchProfile()
+            } label: {
+                Label(L10n.string("profile_change", fallback: "Change Profile"), systemImage: "arrow.left.arrow.right")
+            }
+            .disabled(isProfileFocusPending)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -5025,7 +5052,7 @@ private struct TVMainTabView: View {
                     selectedTab = .home
                     return
                 }
-                onSwitchProfile()
+                if !useTopNavigation { onSwitchProfile() }
             }
         }
         // Re-attempt once the catalog finishes loading, since the first refresh
