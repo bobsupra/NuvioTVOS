@@ -1036,7 +1036,7 @@ final class NativeAVPlayerHost {
             object: avPlayer,
             queue: .main
         ) { [weak self] notification in
-            let reason = (notification.userInfo?[AVPlayer.rateDidChangeReasonKey] as? String)
+            let reason = (notification.userInfo?["AVPlayerRateDidChangeReasonKey"] as? String)
                 .map(AVPlayer.RateDidChangeReason.init(rawValue:))
             // Delivered on .main (queue: .main above), so assert MainActor to reach @MainActor state.
             MainActor.assumeIsolated {

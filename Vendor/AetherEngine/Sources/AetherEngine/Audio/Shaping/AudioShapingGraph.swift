@@ -105,7 +105,9 @@ final class AudioShapingGraph {
           sourceHasCentre: Bool, outputFormat: AVSampleFormat) {
         var described = [CChar](repeating: 0, count: 64)
         guard av_channel_layout_describe(layout, &described, described.count) >= 0 else { return nil }
-        let layoutDescription = String(cString: described)
+        let layoutDescription = described.withUnsafeBufferPointer { ptr in
+            ptr.baseAddress.map { String(cString: $0) } ?? ""
+        }
         let enhance = Self.usesStereoDialogueEnhance(shaping: shaping, outputChannels: layout.pointee.nb_channels,
                                                       sourceHasCentre: sourceHasCentre)
         self.chain = Self.chain(shaping: shaping, stereoDialogueEnhance: enhance,

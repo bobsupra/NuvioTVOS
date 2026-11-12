@@ -4,6 +4,163 @@ import Foundation
 import CoreMedia
 import AetherLibavcodec
 import AetherLibavutil
+import Synchronization
+
+/// Aggregate phase timings for startup diagnosis. The timer uses its own lock so it can report while
+/// `feed` is synchronously inside the decoder or renderer.
+private final class SpatialAudioStartupTiming: @unchecked Sendable {
+    enum Phase {
+        case decode
+        case render
+        case encodeSubmit
+    }
+
+    private let lock = NSLock()
+    private let startedAt = DispatchTime.now().uptimeNanoseconds
+    private let timer: DispatchSourceTimer
+    private let collecting = Atomic<Bool>(true)
+    private var finished = false
+    private var feedPackets = 0
+    private var inputBytes: UInt64 = 0
+    private var decodedBlocks = 0
+    private var renderedFrames: Int64 = 0
+    private var feedNanoseconds: UInt64 = 0
+    private var decodeNanoseconds: UInt64 = 0
+    private var renderNanoseconds: UInt64 = 0
+    private var encodeSubmitNanoseconds: UInt64 = 0
+    private var feedStartedAt: UInt64?
+    private var decodeStartedAt: UInt64?
+    private var renderStartedAt: UInt64?
+    private var encodeSubmitStartedAt: UInt64?
+
+    init() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.aether.spatial-startup-diagnostics"))
+        self.timer = timer
+        timer.setEventHandler { [weak self] in self?.reportInterval() }
+        timer.schedule(deadline: .now() + .seconds(5), repeating: .seconds(5))
+        timer.resume()
+    }
+
+    deinit { timer.cancel() }
+
+    func beginFeed(bytes: Int) {
+        guard collecting.load(ordering: .relaxed) else { return }
+        lock.lock()
+        if collecting.load(ordering: .relaxed) {
+            feedPackets += 1
+            inputBytes &+= UInt64(max(0, bytes))
+            feedStartedAt = DispatchTime.now().uptimeNanoseconds
+        }
+        lock.unlock()
+    }
+
+    func endFeed() {
+        guard collecting.load(ordering: .relaxed) else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        if collecting.load(ordering: .relaxed), let start = feedStartedAt {
+            feedNanoseconds &+= now &- start
+            feedStartedAt = nil
+        }
+        lock.unlock()
+    }
+
+    func noteDecodedBlock(frames: Int) {
+        guard collecting.load(ordering: .relaxed) else { return }
+        lock.lock()
+        if collecting.load(ordering: .relaxed) {
+            decodedBlocks += 1
+            renderedFrames &+= Int64(max(0, frames))
+        }
+        lock.unlock()
+    }
+
+    func measure<T>(_ phase: Phase, _ body: () throws -> T) rethrows -> T {
+        guard collecting.load(ordering: .relaxed) else { return try body() }
+        let start = DispatchTime.now().uptimeNanoseconds
+        setStartedAt(start, for: phase)
+        defer { recordEndedAt(DispatchTime.now().uptimeNanoseconds, start: start, for: phase) }
+        return try body()
+    }
+
+    func finish(reason: String) {
+        closeCollection(phase: "teardown reason=\(reason)")
+    }
+
+    private func reportInterval() {
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- startedAt
+        if elapsed >= 45_000_000_000 {
+            closeCollection(phase: "window-end")
+        } else {
+            emit(phase: "interval")
+        }
+    }
+
+    private func closeCollection(phase: String) {
+        guard collecting.exchange(false, ordering: .acquiringAndReleasing) else { return }
+        emit(phase: phase, final: true)
+        timer.cancel()
+    }
+
+    private func setStartedAt(_ value: UInt64, for phase: Phase) {
+        lock.lock()
+        if collecting.load(ordering: .relaxed) {
+            switch phase {
+            case .decode: decodeStartedAt = value
+            case .render: renderStartedAt = value
+            case .encodeSubmit: encodeSubmitStartedAt = value
+            }
+        }
+        lock.unlock()
+    }
+
+    private func recordEndedAt(_ value: UInt64, start: UInt64, for phase: Phase) {
+        guard collecting.load(ordering: .relaxed) else { return }
+        lock.lock()
+        guard collecting.load(ordering: .relaxed) else {
+            lock.unlock()
+            return
+        }
+        switch phase {
+        case .decode:
+            decodeNanoseconds &+= value &- start
+            decodeStartedAt = nil
+        case .render:
+            renderNanoseconds &+= value &- start
+            renderStartedAt = nil
+        case .encodeSubmit:
+            encodeSubmitNanoseconds &+= value &- start
+            encodeSubmitStartedAt = nil
+        }
+        lock.unlock()
+    }
+
+    private func emit(phase: String, final: Bool = false) {
+        lock.lock()
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        if final { finished = true }
+        func milliseconds(_ total: UInt64, activeSince: UInt64?) -> String {
+            let active = activeSince.map { now &- $0 } ?? 0
+            return String(format: "%.1f(active=%.1f)", Double(total &+ active) / 1_000_000,
+                          Double(active) / 1_000_000)
+        }
+        let elapsed = Double(now &- startedAt) / 1_000_000_000
+        let mediaSeconds = Double(renderedFrames) / 48_000
+        let line = "[SpatialAudioStartup] phase=\(phase) elapsed=\(String(format: "%.1f", elapsed))s "
+            + "feedPackets=\(feedPackets) inputBytes=\(inputBytes) decodedBlocks=\(decodedBlocks) "
+            + "media=\(String(format: "%.2f", mediaSeconds))s "
+            + "decodeMs=\(milliseconds(decodeNanoseconds, activeSince: decodeStartedAt)) "
+            + "renderMs=\(milliseconds(renderNanoseconds, activeSince: renderStartedAt)) "
+            + "encodeSubmitMs=\(milliseconds(encodeSubmitNanoseconds, activeSince: encodeSubmitStartedAt)) "
+            + "feedMs=\(milliseconds(feedNanoseconds, activeSince: feedStartedAt))"
+        lock.unlock()
+        EngineLog.emit(line, category: .session)
+    }
+}
 
 /// TrueHD Atmos or DTS:X in, a speaker bed out: decodes the object presentation, renders its beds and
 /// objects into a `SpatialSpeakerLayout` bed and delivers that as 24-bit PCM or Apple Positional Audio
@@ -102,6 +259,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private var consecutiveEncodeFailures = 0
 
     private let opLock = NSLock()
+    private let startupTiming = SpatialAudioStartupTiming()
     private var stats = AudioBridge.FeedStats()
     private(set) var outputBytesLifetime: Int64 = 0
 
@@ -203,7 +361,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// HLS `CODECS` value for the PCM bed, the `ipcm` sample entry's four-character code.
     static let pcmHLSCodecs = "ipcm"
 
-    deinit { cleanup() }
+    deinit {
+        startupTiming.finish(reason: "deinit")
+        cleanup()
+    }
 
     /// ALAC, 2 channels, 48 kHz, 1024-frame packets: a stream movenc writes from parameters alone and
     /// never inspects the packets of. Its sample entry is replaced wholesale, so only the timing
@@ -244,6 +405,8 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     func feed(packet: UnsafePointer<AVPacket>) throws -> [UnsafeMutablePointer<AVPacket>] {
         opLock.lock()
         defer { opLock.unlock() }
+        startupTiming.beginFeed(bytes: Int(packet.pointee.size))
+        defer { startupTiming.endFeed() }
         stats.packetsFed += 1
         stats.packetsFedSinceLastEnqueue += 1
         // Every exit: a decoder that rejects each packet has decoded nothing too.
@@ -251,7 +414,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
 
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return [] }
         do {
-            try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+            try startupTiming.measure(.decode) {
+                try decoder.push(UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)))
+            }
         } catch {
             stats.packetsRejected += 1
             noteDecoderSelfReset()
@@ -272,9 +437,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         // their timestamps are right, and dropping them would leave a hole the source never had.
         var results: [UnsafeMutablePointer<AVPacket>] = []
         do {
-            while let block = try decoder.nextBlock() {
+            while let block = try startupTiming.measure(.decode, { try decoder.nextBlock() }) {
                 stats.framesDecoded += 1
-                try renderAndEncode(block, into: &results)
+                startupTiming.noteDecodedBlock(frames: block.frameCount)
+                try startupTiming.measure(.render) { try renderAndEncode(block, into: &results) }
             }
             consecutiveFeedFailures = 0
         } catch {
@@ -358,6 +524,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         if !results.isEmpty {
             EngineLog.emit("[SpatialAudioBridge] EOF flush emitted \(results.count) tail packet(s)", category: .session)
         }
+        startupTiming.finish(reason: "flush")
         return results
     }
 
@@ -399,6 +566,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         // A viewer who hears no heights stops playback: the window they stopped in is the one to log.
         logLevels(levelMeter.restart())
         sink.close()
+        startupTiming.finish(reason: "close")
         cleanup()
     }
 
@@ -412,9 +580,10 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     private func renderHeldBlocks(into results: inout [UnsafeMutablePointer<AVPacket>]) {
         decoder.releaseHeldBlocks()
         do {
-            while let block = try decoder.nextBlock() {
+            while let block = try startupTiming.measure(.decode, { try decoder.nextBlock() }) {
                 stats.framesDecoded += 1
-                try renderAndEncode(block, into: &results)
+                startupTiming.noteDecodedBlock(frames: block.frameCount)
+                try startupTiming.measure(.render) { try renderAndEncode(block, into: &results) }
             }
         } catch {
             EngineLog.emit("[SpatialAudioBridge] drain of held blocks failed: \(error)", category: .session)
@@ -568,7 +737,9 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         // Where this chunk plays, for the level line: the anchor is a source PTS in 48 kHz frames.
         logLevels(levelMeter.add(output.planes.map { UnsafePointer($0) }, frameCount: frames,
                                  startSeconds: Double(position) / Double(Self.sampleRate)))
-        output = sink.submit(output, frames: frames, position: position)
+        output = startupTiming.measure(.encodeSubmit) {
+            sink.submit(output, frames: frames, position: position)
+        }
         encoderFramesIn += Int64(frames)
     }
 

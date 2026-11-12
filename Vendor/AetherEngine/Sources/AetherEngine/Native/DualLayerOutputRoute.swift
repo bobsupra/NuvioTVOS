@@ -609,7 +609,7 @@ final class DualLayerOutputRoute: VideoPacketTapReceiver, @unchecked Sendable {
         var owned: UnsafeMutablePointer<AVPacket>? = packet
         defer { trackedPacketFree(&owned) }
         guard av_new_packet(packet, Int32(data.count)) >= 0, let target = packet.pointee.data else { return }
-        data.withUnsafeBytes { memcpy(target, $0.baseAddress!, data.count) }
+        _ = data.withUnsafeBytes { memcpy(target, $0.baseAddress!, data.count) }
         let ticks = Int64((entry.item * 90000).rounded())
         packet.pointee.pts = ticks
         packet.pointee.dts = Int64((entry.decode * 90000).rounded())
