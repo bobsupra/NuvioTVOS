@@ -45,8 +45,8 @@ enum SearchHistoryStore {
         return Array(result.prefix(maxCount))
     }
 
-    /// Loads and sanitizes recent searches from UserDefaults.
-    static func load(defaults: UserDefaults = .standard) -> [String] {
+    /// Loads and sanitizes the active profile's recent searches.
+    static func load(defaults: UserDefaults = ProfileSettings.current) -> [String] {
         let stored = defaults.stringArray(forKey: storageKey) ?? []
         let sanitized = sanitize(stored)
         if sanitized != stored {
@@ -119,8 +119,8 @@ enum SearchHistoryStore {
         return false
     }
 
-    /// Saves the recent searches to UserDefaults.
-    static func save(_ searches: [String], defaults: UserDefaults = .standard) {
+    /// Saves the active profile's recent searches.
+    static func save(_ searches: [String], defaults: UserDefaults = ProfileSettings.current) {
         defaults.set(searches, forKey: storageKey)
     }
 }

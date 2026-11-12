@@ -12483,6 +12483,9 @@ enum ProfileSettings {
         for key in SettingsKey.all {
             UserDefaults.standard.removeObject(forKey: key)
         }
+        // Recent searches were kept in `.standard` for every profile before they moved into
+        // each profile's suite (removed above with the suites).
+        UserDefaults.standard.removeObject(forKey: SearchHistoryStore.storageKey)
     }
 
     /// Clone the current profile's settings into a freshly created profile, then
