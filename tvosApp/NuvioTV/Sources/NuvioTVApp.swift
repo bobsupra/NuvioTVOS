@@ -5011,6 +5011,7 @@ private struct TVMainTabView: View {
 
     private var tabs: some View {
         tabShell
+        .background(NativeTopBarClock(enabled: useTopNavigation))
         .background(Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea())
         .sheet(isPresented: $showingReauthSheet) {
             ReauthSheet(auth: authManager) {
