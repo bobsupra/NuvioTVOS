@@ -1750,6 +1750,14 @@ struct LiquidGlassSurface: ViewModifier {
                         in: shape
                     )
                     .glassEffect(.regular, in: shape)
+            } else if !AppleTVCapability.current.supportsLiquidGlass {
+                // Devices without Liquid Glass (Apple TV HD, 4K 1st gen) can't afford a live
+                // blur either: collection covers show one per visible card. A flat fill instead.
+                content
+                    .background(
+                        Color.white.opacity(prominent ? 0.20 : 0.12),
+                        in: shape
+                    )
             } else {
                 content
                     .background(.ultraThinMaterial, in: shape)
@@ -1802,6 +1810,10 @@ struct LiquidGlassCardModifier: ViewModifier {
                             shape
                                 .fill(Color.white.opacity(0.16))
                                 .glassEffect(.regular, in: shape)
+                        } else if !AppleTVCapability.current.supportsLiquidGlass {
+                            // No live blur on devices without Liquid Glass; see LiquidGlassSurface.
+                            shape
+                                .fill(Color.white.opacity(0.20))
                         } else {
                             shape
                                 .fill(.ultraThinMaterial)
