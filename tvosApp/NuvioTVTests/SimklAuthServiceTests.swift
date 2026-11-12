@@ -2137,6 +2137,219 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertGreaterThan(item.position, 1.0)
     }
 
+    func testContinueWatchingExcludesCompletedAndDroppedSeries() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+
+        let completedMeta = NuvioMeta(
+            id: "tt1111111",
+            name: "Completed Show",
+            imdbId: "tt1111111",
+            type: "series",
+            year: 2026,
+            videos: [
+                NuvioVideo(id: "tt1111111:1:1", title: "Ep 1", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+                NuvioVideo(id: "tt1111111:1:2", title: "Finale", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil)
+            ]
+        )
+        let droppedMeta = NuvioMeta(
+            id: "tt2222222",
+            name: "Dropped Show",
+            imdbId: "tt2222222",
+            type: "series",
+            year: 2026,
+            videos: [
+                NuvioVideo(id: "tt2222222:1:1", title: "Ep 1", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+                NuvioVideo(id: "tt2222222:1:2", title: "Ep 2", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil),
+                NuvioVideo(id: "tt2222222:1:3", title: "Ep 3", season: 1, episode: 3, thumbnail: nil, overview: nil, released: nil, rating: nil)
+            ]
+        )
+        let watchingMeta = NuvioMeta(
+            id: "tt3333333",
+            name: "Active Show",
+            imdbId: "tt3333333",
+            type: "series",
+            year: 2026,
+            videos: [
+                NuvioVideo(id: "tt3333333:1:1", title: "Ep 1", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+                NuvioVideo(id: "tt3333333:1:2", title: "Ep 2", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil)
+            ]
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "all": "2026-05-15T00:32:21Z",
+                      "playback": "2026-05-15T00:32:21Z",
+                      "tv_shows": {
+                        "all": "2026-05-15T00:32:21Z",
+                        "watched_at": "2026-05-15T00:32:21Z"
+                      }
+                    }
+                    """
+                )
+            case "/sync/playback":
+                return Self.response(for: request, status: 204, json: "")
+            case "/sync/all-items/shows":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "shows": [
+                        {
+                          "last_watched_at": "2026-05-15T00:32:21Z",
+                          "status": "completed",
+                          "show": {
+                            "title": "Completed Show",
+                            "year": 2026,
+                            "ids": {"imdb": "tt1111111"}
+                          },
+                          "seasons": [
+                            {"number": 1, "episodes": [{"number": 1, "watched_at": "2026-05-15T00:00:00Z"}, {"number": 2, "watched_at": "2026-05-15T00:32:21Z"}]}
+                          ]
+                        },
+                        {
+                          "last_watched_at": "2026-05-15T00:30:00Z",
+                          "status": "dropped",
+                          "show": {
+                            "title": "Dropped Show",
+                            "year": 2026,
+                            "ids": {"imdb": "tt2222222"}
+                          },
+                          "seasons": [
+                            {"number": 1, "episodes": [{"number": 1, "watched_at": "2026-05-15T00:30:00Z"}]}
+                          ]
+                        },
+                        {
+                          "last_watched_at": "2026-05-15T00:25:00Z",
+                          "status": "watching",
+                          "next_to_watch": "S01E02",
+                          "show": {
+                            "title": "Active Show",
+                            "year": 2026,
+                            "ids": {"imdb": "tt3333333"}
+                          },
+                          "seasons": [
+                            {"number": 1, "episodes": [{"number": 1, "watched_at": "2026-05-15T00:25:00Z"}]}
+                          ]
+                        }
+                      ]
+                    }
+                    """
+                )
+            case "/sync/all-items/movies", "/sync/all-items/anime":
+                return Self.response(for: request, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let metas = [
+            "tt1111111": completedMeta,
+            "tt2222222": droppedMeta,
+            "tt3333333": watchingMeta
+        ]
+        let repo = SimklContinueWatchingTestRepo(metas: metas)
+        let items = await SimklProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        let resolved = try XCTUnwrap(items)
+        XCTAssertEqual(resolved.count, 1, "Only the actively watching series should appear in Continue Watching")
+        let item = try XCTUnwrap(resolved.first)
+        XCTAssertEqual(item.meta.id, "tt3333333")
+        XCTAssertEqual(item.episodeNumbers?.season, 1)
+        XCTAssertEqual(item.episodeNumbers?.episode, 2)
+    }
+
+    func testContinueWatchingDoesNotFabricateEpisodePastSeriesFinale() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+
+        let finaleMeta = NuvioMeta(
+            id: "tt4444444",
+            name: "Finished Show",
+            imdbId: "tt4444444",
+            type: "series",
+            year: 2026,
+            videos: [
+                NuvioVideo(id: "tt4444444:1:1", title: "Ep 1", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+                NuvioVideo(id: "tt4444444:1:2", title: "Finale", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil)
+            ]
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/sync/activities":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "all": "2026-05-15T00:32:21Z",
+                      "playback": "2026-05-15T00:32:21Z",
+                      "tv_shows": {
+                        "all": "2026-05-15T00:32:21Z",
+                        "watched_at": "2026-05-15T00:32:21Z"
+                      }
+                    }
+                    """
+                )
+            case "/sync/playback":
+                return Self.response(for: request, status: 204, json: "")
+            case "/sync/all-items/shows":
+                return Self.response(
+                    for: request,
+                    json: """
+                    {
+                      "shows": [
+                        {
+                          "last_watched_at": "2026-05-15T00:32:21Z",
+                          "status": "watching",
+                          "watched_episodes_count": 2,
+                          "total_episodes_count": 2,
+                          "show": {
+                            "title": "Finished Show",
+                            "year": 2026,
+                            "ids": {"imdb": "tt4444444"}
+                          },
+                          "seasons": [
+                            {"number": 1, "episodes": [{"number": 1, "watched_at": "2026-05-15T00:00:00Z"}, {"number": 2, "watched_at": "2026-05-15T00:32:21Z"}]}
+                          ]
+                        }
+                      ]
+                    }
+                    """
+                )
+            case "/sync/all-items/movies", "/sync/all-items/anime":
+                return Self.response(for: request, json: "{}")
+            default:
+                XCTFail("Unexpected Simkl request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: "{}")
+            }
+        }
+
+        let repo = SimklContinueWatchingTestRepo(meta: finaleMeta)
+        let items = await SimklProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        let resolved = try XCTUnwrap(items)
+        XCTAssertTrue(resolved.isEmpty, "Finished show with all episodes watched must not produce a card for episode 3 past finale")
+    }
+
     func testWatchedItemsFallsBackToShowDateWhenEpisodeWatchedAtIsMissing() throws {
         let json = """
         {

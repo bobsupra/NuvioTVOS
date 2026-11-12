@@ -2910,7 +2910,8 @@ struct SimklProgressService {
         if results.count < 20 {
             let needed = 20 - results.count
             let libraryResponse: SimklAllItemsResponse?
-            if let cached = SimklSyncCache.items(in: store) {
+            let itemSnapshot = SimklSyncCache.itemSnapshot(in: store)
+            if let cached = itemSnapshot?.items, itemSnapshot?.activities?.all == activities.all {
                 libraryResponse = cached
             } else {
                 libraryResponse = await SimklSyncLoader.libraryItems(using: service)
@@ -2918,18 +2919,40 @@ struct SimklProgressService {
 
             var candidateSeeds: [SimklProgressItemSeed] = []
             var candidateKeys = Set<String>()
+            var libraryMetas: [NuvioMeta] = []
+
+            let allShows: [(String, SimklSyncItem)] = (libraryResponse?.shows ?? []).map { ("series", $0) }
+            let allAnime: [(String, SimklSyncItem)] = (libraryResponse?.anime ?? []).map { ("series", $0) }
+            let allMovies: [(String, SimklSyncItem)] = (libraryResponse?.movies ?? []).map { ("movie", $0) }
+            let allLibraryItems = allShows + allAnime + allMovies
+
+            // Register all titles in user's Simkl account so seeds from history cannot
+            // resurrect series that are already completed, dropped, on-hold, plan to watch,
+            // or caught up.
+            for (type, item) in allLibraryItems {
+                if let placeholder = placeholderMeta(item: item, type: type) {
+                    libraryMetas.append(placeholder)
+                    candidateKeys.insert("\(type):\(placeholder.id.lowercased())")
+                    if let imdb = placeholder.imdbId?.lowercased(), !imdb.isEmpty {
+                        candidateKeys.insert("\(type):\(imdb)")
+                    }
+                }
+                let itemIdentity = SimklAllItemsResponse.identity(item).lowercased()
+                candidateKeys.insert("\(type):\(itemIdentity)")
+                if let simkl = item.ids?.simkl, simkl > 0 {
+                    candidateKeys.insert("\(type):simkl:\(simkl)")
+                }
+                if let tmdb = item.ids?.tmdb, tmdb > 0 {
+                    candidateKeys.insert("\(type):tmdb:\(tmdb)")
+                }
+            }
 
             // 1. Titles in user's active Simkl Watching list (shows, anime, movies)
-            let watchingShows: [(String, SimklSyncItem)] = (libraryResponse?.shows ?? []).compactMap { $0.status?.lowercased() == "watching" ? ("series", $0) : nil }
-            let watchingAnime: [(String, SimklSyncItem)] = (libraryResponse?.anime ?? []).compactMap { $0.status?.lowercased() == "watching" ? ("series", $0) : nil }
-            let watchingMovies: [(String, SimklSyncItem)] = (libraryResponse?.movies ?? []).compactMap { $0.status?.lowercased() == "watching" ? ("movie", $0) : nil }
-            let watchingItems = watchingShows + watchingAnime + watchingMovies
+            let watchingItems = allLibraryItems.filter { $0.1.status?.lowercased() == "watching" }
 
             for (type, item) in watchingItems {
                 guard let placeholder = placeholderMeta(item: item, type: type) else { continue }
                 guard !playbackMetas.contains(where: { WatchedStore.sameContent($0, placeholder) }) else { continue }
-                let key = "\(type):\(placeholder.id.lowercased())"
-                guard candidateKeys.insert(key).inserted else { continue }
 
                 let date = parseDate(item.lastWatchedAt)
                     ?? parseDate(item.addedToWatchlistAt)
@@ -2976,10 +2999,12 @@ struct SimklProgressService {
                 }
             }
 
-            // 2. Up Next seeds from Watched History
+            // 2. Up Next seeds from Watched History (only for titles not in library response)
             for seed in upNextSeeds {
                 guard !playbackMetas.contains(where: { WatchedStore.sameContent($0, seed.meta) }) else { continue }
                 let key = "series:\(seed.meta.id.lowercased())"
+                guard !candidateKeys.contains(key),
+                      !libraryMetas.contains(where: { WatchedStore.sameContent($0, seed.meta) }) else { continue }
                 guard candidateKeys.insert(key).inserted else { continue }
 
                 candidateSeeds.append(SimklProgressItemSeed(
@@ -3132,6 +3157,16 @@ struct SimklProgressService {
             targetSeason = s
             targetEpisode = e
             matchedVideo = meta.videos?.first(where: { $0.season == s && $0.episode == e })
+            if matchedVideo == nil, let refreshed = try? await repository.refreshMetadata(
+                id: seed.meta.id,
+                type: "series"
+            ) {
+                meta = refreshed
+                matchedVideo = meta.videos?.first(where: { $0.season == s && $0.episode == e })
+            }
+            if let videos = meta.videos, !videos.isEmpty, matchedVideo == nil {
+                return nil
+            }
         } else {
             let watchedSeason = seed.upNextWatchedSeason ?? 1
             let watchedEp = seed.episode ?? 1
@@ -3149,14 +3184,10 @@ struct SimklProgressService {
                     in: meta
                 )
             }
-            if let next {
-                targetSeason = next.season
-                targetEpisode = next.episode
-                matchedVideo = next
-            } else {
-                targetSeason = watchedSeason
-                targetEpisode = watchedEp + 1
-            }
+            guard let next else { return nil }
+            targetSeason = next.season
+            targetEpisode = next.episode
+            matchedVideo = next
         }
 
         if let released = matchedVideo?.released {
