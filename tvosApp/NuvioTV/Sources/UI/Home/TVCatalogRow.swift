@@ -387,6 +387,9 @@ struct TVCatalogRow: View {
     let horizontalEdgeInset: CGFloat
     let items: [NuvioMeta]
     var progressByItemId: [String: ContinueWatchingItem] = [:]
+    /// IDs whose actual next episode follows the furthest watched guide entry.
+    /// Built by Home when progress/watch state changes, outside card rendering.
+    var revealableNextEpisodeMetaIDs: Set<String> = []
     /// The Today row's episode, time and picture per card, shown
     /// like Up Next cards.
     var calendarLabelsByItemId: [String: CalendarHomeToday.CardLabel] = [:]
@@ -588,6 +591,9 @@ struct TVCatalogRow: View {
                 let upcomingArtworkURL: String? = id == TVHomeSection.upcomingId ? progressItem?.meta.backdropUrl : nil
                 let episodeArtworkURL: String? = progressItem?.episodeArtworkURL ?? upcomingArtworkURL ?? calendarLabel?.artworkURL
                 let isUpNext: Bool = progressItem?.isUpNextEntry == true || calendarLabel != nil
+                let isRevealableNextEpisode = (id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId)
+                    && progressItem?.isUpNextEntry == true
+                    && revealableNextEpisodeMetaIDs.contains(item.id)
                 let upNextBadgeText: String? = progressItem?.upNextBadgeText ?? calendarLabel?.badge
                 let handleFocus: (NuvioMeta) -> Void = { focused in
                     let focusStarted = TVHomeDebugTrace.now()
@@ -651,6 +657,7 @@ struct TVCatalogRow: View {
                     continueEpisodeTitleText: episodeTitleText,
                     continueEpisodeArtworkURL: episodeArtworkURL,
                     continueIsUpNext: isUpNext,
+                    continueEpisodeSpoilerRevealable: isRevealableNextEpisode,
                     continueUpNextBadgeText: upNextBadgeText,
                     collectionOrigin: id == TVHomeSection.continueWatchingId && progressItem?.isUpNextEntry == false
                         ? collectionOriginsByItemId[item.id] : nil,
@@ -758,6 +765,7 @@ extension TVCatalogRow: Equatable {
               lhs.initialFocusCardKey == rhs.initialFocusCardKey,
               lhs.items.count == rhs.items.count,
               lhs.progressByItemId.count == rhs.progressByItemId.count,
+              lhs.revealableNextEpisodeMetaIDs == rhs.revealableNextEpisodeMetaIDs,
               lhs.calendarLabelsByItemId == rhs.calendarLabelsByItemId
         else {
             return false
@@ -992,8 +1000,8 @@ struct TVHomeSeeAllCard: View {
                 )
             )
             .shadow(
-                color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2),
-                radius: showsFocusedAppearance ? 16 : 6
+                color: .black.opacity(showsFocusedAppearance ? 0.5 : 0),
+                radius: showsFocusedAppearance ? 16 : 0
             )
             .scaleEffect(showsFocusedAppearance ? 1.06 : 1)
         }
@@ -1019,7 +1027,14 @@ struct TVHomeSeeAllCard: View {
                 didRequestInitialFocus = false
             }
         }
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
+        .animation(
+            smoothFocus
+                ? (AppleTVCapability.current.supportsLiquidGlass
+                    ? .spring(response: 0.28, dampingFraction: 0.75)
+                    : .easeOut(duration: 0.14))
+                : nil,
+            value: showsFocusedAppearance
+        )
     }
 }
 
@@ -1680,8 +1695,8 @@ struct TVCollectionFolderCard: View {
         showFocus ? (focusHighlighterEnabled ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
     }
 
-    private var shadowOpacity: Double { showFocus ? 0.5 : 0.2 }
-    private var shadowRadius: CGFloat { showFocus ? 16 : 6 }
+    private var shadowOpacity: Double { showFocus ? 0.5 : 0 }
+    private var shadowRadius: CGFloat { showFocus ? 16 : 0 }
 
     private var focusGifURLString: String? {
         folder.activeFocusGifURLString

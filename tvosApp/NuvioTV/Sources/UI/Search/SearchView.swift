@@ -542,7 +542,7 @@ struct GlassCapsule: ViewModifier {
 
     @ViewBuilder
     private func glassed(_ content: Content) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content.glassEffect(.regular, in: Capsule())
         } else {
             content.background(.ultraThinMaterial, in: Capsule())
@@ -570,7 +570,7 @@ struct GlassSearchBar: ViewModifier {
 
     @ViewBuilder
     private func glassed(_ content: Content) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         } else {
             content.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
@@ -585,7 +585,7 @@ struct GlassChipBackground: ViewModifier {
     func body(content: Content) -> some View {
         if filled {
             content.background(Color.white, in: Capsule())
-        } else if #available(tvOS 26.0, *) {
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content.glassEffect(.regular, in: Capsule())
         } else {
             content.background(.ultraThinMaterial, in: Capsule())

@@ -758,6 +758,11 @@ extension PlayerView {
                 }) {
                     NextEpisodeOverlay(
                         episode: next,
+                        isEpisodeWatched: trustedWatchedEpisodeKeys.contains(
+                            EpisodeSpoilerPolicy.episodeKey(for: next)
+                        ),
+                        isRevealableNextEpisode: revealableNextEpisodeSpoilerKey
+                            == EpisodeSpoilerPolicy.episodeKey(for: next),
                         isAdvancing: viewModel.isAdvancingEpisode,
                         isFocused: nextEpisodeFocused,
                         isAutoPlayCancelled: viewModel.isAutoPlayCancelled

@@ -360,22 +360,34 @@ struct DetailsNavigationEntry {
     let id: String
     let type: String
     let libraryWatchedContext: LibraryWatchedContext?
-    let relatedFocusID: String?
+    let focusTarget: DetailsFocusTarget?
     let relatedItemsSnapshot: DetailsRelatedItemsSnapshot?
 
     init(
         id: String,
         type: String,
         libraryWatchedContext: LibraryWatchedContext?,
-        relatedFocusID: String? = nil,
+        focusTarget: DetailsFocusTarget? = nil,
         relatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil
     ) {
         self.id = id
         self.type = type
         self.libraryWatchedContext = libraryWatchedContext
-        self.relatedFocusID = relatedFocusID
+        self.focusTarget = focusTarget
         self.relatedItemsSnapshot = relatedItemsSnapshot
     }
+}
+
+enum DetailsFocusTargetKind: Hashable {
+    case moreLikeThis
+    case cast
+    case network
+    case production
+}
+
+struct DetailsFocusTarget: Hashable {
+    let kind: DetailsFocusTargetKind
+    let itemID: String
 }
 
 struct DetailsRelatedItemsSnapshot {
@@ -383,6 +395,8 @@ struct DetailsRelatedItemsSnapshot {
     let parentType: String
     let items: [RelatedTitle]
     let people: [TmdbPersonMetadata]
+    let peopleAreFallback: Bool
+    let companies: [MetaCompany]
     let simklRatings: SimklTitleRatings?
     let profileID: String?
     let source: String
@@ -399,17 +413,30 @@ struct DetailsRelatedItemsSnapshot {
     static func capture(
         parentID: String,
         parentType: String,
-        selectedRelatedID: String,
+        focusTarget: DetailsFocusTarget,
         items: [RelatedTitle],
         people: [TmdbPersonMetadata],
+        peopleAreFallback: Bool = false,
+        companies: [MetaCompany] = [],
         simklRatings: SimklTitleRatings?
     ) -> DetailsRelatedItemsSnapshot? {
-        guard items.contains(where: { $0.id == selectedRelatedID }) else { return nil }
+        let isKnown: Bool
+        switch focusTarget.kind {
+        case .moreLikeThis:
+            isKnown = items.contains(where: { $0.id == focusTarget.itemID })
+        case .cast:
+            isKnown = people.contains(where: { $0.id == focusTarget.itemID })
+        case .network, .production:
+            isKnown = companies.contains(where: { $0.id == focusTarget.itemID })
+        }
+        guard isKnown else { return nil }
         return DetailsRelatedItemsSnapshot(
             parentID: parentID,
             parentType: parentType,
             items: items,
             people: people,
+            peopleAreFallback: peopleAreFallback,
+            companies: companies,
             simklRatings: simklRatings,
             profileID: ProfileSettings.activeProfileID,
             source: TraktSettingsStore.moreLikeThisSource.rawValue,
@@ -421,6 +448,38 @@ struct DetailsRelatedItemsSnapshot {
             traktAccountBindingID: TraktAuthStore.accountBindingID(in: ProfileSettings.current),
             traktAuthenticated: TraktAuthStore.isAuthenticated,
             simklConfigured: SimklDetailsService.isConfigured
+        )
+    }
+
+    @MainActor
+    static func capture(
+        parentID: String,
+        parentType: String,
+        selectedRelatedID: String,
+        items: [RelatedTitle],
+        people: [TmdbPersonMetadata],
+        companies: [MetaCompany] = [],
+        simklRatings: SimklTitleRatings?
+    ) -> DetailsRelatedItemsSnapshot? {
+        let focusTarget: DetailsFocusTarget
+        if items.contains(where: { $0.id == selectedRelatedID }) {
+            focusTarget = DetailsFocusTarget(kind: .moreLikeThis, itemID: selectedRelatedID)
+        } else if people.contains(where: { $0.id == selectedRelatedID }) {
+            focusTarget = DetailsFocusTarget(kind: .cast, itemID: selectedRelatedID)
+        } else if let company = companies.first(where: { $0.id == selectedRelatedID }) {
+            let kind: DetailsFocusTargetKind = company.kind == .network ? .network : .production
+            focusTarget = DetailsFocusTarget(kind: kind, itemID: selectedRelatedID)
+        } else {
+            return nil
+        }
+        return capture(
+            parentID: parentID,
+            parentType: parentType,
+            focusTarget: focusTarget,
+            items: items,
+            people: people,
+            companies: companies,
+            simklRatings: simklRatings
         )
     }
 
@@ -450,7 +509,7 @@ struct DetailsNavigationContextTransition {
         id: String,
         type: String,
         libraryWatchedContext: LibraryWatchedContext?,
-        relatedFocusID: String? = nil,
+        focusTarget: DetailsFocusTarget? = nil,
         relatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil
     ) -> DetailsNavigationContextTransition {
         DetailsNavigationContextTransition(
@@ -458,7 +517,7 @@ struct DetailsNavigationContextTransition {
                 id: id,
                 type: type,
                 libraryWatchedContext: libraryWatchedContext,
-                relatedFocusID: relatedFocusID,
+                focusTarget: focusTarget,
                 relatedItemsSnapshot: relatedItemsSnapshot
             ),
             activeLibraryWatchedContext: nil
@@ -599,7 +658,7 @@ struct ContentView: View {
     @State private var detailsBackStack: [DetailsNavigationEntry] = []
     /// One-shot recommendation focus request carried from a pushed title back
     /// to the parent Details route.
-    @State private var pendingDetailsRelatedFocusRequest: DetailsNavigationEntry?
+    @State private var pendingDetailsFocusRequest: DetailsNavigationEntry?
     @State private var nextDetailsPlaybackRequestID: UInt = 0
     @State private var pendingDetailsPlaybackRequestID: UInt?
     @State private var presentedAppNoticeDetails: AppNotice?
@@ -1209,6 +1268,7 @@ struct ContentView: View {
         case .productionBrowse:
             withAnimation(.easeInOut(duration: 0.24)) {
                 if let ret = productionBrowseReturn {
+                    pendingDetailsFocusRequest = ret
                     activeScreen = .details(id: ret.id, type: ret.type)
                     detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                 } else {
@@ -1220,6 +1280,7 @@ struct ContentView: View {
         case .personBrowse:
             withAnimation(.easeInOut(duration: 0.24)) {
                 if let ret = personBrowseReturn {
+                    pendingDetailsFocusRequest = ret
                     activeScreen = .details(id: ret.id, type: ret.type)
                     detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                 } else {
@@ -1246,15 +1307,15 @@ struct ContentView: View {
             if let previous = detailsBackStack.popLast() {
                 activeScreen = .details(id: previous.id, type: previous.type)
                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(previous)
-                if previous.relatedFocusID != nil,
+                if previous.focusTarget != nil,
                    let snapshot = previous.relatedItemsSnapshot,
                    snapshot.isValid(for: previous.id, type: previous.type) {
-                    pendingDetailsRelatedFocusRequest = previous
+                    pendingDetailsFocusRequest = previous
                 } else {
-                    pendingDetailsRelatedFocusRequest = nil
+                    pendingDetailsFocusRequest = nil
                 }
             } else {
-                pendingDetailsRelatedFocusRequest = nil
+                pendingDetailsFocusRequest = nil
                 switch detailsReturnDestination {
                 case .main:
                     activeScreen = .main
@@ -1283,7 +1344,7 @@ struct ContentView: View {
             "details.open.root id=\(id) type=\(type) returnDest=\(returnDestination)"
         )
         detailsBackStack.removeAll()
-        pendingDetailsRelatedFocusRequest = nil
+        pendingDetailsFocusRequest = nil
         detailsCollectionContext = collectionContext
         detailsFocusEpisode = focusEpisode
         detailsLibraryWatchedContext = libraryWatchedContext
@@ -2885,6 +2946,7 @@ struct ContentView: View {
                     onBack: {
                         withAnimation(.easeInOut(duration: 0.24)) {
                             if let ret = productionBrowseReturn {
+                                pendingDetailsFocusRequest = ret
                                 activeScreen = .details(id: ret.id, type: ret.type)
                                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                             } else {
@@ -2925,6 +2987,7 @@ struct ContentView: View {
                     onBack: {
                         withAnimation(.easeInOut(duration: 0.24)) {
                             if let ret = personBrowseReturn {
+                                pendingDetailsFocusRequest = ret
                                 activeScreen = .details(id: ret.id, type: ret.type)
                                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                             } else {
@@ -3219,10 +3282,10 @@ struct ContentView: View {
 
     private func detailsScreen(contentId: String, contentType: String) -> some View {
         let provenance = detailsCollectionContext
-        let relatedRestoreEntry: DetailsNavigationEntry? = pendingDetailsRelatedFocusRequest.flatMap { entry in
+        let focusRestoreEntry: DetailsNavigationEntry? = pendingDetailsFocusRequest.flatMap { entry in
             guard entry.id == contentId,
                   entry.type == contentType,
-                  entry.relatedFocusID != nil else {
+                  entry.focusTarget != nil else {
                 return nil
             }
             return entry
@@ -3232,13 +3295,13 @@ struct ContentView: View {
             type: contentType,
             libraryWatchedContext: detailsLibraryWatchedContext,
             repository: CinemetaCatalogRepository(),
-            initialRelatedItemsSnapshot: relatedRestoreEntry?.relatedItemsSnapshot,
-            initialRelatedFocusID: relatedRestoreEntry?.relatedFocusID,
-            onRelatedFocusRequestFinished: { focusedID in
-                guard pendingDetailsRelatedFocusRequest?.id == contentId,
-                      pendingDetailsRelatedFocusRequest?.type == contentType,
-                      pendingDetailsRelatedFocusRequest?.relatedFocusID == focusedID else { return }
-                pendingDetailsRelatedFocusRequest = nil
+            initialRelatedItemsSnapshot: focusRestoreEntry?.relatedItemsSnapshot,
+            initialFocusTarget: focusRestoreEntry?.focusTarget,
+            onFocusRequestFinished: { focusedTarget in
+                guard pendingDetailsFocusRequest?.id == contentId,
+                      pendingDetailsFocusRequest?.type == contentType,
+                      pendingDetailsFocusRequest?.focusTarget == focusedTarget else { return }
+                pendingDetailsFocusRequest = nil
             },
             initialPlaybackRequestID: pendingDetailsPlaybackRequestID,
             onInitialPlaybackRequestConsumed: { requestID in
@@ -3299,16 +3362,17 @@ struct ContentView: View {
             onCreateWatchParty: WatchPartyConfiguration.isEnabled ? { meta, episode in
                 createWatchPartyFromDetails(meta: meta, episode: episode)
             } : nil,
-            onOpenTitle: { nextId, nextType, selectedRelatedID, displayedRelatedItems, displayedPeople, displayedSimklRatings in
-                pendingDetailsRelatedFocusRequest = nil
-                let relatedSnapshot: DetailsRelatedItemsSnapshot? = selectedRelatedID.flatMap { selectedID in
-                    guard let displayedRelatedItems else { return nil }
-                    return DetailsRelatedItemsSnapshot.capture(
+            onOpenTitle: { nextId, nextType, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings in
+                pendingDetailsFocusRequest = nil
+                var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
+                if let focusTarget, let displayedRelatedItems {
+                    relatedSnapshot = DetailsRelatedItemsSnapshot.capture(
                         parentID: contentId,
                         parentType: contentType,
-                        selectedRelatedID: selectedID,
+                        focusTarget: focusTarget,
                         items: displayedRelatedItems,
                         people: displayedPeople,
+                        companies: displayedCompanies,
                         simklRatings: displayedSimklRatings
                     )
                 }
@@ -3316,7 +3380,7 @@ struct ContentView: View {
                     id: contentId,
                     type: contentType,
                     libraryWatchedContext: detailsLibraryWatchedContext,
-                    relatedFocusID: relatedSnapshot == nil ? nil : selectedRelatedID,
+                    focusTarget: relatedSnapshot == nil ? nil : focusTarget,
                     relatedItemsSnapshot: relatedSnapshot
                 )
                 detailsBackStack.append(transition.backStackEntry)
@@ -3325,23 +3389,52 @@ struct ContentView: View {
                     activeScreen = .details(id: nextId, type: nextType)
                 }
             },
-            onOpenProduction: { company in
-                pendingDetailsRelatedFocusRequest = nil
+            onOpenProduction: { company, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings in
+                pendingDetailsFocusRequest = nil
+                var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
+                if let focusTarget {
+                    relatedSnapshot = DetailsRelatedItemsSnapshot.capture(
+                        parentID: contentId,
+                        parentType: contentType,
+                        focusTarget: focusTarget,
+                        items: displayedRelatedItems ?? [],
+                        people: displayedPeople,
+                        companies: displayedCompanies,
+                        simklRatings: displayedSimklRatings
+                    )
+                }
                 productionBrowseReturn = DetailsNavigationEntry(
                     id: contentId,
                     type: contentType,
-                    libraryWatchedContext: detailsLibraryWatchedContext
+                    libraryWatchedContext: detailsLibraryWatchedContext,
+                    focusTarget: relatedSnapshot == nil ? nil : focusTarget,
+                    relatedItemsSnapshot: relatedSnapshot
                 )
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .productionBrowse(company)
                 }
             },
-            onOpenPerson: { person in
-                pendingDetailsRelatedFocusRequest = nil
+            onOpenPerson: { person, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings, peopleAreFallback in
+                pendingDetailsFocusRequest = nil
+                var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
+                if let focusTarget {
+                    relatedSnapshot = DetailsRelatedItemsSnapshot.capture(
+                        parentID: contentId,
+                        parentType: contentType,
+                        focusTarget: focusTarget,
+                        items: displayedRelatedItems ?? [],
+                        people: displayedPeople,
+                        peopleAreFallback: peopleAreFallback,
+                        companies: displayedCompanies,
+                        simklRatings: displayedSimklRatings
+                    )
+                }
                 personBrowseReturn = DetailsNavigationEntry(
                     id: contentId,
                     type: contentType,
-                    libraryWatchedContext: detailsLibraryWatchedContext
+                    libraryWatchedContext: detailsLibraryWatchedContext,
+                    focusTarget: relatedSnapshot == nil ? nil : focusTarget,
+                    relatedItemsSnapshot: relatedSnapshot
                 )
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .personBrowse(person)
@@ -5711,6 +5804,7 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.continueWatchingVisible) private var continueWatchingVisible = true
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
     @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
@@ -5765,6 +5859,9 @@ struct TVHomeView: View {
     @State private var continueWatchingMetas: [NuvioMeta] = []
     @State private var upcomingMetas: [NuvioMeta] = []
     @State private var continueWatchingByMetaId: [String: ContinueWatchingItem] = [:]
+    @State private var revealableNextEpisodeMetaIDs: Set<String> = []
+    @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
+    @State private var hasCachedCompletedLedgerEvidence = false
     @State private var continueWatchingOrigins: [String: CollectionOriginPresentation] = [:]
     @State private var continueWatchingIndexByMetaId: [String: Int] = [:]
     @State private var continueWatchingIDs: [String] = []
@@ -5985,7 +6082,11 @@ struct TVHomeView: View {
                         } else if let heroMeta = visibleFocusedMeta ?? visibleHero {
                             TVHeroView(
                                 meta: heroMeta,
-                                continueItem: heroContinueItem(for: heroMeta)
+                                continueItem: heroContinueItem(for: heroMeta),
+                                continueIsNextEpisodeSpoilerRevealable:
+                                    (focusedSectionId == TVHomeSection.continueWatchingId
+                                        || focusedSectionId == TVHomeSection.upcomingId)
+                                    && revealableNextEpisodeMetaIDs.contains(heroMeta.id)
                             ) {
                                 navigateToDetailsFromHome(id: heroMeta.id, type: heroMeta.type)
                             }
@@ -6394,11 +6495,21 @@ struct TVHomeView: View {
                 ContinueWatchingBuilder.scheduleRebuild(reason: "up next episode preference changed", delayMs: 0)
             }
         }
+        .onChange(of: revealNextEpisodeSpoilers) { _, _ in
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                force: true
+            )
+        }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
             if collectionHome != nil {
                 refreshWatchedTitles()
                 return
             }
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                force: true
+            )
             guard isActive else { return }
             if isFullScreenOverlayPresented {
                 pendingContinueWatchingRefreshAfterOverlay = true
@@ -6411,6 +6522,20 @@ struct TVHomeView: View {
             if collectionHome == nil, !usesRemoteProgress {
                 ContinueWatchingBuilder.scheduleRebuild(reason: "watched state changed")
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard collectionHome == nil else { return }
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                force: true
+            )
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchProgressLedger.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard collectionHome == nil else { return }
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                refreshCompletedLedgerEvidence: true
+            )
         }
         // Settings → Home Catalogs reorder applies to the mounted Home live.
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -6856,6 +6981,7 @@ struct TVHomeView: View {
                                 horizontalEdgeInset: heroBleed,
                                 items: section.items,
                                 progressByItemId: isCalendarToday ? [:] : continueWatchingByMetaId,
+                                revealableNextEpisodeMetaIDs: isCalendarToday ? [] : revealableNextEpisodeMetaIDs,
                                 calendarLabelsByItemId: isCalendarToday ? calendarToday.labels : [:],
                                 collectionOriginsByItemId: collectionHome == nil && section.id == TVHomeSection.continueWatchingId
                                     ? continueWatchingOrigins : [:],
@@ -8169,6 +8295,9 @@ struct TVHomeView: View {
                 items: section.items,
                 progressByItemId: (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId)
                     ? continueWatchingByMetaId : [:],
+                revealableNextEpisodeMetaIDs:
+                    (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId)
+                    ? revealableNextEpisodeMetaIDs : [],
                 calendarLabelsByItemId: section.id == TVHomeSection.calendarTodayId ? calendarToday.labels : [:],
                 collectionOriginsByItemId: collectionHome == nil && section.id == TVHomeSection.continueWatchingId
                     ? continueWatchingOrigins : [:],
@@ -9924,6 +10053,10 @@ struct TVHomeView: View {
            rawContinueWatchingItems.count == rawItems.count {
             let isIdentical = zip(rawContinueWatchingItems, rawItems).allSatisfy { $0.isContentEqual(to: $1) }
             if isIdentical {
+                refreshNextEpisodeSpoilerEligibility(
+                    for: Array(continueWatchingByMetaId.values),
+                    force: true
+                )
                 return
             }
         }
@@ -9973,6 +10106,54 @@ struct TVHomeView: View {
             continueWatchingByMetaId = byMetaId
             continueWatchingIndexByMetaId = indexByMetaId
             continueWatchingIDs = items.map(\.meta.id)
+        }
+        refreshNextEpisodeSpoilerEligibility(
+            for: Array(continueWatchingByMetaId.values),
+            force: true
+        )
+    }
+
+    private func refreshNextEpisodeSpoilerEligibility(
+        for items: [ContinueWatchingItem],
+        refreshCompletedLedgerEvidence: Bool = false,
+        force: Bool = false
+    ) {
+        var ledgerEvidenceChanged = false
+        if refreshCompletedLedgerEvidence || (revealNextEpisodeSpoilers && !hasCachedCompletedLedgerEvidence) {
+            let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
+            ledgerEvidenceChanged = !hasCachedCompletedLedgerEvidence
+                || latestEvidence != completedLedgerEpisodeKeysByContentID
+            completedLedgerEpisodeKeysByContentID = latestEvidence
+            hasCachedCompletedLedgerEvidence = true
+        }
+
+        guard revealNextEpisodeSpoilers else {
+            if !revealableNextEpisodeMetaIDs.isEmpty {
+                revealableNextEpisodeMetaIDs = []
+            }
+            return
+        }
+        guard force || ledgerEvidenceChanged else { return }
+        let snapshot = WatchedStore.currentSnapshot()
+        var eligibleMetaIDs = Set<String>()
+        for item in items where item.isUpNextEntry {
+            guard let numbers = item.episodeNumbers else { continue }
+            let watchedKeys = EpisodeSpoilerPolicy.watchedEpisodeKeys(
+                for: item.meta,
+                in: item.meta.videos,
+                snapshot: snapshot,
+                completedLedgerKeysByContentID: completedLedgerEpisodeKeysByContentID
+            )
+            let revealableKey = EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: item.meta.videos,
+                watchedEpisodeKeys: watchedKeys
+            )
+            if revealableKey == "\(numbers.season):\(numbers.episode)" {
+                eligibleMetaIDs.insert(item.meta.id)
+            }
+        }
+        if eligibleMetaIDs != revealableNextEpisodeMetaIDs {
+            revealableNextEpisodeMetaIDs = eligibleMetaIDs
         }
     }
 
@@ -10346,9 +10527,10 @@ struct TVHomeView: View {
             return
         }
         let indexedTitles = JellyfinLibraryIndex.shared.titles()
+        let firstTitleByID = Self.jellyfinFirstTitleByID(indexedTitles)
         let legacyTitles = indexedTitles.filter { $0.libraryID == nil || $0.libraryName == nil }
         var sections: [TVHomeSection] = []
-        let legacyMetas = Self.jellyfinMetas(legacyTitles)
+        let legacyMetas = Self.jellyfinMetas(legacyTitles, firstTitleByID: firstTitleByID)
         if !legacyMetas.isEmpty {
             sections.append(TVHomeSection(
                 id: TVHomeSection.jellyfinId,
@@ -10377,7 +10559,7 @@ struct TVHomeView: View {
         for key in orderedKeys {
             guard let titles = groupedTitles[key],
                   let libraryName = titles.first?.libraryName else { continue }
-            let metas = Self.jellyfinMetas(titles)
+            let metas = Self.jellyfinMetas(titles, firstTitleByID: firstTitleByID)
             guard !metas.isEmpty else { continue }
             sections.append(TVHomeSection(
                 id: TVHomeSection.jellyfinLibraryId(serverID: key.serverID, libraryID: key.libraryID),
@@ -10389,13 +10571,35 @@ struct TVHomeView: View {
     }
 
     @MainActor
-    private static func jellyfinMetas(_ titles: [JellyfinIndexedTitle]) -> [NuvioMeta] {
+    private static func jellyfinMetas(
+        _ titles: [JellyfinIndexedTitle],
+        firstTitleByID: [String: JellyfinIndexedTitle]
+    ) -> [NuvioMeta] {
         titles.sorted {
             if $0.name != $1.name { return $0.name < $1.name }
             return $0.contentId < $1.contentId
         }.compactMap {
-            JellyfinLibraryIndex.shared.meta(forContentId: $0.contentId)
+            guard let matchingTitle = firstTitleByID[$0.contentId] else { return nil }
+            return JellyfinLibraryIndex.shared.meta(
+                for: matchingTitle,
+                requestedContentId: $0.contentId
+            )
         }
+    }
+
+    /// Preserves `titles().first(where:)` resolution for duplicate synthetic
+    /// IDs and raw Jellyfin item IDs while allowing Home to reuse one index.
+    static func jellyfinFirstTitleByID(_ titles: [JellyfinIndexedTitle]) -> [String: JellyfinIndexedTitle] {
+        var firstTitleByID: [String: JellyfinIndexedTitle] = [:]
+        for title in titles {
+            if firstTitleByID[title.contentId] == nil {
+                firstTitleByID[title.contentId] = title
+            }
+            if firstTitleByID[title.itemId] == nil {
+                firstTitleByID[title.itemId] = title
+            }
+        }
+        return firstTitleByID
     }
 }
 
@@ -12266,10 +12470,14 @@ private struct TVHeroView: View {
     /// say which episode is in progress, how much is left, and show the
     /// episode's own overview instead of the series blurb.
     var continueItem: ContinueWatchingItem? = nil
+    /// Home supplies this only for a matched Continue Watching / Upcoming item.
+    /// Calendar cards intentionally do not carry spoiler reveal evidence.
+    var continueIsNextEpisodeSpoilerRevealable: Bool = false
     let onSelect: () -> Void
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
 
     private var heroHeight: CGFloat {
         homeLayout == "Compact" ? 390 : 500
@@ -12298,7 +12506,9 @@ private struct TVHeroView: View {
         if isContinueItemCurrentlyWatching || isContinueItemWatched {
             return false
         }
-        return true
+        return !(revealNextEpisodeSpoilers
+            && continueItem?.isUpNextEntry == true
+            && continueIsNextEpisodeSpoilerRevealable)
     }
 
     private var isHeroDescriptionSpoilerHidden: Bool {
@@ -12398,6 +12608,8 @@ extension TVHeroView: Equatable {
             && lhs.continueItem?.episode == rhs.continueItem?.episode
             && lhs.continueItem?.episodeOverview == rhs.continueItem?.episodeOverview
             && lhs.continueItem?.isUpNext == rhs.continueItem?.isUpNext
+            && lhs.continueIsNextEpisodeSpoilerRevealable == rhs.continueIsNextEpisodeSpoilerRevealable
+            && lhs.revealNextEpisodeSpoilers == rhs.revealNextEpisodeSpoilers
             && lhs.hideUnwatchedEpisodeDescriptions == rhs.hideUnwatchedEpisodeDescriptions
             && lhs.hideUnwatchedEpisodeTitles == rhs.hideUnwatchedEpisodeTitles
     }

@@ -641,7 +641,7 @@ extension View {
     /// primary call-to-action.
     @ViewBuilder
     func loginGlassCapsule(highlighted: Bool, prominent: Bool = false) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(
                 highlighted
                     ? Glass.regular.tint(.white.opacity(0.92))
@@ -662,7 +662,7 @@ extension View {
     /// fallback for tvOS < 26 that keeps the previous translucent look.
     @ViewBuilder
     func loginGlassPanel() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         } else {
             background(.ultraThinMaterial)

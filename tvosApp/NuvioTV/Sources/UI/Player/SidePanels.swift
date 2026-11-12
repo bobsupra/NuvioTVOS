@@ -123,10 +123,15 @@ struct PlayerPanelRow: View {
 struct PlayerEpisodesPanel: View {
     @ObservedObject var viewModel: PlayerViewModel
     @FocusState private var focusedID: String?
+    @State private var revealableNextEpisodeKey: String?
+    @State private var strictWatchedEpisodeKeys: Set<String> = []
+    @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
+    @State private var hasCachedCompletedLedgerEvidence = false
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
 
     private var rowCornerRadius: CGFloat {
         AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 18)
@@ -145,6 +150,7 @@ struct PlayerEpisodesPanel: View {
     }
 
     var body: some View {
+        let revealableKey = self.revealableNextEpisodeKey
         PlayerSidePanelChrome(title: "Episodes", onExit: { viewModel.closeSidePanel() }) {
             ScrollViewReader { proxy in
                 ScrollView {
@@ -167,7 +173,13 @@ struct PlayerEpisodesPanel: View {
                                 Button {
                                     viewModel.selectEpisode(episode)
                                 } label: {
-                                    episodeRow(episode, isCurrent: isCurrent, isFocused: focusedID == episode.id)
+                                    episodeRow(
+                                        episode,
+                                        isCurrent: isCurrent,
+                                        isFocused: focusedID == episode.id,
+                                        isRevealableNextEpisode: revealableKey
+                                            == EpisodeSpoilerPolicy.episodeKey(for: episode)
+                                    )
                                 }
                                 .buttonStyle(PosterCardButtonStyle())
                                 .focusEffectDisabledIfAvailable()
@@ -185,6 +197,59 @@ struct PlayerEpisodesPanel: View {
                 }
             }
         }
+        .onAppear {
+            refreshSpoilerEvidence()
+        }
+        .onChange(of: revealNextEpisodeSpoilers) { _, _ in
+            refreshSpoilerEvidence()
+        }
+        .onChange(of: viewModel.panelCurrentEpisodeId) { _, _ in
+            refreshSpoilerEvidence()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSpoilerEvidence()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchProgressLedger.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSpoilerEvidence(refreshCompletedLedgerEvidence: true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSpoilerEvidence()
+        }
+    }
+
+    private func refreshSpoilerEvidence(refreshCompletedLedgerEvidence: Bool = false) {
+        var ledgerEvidenceChanged = false
+        if refreshCompletedLedgerEvidence || !hasCachedCompletedLedgerEvidence {
+            let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
+            ledgerEvidenceChanged = !hasCachedCompletedLedgerEvidence
+                || latestEvidence != completedLedgerEpisodeKeysByContentID
+            completedLedgerEpisodeKeysByContentID = latestEvidence
+            hasCachedCompletedLedgerEvidence = true
+        }
+        if refreshCompletedLedgerEvidence && hasCachedCompletedLedgerEvidence && !ledgerEvidenceChanged {
+            return
+        }
+        guard let meta = viewModel.activeMeta,
+              meta.isSeries else {
+            revealableNextEpisodeKey = nil
+            strictWatchedEpisodeKeys = []
+            return
+        }
+        let guide = viewModel.spoilerEpisodeGuide
+        let snapshot = WatchedStore.currentSnapshot()
+        let watchedKeys = EpisodeSpoilerPolicy.watchedEpisodeKeys(
+            for: meta,
+            in: guide,
+            snapshot: snapshot,
+            completedLedgerKeysByContentID: completedLedgerEpisodeKeysByContentID
+        )
+        strictWatchedEpisodeKeys = watchedKeys
+        revealableNextEpisodeKey = revealNextEpisodeSpoilers
+            ? EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: guide,
+                watchedEpisodeKeys: watchedKeys
+            )
+            : nil
     }
 
     private func scrollToTarget(proxy: ScrollViewProxy) {
@@ -201,10 +266,17 @@ struct PlayerEpisodesPanel: View {
         }
     }
 
-    private func episodeRow(_ episode: NuvioVideo, isCurrent: Bool, isFocused: Bool) -> some View {
+    private func episodeRow(
+        _ episode: NuvioVideo,
+        isCurrent: Bool,
+        isFocused: Bool,
+        isRevealableNextEpisode: Bool
+    ) -> some View {
         let isWatched = viewModel.isEpisodeWatched(episode)
-        let shouldBlur = blurUnwatchedEpisodes && !isWatched && !isCurrent
-        let shouldHideTitle = hideUnwatchedEpisodeTitles && !isWatched && !isCurrent
+            || strictWatchedEpisodeKeys.contains(EpisodeSpoilerPolicy.episodeKey(for: episode))
+        let isSpoilerExempt = revealNextEpisodeSpoilers && isRevealableNextEpisode
+        let shouldBlur = blurUnwatchedEpisodes && !isWatched && !isCurrent && !isSpoilerExempt
+        let shouldHideTitle = hideUnwatchedEpisodeTitles && !isWatched && !isCurrent && !isSpoilerExempt
         let displayTitle = shouldHideTitle
             ? L10n.format("calendar_episode_number", fallback: "Episode %d", episode.episode)
             : episode.title

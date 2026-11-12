@@ -24,6 +24,8 @@ final class RemoteLibraryStoreTests: XCTestCase {
     override func tearDown() {
         RemoteLibraryStore.clearAll(for: testProfileA)
         RemoteLibraryStore.clearAll(for: testProfileB)
+        LibraryStore.eraseProfile(testProfileA)
+        LibraryStore.eraseProfile(testProfileB)
 
         LibraryStore.setActiveProfile(previousLibraryProfileID)
         if let previousSettingsProfileID {
@@ -159,7 +161,7 @@ final class RemoteLibraryStoreTests: XCTestCase {
     }
 
     @MainActor
-    func testLibraryViewModelLoadsInstantlyFromRemoteStore() throws {
+    func testLibraryViewModelLoadsCachedRemoteStoreAsynchronously() async throws {
         ProfileSettings.setActiveProfile(testProfileA, isPrimary: false)
         LibraryStore.setActiveProfile(testProfileA)
         ProfileSettings.current.set(TraktLibrarySourceMode.trakt.rawValue,
@@ -189,12 +191,90 @@ final class RemoteLibraryStoreTests: XCTestCase {
         let viewModel = LibraryViewModel()
         viewModel.loadLibrary()
 
+        XCTAssertTrue(viewModel.items.isEmpty)
+        XCTAssertTrue(viewModel.isLoading)
+        await viewModel.loadLibraryAndWait()
         XCTAssertEqual(viewModel.items.map { $0.id }, ["tt100", "tt200"])
         XCTAssertFalse(viewModel.isLoading)
     }
 
     @MainActor
-    func testLibraryViewModelMutationUpdatesRemoteStore() throws {
+    func testLibraryViewModelFallsBackToLocalStoreWhenConfiguredProviderIsUnauthenticated() async throws {
+        ProfileSettings.setActiveProfile(testProfileA, isPrimary: false)
+        LibraryStore.setActiveProfile(testProfileA)
+        TraktAuthStore.clearAuth(store: ProfileSettings.current)
+        ProfileSettings.current.set(TraktLibrarySourceMode.trakt.rawValue,
+                                    forKey: SettingsKey.traktLibrarySourceMode)
+        XCTAssertFalse(SelectedLibraryService.isSelectedAndAuthenticated)
+
+        let localItem = makeItem(id: "tt-local-fallback", name: "Local title", type: "movie")
+        let remoteItem = makeItem(id: "tt-remote-fallback", name: "Remote title", type: "movie")
+        LibraryStore.replaceAll([localItem])
+        RemoteLibraryStore.save(
+            items: [remoteItem],
+            source: .trakt,
+            profileId: testProfileA,
+            accountBindingId: "cached-account"
+        )
+
+        let viewModel = LibraryViewModel()
+        viewModel.loadLibrary(forceReload: true)
+        XCTAssertTrue(viewModel.isLoading)
+        await viewModel.loadLibraryAndWait()
+
+        XCTAssertEqual(viewModel.displayedWatchedContext?.source, .local)
+        XCTAssertEqual(viewModel.items.map(\.id), [localItem.meta.id])
+    }
+
+    @MainActor
+    func testLibraryViewModelClearsCardsWhenProfileChanges() async throws {
+        ProfileSettings.setActiveProfile(testProfileA, isPrimary: false)
+        LibraryStore.setActiveProfile(testProfileA)
+        TraktSettingsStore.librarySourceMode = .local
+        let firstProfileItem = makeItem(id: "tt-first-profile", name: "First", type: "movie")
+        LibraryStore.replaceAll([firstProfileItem])
+
+        let viewModel = LibraryViewModel()
+        await viewModel.loadLibraryAndWait()
+        XCTAssertEqual(viewModel.items.map(\.id), [firstProfileItem.meta.id])
+
+        ProfileSettings.setActiveProfile(testProfileB, isPrimary: false)
+        LibraryStore.setActiveProfile(testProfileB)
+        TraktSettingsStore.librarySourceMode = .local
+        let secondProfileItem = makeItem(id: "tt-second-profile", name: "Second", type: "movie")
+        LibraryStore.replaceAll([secondProfileItem])
+
+        let secondProfileLoaded = expectation(description: "new profile snapshot replaces prior cards")
+        var didLoadSecondProfile = false
+        let subscription = viewModel.$items.sink { items in
+            guard !didLoadSecondProfile, items.map(\.id) == [secondProfileItem.meta.id] else { return }
+            didLoadSecondProfile = true
+            secondProfileLoaded.fulfill()
+        }
+        viewModel.loadLibrary(forceReload: true)
+        XCTAssertTrue(viewModel.items.isEmpty)
+        await fulfillment(of: [secondProfileLoaded], timeout: 2)
+
+        XCTAssertEqual(viewModel.items.map(\.id), [secondProfileItem.meta.id])
+        withExtendedLifetime(subscription) {}
+    }
+
+    @MainActor
+    func testLibraryMetadataBatchRejectsStaleProfileContext() {
+        ProfileSettings.setActiveProfile(testProfileA, isPrimary: false)
+        CinemetaCatalogRepository.clearMetadataCache()
+        let staleContext = CinemetaCatalogRepository.metadataCacheContext
+        ProfileSettings.setActiveProfile(testProfileB, isPrimary: false)
+
+        let staleMeta = NuvioMeta(id: "tt-library-stale-cache", name: "Old Profile", type: "movie")
+        CinemetaCatalogRepository.cacheCatalogMetadata([staleMeta], context: staleContext)
+
+        XCTAssertNil(CinemetaCatalogRepository().cachedMetadata(for: staleMeta.id))
+        CinemetaCatalogRepository.clearMetadataCache()
+    }
+
+    @MainActor
+    func testLibraryViewModelMutationUpdatesRemoteStore() async throws {
         ProfileSettings.setActiveProfile(testProfileA, isPrimary: false)
         LibraryStore.setActiveProfile(testProfileA)
         ProfileSettings.current.set(TraktLibrarySourceMode.trakt.rawValue,
@@ -217,10 +297,11 @@ final class RemoteLibraryStoreTests: XCTestCase {
 
         let item = NuvioMeta(id: "tt999", name: "Mutation Movie", type: "movie")
         let viewModel = LibraryViewModel()
-        viewModel.loadLibrary()
+        viewModel.loadLibrary(forceReload: true)
 
         // Apply mutation
         viewModel.applyTraktMutation(TraktLibraryMutation(meta: item, isInWatchlist: true, context: context))
+        await viewModel.loadLibraryAndWait()
 
         // Check viewModel.items
         XCTAssertEqual(viewModel.items.map { $0.id }, ["tt999"])
@@ -230,7 +311,9 @@ final class RemoteLibraryStoreTests: XCTestCase {
         XCTAssertEqual(diskItems?.map { $0.meta.id }, ["tt999"])
 
         // Remove via mutation
+        viewModel.loadLibrary(forceReload: true)
         viewModel.applyTraktMutation(TraktLibraryMutation(meta: item, isInWatchlist: false, context: context))
+        await viewModel.loadLibraryAndWait()
         XCTAssertTrue(viewModel.items.isEmpty)
         let diskItemsAfterRemove = RemoteLibraryStore.load(source: .trakt, profileId: testProfileA, accountBindingId: accountBinding)
         XCTAssertTrue(diskItemsAfterRemove == nil || diskItemsAfterRemove!.isEmpty)

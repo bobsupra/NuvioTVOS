@@ -46,19 +46,19 @@ struct DetailsScreen: View {
     /// Host a room for the current title or a specific series episode.
     var onCreateWatchParty: ((NuvioMeta, NuvioVideo?) -> Void)? = nil
     /// Open another title (More Like This / production catalog).
-    var onOpenTitle: ((String, String, String?, [RelatedTitle]?, [TmdbPersonMetadata], SimklTitleRatings?) -> Void)? = nil
+    var onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
     /// Open a production company / network catalog.
-    var onOpenProduction: ((MetaCompany) -> Void)? = nil
+    var onOpenProduction: ((MetaCompany, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
     /// Open the movies and series associated with a TMDB person.
-    var onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
+    var onOpenPerson: ((TmdbPersonMetadata, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, Bool) -> Void)? = nil
     let initiallyPresentStreamPicker: Bool
     let initialStreamPickerEpisode: NuvioVideo?
     let initialStreamPickerResumePosition: Double?
     /// Episode to select in the episode list on open (from the calendar).
     let initialFocusEpisode: DetailsEpisodeFocus?
     let initialRelatedItemsSnapshot: DetailsRelatedItemsSnapshot?
-    let initialRelatedFocusID: String?
-    let onRelatedFocusRequestFinished: ((String) -> Void)?
+    let initialFocusTarget: DetailsFocusTarget?
+    let onFocusRequestFinished: ((DetailsFocusTarget) -> Void)?
     let onInitialStreamPickerPresented: (() -> Void)?
     var onWatchPartyMovieReady: ((NuvioMeta) -> Void)? = nil
     var creatingWatchPartyRoom = false
@@ -149,19 +149,46 @@ struct DetailsScreen: View {
 
     private var validInitialRelatedItemsSnapshot: [RelatedTitle]? {
         guard let snapshot = initialRelatedItemsSnapshot,
-              snapshot.isValid(for: id, type: type) else { return nil }
+              snapshot.isValid(for: id, type: type),
+              !snapshot.items.isEmpty else { return nil }
         return snapshot.items
-    }
-
-    private var validInitialRelatedFocusID: String? {
-        guard validInitialRelatedItemsSnapshot != nil else { return nil }
-        return initialRelatedFocusID
     }
 
     private var validInitialRelatedPeopleSnapshot: [TmdbPersonMetadata]? {
         guard let snapshot = initialRelatedItemsSnapshot,
-              snapshot.isValid(for: id, type: type) else { return nil }
+              snapshot.isValid(for: id, type: type),
+              !snapshot.peopleAreFallback else { return nil }
         return snapshot.people
+    }
+
+    private var validInitialRelatedCompaniesSnapshot: [MetaCompany]? {
+        guard let snapshot = initialRelatedItemsSnapshot,
+              snapshot.isValid(for: id, type: type) else { return nil }
+        return snapshot.companies
+    }
+
+    private var validInitialFocusTarget: DetailsFocusTarget? {
+        guard let snapshot = initialRelatedItemsSnapshot,
+              snapshot.isValid(for: id, type: type),
+              let target = initialFocusTarget else { return nil }
+        let isKnown: Bool
+        switch target.kind {
+        case .moreLikeThis:
+            isKnown = snapshot.items.contains(where: { $0.id == target.itemID })
+        case .cast:
+            isKnown = snapshot.people.contains(where: { $0.id == target.itemID })
+        case .network, .production:
+            isKnown = snapshot.companies.contains(where: { $0.id == target.itemID })
+        }
+        return isKnown ? target : nil
+    }
+
+    private var validInitialFocusPersonName: String? {
+        guard let target = initialFocusTarget,
+              target.kind == .cast,
+              let snapshot = initialRelatedItemsSnapshot,
+              snapshot.isValid(for: id, type: type) else { return nil }
+        return snapshot.people.first(where: { $0.id == target.itemID })?.name
     }
 
     private var validInitialSimklRatingsSnapshot: SimklTitleRatings? {
@@ -176,8 +203,8 @@ struct DetailsScreen: View {
         libraryWatchedContext: LibraryWatchedContext? = nil,
         repository: CatalogRepository,
         initialRelatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil,
-        initialRelatedFocusID: String? = nil,
-        onRelatedFocusRequestFinished: ((String) -> Void)? = nil,
+        initialFocusTarget: DetailsFocusTarget? = nil,
+        onFocusRequestFinished: ((DetailsFocusTarget) -> Void)? = nil,
         initialPlaybackRequestID: UInt? = nil,
         onInitialPlaybackRequestConsumed: ((UInt) -> Void)? = nil,
         initiallyPresentStreamPicker: Bool = false,
@@ -208,16 +235,16 @@ struct DetailsScreen: View {
         ) -> Void,
         onBack: @escaping () -> Void,
         onCreateWatchParty: ((NuvioMeta, NuvioVideo?) -> Void)? = nil,
-        onOpenTitle: ((String, String, String?, [RelatedTitle]?, [TmdbPersonMetadata], SimklTitleRatings?) -> Void)? = nil,
-        onOpenProduction: ((MetaCompany) -> Void)? = nil,
-        onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
+        onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil,
+        onOpenProduction: ((MetaCompany, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil,
+        onOpenPerson: ((TmdbPersonMetadata, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, Bool) -> Void)? = nil
     ) {
         self.id = id
         self.type = type
         self.libraryWatchedContext = libraryWatchedContext
         self.initialRelatedItemsSnapshot = initialRelatedItemsSnapshot
-        self.initialRelatedFocusID = initialRelatedFocusID
-        self.onRelatedFocusRequestFinished = onRelatedFocusRequestFinished
+        self.initialFocusTarget = initialFocusTarget
+        self.onFocusRequestFinished = onFocusRequestFinished
         self.initialPlaybackRequestID = initialPlaybackRequestID
         self.onInitialPlaybackRequestConsumed = onInitialPlaybackRequestConsumed
         self.onPlayClick = onPlayClick
@@ -273,8 +300,9 @@ struct DetailsScreen: View {
                     libraryWatchedContext: libraryWatchedContext,
                     initialPlayRequestID: readyInitialPlaybackRequestID,
                     initialFocusEpisode: initialFocusEpisode,
-                    initialRelatedFocusID: validInitialRelatedFocusID,
-                    onRelatedFocusRequestFinished: onRelatedFocusRequestFinished,
+                    initialFocusTarget: validInitialFocusTarget,
+                    initialFocusPersonName: validInitialFocusPersonName,
+                    onFocusRequestFinished: onFocusRequestFinished,
                     openedID: id,
                     onInitialPlayRequestConsumed: { requestID in
                         finishInitialPlaybackRequest(requestID)
@@ -342,16 +370,16 @@ struct DetailsScreen: View {
                     onRateClick: { showingMdbListRating = true },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onTrailerClick: { resumeFrom in openTrailer(for: viewModel.uiState.meta!, resumeFrom: resumeFrom) },
-                    onOpenTitle: { contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedSimklRatings in
-                        onOpenTitle?(contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedSimklRatings)
+                    onOpenTitle: { contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings in
+                        onOpenTitle?(contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings)
                     },
-                    onOpenProduction: { company in
-                        onOpenProduction?(company)
+                    onOpenProduction: { company, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings in
+                        onOpenProduction?(company, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings)
                     },
-                    onOpenPerson: { person in
+                    onOpenPerson: { person, focusTarget, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings, peopleAreFallback in
                         let clean = person.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         guard !clean.isEmpty && clean != "cast" else { return }
-                        onOpenPerson?(person)
+                        onOpenPerson?(person, focusTarget, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings, peopleAreFallback)
                     },
                     onCommentSelect: { comment in
                         expandedComment = comment
@@ -519,8 +547,8 @@ struct DetailsScreen: View {
             }
         }
         .onAppear {
-            if let initialRelatedFocusID, validInitialRelatedFocusID == nil {
-                onRelatedFocusRequestFinished?(initialRelatedFocusID)
+            if let initialFocusTarget, validInitialFocusTarget == nil {
+                onFocusRequestFinished?(initialFocusTarget)
             }
             isDetailsPlaybackContextActive = true
             didHandOffPlayback = false
@@ -545,6 +573,7 @@ struct DetailsScreen: View {
                     type: type,
                     relatedItemsSnapshot: validInitialRelatedItemsSnapshot,
                     relatedPeopleSnapshot: validInitialRelatedPeopleSnapshot,
+                    relatedCompaniesSnapshot: validInitialRelatedCompaniesSnapshot,
                     simklRatingsSnapshot: validInitialSimklRatingsSnapshot
                 )
             } else {
@@ -602,6 +631,7 @@ struct DetailsScreen: View {
             type: type,
             relatedItemsSnapshot: validInitialRelatedItemsSnapshot,
             relatedPeopleSnapshot: validInitialRelatedPeopleSnapshot,
+            relatedCompaniesSnapshot: validInitialRelatedCompaniesSnapshot,
             simklRatingsSnapshot: validInitialSimklRatingsSnapshot
         )
         if let requestID = pendingInitialPlaybackRequestID {
@@ -619,6 +649,7 @@ struct DetailsScreen: View {
             type: type,
             relatedItemsSnapshot: validInitialRelatedItemsSnapshot,
             relatedPeopleSnapshot: validInitialRelatedPeopleSnapshot,
+            relatedCompaniesSnapshot: validInitialRelatedCompaniesSnapshot,
             simklRatingsSnapshot: validInitialSimklRatingsSnapshot
         )
         pendingInitialPlaybackRequestID = requestID
@@ -4231,8 +4262,9 @@ struct TvDetailsContent: View {
     var libraryWatchedContext: LibraryWatchedContext? = nil
     var initialPlayRequestID: UInt? = nil
     var initialFocusEpisode: DetailsEpisodeFocus? = nil
-    var initialRelatedFocusID: String? = nil
-    var onRelatedFocusRequestFinished: ((String) -> Void)? = nil
+    var initialFocusTarget: DetailsFocusTarget? = nil
+    var initialFocusPersonName: String? = nil
+    var onFocusRequestFinished: ((DetailsFocusTarget) -> Void)? = nil
     /// The id the screen was opened with. An AniList card of a later season opens the whole
     /// series on that season's tab.
     var openedID: String? = nil
@@ -4250,9 +4282,9 @@ struct TvDetailsContent: View {
     var onRateClick: (() -> Void)? = nil
     let onShareClick: () -> Void
     let onTrailerClick: (Double?) -> Void
-    var onOpenTitle: ((String, String, String?, [RelatedTitle]?, [TmdbPersonMetadata], SimklTitleRatings?) -> Void)? = nil
-    var onOpenProduction: ((MetaCompany) -> Void)? = nil
-    var onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
+    var onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
+    var onOpenProduction: ((MetaCompany, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
+    var onOpenPerson: ((TmdbPersonMetadata, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, Bool) -> Void)? = nil
     var onCommentSelect: ((TraktCommentReview) -> Void)? = nil
     let onBack: () -> Void
 
@@ -4262,6 +4294,9 @@ struct TvDetailsContent: View {
     /// rather than per card so focus can be put back on a specific episode.
     @FocusState private var episodeFocus: String?
     @FocusState private var relatedCardFocus: String?
+    @FocusState private var castCardFocus: String?
+    @FocusState private var networkCardFocus: String?
+    @FocusState private var productionCardFocus: String?
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
@@ -4277,11 +4312,15 @@ struct TvDetailsContent: View {
     @State private var consumedInitialPlayRequestID: UInt?
     @State private var detailsFocusMoveGeneration = 0
     @State private var pendingPlayFocusGeneration: Int?
-    @State private var relatedFocusRestoreTargetID: String?
-    @State private var relatedFocusRestoreAttemptID: String?
-    @State private var relatedFocusRestoreGeneration = 0
-    @State private var relatedRowIsMounted = false
-    @State private var isSettingRelatedFallbackFocus = false
+    @State private var focusRestoreTarget: DetailsFocusTarget?
+    @State private var focusRestoreAttemptTarget: DetailsFocusTarget?
+    @State private var focusRestoreGeneration = 0
+    @State private var focusRestoreSectionIsMounted = false
+    @State private var mountedFocusTargetKinds: Set<DetailsFocusTargetKind> = []
+    @State private var restoredCastFocusTarget: DetailsFocusTarget?
+    @State private var restoredCastFocusItemID: String?
+    @State private var restoredCastFocusGeneration = 0
+    @State private var isSettingFocusRestoreFallback = false
     /// Episode control to re-focus once the stream picker closes, captured when
     /// this content gets disabled. Same approach Home uses for the card you
     /// left when entering Details — see `restoreEpisodeFocus`.
@@ -4458,7 +4497,7 @@ struct TvDetailsContent: View {
     }
 
     private func handleDetailsBack() {
-        cancelRelatedFocusRestoration()
+        cancelFocusRestoration()
         if isFullscreenTrailerPresented {
             dismissFullscreenTrailer()
             return
@@ -4551,7 +4590,7 @@ struct TvDetailsContent: View {
                 )
             },
             onWatchlistClick: {
-                cancelRelatedFocusRestoration()
+                cancelFocusRestoration()
                 // An AniList title also goes onto (or off) the viewer's AniList and MAL lists.
                 if AniListAccount.isLoggedIn || MALAccount.isLoggedIn,
                    let entryID = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedID ?? meta.id) {
@@ -4566,35 +4605,35 @@ struct TvDetailsContent: View {
                 onWatchlistClick()
             },
             onWatchedClick: {
-                cancelRelatedFocusRestoration()
+                cancelFocusRestoration()
                 onWatchedClick()
             },
             onRateClick: onRateClick != nil ? {
-                cancelRelatedFocusRestoration()
+                cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 onRateClick?()
             } : nil,
             aniListTitle: aniListButtonTitle,
             onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget != nil) ? {
-                cancelRelatedFocusRestoration()
+                cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 showingAniListMenu = true
             } : nil,
             malTitle: MALAccount.buttonTitle(malStatus),
             onMALClick: (MALSettings.showsDetailsButton && malID != nil) ? {
-                cancelRelatedFocusRestoration()
+                cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 showingMALMenu = true
             } : nil,
             onTrailerClick: {
-                cancelRelatedFocusRestoration()
+                cancelFocusRestoration()
                 presentFullscreenTrailer()
             },
             onBack: handleDetailsBack,
             focus: $actionFocus,
             entryLocked: focusedDetailsSection != .actions,
             onFocus: {
-                guard relatedFocusRestoreAttemptID == nil else { return }
+                guard focusRestoreAttemptTarget == nil else { return }
                 if focusedDetailsSection != .actions {
                     focusedDetailsSection = .actions
                     withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -4642,7 +4681,7 @@ struct TvDetailsContent: View {
                     isChoosingWatchPartyEpisode: isChoosingWatchPartyEpisode,
                     onCancelWatchPartySelection: { isChoosingWatchPartyEpisode = false },
                     onFocus: {
-                        guard relatedFocusRestoreAttemptID == nil else { return }
+                        guard focusRestoreAttemptTarget == nil else { return }
                         cancelPendingFocusHandoff()
                         if focusedDetailsSection != .episodes {
                             focusedDetailsSection = .episodes
@@ -4652,7 +4691,7 @@ struct TvDetailsContent: View {
                         }
                     },
                     onSelect: { video in
-                        cancelRelatedFocusRestoration()
+                        cancelFocusRestoration()
                         stopBackgroundTrailer(manual: false)
                         if isChoosingWatchPartyEpisode {
                             isChoosingWatchPartyEpisode = false
@@ -4662,12 +4701,12 @@ struct TvDetailsContent: View {
                         }
                     },
                     onPlayManually: onEpisodePlayManually != nil ? { video in
-                        cancelRelatedFocusRestoration()
+                        cancelFocusRestoration()
                         stopBackgroundTrailer(manual: false)
                         onEpisodePlayManually?(video)
                     } : nil,
                     onEpisodeMenuPresented: { isPresented in
-                        if isPresented { cancelRelatedFocusRestoration() }
+                        if isPresented { cancelFocusRestoration() }
                         onEpisodeMenuPresented?(isPresented)
                     },
                     onBack: handleDetailsBack,
@@ -4688,15 +4727,37 @@ struct TvDetailsContent: View {
         case .cast:
             if hasCastOrTrailer, let meta = uiState.meta {
                 TvDetailsCastAndTrailer(
-                    meta: meta,
-                    people: uiState.people,
+                    mediaType: meta.type,
+                    people: displayedCastPeople,
+                    focusRequestID: focusRequestItemID(for: .cast),
+                    externalFocus: $castCardFocus,
+                    onMounted: {
+                        setFocusRestoreSectionMounted(for: .cast, mounted: true, using: scrollProxy)
+                    },
+                    onUnmounted: {
+                        setFocusRestoreSectionMounted(for: .cast, mounted: false, using: scrollProxy)
+                    },
+                    onPersonFocus: { person in
+                        focusRestoreItemDidFocus(
+                            DetailsFocusTarget(kind: .cast, itemID: person.id),
+                            using: scrollProxy
+                        )
+                    },
                     onPersonClick: { person in
                         let clean = person.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         guard !clean.isEmpty && clean != "cast" else { return }
                         // AniList characters have no TMDB page to open.
                         guard !AniListMetaBuilder.isAniListID(meta.id) else { return }
                         stopBackgroundTrailer(manual: false)
-                        onOpenPerson?(person)
+                        onOpenPerson?(
+                            person,
+                            DetailsFocusTarget(kind: .cast, itemID: person.id),
+                            uiState.moreLikeThis,
+                            displayedCastPeople,
+                            uiState.companies,
+                            uiState.simklRatings,
+                            uiState.people.isEmpty
+                        )
                     },
                     onTrailerClick: {
                         presentFullscreenTrailer()
@@ -4705,7 +4766,7 @@ struct TvDetailsContent: View {
                     headerFocus: $castHeaderFocus,
                     entryLocked: focusedDetailsSection != .cast,
                     onFocus: {
-                        guard relatedFocusRestoreAttemptID == nil else { return }
+                        guard focusRestoreAttemptTarget == nil else { return }
                         if focusedDetailsSection != .cast {
                             focusedDetailsSection = .cast
                             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -4762,12 +4823,33 @@ struct TvDetailsContent: View {
                     title: L10n.string("details_network", fallback: "Network"),
                     companies: networks,
                     entryLocked: focusedDetailsSection != .network,
+                    focusRequestID: focusRequestItemID(for: .network),
+                    externalFocus: $networkCardFocus,
+                    onMounted: {
+                        setFocusRestoreSectionMounted(for: .network, mounted: true, using: scrollProxy)
+                    },
+                    onUnmounted: {
+                        setFocusRestoreSectionMounted(for: .network, mounted: false, using: scrollProxy)
+                    },
+                    onItemFocus: { company in
+                        focusRestoreItemDidFocus(
+                            DetailsFocusTarget(kind: .network, itemID: company.id),
+                            using: scrollProxy
+                        )
+                    },
                     onSelect: { company in
-                        onOpenProduction?(company)
+                        onOpenProduction?(
+                            company,
+                            DetailsFocusTarget(kind: .network, itemID: company.id),
+                            uiState.moreLikeThis,
+                            uiState.people,
+                            uiState.companies,
+                            uiState.simklRatings
+                        )
                     },
                     onBack: handleDetailsBack,
                     onFocus: {
-                        guard relatedFocusRestoreAttemptID == nil else { return }
+                        guard focusRestoreAttemptTarget == nil else { return }
                         if focusedDetailsSection != .network {
                             focusedDetailsSection = .network
                             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -4795,12 +4877,33 @@ struct TvDetailsContent: View {
                     title: L10n.string("details_production", fallback: "Production"),
                     companies: productionCompanies,
                     entryLocked: focusedDetailsSection != .production,
+                    focusRequestID: focusRequestItemID(for: .production),
+                    externalFocus: $productionCardFocus,
+                    onMounted: {
+                        setFocusRestoreSectionMounted(for: .production, mounted: true, using: scrollProxy)
+                    },
+                    onUnmounted: {
+                        setFocusRestoreSectionMounted(for: .production, mounted: false, using: scrollProxy)
+                    },
+                    onItemFocus: { company in
+                        focusRestoreItemDidFocus(
+                            DetailsFocusTarget(kind: .production, itemID: company.id),
+                            using: scrollProxy
+                        )
+                    },
                     onSelect: { company in
-                        onOpenProduction?(company)
+                        onOpenProduction?(
+                            company,
+                            DetailsFocusTarget(kind: .production, itemID: company.id),
+                            uiState.moreLikeThis,
+                            uiState.people,
+                            uiState.companies,
+                            uiState.simklRatings
+                        )
                     },
                     onBack: handleDetailsBack,
                     onFocus: {
-                        guard relatedFocusRestoreAttemptID == nil else { return }
+                        guard focusRestoreAttemptTarget == nil else { return }
                         if focusedDetailsSection != .production {
                             focusedDetailsSection = .production
                             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -4832,7 +4935,7 @@ struct TvDetailsContent: View {
                     },
                     onBack: handleDetailsBack,
                     onFocus: {
-                        guard relatedFocusRestoreAttemptID == nil else { return }
+                        guard focusRestoreAttemptTarget == nil else { return }
                         if focusedDetailsSection != .comments {
                             focusedDetailsSection = .comments
                             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -4858,7 +4961,7 @@ struct TvDetailsContent: View {
     }
 
     private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
-        cancelRelatedFocusRestoration()
+        cancelFocusRestoration()
         stopBackgroundTrailer(manual: false)
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
@@ -4869,7 +4972,7 @@ struct TvDetailsContent: View {
     }
 
     private func handlePlayLongPress(playTarget: TvDetailsPlayTarget) {
-        cancelRelatedFocusRestoration()
+        cancelFocusRestoration()
         stopBackgroundTrailer(manual: false)
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
@@ -4890,7 +4993,7 @@ struct TvDetailsContent: View {
         playTarget: TvDetailsPlayTarget,
         scrollProxy: ScrollViewProxy
     ) {
-        cancelRelatedFocusRestoration()
+        cancelFocusRestoration()
         stopBackgroundTrailer(manual: false)
         guard meta.isSeries else {
             onHostWatchParty?(nil)
@@ -5017,7 +5120,7 @@ struct TvDetailsContent: View {
                         .scrollClipDisabledIfAvailable()
                         .coordinateSpace(name: "tv-details-scroll")
                         .onChange(of: actionFocus) { _, newFocus in
-                            guard newFocus != nil, relatedFocusRestoreAttemptID == nil else { return }
+                            guard newFocus != nil, focusRestoreAttemptTarget == nil else { return }
                             var transaction = Transaction(animation: nil)
                             transaction.disablesAnimations = true
                             withTransaction(transaction) {
@@ -5025,7 +5128,7 @@ struct TvDetailsContent: View {
                             }
                         }
                         .onChange(of: castHeaderFocus) { _, newFocus in
-                            guard newFocus != nil, relatedFocusRestoreAttemptID == nil else { return }
+                            guard newFocus != nil, focusRestoreAttemptTarget == nil else { return }
                             var transaction = Transaction(animation: nil)
                             transaction.disablesAnimations = true
                             withTransaction(transaction) {
@@ -5034,7 +5137,7 @@ struct TvDetailsContent: View {
                         }
                         .onChange(of: episodeFocus) { _, newFocus in
                             guard newFocus != nil,
-                                  relatedFocusRestoreAttemptID == nil,
+                                  focusRestoreAttemptTarget == nil,
                                   focusedDetailsSection == .episodes else { return }
                             var transaction = Transaction(animation: nil)
                             transaction.disablesAnimations = true
@@ -5043,12 +5146,19 @@ struct TvDetailsContent: View {
                             }
                         }
                         .onAppear {
-                            if let initialRelatedFocusID {
-                                beginRelatedFocusRestoration(initialRelatedFocusID, using: scrollProxy)
+                            if let initialFocusTarget {
+                                beginFocusRestoration(initialFocusTarget, using: scrollProxy)
                             }
                         }
                         .onChange(of: uiState.moreLikeThis.map(\.id)) { _, _ in
-                            restoreRelatedFocusWhenAvailable(using: scrollProxy)
+                            restoreFocusWhenAvailable(using: scrollProxy)
+                        }
+                        .onChange(of: uiState.people.map(\.id)) { _, _ in
+                            restoreFocusWhenAvailable(using: scrollProxy)
+                            reconcileRestoredCastFocus()
+                        }
+                        .onChange(of: uiState.companies.map(\.id)) { _, _ in
+                            restoreFocusWhenAvailable(using: scrollProxy)
                         }
                     }
 
@@ -5078,7 +5188,10 @@ struct TvDetailsContent: View {
             .background(Color.black.ignoresSafeArea())
             .onExitCommand(perform: handleDetailsBack)
             #if os(tvOS)
-            .onMoveCommand { _ in cancelRelatedFocusRestoration() }
+            .onMoveCommand { _ in
+                clearRestoredCastFocusHandoff()
+                cancelFocusRestoration()
+            }
             #endif
             // tvOS doesn't re-run default-focus when this content swaps in after
             // the async load finishes, so focus lands nowhere / off the Play
@@ -5087,21 +5200,21 @@ struct TvDetailsContent: View {
             .onAppear {
                 configuredDetailsSections = TVDetailsSectionOrder.currentOrder()
                 disabledDetailsSections = TVDetailsSectionOrder.disabledSections()
-                let relatedFocusRequestID = initialRelatedFocusID
+                let focusRestoreRequest = initialFocusTarget
                 var calendarEpisodeKey: String?
                 if hasAppearedBefore {
                     refreshProgressAfterReturn()
                 } else {
                     hasAppearedBefore = true
-                    if relatedFocusRequestID == nil {
+                    if focusRestoreRequest == nil {
                         // Opened from the calendar: start on that episode card
                         // instead of Play.
                         calendarEpisodeKey = calendarEpisodeFocusKey(in: episodePresentation.guide.episodes)
                         calendarFocusPending = initialFocusEpisode != nil && calendarEpisodeKey == nil
                     }
                 }
-                if relatedFocusRequestID != nil {
-                    // Recommendation focus takes precedence over a retained
+                if focusRestoreRequest != nil {
+                    // Restored card focus takes precedence over a retained
                     // calendar episode target when returning through Details.
                     calendarFocusPending = false
                     restoreGeneration &+= 1
@@ -5119,9 +5232,10 @@ struct TvDetailsContent: View {
             .onReceive(NotificationCenter.default.publisher(for: TVDetailsSectionOrder.changedNotification).receive(on: RunLoop.main)) { _ in
                 configuredDetailsSections = TVDetailsSectionOrder.currentOrder()
                 disabledDetailsSections = TVDetailsSectionOrder.disabledSections()
-                if disabledDetailsSections.contains(.related), relatedFocusRestoreTargetID != nil {
-                    cancelRelatedFocusRestoration()
-                    requestRelatedFallbackPlayFocus()
+                if let target = focusRestoreTarget,
+                   !isFocusTargetSectionEnabled(target) {
+                    cancelFocusRestoration()
+                    requestFocusRestoreFallbackPlayFocus()
                 }
             }
             .onChange(of: episodePresentation.guide.revision) { _, _ in
@@ -5133,7 +5247,8 @@ struct TvDetailsContent: View {
                 focusCalendarEpisode(key)
             }
             .onDisappear {
-                cancelRelatedFocusRestoration()
+                clearRestoredCastFocusHandoff()
+                cancelFocusRestoration()
                 let seconds = trailerPlayer.currentTime().seconds
                 if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
                     TrailerPlaybackHandoff.shared.recordHandoff(metaId: meta.id, time: seconds)
@@ -5170,14 +5285,14 @@ struct TvDetailsContent: View {
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase != .active {
-                    cancelRelatedFocusRestoration()
+                    cancelFocusRestoration()
                     trailerPlayer.pause()
                 } else if isTrailerPlaying {
                     trailerPlayer.play()
                 }
             }
             .onChange(of: isFullscreenTrailerPresented) { _, presented in
-                if presented { cancelRelatedFocusRestoration() }
+                if presented { cancelFocusRestoration() }
             }
             .onReceive(
                 NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification).receive(on: RunLoop.main)
@@ -5196,7 +5311,7 @@ struct TvDetailsContent: View {
             // where it was.
             .onChange(of: isEnabled) { _, enabled in
                 if !enabled {
-                    cancelRelatedFocusRestoration()
+                    cancelFocusRestoration()
                     restoreGeneration &+= 1
                     restoreEpisodeKey = episodeFocus
                     stopBackgroundTrailer(manual: false)
@@ -5280,143 +5395,286 @@ struct TvDetailsContent: View {
         }
     }
 
-    /// Nudges focus back onto the captured episode control. The writes are
-    /// delayed because the cards are unfocusable for a few frames while the
-    /// picker fades, and the 1s clear is a safety net for a target that is gone
-    /// (the season was switched, say) so the strip can't stay unfocusable.
-    private func beginRelatedFocusRestoration(_ targetID: String, using scrollProxy: ScrollViewProxy) {
-        guard initialRelatedFocusID == targetID else { return }
-        if relatedFocusRestoreTargetID != targetID {
-            if relatedFocusRestoreTargetID != nil {
-                cancelRelatedFocusRestoration()
+    private func detailsSection(for target: DetailsFocusTarget) -> TvDetailsFocusSection {
+        switch target.kind {
+        case .moreLikeThis: return .related
+        case .cast: return .cast
+        case .network: return .network
+        case .production: return .production
+        }
+    }
+
+    private func isFocusTargetSectionEnabled(_ target: DetailsFocusTarget) -> Bool {
+        activeDetailsSections.contains { section in
+            switch (target.kind, section) {
+            case (.moreLikeThis, .related), (.cast, .cast), (.network, .network), (.production, .production):
+                return true
+            default:
+                return false
             }
-            relatedFocusRestoreGeneration &+= 1
-            relatedFocusRestoreTargetID = targetID
+        }
+    }
+
+    private func focusTargetItemIsAvailable(_ target: DetailsFocusTarget) -> Bool {
+        switch target.kind {
+        case .moreLikeThis:
+            return uiState.moreLikeThis.contains(where: { $0.id == target.itemID })
+        case .cast:
+            return resolvedFocusItemID(for: target) != nil
+        case .network:
+            return displayedNetworks.contains(where: { $0.id == target.itemID })
+        case .production:
+            return displayedProductionCompanies.contains(where: { $0.id == target.itemID })
+        }
+    }
+
+    private func focusRequestItemID(for kind: DetailsFocusTargetKind) -> String? {
+        guard let target = focusRestoreAttemptTarget, target.kind == kind else { return nil }
+        return resolvedFocusItemID(for: target)
+    }
+
+    private func resolvedFocusItemID(for target: DetailsFocusTarget) -> String? {
+        switch target.kind {
+        case .moreLikeThis:
+            return uiState.moreLikeThis.contains(where: { $0.id == target.itemID }) ? target.itemID : nil
+        case .cast:
+            let availablePeople = uiState.people.isEmpty ? displayedCastPeople : uiState.people
+            if let exactMatch = availablePeople.first(where: { $0.id == target.itemID }) {
+                return exactMatch.id
+            }
+            guard let initialFocusPersonName else { return nil }
+            let normalizedName = normalizedPersonName(initialFocusPersonName)
+            guard !normalizedName.isEmpty else { return nil }
+            return availablePeople.first(where: {
+                normalizedPersonName($0.name) == normalizedName
+            })?.id
+        case .network:
+            return displayedNetworks.contains(where: { $0.id == target.itemID }) ? target.itemID : nil
+        case .production:
+            return displayedProductionCompanies.contains(where: { $0.id == target.itemID }) ? target.itemID : nil
+        }
+    }
+
+    private func normalizedPersonName(_ name: String) -> String {
+        name.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .split(whereSeparator: { $0.isWhitespace })
+            .joined(separator: " ")
+    }
+
+    private func focusedItemID(for kind: DetailsFocusTargetKind) -> String? {
+        switch kind {
+        case .moreLikeThis: return relatedCardFocus
+        case .cast: return castCardFocus
+        case .network: return networkCardFocus
+        case .production: return productionCardFocus
+        }
+    }
+
+    private func setFocusedItemID(_ itemID: String?, for kind: DetailsFocusTargetKind) {
+        switch kind {
+        case .moreLikeThis: relatedCardFocus = itemID
+        case .cast: castCardFocus = itemID
+        case .network: networkCardFocus = itemID
+        case .production: productionCardFocus = itemID
+        }
+    }
+
+    private func beginFocusRestoration(_ target: DetailsFocusTarget, using scrollProxy: ScrollViewProxy) {
+        guard initialFocusTarget == target else { return }
+        if focusRestoreTarget != target {
+            if focusRestoreTarget != nil {
+                cancelFocusRestoration()
+            }
+            focusRestoreGeneration &+= 1
+            focusRestoreTarget = target
+            focusRestoreAttemptTarget = nil
+            focusRestoreSectionIsMounted = mountedFocusTargetKinds.contains(target.kind)
         }
 
         calendarFocusPending = false
         restoreGeneration &+= 1
         restoreEpisodeKey = nil
 
-        guard activeDetailsSections.contains(.related),
-              !disabledDetailsSections.contains(.related) else {
-            cancelRelatedFocusRestoration()
-            requestRelatedFallbackPlayFocus()
+        guard isFocusTargetSectionEnabled(target) else {
+            cancelFocusRestoration()
+            requestFocusRestoreFallbackPlayFocus()
             return
         }
-        restoreRelatedFocusWhenAvailable(using: scrollProxy)
+        restoreFocusWhenAvailable(using: scrollProxy)
     }
 
-    private func restoreRelatedFocusWhenAvailable(using scrollProxy: ScrollViewProxy) {
-        guard let targetID = relatedFocusRestoreTargetID else { return }
+    private func restoreFocusWhenAvailable(using scrollProxy: ScrollViewProxy) {
+        guard let target = focusRestoreTarget else { return }
         guard isEnabled else {
-            cancelRelatedFocusRestoration()
+            cancelFocusRestoration()
             return
         }
-        guard activeDetailsSections.contains(.related),
-              !disabledDetailsSections.contains(.related) else {
-            cancelRelatedFocusRestoration()
-            requestRelatedFallbackPlayFocus()
+        guard isFocusTargetSectionEnabled(target) else {
+            cancelFocusRestoration()
+            requestFocusRestoreFallbackPlayFocus()
             return
         }
-        guard uiState.moreLikeThis.contains(where: { $0.id == targetID }) else {
+        guard focusTargetItemIsAvailable(target) else {
             focusedDetailsSection = .actions
-            requestRelatedFallbackPlayFocus(for: targetID)
+            requestFocusRestoreFallbackPlayFocus(for: target)
             return
         }
 
-        focusedDetailsSection = .related
+        let section = detailsSection(for: target)
+        focusedDetailsSection = section
         withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-            scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+            scrollProxy.scrollTo(scrollID(for: section), anchor: .top)
         }
-        if relatedRowIsMounted {
-            scheduleRelatedFocusRestore(using: scrollProxy)
+        if focusRestoreSectionIsMounted {
+            scheduleFocusRestore(using: scrollProxy)
         }
     }
 
-    private func scheduleRelatedFocusRestore(using scrollProxy: ScrollViewProxy) {
-        guard let targetID = relatedFocusRestoreTargetID,
-              relatedRowIsMounted,
+    private func scheduleFocusRestore(using scrollProxy: ScrollViewProxy) {
+        guard let target = focusRestoreTarget,
+              focusRestoreSectionIsMounted,
               isEnabled,
-              activeDetailsSections.contains(.related),
-              !disabledDetailsSections.contains(.related),
-              uiState.moreLikeThis.contains(where: { $0.id == targetID }) else { return }
-        focusedDetailsSection = .related
-        guard isDetailsFocusReachable(.related) else { return }
+              isFocusTargetSectionEnabled(target),
+              focusTargetItemIsAvailable(target) else { return }
+        let section = detailsSection(for: target)
+        focusedDetailsSection = section
+        guard isDetailsFocusReachable(section) else { return }
 
-        relatedFocusRestoreGeneration &+= 1
-        let generation = relatedFocusRestoreGeneration
-        relatedFocusRestoreAttemptID = targetID
+        focusRestoreGeneration &+= 1
+        let generation = focusRestoreGeneration
+        focusRestoreAttemptTarget = target
         for delay in [0.08, 0.24, 0.42] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                guard relatedFocusRestoreGeneration == generation,
-                      relatedFocusRestoreTargetID == targetID,
-                      relatedRowIsMounted,
+                guard focusRestoreGeneration == generation,
+                      focusRestoreTarget == target,
+                      focusRestoreSectionIsMounted,
                       isEnabled,
-                      focusedDetailsSection == .related,
-                      isDetailsFocusReachable(.related) else { return }
-                relatedCardFocus = targetID
+                      focusedDetailsSection == section,
+                      isDetailsFocusReachable(section),
+                      let focusedItemID = resolvedFocusItemID(for: target) else { return }
+                setFocusedItemID(focusedItemID, for: target.kind)
             }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            guard relatedFocusRestoreGeneration == generation,
-                  relatedFocusRestoreTargetID == targetID else { return }
-            cancelRelatedFocusRestoration()
+            guard focusRestoreGeneration == generation,
+                  focusRestoreTarget == target else { return }
+            cancelFocusRestoration()
             focusedDetailsSection = .actions
-            requestRelatedFallbackPlayFocus()
+            requestFocusRestoreFallbackPlayFocus()
         }
     }
 
-    private func finishRelatedFocusRestoration(_ targetID: String, using scrollProxy: ScrollViewProxy) {
-        guard relatedFocusRestoreTargetID == targetID else { return }
-        relatedFocusRestoreGeneration &+= 1
-        let generation = relatedFocusRestoreGeneration
-        relatedFocusRestoreTargetID = nil
-        relatedFocusRestoreAttemptID = nil
-        onRelatedFocusRequestFinished?(targetID)
+    private func finishFocusRestoration(
+        _ target: DetailsFocusTarget,
+        focusedItemID focusedCardID: String,
+        using scrollProxy: ScrollViewProxy
+    ) {
+        guard focusRestoreTarget == target else { return }
+        focusRestoreGeneration &+= 1
+        let generation = focusRestoreGeneration
+        let section = detailsSection(for: target)
+        if target.kind == .cast {
+            restoredCastFocusGeneration &+= 1
+            restoredCastFocusTarget = target
+            restoredCastFocusItemID = focusedCardID
+        }
+        focusRestoreTarget = nil
+        focusRestoreAttemptTarget = nil
+        onFocusRequestFinished?(target)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            guard relatedFocusRestoreGeneration == generation,
-                  relatedRowIsMounted,
+            guard focusRestoreGeneration == generation,
+                  focusRestoreSectionIsMounted,
                   isEnabled,
-                  focusedDetailsSection == .related,
-                  relatedCardFocus == targetID else { return }
+                  focusedDetailsSection == section,
+                  focusedItemID(for: target.kind) == focusedCardID else { return }
             var transaction = Transaction(animation: nil)
             transaction.disablesAnimations = true
             withTransaction(transaction) {
-                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+                scrollProxy.scrollTo(scrollID(for: section), anchor: .top)
             }
         }
     }
 
-    private func cancelRelatedFocusRestoration() {
+    private func cancelFocusRestoration() {
         detailsFocusMoveGeneration &+= 1
-        relatedFocusRestoreGeneration &+= 1
-        guard let targetID = relatedFocusRestoreTargetID else { return }
-        relatedFocusRestoreTargetID = nil
-        relatedFocusRestoreAttemptID = nil
-        if relatedCardFocus == targetID {
-            relatedCardFocus = nil
+        focusRestoreGeneration &+= 1
+        guard let target = focusRestoreTarget else { return }
+        focusRestoreTarget = nil
+        focusRestoreAttemptTarget = nil
+        focusRestoreSectionIsMounted = false
+        let requestedItemID = resolvedFocusItemID(for: target) ?? target.itemID
+        if focusedItemID(for: target.kind) == requestedItemID {
+            setFocusedItemID(nil, for: target.kind)
         }
-        onRelatedFocusRequestFinished?(targetID)
+        onFocusRequestFinished?(target)
     }
 
-    private func requestRelatedFallbackPlayFocus(for targetID: String? = nil) {
+    private func requestFocusRestoreFallbackPlayFocus(for target: DetailsFocusTarget? = nil) {
         focusedDetailsSection = .actions
         let generation = detailsFocusMoveGeneration
         DispatchQueue.main.async {
             guard detailsFocusMoveGeneration == generation else { return }
-            if let targetID {
-                guard relatedFocusRestoreTargetID == targetID else { return }
+            if let target {
+                guard focusRestoreTarget == target else { return }
             } else {
-                guard relatedFocusRestoreTargetID == nil else { return }
+                guard focusRestoreTarget == nil else { return }
             }
-            isSettingRelatedFallbackFocus = true
+            isSettingFocusRestoreFallback = true
             actionFocus = .play
             DispatchQueue.main.async {
-                isSettingRelatedFallbackFocus = false
+                isSettingFocusRestoreFallback = false
             }
         }
+    }
+
+    private func setFocusRestoreSectionMounted(
+        for kind: DetailsFocusTargetKind,
+        mounted: Bool,
+        using scrollProxy: ScrollViewProxy
+    ) {
+        if mounted {
+            mountedFocusTargetKinds.insert(kind)
+        } else {
+            mountedFocusTargetKinds.remove(kind)
+        }
+        guard focusRestoreTarget?.kind == kind else { return }
+        focusRestoreSectionIsMounted = mounted
+        if mounted {
+            restoreFocusWhenAvailable(using: scrollProxy)
+        }
+    }
+
+    private func focusRestoreItemDidFocus(
+        _ focusedTarget: DetailsFocusTarget,
+        using scrollProxy: ScrollViewProxy
+    ) {
+        guard let target = focusRestoreTarget,
+              target.kind == focusedTarget.kind,
+              resolvedFocusItemID(for: target) == focusedTarget.itemID else { return }
+        finishFocusRestoration(target, focusedItemID: focusedTarget.itemID, using: scrollProxy)
+    }
+
+    private func reconcileRestoredCastFocus() {
+        guard let target = restoredCastFocusTarget,
+              let previousItemID = restoredCastFocusItemID,
+              let currentItemID = resolvedFocusItemID(for: target),
+              currentItemID != previousItemID else { return }
+        let generation = restoredCastFocusGeneration
+        DispatchQueue.main.async {
+            guard restoredCastFocusGeneration == generation,
+                  restoredCastFocusTarget == target,
+                  restoredCastFocusItemID == previousItemID,
+                  resolvedFocusItemID(for: target) == currentItemID else { return }
+            castCardFocus = currentItemID
+            restoredCastFocusItemID = currentItemID
+        }
+    }
+
+    private func clearRestoredCastFocusHandoff() {
+        restoredCastFocusGeneration &+= 1
+        restoredCastFocusTarget = nil
+        restoredCastFocusItemID = nil
     }
 
     /// The card of the episode the calendar asked for, when the title lists it.
@@ -5575,35 +5833,48 @@ struct TvDetailsContent: View {
         scrollProxy: ScrollViewProxy,
         restoresMoreLikeThisFocus: Bool = false
     ) -> some View {
-        TvDetailsRelatedRow(
+        let restoreTarget = restoresMoreLikeThisFocus && focusRestoreAttemptTarget?.kind == .moreLikeThis
+            ? focusRestoreAttemptTarget
+            : nil
+        return TvDetailsRelatedRow(
             title: title,
             items: items,
             entryLocked: focusedDetailsSection != .related,
-            focusRequestID: restoresMoreLikeThisFocus ? relatedFocusRestoreAttemptID : nil,
+            focusRequestID: restoreTarget?.itemID,
             externalFocus: restoresMoreLikeThisFocus ? $relatedCardFocus : nil,
             onMounted: restoresMoreLikeThisFocus ? {
-                relatedRowIsMounted = true
-                scheduleRelatedFocusRestore(using: scrollProxy)
+                setFocusRestoreSectionMounted(for: .moreLikeThis, mounted: true, using: scrollProxy)
             } : nil,
             onUnmounted: restoresMoreLikeThisFocus ? {
-                relatedRowIsMounted = false
+                setFocusRestoreSectionMounted(for: .moreLikeThis, mounted: false, using: scrollProxy)
             } : nil,
             onItemFocus: restoresMoreLikeThisFocus ? { item in
-                guard relatedFocusRestoreTargetID == item.id else { return }
-                finishRelatedFocusRestoration(item.id, using: scrollProxy)
+                focusRestoreItemDidFocus(
+                    DetailsFocusTarget(kind: .moreLikeThis, itemID: item.id),
+                    using: scrollProxy
+                )
             } : nil,
             onSelect: { item in
                 stopBackgroundTrailer(manual: false)
                 CinemetaCatalogRepository.cacheCatalogMetadata(item.asMeta)
                 if restoresMoreLikeThisFocus {
-                    cancelRelatedFocusRestoration()
-                    onOpenTitle?(item.id, item.type, item.id, items, uiState.people, uiState.simklRatings)
+                    cancelFocusRestoration()
+                    onOpenTitle?(
+                        item.id,
+                        item.type,
+                        DetailsFocusTarget(kind: .moreLikeThis, itemID: item.id),
+                        items,
+                        uiState.people,
+                        uiState.companies,
+                        uiState.simklRatings
+                    )
                 } else {
-                    onOpenTitle?(item.id, item.type, nil, nil, uiState.people, uiState.simklRatings)
+                    onOpenTitle?(item.id, item.type, nil, nil, uiState.people, uiState.companies, uiState.simklRatings)
                 }
             },
             onBack: handleDetailsBack,
             onFocus: {
+                guard focusRestoreAttemptTarget == nil || focusRestoreAttemptTarget?.kind == .moreLikeThis else { return }
                 if focusedDetailsSection != .related {
                     focusedDetailsSection = .related
                     withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -5621,11 +5892,49 @@ struct TvDetailsContent: View {
     }
 
     private var hasCastOrTrailer: Bool {
-        guard let meta = uiState.meta else { return false }
-        let hasPeople = !uiState.people.isEmpty
-            || !(meta.cast ?? []).isEmpty
-            || !((meta.director ?? []) + (meta.writer ?? [])).isEmpty
-        return hasPeople
+        !displayedCastPeople.isEmpty
+    }
+
+    private var displayedCastPeople: [TmdbPersonMetadata] {
+        let allPeople: [TmdbPersonMetadata]
+        if !uiState.people.isEmpty {
+            allPeople = uiState.people
+        } else {
+            guard let meta = uiState.meta else { return [] }
+            let names = !(meta.cast ?? []).isEmpty
+                ? (meta.cast ?? [])
+                : ((meta.director ?? []) + (meta.writer ?? []))
+            allPeople = names.map {
+                TmdbPersonMetadata(name: $0, role: nil, profileURL: nil, tmdbId: nil)
+            }
+        }
+
+        var visiblePeople = Array(allPeople.prefix(8))
+        let target = focusRestoreTarget?.kind == .cast ? focusRestoreTarget : restoredCastFocusTarget
+        let targetPerson = target.flatMap { target -> TmdbPersonMetadata? in
+            guard target.kind == .cast else { return nil }
+            return allPeople.first(where: { $0.id == target.itemID })
+                ?? allPeople.first(where: {
+                    guard let initialFocusPersonName else { return false }
+                    return normalizedPersonName($0.name) == normalizedPersonName(initialFocusPersonName)
+                })
+        }
+        let focusedPerson = castCardFocus.flatMap { focusedID in
+            allPeople.first(where: { $0.id == focusedID })
+        }
+        if let selectedPerson = targetPerson ?? focusedPerson,
+           !visiblePeople.contains(where: { $0.id == selectedPerson.id }) {
+            visiblePeople.append(selectedPerson)
+        }
+        return visiblePeople
+    }
+
+    private var displayedNetworks: [MetaCompany] {
+        uiState.companies.filter { $0.kind == .network && $0.tmdbId != nil }
+    }
+
+    private var displayedProductionCompanies: [MetaCompany] {
+        uiState.companies.filter { $0.kind == .production && $0.tmdbId != nil }
     }
 
     /// Settings has one destination pane; Details has a vertical chain of
@@ -6659,8 +6968,13 @@ enum DetailsCastHeaderLabel {
 }
 
 private struct TvDetailsCastAndTrailer: View {
-    let meta: NuvioMeta
+    var mediaType: String = ""
     let people: [TmdbPersonMetadata]
+    var focusRequestID: String? = nil
+    var externalFocus: FocusState<String?>.Binding? = nil
+    var onMounted: (() -> Void)? = nil
+    var onUnmounted: (() -> Void)? = nil
+    var onPersonFocus: ((TmdbPersonMetadata) -> Void)? = nil
     let onPersonClick: (TmdbPersonMetadata) -> Void
     let onTrailerClick: () -> Void
     var onBack: (() -> Void)? = nil
@@ -6676,13 +6990,14 @@ private struct TvDetailsCastAndTrailer: View {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(spacing: 18) {
                     TvDetailsSectionButton(
-                        title: DetailsCastHeaderLabel.title(for: meta.type),
+                        title: DetailsCastHeaderLabel.title(for: mediaType),
                         isSelected: false,
                         focus: headerFocus,
                         tag: .creatorAndCast,
                         onFocus: onFocus,
                         onBack: onBack
                     ) {}
+                    .disabled(focusRequestID != nil)
 
                     Text("|")
                         .font(.system(size: 36, weight: .medium))
@@ -6697,27 +7012,45 @@ private struct TvDetailsCastAndTrailer: View {
                         onBack: onBack,
                         action: onTrailerClick
                     )
-                        .disabled(entryLocked)
+                        .disabled(entryLocked || focusRequestID != nil)
                 }
 
-                ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 58) {
-                        ForEach(Array(items.enumerated()), id: \.element.id) { index, person in
-                            TvDetailsPersonCard(
-                                person: person,
-                                onSelect: { onPersonClick(person) },
-                                onFocus: {
-                                    focusedPersonIndex = index
-                                    onFocus()
-                                },
-                                onBack: onBack
-                            )
-                            .disabled(entryLocked)
+                ScrollViewReader { scrollProxy in
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 58) {
+                            ForEach(Array(items.enumerated()), id: \.element.id) { index, person in
+                                TvDetailsPersonCard(
+                                    person: person,
+                                    externalFocus: externalFocus,
+                                    onSelect: { onPersonClick(person) },
+                                    onFocus: {
+                                        focusedPersonIndex = index
+                                        onFocus()
+                                        onPersonFocus?(person)
+                                    },
+                                    onBack: onBack
+                                )
+                                .id(person.id)
+                                .disabled(focusRequestID.map { $0 != person.id } ?? entryLocked)
+                            }
                         }
+                        .padding(.trailing, 80)
                     }
-                    .padding(.trailing, 80)
+                    .scrollClipDisabledIfAvailable()
+                    .onAppear {
+                        positionAtRequestedItem(using: scrollProxy)
+                        onMounted?()
+                    }
+                    .onChange(of: focusRequestID) { _, _ in
+                        positionAtRequestedItem(using: scrollProxy)
+                    }
+                    .onChange(of: people.map(\.id)) { _, _ in
+                        positionAtRequestedItem(using: scrollProxy)
+                    }
+                    .onDisappear {
+                        onUnmounted?()
+                    }
                 }
-                .scrollClipDisabledIfAvailable()
             }
             .focusSection()
             .onExitCommand {
@@ -6727,25 +7060,13 @@ private struct TvDetailsCastAndTrailer: View {
     }
 
     private var displayPeople: [TmdbPersonMetadata] {
-        if !people.isEmpty {
-            return Array(people.prefix(8))
-        }
+        people
+    }
 
-        let cast = meta.cast ?? []
-        if !cast.isEmpty {
-            return Array(cast.prefix(8)).map {
-                TmdbPersonMetadata(name: $0, role: nil, profileURL: nil, tmdbId: nil)
-            }
-        }
-
-        let creators = (meta.director ?? []) + (meta.writer ?? [])
-        if !creators.isEmpty {
-            return Array(creators.prefix(8)).map {
-                TmdbPersonMetadata(name: $0, role: nil, profileURL: nil, tmdbId: nil)
-            }
-        }
-
-        return []
+    private func positionAtRequestedItem(using scrollProxy: ScrollViewProxy) {
+        guard let focusRequestID,
+              people.contains(where: { $0.id == focusRequestID }) else { return }
+        scrollProxy.scrollTo(focusRequestID, anchor: .center)
     }
 }
 
@@ -6889,6 +7210,11 @@ private struct TvDetailsProductionRow: View {
     let title: String
     let companies: [MetaCompany]
     let entryLocked: Bool
+    var focusRequestID: String? = nil
+    var externalFocus: FocusState<String?>.Binding? = nil
+    var onMounted: (() -> Void)? = nil
+    var onUnmounted: (() -> Void)? = nil
+    var onItemFocus: ((MetaCompany) -> Void)? = nil
     let onSelect: (MetaCompany) -> Void
     var onBack: (() -> Void)? = nil
     let onFocus: () -> Void
@@ -6922,14 +7248,19 @@ private struct TvDetailsProductionRow: View {
                 ForEach(Array(companies.enumerated()), id: \.element.id) { index, company in
                     TvDetailsCompanyCard(
                         company: company,
+                        externalFocus: externalFocus,
                         onSelect: { onSelect(company) },
                         onFocus: {
                             if scrollIndex != index { scrollIndex = index }
                             onFocus()
+                            onItemFocus?(company)
                         },
                         onBack: onBack
                     )
-                    .disabled(entryLocked && index != entryCompanyIndex)
+                    .disabled(
+                        focusRequestID.map { $0 != company.id }
+                            ?? (entryLocked && index != entryCompanyIndex)
+                    )
                 }
             }
             .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
@@ -6944,16 +7275,40 @@ private struct TvDetailsProductionRow: View {
         .onExitCommand {
             onBack?()
         }
+        .onAppear {
+            positionAtRequestedCompany()
+            onMounted?()
+        }
+        .onChange(of: focusRequestID) { _, _ in
+            positionAtRequestedCompany()
+        }
+        .onChange(of: companies.map(\.id)) { _, _ in
+            positionAtRequestedCompany()
+        }
+        .onDisappear {
+            onUnmounted?()
+        }
+    }
+
+    private func positionAtRequestedCompany() {
+        guard let focusRequestID,
+              let index = companies.firstIndex(where: { $0.id == focusRequestID }) else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            scrollIndex = index
+        }
     }
 }
 
 private struct TvDetailsCompanyCard: View {
     let company: MetaCompany
+    var externalFocus: FocusState<String?>.Binding? = nil
     let onSelect: () -> Void
     let onFocus: () -> Void
     var onBack: (() -> Void)? = nil
 
-    @FocusState private var isFocused: Bool
+    @FocusState private var localFocusID: String?
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
 
@@ -6963,6 +7318,10 @@ private struct TvDetailsCompanyCard: View {
 
     private var shape: RoundedRectangle {
         RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+    }
+
+    private var isFocused: Bool {
+        externalFocus?.wrappedValue == company.id || localFocusID == company.id
     }
 
     var body: some View {
@@ -7021,7 +7380,7 @@ private struct TvDetailsCompanyCard: View {
             }
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
+        .focused(externalFocus ?? $localFocusID, equals: company.id)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.05 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -8075,12 +8434,17 @@ actor PersonProfileImageCache {
 
 private struct TvDetailsPersonCard: View {
     let person: TmdbPersonMetadata
+    var externalFocus: FocusState<String?>.Binding? = nil
     let onSelect: () -> Void
     let onFocus: () -> Void
     var onBack: (() -> Void)? = nil
 
-    @FocusState private var isFocused: Bool
+    @FocusState private var localFocusID: String?
     @State private var profileImage: UIImage?
+
+    private var isFocused: Bool {
+        externalFocus?.wrappedValue == person.id || localFocusID == person.id
+    }
 
     var body: some View {
         Button(action: onSelect) {
@@ -8122,7 +8486,7 @@ private struct TvDetailsPersonCard: View {
             .frame(width: 220)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
+        .focused(externalFocus ?? $localFocusID, equals: person.id)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -8592,6 +8956,7 @@ private struct TvDetailsEpisodes: View {
     @State private var seasonEpisodeIndexByID: [String: Int]
     @State private var episodeScrollIndex: Int
     @State private var watchedEpisodeKeys: Set<String>
+    @State private var trustedWatchedEpisodeKeys: Set<String> = []
     @State private var episodeWatchCounts: [String: Int]
     @State private var watchedSummary: WatchedEpisodeSummary?
     @State private var seasonIsWatched: Bool
@@ -8601,6 +8966,10 @@ private struct TvDetailsEpisodes: View {
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.reuseLastLink) private var reuseLastLink = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
+    @State private var revealableNextEpisodeKey: String?
+    @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
+    @State private var hasCachedCompletedLedgerEvidence = false
 
     init(
         meta: NuvioMeta,
@@ -8669,6 +9038,9 @@ private struct TvDetailsEpisodes: View {
             episodeCardStrip
         }
         .focusSection()
+        .onAppear {
+            refreshWatchedState()
+        }
         .onExitCommand {
             if isChoosingWatchPartyEpisode {
                 onCancelWatchPartySelection()
@@ -8678,6 +9050,9 @@ private struct TvDetailsEpisodes: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchProgressLedger.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshWatchedState(refreshCompletedLedgerEvidence: true)
         }
         .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
@@ -8714,6 +9089,9 @@ private struct TvDetailsEpisodes: View {
                 episodeScrollIndex = targetIndex
             }
         }
+        .onChange(of: revealNextEpisodeSpoilers) { _, _ in
+            refreshWatchedState()
+        }
     }
 
     private var watchPartySelectionPrompt: some View {
@@ -8733,9 +9111,6 @@ private struct TvDetailsEpisodes: View {
 
     private func refreshEpisodeGuideState() {
         let watchedKeys = initialState.watchedEpisodeKeys
-        watchedEpisodeKeys = watchedKeys
-        episodeWatchCounts = initialState.episodeWatchCounts
-        watchedSummary = initialState.watchedSummary
         if !userDidSelectSeason || !episodeGuide.seasons.contains(selectedSeason) {
             selectedSeason = initialState.selectedSeason
             setSeasonEpisodes(initialState.seasonEpisodes, watchedKeys: watchedKeys)
@@ -8746,9 +9121,13 @@ private struct TvDetailsEpisodes: View {
                 watchedKeys: watchedKeys
             )
         }
+        refreshWatchedState(
+            using: watchedKeys,
+            episodeWatchCounts: initialState.episodeWatchCounts
+        )
     }
 
-    private func refreshWatchedState() {
+    private func refreshWatchedState(refreshCompletedLedgerEvidence: Bool = false) {
         let snapshot = libraryWatchedContext.map {
             WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
         } ?? WatchedStore.currentSnapshot()
@@ -8757,14 +9136,40 @@ private struct TvDetailsEpisodes: View {
                 ? snapshot.watchedEpisodeKeys(meta: meta)
                 : snapshot.catalogWatchedEpisodeKeys(meta: meta))
                 .union(AniListAccount.watchedEpisodeKeys(meta: meta)),
-            episodeWatchCounts: snapshot.catalogEpisodeWatchCounts(meta: meta)
+            episodeWatchCounts: snapshot.catalogEpisodeWatchCounts(meta: meta),
+            refreshCompletedLedgerEvidence: refreshCompletedLedgerEvidence,
+            snapshot: snapshot
         )
     }
 
     private func refreshWatchedState(
         using watchedKeys: Set<String>,
-        episodeWatchCounts: [String: Int]
+        episodeWatchCounts: [String: Int],
+        refreshCompletedLedgerEvidence: Bool = false,
+        snapshot providedSnapshot: WatchedSnapshot? = nil
     ) {
+        var ledgerEvidenceChanged = false
+        if refreshCompletedLedgerEvidence || !hasCachedCompletedLedgerEvidence {
+            let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
+            ledgerEvidenceChanged = !hasCachedCompletedLedgerEvidence
+                || latestEvidence != completedLedgerEpisodeKeysByContentID
+            completedLedgerEpisodeKeysByContentID = latestEvidence
+            hasCachedCompletedLedgerEvidence = true
+        }
+        if refreshCompletedLedgerEvidence && hasCachedCompletedLedgerEvidence && !ledgerEvidenceChanged {
+            return
+        }
+
+        let snapshot = providedSnapshot ?? libraryWatchedContext.map {
+            WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
+        } ?? WatchedStore.currentSnapshot()
+        let trustedWatchedKeys = EpisodeSpoilerPolicy.watchedEpisodeKeys(
+            for: meta,
+            in: episodeGuide.episodes,
+            snapshot: snapshot,
+            completedLedgerKeysByContentID: completedLedgerEpisodeKeysByContentID
+        )
+        trustedWatchedEpisodeKeys = trustedWatchedKeys
         watchedEpisodeKeys = watchedKeys
         self.episodeWatchCounts = episodeWatchCounts
         watchedSummary = WatchedEpisodeSummary.make(
@@ -8772,6 +9177,15 @@ private struct TvDetailsEpisodes: View {
             watchedEpisodeKeys: watchedKeys
         )
         refreshSeasonWatchedState(for: seasonEpisodes, watchedKeys: watchedKeys)
+        guard revealNextEpisodeSpoilers else {
+            revealableNextEpisodeKey = nil
+            return
+        }
+        revealableNextEpisodeKey = EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+            in: episodeGuide.episodes,
+            watchedEpisodeKeys: trustedWatchedKeys,
+            guideIsOrdered: true
+        )
     }
 
     private func setSeasonEpisodes(_ newEpisodes: [NuvioVideo], watchedKeys: Set<String>? = nil) {
@@ -8866,7 +9280,6 @@ private struct TvDetailsEpisodes: View {
             let materializedIndices = materializedEpisodeIndices(visibleCardCount: visibleCardCount)
             let materializedEpisodes = materializedIndices.map { seasonEpisodes[$0] }
             let currentSeasonEpisodeNumbers = seasonEpisodes.map(\.episode)
-
             HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
                 ForEach(materializedEpisodes) { video in
                     let itemIndex = seasonEpisodeIndexByID[video.id] ?? 0
@@ -8878,7 +9291,9 @@ private struct TvDetailsEpisodes: View {
                         video: video,
                         fallbackArtworkURL: meta.backdropUrl,
                         continueProgress: continueProgress(for: video),
-                        isWatched: watchedEpisodeKeys.contains(watchKey),
+                        isWatched: watchedEpisodeKeys.contains(watchKey)
+                            || trustedWatchedEpisodeKeys.contains(watchKey),
+                        isRevealableNextEpisode: watchKey == revealableNextEpisodeKey,
                         watchCount: episodeWatchCount,
                         isSeasonWatched: isSeasonWatched,
                         episodeRatings: epRating,
@@ -8942,13 +9357,14 @@ private struct TvDetailsEpisodes: View {
                         onMenuClosed: { onEpisodeMenuPresented(false) },
                         action: { onSelect(video) },
                         onPlayManually: onPlayManually != nil ? { onPlayManually?(video) } : nil,
-                        smartStreamSelection: smartStreamSelection || (reuseLastLink && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, meta: meta, profileId: ProfileSettings.activeProfileID) != nil),
+                        smartStreamSelection: smartStreamSelection || (reuseLastLink && itemIndex == episodeScrollIndex && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, meta: meta, profileId: ProfileSettings.activeProfileID) != nil),
                         onBack: onBack,
                         focus: episodeFocus,
-                        restrictFocusToKey: effectiveFocusRestriction,
                         onMoveDown: onMoveDownFromEpisode,
                         onMoveUp: seasons.count <= 1 ? onMoveUpFromSeason : nil
                     )
+                    .equatable()
+                    .disabled(isEpisodeCardBlocked(video.id))
                 }
             }
             .padding(.leading, CGFloat(materializedIndices.first ?? 0) * TvEpisodeCardLayout.step)
@@ -8994,6 +9410,13 @@ private struct TvDetailsEpisodes: View {
                 }
             }
         }
+    }
+
+    /// Whether focus is kept off this card: while it is put back on another episode, or while
+    /// the strip is entered (focus goes to the remembered card).
+    private func isEpisodeCardBlocked(_ videoID: String) -> Bool {
+        guard let restriction = effectiveFocusRestriction else { return false }
+        return restriction != TvEpisodeFocus.card(videoID)
     }
 
     @ViewBuilder
@@ -9226,6 +9649,7 @@ private struct TvEpisodeCard: View {
     let fallbackArtworkURL: String?
     let continueProgress: Double?
     let isWatched: Bool
+    let isRevealableNextEpisode: Bool
     let watchCount: Int
     let isSeasonWatched: Bool
     var episodeRatings: [NuvioExternalRating] = []
@@ -9242,7 +9666,6 @@ private struct TvEpisodeCard: View {
     var smartStreamSelection: Bool = false
     var onBack: (() -> Void)? = nil
     var focus: FocusState<String?>.Binding
-    let restrictFocusToKey: String?
     let onMoveDown: () -> Void
     var onMoveUp: (() -> Void)? = nil
 
@@ -9251,16 +9674,19 @@ private struct TvEpisodeCard: View {
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
 
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
-    private var isFocused: Bool { focus.wrappedValue == cardKey }
+    @FocusState private var isFocused: Bool
 
     private var isCurrentlyWatching: Bool {
         (continueProgress ?? 0) > 0
     }
 
     private var shouldApplySpoilerProtection: Bool {
-        !isWatched && !isCurrentlyWatching
+        !isWatched
+            && !isCurrentlyWatching
+            && !(revealNextEpisodeSpoilers && isRevealableNextEpisode)
     }
 
     private var shouldBlurThumbnail: Bool {
@@ -9312,8 +9738,7 @@ private struct TvEpisodeCard: View {
                         .background {
                             if liquidGlassCards {
                                 Capsule()
-                                    .fill(Color.white.opacity(0.14))
-                                    .modifier(LiquidGlassBadgeModifier(cornerRadius: 16))
+                                    .fill(Color.white.opacity(isFocused ? 0.22 : 0.14))
                             } else {
                                 Capsule()
                                     .fill(Color.black.opacity(0.52))
@@ -9382,30 +9807,15 @@ private struct TvEpisodeCard: View {
                 }
                 .frame(width: cardWidth, height: cardHeight)
                 .background {
-                    if liquidGlassCards {
-                        #if os(tvOS)
-                        if #available(tvOS 26.0, *) {
-                            shape
-                                .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                                .glassEffect(.regular, in: shape)
-                        } else {
-                            shape
-                                .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                        }
-                        #else
-                        shape.fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                        #endif
-                    } else {
-                        shape
-                            .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
-                    }
+                    shape
+                        .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
                 }
                 .clipShape(shape)
                 .modifier(
                     LiquidGlassCardModifier(
                         cornerRadius: episodeCornerRadius,
                         isFocused: isFocused,
-                        isEnabled: liquidGlassCards
+                        isEnabled: false
                     )
                 )
                 .overlay(alignment: .topTrailing) {
@@ -9420,15 +9830,15 @@ private struct TvEpisodeCard: View {
                     )
                 )
                 .shadow(
-                    color: Color.black.opacity(isFocused ? 0.45 : 0.22),
-                    radius: isFocused ? 20 : 10,
-                    y: isFocused ? 14 : 6
+                    color: Color.black.opacity(isFocused ? 0.45 : 0),
+                    radius: isFocused ? 20 : 0,
+                    y: isFocused ? 14 : 0
                 )
             }
             .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
             .focused(focus, equals: cardKey)
             .focusEffectDisabledIfAvailable()
-            .disabled(restrictFocusToKey != nil && restrictFocusToKey != cardKey)
             .scaleEffect(isFocused ? 1.05 : 1)
             .animation(.easeOut(duration: 0.14), value: isFocused)
             .onChange(of: isFocused) { _, focused in
@@ -9642,6 +10052,23 @@ private struct TvEpisodeCard: View {
     }
 }
 
+extension TvEpisodeCard: Equatable {
+    static func == (lhs: TvEpisodeCard, rhs: TvEpisodeCard) -> Bool {
+        lhs.video == rhs.video
+            && lhs.fallbackArtworkURL == rhs.fallbackArtworkURL
+            && lhs.continueProgress == rhs.continueProgress
+            && lhs.isWatched == rhs.isWatched
+            && lhs.isRevealableNextEpisode == rhs.isRevealableNextEpisode
+            && lhs.watchCount == rhs.watchCount
+            && lhs.isSeasonWatched == rhs.isSeasonWatched
+            && lhs.episodeRatings == rhs.episodeRatings
+            && lhs.smartStreamSelection == rhs.smartStreamSelection
+            && (lhs.onPlayManually == nil) == (rhs.onPlayManually == nil)
+            && (lhs.onBack == nil) == (rhs.onBack == nil)
+            && (lhs.onMoveUp == nil) == (rhs.onMoveUp == nil)
+    }
+}
+
 struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
     let filled: Bool
     let shape: S
@@ -9717,6 +10144,11 @@ private struct TvStreamPickerOverlay: View {
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
+    @State private var revealableNextEpisodeKey: String?
+    @State private var strictWatchedEpisodeKeys: Set<String> = []
+    @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
+    @State private var hasCachedCompletedLedgerEvidence = false
     // Settings → Playback → Stream List.
     @AppStorage(SettingsKey.streamListTextScale) private var streamListTextScale = 100
     @AppStorage(SettingsKey.streamListCardSize) private var streamListCardSize = StreamListStyle.CardSize.standard.rawValue
@@ -9725,6 +10157,7 @@ private struct TvStreamPickerOverlay: View {
     @AppStorage(SettingsKey.streamListDescriptionLines) private var streamListDescriptionLines = 6
     @AppStorage(SettingsKey.streamListEpisodeHeader) private var streamListEpisodeHeader = true
     @AppStorage(SettingsKey.streamListExpandFocused) private var streamListExpandFocused = false
+    @AppStorage(SettingsKey.streamListHideFileSize) private var streamListHideFileSize = false
     @AppStorage(SettingsKey.streamListDetailSize) private var streamListDetailSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListBadgeSize) private var streamListBadgeSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListLogoSize) private var streamListLogoSize = StreamListStyle.Step.standard.rawValue
@@ -9800,6 +10233,7 @@ private struct TvStreamPickerOverlay: View {
             descriptionLines: streamListDescriptionLines,
             episodeHeader: streamListEpisodeHeader,
             expandFocused: streamListExpandFocused,
+            hideFileSize: streamListHideFileSize,
             detailSize: streamListDetailSize,
             badgeSize: streamListBadgeSize,
             logoSize: streamListLogoSize,
@@ -9911,6 +10345,7 @@ private struct TvStreamPickerOverlay: View {
             // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
             // first card once results exist.
             .onAppear {
+                refreshSpoilerEvidence()
                 pickerIsVisible = true
                 pickerProfileID = ProfileSettings.activeProfileID
                 refreshDisplayedStreamsIfNeeded()
@@ -9925,6 +10360,9 @@ private struct TvStreamPickerOverlay: View {
             .onChange(of: listCacheKey) { _, _ in
                 refreshDisplayedStreamsIfNeeded()
                 seedStreamFocusIfNeeded()
+            }
+            .onChange(of: revealNextEpisodeSpoilers) { _, _ in
+                refreshSpoilerEvidence()
             }
             .onChange(of: isLoading) { _, loading in
                 if !loading {
@@ -9982,6 +10420,15 @@ private struct TvStreamPickerOverlay: View {
                 streamBadgeSettings = StreamBadgeSettingsStore.snapshot
                 streamBadgeSettingsRevision &+= 1
             }
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSpoilerEvidence()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSpoilerEvidence()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchProgressLedger.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSpoilerEvidence(refreshCompletedLedgerEvidence: true)
+        }
             .onDisappear {
                 pickerIsVisible = false
                 focusedStreamWarmTask?.cancel()
@@ -10225,6 +10672,37 @@ private struct TvStreamPickerOverlay: View {
         }
     }
 
+    private func refreshSpoilerEvidence(refreshCompletedLedgerEvidence: Bool = false) {
+        var ledgerEvidenceChanged = false
+        if refreshCompletedLedgerEvidence || !hasCachedCompletedLedgerEvidence {
+            let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
+            ledgerEvidenceChanged = !hasCachedCompletedLedgerEvidence
+                || latestEvidence != completedLedgerEpisodeKeysByContentID
+            completedLedgerEpisodeKeysByContentID = latestEvidence
+            hasCachedCompletedLedgerEvidence = true
+        }
+        if refreshCompletedLedgerEvidence && hasCachedCompletedLedgerEvidence && !ledgerEvidenceChanged {
+            return
+        }
+        guard meta.isSeries else {
+            revealableNextEpisodeKey = nil
+            strictWatchedEpisodeKeys = []
+            return
+        }
+        let watchedKeys = EpisodeSpoilerPolicy.watchedEpisodeKeys(
+            for: meta,
+            in: meta.videos,
+            completedLedgerKeysByContentID: completedLedgerEpisodeKeysByContentID
+        )
+        strictWatchedEpisodeKeys = watchedKeys
+        revealableNextEpisodeKey = revealNextEpisodeSpoilers
+            ? EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: meta.videos,
+                watchedEpisodeKeys: watchedKeys
+            )
+            : nil
+    }
+
     private func displayEpisodeTitle(for episode: NuvioVideo) -> String {
         if hideUnwatchedEpisodeTitles && shouldApplySpoilerProtection(for: episode) {
             return L10n.format("calendar_episode_number", fallback: "Episode %d", episode.episode)
@@ -10233,6 +10711,9 @@ private struct TvStreamPickerOverlay: View {
     }
 
     private func shouldApplySpoilerProtection(for episode: NuvioVideo) -> Bool {
+        let episodeKey = EpisodeSpoilerPolicy.episodeKey(for: episode)
+        if strictWatchedEpisodeKeys.contains(episodeKey) { return false }
+        if revealNextEpisodeSpoilers && revealableNextEpisodeKey == episodeKey { return false }
         if isEpisodeWatched(episode) { return false }
         if let continueItem = ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id),
            !continueItem.isUpNextEntry,
@@ -11166,6 +11647,7 @@ private struct TvStreamCard: View {
     /// Precomputed once per card identity — not re-derived on every body tick.
     private let primaryName: String
     private let secondaryName: String?
+    private let descriptionText: String?
 
     init(
         stream: NuvioStream,
@@ -11180,16 +11662,19 @@ private struct TvStreamCard: View {
         self.style = style
         self.previewFocused = previewFocused
         self.importedBadges = presentation.importedBadges
-        self.fileSizeLabel = presentation.fileSizeLabel
+        self.fileSizeLabel = style.hideFileSize ? nil : presentation.fileSizeLabel
         self.badgePlacement = presentation.badgePlacement
         self.showAddonLogo = presentation.showAddonLogo
         self.externalFocus = externalFocus
         self.action = action
         self.onSelectPlayer = onSelectPlayer
-        let lines = Self.nameLines(for: stream)
+        let lines = Self.nameLines(for: stream, hidingFileSize: style.hideFileSize)
         self.primaryName = lines.first ?? "Stream"
         let rest = lines.dropFirst().joined(separator: " ")
         self.secondaryName = rest.isEmpty ? nil : rest
+        self.descriptionText = stream.description.map {
+            StreamListStyle.displayText($0, hidingFileSize: style.hideFileSize)
+        }
     }
 
     var body: some View {
@@ -11228,7 +11713,7 @@ private struct TvStreamCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    if let description = stream.description, !description.isEmpty {
+                    if let description = descriptionText, !description.isEmpty {
                         Text(description)
                             .font(.system(size: style.detailFont(26), weight: .regular))
                             .foregroundColor(.white.opacity(0.62))
@@ -11315,12 +11800,13 @@ private struct TvStreamCard: View {
         }
     }
 
-    static func nameLines(for stream: NuvioStream) -> [String] {
-        let raw = stream.name?.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lines = raw?
+    static func nameLines(for stream: NuvioStream, hidingFileSize: Bool = false) -> [String] {
+        let displayedName = StreamListStyle.displayText(stream.name ?? "", hidingFileSize: hidingFileSize)
+        let raw = displayedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lines = raw
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty } ?? []
+            .filter { !$0.isEmpty }
         return lines.isEmpty ? ["Stream"] : lines
     }
 

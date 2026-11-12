@@ -1766,7 +1766,7 @@ struct GlassControlsContainer<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             GlassEffectContainer(spacing: 28) { content }
         } else {
             content
@@ -1777,7 +1777,7 @@ struct GlassControlsContainer<Content: View>: View {
 extension View {
     @ViewBuilder
     func glassCircle() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular.interactive(), in: .circle)
         } else {
             background(.ultraThinMaterial, in: Circle())
@@ -1786,7 +1786,7 @@ extension View {
 
     @ViewBuilder
     func glassCircleSurface() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular, in: .circle)
         } else {
             background(.ultraThinMaterial, in: Circle())
@@ -1795,7 +1795,7 @@ extension View {
 
     @ViewBuilder
     func glassCapsule() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular.interactive(), in: .capsule)
         } else {
             background(.ultraThinMaterial, in: Capsule())
@@ -1804,7 +1804,7 @@ extension View {
 
     @ViewBuilder
     func glassRoundedRect(cornerRadius: CGFloat) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
         } else {
             background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
@@ -1825,7 +1825,7 @@ struct TvCardGlassBackground<S: InsettableShape>: ViewModifier {
                 .background(.ultraThinMaterial, in: shape)
                 .overlay(shape.stroke(Color.white, lineWidth: 2.5))
         } else {
-            if #available(tvOS 26.0, *) {
+            if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                 content
                     .background(Color.black.opacity(0.25), in: shape)
                     .background(Color.white.opacity(0.08), in: shape)
@@ -1847,6 +1847,8 @@ struct TvCardGlassBackground<S: InsettableShape>: ViewModifier {
 // the upcoming episode's thumbnail, and manual Play/Cancel Auto-Play actions.
 struct NextEpisodeOverlay: View {
     let episode: NuvioVideo
+    let isEpisodeWatched: Bool
+    let isRevealableNextEpisode: Bool
     let isAdvancing: Bool
     var isFocused: Bool
     let isAutoPlayCancelled: Bool
@@ -1854,6 +1856,7 @@ struct NextEpisodeOverlay: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
 
     private var overlayCornerRadius: CGFloat {
         max(14, AppCardStyle.episodeCornerRadius(for: cardCornerRadiusSetting))
@@ -1864,7 +1867,9 @@ struct NextEpisodeOverlay: View {
     }
 
     private var episodeLine: String {
-        if hideUnwatchedEpisodeTitles {
+        if hideUnwatchedEpisodeTitles
+            && !isEpisodeWatched
+            && !(revealNextEpisodeSpoilers && isRevealableNextEpisode) {
             return "S\(episode.season) E\(episode.episode)"
         }
         return "S\(episode.season) E\(episode.episode) • \(episode.title)"
@@ -1934,9 +1939,15 @@ struct NextEpisodeOverlay: View {
             }
         }
         .frame(width: 158, height: 90)
-        .scaleEffect(blurUnwatchedEpisodes ? 1.08 : 1.0)
-        .blur(radius: blurUnwatchedEpisodes ? 14 : 0)
+        .scaleEffect(shouldBlurThumbnail ? 1.08 : 1.0)
+        .blur(radius: shouldBlurThumbnail ? 14 : 0)
         .clipShape(RoundedRectangle(cornerRadius: thumbCornerRadius, style: .continuous))
+    }
+
+    private var shouldBlurThumbnail: Bool {
+        blurUnwatchedEpisodes
+            && !isEpisodeWatched
+            && !(revealNextEpisodeSpoilers && isRevealableNextEpisode)
     }
 
     private var playButton: some View {
@@ -2020,11 +2031,14 @@ struct PlayerGlassCircleButtonBackground: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if filled {
-            content.background(Color.white, in: Circle())
-        } else if #available(tvOS 26.0, *) {
-            content.glassEffect(.regular, in: Circle())
+            content
+                .background(Color.white, in: Circle())
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
+            content
+                .glassEffect(.regular, in: Circle())
         } else {
-            content.background(.ultraThinMaterial, in: Circle())
+            content
+                .background(.ultraThinMaterial, in: Circle())
         }
     }
 }

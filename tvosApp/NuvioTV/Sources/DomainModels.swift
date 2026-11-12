@@ -41,7 +41,7 @@ public struct Profile: Equatable, Hashable, Identifiable {
 }
 
 /// Lightweight meta row used by Library and Search view-models.
-public struct StremioMeta: Equatable, Hashable, Identifiable {
+public struct StremioMeta: Equatable, Hashable, Identifiable, Sendable {
     public var id: String
     public var name: String
     public var contentType: String

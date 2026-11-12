@@ -733,8 +733,8 @@ struct ProductionBrowseCard: View {
                     )
                 )
                 .shadow(
-                    color: .black.opacity(isFocused ? 0.5 : 0.2),
-                    radius: isFocused ? 16 : 6
+                    color: .black.opacity(isFocused ? 0.5 : 0),
+                    radius: isFocused ? 16 : 0
                 )
 
                 if posterLabels || alwaysShowLabels {
@@ -758,7 +758,14 @@ struct ProductionBrowseCard: View {
             onOpenDetails: onSelect
         )
         .scaleEffect(isFocused ? 1.06 : 1)
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: isFocused)
+        .animation(
+            smoothFocus
+                ? (AppleTVCapability.current.supportsLiquidGlass
+                    ? .spring(response: 0.28, dampingFraction: 0.75)
+                    : .easeOut(duration: 0.14))
+                : nil,
+            value: isFocused
+        )
         .zIndex(isFocused ? 1 : 0)
     }
 

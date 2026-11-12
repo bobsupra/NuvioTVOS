@@ -118,7 +118,7 @@ final class StreamsDiscoveryTests: XCTestCase {
     }
 
     func testExternalSubtitleProvidersRequireConfiguredCompatibleManifest() throws {
-        let providerURL = try XCTUnwrap(URL(string: "https://opensubtitles-v3.strem.io/manifest.json"))
+        let providerURL = try XCTUnwrap(URL(string: "https://example-subs.strem.io/manifest.json"))
         let unconfiguredURL = try XCTUnwrap(URL(string: "https://other.example/manifest.json"))
         let compatible = try JSONDecoder().decode(StreamAddonManifest.self, from: Data(
             #"{"id":"com.example.subtitles","name":"Example Subs","types":["movie"],"idPrefixes":["tt"],"resources":[{"name":"subtitles","types":["movie"]}]}"#.utf8
@@ -1436,7 +1436,7 @@ final class StreamsDiscoveryTests: XCTestCase {
     }
 
     @MainActor
-    func testJellyfinLibraryIndexTitlesMatching() {
+    func testJellyfinLibraryIndexTitlesMatching() throws {
         let serverID = "srv-\(UUID().uuidString)"
         let title = JellyfinIndexedTitle(
             contentId: "jellyfin-\(serverID)-item42",
@@ -1474,7 +1474,7 @@ final class StreamsDiscoveryTests: XCTestCase {
             ]
         )
 
-        JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+        try JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
         defer { JellyfinLibraryIndex.shared.removeAll(forServerID: serverID) }
 
         // Match by synthetic contentId
@@ -1491,6 +1491,101 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertTrue(JellyfinLibraryIndex.shared.titles(matching: "tt9999999").isEmpty)
         XCTAssertTrue(JellyfinLibraryIndex.shared.titles(matching: "tmdb:9999999").isEmpty)
         XCTAssertTrue(JellyfinLibraryIndex.shared.titles(matching: "").isEmpty)
+    }
+
+    @MainActor
+    func testJellyfinMetadataCanUseAnAlreadyIndexedTitle() throws {
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        ProfileSettings.setActiveProfile("jellyfin-meta-\(UUID().uuidString)", isPrimary: false)
+        defer {
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+        }
+
+        let firstServerID = "srv-\(UUID().uuidString)"
+        let secondServerID = "srv-\(UUID().uuidString)"
+        for (serverID, name) in [(firstServerID, "First server"), (secondServerID, "Second server")] {
+            JellyfinServerStore.shared.upsert(JellyfinServerConfig(
+                id: serverID,
+                displayName: name,
+                baseURLString: "http://127.0.0.1:8096",
+                userId: "user-\(serverID)",
+                syncAutomatically: false
+            ))
+            JellyfinCredentialStore.save("test-token-\(serverID)", forServerID: serverID)
+        }
+        defer {
+            JellyfinServerStore.shared.remove(secondServerID)
+            JellyfinServerStore.shared.remove(firstServerID)
+        }
+
+        func indexedTitle(serverID: String, name: String, contentId: String? = nil) -> JellyfinIndexedTitle {
+            JellyfinIndexedTitle(
+                contentId: contentId ?? JellyfinLibraryIndex.contentId(serverID: serverID, itemId: "shared-item"),
+                serverID: serverID,
+                libraryID: "movies",
+                libraryName: "Movies",
+                itemId: "shared-item",
+                type: "series",
+                name: name,
+                overview: nil,
+                year: nil,
+                genres: nil,
+                communityRating: nil,
+                officialRating: nil,
+                premiereDate: nil,
+                runTimeTicks: nil,
+                imdbId: nil,
+                tmdbId: nil,
+                primaryImageTag: nil,
+                backdropImageTag: nil,
+                cast: nil,
+                directors: nil,
+                items: [
+                    JellyfinIndexedItem(
+                        itemId: "episode-\(serverID)",
+                        container: "mkv",
+                        size: 1_000,
+                        season: 1,
+                        episode: 1,
+                        episodeName: "Pilot",
+                        episodeOverview: nil,
+                        episodePremiereDate: nil,
+                        episodeImageTag: nil
+                    )
+                ]
+            )
+        }
+
+        let firstTitle = indexedTitle(serverID: firstServerID, name: "First title")
+        let secondTitle = indexedTitle(serverID: secondServerID, name: "Second title")
+        try JellyfinLibraryIndex.shared.replace(titles: [firstTitle], forServerID: firstServerID)
+        try JellyfinLibraryIndex.shared.replace(titles: [secondTitle], forServerID: secondServerID)
+
+        let firstMeta = try XCTUnwrap(JellyfinLibraryIndex.shared.meta(for: firstTitle))
+        let secondMeta = try XCTUnwrap(JellyfinLibraryIndex.shared.meta(for: secondTitle))
+        XCTAssertEqual(firstMeta.name, "First title")
+        XCTAssertEqual(secondMeta.name, "Second title")
+        XCTAssertEqual(firstMeta.videos?.first?.id, "\(firstTitle.contentId):1:1")
+        XCTAssertEqual(secondMeta.videos?.first?.id, "\(secondTitle.contentId):1:1")
+
+        let rawIDMeta = try XCTUnwrap(JellyfinLibraryIndex.shared.meta(forContentId: "shared-item"))
+        XCTAssertEqual(rawIDMeta.name, "First title")
+        XCTAssertEqual(rawIDMeta.videos?.first?.id, "shared-item:1:1")
+        XCTAssertEqual(JellyfinLibraryIndex.shared.meta(forContentId: secondTitle.contentId)?.name, "Second title")
+
+        let duplicateContentIDTitle = indexedTitle(
+            serverID: secondServerID,
+            name: "Duplicate content ID",
+            contentId: firstTitle.contentId
+        )
+        let firstTitleByID = TVHomeView.jellyfinFirstTitleByID([firstTitle, secondTitle, duplicateContentIDTitle])
+        XCTAssertEqual(firstTitleByID[firstTitle.contentId]?.name, "First title")
+        XCTAssertEqual(firstTitleByID["shared-item"]?.name, "First title")
     }
 
     @MainActor
@@ -1565,7 +1660,7 @@ final class StreamsDiscoveryTests: XCTestCase {
                 )
             ]
         )
-        JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+        try JellyfinLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
 
         // Clear any external add-ons so only local sources are evaluated (matching #401 reproduction)
         CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([], in: ProfileSettings.current)
@@ -1664,7 +1759,7 @@ final class StreamsDiscoveryTests: XCTestCase {
                 )
             ]
         )
-        JellyfinLibraryIndex.shared.replace(titles: [seriesTitle], forServerID: serverID)
+        try JellyfinLibraryIndex.shared.replace(titles: [seriesTitle], forServerID: serverID)
         CinemetaCatalogRepository.setConfiguredStreamAddonPreferences([], in: ProfileSettings.current)
 
         // Episode play uses canonicalEpisodeStreamId e.g. "tt0903747:1:2"

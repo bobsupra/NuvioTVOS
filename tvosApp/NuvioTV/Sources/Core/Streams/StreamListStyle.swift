@@ -132,6 +132,8 @@ struct StreamListStyle: Equatable {
     var episodeHeader = true
     /// The focused card shows its whole name and description.
     var expandFocused = false
+    /// Remove file-size fragments from the displayed name and description.
+    var hideFileSize = false
 
     init() {}
 
@@ -143,6 +145,7 @@ struct StreamListStyle: Equatable {
         descriptionLines: Int,
         episodeHeader: Bool,
         expandFocused: Bool,
+        hideFileSize: Bool = false,
         detailSize: String = Step.standard.rawValue,
         badgeSize: String = Step.standard.rawValue,
         logoSize: String = Step.standard.rawValue,
@@ -156,6 +159,7 @@ struct StreamListStyle: Equatable {
         self.descriptionLines = descriptionLines > 0 ? descriptionLines : nil
         self.episodeHeader = episodeHeader
         self.expandFocused = expandFocused
+        self.hideFileSize = hideFileSize
         self.detailSize = Step(rawValue: detailSize) ?? .standard
         self.badgeSize = Step(rawValue: badgeSize) ?? .standard
         self.logoSize = Step(rawValue: logoSize) ?? .standard
@@ -181,12 +185,61 @@ struct StreamListStyle: Equatable {
             descriptionLines: int(SettingsKey.streamListDescriptionLines, 6),
             episodeHeader: bool(SettingsKey.streamListEpisodeHeader, true),
             expandFocused: bool(SettingsKey.streamListExpandFocused, false),
+            hideFileSize: bool(SettingsKey.streamListHideFileSize, false),
             detailSize: string(SettingsKey.streamListDetailSize),
             badgeSize: string(SettingsKey.streamListBadgeSize),
             logoSize: string(SettingsKey.streamListLogoSize),
             spacing: string(SettingsKey.streamListSpacing),
             height: string(SettingsKey.streamListHeight))
     }
+
+    /// Display-only cleanup; the underlying stream remains available unchanged for sorting,
+    /// playback, and badge matching. Returning the input directly when disabled preserves the
+    /// existing display exactly.
+    static func displayText(_ text: String, hidingFileSize: Bool) -> String {
+        guard hidingFileSize else { return text }
+        let fullRange = NSRange(text.startIndex..., in: text)
+        guard fileSizePattern.firstMatch(in: text, range: fullRange) != nil else { return text }
+
+        let normalizedText = text
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let lines = normalizedText.components(separatedBy: "\n").compactMap { line -> String? in
+            let range = NSRange(line.startIndex..., in: line)
+            guard fileSizePattern.firstMatch(in: line, range: range) != nil else { return line }
+
+            var cleaned = fileSizePattern.stringByReplacingMatches(
+                in: line,
+                range: range,
+                withTemplate: ""
+            )
+            cleaned = cleaned.replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
+            cleaned = repeatedSeparatorPattern.stringByReplacingMatches(
+                in: cleaned,
+                range: NSRange(cleaned.startIndex..., in: cleaned),
+                withTemplate: " $1 "
+            )
+            cleaned = cleaned.replacingOccurrences(
+                of: #"[ \t]+([,;:])"#,
+                with: "$1",
+                options: .regularExpression
+            )
+            cleaned = cleaned.trimmingCharacters(
+                in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "|•·/,:;–—-"))
+            )
+            return cleaned.isEmpty ? nil : cleaned
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private static let fileSizePattern = try! NSRegularExpression(
+        pattern: #"(?<![\p{L}\p{N}])(?:(?:💾|💽|📦)[ \t]*[:=]?[ \t]*)?(?:(?:file[ \t_-]*size|size)[ \t]*[:=]?[ \t]*)?\d+(?:[.,]\d+)?[ \t]*(?:[KMGT](?:I?B))(?![\p{L}\p{N}])(?![ \t]*/[ \t]*s(?:ec(?:ond)?s?)?\b)"#,
+        options: [.caseInsensitive]
+    )
+
+    private static let repeatedSeparatorPattern = try! NSRegularExpression(
+        pattern: #"\s*([|•·/,:;–—-])(?:\s*[|•·/,:;–—-])+\s*"#
+    )
 
     // MARK: Sizes
 

@@ -18,7 +18,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Bounded per-add-on stream request timeout (seconds). Dead providers
     /// finish as failed without blocking the rest or smart autoplay forever.
-    static let streamRequestTimeout: TimeInterval = 15
+    nonisolated static let streamRequestTimeout: TimeInterval = 15
 
     @Published private(set) var state = StreamsDiscoveryState()
 
@@ -502,7 +502,10 @@ final class StreamsRepository: ObservableObject {
         stableAddonId(manifestId: manifest.id, manifestURL: manifestURL)
     }
 
-    private static func fetchAddonGroup(
+    /// Off the main thread (as `fetchStreams`): as static members of this main-actor class they
+    /// ran on it, so every add-on's answer was decoded, turned into streams and its titles
+    /// parsed there, holding Details up for 200-330 ms as it opened.
+    nonisolated private static func fetchAddonGroup(
         target: StreamAddonTarget,
         type: String,
         videoId: String
@@ -574,7 +577,7 @@ final class StreamsRepository: ObservableObject {
         }
     }
 
-    static func fetchStreams(
+    nonisolated static func fetchStreams(
         from url: URL,
         addonName: String,
         logo: String?,

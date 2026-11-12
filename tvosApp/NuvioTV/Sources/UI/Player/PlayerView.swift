@@ -18,6 +18,11 @@ import Combine
 
 struct PlayerView: View {
     @StateObject var viewModel: PlayerViewModel
+    @State var revealableNextEpisodeSpoilerKey: String?
+    @State var trustedWatchedEpisodeKeys: Set<String> = []
+    @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
+    @State private var hasCachedCompletedLedgerEvidence = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) var revealNextEpisodeSpoilers = false
     @Environment(\.scenePhase) var scenePhase
 
     let url: URL
@@ -188,6 +193,62 @@ struct PlayerView: View {
 
     var body: some View {
         layersWithRemoteCommands
+            .onAppear {
+                refreshNextEpisodeSpoilerEligibility()
+            }
+            .onChange(of: revealNextEpisodeSpoilers) { _, _ in
+                refreshNextEpisodeSpoilerEligibility()
+            }
+            .onChange(of: viewModel.nextEpisode?.id) { _, _ in
+                refreshNextEpisodeSpoilerEligibility()
+            }
+            .onChange(of: episodes.map(\.id)) { _, _ in
+                refreshNextEpisodeSpoilerEligibility()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshNextEpisodeSpoilerEligibility()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshNextEpisodeSpoilerEligibility()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: WatchProgressLedger.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshNextEpisodeSpoilerEligibility(refreshCompletedLedgerEvidence: true)
+            }
+    }
+
+    func refreshNextEpisodeSpoilerEligibility(refreshCompletedLedgerEvidence: Bool = false) {
+        var ledgerEvidenceChanged = false
+        if refreshCompletedLedgerEvidence || !hasCachedCompletedLedgerEvidence {
+            let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
+            ledgerEvidenceChanged = !hasCachedCompletedLedgerEvidence
+                || latestEvidence != completedLedgerEpisodeKeysByContentID
+            completedLedgerEpisodeKeysByContentID = latestEvidence
+            hasCachedCompletedLedgerEvidence = true
+        }
+        if refreshCompletedLedgerEvidence && hasCachedCompletedLedgerEvidence && !ledgerEvidenceChanged {
+            return
+        }
+        guard meta.isSeries,
+              !episodes.isEmpty else {
+            revealableNextEpisodeSpoilerKey = nil
+            trustedWatchedEpisodeKeys = []
+            return
+        }
+        let watchedKeys = EpisodeSpoilerPolicy.watchedEpisodeKeys(
+            for: meta,
+            in: episodes,
+            snapshot: WatchedStore.currentSnapshot(),
+            completedLedgerKeysByContentID: completedLedgerEpisodeKeysByContentID
+        )
+        trustedWatchedEpisodeKeys = watchedKeys
+        guard revealNextEpisodeSpoilers else {
+            revealableNextEpisodeSpoilerKey = nil
+            return
+        }
+        revealableNextEpisodeSpoilerKey = EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+            in: episodes,
+            watchedEpisodeKeys: watchedKeys
+        )
     }
 
     var isStandalonePlaybackSession: Bool {

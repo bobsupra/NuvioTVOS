@@ -13,6 +13,7 @@ final class EpisodeSpoilerSettingsTests: XCTestCase {
             SettingsKey.blurUnwatchedEpisodes,
             SettingsKey.hideUnwatchedEpisodeDescriptions,
             SettingsKey.hideUnwatchedEpisodeTitles,
+            SettingsKey.revealNextEpisodeSpoilers,
             SettingsKey.continueWatchingBlurNextUp
         ]
 
@@ -30,6 +31,7 @@ final class EpisodeSpoilerSettingsTests: XCTestCase {
             SettingsKey.blurUnwatchedEpisodes,
             SettingsKey.hideUnwatchedEpisodeDescriptions,
             SettingsKey.hideUnwatchedEpisodeTitles,
+            SettingsKey.revealNextEpisodeSpoilers,
             SettingsKey.continueWatchingBlurNextUp
         ]
 
@@ -75,6 +77,14 @@ final class EpisodeSpoilerSettingsTests: XCTestCase {
             "Replace unwatched episode titles with Episode numbers to avoid spoilers"
         )
         XCTAssertEqual(
+            L10n.string("tvos_settings_reveal_next_episode", fallback: ""),
+            "Reveal Next Episode"
+        )
+        XCTAssertEqual(
+            L10n.string("tvos_settings_reveal_next_episode_subtitle", fallback: ""),
+            "Show spoilers for only the next episode after its predecessor is watched"
+        )
+        XCTAssertEqual(
             L10n.string("details_spoiler_hidden_description", fallback: ""),
             "Description hidden to avoid spoilers."
         )
@@ -85,6 +95,146 @@ final class EpisodeSpoilerSettingsTests: XCTestCase {
         XCTAssertEqual(
             L10n.string("settings_continue_watching_blur_next_up_description", fallback: ""),
             "Blur episode thumbnails in Continue Watching for episodes you haven't started yet"
+        )
+    }
+
+    func testEpisodeSpoilerPolicyRevealsOnlyTheNextEpisodeAcrossSeasonRollover() {
+        let episodes = [episode(1, 1), episode(1, 2), episode(2, 1), episode(2, 2)]
+        let watched = Set(["1:1", "1:2"])
+
+        XCTAssertEqual(
+            EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: episodes, watchedEpisodeKeys: watched),
+            "2:1"
+        )
+        XCTAssertTrue(
+            EpisodeSpoilerPolicy.isRevealableNextEpisode(
+                episodes[2],
+                in: episodes,
+                watchedEpisodeKeys: watched
+            )
+        )
+        XCTAssertFalse(
+            EpisodeSpoilerPolicy.isRevealableNextEpisode(
+                episodes[3],
+                in: episodes,
+                watchedEpisodeKeys: watched
+            )
+        )
+
+        XCTAssertEqual(
+            EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: [episode(1, 1), episode(2, 1)],
+                watchedEpisodeKeys: ["1:1"]
+            ),
+            "2:1"
+        )
+    }
+
+    func testEpisodeSpoilerPolicyChoosesOneSuccessorWithOutOfOrderWatchHistory() {
+        let episodes = [episode(1, 1), episode(1, 2), episode(1, 3), episode(1, 4)]
+        let watched = Set(["1:1", "1:3"])
+
+        XCTAssertEqual(
+            EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: episodes, watchedEpisodeKeys: watched),
+            "1:4"
+        )
+        XCTAssertFalse(
+            EpisodeSpoilerPolicy.isRevealableNextEpisode(
+                episodes[1],
+                in: episodes,
+                watchedEpisodeKeys: watched
+            )
+        )
+    }
+
+    func testEpisodeSpoilerPolicyRequiresGuideAndWatchedPredecessor() {
+        let episodes = [episode(1, 1), episode(1, 2)]
+
+        XCTAssertNil(EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: nil, watchedEpisodeKeys: ["1:1"]))
+        XCTAssertNil(EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: episodes, watchedEpisodeKeys: []))
+        XCTAssertNil(EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: episodes, watchedEpisodeKeys: ["1:2"]))
+    }
+
+    func testEpisodeSpoilerPolicyKeepsNumberingGapsProtected() {
+        let incompleteGuide = [episode(1, 1), episode(1, 3)]
+
+        XCTAssertNil(
+            EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: incompleteGuide,
+                watchedEpisodeKeys: ["1:1"]
+            )
+        )
+    }
+
+    func testEpisodeSpoilerPolicyKeepsSpecialsProtectedAndOutOfProgression() {
+        let special = episode(0, 1)
+        let first = episode(1, 1)
+        let next = episode(1, 2)
+        let guide = [special, first, next]
+
+        XCTAssertNil(EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: guide, watchedEpisodeKeys: ["0:1"]))
+        XCTAssertEqual(
+            EpisodeSpoilerPolicy.revealableNextEpisodeKey(in: guide, watchedEpisodeKeys: ["1:1"]),
+            "1:2"
+        )
+        XCTAssertFalse(
+            EpisodeSpoilerPolicy.isRevealableNextEpisode(
+                special,
+                in: guide,
+                watchedEpisodeKeys: ["1:1"]
+            )
+        )
+    }
+
+    func testCompletedLedgerEvidenceRequiresCompletionAndExactContentID() {
+        let meta = NuvioMeta(
+            id: "tt1234567",
+            name: "Shared Series Name",
+            type: "series"
+        )
+        func record(contentId: String, episode: Int, position: Double) -> WatchProgressRecord {
+            WatchProgressRecord(
+                progressKey: "\(contentId)_s1e\(episode)",
+                contentId: contentId,
+                contentType: "series",
+                videoId: "\(contentId):1:\(episode)",
+                season: 1,
+                episode: episode,
+                position: position,
+                duration: 100,
+                lastWatchedAt: Date()
+            )
+        }
+
+        let ledgerKeys = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID(
+            from: [
+                record(contentId: "tt1234567", episode: 1, position: 100),
+                record(contentId: "tt1234567", episode: 2, position: 40),
+                record(contentId: "Shared Series Name", episode: 3, position: 100)
+            ]
+        )
+        let watchedKeys = EpisodeSpoilerPolicy.trustedWatchedEpisodeKeys(
+            for: meta,
+            exactEpisodeKeys: [],
+            completedLedgerKeysByContentID: ledgerKeys
+        )
+
+        XCTAssertEqual(watchedKeys, ["1:1"])
+        XCTAssertEqual(
+            EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: [episode(1, 1), episode(1, 2), episode(1, 3)],
+                watchedEpisodeKeys: watchedKeys
+            ),
+            "1:2"
+        )
+    }
+
+    private func episode(_ season: Int, _ number: Int) -> NuvioVideo {
+        NuvioVideo(
+            id: "s\(season)e\(number)",
+            title: "S\(season)E\(number)",
+            season: season,
+            episode: number
         )
     }
 

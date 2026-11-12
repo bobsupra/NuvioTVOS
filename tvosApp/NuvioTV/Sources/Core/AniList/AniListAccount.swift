@@ -441,7 +441,7 @@ enum AniListAccount {
                 return Change(status: "CURRENT", progress: reached, startsToday: !hasStarted)
             }
         case .unwatched(let episode):
-            guard let entry, episode > 0 else { return nil }
+            guard entry != nil, episode > 0 else { return nil }
             let isDone = status == "COMPLETED"
             guard isDone || progress >= episode else { return nil }
             return Change(status: isDone ? "CURRENT" : nil, progress: episode - 1)

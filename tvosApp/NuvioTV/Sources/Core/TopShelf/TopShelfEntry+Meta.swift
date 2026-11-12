@@ -176,7 +176,7 @@ enum TopShelfLibraryFeed {
             accountBindingId: bindingId
         )
         prefetchLock.lock()
-        if let task = inFlightPrefetchTasks[cacheKey] {
+        if inFlightPrefetchTasks[cacheKey] != nil {
             pendingPrefetchKeys.insert(cacheKey)
             if force {
                 pendingForcedPrefetchKeys.insert(cacheKey)

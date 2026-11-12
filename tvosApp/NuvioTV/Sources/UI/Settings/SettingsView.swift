@@ -212,6 +212,7 @@ enum SettingsKey {
     static let blurUnwatchedEpisodes = "nuvio.tv.settings.layout.blurUnwatchedEpisodes"
     static let hideUnwatchedEpisodeDescriptions = "nuvio.tv.settings.layout.hideUnwatchedDescriptions"
     static let hideUnwatchedEpisodeTitles = "nuvio.tv.settings.layout.hideUnwatchedTitles"
+    static let revealNextEpisodeSpoilers = "nuvio.tv.settings.layout.revealNextEpisodeSpoilers"
     static let continueWatchingBlurNextUp = "nuvio.tv.settings.layout.continueWatchingBlurNextUp"
 
     static let traktConnected = "nuvio.tv.settings.integrations.traktConnected"
@@ -337,6 +338,7 @@ enum SettingsKey {
     static let streamListDescriptionLines = "nuvio.tv.settings.playback.streamListDescriptionLines"
     static let streamListEpisodeHeader = "nuvio.tv.settings.playback.streamListEpisodeHeader"
     static let streamListExpandFocused = "nuvio.tv.settings.playback.streamListExpandFocused"
+    static let streamListHideFileSize = "nuvio.tv.settings.playback.streamListHideFileSize"
     static let streamListDetailSize = "nuvio.tv.settings.playback.streamListDetailSize"
     static let streamListBadgeSize = "nuvio.tv.settings.playback.streamListBadgeSize"
     static let streamListLogoSize = "nuvio.tv.settings.playback.streamListLogoSize"
@@ -438,7 +440,7 @@ enum SettingsKey {
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
-        blurUnwatchedEpisodes, hideUnwatchedEpisodeDescriptions, hideUnwatchedEpisodeTitles,
+        blurUnwatchedEpisodes, hideUnwatchedEpisodeDescriptions, hideUnwatchedEpisodeTitles, revealNextEpisodeSpoilers,
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
@@ -472,7 +474,7 @@ enum SettingsKey {
         playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, preferHDR10Plus, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
-        streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused,
+        streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
@@ -3793,12 +3795,14 @@ private struct StreamListStyleEditor: View {
     @AppStorage(SettingsKey.streamListNameLines) private var nameLines = 2
     @AppStorage(SettingsKey.streamListDescriptionLines) private var descriptionLines = 6
     @AppStorage(SettingsKey.streamListExpandFocused) private var expandFocused = false
+    @AppStorage(SettingsKey.streamListHideFileSize) private var hideFileSize = false
 
     private var style: StreamListStyle {
         StreamListStyle(
             textScale: textScale, cardSize: cardSize, width: width,
             nameLines: nameLines, descriptionLines: descriptionLines,
             episodeHeader: episodeHeader, expandFocused: expandFocused,
+            hideFileSize: hideFileSize,
             detailSize: detailSize, badgeSize: badgeSize, logoSize: logoSize,
             spacing: spacing, height: height)
     }
@@ -3945,6 +3949,13 @@ private struct StreamListStyleEditor: View {
         )
 
         SettingsToggleRow(
+            title: L10n.string("tvos_settings_stream_list_hide_file_size", fallback: "Hide File Size"),
+            subtitle: L10n.string("tvos_settings_stream_list_hide_file_size_subtitle", fallback: "Remove file sizes from stream names and descriptions"),
+            isOn: $hideFileSize,
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
             title: L10n.string("tvos_settings_stream_list_expand_focused", fallback: "Expand Focused Card (Experimental)"),
             subtitle: L10n.string("tvos_settings_stream_list_expand_focused_subtitle", fallback: "The selected stream shows its whole name and description"),
             isOn: $expandFocused,
@@ -3999,6 +4010,7 @@ private struct StreamListStyleEditor: View {
         nameLines = 2
         descriptionLines = 6
         expandFocused = false
+        hideFileSize = false
     }
 }
 
@@ -4070,6 +4082,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
     @AppStorage(SettingsKey.homeCalendarToday) private var homeCalendarToday = true
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
@@ -4582,6 +4595,19 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Replace unwatched episode titles with Episode numbers to avoid spoilers"
                     ),
                     isOn: $hideUnwatchedEpisodeTitles,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_reveal_next_episode",
+                        fallback: "Reveal Next Episode"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_reveal_next_episode_subtitle",
+                        fallback: "Show spoilers for only the next episode after its predecessor is watched"
+                    ),
+                    isOn: $revealNextEpisodeSpoilers,
                     accentColor: accentColor
                 )
             }
@@ -11230,7 +11256,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     subtitle: L10n.string(
                         "tvos_settings_prefer_dual_layer_dolby_vision_subtitle",
-                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with per-scene FEL curve folding. Turn on for full pixel-level dual-layer composition. Applies next playback."
+                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with fast single-layer conversion. Turn on for full pixel-level dual-layer composition. Applies next playback."
                     ),
                     isOn: Binding(
                         get: { preferDualLayerDolbyVision },
@@ -14875,8 +14901,11 @@ private struct JellyfinServerRow: View {
     }
 
     private var syncTitle: String {
-        if case .syncing(let found, _) = syncState {
-            return L10n.format("jellyfin_syncing_count", fallback: "Syncing (%d)…", found)
+        if case .syncing(let progress) = syncState {
+            if let total = progress.total {
+                return L10n.format("jellyfin_syncing_count_total", fallback: "Syncing (%d / %d)…", progress.found, total)
+            }
+            return L10n.format("jellyfin_syncing_count", fallback: "Syncing (%d)…", progress.found)
         }
         return L10n.string("jellyfin_sync", fallback: "Sync")
     }
@@ -15237,12 +15266,13 @@ private struct JellyfinLibrarySelectionSheet: View {
         switch sessionManager.syncState(for: server.id) {
         case .idle:
             EmptyView()
-        case .syncing(let found, let library):
+        case .syncing(let progress):
             SettingsGroup(
-                title: L10n.string("jellyfin_syncing", fallback: "Syncing…"),
-                subtitle: library
+                title: syncStageTitle(progress.stage),
+                subtitle: progress.currentLibrary
             ) {
-                SettingsInfoRow(title: L10n.string("smb_found_so_far", fallback: "Found so far"), value: "\(found)")
+                let count = progress.total.map { "\(progress.found) / \($0)" } ?? "\(progress.found)"
+                SettingsInfoRow(title: L10n.string("smb_found_so_far", fallback: "Found so far"), value: count)
             }
         case .done(let report):
             SettingsGroup(
@@ -15268,6 +15298,19 @@ private struct JellyfinLibrarySelectionSheet: View {
                 title: L10n.string("smb_scan_failed", fallback: "Scan Failed"),
                 subtitle: message
             ) { EmptyView() }
+        }
+    }
+
+    private func syncStageTitle(_ stage: JellyfinSyncProgress.Stage) -> String {
+        switch stage {
+        case .items:
+            return L10n.string("jellyfin_syncing_items", fallback: "Syncing library items…")
+        case .episodes:
+            return L10n.string("jellyfin_syncing_episodes", fallback: "Loading episodes…")
+        case .resolving:
+            return L10n.string("jellyfin_syncing_resolving", fallback: "Matching titles…")
+        case .saving:
+            return L10n.string("jellyfin_syncing_saving", fallback: "Saving library index…")
         }
     }
 }
@@ -21066,7 +21109,7 @@ private struct SettingsMiniButton: View {
 private extension View {
     @ViewBuilder
     func settingsGlass<S: InsettableShape>(shape: S, isProminent: Bool) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             self
                 .background(isProminent ? Color.white.opacity(0.13) : Color.white.opacity(0.045), in: shape)
                 .glassEffect(.regular, in: shape)
@@ -21110,7 +21153,7 @@ private struct SettingsSearchGlassBackground<S: InsettableShape>: ViewModifier {
     func body(content: Content) -> some View {
         if filled {
             content.background(Color.white, in: shape)
-        } else if #available(tvOS 26.0, *) {
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content.glassEffect(.regular, in: shape)
         } else {
             content.background(.ultraThinMaterial, in: shape)
