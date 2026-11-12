@@ -323,8 +323,9 @@ final class TraktPkceAuthTests: XCTestCase {
                 """.utf8))
         }
 
-        async let first = TraktAuthService(session: stubbedSession(), store: store).refreshTokenIfNeeded(force: true)
-        async let second = TraktAuthService(session: stubbedSession(), store: store).refreshTokenIfNeeded(force: true)
+        let session = stubbedSession()
+        async let first = TraktAuthService(session: session, store: store).refreshTokenIfNeeded(force: true)
+        async let second = TraktAuthService(session: session, store: store).refreshTokenIfNeeded(force: true)
         let results = await [first, second]
 
         XCTAssertEqual(results, [true, true])

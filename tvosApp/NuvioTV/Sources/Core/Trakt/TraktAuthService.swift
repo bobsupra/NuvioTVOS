@@ -1466,11 +1466,11 @@ final class TraktAuthService {
     /// together after the response arrives.
     @MainActor
     func refreshTokenIfNeeded(force: Bool = false) async -> Bool {
-        await TraktRefreshCoordinator.shared.refresh(
-            key: "\(clientID):\(TraktConfig.profileScope(in: store))"
-        ) { [weak self] in
-            guard let self else { return false }
-            return await self.refreshTokenIfNeededUncoordinated(force: force)
+        let sessionKey = session === URLSession.shared ? "shared" : "\(ObjectIdentifier(session))"
+        return await TraktRefreshCoordinator.shared.refresh(
+            key: "\(sessionKey):\(clientID):\(TraktConfig.profileScope(in: store))"
+        ) { [self] in
+            await self.refreshTokenIfNeededUncoordinated(force: force)
         }
     }
 
