@@ -274,6 +274,8 @@ struct NativeSearchView: View {
     @State private var searchPresented = true
     @State private var linearKeyboardExpandedHeight: CGFloat = 220
     @State private var resultFocusGeneration = 0
+    /// The results without unreleased titles, worked out once per results list.
+    @State private var resultsMemo = ReleasedTitlesMemo()
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -892,11 +894,14 @@ struct NativeSearchView: View {
     // MARK: - Results
 
     private var visibleResults: [NuvioMeta] {
-        guard hideUnreleased else { return viewModel.results }
-        return viewModel.results.filter { !ContentReleasePolicy.isUnreleased($0) }
+        resultsMemo.update(viewModel.results, revision: viewModel.resultsRevision, hideUnreleased: hideUnreleased)
+        return resultsMemo.titles
     }
 
-    private var visibleResultIDs: [String] { visibleResults.map(\.id) }
+    private var visibleResultIDs: [String] {
+        resultsMemo.update(viewModel.results, revision: viewModel.resultsRevision, hideUnreleased: hideUnreleased)
+        return resultsMemo.ids
+    }
 
     private var gridSuggestionTitles: [String] {
         let query = viewModel.searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -996,6 +1001,16 @@ struct NativeSearchView: View {
                             onContentClick(item.id, item.type)
                         }
                         .accessibilityIdentifier("native-search-result-\(item.id)")
+                        // Kept as it was while it shows the same: every move along the results
+                        // redraws this screen, which rebuilt every card on it. The lock for
+                        // putting focus back stays outside it.
+                        .cardSnapshot(GridCardSnapshotKey(
+                            meta: item,
+                            index: index,
+                            columns: colCount,
+                            mode: isGridMode ? 1 : 0,
+                            retainsFocusAppearance: overlayRestoreResultID == item.id
+                        ))
                         .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)
                     }
                 }

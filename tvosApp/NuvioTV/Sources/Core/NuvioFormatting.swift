@@ -8,9 +8,24 @@
 import Foundation
 
 enum NuvioDateDisplay {
+    /// Formatted dates by input. Cards and episode rows format their dates every time they
+    /// redraw, and each formatting goes through ICU (seen in main-thread samples on an Apple
+    /// TV); the same few dates come back again and again.
+    private static let formatted = NSCache<NSString, NSString>()
+
     static func formattedDate(_ value: String?) -> String? {
-        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else {
+        guard let value, !value.isEmpty else { return nil }
+        let fullDates = showsFullDates
+        let cacheKey = ((fullDates ? "f\u{1}" : "y\u{1}") + value) as NSString
+        if let cached = formatted.object(forKey: cacheKey) { return cached as String }
+        guard let result = format(value, fullDates: fullDates) else { return nil }
+        formatted.setObject(result as NSString, forKey: cacheKey)
+        return result
+    }
+
+    private static func format(_ value: String, fullDates: Bool) -> String? {
+        let raw = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else {
             return nil
         }
         if raw.caseInsensitiveCompare("tbd") == .orderedSame || raw.caseInsensitiveCompare("tba") == .orderedSame {
@@ -18,7 +33,7 @@ enum NuvioDateDisplay {
         }
 
         let datePart = String(raw.prefix(10))
-        if !showsFullDates {
+        if !fullDates {
             let year = String(datePart.prefix(4))
             return Int(year) == nil ? raw : year
         }
