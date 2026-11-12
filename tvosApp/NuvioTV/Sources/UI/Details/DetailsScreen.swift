@@ -3833,6 +3833,8 @@ enum StreamSortOption: String, CaseIterable, Identifiable, Sendable {
     case quality = "Quality"
     case size = "Size"
     case name = "Name"
+    /// Used only by the local picker; not persisted as a shared sync sort mode.
+    case recommended = "Nuvio Recommended"
 
     var id: String { rawValue }
 
@@ -3937,7 +3939,7 @@ enum StreamPickerListBuilder {
             selectedAddonId: selectedAddonId,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
-            preserveAddonStreams: preserveAddonStreams,
+            preserveAddonStreams: preserveAddonStreams || sortOption == .recommended,
             includeUnknownCacheStatus: includeUnknownCacheStatus
         )
         return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
@@ -4003,26 +4005,57 @@ enum StreamPickerListBuilder {
     ) -> [NuvioStream] {
         // Parse sort facts once per stream, not on every O(n log n) comparison.
         // Keep mode-specific work out of modes that do not use it.
-        let needsResolution = !preserveAddonStreams || option == .quality || option == .default
+        let needsResolution = !preserveAddonStreams || option == .quality || option == .default || option == .recommended
         let needsHardwareCheck = option == .quality && !AppleTVCapability.current.supportsAV1HardwareDecode
+        let preferRecommendedHardware = option == .recommended
+            && (ProfileSettings.current.object(forKey: SettingsKey.preferHardwareDecodedStreams) as? Bool ?? true)
         let entries = streams.enumerated().map { entry in
             let stream = entry.element
             let resolutionValue = needsResolution ? resolution(for: stream) : 0
-            let isBad = (!preserveAddonStreams || option == .default)
+            let tags = option == .recommended ? StreamQualityTags.parse(stream: stream) : StreamQualityTags()
+            let hasKnownCodec = tags.isAV1 || tags.isHEVC || tags.isAVC
+            let isBad = (!preserveAddonStreams || option == .default || option == .recommended)
                 && (SmartPlaybackSelector.isLowQualityOrTicketStream(stream) || resolutionValue == 0)
             return (
                 offset: entry.offset,
                 element: stream,
                 resolution: resolutionValue,
                 isBad: isBad,
-                quality: option == .quality ? streamQuality(for: stream) : DebridStreamQuality.unknown,
-                size: option == .quality || option == .size ? sizeBytes(for: stream) : 0,
+                quality: option == .quality || option == .recommended ? streamQuality(for: stream) : DebridStreamQuality.unknown,
+                size: option == .quality || option == .size || option == .recommended ? sizeBytes(for: stream) : 0,
+                recommendedTags: tags,
+                recommendedHardware: hasKnownCodec ? (tags.isHardwareAccelerated() ? 1 : -1) : 0,
+                recommendedCached: option == .recommended && stream.isLikelyCached,
+                recommendedAudio: option == .recommended ? recommendedAudioRank(for: stream) : 0,
                 hardwareAccelerated: needsHardwareCheck && resolutionValue >= 2160
                     ? StreamQualityTags.parse(stream: stream).isHardwareAccelerated() : false
             )
         }
 
         switch option {
+        case .recommended:
+            return entries.sorted {
+                let available0 = $0.element.unavailabilityReason == nil
+                let available1 = $1.element.unavailabilityReason == nil
+                if available0 != available1 { return available0 && !available1 }
+                if $0.isBad != $1.isBad { return !$0.isBad && $1.isBad }
+                if $0.resolution != $1.resolution { return $0.resolution > $1.resolution }
+                let hdr0 = $0.recommendedTags.isDolbyVision ? 2 : ($0.recommendedTags.isHDR ? 1 : 0)
+                let hdr1 = $1.recommendedTags.isDolbyVision ? 2 : ($1.recommendedTags.isHDR ? 1 : 0)
+                if hdr0 != hdr1 { return hdr0 > hdr1 }
+                if $0.quality != $1.quality { return $0.quality > $1.quality }
+                if $0.recommendedAudio != $1.recommendedAudio { return $0.recommendedAudio > $1.recommendedAudio }
+                if preferRecommendedHardware {
+                    let hw0 = $0.recommendedHardware
+                    let hw1 = $1.recommendedHardware
+                    if hw0 != hw1 { return hw0 > hw1 }
+                }
+                let cached0 = $0.recommendedCached
+                let cached1 = $1.recommendedCached
+                if cached0 != cached1 { return cached0 && !cached1 }
+                if $0.size != $1.size { return $0.size > $1.size }
+                return $0.offset < $1.offset
+            }.map(\.element)
         case .default:
             return entries.sorted {
                 let bad0 = $0.isBad
@@ -4102,6 +4135,34 @@ enum StreamPickerListBuilder {
                 return $0.offset < $1.offset
             }.map(\.element)
         }
+    }
+
+    /// A best-effort ranking of *declared* audio formats. Metadata can be
+    /// missing or incorrect and does not describe the user's sound system.
+    static func recommendedAudioRank(for stream: NuvioStream) -> Int {
+        let text = [stream.name, stream.description, stream.filename].compactMap { $0 }.joined(separator: " ").lowercased()
+        func matches(_ pattern: String) -> Bool {
+            text.range(of: pattern, options: .regularExpression) != nil
+        }
+        if matches(#"\batmos\b"#) { return 5 }
+        if matches(#"\btrue[ ._-]*hd\b|\bdts[ ._-]*hd\b|\bdts[ ._-]*x\b"#) { return 4 }
+        if matches(#"\bddp(?:[ ._-]?[0-9])?\b|\be[ ._-]?ac[ ._-]?3\b|\bdd\+"#) { return 3 }
+        if matches(#"\bac[ ._-]?3\b|\bdts\b|\baac\b|\bdolby[ ._-]+digital\b"#) { return 2 }
+        if matches(#"\bstereo\b|\b2[.]0\b"#) { return 1 }
+        return 0
+    }
+
+    /// One candidate per known resolution, in descending resolution order.
+    /// Input is already ranked and filtered for the current source scope.
+    static func recommendedByResolution(from streams: [NuvioStream]) -> [(resolution: Int, stream: NuvioStream)] {
+        var seen = Set<Int>()
+        var picks: [(resolution: Int, stream: NuvioStream)] = []
+        for stream in streams where !stream.isNotPlayable && stream.unavailabilityReason == nil {
+            let value = resolution(for: stream)
+            guard value > 0, seen.insert(value).inserted else { continue }
+            picks.append((value, stream))
+        }
+        return picks.sorted { $0.resolution > $1.resolution }
     }
 
     /// Best-effort resolution parsed from a stream's release metadata (2160/1440/1080/720/576/480/360),
@@ -9633,6 +9694,8 @@ private struct TvStreamPickerOverlay: View {
     /// Filter by stable add-on id (not display name).
     @State private var selectedAddonId: String?
     @AppStorage(SettingsKey.streamSortOption) private var sortOption: StreamSortOption = .quality
+    @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedSort = false
+    private var pickerSortOption: StreamSortOption { recommendedSort ? .recommended : sortOption }
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
@@ -9704,7 +9767,7 @@ private struct TvStreamPickerOverlay: View {
         StreamPickerListBuilder.cacheKey(
             revision: streamsRevision,
             selectedAddonId: selectedAddonId,
-            sortOption: sortOption,
+            sortOption: pickerSortOption,
             includeDebrid: includeDebrid,
             cachedOnly: effectiveCachedOnly,
             preserveAddonStreams: preserveAddonOrder
@@ -10011,7 +10074,7 @@ private struct TvStreamPickerOverlay: View {
             streams: streams,
             groups: groups,
             selectedAddonId: selectedAddonId,
-            sortOption: sortOption,
+            sortOption: pickerSortOption,
             includeDebrid: includeDebrid,
             cachedOnly: effectiveCachedOnly,
             preserveAddonStreams: preserveAddonOrder,
@@ -10243,8 +10306,8 @@ private struct TvStreamPickerOverlay: View {
             // Sort remains pinned to the trailing edge instead of moving with
             // the add-on scroller.
             TvStreamFilterButton(
-                title: L10n.format("details_sort_format", fallback: "Sort: %@", L10n.optionLabel(sortOption.rawValue)),
-                isSelected: sortOption != .quality,
+                title: L10n.format("details_sort_format", fallback: "Sort: %@", pickerSortOption == .recommended ? L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended") : L10n.optionLabel(sortOption.rawValue)),
+                isSelected: pickerSortOption != .quality,
                 focusBinding: $focusedItem,
                 focusValue: sortKey,
                 action: { showSortOptions = true }
@@ -10255,9 +10318,10 @@ private struct TvStreamPickerOverlay: View {
                 isPresented: $showSortOptions,
                 titleVisibility: .visible
             ) {
-                ForEach(StreamSortOption.allCases) { option in
-                    Button(L10n.optionLabel(option.rawValue)) { sortOption = option }
+                ForEach(StreamSortOption.allCases.filter { $0 != .recommended }) { option in
+                    Button(L10n.optionLabel(option.rawValue)) { recommendedSort = false; sortOption = option }
                 }
+                Button(L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended")) { recommendedSort = true }
             }
         }
         .padding(.vertical, 4)
@@ -10271,6 +10335,12 @@ private struct TvStreamPickerOverlay: View {
         let totalCount = activeDisplayedStreams.count
         let badgeSettings = streamBadgeSettings
         let hasMore = totalCount > streamsToShow.count
+        let picks = pickerSortOption == .recommended
+            ? StreamPickerListBuilder.recommendedByResolution(from: activeDisplayedStreams)
+            : []
+        let recommendedStream = pickerSortOption == .recommended
+            ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })
+            : nil
         return ZStack {
             if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
@@ -10314,6 +10384,45 @@ private struct TvStreamPickerOverlay: View {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVStack(spacing: style.metrics.cardSpacing) {
+                            if let recommendedStream {
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text(selectedAddonId == nil
+                                         ? L10n.string("stream_recommendation_all_addons", fallback: "Among available results from all add-ons")
+                                         : L10n.string("stream_recommendation_selected_addon", fallback: "Among results from the selected add-on"))
+                                        .font(.system(size: 16))
+                                        .foregroundColor(.white.opacity(0.65))
+                                    TvStreamRecommendationCard(
+                                        stream: recommendedStream,
+                                        title: isLoading || selectedGroupIsLoading
+                                            ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
+                                            : L10n.string("stream_best_overall", fallback: "Best overall"),
+                                        prominent: true,
+                                        focusBinding: $focusedItem,
+                                        focusValue: "recommended::overall",
+                                        action: { select(recommendedStream, player: nil) }
+                                    )
+                                    Text(L10n.string("stream_recommended_criteria", fallback: "Based on reported resolution, HDR, release, audio, codec, availability and size"))
+                                        .font(.system(size: 18))
+                                        .foregroundColor(.white.opacity(0.65))
+                                    // The overall pick already has its own card; its resolution's card
+                                    // would repeat the same source.
+                                    ForEach(picks.filter { $0.stream.id != recommendedStream.id }.map { $0.resolution }, id: \.self) { resolution in
+                                        if let pick = picks.first(where: { $0.resolution == resolution }) {
+                                            let resolutionLabel = resolution == 2160 ? "4K" : "\(resolution)p"
+                                            TvStreamRecommendationCard(
+                                                stream: pick.stream,
+                                                title: L10n.format("stream_best_resolution", fallback: "Best %@", resolutionLabel),
+                                                prominent: false,
+                                                focusBinding: $focusedItem,
+                                                focusValue: "recommended::\(resolution)",
+                                                action: { select(pick.stream, player: nil) }
+                                            )
+                                        }
+                                    }
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .focusSection()
+                            }
                             ForEach(streamsToShow) { stream in
                                 // Focus appearance is owned by the card via local
                                 // @FocusState + ExternalFocusBinding so only the
@@ -10664,6 +10773,66 @@ private final class UpHoldPressHostView: UIView, UIGestureRecognizerDelegate {
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
         isActive
+    }
+}
+
+/// A shortcut to a ranked source. Display only metadata supplied by its add-on;
+/// the full source list below remains available, including its player menu.
+private struct TvStreamRecommendationCard: View {
+    let stream: NuvioStream
+    let title: String
+    let prominent: Bool
+    let focusBinding: FocusState<String?>.Binding
+    let focusValue: String
+    let action: () -> Void
+
+    private var isFocused: Bool { focusBinding.wrappedValue == focusValue }
+
+    var body: some View {
+        Button(action: action) {
+            HStack(alignment: .center, spacing: 18) {
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: prominent ? 42 : 30))
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(title)
+                        .font(.system(size: prominent ? 24 : 20, weight: .bold))
+                    if let name = stream.name, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Text(name.replacingOccurrences(of: "\n", with: " · "))
+                            .font(.system(size: prominent ? 27 : 22, weight: .semibold))
+                            .lineLimit(2)
+                    }
+                    if let description = stream.description, !description.isEmpty {
+                        Text(description.replacingOccurrences(of: "\n", with: " · "))
+                            .font(.system(size: 19))
+                            .lineLimit(prominent ? 2 : 1)
+                    }
+                    HStack(spacing: 12) {
+                        if let size = StreamBadgeSizing.fileSizeLabel(for: stream) {
+                            Text(size)
+                        }
+                        if let addon = stream.addonName, !addon.isEmpty {
+                            Text(addon)
+                        }
+                    }
+                    .font(.system(size: 18, weight: .medium))
+                    .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .foregroundColor(.white)
+            .padding(prominent ? 24 : 18)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .fill(Color.white.opacity(isFocused ? 0.16 : 0.07)))
+            .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
+                .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.12),
+                        lineWidth: isFocused ? AppFocusOutline.width : 1))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused(focusBinding, equals: focusValue)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.025 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
     }
 }
 

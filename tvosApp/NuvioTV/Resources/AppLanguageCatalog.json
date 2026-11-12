@@ -3080,7 +3080,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "تمت مشاهدته",
-    "watched_repeat_count_accessibility": "تمت مشاهدته %d مرات"
+    "watched_repeat_count_accessibility": "تمت مشاهدته %d مرات",
+    "stream_sort_recommended": "ترشيح Nuvio",
+    "stream_best_overall": "أفضل اختيار إجمالاً",
+    "stream_best_overall_so_far": "أفضل اختيار حتى الآن",
+    "stream_play_best_overall": "تشغيل أفضل اختيار",
+    "stream_best_resolution": "أفضل خيار بدقة %1$s",
+    "stream_recommendation_all_addons": "من النتائج المتاحة لجميع الإضافات",
+    "stream_recommendation_selected_addon": "من نتائج الإضافة المحددة",
+    "stream_sort_recommended_setting_subtitle": "يرتب المصادر المتاحة بناءً على معلومات الإضافات. قد تكون البيانات ناقصة أو غير دقيقة، ولا يمكن ضمان جودة التشغيل.",
+    "stream_recommended": "مُوصى به",
+    "stream_recommended_criteria": "استناداً إلى الدقة وHDR والإصدار والصوت والترميز والتوفر والحجم المعلنة",
+    "stream_recommended_so_far": "الأفضل حتى الآن"
   },
   "bg": {
     "about_check_updates": "Провери за актуализации",
@@ -6163,7 +6174,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Гледано",
-    "watched_repeat_count_accessibility": "Гледано %d пъти"
+    "watched_repeat_count_accessibility": "Гледано %d пъти",
+    "stream_sort_recommended": "Препоръка от Nuvio",
+    "stream_best_overall": "Най-добър избор",
+    "stream_best_overall_so_far": "Най-добър избор досега",
+    "stream_play_best_overall": "Пусни най-добрия избор",
+    "stream_best_resolution": "Най-добро в %1$s",
+    "stream_recommendation_all_addons": "Сред наличните резултати от всички добавки",
+    "stream_recommendation_selected_addon": "Сред резултатите от избраната добавка",
+    "stream_sort_recommended_setting_subtitle": "Подрежда наличните източници според данните от добавките. Данните може да са непълни или неточни; качеството на възпроизвеждане не е гарантирано.",
+    "stream_recommended": "Препоръчано",
+    "stream_recommended_criteria": "Според посочените резолюция, HDR, издание, аудио, кодек, наличност и размер",
+    "stream_recommended_so_far": "Препоръчано досега"
   },
   "bn": {
     "about_check_updates": "আপডেটের জন্য চেক করুন",
@@ -9246,7 +9268,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "দেখেছে",
-    "watched_repeat_count_accessibility": "%d বার দেখা হয়েছে৷"
+    "watched_repeat_count_accessibility": "%d বার দেখা হয়েছে৷",
+    "stream_sort_recommended": "Nuvio-এর সুপারিশ",
+    "stream_best_overall": "সামগ্রিকভাবে সেরা",
+    "stream_best_overall_so_far": "এখন পর্যন্ত সেরা",
+    "stream_play_best_overall": "সেরা বিকল্পটি চালান",
+    "stream_best_resolution": "সেরা %1$s",
+    "stream_recommendation_all_addons": "সব অ্যাড-অনের উপলব্ধ ফলাফল থেকে",
+    "stream_recommendation_selected_addon": "নির্বাচিত অ্যাড-অনের ফলাফল থেকে",
+    "stream_sort_recommended_setting_subtitle": "অ্যাড-অনের দেওয়া তথ্য অনুযায়ী উপলব্ধ উৎস সাজায়। তথ্য অসম্পূর্ণ বা ভুল হতে পারে; প্লেব্যাকের মান নিশ্চিত নয়।",
+    "stream_recommended": "প্রস্তাবিত",
+    "stream_recommended_criteria": "জানানো রেজোলিউশন, HDR, রিলিজ, অডিও, কোডেক, প্রাপ্যতা ও আকারের ভিত্তিতে",
+    "stream_recommended_so_far": "এখন পর্যন্ত প্রস্তাবিত"
   },
   "bs": {
     "about_check_updates": "Provjeri ažuriranja",
@@ -12329,7 +12362,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Gledano",
-    "watched_repeat_count_accessibility": "Gledano %d puta"
+    "watched_repeat_count_accessibility": "Gledano %d puta",
+    "stream_sort_recommended": "Nuvio preporuka",
+    "stream_best_overall": "Najbolji ukupni izbor",
+    "stream_best_overall_so_far": "Najbolji izbor dosad",
+    "stream_play_best_overall": "Reproduciraj najbolji izbor",
+    "stream_best_resolution": "Najbolje u %1$s",
+    "stream_recommendation_all_addons": "Među dostupnim rezultatima svih dodataka",
+    "stream_recommendation_selected_addon": "Među rezultatima odabranog dodatka",
+    "stream_sort_recommended_setting_subtitle": "Sortira dostupne izvore prema podacima dodataka. Podaci mogu biti nepotpuni ili netačni; kvalitet reprodukcije nije zagarantovan.",
+    "stream_recommended": "Preporučeno",
+    "stream_recommended_criteria": "Na osnovu navedene rezolucije, HDR-a, izdanja, zvuka, kodeka, dostupnosti i veličine",
+    "stream_recommended_so_far": "Preporučeno dosad"
   },
   "cs": {
     "about_check_updates": "Zkontrolovat aktualizace",
@@ -15412,7 +15456,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Zhlédnuto",
-    "watched_repeat_count_accessibility": "Zhlédnuto %d krát"
+    "watched_repeat_count_accessibility": "Zhlédnuto %d krát",
+    "stream_sort_recommended": "Doporučení Nuvio",
+    "stream_best_overall": "Celkově nejlepší volba",
+    "stream_best_overall_so_far": "Dosud nejlepší volba",
+    "stream_play_best_overall": "Přehrát nejlepší volbu",
+    "stream_best_resolution": "Nejlepší v %1$s",
+    "stream_recommendation_all_addons": "Z dostupných výsledků všech doplňků",
+    "stream_recommendation_selected_addon": "Z výsledků vybraného doplňku",
+    "stream_sort_recommended_setting_subtitle": "Řadí dostupné zdroje podle údajů doplňků. Údaje mohou být neúplné nebo nepřesné; kvalita přehrávání není zaručena.",
+    "stream_recommended": "Doporučeno",
+    "stream_recommended_criteria": "Podle uvedeného rozlišení, HDR, vydání, zvuku, kodeku, dostupnosti a velikosti",
+    "stream_recommended_so_far": "Dosud doporučeno"
   },
   "da": {
     "about_check_updates": "Søg efter opdateringer",
@@ -18495,7 +18550,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Set",
-    "watched_repeat_count_accessibility": "Set %d gange"
+    "watched_repeat_count_accessibility": "Set %d gange",
+    "stream_sort_recommended": "Nuvios anbefaling",
+    "stream_best_overall": "Bedste valg samlet",
+    "stream_best_overall_so_far": "Bedste valg indtil nu",
+    "stream_play_best_overall": "Afspil bedste valg",
+    "stream_best_resolution": "Bedste i %1$s",
+    "stream_recommendation_all_addons": "Blandt tilgængelige resultater fra alle tilføjelser",
+    "stream_recommendation_selected_addon": "Blandt resultaterne fra den valgte tilføjelse",
+    "stream_sort_recommended_setting_subtitle": "Sorterer tilgængelige kilder ud fra oplysninger fra tilføjelser. Oplysningerne kan være ufuldstændige eller forkerte; afspilningskvaliteten er ikke garanteret.",
+    "stream_recommended": "Anbefalet",
+    "stream_recommended_criteria": "Baseret på oplyst opløsning, HDR, udgivelse, lyd, codec, tilgængelighed og størrelse",
+    "stream_recommended_so_far": "Anbefalet indtil nu"
   },
   "de": {
     "about_check_updates": "Nach Updates suchen",
@@ -21578,7 +21644,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Gesehen",
-    "watched_repeat_count_accessibility": "%d-mal gesehen"
+    "watched_repeat_count_accessibility": "%d-mal gesehen",
+    "stream_sort_recommended": "Nuvio-Empfehlung",
+    "stream_best_overall": "Beste Gesamtwahl",
+    "stream_best_overall_so_far": "Bisher beste Gesamtwahl",
+    "stream_play_best_overall": "Beste Gesamtwahl abspielen",
+    "stream_best_resolution": "Beste Wahl in %1$s",
+    "stream_recommendation_all_addons": "Unter verfügbaren Ergebnissen aller Add-ons",
+    "stream_recommendation_selected_addon": "Unter Ergebnissen des ausgewählten Add-ons",
+    "stream_sort_recommended_setting_subtitle": "Sortiert verfügbare Quellen anhand der Angaben der Add-ons. Diese können unvollständig oder ungenau sein; die Wiedergabequalität ist nicht garantiert.",
+    "stream_recommended": "Empfohlen",
+    "stream_recommended_criteria": "Basierend auf angegebener Auflösung, HDR, Version, Ton, Codec, Verfügbarkeit und Größe",
+    "stream_recommended_so_far": "Bisher empfohlen"
   },
   "el": {
     "about_check_updates": "Έλεγχος ενημερώσεων",
@@ -24661,7 +24738,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Παρακολουθήθηκε",
-    "watched_repeat_count_accessibility": "Παρακολουθήθηκε %d φορές"
+    "watched_repeat_count_accessibility": "Παρακολουθήθηκε %d φορές",
+    "stream_sort_recommended": "Πρόταση Nuvio",
+    "stream_best_overall": "Καλύτερη συνολική επιλογή",
+    "stream_best_overall_so_far": "Καλύτερη επιλογή μέχρι τώρα",
+    "stream_play_best_overall": "Αναπαραγωγή καλύτερης επιλογής",
+    "stream_best_resolution": "Καλύτερο σε %1$s",
+    "stream_recommendation_all_addons": "Από τα διαθέσιμα αποτελέσματα όλων των πρόσθετων",
+    "stream_recommendation_selected_addon": "Από τα αποτελέσματα του επιλεγμένου πρόσθετου",
+    "stream_sort_recommended_setting_subtitle": "Ταξινομεί τις διαθέσιμες πηγές βάσει των πληροφοριών των πρόσθετων. Οι πληροφορίες μπορεί να είναι ελλιπείς ή ανακριβείς· η ποιότητα αναπαραγωγής δεν είναι εγγυημένη.",
+    "stream_recommended": "Προτείνεται",
+    "stream_recommended_criteria": "Με βάση την αναφερόμενη ανάλυση, HDR, έκδοση, ήχο, κωδικοποιητή, διαθεσιμότητα και μέγεθος",
+    "stream_recommended_so_far": "Προτείνεται μέχρι τώρα"
   },
   "en": {
     "about_check_updates": "Check for updates",
@@ -27744,7 +27832,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Watched",
-    "watched_repeat_count_accessibility": "Watched %d times"
+    "watched_repeat_count_accessibility": "Watched %d times",
+    "stream_sort_recommended": "Nuvio Recommended",
+    "stream_best_overall": "Best overall",
+    "stream_best_overall_so_far": "Best overall so far",
+    "stream_play_best_overall": "Play best overall",
+    "stream_best_resolution": "Best %1$s",
+    "stream_recommendation_all_addons": "Among available results from all add-ons",
+    "stream_recommendation_selected_addon": "Among results from the selected add-on",
+    "stream_sort_recommended_setting_subtitle": "Ranks available sources using information reported by add-ons. Metadata may be incomplete or inaccurate; playback quality is not guaranteed.",
+    "stream_recommended": "Recommended",
+    "stream_recommended_criteria": "Based on reported resolution, HDR, release, audio, codec, availability and size",
+    "stream_recommended_so_far": "Recommended so far"
   },
   "es": {
     "about_check_updates": "Buscar actualizaciones",
@@ -30827,7 +30926,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Visto",
-    "watched_repeat_count_accessibility": "Visto %d veces"
+    "watched_repeat_count_accessibility": "Visto %d veces",
+    "stream_sort_recommended": "Recomendación Nuvio",
+    "stream_best_overall": "Mejor opción general",
+    "stream_best_overall_so_far": "Mejor opción general hasta ahora",
+    "stream_play_best_overall": "Reproducir mejor opción general",
+    "stream_best_resolution": "Mejor en %1$s",
+    "stream_recommendation_all_addons": "Entre los resultados disponibles de todos los add-ons",
+    "stream_recommendation_selected_addon": "Entre los resultados del add-on seleccionado",
+    "stream_sort_recommended_setting_subtitle": "Ordena las fuentes disponibles según la información de los add-ons. Los datos pueden ser incompletos o incorrectos; la calidad de reproducción no está garantizada.",
+    "stream_recommended": "Recomendado",
+    "stream_recommended_criteria": "Según resolución, HDR, tipo de versión, audio, códec, disponibilidad y tamaño informados",
+    "stream_recommended_so_far": "Recomendado hasta ahora"
   },
   "es-419": {
     "about_check_updates": "Buscar actualizaciones",
@@ -33910,7 +34020,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Visto",
-    "watched_repeat_count_accessibility": "Visto %d veces"
+    "watched_repeat_count_accessibility": "Visto %d veces",
+    "stream_sort_recommended": "Recomendación Nuvio",
+    "stream_best_overall": "Mejor opción general",
+    "stream_best_overall_so_far": "Mejor opción general hasta ahora",
+    "stream_play_best_overall": "Reproducir mejor opción general",
+    "stream_best_resolution": "Mejor en %1$s",
+    "stream_recommendation_all_addons": "Entre los resultados disponibles de todos los add-ons",
+    "stream_recommendation_selected_addon": "Entre los resultados del add-on seleccionado",
+    "stream_sort_recommended_setting_subtitle": "Ordena las fuentes disponibles según la información de los add-ons. Los datos pueden ser incompletos o incorrectos; la calidad de reproducción no está garantizada.",
+    "stream_recommended": "Recomendado",
+    "stream_recommended_criteria": "Según resolución, HDR, tipo de versión, audio, códec, disponibilidad y tamaño informados",
+    "stream_recommended_so_far": "Recomendado hasta ahora"
   },
   "fr": {
     "about_check_updates": "Vérifier les mises à jour",
@@ -36993,7 +37114,18 @@
     "usenet_sync_title": "Enregistrer sur le compte Nuvio",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Vu",
-    "watched_repeat_count_accessibility": "Vu %d fois"
+    "watched_repeat_count_accessibility": "Vu %d fois",
+    "stream_sort_recommended": "Recommandation Nuvio",
+    "stream_best_overall": "Meilleur choix global",
+    "stream_best_overall_so_far": "Meilleur choix pour le moment",
+    "stream_play_best_overall": "Lire le meilleur choix",
+    "stream_best_resolution": "Meilleur en %1$s",
+    "stream_recommendation_all_addons": "Parmi les résultats disponibles de toutes les extensions",
+    "stream_recommendation_selected_addon": "Parmi les résultats de l’extension sélectionnée",
+    "stream_sort_recommended_setting_subtitle": "Classe les sources disponibles selon les informations fournies par les extensions. Ces données peuvent être incomplètes ou inexactes ; la qualité de lecture n’est pas garantie.",
+    "stream_recommended": "Recommandé",
+    "stream_recommended_criteria": "Selon la résolution, le HDR, la version, l’audio, le codec, la disponibilité et la taille indiqués",
+    "stream_recommended_so_far": "Recommandé pour le moment"
   },
   "he": {
     "about_check_updates": "בדוק עדכונים",
@@ -40076,7 +40208,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "נצפה",
-    "watched_repeat_count_accessibility": "נצפה %d פעמים"
+    "watched_repeat_count_accessibility": "נצפה %d פעמים",
+    "stream_sort_recommended": "המלצת Nuvio",
+    "stream_best_overall": "הבחירה הטובה ביותר",
+    "stream_best_overall_so_far": "הבחירה הטובה ביותר עד כה",
+    "stream_play_best_overall": "ניגון הבחירה הטובה ביותר",
+    "stream_best_resolution": "הטוב ביותר ב־%1$s",
+    "stream_recommendation_all_addons": "מתוך התוצאות הזמינות מכל התוספים",
+    "stream_recommendation_selected_addon": "מתוך תוצאות התוסף שנבחר",
+    "stream_sort_recommended_setting_subtitle": "ממיין מקורות זמינים לפי מידע מהתוספים. המידע עשוי להיות חלקי או שגוי; איכות הניגון אינה מובטחת.",
+    "stream_recommended": "מומלץ",
+    "stream_recommended_criteria": "לפי הרזולוציה, HDR, הגרסה, השמע, הקודק, הזמינות והגודל שדווחו",
+    "stream_recommended_so_far": "מומלץ עד כה"
   },
   "hi": {
     "about_check_updates": "अपडेट जांचें",
@@ -43159,7 +43302,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "देखा गया",
-    "watched_repeat_count_accessibility": "%d बार देखा गया"
+    "watched_repeat_count_accessibility": "%d बार देखा गया",
+    "stream_sort_recommended": "Nuvio की सिफ़ारिश",
+    "stream_best_overall": "कुल मिलाकर सर्वश्रेष्ठ",
+    "stream_best_overall_so_far": "अब तक का सर्वश्रेष्ठ",
+    "stream_play_best_overall": "सर्वश्रेष्ठ चलाएं",
+    "stream_best_resolution": "सर्वश्रेष्ठ %1$s",
+    "stream_recommendation_all_addons": "सभी ऐड-ऑन के उपलब्ध परिणामों में से",
+    "stream_recommendation_selected_addon": "चुने गए ऐड-ऑन के परिणामों में से",
+    "stream_sort_recommended_setting_subtitle": "ऐड-ऑन से मिली जानकारी के आधार पर उपलब्ध स्रोतों को क्रम में रखता है। जानकारी अधूरी या गलत हो सकती है; प्लेबैक गुणवत्ता की गारंटी नहीं है।",
+    "stream_recommended": "सुझाया गया",
+    "stream_recommended_criteria": "बताए गए रिज़ॉल्यूशन, HDR, रिलीज़, ऑडियो, कोडेक, उपलब्धता और आकार के आधार पर",
+    "stream_recommended_so_far": "अब तक की सिफ़ारिश"
   },
   "hr": {
     "about_check_updates": "Provjeri ažuriranja",
@@ -46242,7 +46396,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Gledao",
-    "watched_repeat_count_accessibility": "Gledano %d puta"
+    "watched_repeat_count_accessibility": "Gledano %d puta",
+    "stream_sort_recommended": "Nuvio preporuka",
+    "stream_best_overall": "Najbolji ukupni izbor",
+    "stream_best_overall_so_far": "Najbolji izbor dosad",
+    "stream_play_best_overall": "Reproduciraj najbolji izbor",
+    "stream_best_resolution": "Najbolje u %1$s",
+    "stream_recommendation_all_addons": "Među dostupnim rezultatima svih dodataka",
+    "stream_recommendation_selected_addon": "Među rezultatima odabranog dodatka",
+    "stream_sort_recommended_setting_subtitle": "Sortira dostupne izvore prema podacima dodataka. Podaci mogu biti nepotpuni ili netočni; kvaliteta reprodukcije nije zajamčena.",
+    "stream_recommended": "Preporučeno",
+    "stream_recommended_criteria": "Na temelju navedene rezolucije, HDR-a, izdanja, zvuka, kodeka, dostupnosti i veličine",
+    "stream_recommended_so_far": "Preporučeno dosad"
   },
   "hu": {
     "about_check_updates": "Frissítések keresése",
@@ -49325,7 +49490,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Megtekintve",
-    "watched_repeat_count_accessibility": "Megtekintve %d alkalommal"
+    "watched_repeat_count_accessibility": "Megtekintve %d alkalommal",
+    "stream_sort_recommended": "Nuvio ajánlása",
+    "stream_best_overall": "Összességében a legjobb",
+    "stream_best_overall_so_far": "Eddig a legjobb választás",
+    "stream_play_best_overall": "Legjobb választás lejátszása",
+    "stream_best_resolution": "Legjobb %1$s",
+    "stream_recommendation_all_addons": "Az összes bővítmény elérhető találatai közül",
+    "stream_recommendation_selected_addon": "A kiválasztott bővítmény találatai közül",
+    "stream_sort_recommended_setting_subtitle": "Az elérhető forrásokat a bővítmények adatai alapján rendezi. Az adatok hiányosak vagy pontatlanok lehetnek; a lejátszás minősége nem garantált.",
+    "stream_recommended": "Ajánlott",
+    "stream_recommended_criteria": "A megadott felbontás, HDR, kiadás, hang, kodek, elérhetőség és méret alapján",
+    "stream_recommended_so_far": "Eddig ajánlott"
   },
   "in": {
     "about_check_updates": "Periksa pembaruan",
@@ -52408,7 +52584,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Ditonton",
-    "watched_repeat_count_accessibility": "Ditonton %d kali"
+    "watched_repeat_count_accessibility": "Ditonton %d kali",
+    "stream_sort_recommended": "Rekomendasi Nuvio",
+    "stream_best_overall": "Pilihan terbaik",
+    "stream_best_overall_so_far": "Pilihan terbaik sejauh ini",
+    "stream_play_best_overall": "Putar pilihan terbaik",
+    "stream_best_resolution": "Terbaik dalam %1$s",
+    "stream_recommendation_all_addons": "Dari hasil yang tersedia di semua add-on",
+    "stream_recommendation_selected_addon": "Dari hasil add-on yang dipilih",
+    "stream_sort_recommended_setting_subtitle": "Mengurutkan sumber berdasarkan informasi dari add-on. Data mungkin tidak lengkap atau akurat; kualitas pemutaran tidak dijamin.",
+    "stream_recommended": "Direkomendasikan",
+    "stream_recommended_criteria": "Berdasarkan resolusi, HDR, rilis, audio, codec, ketersediaan, dan ukuran yang dilaporkan",
+    "stream_recommended_so_far": "Direkomendasikan sejauh ini"
   },
   "it": {
     "about_check_updates": "Controlla aggiornamenti",
@@ -55491,7 +55678,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Visto",
-    "watched_repeat_count_accessibility": "Visto %d volte"
+    "watched_repeat_count_accessibility": "Visto %d volte",
+    "stream_sort_recommended": "Consigliato da Nuvio",
+    "stream_best_overall": "Migliore in assoluto",
+    "stream_best_overall_so_far": "Migliore finora",
+    "stream_play_best_overall": "Riproduci il migliore",
+    "stream_best_resolution": "Migliore in %1$s",
+    "stream_recommendation_all_addons": "Tra i risultati disponibili di tutti gli add-on",
+    "stream_recommendation_selected_addon": "Tra i risultati dell’add-on selezionato",
+    "stream_sort_recommended_setting_subtitle": "Ordina le fonti disponibili in base ai dati forniti dagli add-on. I dati potrebbero essere incompleti o inesatti; la qualità di riproduzione non è garantita.",
+    "stream_recommended": "Consigliato",
+    "stream_recommended_criteria": "In base a risoluzione, HDR, versione, audio, codec, disponibilità e dimensione dichiarati",
+    "stream_recommended_so_far": "Consigliato finora"
   },
   "ja": {
     "about_check_updates": "アップデートを確認",
@@ -58574,7 +58772,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "視聴済み",
-    "watched_repeat_count_accessibility": "%d回視聴済み"
+    "watched_repeat_count_accessibility": "%d回視聴済み",
+    "stream_sort_recommended": "Nuvioのおすすめ",
+    "stream_best_overall": "総合おすすめ",
+    "stream_best_overall_so_far": "現在の総合おすすめ",
+    "stream_play_best_overall": "総合おすすめを再生",
+    "stream_best_resolution": "%1$sのおすすめ",
+    "stream_recommendation_all_addons": "すべてのアドオンの利用可能な結果から選択",
+    "stream_recommendation_selected_addon": "選択中のアドオンの結果から選択",
+    "stream_sort_recommended_setting_subtitle": "アドオンが提供する情報に基づいてソースを並べ替えます。情報が不完全または不正確な場合があり、再生品質は保証されません。",
+    "stream_recommended": "おすすめ",
+    "stream_recommended_criteria": "表示された解像度、HDR、リリース、音声、コーデック、利用状況、サイズに基づきます",
+    "stream_recommended_so_far": "現在のおすすめ"
   },
   "lt": {
     "about_check_updates": "Tikrinti atnaujinimus",
@@ -61657,7 +61866,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Žiūrėta",
-    "watched_repeat_count_accessibility": "Žiūrėta %d kartus"
+    "watched_repeat_count_accessibility": "Žiūrėta %d kartus",
+    "stream_sort_recommended": "„Nuvio“ rekomendacija",
+    "stream_best_overall": "Geriausias bendras pasirinkimas",
+    "stream_best_overall_so_far": "Kol kas geriausias pasirinkimas",
+    "stream_play_best_overall": "Leisti geriausią pasirinkimą",
+    "stream_best_resolution": "Geriausias %1$s",
+    "stream_recommendation_all_addons": "Iš galimų visų priedų rezultatų",
+    "stream_recommendation_selected_addon": "Iš pasirinkto priedo rezultatų",
+    "stream_sort_recommended_setting_subtitle": "Rikiuoja galimus šaltinius pagal priedų pateiktus duomenis. Duomenys gali būti neišsamūs ar netikslūs; atkūrimo kokybė negarantuojama.",
+    "stream_recommended": "Rekomenduojama",
+    "stream_recommended_criteria": "Pagal nurodytą raišką, HDR, leidimą, garsą, kodeką, prieinamumą ir dydį",
+    "stream_recommended_so_far": "Kol kas rekomenduojama"
   },
   "nl": {
     "about_check_updates": "Controleren op updates",
@@ -64740,7 +64960,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Gezien",
-    "watched_repeat_count_accessibility": "%d keer gezien"
+    "watched_repeat_count_accessibility": "%d keer gezien",
+    "stream_sort_recommended": "Nuvio-aanbeveling",
+    "stream_best_overall": "Beste algemene keuze",
+    "stream_best_overall_so_far": "Beste keuze tot nu toe",
+    "stream_play_best_overall": "Beste keuze afspelen",
+    "stream_best_resolution": "Beste in %1$s",
+    "stream_recommendation_all_addons": "Uit beschikbare resultaten van alle add-ons",
+    "stream_recommendation_selected_addon": "Uit resultaten van de geselecteerde add-on",
+    "stream_sort_recommended_setting_subtitle": "Sorteert beschikbare bronnen op basis van informatie van add-ons. Die informatie kan onvolledig of onjuist zijn; de afspeelkwaliteit is niet gegarandeerd.",
+    "stream_recommended": "Aanbevolen",
+    "stream_recommended_criteria": "Gebaseerd op opgegeven resolutie, HDR, release, audio, codec, beschikbaarheid en grootte",
+    "stream_recommended_so_far": "Tot nu toe aanbevolen"
   },
   "no": {
     "about_check_updates": "Se etter oppdateringer",
@@ -67823,7 +68054,18 @@
     "usenet_sync_title": "Lagre til Nuvio-konto",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Sett",
-    "watched_repeat_count_accessibility": "Sett %d ganger"
+    "watched_repeat_count_accessibility": "Sett %d ganger",
+    "stream_sort_recommended": "Nuvios anbefaling",
+    "stream_best_overall": "Beste valg totalt",
+    "stream_best_overall_so_far": "Beste valg så langt",
+    "stream_play_best_overall": "Spill av beste valg",
+    "stream_best_resolution": "Beste i %1$s",
+    "stream_recommendation_all_addons": "Blant tilgjengelige resultater fra alle tillegg",
+    "stream_recommendation_selected_addon": "Blant resultatene fra det valgte tillegget",
+    "stream_sort_recommended_setting_subtitle": "Sorterer tilgjengelige kilder ut fra opplysninger fra tilleggene. Opplysningene kan være ufullstendige eller feil; avspillingskvaliteten er ikke garantert.",
+    "stream_recommended": "Anbefalt",
+    "stream_recommended_criteria": "Basert på oppgitt oppløsning, HDR, utgivelse, lyd, kodek, tilgjengelighet og størrelse",
+    "stream_recommended_so_far": "Anbefalt så langt"
   },
   "pl": {
     "about_check_updates": "Sprawdź aktualizacje",
@@ -70906,7 +71148,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Obejrzano",
-    "watched_repeat_count_accessibility": "Obejrzano %d razy"
+    "watched_repeat_count_accessibility": "Obejrzano %d razy",
+    "stream_sort_recommended": "Polecane przez Nuvio",
+    "stream_best_overall": "Najlepszy wybór",
+    "stream_best_overall_so_far": "Najlepszy wybór do tej pory",
+    "stream_play_best_overall": "Odtwórz najlepszy wybór",
+    "stream_best_resolution": "Najlepsze %1$s",
+    "stream_recommendation_all_addons": "Spośród dostępnych wyników ze wszystkich dodatków",
+    "stream_recommendation_selected_addon": "Spośród wyników wybranego dodatku",
+    "stream_sort_recommended_setting_subtitle": "Sortuje dostępne źródła na podstawie danych z dodatków. Dane mogą być niepełne lub błędne; jakość odtwarzania nie jest gwarantowana.",
+    "stream_recommended": "Polecane",
+    "stream_recommended_criteria": "Na podstawie podanych: rozdzielczości, HDR, wydania, dźwięku, kodeka, dostępności i rozmiaru",
+    "stream_recommended_so_far": "Polecane do tej pory"
   },
   "pt-BR": {
     "about_check_updates": "Verificar atualizações",
@@ -73989,7 +74242,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Assistido",
-    "watched_repeat_count_accessibility": "Assistido %d vezes"
+    "watched_repeat_count_accessibility": "Assistido %d vezes",
+    "stream_sort_recommended": "Recomendação Nuvio",
+    "stream_best_overall": "Melhor opção geral",
+    "stream_best_overall_so_far": "Melhor opção até agora",
+    "stream_play_best_overall": "Reproduzir melhor opção geral",
+    "stream_best_resolution": "Melhor em %1$s",
+    "stream_recommendation_all_addons": "Entre os resultados disponíveis de todos os add-ons",
+    "stream_recommendation_selected_addon": "Entre os resultados do add-on selecionado",
+    "stream_sort_recommended_setting_subtitle": "Ordena as fontes disponíveis usando dados dos add-ons. Eles podem estar incompletos ou incorretos; a qualidade da reprodução não é garantida.",
+    "stream_recommended": "Recomendado",
+    "stream_recommended_criteria": "Com base em resolução, HDR, versão, áudio, codec, disponibilidade e tamanho informados",
+    "stream_recommended_so_far": "Recomendado até agora"
   },
   "pt-PT": {
     "about_check_updates": "Procurar atualizações",
@@ -77072,7 +77336,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Visto",
-    "watched_repeat_count_accessibility": "Visto %d vezes"
+    "watched_repeat_count_accessibility": "Visto %d vezes",
+    "stream_sort_recommended": "Recomendação Nuvio",
+    "stream_best_overall": "Melhor opção geral",
+    "stream_best_overall_so_far": "Melhor opção até agora",
+    "stream_play_best_overall": "Reproduzir melhor opção geral",
+    "stream_best_resolution": "Melhor em %1$s",
+    "stream_recommendation_all_addons": "Entre os resultados disponíveis de todos os add-ons",
+    "stream_recommendation_selected_addon": "Entre os resultados do add-on selecionado",
+    "stream_sort_recommended_setting_subtitle": "Ordena as fontes disponíveis usando dados dos add-ons. Estes podem estar incompletos ou incorretos; a qualidade de reprodução não é garantida.",
+    "stream_recommended": "Recomendado",
+    "stream_recommended_criteria": "Com base na resolução, HDR, versão, áudio, codec, disponibilidade e tamanho indicados",
+    "stream_recommended_so_far": "Recomendado até agora"
   },
   "ro": {
     "about_check_updates": "Verifică actualizările",
@@ -80155,7 +80430,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Vizionat",
-    "watched_repeat_count_accessibility": "Vizionat de %d ori"
+    "watched_repeat_count_accessibility": "Vizionat de %d ori",
+    "stream_sort_recommended": "Recomandarea Nuvio",
+    "stream_best_overall": "Cea mai bună alegere",
+    "stream_best_overall_so_far": "Cea mai bună alegere de până acum",
+    "stream_play_best_overall": "Redă cea mai bună alegere",
+    "stream_best_resolution": "Cel mai bun în %1$s",
+    "stream_recommendation_all_addons": "Dintre rezultatele disponibile de la toate suplimentele",
+    "stream_recommendation_selected_addon": "Dintre rezultatele suplimentului selectat",
+    "stream_sort_recommended_setting_subtitle": "Ordonează sursele disponibile folosind informațiile furnizate de suplimente. Datele pot fi incomplete sau incorecte; calitatea redării nu este garantată.",
+    "stream_recommended": "Recomandat",
+    "stream_recommended_criteria": "Pe baza rezoluției, HDR, versiunii, sunetului, codecului, disponibilității și dimensiunii raportate",
+    "stream_recommended_so_far": "Recomandat până acum"
   },
   "ru": {
     "about_check_updates": "Проверить обновления",
@@ -83238,7 +83524,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Просмотрено",
-    "watched_repeat_count_accessibility": "Просмотрено %d раз"
+    "watched_repeat_count_accessibility": "Просмотрено %d раз",
+    "stream_sort_recommended": "Рекомендация Nuvio",
+    "stream_best_overall": "Лучший вариант",
+    "stream_best_overall_so_far": "Лучший вариант на данный момент",
+    "stream_play_best_overall": "Воспроизвести лучший вариант",
+    "stream_best_resolution": "Лучший вариант %1$s",
+    "stream_recommendation_all_addons": "Среди доступных результатов всех дополнений",
+    "stream_recommendation_selected_addon": "Среди результатов выбранного дополнения",
+    "stream_sort_recommended_setting_subtitle": "Сортирует доступные источники по данным дополнений. Данные могут быть неполными или неточными; качество воспроизведения не гарантируется.",
+    "stream_recommended": "Рекомендуется",
+    "stream_recommended_criteria": "На основе указанных разрешения, HDR, релиза, звука, кодека, доступности и размера",
+    "stream_recommended_so_far": "Рекомендуется на данный момент"
   },
   "sk": {
     "about_check_updates": "Skontrolovať aktualizácie",
@@ -86321,7 +86618,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Zhliadnuté",
-    "watched_repeat_count_accessibility": "Zhliadnuté %d-krát"
+    "watched_repeat_count_accessibility": "Zhliadnuté %d-krát",
+    "stream_sort_recommended": "Odporúčanie Nuvio",
+    "stream_best_overall": "Celkovo najlepšia voľba",
+    "stream_best_overall_so_far": "Doteraz najlepšia voľba",
+    "stream_play_best_overall": "Prehrať najlepšiu voľbu",
+    "stream_best_resolution": "Najlepšie v %1$s",
+    "stream_recommendation_all_addons": "Z dostupných výsledkov všetkých doplnkov",
+    "stream_recommendation_selected_addon": "Z výsledkov vybraného doplnku",
+    "stream_sort_recommended_setting_subtitle": "Zoraďuje dostupné zdroje podľa údajov doplnkov. Údaje môžu byť neúplné alebo nepresné; kvalita prehrávania nie je zaručená.",
+    "stream_recommended": "Odporúčané",
+    "stream_recommended_criteria": "Podľa uvedeného rozlíšenia, HDR, vydania, zvuku, kodeku, dostupnosti a veľkosti",
+    "stream_recommended_so_far": "Zatiaľ odporúčané"
   },
   "sl": {
     "about_check_updates": "Preveri za posodobitve",
@@ -89404,7 +89712,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Ogledano",
-    "watched_repeat_count_accessibility": "Ogledano %d-krat"
+    "watched_repeat_count_accessibility": "Ogledano %d-krat",
+    "stream_sort_recommended": "Priporočilo Nuvio",
+    "stream_best_overall": "Najboljša skupna izbira",
+    "stream_best_overall_so_far": "Najboljša izbira doslej",
+    "stream_play_best_overall": "Predvajaj najboljšo izbiro",
+    "stream_best_resolution": "Najboljše v %1$s",
+    "stream_recommendation_all_addons": "Med razpoložljivimi rezultati vseh dodatkov",
+    "stream_recommendation_selected_addon": "Med rezultati izbranega dodatka",
+    "stream_sort_recommended_setting_subtitle": "Razvrsti razpoložljive vire po podatkih dodatkov. Podatki so lahko nepopolni ali netočni; kakovost predvajanja ni zagotovljena.",
+    "stream_recommended": "Priporočeno",
+    "stream_recommended_criteria": "Na podlagi navedene ločljivosti, HDR, izdaje, zvoka, kodeka, razpoložljivosti in velikosti",
+    "stream_recommended_so_far": "Priporočeno doslej"
   },
   "sq": {
     "about_check_updates": "Kontrollo për përditësime",
@@ -92487,7 +92806,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Shikuar",
-    "watched_repeat_count_accessibility": "Shikuar %d herë"
+    "watched_repeat_count_accessibility": "Shikuar %d herë",
+    "stream_sort_recommended": "Rekomandimi i Nuvio",
+    "stream_best_overall": "Zgjedhja më e mirë",
+    "stream_best_overall_so_far": "Zgjedhja më e mirë deri tani",
+    "stream_play_best_overall": "Luaj zgjedhjen më të mirë",
+    "stream_best_resolution": "Më e mira në %1$s",
+    "stream_recommendation_all_addons": "Nga rezultatet e disponueshme të të gjitha shtesave",
+    "stream_recommendation_selected_addon": "Nga rezultatet e shtesës së zgjedhur",
+    "stream_sort_recommended_setting_subtitle": "Rendit burimet e disponueshme sipas të dhënave të shtesave. Të dhënat mund të jenë të paplota ose të pasakta; cilësia e luajtjes nuk garantohet.",
+    "stream_recommended": "Rekomandohet",
+    "stream_recommended_criteria": "Bazuar në rezolucionin, HDR, versionin, audion, kodekun, disponueshmërinë dhe madhësinë e raportuar",
+    "stream_recommended_so_far": "Rekomandohet deri tani"
   },
   "sr-Latn": {
     "about_check_updates": "Proveri ažuriranja",
@@ -95570,7 +95900,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Gledao",
-    "watched_repeat_count_accessibility": "Watched %d times"
+    "watched_repeat_count_accessibility": "Watched %d times",
+    "stream_sort_recommended": "Nuvio preporuka",
+    "stream_best_overall": "Najbolji ukupni izbor",
+    "stream_best_overall_so_far": "Najbolji izbor do sada",
+    "stream_play_best_overall": "Pusti najbolji izbor",
+    "stream_best_resolution": "Najbolje u %1$s",
+    "stream_recommendation_all_addons": "Među dostupnim rezultatima svih dodataka",
+    "stream_recommendation_selected_addon": "Među rezultatima izabranog dodatka",
+    "stream_sort_recommended_setting_subtitle": "Sortira dostupne izvore prema podacima dodataka. Podaci mogu biti nepotpuni ili netačni; kvalitet reprodukcije nije zagarantovan.",
+    "stream_recommended": "Preporučeno",
+    "stream_recommended_criteria": "Na osnovu navedene rezolucije, HDR-a, izdanja, zvuka, kodeka, dostupnosti i veličine",
+    "stream_recommended_so_far": "Preporučeno do sada"
   },
   "sv": {
     "about_check_updates": "Sök efter uppdateringar",
@@ -98653,7 +98994,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Sedd",
-    "watched_repeat_count_accessibility": "Sedd %d gånger"
+    "watched_repeat_count_accessibility": "Sedd %d gånger",
+    "stream_sort_recommended": "Nuvios rekommendation",
+    "stream_best_overall": "Bästa valet totalt",
+    "stream_best_overall_so_far": "Bästa valet hittills",
+    "stream_play_best_overall": "Spela bästa valet",
+    "stream_best_resolution": "Bästa i %1$s",
+    "stream_recommendation_all_addons": "Bland tillgängliga resultat från alla tillägg",
+    "stream_recommendation_selected_addon": "Bland resultaten från det valda tillägget",
+    "stream_sort_recommended_setting_subtitle": "Sorterar tillgängliga källor utifrån uppgifter från tilläggen. Uppgifterna kan vara ofullständiga eller felaktiga; uppspelningskvaliteten garanteras inte.",
+    "stream_recommended": "Rekommenderas",
+    "stream_recommended_criteria": "Baserat på angiven upplösning, HDR, utgåva, ljud, kodek, tillgänglighet och storlek",
+    "stream_recommended_so_far": "Rekommenderas hittills"
   },
   "ta": {
     "about_check_updates": "புதுப்பிப்புகளை சரிபார்",
@@ -101736,7 +102088,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "பார்த்தது",
-    "watched_repeat_count_accessibility": "%d முறை பார்த்தது"
+    "watched_repeat_count_accessibility": "%d முறை பார்த்தது",
+    "stream_sort_recommended": "Nuvio பரிந்துரை",
+    "stream_best_overall": "ஒட்டுமொத்த சிறந்த தேர்வு",
+    "stream_best_overall_so_far": "இதுவரை சிறந்த தேர்வு",
+    "stream_play_best_overall": "சிறந்த தேர்வை இயக்கவும்",
+    "stream_best_resolution": "%1$s-இல் சிறந்தது",
+    "stream_recommendation_all_addons": "அனைத்து துணை நிரல்களின் கிடைக்கும் முடிவுகளில் இருந்து",
+    "stream_recommendation_selected_addon": "தேர்ந்தெடுத்த துணை நிரலின் முடிவுகளில் இருந்து",
+    "stream_sort_recommended_setting_subtitle": "துணை நிரல்கள் வழங்கும் தகவல்களின் அடிப்படையில் ஆதாரங்களை வரிசைப்படுத்தும். தகவல் முழுமையற்றதாகவோ தவறாகவோ இருக்கலாம்; பிளேபேக் தரம் உறுதியில்லை.",
+    "stream_recommended": "பரிந்துரைக்கப்பட்டது",
+    "stream_recommended_criteria": "குறிப்பிடப்பட்ட தெளிவுத்திறன், HDR, வெளியீடு, ஆடியோ, கோடெக், கிடைக்கும் நிலை மற்றும் அளவின் அடிப்படையில்",
+    "stream_recommended_so_far": "இதுவரை பரிந்துரைக்கப்பட்டது"
   },
   "tr": {
     "about_check_updates": "Güncellemeleri kontrol et",
@@ -104819,7 +105182,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "İzlendi",
-    "watched_repeat_count_accessibility": "%d kez izlendi"
+    "watched_repeat_count_accessibility": "%d kez izlendi",
+    "stream_sort_recommended": "Nuvio Önerisi",
+    "stream_best_overall": "Genel olarak en iyi",
+    "stream_best_overall_so_far": "Şu ana kadarki en iyi",
+    "stream_play_best_overall": "En iyiyi oynat",
+    "stream_best_resolution": "En iyi %1$s",
+    "stream_recommendation_all_addons": "Tüm eklentilerin kullanılabilir sonuçları arasından",
+    "stream_recommendation_selected_addon": "Seçili eklentinin sonuçları arasından",
+    "stream_sort_recommended_setting_subtitle": "Kullanılabilir kaynakları eklentilerin sağladığı bilgilere göre sıralar. Bilgiler eksik veya hatalı olabilir; oynatma kalitesi garanti edilmez.",
+    "stream_recommended": "Önerilen",
+    "stream_recommended_criteria": "Bildirilen çözünürlük, HDR, sürüm, ses, kodek, kullanılabilirlik ve boyuta göre",
+    "stream_recommended_so_far": "Şu ana kadarki öneri"
   },
   "uk": {
     "about_check_updates": "Перевірити оновлення",
@@ -107902,7 +108276,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Переглянуто",
-    "watched_repeat_count_accessibility": "Переглянуто %d разів"
+    "watched_repeat_count_accessibility": "Переглянуто %d разів",
+    "stream_sort_recommended": "Рекомендація Nuvio",
+    "stream_best_overall": "Найкращий варіант",
+    "stream_best_overall_so_far": "Найкращий варіант наразі",
+    "stream_play_best_overall": "Відтворити найкращий варіант",
+    "stream_best_resolution": "Найкращий варіант %1$s",
+    "stream_recommendation_all_addons": "Серед доступних результатів усіх доповнень",
+    "stream_recommendation_selected_addon": "Серед результатів вибраного доповнення",
+    "stream_sort_recommended_setting_subtitle": "Сортує доступні джерела за даними доповнень. Дані можуть бути неповними або неточними; якість відтворення не гарантується.",
+    "stream_recommended": "Рекомендовано",
+    "stream_recommended_criteria": "На основі вказаних роздільності, HDR, версії, звуку, кодека, доступності та розміру",
+    "stream_recommended_so_far": "Рекомендовано наразі"
   },
   "vi": {
     "about_check_updates": "Kiểm tra cập nhật",
@@ -110985,7 +111370,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "Đã xem",
-    "watched_repeat_count_accessibility": "Đã xem %d lần"
+    "watched_repeat_count_accessibility": "Đã xem %d lần",
+    "stream_sort_recommended": "Nuvio đề xuất",
+    "stream_best_overall": "Lựa chọn tốt nhất",
+    "stream_best_overall_so_far": "Lựa chọn tốt nhất hiện tại",
+    "stream_play_best_overall": "Phát lựa chọn tốt nhất",
+    "stream_best_resolution": "Tốt nhất ở %1$s",
+    "stream_recommendation_all_addons": "Trong các kết quả có sẵn từ tất cả tiện ích",
+    "stream_recommendation_selected_addon": "Trong kết quả của tiện ích đã chọn",
+    "stream_sort_recommended_setting_subtitle": "Sắp xếp nguồn có sẵn dựa trên thông tin từ tiện ích. Dữ liệu có thể thiếu hoặc không chính xác; chất lượng phát không được đảm bảo.",
+    "stream_recommended": "Đề xuất",
+    "stream_recommended_criteria": "Dựa trên độ phân giải, HDR, bản phát hành, âm thanh, codec, tình trạng và dung lượng được cung cấp",
+    "stream_recommended_so_far": "Đề xuất hiện tại"
   },
   "zh-CN": {
     "about_check_updates": "检查更新",
@@ -114068,7 +114464,18 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "已观看",
-    "watched_repeat_count_accessibility": "已观看 %d 次"
+    "watched_repeat_count_accessibility": "已观看 %d 次",
+    "stream_sort_recommended": "Nuvio 推荐",
+    "stream_best_overall": "综合最佳",
+    "stream_best_overall_so_far": "目前综合最佳",
+    "stream_play_best_overall": "播放综合最佳",
+    "stream_best_resolution": "最佳 %1$s",
+    "stream_recommendation_all_addons": "从所有插件的可用结果中选择",
+    "stream_recommendation_selected_addon": "从所选插件的结果中选择",
+    "stream_sort_recommended_setting_subtitle": "根据插件提供的信息排序可用来源。信息可能不完整或不准确，无法保证播放质量。",
+    "stream_recommended": "推荐",
+    "stream_recommended_criteria": "基于所提供的分辨率、HDR、版本、音频、编码、可用性和大小",
+    "stream_recommended_so_far": "目前推荐"
   },
   "zh-TW": {
     "about_check_updates": "檢查更新",
@@ -117151,6 +117558,17 @@
     "usenet_sync_title": "Save to Nuvio Account",
     "usenet_test_ok": "Login OK",
     "watched_accessibility": "已觀看",
-    "watched_repeat_count_accessibility": "已觀看 %d 次"
+    "watched_repeat_count_accessibility": "已觀看 %d 次",
+    "stream_sort_recommended": "Nuvio 推薦",
+    "stream_best_overall": "綜合最佳",
+    "stream_best_overall_so_far": "目前綜合最佳",
+    "stream_play_best_overall": "播放綜合最佳",
+    "stream_best_resolution": "最佳 %1$s",
+    "stream_recommendation_all_addons": "從所有附加元件的可用結果中選擇",
+    "stream_recommendation_selected_addon": "從所選附加元件的結果中選擇",
+    "stream_sort_recommended_setting_subtitle": "依附加元件提供的資訊排序可用來源。資訊可能不完整或不準確，無法保證播放品質。",
+    "stream_recommended": "推薦",
+    "stream_recommended_criteria": "依據所提供的解析度、HDR、版本、音訊、編碼、可用性與大小",
+    "stream_recommended_so_far": "目前推薦"
   }
 }
