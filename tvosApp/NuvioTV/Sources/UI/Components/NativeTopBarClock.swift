@@ -31,11 +31,22 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ view: Marker, coordinator: ()) {
-        view.removeClock()
+        view.dismantle()
+    }
+
+    /// Reports when the system moves the label in or out of the window, so the marker can
+    /// put it back after a tab change, a profile switch or a rebuilt accessory area.
+    final class ClockLabel: UILabel {
+        var onWindowChange: (() -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            onWindowChange?()
+        }
     }
 
     final class Marker: UIView {
-        private let clockLabel = UILabel()
+        private let clockLabel = ClockLabel()
         private weak var accessory: UIView?
         private var wantsClock = false
         private var retryGeneration = 0
@@ -52,6 +63,7 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
             clockLabel.isUserInteractionEnabled = false
             clockLabel.isAccessibilityElement = true
             clockLabel.accessibilityTraits = .staticText
+            clockLabel.onWindowChange = { [weak self] in self?.clockLabelWindowChanged() }
         }
 
         required init?(coder: NSCoder) { return nil }
@@ -69,7 +81,35 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
                 wantsClock = enabled
                 if !enabled { removeClock(); return }
             }
-            if enabled && accessory == nil { scheduleAttach() }
+            if enabled && !isAttached { scheduleAttach() }
+        }
+
+        /// The system can rebuild or empty the bar's accessory area (the bar hiding while
+        /// content scrolls, a tab change), which takes the label out of the window while the
+        /// weak reference to the old accessory may still be set. Attached means on screen.
+        private var isAttached: Bool {
+            guard let accessory else { return false }
+            return clockLabel.superview === accessory && clockLabel.window != nil
+        }
+
+        private var isRetrying = false
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            // Layout passes come with tab and bar changes: reattach then, not only on the next minute.
+            if wantsClock, !isAttached, !isRetrying { scheduleAttach() }
+        }
+
+        /// The label left the window while the marker is still on screen: the system took it
+        /// out with the bar's old accessory area. Put it back in the current one.
+        private func clockLabelWindowChanged() {
+            guard wantsClock, window != nil, clockLabel.window == nil, !isRetrying else { return }
+            scheduleAttach()
+        }
+
+        func dismantle() {
+            wantsClock = false
+            removeClock()
         }
 
         func removeClock() {
@@ -82,16 +122,17 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
             guard wantsClock else { return }
             retryGeneration += 1
             let generation = retryGeneration
-            attemptAttach(generation: generation, attemptsRemaining: 10)
+            isRetrying = true
+            attemptAttach(generation: generation, attemptsRemaining: Self.fastAttempts + Self.slowAttempts)
         }
 
         private func attemptAttach(generation: Int, attemptsRemaining: Int) {
-            guard wantsClock, generation == retryGeneration else { return }
-            guard let window, let root = window.rootViewController else { return }
+            guard wantsClock, generation == retryGeneration else { isRetrying = false; return }
+            guard let window, let root = window.rootViewController else { isRetrying = false; return }
             let bars = Self.visibleTabBars(in: root, window: window)
             if bars.count == 1, let bar = bars.first {
                 let target = bar.leadingAccessoryView
-                if accessory !== target {
+                if clockLabel.superview !== target || clockLabel.window == nil {
                     clockLabel.removeFromSuperview()
                     target.addSubview(clockLabel)
                     clockLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -103,13 +144,20 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
                     ])
                     accessory = target
                 }
+                isRetrying = false
                 return
             }
-            guard attemptsRemaining > 0 else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            guard attemptsRemaining > 0 else { isRetrying = false; return }
+            // Retry quickly at first, then slowly: after a profile switch the bar can take a
+            // few seconds to come back, longer than the fast retries alone cover.
+            let delay = attemptsRemaining > Self.slowAttempts ? 0.2 : 1.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.attemptAttach(generation: generation, attemptsRemaining: attemptsRemaining - 1)
             }
         }
+
+        private static let fastAttempts = 10
+        private static let slowAttempts = 30
 
         private static func visibleTabBars(in root: UIViewController, window: UIWindow) -> [UITabBar] {
             var result: [UITabBar] = []
