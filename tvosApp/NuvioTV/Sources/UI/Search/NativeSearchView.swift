@@ -246,6 +246,7 @@ struct NativeSearchView: View {
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
 
     @FocusState private var focusedResultID: String?
     @FocusState private var focusedFilterID: String?
@@ -490,7 +491,9 @@ struct NativeSearchView: View {
                 .autocorrectionDisabled()
                 #if os(tvOS)
                 .toolbar(.hidden, for: .navigationBar)
-                .toolbar(.hidden, for: .tabBar)
+                // Hiding the tab bar suits the sidebar layout; the native top bar is the only
+                // way back to the other tabs, so it stays under the system's control there.
+                .toolbar(useTopNavigation ? .automatic : .hidden, for: .tabBar)
                 #endif
         }
     }
