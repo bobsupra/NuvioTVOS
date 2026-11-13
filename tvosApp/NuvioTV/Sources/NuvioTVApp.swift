@@ -4974,7 +4974,6 @@ private struct TVMainTabView: View {
                     .tag(TVTab.calendar)
             }
             settingsTabContent
-                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .settings)
                 .tabItem { settingsTabLabel }.tag(TVTab.settings)
             ForEach(directCollectionDestinations + genreCollectionDestinations) { destination in
                 collectionTabContent(destination)
