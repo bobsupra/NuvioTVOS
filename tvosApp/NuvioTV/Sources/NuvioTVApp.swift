@@ -4738,7 +4738,10 @@ private struct TVMainTabView: View {
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
-        } else if searchStyle == "Grid" {
+        } else if searchStyle == "Grid" && !useTopNavigation {
+            // Grid hides the tab bar for its side-by-side keyboard. With the native top bar
+            // that left no way back to the other tabs, so Grid falls through to Native there
+            // (the stored choice is kept for the sidebar layout).
             NativeSearchView(
                 viewModel: searchViewModel,
                 showDiscover: discoverLocation == "Search",
@@ -4749,7 +4752,7 @@ private struct TVMainTabView: View {
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
-        } else if searchStyle == "Native" {
+        } else if searchStyle == "Native" || searchStyle == "Grid" {
             NativeSearchView(
                 viewModel: searchViewModel,
                 showDiscover: discoverLocation == "Search",
