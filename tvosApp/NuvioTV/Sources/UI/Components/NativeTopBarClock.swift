@@ -31,11 +31,22 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
     }
 
     static func dismantleUIView(_ view: Marker, coordinator: ()) {
-        view.removeClock()
+        view.dismantle()
+    }
+
+    /// Reports when the system moves the label in or out of the window, so the marker can
+    /// put it back after a tab change, a profile switch or a rebuilt accessory area.
+    final class ClockLabel: UILabel {
+        var onWindowChange: (() -> Void)?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            onWindowChange?()
+        }
     }
 
     final class Marker: UIView {
-        private let clockLabel = UILabel()
+        private let clockLabel = ClockLabel()
         private weak var accessory: UIView?
         private var wantsClock = false
         private var retryGeneration = 0
@@ -52,6 +63,7 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
             clockLabel.isUserInteractionEnabled = false
             clockLabel.isAccessibilityElement = true
             clockLabel.accessibilityTraits = .staticText
+            clockLabel.onWindowChange = { [weak self] in self?.clockLabelWindowChanged() }
         }
 
         required init?(coder: NSCoder) { return nil }
@@ -88,6 +100,18 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
             if wantsClock, !isAttached, !isRetrying { scheduleAttach() }
         }
 
+        /// The label left the window while the marker is still on screen: the system took it
+        /// out with the bar's old accessory area. Put it back in the current one.
+        private func clockLabelWindowChanged() {
+            guard wantsClock, window != nil, clockLabel.window == nil, !isRetrying else { return }
+            scheduleAttach()
+        }
+
+        func dismantle() {
+            wantsClock = false
+            removeClock()
+        }
+
         func removeClock() {
             retryGeneration += 1
             clockLabel.removeFromSuperview()
@@ -99,7 +123,7 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
             retryGeneration += 1
             let generation = retryGeneration
             isRetrying = true
-            attemptAttach(generation: generation, attemptsRemaining: 10)
+            attemptAttach(generation: generation, attemptsRemaining: Self.fastAttempts + Self.slowAttempts)
         }
 
         private func attemptAttach(generation: Int, attemptsRemaining: Int) {
@@ -124,10 +148,16 @@ private struct NativeTopBarClockMarker: UIViewRepresentable {
                 return
             }
             guard attemptsRemaining > 0 else { isRetrying = false; return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            // Retry quickly at first, then slowly: after a profile switch the bar can take a
+            // few seconds to come back, longer than the fast retries alone cover.
+            let delay = attemptsRemaining > Self.slowAttempts ? 0.2 : 1.0
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
                 self?.attemptAttach(generation: generation, attemptsRemaining: attemptsRemaining - 1)
             }
         }
+
+        private static let fastAttempts = 10
+        private static let slowAttempts = 30
 
         private static func visibleTabBars(in root: UIViewController, window: UIWindow) -> [UITabBar] {
             var result: [UITabBar] = []
