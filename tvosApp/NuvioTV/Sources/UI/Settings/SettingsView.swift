@@ -4782,6 +4782,40 @@ private struct HeroCatalogSelectionRow: View {
     }
 }
 
+private extension TopShelfSigningCheck {
+    /// What this install's signing is missing for the Top Shelf, in a sentence the user can
+    /// act on; nil when nothing is.
+    var problemDescription: String? {
+        switch problem {
+        case nil:
+            return nil
+        case .extensionMissing:
+            return L10n.string(
+                "tvos_settings_topshelf_problem_extension_missing",
+                fallback: "This install has no Top Shelf extension. Install again without removing app extensions."
+            )
+        case .appWithoutGroup(let profileGroups?) where !profileGroups.isEmpty:
+            return L10n.format(
+                "tvos_settings_topshelf_problem_group_not_signed",
+                fallback: "The provisioning profile allows %@, but the app was not signed with it. Sign again with the profile's entitlements.",
+                profileGroups.joined(separator: ", ")
+            )
+        case .appWithoutGroup:
+            return L10n.format(
+                "tvos_settings_topshelf_problem_no_group",
+                fallback: "The app was signed without an App Group. Sign the app and its .topshelf extension with a profile that includes %@.",
+                groupID
+            )
+        case .extensionWithoutGroup:
+            return L10n.format(
+                "tvos_settings_topshelf_problem_extension_group",
+                fallback: "The Top Shelf extension's provisioning profile does not include %@. Sign the .topshelf extension with a profile that has it.",
+                groupID
+            )
+        }
+    }
+}
+
 /// What the Apple TV home screen shows for the app when it sits in the top row
 /// of the Dock. Device-wide (one shelf per Apple TV), saved by
 /// `TopShelfConfigurationStore`, which redraws the shelf on every change.
@@ -4806,10 +4840,15 @@ private struct TopShelfSettingsGroup: View {
                 fallback: "What the Apple TV home screen shows when Nuvio is in the top row of the Dock"
             )
         ) {
-            if !TopShelfFeedStore.isAvailable {
+            if let problem = TopShelfSigningCheck.installed.problemDescription {
                 SettingsInfoRow(
                     title: L10n.string("tvos_settings_topshelf_status", fallback: "Top Shelf"),
                     value: L10n.string("tvos_settings_topshelf_unavailable", fallback: "Unavailable")
+                )
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_topshelf_missing", fallback: "What's Missing"),
+                    value: problem,
+                    isDiagnostic: true
                 )
             }
 
@@ -13524,15 +13563,16 @@ private struct AdvancedSettingsView: View {
                 #endif
 
                 // Whether the app can hand its rows to the Top Shelf extension: a sideloaded
-                // build only can when its signing kept the App Group.
+                // build only can when its signing kept the extension and the App Group in
+                // both. When it did not, the subtitle says what is missing.
                 SettingsActionRow(
                     title: L10n.string("tvos_settings_topshelf_status", fallback: "Top Shelf"),
-                    subtitle: L10n.format(
+                    subtitle: TopShelfSigningCheck.installed.problemDescription ?? L10n.format(
                         "tvos_settings_topshelf_status_detail",
                         fallback: "Data shared with the home screen row (App Group %@)",
                         topShelfAppGroupID
                     ),
-                    value: TopShelfFeedStore.isAvailable
+                    value: TopShelfSigningCheck.installed.problem == nil
                         ? L10n.string("tvos_settings_topshelf_available", fallback: "OK")
                         : L10n.string("tvos_settings_topshelf_unavailable", fallback: "Unavailable"),
                     accentColor: accentColor,

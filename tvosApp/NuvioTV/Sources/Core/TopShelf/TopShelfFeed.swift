@@ -67,14 +67,20 @@ private func topShelfInfoPlistGroupIdentifiers(at appBundleURL: URL) -> [String]
 }
 
 private func topShelfProvisioningProfileGroupIdentifiers(at appBundleURL: URL) -> [String] {
-    let profileURL = appBundleURL.appendingPathComponent("embedded.mobileprovision")
+    topShelfProvisioningProfileGroups(at: appBundleURL) ?? []
+}
+
+/// The App Groups a bundle's embedded provisioning profile allows: nil when the bundle carries
+/// no profile (or it cannot be read), empty when the profile allows none.
+private func topShelfProvisioningProfileGroups(at bundleURL: URL) -> [String]? {
+    let profileURL = bundleURL.appendingPathComponent("embedded.mobileprovision")
     guard let profileData = try? Data(contentsOf: profileURL),
           let xmlStart = profileData.range(of: Data("<?xml".utf8)),
           let plistEnd = profileData.range(
             of: Data("</plist>".utf8),
             in: xmlStart.lowerBound..<profileData.endIndex
           ) else {
-        return []
+        return nil
     }
 
     let plistData = profileData.subdata(in: xmlStart.lowerBound..<plistEnd.upperBound)
@@ -83,12 +89,85 @@ private func topShelfProvisioningProfileGroupIdentifiers(at appBundleURL: URL) -
         options: [],
         format: nil
     ),
-    let profile = plistObject as? [String: Any],
-    let entitlements = profile["Entitlements"] as? [String: Any],
-    let groupIDs = entitlements["com.apple.security.application-groups"] as? [String] else {
-        return []
+    let profile = plistObject as? [String: Any] else {
+        return nil
     }
-    return groupIDs
+    let entitlements = profile["Entitlements"] as? [String: Any]
+    return entitlements?["com.apple.security.application-groups"] as? [String] ?? []
+}
+
+/// The Top Shelf extension inside the app, found by its extension point (an installer may
+/// rename it, or leave it out).
+private func topShelfExtensionBundleURL(in appBundleURL: URL) -> URL? {
+    let plugIns = appBundleURL.appendingPathComponent("PlugIns", isDirectory: true)
+    guard let contents = try? FileManager.default.contentsOfDirectory(
+        at: plugIns,
+        includingPropertiesForKeys: nil
+    ) else {
+        return nil
+    }
+    return contents.first { url in
+        guard url.pathExtension == "appex",
+              let info = Bundle(url: url)?.infoDictionary,
+              let extensionInfo = info["NSExtension"] as? [String: Any] else {
+            return false
+        }
+        return extensionInfo["NSExtensionPointIdentifier"] as? String == "com.apple.tv-top-shelf"
+    }
+}
+
+/// What this install's signing gives the Top Shelf, for Settings. A sideloaded build can lose
+/// the App Group or the extension itself, and the home screen row then stays empty with no
+/// other sign of what is missing.
+public struct TopShelfSigningCheck: Equatable, Sendable {
+    public enum Problem: Equatable, Sendable {
+        /// The installer left the Top Shelf extension out of the app.
+        case extensionMissing
+        /// The app cannot open an App Group. `profileGroups` are the groups its provisioning
+        /// profile allows (empty: none); nil when the build carries no profile.
+        case appWithoutGroup(profileGroups: [String]?)
+        /// The app opens `groupID`, but the extension's provisioning profile does not allow
+        /// it, so the extension cannot read what the app writes there.
+        case extensionWithoutGroup
+    }
+
+    /// The App Group the app uses, or would use (`group.<bundle ID>`) when it can open none.
+    public let groupID: String
+    public let problem: Problem?
+
+    /// Signing does not change while the app runs, so it is read once.
+    public static let installed: TopShelfSigningCheck = {
+        let appBundleURL = topShelfContainingAppBundleURL()
+        let extensionURL = topShelfExtensionBundleURL(in: appBundleURL)
+        let groupID = topShelfAppGroupID
+        return TopShelfSigningCheck(
+            groupID: groupID,
+            problem: diagnose(
+                groupID: groupID,
+                appOpensGroup: FileManager.default
+                    .containerURL(forSecurityApplicationGroupIdentifier: groupID) != nil,
+                appProfileGroups: topShelfProvisioningProfileGroups(at: appBundleURL),
+                hasExtension: extensionURL != nil,
+                extensionProfileGroups: extensionURL.flatMap { topShelfProvisioningProfileGroups(at: $0) }
+            )
+        )
+    }()
+
+    static func diagnose(
+        groupID: String,
+        appOpensGroup: Bool,
+        appProfileGroups: [String]?,
+        hasExtension: Bool,
+        extensionProfileGroups: [String]?
+    ) -> Problem? {
+        guard hasExtension else { return .extensionMissing }
+        guard appOpensGroup else { return .appWithoutGroup(profileGroups: appProfileGroups) }
+        // A build without a profile (App Store, TestFlight) has nothing to compare.
+        if let extensionProfileGroups, !extensionProfileGroups.contains(groupID) {
+            return .extensionWithoutGroup
+        }
+        return nil
+    }
 }
 
 /// One Top Shelf row. Each section is mirrored to its own file so the stores
