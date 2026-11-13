@@ -5774,6 +5774,8 @@ struct TVHomeView: View {
     /// next entry needs it. A relaunch clears it, giving a genuinely transient
     /// outage a fresh try.
     @MainActor private static var unimprovedHomeFailures: Set<String> = []
+    /// How long a Home with missing catalogs waits before a return to Home loads it again.
+    private static let partialHomeRetryInterval: TimeInterval = 60
 
     @ObservedObject var store: TVHomeStore
     let repository: CatalogRepository
@@ -9856,7 +9858,15 @@ struct TVHomeView: View {
             thresholdSeconds = nil
         }
 
-        guard let threshold = thresholdSeconds else { return }
+        // A Home that loaded with some catalogs missing (an add-on timed out, the
+        // network was not ready yet) stays that way for the whole session otherwise:
+        // the store counts it as loaded, and the automatic retry right after the load
+        // gives up when the same rows fail twice. Try again on the next return to
+        // Home, whatever the auto-refresh setting says.
+        let partialRetrySeconds: TimeInterval? = repository.homeCatalogLoadWasPartial
+            ? Self.partialHomeRetryInterval
+            : nil
+        guard let threshold = [thresholdSeconds, partialRetrySeconds].compactMap({ $0 }).min() else { return }
         let elapsed = Date().timeIntervalSince(lastLoaded)
         if elapsed >= threshold {
             TVHomeDebugTrace.log("home.autoRefresh triggered elapsed=\(Int(elapsed))s threshold=\(Int(threshold))s")
