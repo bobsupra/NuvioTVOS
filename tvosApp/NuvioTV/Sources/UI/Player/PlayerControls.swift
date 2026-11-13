@@ -2462,12 +2462,12 @@ struct PlayerSettingsPanel: View {
             style = SubtitleStyle.current
             viewModel.setControlsAutoHideSuspended(true)
             DispatchQueue.main.async {
+                // Open on the tab row, at the top of the panel, instead of jumping down to the
+                // current subtitle language; that language stays selected in the list.
                 if let language = effectiveLanguage {
                     selectedLanguage = language
-                    focus = .language(language)
-                } else {
-                    focus = .noneRow
                 }
+                focus = .tab(tab)
             }
         }
         .onDisappear {
