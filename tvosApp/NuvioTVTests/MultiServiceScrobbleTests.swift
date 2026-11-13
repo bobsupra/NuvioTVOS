@@ -323,17 +323,17 @@ final class MultiServiceScrobbleTests: XCTestCase {
         XCTAssertFalse(activeAfterDisable.contains(.mdblist))
     }
 
-    func testMdbListWithApiKeyOnlyIsNotAuthenticatedForSync() {
+    func testMdbListWithApiKeyOnlyEnablesLibraryAndProgressWithoutOAuthSession() {
         let store = ProfileSettings.current
         store.set("ratings-api-key", forKey: SettingsKey.mdbListApiKey)
         store.set(true, forKey: SettingsKey.mdbListEnabled)
 
-        // API key alone for ratings should NOT authenticate MDBList for sync or scrobble
+        // The API key enables library/progress access, but is not an OAuth session and does not enable scrobbling by default.
         XCTAssertFalse(MdbListRuntimeSession.isAuthenticated(in: store))
-        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(.mdblist, in: store))
-        XCTAssertFalse(RemoteTrackingState.isLibrarySourceAuthenticated(.mdblist, in: store))
-        XCTAssertFalse(RemoteTrackingState.availableProgressSources(in: store).contains(.mdblist))
-        XCTAssertFalse(RemoteTrackingState.availableLibrarySources(in: store).contains(.mdblist))
+        XCTAssertTrue(RemoteTrackingState.isProgressSourceAuthenticated(.mdblist, in: store))
+        XCTAssertTrue(RemoteTrackingState.isLibrarySourceAuthenticated(.mdblist, in: store))
+        XCTAssertTrue(RemoteTrackingState.availableProgressSources(in: store).contains(.mdblist))
+        XCTAssertTrue(RemoteTrackingState.availableLibrarySources(in: store).contains(.mdblist))
         XCTAssertFalse(RemoteTrackingState.isScrobbleEnabled(for: .mdblist, in: store))
     }
 

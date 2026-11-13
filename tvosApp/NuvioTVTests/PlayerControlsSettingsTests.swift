@@ -3676,11 +3676,13 @@ extension PlayerControlsSettingsTests {
         model.sceneCoordinator.updateContext(context)
         let firstCapture = expectation(description: "Panel begins its playing capture loop")
         let pausedCapture = expectation(description: "Observed engine pause captures one frozen frame")
+        let resumedCapture = expectation(description: "Observed resume captures a frame")
         let explicitPauseCapture = expectation(description: "Explicit pause captures one frozen frame")
         frameProvider.onCapture = { count in
             if count == 1 { firstCapture.fulfill() }
             if count == 2 { pausedCapture.fulfill() }
-            if count == 3 { explicitPauseCapture.fulfill() }
+            if count == 3 { resumedCapture.fulfill() }
+            if count == 4 { explicitPauseCapture.fulfill() }
         }
         model.sceneCoordinator.openPanel()
         await fulfillment(of: [firstCapture], timeout: 2)
@@ -3709,13 +3711,16 @@ extension PlayerControlsSettingsTests {
         model.pollForTesting(using: engine)
         XCTAssertEqual(model.status, .playing)
         XCTAssertTrue(scene.isFrameSamplingActive, "The observed resume should restart scene sampling")
+        await fulfillment(of: [resumedCapture], timeout: 2)
+        XCTAssertEqual(frameProvider.captureCount, 3, "The resumed scene loop should capture before an explicit pause")
 
         model.pause()
         await fulfillment(of: [explicitPauseCapture], timeout: 2)
         engine.isPlayerPlaying = false
         engine.isTransportPlaying = false
         model.pollForTesting(using: engine)
-        XCTAssertEqual(frameProvider.captureCount, 3, "Polling must not duplicate the explicit pause capture")
+        model.pollForTesting(using: engine)
+        XCTAssertEqual(frameProvider.captureCount, 4, "Repeated paused polls must not duplicate the explicit pause capture")
         XCTAssertFalse(scene.isFrameSamplingActive)
     }
 
@@ -3861,7 +3866,12 @@ final class NextEpisodeAetherTransitionRegressionTests: XCTestCase {
             try? FileManager.default.removeItem(at: directory)
         }
 
-        let meta = NuvioMeta(id: "next-up-local-fixture", name: "Next Up Fixture", type: "series")
+        let fixtureIdentity = UUID().uuidString
+        let meta = NuvioMeta(
+            id: "next-up-local-fixture-\(fixtureIdentity)",
+            name: "Next Up Fixture \(fixtureIdentity)",
+            type: "series"
+        )
         let episode1 = NuvioVideo(id: "fixture:1:1", title: "Episode 1", season: 1, episode: 1)
         let episode2 = NuvioVideo(
             id: "fixture:1:2",

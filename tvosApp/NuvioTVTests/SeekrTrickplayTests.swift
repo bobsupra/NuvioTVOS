@@ -96,10 +96,12 @@ final class SeekrTrickplayTests: XCTestCase {
         XCTAssertEqual(SettingsQRCode.displayText(for: "https://seekr.tv/join/"), "seekr.tv/join")
     }
 
-    func testTheSwitchIsOnUntilTurnedOff() throws {
+    func testTheSwitchDefaultsOffAndCanBeEnabledOrDisabled() throws {
         let suite = "SeekrTrickplayTests.switch"
         let settings = try XCTUnwrap(UserDefaults(suiteName: suite))
         defer { settings.removePersistentDomain(forName: suite) }
+        XCTAssertFalse(SeekrTrickplay.isSwitchedOn(in: settings))
+        settings.set(true, forKey: SettingsKey.seekrEnabled)
         XCTAssertTrue(SeekrTrickplay.isSwitchedOn(in: settings))
         settings.set(false, forKey: SettingsKey.seekrEnabled)
         XCTAssertFalse(SeekrTrickplay.isSwitchedOn(in: settings))

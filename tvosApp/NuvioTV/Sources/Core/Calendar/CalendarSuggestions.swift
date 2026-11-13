@@ -242,7 +242,7 @@ extension CalendarSuggestions {
             return CalendarSuggestionItem(
                 key: key,
                 kind: entry.kind,
-                type: entry.type,
+                type: entry.type.isEmpty ? (entry.kind == .series ? "series" : "movie") : entry.type,
                 tmdbId: tmdb,
                 imdbId: entry.imdbId ?? NuvioMeta.canonicalImdbID(from: entry.id),
                 title: title,

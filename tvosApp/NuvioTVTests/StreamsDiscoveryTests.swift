@@ -1598,6 +1598,7 @@ final class StreamsDiscoveryTests: XCTestCase {
         let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
         let testProfileID = "jellyfin-play-\(UUID().uuidString)"
         ProfileSettings.setActiveProfile(testProfileID, isPrimary: false)
+        let credentialProfileScope = ProfileSettings.activeProfileScope
         defer {
             if let previousProfileID {
                 ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
@@ -1619,8 +1620,19 @@ final class StreamsDiscoveryTests: XCTestCase {
             syncAutomatically: false
         )
         JellyfinServerStore.shared.upsert(server)
-        JellyfinCredentialStore.save("test-token-123", forServerID: serverID)
+        let testToken = "test-token-123"
+        XCTAssertTrue(JellyfinCredentialStore.save(
+            testToken,
+            forServerID: serverID,
+            profileScope: credentialProfileScope
+        ), "Jellyfin API key should be saved for the active profile")
+        XCTAssertEqual(
+            JellyfinCredentialStore.token(forServerID: serverID, profileScope: credentialProfileScope),
+            testToken,
+            "Jellyfin API key should be readable from the active profile scope"
+        )
         defer {
+            JellyfinCredentialStore.remove(forServerID: serverID, profileScope: credentialProfileScope)
             JellyfinServerStore.shared.remove(serverID)
         }
 
@@ -1671,8 +1683,13 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertFalse(streams.isEmpty, "Jellyfin stream should be resolved for IMDb ID tt1856101")
         XCTAssertEqual(streams.first?.addonName, "Jellyfin")
         XCTAssertEqual(streams.first?.name, "Home Jellyfin")
-        XCTAssertTrue(streams.first?.url?.contains("Videos/item42/stream") ?? false)
-        XCTAssertTrue(streams.first?.url?.contains("api_key=test-token-123") ?? false)
+        let streamURL = try XCTUnwrap(streams.first?.url)
+        let streamURLComponents = try XCTUnwrap(URLComponents(string: streamURL))
+        XCTAssertTrue(streamURLComponents.path.contains("Videos/item42/stream"))
+        XCTAssertEqual(
+            streamURLComponents.queryItems?.first(where: { $0.name == "api_key" })?.value,
+            testToken
+        )
 
         // Verify discovery state does not report "No compatible add-ons"
         let state = StreamsRepository.shared.state
