@@ -12721,6 +12721,8 @@ enum ProfileSettings {
         // Removing the suites no longer takes the sync caches with them — they
         // are files now, and would otherwise be inherited by the next account.
         SimklSyncCache.eraseAll()
+        // Interrupted Jellyfin syncs keep the server's library listing in checkpoint pages.
+        JellyfinSyncCheckpoints.eraseAll()
         LargePayloadStore.purgeLegacyOversizedPreferences(in: .standard)
         for key in SettingsKey.all {
             UserDefaults.standard.removeObject(forKey: key)

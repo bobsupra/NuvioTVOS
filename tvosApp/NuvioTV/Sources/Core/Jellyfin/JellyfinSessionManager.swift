@@ -97,7 +97,7 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
     private var checkpoint: JellyfinSyncCheckpoint
 
     init(identity: JellyfinSyncCheckpoint.Identity) throws {
-        key = "jellyfinSyncCheckpoint.v1.\(Self.shortHash("\(identity.profileID)|\(identity.serverID)"))"
+        key = Self.checkpointKey(profileID: identity.profileID, serverID: identity.serverID)
         Self.lock.lock()
         defer { Self.lock.unlock() }
         if let data = LargePayloadStore.read(key: key, directory: Self.directory),
@@ -247,6 +247,30 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
         }
     }
 
+    /// Drops a server's checkpoint and its pages for one profile, whatever run left them.
+    /// The pages hold the server's library listing, so they must not outlive the server.
+    static func remove(profileID: String, serverID: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = checkpointKey(profileID: profileID, serverID: serverID)
+        if let data = LargePayloadStore.read(key: key, directory: directory),
+           let saved = try? JSONDecoder().decode(JellyfinSyncCheckpoint.self, from: data) {
+            removePages(saved, key: key)
+        }
+        LargePayloadStore.remove(key: key, directory: directory)
+    }
+
+    /// Sign-out: every profile's checkpoints and pages.
+    static func eraseAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        LargePayloadStore.removeDirectory(directory)
+    }
+
+    private static func checkpointKey(profileID: String, serverID: String) -> String {
+        "jellyfinSyncCheckpoint.v1.\(shortHash("\(profileID)|\(serverID)"))"
+    }
+
     private static func pageKey(key: String, runID: String, entity: String, startIndex: Int) -> String {
         "jellyfinSyncPage.\(shortHash("\(key)|\(runID)|\(entity)|\(startIndex)"))"
     }
@@ -264,6 +288,17 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
                 )
             }
         }
+    }
+}
+
+/// Removal of interrupted Jellyfin sync checkpoints (a finished sync removes its own).
+enum JellyfinSyncCheckpoints {
+    static func remove(profileID: String, serverID: String) {
+        JellyfinSyncCheckpointStore.remove(profileID: profileID, serverID: serverID)
+    }
+
+    static func eraseAll() {
+        JellyfinSyncCheckpointStore.eraseAll()
     }
 }
 
