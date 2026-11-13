@@ -9087,8 +9087,13 @@ class PlayerViewModel: ObservableObject {
     }
 
     private static func expectedDuration(for meta: NuvioMeta) -> Double? {
-        if let stored = (ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id))?.duration, stored >= 60 {
-            return stored
+        let progressItem = ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
+        return expectedDuration(for: meta, progressItem: progressItem)
+    }
+
+    static func expectedDuration(for meta: NuvioMeta, progressItem: ContinueWatchingItem?) -> Double? {
+        if let progressItem, !progressItem.isUpNextEntry, progressItem.duration >= 60 {
+            return progressItem.duration
         }
         return runtimeSeconds(from: meta.runtime)
     }

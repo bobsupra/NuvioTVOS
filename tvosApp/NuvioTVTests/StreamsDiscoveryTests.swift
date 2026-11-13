@@ -1494,7 +1494,34 @@ final class StreamsDiscoveryTests: XCTestCase {
     }
 
     @MainActor
+    func testJellyfinCredentialStoreScopesOverwritesAndDeletesTokens() {
+        let previousStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        defer { JellyfinCredentialStore.storage = previousStorage }
+
+        XCTAssertTrue(JellyfinCredentialStore.save("first", forServerID: "server-a", profileScope: "profile-a"))
+        XCTAssertTrue(JellyfinCredentialStore.save("other-profile", forServerID: "server-a", profileScope: "profile-b"))
+        XCTAssertTrue(JellyfinCredentialStore.save("other-server", forServerID: "server-b", profileScope: "profile-a"))
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-a", profileScope: "profile-a"), "first")
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-a", profileScope: "profile-b"), "other-profile")
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-b", profileScope: "profile-a"), "other-server")
+
+        XCTAssertTrue(JellyfinCredentialStore.save("replacement", forServerID: "server-a", profileScope: "profile-a"))
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-a", profileScope: "profile-a"), "replacement")
+        XCTAssertTrue(JellyfinCredentialStore.remove(forServerID: "server-a", profileScope: "profile-a"))
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-a", profileScope: "profile-a"), "")
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-a", profileScope: "profile-b"), "other-profile")
+
+        XCTAssertTrue(JellyfinCredentialStore.save("", forServerID: "server-a", profileScope: "profile-b"))
+        XCTAssertEqual(JellyfinCredentialStore.token(forServerID: "server-a", profileScope: "profile-b"), "")
+    }
+
+    @MainActor
     func testJellyfinMetadataCanUseAnAlreadyIndexedTitle() throws {
+        let previousCredentialStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        defer { JellyfinCredentialStore.storage = previousCredentialStorage }
+
         let previousProfileID = ProfileSettings.activeProfileID
         let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
         ProfileSettings.setActiveProfile("jellyfin-meta-\(UUID().uuidString)", isPrimary: false)
@@ -1590,6 +1617,10 @@ final class StreamsDiscoveryTests: XCTestCase {
 
     @MainActor
     func testJellyfinStreamGroupResolvesWhenPlayUsesImdbStreamId() async throws {
+        let previousCredentialStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        defer { JellyfinCredentialStore.storage = previousCredentialStorage }
+
         let suiteName = "NuvioTVTests.JellyfinPlay.\(UUID().uuidString)"
         let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
         defer { defaults.removePersistentDomain(forName: suiteName) }
@@ -1701,6 +1732,10 @@ final class StreamsDiscoveryTests: XCTestCase {
 
     @MainActor
     func testJellyfinStreamGroupResolvesSeriesEpisodeWhenUsingCanonicalEpisodeStreamId() async throws {
+        let previousCredentialStorage = JellyfinCredentialStore.storage
+        JellyfinCredentialStore.storage = MemoryJellyfinCredentialStorage()
+        defer { JellyfinCredentialStore.storage = previousCredentialStorage }
+
         let previousProfileID = ProfileSettings.activeProfileID
         let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
         let testProfileID = "jellyfin-series-\(UUID().uuidString)"
@@ -1725,8 +1760,10 @@ final class StreamsDiscoveryTests: XCTestCase {
             syncAutomatically: false
         )
         JellyfinServerStore.shared.upsert(server)
-        JellyfinCredentialStore.save("test-token-series", forServerID: serverID)
+        let testToken = "test-token-series"
+        XCTAssertTrue(JellyfinCredentialStore.save(testToken, forServerID: serverID))
         defer {
+            JellyfinCredentialStore.remove(forServerID: serverID)
             JellyfinServerStore.shared.remove(serverID)
         }
 
@@ -1784,7 +1821,36 @@ final class StreamsDiscoveryTests: XCTestCase {
 
         XCTAssertEqual(streams.count, 1)
         XCTAssertEqual(streams.first?.addonName, "Jellyfin")
-        XCTAssertTrue(streams.first?.url?.contains("Videos/ep-s1e2/stream") ?? false)
+        let streamURL = try XCTUnwrap(streams.first?.url)
+        let streamURLComponents = try XCTUnwrap(URLComponents(string: streamURL))
+        XCTAssertTrue(streamURLComponents.path.contains("Videos/ep-s1e2/stream"))
+        XCTAssertEqual(
+            streamURLComponents.queryItems?.first(where: { $0.name == "api_key" })?.value,
+            testToken
+        )
+    }
+}
+
+private final class MemoryJellyfinCredentialStorage: JellyfinCredentialStorage {
+    private struct Key: Hashable {
+        let serverID: String
+        let profileScope: String
+    }
+
+    private var tokens: [Key: String] = [:]
+
+    func token(forServerID serverID: String, profileScope: String) -> String? {
+        tokens[Key(serverID: serverID, profileScope: profileScope)]
+    }
+
+    func save(_ token: String, forServerID serverID: String, profileScope: String) -> Bool {
+        tokens[Key(serverID: serverID, profileScope: profileScope)] = token
+        return true
+    }
+
+    func remove(forServerID serverID: String, profileScope: String) -> Bool {
+        tokens.removeValue(forKey: Key(serverID: serverID, profileScope: profileScope))
+        return true
     }
 }
 
