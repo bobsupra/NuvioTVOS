@@ -7157,6 +7157,20 @@ struct TVHomeView: View {
                         withAnimation(animation) {
                             verticalScrollProxy.scrollTo("home-grid-hero-top", anchor: .top)
                         }
+                    } else if wasFocused {
+                        // The first row already shows under the hero, so the focus engine
+                        // sees nothing to scroll when Down moves into it. The page stayed on
+                        // the hero, and the next section below was not laid out yet, so Down
+                        // found nothing until focus went back up. Bring the row to the top.
+                        DispatchQueue.main.async {
+                            guard !isGridHeroFocused, let sectionID = focusedSectionId else { return }
+                            let animation = (isFastScrolling || fastNavigation)
+                                ? TVHomeLayout.fastVerticalScrollAnimation
+                                : TVHomeLayout.verticalScrollAnimation
+                            withAnimation(animation) {
+                                verticalScrollProxy.scrollTo(sectionID, anchor: .top)
+                            }
+                        }
                     }
                 }
                 .task(id: profileGateFocusRequestSignature) {
