@@ -3,6 +3,163 @@ import Foundation
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
+import Synchronization
+
+/// Low-rate startup diagnostics for bridged-audio sessions. The timer runs independently of the
+/// pump so it can report a source read or bridge call that is still blocked.
+private final class HLSStartupDiagnostics: @unchecked Sendable {
+    enum Phase {
+        case sourceRead
+        case bridgeFeed
+        case bridgeSettle
+        case muxerSetup
+        case muxWrite
+    }
+
+    private let lock = NSLock()
+    private let startedAt = DispatchTime.now().uptimeNanoseconds
+    private let timer: DispatchSourceTimer
+    private let collecting = Atomic<Bool>(true)
+    private var finished = false
+    private var sourcePackets = 0
+    private var sourceBytes: UInt64 = 0
+    private var bridgePackets = 0
+    private var bridgeBytes: UInt64 = 0
+    private var muxPackets = 0
+    private var sourceReadNanoseconds: UInt64 = 0
+    private var bridgeFeedNanoseconds: UInt64 = 0
+    private var bridgeSettleNanoseconds: UInt64 = 0
+    private var muxerSetupNanoseconds: UInt64 = 0
+    private var muxWriteNanoseconds: UInt64 = 0
+    private var sourceReadStartedAt: UInt64?
+    private var bridgeFeedStartedAt: UInt64?
+    private var bridgeSettleStartedAt: UInt64?
+    private var muxerSetupStartedAt: UInt64?
+    private var muxWriteStartedAt: UInt64?
+
+    init() {
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "com.aether.hls-startup-diagnostics"))
+        self.timer = timer
+        timer.setEventHandler { [weak self] in self?.reportInterval() }
+        timer.schedule(deadline: .now() + .seconds(5), repeating: .seconds(5))
+        timer.resume()
+    }
+
+    func noteSourcePacket(bytes: Int) {
+        guard collecting.load(ordering: .relaxed) else { return }
+        lock.lock()
+        if collecting.load(ordering: .relaxed) {
+            sourcePackets += 1
+            sourceBytes &+= UInt64(max(0, bytes))
+        }
+        lock.unlock()
+    }
+
+    func noteBridgePacket(bytes: Int) {
+        guard collecting.load(ordering: .relaxed) else { return }
+        lock.lock()
+        if collecting.load(ordering: .relaxed) {
+            bridgePackets += 1
+            bridgeBytes &+= UInt64(max(0, bytes))
+        }
+        lock.unlock()
+    }
+
+    func measure<T>(_ phase: Phase, _ body: () throws -> T) rethrows -> T {
+        guard collecting.load(ordering: .relaxed) else { return try body() }
+        let start = DispatchTime.now().uptimeNanoseconds
+        setStartedAt(start, for: phase)
+        defer { recordEndedAt(DispatchTime.now().uptimeNanoseconds, start: start, for: phase) }
+        return try body()
+    }
+
+    func finish(reason: String) {
+        closeCollection(phase: "teardown reason=\(reason)")
+    }
+
+    private func reportInterval() {
+        let elapsed = DispatchTime.now().uptimeNanoseconds &- startedAt
+        if elapsed >= 45_000_000_000 {
+            closeCollection(phase: "window-end")
+        } else {
+            emit(phase: "interval")
+        }
+    }
+
+    private func closeCollection(phase: String) {
+        guard collecting.exchange(false, ordering: .acquiringAndReleasing) else { return }
+        emit(phase: phase, final: true)
+        timer.cancel()
+    }
+
+    private func setStartedAt(_ value: UInt64, for phase: Phase) {
+        lock.lock()
+        if collecting.load(ordering: .relaxed) {
+            switch phase {
+            case .sourceRead: sourceReadStartedAt = value
+            case .bridgeFeed: bridgeFeedStartedAt = value
+            case .bridgeSettle: bridgeSettleStartedAt = value
+            case .muxerSetup: muxerSetupStartedAt = value
+            case .muxWrite: muxWriteStartedAt = value
+            }
+        }
+        lock.unlock()
+    }
+
+    private func recordEndedAt(_ value: UInt64, start: UInt64, for phase: Phase) {
+        guard collecting.load(ordering: .relaxed) else { return }
+        lock.lock()
+        guard collecting.load(ordering: .relaxed) else {
+            lock.unlock()
+            return
+        }
+        switch phase {
+        case .sourceRead:
+            sourceReadNanoseconds &+= value &- start
+            sourceReadStartedAt = nil
+        case .bridgeFeed:
+            bridgeFeedNanoseconds &+= value &- start
+            bridgeFeedStartedAt = nil
+        case .bridgeSettle:
+            bridgeSettleNanoseconds &+= value &- start
+            bridgeSettleStartedAt = nil
+        case .muxerSetup:
+            muxerSetupNanoseconds &+= value &- start
+            muxerSetupStartedAt = nil
+        case .muxWrite:
+            muxWriteNanoseconds &+= value &- start
+            muxPackets += 1
+            muxWriteStartedAt = nil
+        }
+        lock.unlock()
+    }
+
+    private func emit(phase: String, final: Bool = false) {
+        lock.lock()
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        if final { finished = true }
+        func milliseconds(_ total: UInt64, activeSince: UInt64?) -> String {
+            let active = activeSince.map { now &- $0 } ?? 0
+            return String(format: "%.1f(active=%.1f)", Double(total &+ active) / 1_000_000,
+                          Double(active) / 1_000_000)
+        }
+        let elapsed = Double(now &- startedAt) / 1_000_000_000
+        let line = "[AetherStartupPipeline] phase=\(phase) elapsed=\(String(format: "%.1f", elapsed))s "
+            + "sourcePackets=\(sourcePackets) sourceBytes=\(sourceBytes) "
+            + "readMs=\(milliseconds(sourceReadNanoseconds, activeSince: sourceReadStartedAt)) "
+            + "bridgePackets=\(bridgePackets) bridgeBytes=\(bridgeBytes) "
+            + "feedMs=\(milliseconds(bridgeFeedNanoseconds, activeSince: bridgeFeedStartedAt)) "
+            + "settleMs=\(milliseconds(bridgeSettleNanoseconds, activeSince: bridgeSettleStartedAt)) "
+            + "muxerSetupMs=\(milliseconds(muxerSetupNanoseconds, activeSince: muxerSetupStartedAt)) "
+            + "muxPackets=\(muxPackets) muxMs=\(milliseconds(muxWriteNanoseconds, activeSince: muxWriteStartedAt))"
+        lock.unlock()
+        EngineLog.emit(line, category: .session)
+    }
+}
 
 /// Drives one playback session's read-to-mux pipeline via a per-segment
 /// `MP4SegmentMuxer` writing into `SegmentCache`. Forward-only; backward
@@ -1029,6 +1186,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Video packet write counter; excludes bridge packets (different path). Read under packetCounterLock.
     private let packetCounterLock = NSLock()
     private var _packetsWrittenCount: Int = 0
+    /// Set only while this producer's pump runs; the diagnostics object owns its own timer and lock.
+    private var pumpStartupDiagnostics: HLSStartupDiagnostics?
     var packetsWrittenCount: Int {
         packetCounterLock.lock()
         defer { packetCounterLock.unlock() }
@@ -1885,6 +2044,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Returns muxer for targetIdx, advancing/allocating as needed. Forward-only: clamps late packets
     /// (HEVC RASL B-frames, FLAC bridge lag) upward to avoid premature finalize. Returns nil on stop/alloc failure.
     private func ensureMuxer(forSegmentIndex targetIdx: Int) -> MP4SegmentMuxer? {
+        guard let diagnostics = pumpStartupDiagnostics else {
+            return ensureMuxerUnmeasured(forSegmentIndex: targetIdx)
+        }
+        return diagnostics.measure(.muxerSetup) {
+            ensureMuxerUnmeasured(forSegmentIndex: targetIdx)
+        }
+    }
+
+    private func ensureMuxerUnmeasured(forSegmentIndex targetIdx: Int) -> MP4SegmentMuxer? {
         let effectiveIdx = max(targetIdx, currentMuxerSegmentIndex)
 
         if let m = currentMuxer, m.currentSegmentIndex == effectiveIdx {
@@ -3560,6 +3728,31 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return (main, .main)
     }
 
+    private func readNextSourcePacketForPump() throws -> (packet: UnsafeMutablePointer<AVPacket>, origin: PacketOrigin,
+                                                          replaySample: LiveReplaySample?)? {
+        guard let diagnostics = pumpStartupDiagnostics else { return try readNextSourcePacket() }
+        return try diagnostics.measure(.sourceRead) { try readNextSourcePacket() }
+    }
+
+    private func feedAudioBridge(
+        _ bridge: any AudioTranscodingBridge,
+        packet: UnsafePointer<AVPacket>
+    ) throws -> [UnsafeMutablePointer<AVPacket>] {
+        guard let diagnostics = pumpStartupDiagnostics else { return try bridge.feed(packet: packet) }
+        diagnostics.noteBridgePacket(bytes: Int(packet.pointee.size))
+        return try diagnostics.measure(.bridgeFeed) { try bridge.feed(packet: packet) }
+    }
+
+    private func settleAudioBridge(_ bridge: any AudioTranscodingBridge) -> [UnsafeMutablePointer<AVPacket>] {
+        guard let diagnostics = pumpStartupDiagnostics else { return bridge.settle() }
+        return diagnostics.measure(.bridgeSettle) { bridge.settle() }
+    }
+
+    private func writeMuxPacket<T>(_ body: () -> T) -> T {
+        guard let diagnostics = pumpStartupDiagnostics else { return body() }
+        return diagnostics.measure(.muxWrite, body)
+    }
+
     #if DolbyVisionFelCurves
     /// The fold applies to a VOD source converted from Profile 7 on this route alone: the enhancement-route tap
     /// needs the enhancement layer intact, and a live source has no GOP to wait for.
@@ -3758,6 +3951,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
         sideReaderLinkGate?.videoFetchBegan()
         defer { sideReaderLinkGate?.videoFetchEnded() }
         let pumpStart = DispatchTime.now()
+        let startupDiagnostics: HLSStartupDiagnostics?
+        if let audio = audioConfig, let _ = audio.bridge {
+            startupDiagnostics = HLSStartupDiagnostics()
+        } else {
+            startupDiagnostics = nil
+        }
+        pumpStartupDiagnostics = startupDiagnostics
+        defer { pumpStartupDiagnostics = nil }
         var packetsRead = 0
         var lastError: Int32 = 0
         var exitReason: PumpExitReason = .eof
@@ -3767,6 +3968,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if isLive { startNoCutWatchdog() }
         defer { stopNoCutWatchdog() }
         var vodLedgerLastRoutedSeg = Int.min  // #65 ledger: last VOD segment index logged at the routing site
+
+        // Eagerly allocate the base muxer on VOD startup so init.mp4 is captured and stored
+        // into SegmentCache immediately, preventing startup timeouts awaiting init.mp4.
+        if !isLive, currentMuxer == nil {
+            _ = ensureMuxer(forSegmentIndex: baseIndex)
+        }
 
         do {
             readLoop: while true {
@@ -3805,7 +4012,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     replaySample = nil
                     pregateAudioBufferBytes -= Int(packet.pointee.size)
                 } else {
-                    guard let read = try readNextSourcePacket() else {
+                    guard let read = try readNextSourcePacketForPump() else {
                         break readLoop
                     }
                     // Audit SEG-104: a stop that landed while this read was parked means the session
@@ -3820,6 +4027,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     origin = read.origin
                     replaySample = read.replaySample
                     packetsRead += 1
+                    startupDiagnostics?.noteSourcePacket(bytes: Int(packet.pointee.size))
                     noCutWatchdog?.notePacketRead()
                 }
                 var pktPtr: UnsafeMutablePointer<AVPacket>? = packet
@@ -4844,9 +5052,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                 isKeyframe: true) != vodCutter.current
                         let lookBehindCuts = pendingVideoPkt != nil && currentMuxer != nil
                             && pendingVideoSegIndex > currentMuxerSegmentIndex
-                        if advancesCutter || lookBehindCuts, !writeBridgedAudio(bridge.settle(), audio: audio) {
-                            exitReason = .muxerFailed
-                            break readLoop
+                        if advancesCutter || lookBehindCuts {
+                            if !writeBridgedAudio(settleAudioBridge(bridge), audio: audio) {
+                                exitReason = .muxerFailed
+                                break readLoop
+                            }
                         }
                     }
                     // VOD now cuts keyframe-gated like live (and like FFmpeg's hls muxer): a segment opens
@@ -4967,7 +5177,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     if let bridge = audio.bridge {
                         let flacPackets: [UnsafeMutablePointer<AVPacket>]
                         do {
-                            flacPackets = try bridge.feed(packet: packet)
+                            flacPackets = try feedAudioBridge(bridge, packet: packet)
                         } catch {
                             EngineLog.emit(
                                 "[HLSSegmentProducer] audio bridge.feed failed at pkt#\(packetsRead): \(error)",
@@ -5088,7 +5298,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // #731: the last keyframe can open a final segment; what the bridge still encodes belongs
         // before that cut. Only an EOF adopts the open segment, so only an EOF needs it.
         if case .eof = exitReason, let audio = audioConfig, let bridge = audio.bridge {
-            _ = writeBridgedAudio(bridge.settle(), audio: audio)
+            _ = writeBridgedAudio(settleAudioBridge(bridge), audio: audio)
         }
         if let prev = pendingVideoPkt {
             let prevSeg = pendingVideoSegIndex   // unified: live + VOD both carry the routed index
@@ -5129,7 +5339,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 if let muxer = ensureMuxer(forSegmentIndex: fpSeg) {
                     fp.pointee.stream_index = muxer.audioOutputStreamIndex
                     av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
-                    _ = muxer.writePacket(fp)
+                    _ = writeMuxPacket { muxer.writePacket(fp) }
                 }
                 var fpVar: UnsafeMutablePointer<AVPacket>? = fp
                 trackedPacketFree(&fpVar)
@@ -5146,6 +5356,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         } else {
             discardSessionMuxer()
         }
+        startupDiagnostics?.finish(reason: String(describing: exitReason))
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - pumpStart.uptimeNanoseconds) / 1_000_000
         EngineLog.emit(
             "[HLSSegmentProducer] pump finished: reason=\(exitReason) "
@@ -5180,7 +5391,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             fp.pointee.stream_index = muxer.audioOutputStreamIndex
             av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
             let prime = copyAudioPrimeCandidate(fp)
-            if muxer.writePacket(fp).rc >= 0, let prime {
+            if writeMuxPacket({ muxer.writePacket(fp) }).rc >= 0, let prime {
                 audioMoovPrimeFrame = prime
             }
         }
@@ -5225,7 +5436,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             var written = 0
             for packet in packets {
                 packet.pointee.stream_index = muxer.audioOutputStreamIndex
-                if muxer.writePacket(packet).rc >= 0 { written += 1 }
+                if writeMuxPacket({ muxer.writePacket(packet) }).rc >= 0 { written += 1 }
                 var pkt: UnsafeMutablePointer<AVPacket>? = packet
                 trackedPacketFree(&pkt)
             }
@@ -5351,7 +5562,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         } else if frameGrid != nil {
             offGridVideoPackets += 1
         }
-        let write = muxer.writePacket(packet)
+        let write = writeMuxPacket { muxer.writePacket(packet) }
         if write.rc < 0, !loggedVideoWriteFailure {
             // #369: this rc used to be dropped on the floor; the field failure (movenc rejecting a
             // wrap-scale sample duration) was only findable through libav's own stderr line.
@@ -5435,7 +5646,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packet.pointee.stream_index = muxer.audioOutputStreamIndex
         av_packet_rescale_ts(packet, audio.inputTimeBase, muxer.muxerAudioTimeBase)
         let prime = copyAudioPrimeCandidate(packet)
-        if muxer.writePacket(packet).rc >= 0, let prime {
+        if writeMuxPacket({ muxer.writePacket(packet) }).rc >= 0, let prime {
             audioMoovPrimeFrame = prime
         }
 

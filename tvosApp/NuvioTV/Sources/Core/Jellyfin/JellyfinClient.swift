@@ -15,7 +15,7 @@ struct JellyfinLibrary: Identifiable, Equatable {
 /// over its series'. `JellyfinLibraryResolver` groups these locally; nothing
 /// here is looked up against any other metadata source — the whole point of
 /// fetching this many fields directly is that Jellyfin never needs to be.
-struct JellyfinMediaItem: Equatable {
+struct JellyfinMediaItem: Codable, Equatable {
     let id: String
     let name: String
     /// `"Movie"`, `"Series"`, or `"Episode"`.
@@ -42,6 +42,13 @@ struct JellyfinMediaItem: Equatable {
     let indexNumber: Int?
     let container: String?
     let sizeBytes: Int64?
+}
+
+struct JellyfinItemsPage {
+    let items: [JellyfinMediaItem]
+    let startIndex: Int
+    let nextStartIndex: Int
+    let totalRecordCount: Int?
 }
 
 /// Thin REST client for one Jellyfin server. Stateless beyond the
@@ -226,18 +233,16 @@ struct JellyfinClient {
 
         init(from decoder: Decoder) throws {
             if let container = try? decoder.container(keyedBy: CodingKeys.self) {
-                self.Items = (try? container.decode([Item].self, forKey: .Items)) ?? []
-                self.TotalRecordCount = try? container.decode(Int.self, forKey: .TotalRecordCount)
-                self.StartIndex = try? container.decode(Int.self, forKey: .StartIndex)
-            } else if let singleContainer = try? decoder.singleValueContainer(),
-                      let array = try? singleContainer.decode([Item].self) {
-                self.Items = array
-                self.TotalRecordCount = array.count
-                self.StartIndex = 0
+                Items = try container.decode([Item].self, forKey: .Items)
+                TotalRecordCount = try container.decodeIfPresent(Int.self, forKey: .TotalRecordCount)
+                StartIndex = try container.decodeIfPresent(Int.self, forKey: .StartIndex)
             } else {
-                self.Items = []
-                self.TotalRecordCount = 0
-                self.StartIndex = 0
+                let singleContainer = try decoder.singleValueContainer()
+                Items = try singleContainer.decode([Item].self)
+                // A bare array has no pagination metadata. Its length is only
+                // this response's page size, not the server's full result count.
+                TotalRecordCount = nil
+                StartIndex = nil
             }
         }
 
@@ -299,14 +304,37 @@ struct JellyfinClient {
         libraryId: String,
         onPageFetched: ((Int) -> Void)? = nil
     ) async throws -> [JellyfinMediaItem] {
-        var allItems: [JellyfinMediaItem] = []
-        var seenIds = Set<String>()
-        var startIndex = 0
-        let pageSize = 100
-        var iteration = 0
+        try await fetchItems(userId: userId, libraryId: libraryId, startingAt: 0, seenItemIDs: []) { page in
+            onPageFetched?(page.nextStartIndex)
+        }
+    }
 
-        while iteration < 500 {
-            iteration += 1
+    /// Fetches pages starting at a saved server offset. The callback runs
+    /// after each response page has been decoded and mapped, so callers can
+    /// durably record it before another request begins.
+    func items(
+        userId: String,
+        libraryId: String,
+        startingAt: Int,
+        seenItemIDs: Set<String> = [],
+        onPageFetched: ((JellyfinItemsPage) throws -> Void)? = nil
+    ) async throws -> [JellyfinMediaItem] {
+        try await fetchItems(userId: userId, libraryId: libraryId, startingAt: startingAt, seenItemIDs: seenItemIDs, onPageFetched: onPageFetched)
+    }
+
+    private func fetchItems(
+        userId: String,
+        libraryId: String,
+        startingAt initialStartIndex: Int,
+        seenItemIDs initialSeenItemIDs: Set<String>,
+        onPageFetched: ((JellyfinItemsPage) throws -> Void)?
+    ) async throws -> [JellyfinMediaItem] {
+        var allItems: [JellyfinMediaItem] = []
+        var seenIds = initialSeenItemIDs
+        var startIndex = max(0, initialStartIndex)
+        let pageSize = 100
+
+        for _ in 0..<500 {
             try Task.checkCancellation()
 
             let (data, response) = try await get("Users/\(userId)/Items", query: [
@@ -321,8 +349,11 @@ struct JellyfinClient {
             try Self.validate(response, data: data)
 
             let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
+            if let reportedStartIndex = payload.StartIndex, reportedStartIndex != startIndex {
+                throw ClientError(message: "The server returned a library page for the wrong offset")
+            }
             if payload.Items.isEmpty {
-                break
+                return allItems
             }
 
             let pageItems = payload.Items.compactMap { item -> JellyfinMediaItem? in
@@ -331,20 +362,26 @@ struct JellyfinClient {
                 return Self.mapMediaItem(item)
             }
 
-            allItems.append(contentsOf: pageItems)
-            onPageFetched?(allItems.count)
+            guard !pageItems.isEmpty else {
+                throw ClientError(message: "The server repeated a library page without advancing results")
+            }
 
-            startIndex += payload.Items.count
+            allItems.append(contentsOf: pageItems)
+            let nextStartIndex = startIndex + payload.Items.count
+            try onPageFetched?(JellyfinItemsPage(
+                items: pageItems,
+                startIndex: startIndex,
+                nextStartIndex: nextStartIndex,
+                totalRecordCount: payload.TotalRecordCount
+            ))
+            startIndex = nextStartIndex
 
             if let total = payload.TotalRecordCount, startIndex >= total {
-                break
-            }
-            if payload.TotalRecordCount == nil && payload.Items.count < pageSize {
-                break
+                return allItems
             }
         }
 
-        return allItems
+        throw ClientError(message: "The server library exceeded the 500-page sync limit")
     }
 
     /// All episodes under one TV series, fetched hierarchically.
@@ -355,14 +392,34 @@ struct JellyfinClient {
         userId: String? = nil,
         onPageFetched: ((Int) -> Void)? = nil
     ) async throws -> [JellyfinMediaItem] {
-        var allEpisodes: [JellyfinMediaItem] = []
-        var seenIds = Set<String>()
-        var startIndex = 0
-        let pageSize = 100
-        var iteration = 0
+        try await fetchEpisodes(seriesId: seriesId, userId: userId, startingAt: 0, seenItemIDs: []) { page in
+            onPageFetched?(page.nextStartIndex)
+        }
+    }
 
-        while iteration < 500 {
-            iteration += 1
+    func episodes(
+        seriesId: String,
+        userId: String? = nil,
+        startingAt: Int,
+        seenItemIDs: Set<String> = [],
+        onPageFetched: ((JellyfinItemsPage) throws -> Void)? = nil
+    ) async throws -> [JellyfinMediaItem] {
+        try await fetchEpisodes(seriesId: seriesId, userId: userId, startingAt: startingAt, seenItemIDs: seenItemIDs, onPageFetched: onPageFetched)
+    }
+
+    private func fetchEpisodes(
+        seriesId: String,
+        userId: String?,
+        startingAt initialStartIndex: Int,
+        seenItemIDs initialSeenItemIDs: Set<String>,
+        onPageFetched: ((JellyfinItemsPage) throws -> Void)?
+    ) async throws -> [JellyfinMediaItem] {
+        var allEpisodes: [JellyfinMediaItem] = []
+        var seenIds = initialSeenItemIDs
+        var startIndex = max(0, initialStartIndex)
+        let pageSize = 100
+
+        for _ in 0..<500 {
             try Task.checkCancellation()
 
             var query: [String: String] = [
@@ -379,8 +436,11 @@ struct JellyfinClient {
             try Self.validate(response, data: data)
 
             let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
+            if let reportedStartIndex = payload.StartIndex, reportedStartIndex != startIndex {
+                throw ClientError(message: "The server returned an episode page for the wrong offset")
+            }
             if payload.Items.isEmpty {
-                break
+                return allEpisodes
             }
 
             let pageItems = payload.Items.compactMap { item -> JellyfinMediaItem? in
@@ -389,20 +449,26 @@ struct JellyfinClient {
                 return Self.mapMediaItem(item, fallbackSeriesId: seriesId, fallbackType: "Episode")
             }
 
-            allEpisodes.append(contentsOf: pageItems)
-            onPageFetched?(allEpisodes.count)
+            guard !pageItems.isEmpty else {
+                throw ClientError(message: "The server repeated an episode page without advancing results")
+            }
 
-            startIndex += payload.Items.count
+            allEpisodes.append(contentsOf: pageItems)
+            let nextStartIndex = startIndex + payload.Items.count
+            try onPageFetched?(JellyfinItemsPage(
+                items: pageItems,
+                startIndex: startIndex,
+                nextStartIndex: nextStartIndex,
+                totalRecordCount: payload.TotalRecordCount
+            ))
+            startIndex = nextStartIndex
 
             if let total = payload.TotalRecordCount, startIndex >= total {
-                break
-            }
-            if payload.TotalRecordCount == nil && payload.Items.count < pageSize {
-                break
+                return allEpisodes
             }
         }
 
-        return allEpisodes
+        throw ClientError(message: "The server episode list exceeded the 500-page sync limit")
     }
 
     // MARK: - Media URLs

@@ -3,6 +3,33 @@ import Foundation
 @testable import NuvioTV
 
 final class SearchHistoryTests: XCTestCase {
+    func testRecentSearchesBelongToTheProfile() {
+        let first = UserDefaults(suiteName: "search-history-a-\(UUID().uuidString)")!
+        let second = UserDefaults(suiteName: "search-history-b-\(UUID().uuidString)")!
+
+        SearchHistoryStore.save(["dune part two"], defaults: first)
+
+        XCTAssertEqual(SearchHistoryStore.load(defaults: first), ["dune part two"])
+        XCTAssertEqual(SearchHistoryStore.load(defaults: second), [])
+    }
+
+    func testSignOutErasesLegacySharedRecentSearches() {
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        defer {
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousIsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+        }
+        UserDefaults.standard.set(["previous account search"], forKey: SearchHistoryStore.storageKey)
+
+        ProfileSettings.eraseAll(profileIds: ["search-history-\(UUID().uuidString)"])
+
+        XCTAssertNil(UserDefaults.standard.stringArray(forKey: SearchHistoryStore.storageKey))
+    }
+
     func testSanitizeDiscardsShortAndEmptyQueries() {
         let input = ["", " ", "S", "a", "  b  "]
         let output = SearchHistoryStore.sanitize(input)

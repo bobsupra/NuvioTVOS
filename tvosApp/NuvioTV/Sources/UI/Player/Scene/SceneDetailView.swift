@@ -227,7 +227,7 @@ struct SceneDetailView: View {
             .padding(40)
             .frame(maxWidth: 880)
             .background {
-                if #available(tvOS 26.0, *) {
+                if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                     RoundedRectangle(cornerRadius: 28, style: .continuous)
                         .fill(Color.black.opacity(0.28))
                         .background(Color.white.opacity(0.08), in: .rect(cornerRadius: 28))

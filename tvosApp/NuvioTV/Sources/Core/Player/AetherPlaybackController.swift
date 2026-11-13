@@ -1373,8 +1373,22 @@ enum OpenRouterSubtitleTranslator {
         }
     }
 
-    private struct Reasoning: Encodable {
-        let enabled: Bool
+    struct Reasoning: Encodable, Equatable {
+        let effort: String?
+        let enabled: Bool?
+
+        static let minimal = Reasoning(effort: "minimal", enabled: nil)
+        static let disabled = Reasoning(effort: nil, enabled: false)
+
+        private enum CodingKeys: String, CodingKey {
+            case effort, enabled
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encodeIfPresent(effort, forKey: .effort)
+            try container.encodeIfPresent(enabled, forKey: .enabled)
+        }
     }
 
     private struct Message: Encodable {
@@ -1487,11 +1501,63 @@ enum OpenRouterSubtitleTranslator {
         return translations
     }
 
+    static func reasoning(for model: String) -> Reasoning {
+        requiresMandatoryReasoning(model) ? .minimal : .disabled
+    }
+
+    static func requiresMandatoryReasoning(_ model: String) -> Bool {
+        let lower = model.lowercased()
+        if lower.contains("gemini-2.5-pro") {
+            return true
+        }
+        if lower.contains("gemini-pro-latest") || lower.contains("gemini-flash-latest") || lower.contains("gemini-omni") {
+            return true
+        }
+        if let geminiRange = lower.range(of: "gemini-") {
+            let after = lower[geminiRange.upperBound...]
+            if let major = after.first, major.isNumber, (major.wholeNumberValue ?? 0) >= 3 {
+                return true
+            }
+        }
+        if lower.contains("-thinking")
+            || lower.contains("deepseek-r1")
+            || lower.contains("deepseek/r1")
+            || lower.contains("/o1") || lower.hasPrefix("o1-") || lower.hasPrefix("o1/")
+            || lower.contains("/o3") || lower.hasPrefix("o3-") || lower.hasPrefix("o3/")
+            || lower.contains("/o4") || lower.hasPrefix("o4-") || lower.hasPrefix("o4/")
+            || lower.contains("claude-fable")
+            || lower.contains("claude-sonnet-5.5")
+            || lower.contains("claude-opus-5.5") {
+            return true
+        }
+        return false
+    }
+
     private static func complete(
         model: String,
         prompt: String,
         apiKey: String,
         maxTokens: Int,
+        timeout: TimeInterval,
+        session: URLSession
+    ) async throws -> String {
+        try await complete(
+            model: model,
+            prompt: prompt,
+            apiKey: apiKey,
+            maxTokens: maxTokens,
+            reasoning: reasoning(for: model),
+            timeout: timeout,
+            session: session
+        )
+    }
+
+    private static func complete(
+        model: String,
+        prompt: String,
+        apiKey: String,
+        maxTokens: Int,
+        reasoning: Reasoning,
         timeout: TimeInterval,
         session: URLSession
     ) async throws -> String {
@@ -1503,7 +1569,7 @@ enum OpenRouterSubtitleTranslator {
             ],
             temperature: 0.1,
             maxTokens: maxTokens,
-            reasoning: Reasoning(enabled: false)
+            reasoning: reasoning
         )
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -1518,9 +1584,23 @@ enum OpenRouterSubtitleTranslator {
         }
         guard (200...299).contains(http.statusCode) else {
             let serviceError = try? JSONDecoder().decode(ErrorBody.self, from: data)
+            let errorMessage = serviceError?.error?.message ?? "OpenRouter request failed (HTTP \(http.statusCode))."
+            if reasoning != .minimal,
+               http.statusCode == 400,
+               errorMessage.localizedCaseInsensitiveContains("reasoning is mandatory") {
+                return try await complete(
+                    model: model,
+                    prompt: prompt,
+                    apiKey: apiKey,
+                    maxTokens: maxTokens,
+                    reasoning: .minimal,
+                    timeout: timeout,
+                    session: session
+                )
+            }
             throw AISubtitleTranslationError.service(
                 statusCode: http.statusCode,
-                message: serviceError?.error?.message ?? "OpenRouter request failed (HTTP \(http.statusCode)).",
+                message: errorMessage,
                 retryAfter: retryAfter(from: http)
             )
         }
@@ -1531,9 +1611,11 @@ enum OpenRouterSubtitleTranslator {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    /// Translation does not benefit from hidden reasoning. The dynamic
-    /// completion cap also prevents a short batch from consuming the former
-    /// blanket 4,096-token allowance.
+    /// Translation does not benefit from hidden reasoning. For models that
+    /// support turning it off, reasoning is disabled. For models where reasoning
+    /// is mandatory (such as Gemini 3 and Gemini 2.5 Pro), we request minimal
+    /// effort instead. The dynamic completion cap also prevents a short batch
+    /// from consuming the former blanket 4,096-token allowance.
     static func batchOutputTokenLimit(for items: [AISubtitleTranslationItem]) -> Int {
         AISubtitleBatching.outputTokenLimit(for: items)
     }

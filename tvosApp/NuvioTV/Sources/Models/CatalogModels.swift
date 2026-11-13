@@ -1405,7 +1405,9 @@ enum EpisodeReleasePolicy {
         }
 
         let parsed: Date?
-        if !raw.contains("T"), let day = isoDay(raw) {
+        if let date = fastUTCDate(raw) {
+            parsed = date
+        } else if !raw.contains("T"), let day = isoDay(raw) {
             let parts = day.split(separator: "-").compactMap { Int($0) }
             if parts.count == 3 {
                 var calendar = Calendar(identifier: .gregorian)
@@ -1442,6 +1444,58 @@ enum EpisodeReleasePolicy {
 
         cacheReleaseDate(parsed, for: raw)
         return parsed
+    }
+
+    /// "2008-01-20", "2008-01-20T19:00:00Z" and "2008-01-20T19:00:00.000Z", the shapes addons
+    /// send, read by hand (a day alone is midnight UTC, as below). Through the system's date
+    /// formatters, a long series' episodes, each looked at for the first time, held the main
+    /// thread for 400 ms as Details opened. Any other shape (an offset, a space instead of "T")
+    /// is nil here and left to the formatters.
+    static func fastUTCDate(_ raw: String) -> Date? {
+        let bytes = Array(raw.utf8)
+        func number(_ start: Int, _ count: Int) -> Int? {
+            guard start + count <= bytes.count else { return nil }
+            var value = 0
+            for index in start..<(start + count) {
+                let byte = bytes[index]
+                guard byte >= 48, byte <= 57 else { return nil }
+                value = value * 10 + Int(byte - 48)
+            }
+            return value
+        }
+        guard bytes.count >= 10, bytes[4] == 45, bytes[7] == 45,
+              let year = number(0, 4), let month = number(5, 2), let day = number(8, 2),
+              (1...12).contains(month), (1...31).contains(day) else { return nil }
+        var seconds = 0
+        var fraction = 0.0
+        if bytes.count > 10 {
+            // "T", ":" twice, then the seconds, an optional fraction, and "Z".
+            guard bytes.count >= 20, bytes[10] == 84, bytes[13] == 58, bytes[16] == 58,
+                  let hour = number(11, 2), let minute = number(14, 2), let second = number(17, 2),
+                  hour < 24, minute < 60, second < 60 else { return nil }
+            var index = 19
+            if bytes[index] == 46 {
+                index += 1
+                let digitsStart = index
+                var scale = 0.1
+                while index < bytes.count, bytes[index] >= 48, bytes[index] <= 57 {
+                    fraction += Double(bytes[index] - 48) * scale
+                    scale /= 10
+                    index += 1
+                }
+                guard index > digitsStart else { return nil }
+            }
+            guard index == bytes.count - 1, bytes[index] == 90 else { return nil }
+            seconds = hour * 3_600 + minute * 60 + second
+        }
+        // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
+        let shiftedYear = month <= 2 ? year - 1 : year
+        let era = (shiftedYear >= 0 ? shiftedYear : shiftedYear - 399) / 400
+        let yearOfEra = shiftedYear - era * 400
+        let dayOfYear = (153 * ((month + 9) % 12) + 2) / 5 + day - 1
+        let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+        let days = era * 146_097 + dayOfEra - 719_468
+        return Date(timeIntervalSince1970: Double(days * 86_400 + seconds) + fraction)
     }
 
     private static func cacheReleaseDate(_ value: Date?, for raw: String) {
@@ -2134,6 +2188,188 @@ enum ContinueWatchingFeatureFlags {
     /// Next Up remains enabled in normal builds. Set this false only when
     /// isolating the cost of the Next Up metadata path.
     static let nextUpCardsEnabled = true
+}
+
+/// The one unwatched episode that may be revealed by the episode spoiler
+/// setting. Selection follows the full guide order and the furthest watched
+/// episode, so out-of-order watch history never reveals several later cards.
+enum EpisodeSpoilerPolicy {
+    static func completedLedgerEpisodeKeysByContentID() -> [String: Set<String>] {
+        completedLedgerEpisodeKeysByContentID(from: WatchProgressLedger.records())
+    }
+
+    static func completedLedgerEpisodeKeysByContentID(
+        from records: [WatchProgressRecord]
+    ) -> [String: Set<String>] {
+        var result: [String: Set<String>] = [:]
+        for record in records {
+            guard record.isSeries,
+                  record.isEpisode,
+                  WatchProgressLedger.isComplete(record),
+                  let season = record.season, season > 0,
+                  let episode = record.episode, episode > 0 else {
+                continue
+            }
+            let contentID = record.contentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            guard !contentID.isEmpty else { continue }
+            result[contentID, default: []].insert("\(season):\(episode)")
+        }
+        return result
+    }
+
+    static func completedLedgerEpisodeKeys(
+        for meta: NuvioMeta,
+        from records: [WatchProgressRecord]
+    ) -> Set<String> {
+        let contentIDs = exactProgressContentIDs(for: meta)
+        return records.reduce(into: Set<String>()) { result, record in
+            guard contentIDs.contains(record.contentId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()),
+                  record.isSeries,
+                  record.isEpisode,
+                  WatchProgressLedger.isComplete(record),
+                  let season = record.season, season > 0,
+                  let episode = record.episode, episode > 0 else {
+                return
+            }
+            result.insert("\(season):\(episode)")
+        }
+    }
+
+    /// Watch evidence for spoiler decisions uses stable IDs and completed
+    /// playback records. The catalog title/year fallback is intentionally
+    /// excluded because two different series can share a title.
+    static func watchedEpisodeKeys(
+        for meta: NuvioMeta,
+        in episodes: [NuvioVideo]?,
+        snapshot: WatchedSnapshot? = nil,
+        completedLedgerKeysByContentID: [String: Set<String>]? = nil,
+        includeAniList: Bool = true
+    ) -> Set<String> {
+        guard let episodes, !episodes.isEmpty else { return [] }
+        let snapshot = snapshot ?? WatchedStore.currentSnapshot()
+        var result = snapshot.watchedEpisodeKeys(meta: meta)
+        for episode in episodes where snapshot.episodeWatchCount(
+            meta: meta,
+            season: episode.season,
+            episode: episode.episode
+        ) > 0 {
+            result.insert(episodeKey(for: episode))
+        }
+        if includeAniList {
+            result.formUnion(AniListAccount.watchedEpisodeKeys(meta: meta))
+        }
+
+        let ledgerKeys = completedLedgerKeysByContentID ?? completedLedgerEpisodeKeysByContentID()
+        return trustedWatchedEpisodeKeys(
+            for: meta,
+            exactEpisodeKeys: result,
+            completedLedgerKeysByContentID: ledgerKeys
+        )
+    }
+
+    static func trustedWatchedEpisodeKeys(
+        for meta: NuvioMeta,
+        exactEpisodeKeys: Set<String>,
+        completedLedgerKeysByContentID: [String: Set<String>]
+    ) -> Set<String> {
+        var result = exactEpisodeKeys
+        for contentID in exactProgressContentIDs(for: meta) {
+            result.formUnion(completedLedgerKeysByContentID[contentID] ?? [])
+        }
+        return result
+    }
+
+    static func revealableNextEpisodeKey(
+        in episodes: [NuvioVideo]?,
+        watchedEpisodeKeys: Set<String>,
+        guideIsOrdered: Bool = false
+    ) -> String? {
+        guard let episodes, !watchedEpisodeKeys.isEmpty else { return nil }
+
+        // Specials (season 0 or invalid numbering) are not part of the regular
+        // next-up sequence and must remain protected without explicit evidence.
+        let regularEpisodes = episodes.enumerated()
+            .filter { $0.element.season > 0 && $0.element.episode > 0 }
+        let ordered: [NuvioVideo]
+        if guideIsOrdered {
+            ordered = regularEpisodes.map(\.element)
+        } else {
+            ordered = regularEpisodes
+            .sorted { lhs, rhs in
+                if lhs.element.season != rhs.element.season {
+                    return lhs.element.season < rhs.element.season
+                }
+                if lhs.element.episode != rhs.element.episode {
+                    return lhs.element.episode < rhs.element.episode
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+        }
+        guard ordered.count > 1 else { return nil }
+
+        guard let furthestWatchedIndex = ordered.indices.last(where: {
+            watchedEpisodeKeys.contains(episodeKey(for: ordered[$0]))
+        }) else {
+            return nil
+        }
+
+        let nextIndex = furthestWatchedIndex + 1
+        guard ordered.indices.contains(nextIndex) else { return nil }
+        let predecessor = ordered[furthestWatchedIndex]
+        let nextEpisode = ordered[nextIndex]
+        let predecessorKey = episodeKey(for: predecessor)
+        let nextEpisodeKey = episodeKey(for: ordered[nextIndex])
+        guard watchedEpisodeKeys.contains(predecessorKey),
+              predecessorKey != nextEpisodeKey,
+              !watchedEpisodeKeys.contains(nextEpisodeKey),
+              isConsecutiveGuideSuccessor(nextEpisode, after: predecessor, in: ordered) else {
+            return nil
+        }
+        return nextEpisodeKey
+    }
+
+    static func isRevealableNextEpisode(
+        _ episode: NuvioVideo,
+        in episodes: [NuvioVideo]?,
+        watchedEpisodeKeys: Set<String>
+    ) -> Bool {
+        revealableNextEpisodeKey(in: episodes, watchedEpisodeKeys: watchedEpisodeKeys)
+            == episodeKey(for: episode)
+    }
+
+    static func episodeKey(for episode: NuvioVideo) -> String {
+        "\(episode.season):\(episode.episode)"
+    }
+
+    private static func exactProgressContentIDs(for meta: NuvioMeta) -> Set<String> {
+        var result = Set<String>()
+        for rawValue in [meta.id, meta.imdbId].compactMap({ $0 }) {
+            let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !normalized.isEmpty { result.insert(normalized) }
+        }
+        if let tmdbID = meta.tmdbId {
+            result.insert(String(tmdbID))
+            result.insert("tmdb:\(tmdbID)")
+        }
+        return result
+    }
+
+    private static func isConsecutiveGuideSuccessor(
+        _ next: NuvioVideo,
+        after previous: NuvioVideo,
+        in ordered: [NuvioVideo]
+    ) -> Bool {
+        if next.season == previous.season {
+            return next.episode == previous.episode + 1
+        }
+        guard next.season == previous.season + 1, next.episode == 1 else { return false }
+        let previousSeasonEpisodes = ordered.filter { $0.season == previous.season }
+        guard previousSeasonEpisodes.last?.id == previous.id else { return false }
+        return previousSeasonEpisodes.enumerated().allSatisfy { index, episode in
+            episode.episode == index + 1
+        }
+    }
 }
 
 struct ContinueWatchingItem: Identifiable, Codable, Equatable, Sendable {
@@ -4433,6 +4669,12 @@ enum LibraryStore {
         cacheLock.lock()
         defer { cacheLock.unlock() }
         return readEnvelopeLocked(forProfileId: activeProfileId).items
+    }
+
+    static func items(forProfileId profileId: String?) -> [LibraryStoreItem] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return readEnvelopeLocked(forProfileId: profileId).items
     }
 
     static func contains(metaId: String, type: String) -> Bool {
@@ -12433,6 +12675,8 @@ enum ProfileSettings {
     static func eraseAll(profileIds: [String]) {
         current = .standard
         activeProfileID = nil
+        do { try IPTVKeychainStorage.removeAll() }
+        catch { print("Failed to clear IPTV sources from Keychain") }
         let simklTokenStorage = SimklKeychainTokenStorage()
         let mdbListTokenStorage = MdbListKeychainTokenStorage()
         for id in Set(profileIds) where !id.isEmpty {
@@ -12446,10 +12690,21 @@ enum ProfileSettings {
             AISubtitleKeyStore.remove(profileScope: id)
             Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: id) }
             StreamBadgeSettingsStore.removeRules(for: id)
+            AniListAccount.storage.remove(for: id)
+            MALKeychain.remove(for: id)
             UserDefaults.standard.removePersistentDomain(forName: "\(suitePrefix).\(id)")
         }
         HomeCatalogPayloadStore.removeAll(in: .standard)
         AISubtitleKeyStore.remove(profileScope: "default")
+        // Keychain logins outlive the removed suites. Profile ids 1-6 and
+        // "guest" are reused by the next account, and Trakt falls back across
+        // "guest", "1" and "default", so the previous user's sessions would be
+        // restored without these.
+        TraktKeychainStorage.shared.clearAll()
+        AniListAccount.storage.remove(for: "default")
+        AniListAccount.clearStates()
+        MALKeychain.remove(for: "default")
+        Task { await MALAccount.lists.forget() }
         Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: "default") }
         StreamBadgeSettingsStore.removeRules(for: "default")
         SimklAuthStore.clearAuth(
@@ -12470,6 +12725,9 @@ enum ProfileSettings {
         for key in SettingsKey.all {
             UserDefaults.standard.removeObject(forKey: key)
         }
+        // Recent searches were kept in `.standard` for every profile before they moved into
+        // each profile's suite (removed above with the suites).
+        UserDefaults.standard.removeObject(forKey: SearchHistoryStore.storageKey)
     }
 
     /// Clone the current profile's settings into a freshly created profile, then

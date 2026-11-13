@@ -303,6 +303,37 @@ final class TraktPkceAuthTests: XCTestCase {
         XCTAssertEqual(TraktConfig.redirectURI(in: store), "https://example.test/new-callback")
     }
 
+    func testConcurrentRefreshesShareOneTokenRequest() async throws {
+        seedConnectedSession(clientID: "concurrent-refresh-id")
+        TraktConfig.setRedirectURI(TraktConfig.defaultRedirectURI, in: store)
+        let store = try XCTUnwrap(self.store)
+        let lock = NSLock()
+        var tokenRequests = 0
+        TraktStubURLProtocol.responder = { request in
+            guard request.url?.path.hasSuffix("oauth/token") == true else { return (200, Data("{}".utf8)) }
+            let count: Int = lock.withLock {
+                tokenRequests += 1
+                return tokenRequests
+            }
+            // Trakt rotates the refresh token: a second use of the old one is rejected.
+            guard count == 1 else { return (401, Data("{}".utf8)) }
+            Thread.sleep(forTimeInterval: 0.2)
+            return (200, Data("""
+                {"access_token":"rotated-access","token_type":"Bearer","expires_in":7776000,"refresh_token":"rotated-refresh","created_at":2}
+                """.utf8))
+        }
+
+        let session = stubbedSession()
+        async let first = TraktAuthService(session: session, store: store).refreshTokenIfNeeded(force: true)
+        async let second = TraktAuthService(session: session, store: store).refreshTokenIfNeeded(force: true)
+        let results = await [first, second]
+
+        XCTAssertEqual(results, [true, true])
+        XCTAssertEqual(lock.withLock { tokenRequests }, 1, "parallel refreshes must share one token request")
+        XCTAssertTrue(TraktAuthStore.isAuthenticated(in: store))
+        XCTAssertEqual(TraktAuthStore.state(in: store).refreshToken, "rotated-refresh")
+    }
+
     // MARK: - Keychain & Update Persistence Tests
 
     func testTraktCredentialsAndTokensPersistAcrossStoreResetViaKeychain() {

@@ -500,6 +500,7 @@ class DetailsViewModel: ObservableObject {
         type: String,
         relatedItemsSnapshot: [RelatedTitle]? = nil,
         relatedPeopleSnapshot: [TmdbPersonMetadata]? = nil,
+        relatedCompaniesSnapshot: [MetaCompany]? = nil,
         simklRatingsSnapshot: SimklTitleRatings? = nil
     ) -> Task<Void, Never> {
         TVHomeDebugTrace.log("details.load.begin id=\(id) type=\(type)")
@@ -535,6 +536,7 @@ class DetailsViewModel: ObservableObject {
                 isInWatchlist: LibraryStore.contains(metaId: cached.id, type: cached.type),
                 isWatched: WatchedStore.contains(meta: cached),
                 moreLikeThis: relatedItemsSnapshot ?? [],
+                companies: relatedCompaniesSnapshot ?? [],
                 people: relatedPeopleSnapshot ?? [],
                 simklRatings: simklRatingsSnapshot
             )
@@ -552,11 +554,13 @@ class DetailsViewModel: ObservableObject {
                 isLoading: true,
                 error: nil,
                 moreLikeThis: relatedItemsSnapshot ?? [],
+                companies: relatedCompaniesSnapshot ?? [],
                 people: relatedPeopleSnapshot ?? [],
                 simklRatings: simklRatingsSnapshot
             )
         } else {
             if let relatedItemsSnapshot { uiState.moreLikeThis = relatedItemsSnapshot }
+            if let relatedCompaniesSnapshot { uiState.companies = relatedCompaniesSnapshot }
             if let relatedPeopleSnapshot { uiState.people = relatedPeopleSnapshot }
             if let simklRatingsSnapshot { uiState.simklRatings = simklRatingsSnapshot }
         }

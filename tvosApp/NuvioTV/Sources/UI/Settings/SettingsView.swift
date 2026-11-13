@@ -212,6 +212,7 @@ enum SettingsKey {
     static let blurUnwatchedEpisodes = "nuvio.tv.settings.layout.blurUnwatchedEpisodes"
     static let hideUnwatchedEpisodeDescriptions = "nuvio.tv.settings.layout.hideUnwatchedDescriptions"
     static let hideUnwatchedEpisodeTitles = "nuvio.tv.settings.layout.hideUnwatchedTitles"
+    static let revealNextEpisodeSpoilers = "nuvio.tv.settings.layout.revealNextEpisodeSpoilers"
     static let continueWatchingBlurNextUp = "nuvio.tv.settings.layout.continueWatchingBlurNextUp"
 
     static let traktConnected = "nuvio.tv.settings.integrations.traktConnected"
@@ -268,6 +269,7 @@ enum SettingsKey {
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
     static let debridEnabled = "nuvio.tv.settings.integrations.debridEnabled"
     static let p2pEnabled = "nuvio.tv.settings.integrations.p2pEnabled"
+    static let nativeIPTVEnabled = "nuvio.tv.settings.integrations.nativeIPTVEnabled"
     /// Device/profile-local acknowledgement for direct peer-to-peer playback.
     static let p2pConsentAccepted = "nuvio.tv.settings.integrations.p2pConsentAccepted"
     static let p2pHideTorrentStats = "nuvio.tv.settings.integrations.p2pHideTorrentStats"
@@ -323,6 +325,8 @@ enum SettingsKey {
     static let preferHardwareDecodedStreams = "nuvio.tv.settings.playback.preferHardwareDecodedStreams"
     static let preserveAddonStreamOrder = "nuvio.tv.settings.playback.preserveAddonStreamOrder"
     static let streamSortOption = "nuvio.tv.settings.playback.streamSortOption"
+    /// Local picker preference; the shared stream sort contract does not know this mode.
+    static let recommendedStreamSort = "nuvio.tv.streamPicker.recommendedSort"
     static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
     static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
     static let showAddonLogo = "nuvio.tv.settings.playback.showAddonLogo"
@@ -334,6 +338,7 @@ enum SettingsKey {
     static let streamListDescriptionLines = "nuvio.tv.settings.playback.streamListDescriptionLines"
     static let streamListEpisodeHeader = "nuvio.tv.settings.playback.streamListEpisodeHeader"
     static let streamListExpandFocused = "nuvio.tv.settings.playback.streamListExpandFocused"
+    static let streamListHideFileSize = "nuvio.tv.settings.playback.streamListHideFileSize"
     static let streamListDetailSize = "nuvio.tv.settings.playback.streamListDetailSize"
     static let streamListBadgeSize = "nuvio.tv.settings.playback.streamListBadgeSize"
     static let streamListLogoSize = "nuvio.tv.settings.playback.streamListLogoSize"
@@ -375,6 +380,7 @@ enum SettingsKey {
     static let playerShowSubtitles = "nuvio.tv.settings.playback.showSubtitles"
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
     static let playerShowSpeed = "nuvio.tv.settings.playback.showSpeed"
+    static let playerShowFinishTime = "nuvio.tv.settings.playback.showFinishTime"
     /// JSON `[String]` of player transport button ids in preferred order.
     static let playerButtonOrder = "nuvio.tv.settings.playback.playerButtonOrder"
     /// JSON `[String]` of InSight tab ids in preferred order.
@@ -434,7 +440,7 @@ enum SettingsKey {
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
-        blurUnwatchedEpisodes, hideUnwatchedEpisodeDescriptions, hideUnwatchedEpisodeTitles,
+        blurUnwatchedEpisodes, hideUnwatchedEpisodeDescriptions, hideUnwatchedEpisodeTitles, revealNextEpisodeSpoilers,
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
@@ -454,7 +460,7 @@ enum SettingsKey {
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
         mdbListUseMyAnimeList, mdbListUseTvdb,
-        debridProvider, debridApiKey, debridEnabled, p2pEnabled, p2pConsentAccepted,
+        debridProvider, debridApiKey, debridEnabled, p2pEnabled, p2pConsentAccepted, nativeIPTVEnabled,
         p2pHideTorrentStats, p2pCacheLimitGB, cloudLibraryEnabled,
         torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
         aiSubtitlesEnabled, aiSubtitlesProvider, aiSubtitlesGeminiAPIKey, aiSubtitlesGeminiModel,
@@ -468,14 +474,14 @@ enum SettingsKey {
         playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, preferHDR10Plus, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
-        streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused,
+        streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerShowFinishTime, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
         subtitleAutoSync, subtitleAutoSyncToleranceMs,
         audioDelayPersistEnabled, persistentAudioDelayMs,
@@ -1763,6 +1769,7 @@ struct SettingsView: View {
                             .padding(.leading, 44)
                             .padding(.trailing, 72)
                             .padding(.vertical, 56)
+                            .background(TVTopBarScrollAnchor())
                         }
                         // Every category shares this one ScrollView, so without a
                         // per-category identity SwiftUI reuses it and carries the
@@ -3788,12 +3795,14 @@ private struct StreamListStyleEditor: View {
     @AppStorage(SettingsKey.streamListNameLines) private var nameLines = 2
     @AppStorage(SettingsKey.streamListDescriptionLines) private var descriptionLines = 6
     @AppStorage(SettingsKey.streamListExpandFocused) private var expandFocused = false
+    @AppStorage(SettingsKey.streamListHideFileSize) private var hideFileSize = false
 
     private var style: StreamListStyle {
         StreamListStyle(
             textScale: textScale, cardSize: cardSize, width: width,
             nameLines: nameLines, descriptionLines: descriptionLines,
             episodeHeader: episodeHeader, expandFocused: expandFocused,
+            hideFileSize: hideFileSize,
             detailSize: detailSize, badgeSize: badgeSize, logoSize: logoSize,
             spacing: spacing, height: height)
     }
@@ -3940,6 +3949,13 @@ private struct StreamListStyleEditor: View {
         )
 
         SettingsToggleRow(
+            title: L10n.string("tvos_settings_stream_list_hide_file_size", fallback: "Hide File Size"),
+            subtitle: L10n.string("tvos_settings_stream_list_hide_file_size_subtitle", fallback: "Remove file sizes from stream names and descriptions"),
+            isOn: $hideFileSize,
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
             title: L10n.string("tvos_settings_stream_list_expand_focused", fallback: "Expand Focused Card (Experimental)"),
             subtitle: L10n.string("tvos_settings_stream_list_expand_focused_subtitle", fallback: "The selected stream shows its whole name and description"),
             isOn: $expandFocused,
@@ -3994,6 +4010,7 @@ private struct StreamListStyleEditor: View {
         nameLines = 2
         descriptionLines = 6
         expandFocused = false
+        hideFileSize = false
     }
 }
 
@@ -4065,6 +4082,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
     @AppStorage(SettingsKey.homeCalendarToday) private var homeCalendarToday = true
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
@@ -4577,6 +4595,19 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Replace unwatched episode titles with Episode numbers to avoid spoilers"
                     ),
                     isOn: $hideUnwatchedEpisodeTitles,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_reveal_next_episode",
+                        fallback: "Reveal Next Episode"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_reveal_next_episode_subtitle",
+                        fallback: "Show spoilers for only the next episode after its predecessor is watched"
+                    ),
+                    isOn: $revealNextEpisodeSpoilers,
                     accentColor: accentColor
                 )
             }
@@ -5331,6 +5362,7 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
     @AppStorage(SettingsKey.debridEnabled) private var debridEnabled = true
     @AppStorage(SettingsKey.cloudLibraryEnabled) private var cloudLibraryEnabled = true
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
     @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
     @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
@@ -5733,6 +5765,13 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingMdbListOptions = true
                 }
+            }
+
+            SettingsGroup(title: L10n.string("iptv_settings_title", fallback: "Live TV"),
+                          subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")) {
+                SettingsToggleRow(title: L10n.string("iptv_enable_title", fallback: "Native IPTV"),
+                                  subtitle: L10n.string("iptv_enable_subtitle", fallback: "Show Live TV in navigation"),
+                                  isOn: $nativeIPTVEnabled, accentColor: accentColor)
             }
 
             SettingsGroup(
@@ -11043,6 +11082,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.preferHardwareDecodedStreams) private var preferHardwareDecodedStreams = true
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonStreamOrder = false
     @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
+    @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedStreamSort = false
     @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
@@ -11089,6 +11129,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
+    @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
     @AppStorage(SettingsKey.sceneFeatureEnabled) private var sceneFeatureEnabled = true
 
     @State private var streamBadgeURL = ""
@@ -11109,7 +11150,7 @@ private struct PlaybackSettingsView: View {
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max", "Ultra"]
     private let assModes = ["Off", "Strip", "Scale", "Force"]
     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
-    private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
+    private let streamSortModes = StreamSortOption.allCases.filter { $0 != .recommended }.map(\.rawValue)
     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
 
     private enum SeekrKeyCheck {
@@ -11247,7 +11288,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     subtitle: L10n.string(
                         "tvos_settings_prefer_dual_layer_dolby_vision_subtitle",
-                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with per-scene FEL curve folding. Turn on for full pixel-level dual-layer composition. Applies next playback."
+                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with fast single-layer conversion. Turn on for full pixel-level dual-layer composition. Applies next playback."
                     ),
                     isOn: Binding(
                         get: { preferDualLayerDolbyVision },
@@ -11526,6 +11567,12 @@ private struct PlaybackSettingsView: View {
                 )
             ) {
                 SettingsToggleRow(
+                    title: L10n.string("player_show_finish_time", fallback: "Show estimated finish time"),
+                    subtitle: L10n.string("player_show_finish_time_subtitle", fallback: "Show when the current video is expected to finish in the player controls."),
+                    isOn: $playerShowFinishTime,
+                    accentColor: accentColor
+                )
+                SettingsToggleRow(
                     title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
                     subtitle: L10n.string(
                         "tvos_settings_post_play_recommendations_subtitle",
@@ -11756,6 +11803,14 @@ private struct PlaybackSettingsView: View {
                     subtitle: L10n.string("tvos_settings_stream_sort_subtitle", fallback: "Default ordering when opening sources (Quality merges all add-ons and ranks by 4K/1080p)"),
                     selection: $streamSortOption,
                     options: streamSortModes,
+                    accentColor: accentColor
+                )
+                .disabled(recommendedStreamSort)
+
+                SettingsToggleRow(
+                    title: L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended"),
+                    subtitle: L10n.string("stream_sort_recommended_setting_subtitle", fallback: "Ranks available sources using information reported by add-ons. Metadata may be incomplete or inaccurate; playback quality is not guaranteed."),
+                    isOn: $recommendedStreamSort,
                     accentColor: accentColor
                 )
 
@@ -12688,6 +12743,7 @@ struct SubtitleStyleEditor: View {
                     // the scroll view's bottom clip edge — without it, focusing the
                     // final stepper leaves its +/- controls sliced off the bottom.
                     .padding(.bottom, 140)
+                    .background(TVTopBarScrollAnchor())
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .focusSection()
@@ -13940,8 +13996,26 @@ private struct LicensesAttributionsSheet: View {
             title: L10n.string("tvos_settings_nuviotv", fallback: "NuvioTV"),
             body: "Native Apple TV app for browsing Stremio-compatible catalogs and playing streams.",
             license: "GPL-3.0"
+        ),
+        LicenseEntry(
+            id: "bro-iptv",
+            title: "Bro IPTV Player",
+            body: Self.licenseText(named: "BroIPTV-LICENSE", fallback: "Copyright (c) 2026 Mikhail Demidov. See the included MIT license."),
+            license: "MIT"
+        ),
+        LicenseEntry(
+            id: "open-iptv",
+            title: "OpenIPTV",
+            body: Self.licenseText(named: "OpenIPTV-LICENSE", fallback: "Copyright (c) 2026 Paulo Batista. See the included MIT license."),
+            license: "MIT"
         )
     ]
+
+    private static func licenseText(named name: String, fallback: String) -> String {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "txt"),
+              let text = try? String(contentsOf: url, encoding: .utf8) else { return fallback }
+        return text
+    }
 
     private let dataEntries: [LicenseEntry] = [
         LicenseEntry(
@@ -14859,8 +14933,11 @@ private struct JellyfinServerRow: View {
     }
 
     private var syncTitle: String {
-        if case .syncing(let found, _) = syncState {
-            return L10n.format("jellyfin_syncing_count", fallback: "Syncing (%d)…", found)
+        if case .syncing(let progress) = syncState {
+            if let total = progress.total {
+                return L10n.format("jellyfin_syncing_count_total", fallback: "Syncing (%d / %d)…", progress.found, total)
+            }
+            return L10n.format("jellyfin_syncing_count", fallback: "Syncing (%d)…", progress.found)
         }
         return L10n.string("jellyfin_sync", fallback: "Sync")
     }
@@ -15221,12 +15298,13 @@ private struct JellyfinLibrarySelectionSheet: View {
         switch sessionManager.syncState(for: server.id) {
         case .idle:
             EmptyView()
-        case .syncing(let found, let library):
+        case .syncing(let progress):
             SettingsGroup(
-                title: L10n.string("jellyfin_syncing", fallback: "Syncing…"),
-                subtitle: library
+                title: syncStageTitle(progress.stage),
+                subtitle: progress.currentLibrary
             ) {
-                SettingsInfoRow(title: L10n.string("smb_found_so_far", fallback: "Found so far"), value: "\(found)")
+                let count = progress.total.map { "\(progress.found) / \($0)" } ?? "\(progress.found)"
+                SettingsInfoRow(title: L10n.string("smb_found_so_far", fallback: "Found so far"), value: count)
             }
         case .done(let report):
             SettingsGroup(
@@ -15252,6 +15330,19 @@ private struct JellyfinLibrarySelectionSheet: View {
                 title: L10n.string("smb_scan_failed", fallback: "Scan Failed"),
                 subtitle: message
             ) { EmptyView() }
+        }
+    }
+
+    private func syncStageTitle(_ stage: JellyfinSyncProgress.Stage) -> String {
+        switch stage {
+        case .items:
+            return L10n.string("jellyfin_syncing_items", fallback: "Syncing library items…")
+        case .episodes:
+            return L10n.string("jellyfin_syncing_episodes", fallback: "Loading episodes…")
+        case .resolving:
+            return L10n.string("jellyfin_syncing_resolving", fallback: "Matching titles…")
+        case .saving:
+            return L10n.string("jellyfin_syncing_saving", fallback: "Saving library index…")
         }
     }
 }
@@ -21974,7 +22065,7 @@ private struct SettingsMiniButton: View {
 private extension View {
     @ViewBuilder
     func settingsGlass<S: InsettableShape>(shape: S, isProminent: Bool) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             self
                 .background(isProminent ? Color.white.opacity(0.13) : Color.white.opacity(0.045), in: shape)
                 .glassEffect(.regular, in: shape)
@@ -22018,7 +22109,7 @@ private struct SettingsSearchGlassBackground<S: InsettableShape>: ViewModifier {
     func body(content: Content) -> some View {
         if filled {
             content.background(Color.white, in: shape)
-        } else if #available(tvOS 26.0, *) {
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content.glassEffect(.regular, in: shape)
         } else {
             content.background(.ultraThinMaterial, in: shape)

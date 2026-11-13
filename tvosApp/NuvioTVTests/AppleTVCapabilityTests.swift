@@ -52,4 +52,24 @@ final class AppleTVCapabilityTests: XCTestCase {
     func testUnknownHardwareIdentifierIsAvailable() {
         XCTAssertFalse(AppleTVCapability.hardwareIdentifier().isEmpty)
     }
+
+    func testAppleTV4K1stGenDisablesLiquidGlass() {
+        let firstGen = AppleTVCapability.capability(for: "AppleTV6,2")
+        XCTAssertFalse(firstGen.supportsLiquidGlass)
+        XCTAssertTrue(firstGen.supportsHDR)
+        XCTAssertTrue(firstGen.supportsDolbyVision)
+    }
+
+    func testAppleTVHDDisablesLiquidGlass() {
+        let hd = AppleTVCapability.capability(for: "AppleTV5,3")
+        XCTAssertFalse(hd.supportsLiquidGlass)
+    }
+
+    func testAppleTV4K2ndAnd3rdGenEnableLiquidGlass() {
+        let secondGen = AppleTVCapability.capability(for: "AppleTV11,1")
+        XCTAssertTrue(secondGen.supportsLiquidGlass)
+
+        let thirdGen = AppleTVCapability.capability(for: "AppleTV14,1")
+        XCTAssertTrue(thirdGen.supportsLiquidGlass)
+    }
 }

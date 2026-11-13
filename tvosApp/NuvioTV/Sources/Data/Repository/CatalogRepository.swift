@@ -687,21 +687,29 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     static func cacheCatalogMetadata(_ meta: NuvioMeta) {
-        let context = metadataCacheContext
+        cacheCatalogMetadata([meta], context: metadataCacheContext)
+    }
+
+    /// Caches a library snapshot using the metadata context captured when its
+    /// asynchronous load began. A profile or metadata-settings change makes the
+    /// whole snapshot stale, so none of it is written into the new context.
+    static func cacheCatalogMetadata(_ metas: [NuvioMeta], context: String) {
+        guard !metas.isEmpty else { return }
         metadataCacheQueue.sync(flags: .barrier) {
             guard prepareMetadataCache(for: context) else { return }
-            if !cachedFullMetaIds.contains(meta.id) {
-                cachedMetaById[meta.id] = meta
-            }
-            if let imdbId = meta.imdbId, !imdbId.isEmpty, imdbId != meta.id {
-                if !cachedFullMetaIds.contains(imdbId) {
+            for meta in metas {
+                if !cachedFullMetaIds.contains(meta.id) {
+                    cachedMetaById[meta.id] = meta
+                }
+                if let imdbId = meta.imdbId, !imdbId.isEmpty, imdbId != meta.id,
+                   !cachedFullMetaIds.contains(imdbId) {
                     cachedMetaById[imdbId] = meta
                 }
+                if let tmdbId = meta.tmdbId, let imdbId = meta.imdbId, imdbId.hasPrefix("tt") {
+                    let type = meta.isSeries ? "series" : "movie"
+                    cacheImdb(imdbId, forTmdbId: tmdbId, type: type)
+                }
             }
-        }
-        if let tmdbId = meta.tmdbId, let imdbId = meta.imdbId, imdbId.hasPrefix("tt") {
-            let type = meta.isSeries ? "series" : "movie"
-            cacheImdb(imdbId, forTmdbId: tmdbId, type: type)
         }
     }
 

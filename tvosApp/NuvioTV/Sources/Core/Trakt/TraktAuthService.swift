@@ -1290,6 +1290,38 @@ enum TraktPollResult {
     case failed(String)
 }
 
+/// One Trakt token refresh per client and profile at a time. Home's rows, Details and sync each
+/// build their own `TraktAuthService`; without this, an expired token is refreshed several times
+/// in parallel with the same refresh token, and a late rejection of a used token could clear the
+/// session that the first refresh just renewed.
+private actor TraktRefreshCoordinator {
+    static let shared = TraktRefreshCoordinator()
+
+    private struct Entry {
+        let generation: Int
+        let task: Task<Bool, Never>
+    }
+
+    private var nextGeneration = 0
+    private var entries: [String: Entry] = [:]
+
+    func refresh(key: String, operation: @escaping () async -> Bool) async -> Bool {
+        if let existing = entries[key] {
+            return await existing.task.value
+        }
+        nextGeneration &+= 1
+        let generation = nextGeneration
+        let task = Task { await operation() }
+        entries[key] = Entry(generation: generation, task: task)
+
+        let result = await task.value
+        if entries[key]?.generation == generation {
+            entries.removeValue(forKey: key)
+        }
+        return result
+    }
+}
+
 final class TraktAuthService {
     private let session: URLSession
     private let store: UserDefaults
@@ -1434,6 +1466,15 @@ final class TraktAuthService {
     /// together after the response arrives.
     @MainActor
     func refreshTokenIfNeeded(force: Bool = false) async -> Bool {
+        let sessionKey = session === URLSession.shared ? "shared" : "\(ObjectIdentifier(session))"
+        return await TraktRefreshCoordinator.shared.refresh(
+            key: "\(sessionKey):\(clientID):\(TraktConfig.profileScope(in: store))"
+        ) { [self] in
+            await self.refreshTokenIfNeededUncoordinated(force: force)
+        }
+    }
+
+    private func refreshTokenIfNeededUncoordinated(force: Bool) async -> Bool {
         guard ProfileSettings.isActiveStore(store), hasRequiredCredentials() else { return false }
         let state = currentState()
         guard TraktAuthStore.isAuthenticated(in: store), let refreshToken = state.refreshToken else { return false }

@@ -1314,7 +1314,7 @@ struct WatchPartyLobbyView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .frame(height: 124, alignment: .leading)
 
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             label
                 .background(
                     shape.fill(isFocused ? Color.white.opacity(0.08) : Color.black.opacity(0.22))

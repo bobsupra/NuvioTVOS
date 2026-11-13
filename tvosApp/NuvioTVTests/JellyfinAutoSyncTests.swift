@@ -354,4 +354,103 @@ final class JellyfinAutoSyncTests: XCTestCase {
         XCTAssertEqual(series?.items.count, 2, "Series must retain both fetched episodes")
         XCTAssertEqual(series?.items.first?.episodeName, "Pilot")
     }
+
+    func testSyncResumesSavedPagesAfterFailureAndKeepsPreviousIndexUntilCommit() async throws {
+        let serverID = "resume-\(UUID().uuidString)"
+        let server = JellyfinServerConfig(
+            id: serverID,
+            displayName: "Resume Server",
+            baseURLString: baseURL.absoluteString,
+            userId: "user-resume",
+            selectedLibraryIDs: ["lib-resume"],
+            syncAutomatically: false
+        )
+        JellyfinServerStore.shared.upsert(server)
+        let oldTitles = JellyfinLibraryResolver.resolve(
+            [movieItem(id: "old-movie", name: "Old Index")],
+            serverID: serverID,
+            libraryID: "lib-resume",
+            libraryName: "Movies"
+        ).titles
+        try JellyfinLibraryIndex.shared.replace(titles: oldTitles, forServerID: serverID)
+
+        var requestedStartIndices: [String] = []
+        var failSecondPageOnce = true
+        JellyfinAutoSyncMockProtocol.requestHandler = { request in
+            let url = request.url!
+            let startIndex = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?
+                .first(where: { $0.name == "StartIndex" })?.value ?? "0"
+            requestedStartIndices.append(startIndex)
+            if startIndex == "1", failSecondPageOnce {
+                failSecondPageOnce = false
+                return (HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: nil)!, Data("temporary failure".utf8))
+            }
+            let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
+            let body = startIndex == "0"
+                ? #"{"Items":[{"Id":"new-1","Name":"New One","Type":"Movie"}],"TotalRecordCount":2}"#
+                : #"{"Items":[{"Id":"new-2","Name":"New Two","Type":"Movie"}],"TotalRecordCount":2}"#
+            return (response, Data(body.utf8))
+        }
+
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "token-resume", session: session)
+        JellyfinSessionManager.shared.setClientForTesting(client, forServerID: serverID)
+        JellyfinSessionManager.shared.setConnectionStateForTesting(
+            .connected(libraries: [JellyfinLibrary(id: "lib-resume", name: "Movies", collectionType: "movies")]),
+            forServerID: serverID
+        )
+
+        JellyfinSessionManager.shared.sync(server)
+        for _ in 0..<100 {
+            if case .failed = JellyfinSessionManager.shared.syncState(for: serverID) { break }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+        guard case .failed = JellyfinSessionManager.shared.syncState(for: serverID) else {
+            XCTFail("First sync should fail at its second page")
+            return
+        }
+        XCTAssertEqual(JellyfinLibraryIndex.shared.titles().filter { $0.serverID == serverID }.map(\.name), ["Old Index"])
+
+        JellyfinSessionManager.shared.sync(server)
+        var completed = false
+        for _ in 0..<100 {
+            if case .done = JellyfinSessionManager.shared.syncState(for: serverID) {
+                completed = true
+                break
+            }
+            try await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        XCTAssertTrue(completed, "Second sync should resume and commit")
+        XCTAssertEqual(requestedStartIndices, ["0", "1", "1"], "The saved first page should not be fetched again")
+        XCTAssertEqual(
+            Set(JellyfinLibraryIndex.shared.titles().filter { $0.serverID == serverID }.map(\.name)),
+            Set(["New One", "New Two"])
+        )
+    }
+
+    private func movieItem(id: String, name: String) -> JellyfinMediaItem {
+        JellyfinMediaItem(
+            id: id,
+            name: name,
+            type: "Movie",
+            overview: nil,
+            productionYear: nil,
+            premiereDate: nil,
+            communityRating: nil,
+            officialRating: nil,
+            genres: nil,
+            runTimeTicks: nil,
+            imdbId: nil,
+            tmdbId: nil,
+            primaryImageTag: nil,
+            backdropImageTag: nil,
+            cast: nil,
+            directors: nil,
+            seriesId: nil,
+            parentIndexNumber: nil,
+            indexNumber: nil,
+            container: nil,
+            sizeBytes: nil
+        )
+    }
 }

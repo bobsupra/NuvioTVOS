@@ -281,6 +281,7 @@ public enum PlaybackOrigin {
     case main
     case details
     case cloudLibrary
+    case liveTV
 }
 
 private enum DetailsReturnDestination {
@@ -289,13 +290,14 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, party, search, library, calendar, settings
+    case profile, home, party, search, library, calendar, settings, liveTV
     case collection(CollectionHomeID)
 
     static var allCases: [Self] {
         var tabs: [Self] = [.profile, .home]
         if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
+        if ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
         if isCalendarEnabled { tabs.append(.calendar) }
         tabs.append(.settings)
         return tabs
@@ -321,6 +323,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .calendar: return "Calendar"
         case .settings: return "Settings"
         case .party: return "Watch Party"
+        case .liveTV: return "Live TV"
         case .collection(let id): return "Collection:\(id.key)"
         }
     }
@@ -333,6 +336,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .calendar: return L10n.string("nav_calendar", fallback: "Calendar")
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
         case .party: return L10n.string("nav_watch_party", fallback: "Watch Party")
+        case .liveTV: return L10n.string("nav_live_tv", fallback: "Live TV")
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
         }
     }
@@ -345,6 +349,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .calendar: return "calendar"
         case .settings: return "gearshape"
         case .party: return "person.2.fill"
+        case .liveTV: return "tv"
         case .collection: return "rectangle.stack.fill"
         }
     }
@@ -355,22 +360,34 @@ struct DetailsNavigationEntry {
     let id: String
     let type: String
     let libraryWatchedContext: LibraryWatchedContext?
-    let relatedFocusID: String?
+    let focusTarget: DetailsFocusTarget?
     let relatedItemsSnapshot: DetailsRelatedItemsSnapshot?
 
     init(
         id: String,
         type: String,
         libraryWatchedContext: LibraryWatchedContext?,
-        relatedFocusID: String? = nil,
+        focusTarget: DetailsFocusTarget? = nil,
         relatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil
     ) {
         self.id = id
         self.type = type
         self.libraryWatchedContext = libraryWatchedContext
-        self.relatedFocusID = relatedFocusID
+        self.focusTarget = focusTarget
         self.relatedItemsSnapshot = relatedItemsSnapshot
     }
+}
+
+enum DetailsFocusTargetKind: Hashable {
+    case moreLikeThis
+    case cast
+    case network
+    case production
+}
+
+struct DetailsFocusTarget: Hashable {
+    let kind: DetailsFocusTargetKind
+    let itemID: String
 }
 
 struct DetailsRelatedItemsSnapshot {
@@ -378,6 +395,8 @@ struct DetailsRelatedItemsSnapshot {
     let parentType: String
     let items: [RelatedTitle]
     let people: [TmdbPersonMetadata]
+    let peopleAreFallback: Bool
+    let companies: [MetaCompany]
     let simklRatings: SimklTitleRatings?
     let profileID: String?
     let source: String
@@ -394,17 +413,30 @@ struct DetailsRelatedItemsSnapshot {
     static func capture(
         parentID: String,
         parentType: String,
-        selectedRelatedID: String,
+        focusTarget: DetailsFocusTarget,
         items: [RelatedTitle],
         people: [TmdbPersonMetadata],
+        peopleAreFallback: Bool = false,
+        companies: [MetaCompany] = [],
         simklRatings: SimklTitleRatings?
     ) -> DetailsRelatedItemsSnapshot? {
-        guard items.contains(where: { $0.id == selectedRelatedID }) else { return nil }
+        let isKnown: Bool
+        switch focusTarget.kind {
+        case .moreLikeThis:
+            isKnown = items.contains(where: { $0.id == focusTarget.itemID })
+        case .cast:
+            isKnown = people.contains(where: { $0.id == focusTarget.itemID })
+        case .network, .production:
+            isKnown = companies.contains(where: { $0.id == focusTarget.itemID })
+        }
+        guard isKnown else { return nil }
         return DetailsRelatedItemsSnapshot(
             parentID: parentID,
             parentType: parentType,
             items: items,
             people: people,
+            peopleAreFallback: peopleAreFallback,
+            companies: companies,
             simklRatings: simklRatings,
             profileID: ProfileSettings.activeProfileID,
             source: TraktSettingsStore.moreLikeThisSource.rawValue,
@@ -416,6 +448,38 @@ struct DetailsRelatedItemsSnapshot {
             traktAccountBindingID: TraktAuthStore.accountBindingID(in: ProfileSettings.current),
             traktAuthenticated: TraktAuthStore.isAuthenticated,
             simklConfigured: SimklDetailsService.isConfigured
+        )
+    }
+
+    @MainActor
+    static func capture(
+        parentID: String,
+        parentType: String,
+        selectedRelatedID: String,
+        items: [RelatedTitle],
+        people: [TmdbPersonMetadata],
+        companies: [MetaCompany] = [],
+        simklRatings: SimklTitleRatings?
+    ) -> DetailsRelatedItemsSnapshot? {
+        let focusTarget: DetailsFocusTarget
+        if items.contains(where: { $0.id == selectedRelatedID }) {
+            focusTarget = DetailsFocusTarget(kind: .moreLikeThis, itemID: selectedRelatedID)
+        } else if people.contains(where: { $0.id == selectedRelatedID }) {
+            focusTarget = DetailsFocusTarget(kind: .cast, itemID: selectedRelatedID)
+        } else if let company = companies.first(where: { $0.id == selectedRelatedID }) {
+            let kind: DetailsFocusTargetKind = company.kind == .network ? .network : .production
+            focusTarget = DetailsFocusTarget(kind: kind, itemID: selectedRelatedID)
+        } else {
+            return nil
+        }
+        return capture(
+            parentID: parentID,
+            parentType: parentType,
+            focusTarget: focusTarget,
+            items: items,
+            people: people,
+            companies: companies,
+            simklRatings: simklRatings
         )
     }
 
@@ -445,7 +509,7 @@ struct DetailsNavigationContextTransition {
         id: String,
         type: String,
         libraryWatchedContext: LibraryWatchedContext?,
-        relatedFocusID: String? = nil,
+        focusTarget: DetailsFocusTarget? = nil,
         relatedItemsSnapshot: DetailsRelatedItemsSnapshot? = nil
     ) -> DetailsNavigationContextTransition {
         DetailsNavigationContextTransition(
@@ -453,7 +517,7 @@ struct DetailsNavigationContextTransition {
                 id: id,
                 type: type,
                 libraryWatchedContext: libraryWatchedContext,
-                relatedFocusID: relatedFocusID,
+                focusTarget: focusTarget,
                 relatedItemsSnapshot: relatedItemsSnapshot
             ),
             activeLibraryWatchedContext: nil
@@ -479,7 +543,7 @@ struct DetailsNavigationContextTransition {
     ) -> LibraryWatchedContext? {
         switch origin {
         case .details: return currentLibraryWatchedContext
-        case .main, .cloudLibrary: return nil
+        case .main, .cloudLibrary, .liveTV: return nil
         }
     }
 }
@@ -594,7 +658,7 @@ struct ContentView: View {
     @State private var detailsBackStack: [DetailsNavigationEntry] = []
     /// One-shot recommendation focus request carried from a pushed title back
     /// to the parent Details route.
-    @State private var pendingDetailsRelatedFocusRequest: DetailsNavigationEntry?
+    @State private var pendingDetailsFocusRequest: DetailsNavigationEntry?
     @State private var nextDetailsPlaybackRequestID: UInt = 0
     @State private var pendingDetailsPlaybackRequestID: UInt?
     @State private var presentedAppNoticeDetails: AppNotice?
@@ -1206,6 +1270,7 @@ struct ContentView: View {
         case .productionBrowse:
             withAnimation(.easeInOut(duration: 0.24)) {
                 if let ret = productionBrowseReturn {
+                    pendingDetailsFocusRequest = ret
                     activeScreen = .details(id: ret.id, type: ret.type)
                     detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                 } else {
@@ -1217,6 +1282,7 @@ struct ContentView: View {
         case .personBrowse:
             withAnimation(.easeInOut(duration: 0.24)) {
                 if let ret = personBrowseReturn {
+                    pendingDetailsFocusRequest = ret
                     activeScreen = .details(id: ret.id, type: ret.type)
                     detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                 } else {
@@ -1243,15 +1309,15 @@ struct ContentView: View {
             if let previous = detailsBackStack.popLast() {
                 activeScreen = .details(id: previous.id, type: previous.type)
                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(previous)
-                if previous.relatedFocusID != nil,
+                if previous.focusTarget != nil,
                    let snapshot = previous.relatedItemsSnapshot,
                    snapshot.isValid(for: previous.id, type: previous.type) {
-                    pendingDetailsRelatedFocusRequest = previous
+                    pendingDetailsFocusRequest = previous
                 } else {
-                    pendingDetailsRelatedFocusRequest = nil
+                    pendingDetailsFocusRequest = nil
                 }
             } else {
-                pendingDetailsRelatedFocusRequest = nil
+                pendingDetailsFocusRequest = nil
                 switch detailsReturnDestination {
                 case .main:
                     activeScreen = .main
@@ -1280,7 +1346,7 @@ struct ContentView: View {
             "details.open.root id=\(id) type=\(type) returnDest=\(returnDestination)"
         )
         detailsBackStack.removeAll()
-        pendingDetailsRelatedFocusRequest = nil
+        pendingDetailsFocusRequest = nil
         detailsCollectionContext = collectionContext
         detailsFocusEpisode = focusEpisode
         detailsLibraryWatchedContext = libraryWatchedContext
@@ -2898,6 +2964,7 @@ struct ContentView: View {
                     onBack: {
                         withAnimation(.easeInOut(duration: 0.24)) {
                             if let ret = productionBrowseReturn {
+                                pendingDetailsFocusRequest = ret
                                 activeScreen = .details(id: ret.id, type: ret.type)
                                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                             } else {
@@ -2938,6 +3005,7 @@ struct ContentView: View {
                     onBack: {
                         withAnimation(.easeInOut(duration: 0.24)) {
                             if let ret = personBrowseReturn {
+                                pendingDetailsFocusRequest = ret
                                 activeScreen = .details(id: ret.id, type: ret.type)
                                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
                             } else {
@@ -3204,6 +3272,12 @@ struct ContentView: View {
                     filename: meta.name
                 )
             },
+            onPlayLiveChannel: { url, meta, headers in
+                playbackEpisodes = []
+                playbackCurrentEpisode = nil
+                presentPlayback(url: url, meta: meta, subtitle: "", externalSubtitles: [],
+                                resumeFrom: nil, httpHeaders: headers, origin: .liveTV, filename: meta.name)
+            },
             onOpenCalendarEntry: { entry in
                 openCalendarEntry(entry)
             }
@@ -3226,10 +3300,10 @@ struct ContentView: View {
 
     private func detailsScreen(contentId: String, contentType: String) -> some View {
         let provenance = detailsCollectionContext
-        let relatedRestoreEntry: DetailsNavigationEntry? = pendingDetailsRelatedFocusRequest.flatMap { entry in
+        let focusRestoreEntry: DetailsNavigationEntry? = pendingDetailsFocusRequest.flatMap { entry in
             guard entry.id == contentId,
                   entry.type == contentType,
-                  entry.relatedFocusID != nil else {
+                  entry.focusTarget != nil else {
                 return nil
             }
             return entry
@@ -3239,13 +3313,13 @@ struct ContentView: View {
             type: contentType,
             libraryWatchedContext: detailsLibraryWatchedContext,
             repository: CinemetaCatalogRepository(),
-            initialRelatedItemsSnapshot: relatedRestoreEntry?.relatedItemsSnapshot,
-            initialRelatedFocusID: relatedRestoreEntry?.relatedFocusID,
-            onRelatedFocusRequestFinished: { focusedID in
-                guard pendingDetailsRelatedFocusRequest?.id == contentId,
-                      pendingDetailsRelatedFocusRequest?.type == contentType,
-                      pendingDetailsRelatedFocusRequest?.relatedFocusID == focusedID else { return }
-                pendingDetailsRelatedFocusRequest = nil
+            initialRelatedItemsSnapshot: focusRestoreEntry?.relatedItemsSnapshot,
+            initialFocusTarget: focusRestoreEntry?.focusTarget,
+            onFocusRequestFinished: { focusedTarget in
+                guard pendingDetailsFocusRequest?.id == contentId,
+                      pendingDetailsFocusRequest?.type == contentType,
+                      pendingDetailsFocusRequest?.focusTarget == focusedTarget else { return }
+                pendingDetailsFocusRequest = nil
             },
             initialPlaybackRequestID: pendingDetailsPlaybackRequestID,
             onInitialPlaybackRequestConsumed: { requestID in
@@ -3306,16 +3380,17 @@ struct ContentView: View {
             onCreateWatchParty: WatchPartyConfiguration.isEnabled ? { meta, episode in
                 createWatchPartyFromDetails(meta: meta, episode: episode)
             } : nil,
-            onOpenTitle: { nextId, nextType, selectedRelatedID, displayedRelatedItems, displayedPeople, displayedSimklRatings in
-                pendingDetailsRelatedFocusRequest = nil
-                let relatedSnapshot: DetailsRelatedItemsSnapshot? = selectedRelatedID.flatMap { selectedID in
-                    guard let displayedRelatedItems else { return nil }
-                    return DetailsRelatedItemsSnapshot.capture(
+            onOpenTitle: { nextId, nextType, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings in
+                pendingDetailsFocusRequest = nil
+                var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
+                if let focusTarget, let displayedRelatedItems {
+                    relatedSnapshot = DetailsRelatedItemsSnapshot.capture(
                         parentID: contentId,
                         parentType: contentType,
-                        selectedRelatedID: selectedID,
+                        focusTarget: focusTarget,
                         items: displayedRelatedItems,
                         people: displayedPeople,
+                        companies: displayedCompanies,
                         simklRatings: displayedSimklRatings
                     )
                 }
@@ -3323,7 +3398,7 @@ struct ContentView: View {
                     id: contentId,
                     type: contentType,
                     libraryWatchedContext: detailsLibraryWatchedContext,
-                    relatedFocusID: relatedSnapshot == nil ? nil : selectedRelatedID,
+                    focusTarget: relatedSnapshot == nil ? nil : focusTarget,
                     relatedItemsSnapshot: relatedSnapshot
                 )
                 detailsBackStack.append(transition.backStackEntry)
@@ -3332,23 +3407,52 @@ struct ContentView: View {
                     activeScreen = .details(id: nextId, type: nextType)
                 }
             },
-            onOpenProduction: { company in
-                pendingDetailsRelatedFocusRequest = nil
+            onOpenProduction: { company, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings in
+                pendingDetailsFocusRequest = nil
+                var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
+                if let focusTarget {
+                    relatedSnapshot = DetailsRelatedItemsSnapshot.capture(
+                        parentID: contentId,
+                        parentType: contentType,
+                        focusTarget: focusTarget,
+                        items: displayedRelatedItems ?? [],
+                        people: displayedPeople,
+                        companies: displayedCompanies,
+                        simklRatings: displayedSimklRatings
+                    )
+                }
                 productionBrowseReturn = DetailsNavigationEntry(
                     id: contentId,
                     type: contentType,
-                    libraryWatchedContext: detailsLibraryWatchedContext
+                    libraryWatchedContext: detailsLibraryWatchedContext,
+                    focusTarget: relatedSnapshot == nil ? nil : focusTarget,
+                    relatedItemsSnapshot: relatedSnapshot
                 )
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .productionBrowse(company)
                 }
             },
-            onOpenPerson: { person in
-                pendingDetailsRelatedFocusRequest = nil
+            onOpenPerson: { person, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings, peopleAreFallback in
+                pendingDetailsFocusRequest = nil
+                var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
+                if let focusTarget {
+                    relatedSnapshot = DetailsRelatedItemsSnapshot.capture(
+                        parentID: contentId,
+                        parentType: contentType,
+                        focusTarget: focusTarget,
+                        items: displayedRelatedItems ?? [],
+                        people: displayedPeople,
+                        peopleAreFallback: peopleAreFallback,
+                        companies: displayedCompanies,
+                        simklRatings: displayedSimklRatings
+                    )
+                }
                 personBrowseReturn = DetailsNavigationEntry(
                     id: contentId,
                     type: contentType,
-                    libraryWatchedContext: detailsLibraryWatchedContext
+                    libraryWatchedContext: detailsLibraryWatchedContext,
+                    focusTarget: relatedSnapshot == nil ? nil : focusTarget,
+                    relatedItemsSnapshot: relatedSnapshot
                 )
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .personBrowse(person)
@@ -4096,6 +4200,8 @@ struct ContentView: View {
                     dismissalTarget = .details(id: meta.id, type: meta.type)
                 case .cloudLibrary:
                     dismissalTarget = .cloudLibrary
+                case .liveTV:
+                    dismissalTarget = .main
                 case .main:
                     dismissalTarget = (isTrailer || isActionPlaybackSession || meta.isSeries)
                         ? .details(id: meta.id, type: meta.type)
@@ -4132,6 +4238,10 @@ struct ContentView: View {
             case .cloudLibrary:
                 detailsLibraryWatchedContext = nil
                 activeScreen = .cloudLibrary
+            case .liveTV:
+                detailsLibraryWatchedContext = nil
+                selectedTab = ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) ? .liveTV : .home
+                activeScreen = .main
             case .main:
                 detailsLibraryWatchedContext = nil
                 activeScreen = (isTrailer || isActionPlaybackSession || meta.isSeries)
@@ -4567,6 +4677,7 @@ private struct TVMainTabView: View {
     let onLongPressContinueWatching: (ContinueWatchingItem) -> Void
     let onOpenCloudLibrary: () -> Void
     let onPlayCloudFile: (URL, NuvioMeta) -> Void
+    let onPlayLiveChannel: (URL, NuvioMeta, [String: String]) -> Void
     var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -4574,6 +4685,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
@@ -4610,6 +4722,9 @@ private struct TVMainTabView: View {
         }
         .onChange(of: showWatchPartyTab) { _, isShown in
             if !isShown, selectedTab == .party { selectedTab = .home }
+        }
+        .onChange(of: nativeIPTVEnabled) { _, enabled in
+            if !enabled, selectedTab == .liveTV { selectedTab = .home }
         }
     }
 
@@ -4757,6 +4872,11 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    private var liveTVTabContent: some View {
+        IPTVLiveView(profileID: activeProfile?.id ?? "", onPlay: onPlayLiveChannel)
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var settingsTabContent: some View {
         SettingsView(
             selectedCategory: $selectedSettingsCategory,
@@ -4819,7 +4939,14 @@ private struct TVMainTabView: View {
     // Compatibility shell for systems predating native tab sections.
     private var standardTabs: some View {
         TabView(selection: $selectedTab) {
-            Color.clear.tabItem { profileTabLabel }.tag(TVTab.profile)
+            Group {
+                if useTopNavigation {
+                    topBarProfileContent
+                } else {
+                    Color.clear
+                }
+            }
+            .tabItem { profileTabLabel }.tag(TVTab.profile)
             homeTabContent
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
@@ -4829,23 +4956,52 @@ private struct TVMainTabView: View {
                     .tag(TVTab.party)
             }
             searchTab
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .search)
                 .tabItem { Label(TVTab.search.title, systemImage: TVTab.search.symbol) }
                 .tag(TVTab.search)
             libraryTabContent
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .library)
                 .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
                 .tag(TVTab.library)
+            if nativeIPTVEnabled {
+                liveTVTabContent
+                    .tabItem { Label(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol) }
+                    .tag(TVTab.liveTV)
+            }
             if showCalendarTab {
                 calendarTabContent
                     .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
                     .tag(TVTab.calendar)
             }
-            settingsTabContent.tabItem { settingsTabLabel }.tag(TVTab.settings)
+            settingsTabContent
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .settings)
+                .tabItem { settingsTabLabel }.tag(TVTab.settings)
             ForEach(directCollectionDestinations + genreCollectionDestinations) { destination in
                 collectionTabContent(destination)
                     .tabItem { collectionTabLabel(destination) }
                     .tag(TVTab.collection(destination.id))
             }
         }
+    }
+
+    private var topBarProfileContent: some View {
+        VStack(spacing: 24) {
+            ProfileAvatarView(
+                avatarId: displayedProfile?.avatarId ?? ProfileAvatarCatalog.defaultId,
+                size: 144,
+                showsFocusOutline: false
+            )
+            Text(profileTabTitle)
+                .font(.title2.bold())
+            Button {
+                guard !isProfileFocusPending else { return }
+                onSwitchProfile()
+            } label: {
+                Label(L10n.string("profile_change", fallback: "Change Profile"), systemImage: "arrow.left.arrow.right")
+            }
+            .disabled(isProfileFocusPending)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     @ViewBuilder
@@ -4889,6 +5045,11 @@ private struct TVMainTabView: View {
             }
             Tab(TVTab.library.title, systemImage: TVTab.library.symbol, value: TVTab.library) {
                 libraryTabContent
+            }
+            if nativeIPTVEnabled {
+                Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
+                    liveTVTabContent
+                }
             }
             if showCalendarTab {
                 Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
@@ -4961,6 +5122,7 @@ private struct TVMainTabView: View {
 
     private var tabs: some View {
         tabShell
+        .background(NativeTopBarClock(enabled: useTopNavigation))
         .background(Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea())
         .sheet(isPresented: $showingReauthSheet) {
             ReauthSheet(auth: authManager) {
@@ -5006,7 +5168,7 @@ private struct TVMainTabView: View {
                     selectedTab = .home
                     return
                 }
-                onSwitchProfile()
+                if !useTopNavigation { onSwitchProfile() }
             }
         }
         // Re-attempt once the catalog finishes loading, since the first refresh
@@ -5276,6 +5438,24 @@ struct TVReauthBannerView: View {
 }
 
 #if os(tvOS)
+private struct TVTopBarScrollEnabledKey: EnvironmentKey {
+    static let defaultValue = false
+}
+
+extension EnvironmentValues {
+    var tvTopBarScrollEnabled: Bool {
+        get { self[TVTopBarScrollEnabledKey.self] }
+        set { self[TVTopBarScrollEnabledKey.self] = newValue }
+    }
+}
+
+/// Place inside the primary vertical scroll content of a top-level tab.
+struct TVTopBarScrollAnchor: View {
+    @Environment(\.tvTopBarScrollEnabled) private var enabled
+    var isActive = true
+    var body: some View { TVTopBarScrollLink(enabled: enabled && isActive) }
+}
+
 struct TVScrollViewFocusConfigurator: UIViewRepresentable {
     func makeUIView(context: Context) -> UIView {
         let view = UIView(frame: .zero)
@@ -5316,6 +5496,79 @@ struct TVScrollViewFocusConfigurator: UIViewRepresentable {
             current = c.superview
         }
         return nil
+    }
+}
+
+/// Experimental: associate Home's vertical rows with the system's top bar.
+/// The marker lives inside the scroll content, so its closest scroll ancestor
+/// is the intended vertical container rather than one of the horizontal rows.
+private struct TVTopBarScrollLink: UIViewRepresentable {
+    let enabled: Bool
+
+    func makeUIView(context: Context) -> Marker {
+        let marker = Marker()
+        marker.isUserInteractionEnabled = false
+        marker.backgroundColor = .clear
+        return marker
+    }
+
+    func updateUIView(_ view: Marker, context: Context) {
+        view.setEnabled(enabled)
+    }
+
+    static func dismantleUIView(_ view: Marker, coordinator: ()) {
+        view.setEnabled(false)
+    }
+
+    final class Marker: UIView {
+        private weak var linkedController: UIViewController?
+        private weak var linkedScroll: UIScrollView?
+        private var enabled = false
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            scheduleUpdate()
+        }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            scheduleUpdate()
+        }
+
+        func setEnabled(_ value: Bool) {
+            enabled = value
+            if !value { unlink() }
+            else { scheduleUpdate() }
+        }
+
+        private func scheduleUpdate() {
+            DispatchQueue.main.async { [weak self] in self?.updateLink() }
+        }
+
+        private func updateLink() {
+            guard enabled, window != nil else { unlink(); return }
+            var ancestor = superview
+            while ancestor != nil && !(ancestor is UIScrollView) { ancestor = ancestor?.superview }
+            guard let scroll = ancestor as? UIScrollView else { unlink(); return }
+            var responder: UIResponder? = self
+            while let current = responder, !(current is UIViewController) { responder = current.next }
+            guard let controller = responder as? UIViewController,
+                  !(controller is UINavigationController), !(controller is UITabBarController) else { unlink(); return }
+            if linkedController === controller && linkedScroll === scroll { return }
+            unlink()
+            controller.setContentScrollView(scroll, for: .top)
+            linkedController = controller
+            linkedScroll = scroll
+        }
+
+        private func unlink() {
+            if let controller = linkedController, let scroll = linkedScroll,
+               controller.contentScrollView(for: .top) === scroll {
+                controller.setContentScrollView(nil, for: .top)
+            }
+            linkedController = nil
+            linkedScroll = nil
+        }
     }
 }
 #endif
@@ -5569,11 +5822,13 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.continueWatchingVisible) private var continueWatchingVisible = true
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
     @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
@@ -5622,6 +5877,9 @@ struct TVHomeView: View {
     @State private var continueWatchingMetas: [NuvioMeta] = []
     @State private var upcomingMetas: [NuvioMeta] = []
     @State private var continueWatchingByMetaId: [String: ContinueWatchingItem] = [:]
+    @State private var revealableNextEpisodeMetaIDs: Set<String> = []
+    @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
+    @State private var hasCachedCompletedLedgerEvidence = false
     @State private var continueWatchingOrigins: [String: CollectionOriginPresentation] = [:]
     @State private var continueWatchingIndexByMetaId: [String: Int] = [:]
     @State private var continueWatchingIDs: [String] = []
@@ -5842,7 +6100,11 @@ struct TVHomeView: View {
                         } else if let heroMeta = visibleFocusedMeta ?? visibleHero {
                             TVHeroView(
                                 meta: heroMeta,
-                                continueItem: heroContinueItem(for: heroMeta)
+                                continueItem: heroContinueItem(for: heroMeta),
+                                continueIsNextEpisodeSpoilerRevealable:
+                                    (focusedSectionId == TVHomeSection.continueWatchingId
+                                        || focusedSectionId == TVHomeSection.upcomingId)
+                                    && revealableNextEpisodeMetaIDs.contains(heroMeta.id)
                             ) {
                                 navigateToDetailsFromHome(id: heroMeta.id, type: heroMeta.type)
                             }
@@ -5915,6 +6177,7 @@ struct TVHomeView: View {
                                     // Place the configurator inside the scroll content so its
                                     // ancestor is the UIScrollView that owns the row offset.
                                     .background(TVScrollViewFocusConfigurator())
+                                    .background(TVTopBarScrollLink(enabled: useTopNavigation && isActive))
                                     #endif
                                     .onAppear {
                                         prepareInitialFocusViewport(
@@ -6250,11 +6513,21 @@ struct TVHomeView: View {
                 ContinueWatchingBuilder.scheduleRebuild(reason: "up next episode preference changed", delayMs: 0)
             }
         }
+        .onChange(of: revealNextEpisodeSpoilers) { _, _ in
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                force: true
+            )
+        }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
             if collectionHome != nil {
                 refreshWatchedTitles()
                 return
             }
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                force: true
+            )
             guard isActive else { return }
             if isFullScreenOverlayPresented {
                 pendingContinueWatchingRefreshAfterOverlay = true
@@ -6267,6 +6540,20 @@ struct TVHomeView: View {
             if collectionHome == nil, !usesRemoteProgress {
                 ContinueWatchingBuilder.scheduleRebuild(reason: "watched state changed")
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard collectionHome == nil else { return }
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                force: true
+            )
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchProgressLedger.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard collectionHome == nil else { return }
+            refreshNextEpisodeSpoilerEligibility(
+                for: Array(continueWatchingByMetaId.values),
+                refreshCompletedLedgerEvidence: true
+            )
         }
         // Settings → Home Catalogs reorder applies to the mounted Home live.
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -6712,6 +6999,7 @@ struct TVHomeView: View {
                                 horizontalEdgeInset: heroBleed,
                                 items: section.items,
                                 progressByItemId: isCalendarToday ? [:] : continueWatchingByMetaId,
+                                revealableNextEpisodeMetaIDs: isCalendarToday ? [] : revealableNextEpisodeMetaIDs,
                                 calendarLabelsByItemId: isCalendarToday ? calendarToday.labels : [:],
                                 collectionOriginsByItemId: collectionHome == nil && section.id == TVHomeSection.continueWatchingId
                                     ? continueWatchingOrigins : [:],
@@ -6840,6 +7128,7 @@ struct TVHomeView: View {
                     heroEnabled && !heroItems.isEmpty ? 0 : TVHomeLayout.rowsTopPadding
                 )
                 .padding(.bottom, 80)
+                .background(TVTopBarScrollLink(enabled: useTopNavigation && isActive))
                 .onAppear {
                     prepareInitialFocusViewport(
                         for: sections,
@@ -8024,6 +8313,9 @@ struct TVHomeView: View {
                 items: section.items,
                 progressByItemId: (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId)
                     ? continueWatchingByMetaId : [:],
+                revealableNextEpisodeMetaIDs:
+                    (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId)
+                    ? revealableNextEpisodeMetaIDs : [],
                 calendarLabelsByItemId: section.id == TVHomeSection.calendarTodayId ? calendarToday.labels : [:],
                 collectionOriginsByItemId: collectionHome == nil && section.id == TVHomeSection.continueWatchingId
                     ? continueWatchingOrigins : [:],
@@ -9779,6 +10071,10 @@ struct TVHomeView: View {
            rawContinueWatchingItems.count == rawItems.count {
             let isIdentical = zip(rawContinueWatchingItems, rawItems).allSatisfy { $0.isContentEqual(to: $1) }
             if isIdentical {
+                refreshNextEpisodeSpoilerEligibility(
+                    for: Array(continueWatchingByMetaId.values),
+                    force: true
+                )
                 return
             }
         }
@@ -9828,6 +10124,54 @@ struct TVHomeView: View {
             continueWatchingByMetaId = byMetaId
             continueWatchingIndexByMetaId = indexByMetaId
             continueWatchingIDs = items.map(\.meta.id)
+        }
+        refreshNextEpisodeSpoilerEligibility(
+            for: Array(continueWatchingByMetaId.values),
+            force: true
+        )
+    }
+
+    private func refreshNextEpisodeSpoilerEligibility(
+        for items: [ContinueWatchingItem],
+        refreshCompletedLedgerEvidence: Bool = false,
+        force: Bool = false
+    ) {
+        var ledgerEvidenceChanged = false
+        if refreshCompletedLedgerEvidence || (revealNextEpisodeSpoilers && !hasCachedCompletedLedgerEvidence) {
+            let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
+            ledgerEvidenceChanged = !hasCachedCompletedLedgerEvidence
+                || latestEvidence != completedLedgerEpisodeKeysByContentID
+            completedLedgerEpisodeKeysByContentID = latestEvidence
+            hasCachedCompletedLedgerEvidence = true
+        }
+
+        guard revealNextEpisodeSpoilers else {
+            if !revealableNextEpisodeMetaIDs.isEmpty {
+                revealableNextEpisodeMetaIDs = []
+            }
+            return
+        }
+        guard force || ledgerEvidenceChanged else { return }
+        let snapshot = WatchedStore.currentSnapshot()
+        var eligibleMetaIDs = Set<String>()
+        for item in items where item.isUpNextEntry {
+            guard let numbers = item.episodeNumbers else { continue }
+            let watchedKeys = EpisodeSpoilerPolicy.watchedEpisodeKeys(
+                for: item.meta,
+                in: item.meta.videos,
+                snapshot: snapshot,
+                completedLedgerKeysByContentID: completedLedgerEpisodeKeysByContentID
+            )
+            let revealableKey = EpisodeSpoilerPolicy.revealableNextEpisodeKey(
+                in: item.meta.videos,
+                watchedEpisodeKeys: watchedKeys
+            )
+            if revealableKey == "\(numbers.season):\(numbers.episode)" {
+                eligibleMetaIDs.insert(item.meta.id)
+            }
+        }
+        if eligibleMetaIDs != revealableNextEpisodeMetaIDs {
+            revealableNextEpisodeMetaIDs = eligibleMetaIDs
         }
     }
 
@@ -10201,9 +10545,10 @@ struct TVHomeView: View {
             return
         }
         let indexedTitles = JellyfinLibraryIndex.shared.titles()
+        let firstTitleByID = Self.jellyfinFirstTitleByID(indexedTitles)
         let legacyTitles = indexedTitles.filter { $0.libraryID == nil || $0.libraryName == nil }
         var sections: [TVHomeSection] = []
-        let legacyMetas = Self.jellyfinMetas(legacyTitles)
+        let legacyMetas = Self.jellyfinMetas(legacyTitles, firstTitleByID: firstTitleByID)
         if !legacyMetas.isEmpty {
             sections.append(TVHomeSection(
                 id: TVHomeSection.jellyfinId,
@@ -10232,7 +10577,7 @@ struct TVHomeView: View {
         for key in orderedKeys {
             guard let titles = groupedTitles[key],
                   let libraryName = titles.first?.libraryName else { continue }
-            let metas = Self.jellyfinMetas(titles)
+            let metas = Self.jellyfinMetas(titles, firstTitleByID: firstTitleByID)
             guard !metas.isEmpty else { continue }
             sections.append(TVHomeSection(
                 id: TVHomeSection.jellyfinLibraryId(serverID: key.serverID, libraryID: key.libraryID),
@@ -10244,13 +10589,35 @@ struct TVHomeView: View {
     }
 
     @MainActor
-    private static func jellyfinMetas(_ titles: [JellyfinIndexedTitle]) -> [NuvioMeta] {
+    private static func jellyfinMetas(
+        _ titles: [JellyfinIndexedTitle],
+        firstTitleByID: [String: JellyfinIndexedTitle]
+    ) -> [NuvioMeta] {
         titles.sorted {
             if $0.name != $1.name { return $0.name < $1.name }
             return $0.contentId < $1.contentId
         }.compactMap {
-            JellyfinLibraryIndex.shared.meta(forContentId: $0.contentId)
+            guard let matchingTitle = firstTitleByID[$0.contentId] else { return nil }
+            return JellyfinLibraryIndex.shared.meta(
+                for: matchingTitle,
+                requestedContentId: $0.contentId
+            )
         }
+    }
+
+    /// Preserves `titles().first(where:)` resolution for duplicate synthetic
+    /// IDs and raw Jellyfin item IDs while allowing Home to reuse one index.
+    static func jellyfinFirstTitleByID(_ titles: [JellyfinIndexedTitle]) -> [String: JellyfinIndexedTitle] {
+        var firstTitleByID: [String: JellyfinIndexedTitle] = [:]
+        for title in titles {
+            if firstTitleByID[title.contentId] == nil {
+                firstTitleByID[title.contentId] = title
+            }
+            if firstTitleByID[title.itemId] == nil {
+                firstTitleByID[title.itemId] = title
+            }
+        }
+        return firstTitleByID
     }
 }
 
@@ -11398,7 +11765,7 @@ enum TVDetailsSection: String, CaseIterable, Identifiable, Codable {
         case .episodes:
             return L10n.string("settings_meta_episodes", fallback: "Episodes")
         case .cast:
-            return L10n.string("details_creator_and_cast", fallback: "Cast & Crew")
+            return L10n.string("details_cast_and_crew", fallback: "Cast & Crew")
         case .related:
             return L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This")
         case .network:
@@ -12121,10 +12488,14 @@ private struct TVHeroView: View {
     /// say which episode is in progress, how much is left, and show the
     /// episode's own overview instead of the series blurb.
     var continueItem: ContinueWatchingItem? = nil
+    /// Home supplies this only for a matched Continue Watching / Upcoming item.
+    /// Calendar cards intentionally do not carry spoiler reveal evidence.
+    var continueIsNextEpisodeSpoilerRevealable: Bool = false
     let onSelect: () -> Void
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
 
     private var heroHeight: CGFloat {
         homeLayout == "Compact" ? 390 : 500
@@ -12153,7 +12524,9 @@ private struct TVHeroView: View {
         if isContinueItemCurrentlyWatching || isContinueItemWatched {
             return false
         }
-        return true
+        return !(revealNextEpisodeSpoilers
+            && continueItem?.isUpNextEntry == true
+            && continueIsNextEpisodeSpoilerRevealable)
     }
 
     private var isHeroDescriptionSpoilerHidden: Bool {
@@ -12253,6 +12626,8 @@ extension TVHeroView: Equatable {
             && lhs.continueItem?.episode == rhs.continueItem?.episode
             && lhs.continueItem?.episodeOverview == rhs.continueItem?.episodeOverview
             && lhs.continueItem?.isUpNext == rhs.continueItem?.isUpNext
+            && lhs.continueIsNextEpisodeSpoilerRevealable == rhs.continueIsNextEpisodeSpoilerRevealable
+            && lhs.revealNextEpisodeSpoilers == rhs.revealNextEpisodeSpoilers
             && lhs.hideUnwatchedEpisodeDescriptions == rhs.hideUnwatchedEpisodeDescriptions
             && lhs.hideUnwatchedEpisodeTitles == rhs.hideUnwatchedEpisodeTitles
     }

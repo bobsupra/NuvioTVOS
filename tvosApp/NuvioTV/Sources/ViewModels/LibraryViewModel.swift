@@ -1,6 +1,18 @@
 import Foundation
 import Combine
 
+private struct LibraryLoadIdentity: Equatable, Sendable {
+    let source: TraktLibrarySourceMode
+    let profileID: String?
+    let settingsProfileID: String?
+    let accountBindingID: String?
+    let metadataCacheContext: String
+}
+
+private struct LibraryLoadSnapshot: Sendable {
+    let items: [StremioMeta]
+}
+
 @MainActor
 public class LibraryViewModel: ObservableObject {
     typealias LibraryHistorySyncHandler = @MainActor (TraktLibrarySourceMode, String?) async -> Bool
@@ -31,6 +43,12 @@ public class LibraryViewModel: ObservableObject {
     private var wetrakrMutationObserver: NSObjectProtocol?
     private var displayedSource: TraktLibrarySourceMode?
     private var refreshGeneration = 0
+    private var libraryLoadGeneration = 0
+    private var hasDeferredInitialLibraryLoad = false
+    private var isLoadingCachedLibrary = false
+    private var isRefreshingRemoteLibrary = false
+    private var inFlightLibraryLoadTask: Task<LibraryLoadSnapshot, Never>?
+    private var inFlightLibraryLoadIdentity: LibraryLoadIdentity?
     private var inFlightRefreshTask: Task<Void, Never>?
     private var inFlightRefreshIdentity: String?
     private var lastSuccessfulRefreshTimes: [String: Date] = [:]
@@ -82,14 +100,13 @@ public class LibraryViewModel: ObservableObject {
 
     init(libraryHistorySyncHandler: @escaping LibraryHistorySyncHandler) {
         self.libraryHistorySyncHandler = libraryHistorySyncHandler
-        loadLibrary()
         libraryObserver = NotificationCenter.default.addObserver(
             forName: LibraryStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                self?.loadLibrary()
+                self?.loadLibrary(forceReload: true)
             }
         }
         watchedOwnerObserver = NotificationCenter.default.addObserver(
@@ -184,6 +201,18 @@ public class LibraryViewModel: ObservableObject {
                 await self?.refreshSelectedLibrary()
             }
         }
+        let initialLoadGeneration = libraryLoadGeneration
+        let initialWatchedContext = LibraryWatchedContext.captureCurrent()
+        displayedSource = initialWatchedContext.source
+        displayedWatchedContext = initialWatchedContext
+        hasDeferredInitialLibraryLoad = true
+        isLoadingCachedLibrary = true
+        updateLoadingState()
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self, self.libraryLoadGeneration == initialLoadGeneration else { return }
+            self.loadLibrary()
+        }
     }
 
     private func refreshAfterWatchedOwnerChange() async {
@@ -250,6 +279,7 @@ public class LibraryViewModel: ObservableObject {
         watchedContext: LibraryWatchedContext
     ) -> Bool {
         guard watchedContext.isCurrentScope else {
+            invalidatePendingCachedLibraryLoad()
             self.items = []
             self.displayedWatchedContext = nil
             mdbListLists = []
@@ -257,6 +287,7 @@ public class LibraryViewModel: ObservableObject {
             validateFilters()
             return false
         }
+        invalidatePendingCachedLibraryLoad()
         displayedSource = source
         displayedWatchedContext = watchedContext
         self.items = items
@@ -265,6 +296,7 @@ public class LibraryViewModel: ObservableObject {
     }
 
     deinit {
+        inFlightLibraryLoadTask?.cancel()
         inFlightRefreshTask?.cancel()
         for observer in [
             libraryObserver, watchedOwnerObserver, watchedTargetsObserver,
@@ -276,54 +308,179 @@ public class LibraryViewModel: ObservableObject {
         }
     }
     
-    public func loadLibrary() {
-        guard !usesRemoteLibrary else {
-            let source = TraktSettingsStore.librarySourceMode
-            let profileID = LibraryStore.activeProfileId
-            let watchedContext = LibraryWatchedContext.capture(
-                source: source,
-                profileId: profileID
-            )
-            guard watchedContext.isCurrentScope else {
-                items = []
-                displayedSource = source
-                displayedWatchedContext = nil
-                validateFilters()
-                return
-            }
+    public func loadLibrary(forceReload: Bool = false) {
+        guard let request = startLibraryLoad(forceReload: forceReload) else { return }
+        Task { @MainActor [weak self] in
+            let snapshot = await request.task.value
+            self?.applyLibraryLoad(snapshot, request: request)
+        }
+    }
 
+    func loadLibraryAndWait(forceReload: Bool = false) async {
+        guard let request = startLibraryLoad(forceReload: forceReload) else { return }
+        let snapshot = await request.task.value
+        applyLibraryLoad(snapshot, request: request)
+    }
+
+    private struct LibraryLoadRequest {
+        let generation: Int
+        let identity: LibraryLoadIdentity
+        let watchedContext: LibraryWatchedContext
+        let task: Task<LibraryLoadSnapshot, Never>
+    }
+
+    private func startLibraryLoad(forceReload: Bool) -> LibraryLoadRequest? {
+        let watchedContext = LibraryWatchedContext.captureCurrent()
+        let source = watchedContext.source
+        let profileID = watchedContext.profileId
+        hasDeferredInitialLibraryLoad = false
+        guard watchedContext.isCurrentScope else {
+            libraryLoadGeneration &+= 1
+            inFlightLibraryLoadTask?.cancel()
+            inFlightLibraryLoadTask = nil
+            inFlightLibraryLoadIdentity = nil
+            isLoadingCachedLibrary = false
+            updateLoadingState()
+            items = []
             displayedSource = source
-            displayedWatchedContext = watchedContext
-            if TraktSettingsStore.librarySourceMode != .mdblist {
-                mdbListLists = []
-                selectedMdbListListID = nil
-            }
-
-            if let cachedItems = RemoteLibraryStore.load(
-                source: source,
-                profileId: profileID,
-                accountBindingId: watchedContext.displayOwner.accountBindingId
-            ), !cachedItems.isEmpty {
-                cachedItems.forEach { CinemetaCatalogRepository.cacheCatalogMetadata($0.meta) }
-                items = cachedItems.map(\.stremioMeta)
-            } else {
-                items = []
-            }
+            displayedWatchedContext = nil
             validateFilters()
-            return
+            return nil
         }
 
-        displayedSource = .local
-        displayedWatchedContext = LibraryWatchedContext.capture(
-            source: .local,
-            profileId: LibraryStore.activeProfileId
+        let identity = LibraryLoadIdentity(
+            source: source,
+            profileID: profileID,
+            settingsProfileID: ProfileSettings.activeProfileID,
+            accountBindingID: source == .local ? nil : watchedContext.displayOwner.accountBindingId,
+            metadataCacheContext: CinemetaCatalogRepository.metadataCacheContext
         )
-        mdbListLists = []
-        selectedMdbListListID = nil
-        let storeItems = LibraryStore.items()
-        storeItems.forEach { CinemetaCatalogRepository.cacheCatalogMetadata($0.meta) }
-        items = storeItems.map(\.stremioMeta)
+
+        let sameOwner: Bool
+        if source == .local {
+            sameOwner = displayedWatchedContext?.source == .local
+                && displayedWatchedContext?.profileId == profileID
+        } else {
+            sameOwner = displayedWatchedContext?.hasSameDisplayOwner(as: watchedContext) == true
+        }
+        if !sameOwner {
+            items = []
+            validateFilters()
+        }
+        displayedSource = source
+        displayedWatchedContext = watchedContext
+        isLoadingCachedLibrary = items.isEmpty
+        updateLoadingState()
+        if source != .mdblist {
+            mdbListLists = []
+            selectedMdbListListID = nil
+        }
+
+        if !forceReload,
+           let task = inFlightLibraryLoadTask,
+           inFlightLibraryLoadIdentity == identity {
+            return LibraryLoadRequest(
+                generation: libraryLoadGeneration,
+                identity: identity,
+                watchedContext: watchedContext,
+                task: task
+            )
+        }
+
+        libraryLoadGeneration &+= 1
+        let generation = libraryLoadGeneration
+        inFlightLibraryLoadTask?.cancel()
+        inFlightLibraryLoadIdentity = identity
+
+        let task = Task.detached(priority: .userInitiated) {
+            guard !Task.isCancelled else { return LibraryLoadSnapshot(items: []) }
+            let storeItems: [LibraryStoreItem]
+            if identity.source == .local {
+                storeItems = LibraryStore.items(forProfileId: identity.profileID)
+            } else {
+                storeItems = RemoteLibraryStore.load(
+                    source: identity.source,
+                    profileId: identity.profileID,
+                    accountBindingId: identity.accountBindingID
+                ) ?? []
+            }
+            guard !Task.isCancelled else { return LibraryLoadSnapshot(items: []) }
+            CinemetaCatalogRepository.cacheCatalogMetadata(
+                storeItems.map(\.meta),
+                context: identity.metadataCacheContext
+            )
+            guard !Task.isCancelled else { return LibraryLoadSnapshot(items: []) }
+            return LibraryLoadSnapshot(items: storeItems.map(\.stremioMeta))
+        }
+        inFlightLibraryLoadTask = task
+        return LibraryLoadRequest(
+            generation: generation,
+            identity: identity,
+            watchedContext: watchedContext,
+            task: task
+        )
+    }
+
+    private func applyLibraryLoad(_ snapshot: LibraryLoadSnapshot, request: LibraryLoadRequest) {
+        let currentContext = LibraryWatchedContext.captureCurrent()
+        let currentIdentity = currentLibraryLoadIdentity()
+        guard request.generation == libraryLoadGeneration,
+              request.identity == currentIdentity,
+              request.watchedContext.source == currentContext.source,
+              request.watchedContext.profileId == currentContext.profileId,
+              currentContext.isCurrentScope,
+              request.identity.source == .local
+                || request.watchedContext.hasSameDisplayOwner(as: currentContext) else {
+            if request.generation == libraryLoadGeneration {
+                inFlightLibraryLoadTask = nil
+                inFlightLibraryLoadIdentity = nil
+                isLoadingCachedLibrary = false
+                updateLoadingState()
+                loadLibrary(forceReload: true)
+            }
+            return
+        }
+        displayedSource = currentContext.source
+        displayedWatchedContext = currentContext
+        items = snapshot.items
+        isLoadingCachedLibrary = false
+        updateLoadingState()
         validateFilters()
+        inFlightLibraryLoadTask = nil
+        inFlightLibraryLoadIdentity = nil
+    }
+
+    private func currentLibraryLoadIdentity() -> LibraryLoadIdentity {
+        let watchedContext = LibraryWatchedContext.captureCurrent()
+        let source = watchedContext.source
+        let profileID = watchedContext.profileId
+        return LibraryLoadIdentity(
+            source: source,
+            profileID: profileID,
+            settingsProfileID: ProfileSettings.activeProfileID,
+            accountBindingID: source == .local ? nil : watchedContext.displayOwner.accountBindingId,
+            metadataCacheContext: CinemetaCatalogRepository.metadataCacheContext
+        )
+    }
+
+    private func updateLoadingState() {
+        let newValue = isLoadingCachedLibrary || isRefreshingRemoteLibrary
+        if isLoading != newValue {
+            isLoading = newValue
+        }
+    }
+
+    @discardableResult
+    private func invalidatePendingCachedLibraryLoad() -> Bool {
+        let hadPendingLoad = inFlightLibraryLoadTask != nil || hasDeferredInitialLibraryLoad
+        hasDeferredInitialLibraryLoad = false
+        libraryLoadGeneration &+= 1
+        inFlightLibraryLoadTask?.cancel()
+        inFlightLibraryLoadTask = nil
+        inFlightLibraryLoadIdentity = nil
+        isLoadingCachedLibrary = false
+        updateLoadingState()
+        return hadPendingLoad
     }
 
     public func refreshSelectedLibrary(syncWatchedHistory: Bool = false, force: Bool = false) async {
@@ -335,7 +492,7 @@ public class LibraryViewModel: ObservableObject {
         let watchedContext = LibraryWatchedContext.capture(source: source, profileId: profileID)
 
         guard usesRemoteLibrary else {
-            loadLibrary()
+            await loadLibraryAndWait()
             if syncWatchedHistory, let watchedContext = displayedWatchedContext {
                 scheduleLibraryHistorySync(for: watchedContext)
             }
@@ -363,13 +520,15 @@ public class LibraryViewModel: ObservableObject {
         let generation = refreshGeneration
 
         if displayedSource != TraktSettingsStore.librarySourceMode {
+            invalidatePendingCachedLibraryLoad()
             displayedSource = TraktSettingsStore.librarySourceMode
             items = []
             displayedWatchedContext = nil
             validateFilters()
         }
 
-        isLoading = true
+        isRefreshingRemoteLibrary = true
+        updateLoadingState()
         inFlightRefreshIdentity = refreshIdentity
 
         let task = Task { [weak self] in
@@ -378,7 +537,8 @@ public class LibraryViewModel: ObservableObject {
                 Task { @MainActor [weak self] in
                     guard let self else { return }
                     if self.refreshGeneration == generation {
-                        self.isLoading = false
+                        self.isRefreshingRemoteLibrary = false
+                        self.updateLoadingState()
                         self.inFlightRefreshTask = nil
                         self.inFlightRefreshIdentity = nil
                     }
@@ -601,6 +761,7 @@ public class LibraryViewModel: ObservableObject {
         if usesRemoteLibrary && displayedWatchedContext?.isCurrentScope == true {
             applyLibraryMutation(meta: mutation.meta, isInWatchlist: mutation.isInWatchlist)
         } else {
+            let shouldReloadCachedLibrary = invalidatePendingCachedLibraryLoad()
             RemoteLibraryStore.applyMutation(
                 meta: mutation.meta,
                 isInWatchlist: mutation.isInWatchlist,
@@ -608,6 +769,9 @@ public class LibraryViewModel: ObservableObject {
                 profileId: profileID,
                 accountBindingId: bindingID
             )
+            if shouldReloadCachedLibrary {
+                loadLibrary(forceReload: true)
+            }
         }
     }
 
@@ -619,6 +783,7 @@ public class LibraryViewModel: ObservableObject {
         let bindingID = RemoteLibraryStore.accountBindingID(for: source, profileId: profileID, in: store)
 
         guard selectedMdbListListID == nil else {
+            invalidatePendingCachedLibraryLoad()
             Task { @MainActor in await refreshSelectedLibrary(force: true) }
             return
         }
@@ -627,6 +792,7 @@ public class LibraryViewModel: ObservableObject {
             if displayedWatchedContext?.isCurrentScope == true {
                 applyLibraryMutation(meta: mutation.meta, isInWatchlist: true)
             } else {
+                let shouldReloadCachedLibrary = invalidatePendingCachedLibraryLoad()
                 RemoteLibraryStore.applyMutation(
                     meta: mutation.meta,
                     isInWatchlist: true,
@@ -634,8 +800,12 @@ public class LibraryViewModel: ObservableObject {
                     profileId: profileID,
                     accountBindingId: bindingID
                 )
+                if shouldReloadCachedLibrary {
+                    loadLibrary(forceReload: true)
+                }
             }
         } else {
+            let shouldReloadCachedLibrary = invalidatePendingCachedLibraryLoad()
             RemoteLibraryStore.applyMutation(
                 meta: mutation.meta,
                 isInWatchlist: false,
@@ -643,6 +813,9 @@ public class LibraryViewModel: ObservableObject {
                 profileId: profileID,
                 accountBindingId: bindingID
             )
+            if shouldReloadCachedLibrary {
+                loadLibrary(forceReload: true)
+            }
             Task { @MainActor in await refreshSelectedLibrary(force: true) }
         }
     }
@@ -650,6 +823,7 @@ public class LibraryViewModel: ObservableObject {
     private func applyLibraryMutation(meta: NuvioMeta, isInWatchlist: Bool) {
         guard usesRemoteLibrary,
               displayedWatchedContext?.isCurrentScope == true else { return }
+        let shouldReloadCachedLibrary = invalidatePendingCachedLibraryLoad()
         let item = LibraryStoreItem(meta: meta, addedAt: Date()).stremioMeta
         if isInWatchlist {
             items = [item] + items.filter { !matchesLibraryMutation($0, meta: meta) }
@@ -669,6 +843,9 @@ public class LibraryViewModel: ObservableObject {
             profileId: profileID,
             accountBindingId: accountBindingID
         )
+        if shouldReloadCachedLibrary {
+            loadLibrary(forceReload: true)
+        }
     }
 
     private func matchesLibraryMutation(_ item: StremioMeta, meta: NuvioMeta) -> Bool {

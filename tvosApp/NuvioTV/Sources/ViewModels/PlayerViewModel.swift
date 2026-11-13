@@ -7537,6 +7537,12 @@ class PlayerViewModel: ObservableObject {
         currentEpisodeVideo?.id
     }
 
+    /// Full series guide for spoiler decisions; the side panel can display only
+    /// the current season while the eligibility rule still handles rollovers.
+    var spoilerEpisodeGuide: [NuvioVideo] {
+        seriesEpisodes
+    }
+
     func isEpisodeWatched(_ episode: NuvioVideo) -> Bool {
         guard let meta = activeMeta else { return false }
         let key = "\(episode.season):\(episode.episode)"

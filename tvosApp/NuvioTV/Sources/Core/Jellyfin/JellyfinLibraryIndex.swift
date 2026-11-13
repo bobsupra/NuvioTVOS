@@ -86,6 +86,17 @@ final class JellyfinLibraryIndex: ObservableObject {
 
     @Published private(set) var titlesByServerID: [String: [JellyfinIndexedTitle]] = [:]
 
+    enum IndexError: LocalizedError {
+        case persistenceFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .persistenceFailed:
+                return "The Jellyfin library index could not be saved."
+            }
+        }
+    }
+
     private init() {
         titlesByServerID = Self.load()
     }
@@ -157,8 +168,22 @@ final class JellyfinLibraryIndex: ObservableObject {
     /// `nil` only when the title isn't indexed or its server has since been
     /// removed (so there's nowhere to point an image URL).
     func meta(forContentId contentId: String) -> NuvioMeta? {
-        guard let title = titles().first(where: { $0.contentId == contentId || $0.itemId == contentId }),
-              let server = JellyfinServerStore.shared.server(id: title.serverID),
+        guard let title = titles().first(where: { $0.contentId == contentId || $0.itemId == contentId }) else {
+            return nil
+        }
+        return meta(for: title, requestedContentId: contentId)
+    }
+
+    /// Builds metadata from an already indexed title without searching the
+    /// full index. Home uses this after it has grouped the indexed titles.
+    func meta(for title: JellyfinIndexedTitle) -> NuvioMeta? {
+        meta(for: title, requestedContentId: title.contentId)
+    }
+
+    /// `requestedContentId` preserves `meta(forContentId:)`'s episode IDs when
+    /// the lookup matched through a raw Jellyfin item ID or another alias.
+    func meta(for title: JellyfinIndexedTitle, requestedContentId: String) -> NuvioMeta? {
+        guard let server = JellyfinServerStore.shared.server(id: title.serverID),
               let baseURL = server.baseURL else { return nil }
         let token = JellyfinCredentialStore.token(forServerID: server.id)
 
@@ -173,7 +198,7 @@ final class JellyfinLibraryIndex: ObservableObject {
                 .compactMap { file -> NuvioVideo? in
                     guard let season = file.season, let episode = file.episode else { return nil }
                     return NuvioVideo(
-                        id: "\(contentId):\(season):\(episode)",
+                        id: "\(requestedContentId):\(season):\(episode)",
                         title: file.episodeName ?? L10n.format("jellyfin_episode_fallback_title", fallback: "Episode %d", episode),
                         season: season,
                         episode: episode,
@@ -222,14 +247,25 @@ final class JellyfinLibraryIndex: ObservableObject {
         return hours > 0 ? "\(hours)h \(remainder)m" : "\(minutes)m"
     }
 
-    func replace(titles: [JellyfinIndexedTitle], forServerID serverID: String) {
-        titlesByServerID[serverID] = titles
-        persist()
+    func replace(titles: [JellyfinIndexedTitle], forServerID serverID: String) throws {
+        var updatedTitles = titlesByServerID
+        updatedTitles[serverID] = titles
+        guard persist(updatedTitles) else {
+            throw IndexError.persistenceFailed
+        }
+        titlesByServerID = updatedTitles
+        NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     }
 
     func removeAll(forServerID serverID: String) {
-        titlesByServerID.removeValue(forKey: serverID)
-        persist()
+        var updatedTitles = titlesByServerID
+        updatedTitles.removeValue(forKey: serverID)
+        guard persist(updatedTitles) else {
+            print("Nuvio Jellyfin library index write failed")
+            return
+        }
+        titlesByServerID = updatedTitles
+        NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     }
 
     private static let storageDirectoryName = "jellyfinLibraryIndex"
@@ -238,13 +274,14 @@ final class JellyfinLibraryIndex: ObservableObject {
         return "jellyfinLibraryIndex.\(profileId)"
     }
 
-    private func persist() {
-        guard let data = try? JSONEncoder().encode(titlesByServerID) else { return }
-        if LargePayloadStore.write(data, key: Self.storageKey, directory: Self.storageDirectoryName) {
-            ProfileSettings.current.removeObject(forKey: SettingsKey.jellyfinLibraryIndex)
-            UserDefaults.standard.removeObject(forKey: SettingsKey.jellyfinLibraryIndex)
+    private func persist(_ titles: [String: [JellyfinIndexedTitle]]) -> Bool {
+        guard let data = try? JSONEncoder().encode(titles),
+              LargePayloadStore.write(data, key: Self.storageKey, directory: Self.storageDirectoryName) else {
+            return false
         }
-        NotificationCenter.default.post(name: Self.changedNotification, object: nil)
+        ProfileSettings.current.removeObject(forKey: SettingsKey.jellyfinLibraryIndex)
+        UserDefaults.standard.removeObject(forKey: SettingsKey.jellyfinLibraryIndex)
+        return true
     }
 
     private static func load() -> [String: [JellyfinIndexedTitle]] {

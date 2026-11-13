@@ -97,6 +97,13 @@ final class SubtitleFontTests: XCTestCase {
         XCTAssertNotEqual(first, second)
     }
 
+    func testABodyIsOnlyAcceptedForAKnownRoute() {
+        XCTAssertEqual(SubtitleFontUploadServer.maximumBodyBytes(for: .notFound), 0, "a wrong key or path takes no body")
+        XCTAssertEqual(SubtitleFontUploadServer.maximumBodyBytes(for: .upload(name: "Font.ttf")), SubtitleFontLimits.downloadBytes)
+        XCTAssertLessThan(SubtitleFontUploadServer.maximumBodyBytes(for: .link), SubtitleFontLimits.downloadBytes)
+        XCTAssertLessThan(SubtitleFontUploadServer.maximumBodyBytes(for: .delete(id: "x")), SubtitleFontLimits.downloadBytes)
+    }
+
     func testThePageRequestsAreRouted() {
         func route(_ text: String, key: String = "abc234") -> SubtitleFontUploadServer.Route? {
             SubtitleFontUploadServer.parseHead(Data(text.utf8)).map { SubtitleFontUploadServer.route($0, key: key) }

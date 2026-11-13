@@ -481,6 +481,7 @@ final class CatalogWatchedMemoryTests: XCTestCase {
         )
         XCTAssertNil(DetailsNavigationContextTransition.playbackContext(origin: .main, currentLibraryWatchedContext: libraryContext))
         XCTAssertNil(DetailsNavigationContextTransition.playbackContext(origin: .cloudLibrary, currentLibraryWatchedContext: libraryContext))
+        XCTAssertNil(DetailsNavigationContextTransition.playbackContext(origin: .liveTV, currentLibraryWatchedContext: libraryContext))
     }
 
     func testSameProfileNuvioSyncRelinkInvalidatesCapturedLibraryMutation() {
@@ -597,6 +598,7 @@ final class CatalogWatchedMemoryTests: XCTestCase {
         let savedMeta = NuvioMeta(id: "tt-library-owner-preserved", name: "Saved title", type: "movie")
         LibraryStore.add(savedMeta)
         let viewModel = LibraryViewModel()
+        viewModel.loadLibrary(forceReload: true)
         let ownerRebound = expectation(description: "display owner follows the new sync binding")
         var didFulfill = false
         let subscription = viewModel.$displayedWatchedContext
@@ -609,6 +611,7 @@ final class CatalogWatchedMemoryTests: XCTestCase {
             }
 
         WatchedStore.setNuvioSyncAccountBinding("sync-account-after", profileId: profileID)
+        await viewModel.loadLibraryAndWait()
         await fulfillment(of: [ownerRebound], timeout: 1)
 
         XCTAssertEqual(viewModel.items.map(\.id), [savedMeta.id])

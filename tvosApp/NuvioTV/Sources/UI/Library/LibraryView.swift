@@ -654,6 +654,7 @@ public struct LibraryView: View {
                 .padding(.horizontal, 12)
                 .padding(.bottom, 90)
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .background(TVTopBarScrollAnchor())
             }
             .focusSection()
             .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
@@ -744,6 +745,7 @@ public struct LibraryView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 90)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(TVTopBarScrollAnchor())
         }
         .focusSection()
         .defaultFocusIfAvailable($cloudFocusedKey, lastFocusedCloudItemID ?? cloudViewModel.filteredItems.first?.stableKey)
@@ -798,6 +800,7 @@ public struct LibraryView: View {
             .padding(.horizontal, 24)
             .padding(.bottom, 90)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .background(TVTopBarScrollAnchor())
         }
         .focusSection()
         .defaultFocusIfAvailable($cloudFocusedKey, lastFocusedCloudItemID ?? defaultFileKey)
@@ -1014,7 +1017,7 @@ struct LibraryItemButton: View {
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                         .stroke(showsFocusedAppearance ? focusBorderColor : Color.clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
-                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2), radius: showsFocusedAppearance ? 16 : 6)
+                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0), radius: showsFocusedAppearance ? 16 : 0)
                 
                 if posterLabels {
                     VStack(alignment: .leading, spacing: 3) {
@@ -1049,7 +1052,14 @@ struct LibraryItemButton: View {
                 onFocus?()
             }
         }
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
+        .animation(
+            smoothFocus
+                ? (AppleTVCapability.current.supportsLiquidGlass
+                    ? .spring(response: 0.28, dampingFraction: 0.75)
+                    : .easeOut(duration: 0.14))
+                : nil,
+            value: showsFocusedAppearance
+        )
         .disabled(!watchedContextIsCurrent)
         .zIndex(showsFocusedAppearance ? 1 : 0)
     }

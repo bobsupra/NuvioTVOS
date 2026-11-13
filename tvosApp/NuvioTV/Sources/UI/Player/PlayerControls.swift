@@ -49,6 +49,7 @@ struct PlayerControls: View {
     @AppStorage(SettingsKey.playerShowSubtitles) private var playerShowSubtitles = true
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
+    @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
 
     var body: some View {
         ZStack {
@@ -91,6 +92,21 @@ struct PlayerControls: View {
                     }
                 )
                 .transition(.opacity)
+            }
+        }
+        .overlay(alignment: .topTrailing) {
+            if playerShowFinishTime && !viewModel.isLiveStream && !isNamingSubtitlePreset {
+                PlayerEstimatedFinishTime(
+                    clock: viewModel.clock,
+                    playbackSpeed: Double(viewModel.playbackSpeed.rawValue),
+                    status: viewModel.status,
+                    isMovie: viewModel.activeMeta?.type.lowercased() == "movie",
+                    isScrubbing: viewModel.isScrubbing,
+                    pendingSeekDelta: viewModel.pendingSeekDelta
+                )
+                .padding(.top, 50)
+                .padding(.horizontal, 60)
+                .allowsHitTesting(false)
             }
         }
         .onExitCommand(perform: handleExit)
@@ -1499,6 +1515,51 @@ private struct SeekPreviewTimelineCard: View {
 
 // MARK: - Isolated Timeline Bar
 
+enum PlayerFinishEstimate {
+    static func date(now: Date, position: Double, duration: Double, speed: Double) -> Date? {
+        guard position.isFinite, duration.isFinite, speed.isFinite,
+              duration > 0, speed > 0 else { return nil }
+        let remaining = max(0, duration - max(0, position)) / speed
+        guard remaining.isFinite, remaining <= 7 * 24 * 60 * 60 else { return nil }
+        return now.addingTimeInterval(remaining)
+    }
+}
+
+private struct PlayerEstimatedFinishTime: View {
+    @ObservedObject var clock: PlaybackClock
+    let playbackSpeed: Double
+    let status: PlayerStatus
+    let isMovie: Bool
+    let isScrubbing: Bool
+    let pendingSeekDelta: Double
+
+    var body: some View {
+        if status == .playing || status == .paused {
+            TimelineView(.periodic(from: .now, by: 30)) { _ in
+                let position = isScrubbing ? (clock.scrubTarget ?? clock.position) : clock.position + pendingSeekDelta
+                if let end = PlayerFinishEstimate.date(now: Date(), position: position, duration: clock.duration, speed: playbackSpeed) {
+                    let time = end.formatted(date: .omitted, time: .shortened)
+                    let label: String = {
+                        if status == .paused {
+                            return L10n.format("player_ends_if_resumed", fallback: "If resumed now, ends at %@", time)
+                        }
+                        if isMovie {
+                            return L10n.format("player_movie_ends_at", fallback: "The movie will end at %@", time)
+                        }
+                        return L10n.format("player_ends_at", fallback: "Ends at %@", time)
+                    }()
+                    Text(label)
+                        .font(.system(size: 19, weight: .medium))
+                        .foregroundColor(.white.opacity(0.76))
+                        .shadow(color: .black.opacity(0.9), radius: 4)
+                        .frame(maxWidth: .infinity, alignment: .trailing)
+                        .accessibilityLabel(label)
+                }
+            }
+        }
+    }
+}
+
 private struct PlayerTimelineBar: View {
     @ObservedObject var clock: PlaybackClock
     let isTimelineFocused: Bool
@@ -1705,7 +1766,7 @@ struct GlassControlsContainer<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             GlassEffectContainer(spacing: 28) { content }
         } else {
             content
@@ -1716,7 +1777,7 @@ struct GlassControlsContainer<Content: View>: View {
 extension View {
     @ViewBuilder
     func glassCircle() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular.interactive(), in: .circle)
         } else {
             background(.ultraThinMaterial, in: Circle())
@@ -1725,7 +1786,7 @@ extension View {
 
     @ViewBuilder
     func glassCircleSurface() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular, in: .circle)
         } else {
             background(.ultraThinMaterial, in: Circle())
@@ -1734,7 +1795,7 @@ extension View {
 
     @ViewBuilder
     func glassCapsule() -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular.interactive(), in: .capsule)
         } else {
             background(.ultraThinMaterial, in: Capsule())
@@ -1743,7 +1804,7 @@ extension View {
 
     @ViewBuilder
     func glassRoundedRect(cornerRadius: CGFloat) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
         } else {
             background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
@@ -1764,7 +1825,7 @@ struct TvCardGlassBackground<S: InsettableShape>: ViewModifier {
                 .background(.ultraThinMaterial, in: shape)
                 .overlay(shape.stroke(Color.white, lineWidth: 2.5))
         } else {
-            if #available(tvOS 26.0, *) {
+            if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                 content
                     .background(Color.black.opacity(0.25), in: shape)
                     .background(Color.white.opacity(0.08), in: shape)
@@ -1786,6 +1847,8 @@ struct TvCardGlassBackground<S: InsettableShape>: ViewModifier {
 // the upcoming episode's thumbnail, and manual Play/Cancel Auto-Play actions.
 struct NextEpisodeOverlay: View {
     let episode: NuvioVideo
+    let isEpisodeWatched: Bool
+    let isRevealableNextEpisode: Bool
     let isAdvancing: Bool
     var isFocused: Bool
     let isAutoPlayCancelled: Bool
@@ -1793,6 +1856,7 @@ struct NextEpisodeOverlay: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
 
     private var overlayCornerRadius: CGFloat {
         max(14, AppCardStyle.episodeCornerRadius(for: cardCornerRadiusSetting))
@@ -1803,7 +1867,9 @@ struct NextEpisodeOverlay: View {
     }
 
     private var episodeLine: String {
-        if hideUnwatchedEpisodeTitles {
+        if hideUnwatchedEpisodeTitles
+            && !isEpisodeWatched
+            && !(revealNextEpisodeSpoilers && isRevealableNextEpisode) {
             return "S\(episode.season) E\(episode.episode)"
         }
         return "S\(episode.season) E\(episode.episode) • \(episode.title)"
@@ -1873,9 +1939,15 @@ struct NextEpisodeOverlay: View {
             }
         }
         .frame(width: 158, height: 90)
-        .scaleEffect(blurUnwatchedEpisodes ? 1.08 : 1.0)
-        .blur(radius: blurUnwatchedEpisodes ? 14 : 0)
+        .scaleEffect(shouldBlurThumbnail ? 1.08 : 1.0)
+        .blur(radius: shouldBlurThumbnail ? 14 : 0)
         .clipShape(RoundedRectangle(cornerRadius: thumbCornerRadius, style: .continuous))
+    }
+
+    private var shouldBlurThumbnail: Bool {
+        blurUnwatchedEpisodes
+            && !isEpisodeWatched
+            && !(revealNextEpisodeSpoilers && isRevealableNextEpisode)
     }
 
     private var playButton: some View {
@@ -1959,11 +2031,14 @@ struct PlayerGlassCircleButtonBackground: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if filled {
-            content.background(Color.white, in: Circle())
-        } else if #available(tvOS 26.0, *) {
-            content.glassEffect(.regular, in: Circle())
+            content
+                .background(Color.white, in: Circle())
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
+            content
+                .glassEffect(.regular, in: Circle())
         } else {
-            content.background(.ultraThinMaterial, in: Circle())
+            content
+                .background(.ultraThinMaterial, in: Circle())
         }
     }
 }

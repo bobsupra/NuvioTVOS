@@ -1092,7 +1092,14 @@ private struct CollectionFolderTabButton: View {
         .focused($isFocused)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1.0)
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : .easeOut(duration: 0.12), value: isFocused)
+        .animation(
+            smoothFocus
+                ? (AppleTVCapability.current.supportsLiquidGlass
+                    ? .spring(response: 0.28, dampingFraction: 0.75)
+                    : .easeOut(duration: 0.12))
+                : .easeOut(duration: 0.12),
+            value: isFocused
+        )
         .animation(.easeOut(duration: 0.12), value: isSelected)
     }
 
@@ -1185,8 +1192,8 @@ struct CollectionFolderResultCard: View {
                     )
                 )
                 .shadow(
-                    color: .black.opacity(focused ? 0.5 : 0.2),
-                    radius: focused ? 16 : 6
+                    color: .black.opacity(focused ? 0.5 : 0),
+                    radius: focused ? 16 : 0
                 )
 
                 if posterLabels {
@@ -1211,7 +1218,14 @@ struct CollectionFolderResultCard: View {
             meta: meta,
             onOpenDetails: action
         )
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: focused)
+        .animation(
+            smoothFocus
+                ? (AppleTVCapability.current.supportsLiquidGlass
+                    ? .spring(response: 0.28, dampingFraction: 0.75)
+                    : .easeOut(duration: 0.12))
+                : nil,
+            value: focused
+        )
         .zIndex(focused ? 1 : 0)
     }
 

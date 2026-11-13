@@ -190,6 +190,9 @@ struct PosterCard: View {
     /// for a genuinely fresh drop) and the progress bar is hidden, since there's
     /// no real playback position yet.
     var continueIsUpNext: Bool = false
+    /// Set only when this Up Next item is the one eligible successor in the
+    /// watched series guide; Calendar cards never receive this evidence.
+    var continueEpisodeSpoilerRevealable: Bool = false
     var continueUpNextBadgeText: String? = nil
     var collectionOrigin: CollectionOriginPresentation? = nil
     /// Continue Watching: AniList's mark on an AniList title (as in Search) when no collection
@@ -248,12 +251,17 @@ struct PosterCard: View {
     @AppStorage(SettingsKey.continueWatchingBlurNextUp) private var continueWatchingBlurNextUp = false
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
+    @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
     @State private var loadedCustomLandscapeArtworkURL: String?
 
     private var shouldBlurNextUpArtwork: Bool {
-        (continueWatchingBlurNextUp || blurUnwatchedEpisodes)
+        (continueWatchingBlurNextUp
+            || (blurUnwatchedEpisodes
+                && !(revealNextEpisodeSpoilers && continueEpisodeSpoilerRevealable)))
             && continueIsUpNext
             && continueEpisodeArtworkURL != nil
+            && effectiveLandscape
+            && imageUrl == continueEpisodeArtworkURL
     }
 
     #if os(tvOS)
@@ -585,7 +593,9 @@ struct PosterCard: View {
                         isActive: showsFocusedAppearance, minimumScaleFactor: 0.82)
 
             if showsContinueWatchingLabels, let continueEpisodeTitleText, !continueEpisodeTitleText.isEmpty {
-                if !(hideUnwatchedEpisodeTitles && continueIsUpNext) {
+                if !(hideUnwatchedEpisodeTitles
+                    && continueIsUpNext
+                    && !(revealNextEpisodeSpoilers && continueEpisodeSpoilerRevealable)) {
                     MarqueeText(continueEpisodeTitleText, size: 23, weight: .medium, color: .white.opacity(0.66),
                                 isActive: showsFocusedAppearance, minimumScaleFactor: 0.82)
                 }
@@ -950,11 +960,11 @@ struct PosterCard: View {
     }
 
     private var shadowOpacity: Double {
-        showsFocusedAppearance ? 0.24 : 0.12
+        showsFocusedAppearance ? 0.24 : 0
     }
 
     private var shadowRadius: CGFloat {
-        showsFocusedAppearance ? 10 : 4
+        showsFocusedAppearance ? 10 : 0
     }
 
     private var titleColor: Color {
@@ -1062,7 +1072,7 @@ struct PosterCard: View {
     }
 
     private var shadowOpacity: Double {
-        0.2
+        !AppleTVCapability.current.supportsLiquidGlass ? 0 : 0.2
     }
 
     private var shadowRadius: CGFloat {
@@ -1110,6 +1120,8 @@ extension PosterCard: Equatable {
             && lhs.continueEpisodeTitleText == rhs.continueEpisodeTitleText
             && lhs.continueEpisodeArtworkURL == rhs.continueEpisodeArtworkURL
             && lhs.continueIsUpNext == rhs.continueIsUpNext
+            && lhs.continueEpisodeSpoilerRevealable == rhs.continueEpisodeSpoilerRevealable
+            && lhs.revealNextEpisodeSpoilers == rhs.revealNextEpisodeSpoilers
             && lhs.continueUpNextBadgeText == rhs.continueUpNextBadgeText
             && lhs.showsWatchedBadge == rhs.showsWatchedBadge
             && lhs.shouldRequestInitialFocus == rhs.shouldRequestInitialFocus
@@ -1609,8 +1621,8 @@ struct PosterGridCard: View {
                 )
             )
             .shadow(
-                color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2),
-                radius: showsFocusedAppearance ? 16 : 6
+                color: .black.opacity(showsFocusedAppearance ? 0.5 : 0),
+                radius: showsFocusedAppearance ? 16 : 0
             )
 
             if posterLabels || forceShowLabels {
@@ -1659,7 +1671,11 @@ struct PosterGridCard: View {
             }
         }
         .animation(
-            smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil,
+            smoothFocus
+                ? (AppleTVCapability.current.supportsLiquidGlass
+                    ? .spring(response: 0.28, dampingFraction: 0.75)
+                    : .easeOut(duration: 0.14))
+                : nil,
             value: showsFocusedAppearance
         )
     }
@@ -1727,7 +1743,7 @@ struct LiquidGlassSurface: ViewModifier {
                 )
         } else {
             #if os(tvOS)
-            if #available(tvOS 26.0, *) {
+            if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                 content
                     .background(
                         Color.white.opacity(prominent ? 0.16 : 0.08),
@@ -1782,7 +1798,7 @@ struct LiquidGlassCardModifier: ViewModifier {
                 .background {
                     #if os(tvOS)
                     if isFocused {
-                        if #available(tvOS 26.0, *) {
+                        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                             shape
                                 .fill(Color.white.opacity(0.16))
                                 .glassEffect(.regular, in: shape)
@@ -1840,7 +1856,7 @@ struct LiquidGlassBadgeModifier: ViewModifier {
     func body(content: Content) -> some View {
         if isFocused {
             #if os(tvOS)
-            if #available(tvOS 26.0, *) {
+            if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                 content
                     .glassEffect(.regular, in: shape)
                     .overlay(
@@ -2246,11 +2262,14 @@ actor PosterArtworkCache {
     static let shared = PosterArtworkCache()
     private static let tracker = NSCacheMemoryTracker(
         maxCost: {
+            if !AppleTVCapability.current.supportsLiquidGlass {
+                return 80 * 1024 * 1024 // 80 MB (Apple TV 4K Gen 1 / HD)
+            }
             let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
             if gib > 3.5 {
                 return 140 * 1024 * 1024 // 140 MB (Apple TV 4K Gen 2/3)
             } else if gib > 2.5 {
-                return 100 * 1024 * 1024 // 100 MB (Apple TV 4K Gen 1)
+                return 100 * 1024 * 1024 // 100 MB
             } else {
                 return 60 * 1024 * 1024  // 60 MB (Apple TV HD)
             }
@@ -2266,7 +2285,10 @@ actor PosterArtworkCache {
 
     init() {
         let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
-        if gib > 3.5 {
+        if !AppleTVCapability.current.supportsLiquidGlass {
+            cache.countLimit = 120
+            cache.totalCostLimit = Self.tracker.maxCost
+        } else if gib > 3.5 {
             cache.countLimit = 220
             cache.totalCostLimit = Self.tracker.maxCost
         } else if gib > 2.5 {
@@ -2522,7 +2544,7 @@ private let posterURLSession: URLSession = {
     config.timeoutIntervalForResource = 20
     config.httpMaximumConnectionsPerHost = 10
     let totalRam = ProcessInfo.processInfo.physicalMemory
-    let isLegacyDevice = totalRam <= 2_500_000_000 // <= 2.5 GB (Apple TV HD)
+    let isLegacyDevice = totalRam <= 2_500_000_000 || !AppleTVCapability.current.supportsLiquidGlass
     config.urlCache = URLCache(
         memoryCapacity: isLegacyDevice ? (8 * 1024 * 1024) : (20 * 1024 * 1024),
         diskCapacity: isLegacyDevice ? (50 * 1024 * 1024) : (100 * 1024 * 1024),

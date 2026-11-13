@@ -222,7 +222,7 @@ enum TmdbDetailsService {
         config.waitsForConnectivity = false
         config.requestCachePolicy = .useProtocolCachePolicy
         let totalRam = ProcessInfo.processInfo.physicalMemory
-        let isLegacyDevice = totalRam <= 2_500_000_000 // <= 2.5 GB (Apple TV HD)
+        let isLegacyDevice = totalRam <= 2_500_000_000 || !AppleTVCapability.current.supportsLiquidGlass
         config.urlCache = URLCache(
             memoryCapacity: isLegacyDevice ? (10 * 1024 * 1024) : (30 * 1024 * 1024),
             diskCapacity: isLegacyDevice ? (50 * 1024 * 1024) : (150 * 1024 * 1024),
