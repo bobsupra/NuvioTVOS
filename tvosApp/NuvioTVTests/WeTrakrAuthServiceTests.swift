@@ -907,6 +907,13 @@ final class WeTrakrAuthServiceTests: XCTestCase {
         )
         XCTAssertTrue(started)
 
+        // Exercise history sync when WeTrakr owns only the library, while the
+        // live playback session was started before switching watch progress.
+        store.set(TraktLibrarySourceMode.wetrakr.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        TraktSettingsStore.watchProgressSource = .trakt
+        XCTAssertEqual(TraktSettingsStore.watchProgressSource(in: store), .trakt)
+        XCTAssertEqual(TraktSettingsStore.librarySourceMode(in: store), .wetrakr)
+
         let synced = await WeTrakrProgressService.syncWatchedHistory(store: store)
         XCTAssertTrue(synced)
         let requests = WeTrakrFixtureURLProtocol.capturedRequests()

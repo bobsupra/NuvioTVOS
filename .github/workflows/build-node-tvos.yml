@@ -1,0 +1,203 @@
+name: Node.js for tvOS
+
+# Builds nodejs-mobile (Node.js 24) for tvOS as NodeMobile.xcframework, the
+# runtime the original AIOStreams runs in inside Nuvio (AIOStreamsHost; the
+# tvOS changes: aio-node/node-tvos/tvos_patch.py), and publishes it as
+# NodeMobile.xcframework.zip in the release node-tvos-<nodejs-mobile tag>.
+# Vendor/NodeMobile/Package.swift points at that release: after a new build,
+# update its URL and the checksum this workflow prints.
+on:
+  workflow_dispatch:
+    inputs:
+      reuse_run:
+        description: "Publish the two slices of an earlier run of this workflow (its id) instead of building"
+        required: false
+        default: ""
+      publish:
+        description: "Publish the release (off: the zip as an artifact only)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  actions: read
+
+env:
+  NODEJS_MOBILE_TAG: v24.20.0-0
+  TVOS_DEPLOYMENT_TARGET: "18.0"
+
+jobs:
+  build:
+    if: inputs.reuse_run == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [arm64, arm64-simulator]
+    runs-on: xcode-27
+    timeout-minutes: 350
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 3G
+      CCACHE_SLOPPINESS: pch_defines,time_macros,include_file_mtime,include_file_ctime
+      CCACHE_BASEDIR: ${{ github.workspace }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        # Node + V8 objects, archives and the compiler cache need ~25 GB.
+        run: |
+          df -h / | tail -1
+          keep="$(xcode-select -p | sed 's#/Contents/Developer##')"
+          for app in /Applications/Xcode*.app; do
+            [ "$app" = "$keep" ] || sudo rm -rf "$app" &
+          done
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent}" ~/Library/Android ~/.android ~/.dotnet /usr/local/share/dotnet \
+            /Users/runner/hostedtoolcache/CodeQL /Users/runner/hostedtoolcache/go /Users/runner/hostedtoolcache/Ruby \
+            /Users/runner/hostedtoolcache/PyPy ~/.ghcup /usr/local/lib/node_modules &
+          wait
+          df -h / | tail -1
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk appletvos --show-sdk-path
+          xcrun --sdk appletvsimulator --show-sdk-path
+          echo "cores: $(sysctl -n hw.ncpu)"
+          brew list ccache >/dev/null 2>&1 || brew install ccache
+
+      - name: Source (nodejs-mobile ${{ env.NODEJS_MOBILE_TAG }})
+        run: git clone --depth 1 --branch "$NODEJS_MOBILE_TAG" https://github.com/digidem/nodejs-mobile node-src
+
+      - name: Patch for tvOS
+        run: python3 aio-node/node-tvos/tvos_patch.py node-src "$TVOS_DEPLOYMENT_TARGET"
+
+      - name: Restore compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-node-tvos-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: ccache-node-tvos-${{ matrix.target }}-
+
+      - name: Build
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/cc"
+          printf '#!/bin/sh\nexec ccache clang "$@"\n' > "$RUNNER_TEMP/cc/cc"
+          printf '#!/bin/sh\nexec ccache clang++ "$@"\n' > "$RUNNER_TEMP/cc/cxx"
+          chmod +x "$RUNNER_TEMP/cc/cc" "$RUNNER_TEMP/cc/cxx"
+          export CC="$RUNNER_TEMP/cc/cc" CXX="$RUNNER_TEMP/cc/cxx"
+          export CC_host="$CC" CXX_host="$CXX"
+          cd node-src
+          python3 -m venv .venv
+          source .venv/bin/activate
+          python3 -m pip install --quiet setuptools
+          ./tools/ios_framework_prepare.sh ${{ matrix.target }} 2>&1 | tee ../build.log
+
+      - name: Report errors
+        if: failure()
+        run: |
+          df -h / | tail -1
+          grep -E "(error|fatal error): " build.log | sed -E 's#^.*/node-src/##' | sort | uniq -c | sort -rn | head -60 \
+            | while IFS= read -r line; do echo "::error::$line"; done
+          grep -cE "error: " build.log || true
+
+      - name: Save compiler cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-node-tvos-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.target }}
+          path: build.log
+
+      - name: Headers
+        if: matrix.target == 'arm64'
+        run: |
+          cd node-src
+          bash tools/copy_libnode_headers.sh ios
+          mkdir -p ../headers && cp -R out_ios/libnode/include ../headers/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: node-tvos-${{ matrix.target }}
+          path: node-src/out_ios_${{ matrix.target }}
+
+      - if: matrix.target == 'arm64'
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-tvos-headers
+          path: headers
+
+  release:
+    needs: build
+    if: always() && (needs.build.result == 'success' || needs.build.result == 'skipped')
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - name: The two slices (this run)
+        if: inputs.reuse_run == ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: node-tvos-arm64*
+      - name: The two slices (run ${{ inputs.reuse_run }})
+        if: inputs.reuse_run != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: node-tvos-arm64*
+          run-id: ${{ inputs.reuse_run }}
+          github-token: ${{ github.token }}
+      - name: NodeMobile.xcframework.zip
+        id: zip
+        run: |
+          set -euo pipefail
+          # The frameworks themselves, not the build's EagerLinkingTBDs stubs of the same name.
+          device=$(find node-tvos-arm64 -path '*Release-appletvos/NodeMobile.framework' -not -path '*EagerLinkingTBDs*' -type d | head -1)
+          simulator=$(find node-tvos-arm64-simulator -path '*Release-appletvsimulator/NodeMobile.framework' -not -path '*EagerLinkingTBDs*' -type d | head -1)
+          [ -f "$device/NodeMobile" ] && [ -f "$simulator/NodeMobile" ] || { echo "::error::NodeMobile.framework not found"; exit 1; }
+          for framework in "$device" "$simulator"; do
+            before=$(du -sh "$framework/NodeMobile" | cut -f1)
+            xcrun strip -S -x "$framework/NodeMobile"
+            # Stripping breaks the signature from the Node build: sign again (ad hoc),
+            # or dyld kills the app ("Code Signature Invalid"). The app's build signs it too.
+            codesign --force --sign - --timestamp=none "$framework"
+            codesign --verify --verbose=1 "$framework"
+            echo "$(basename "$(dirname "$framework")"): NodeMobile $before → $(du -sh "$framework/NodeMobile" | cut -f1)"
+            # AIOStreamsHost finds node_start with dlsym. awk reads all of nm's output: no SIGPIPE under pipefail.
+            nm -gU "$framework/NodeMobile" | awk '$3 == "_node_start" { found = 1 } END { exit !found }' \
+              || { echo "::error::node_start missing in $framework"; exit 1; }
+          done
+          mkdir -p out
+          xcodebuild -create-xcframework -framework "$device" -framework "$simulator" -output out/NodeMobile.xcframework
+          (cd out && ditto -c -k --sequesterRsrc --keepParent NodeMobile.xcframework NodeMobile.xcframework.zip)
+          checksum=$(swift package compute-checksum out/NodeMobile.xcframework.zip)
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+          echo "::notice::NodeMobile.xcframework.zip $(du -h out/NodeMobile.xcframework.zip | cut -f1) · checksum $checksum"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NodeMobile.xcframework
+          path: out/NodeMobile.xcframework.zip
+      - name: Release node-tvos-${{ env.NODEJS_MOBILE_TAG }}
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHECKSUM: ${{ steps.zip.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          tag="node-tvos-$NODEJS_MOBILE_TAG"
+          notes="nodejs-mobile $NODEJS_MOBILE_TAG for tvOS $TVOS_DEPLOYMENT_TARGET+ (device arm64, simulator arm64), for AIOStreams in Nuvio.
+
+          Vendor/NodeMobile/Package.swift:
+          url: https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/NodeMobile.xcframework.zip
+          checksum: $CHECKSUM"
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" out/NodeMobile.xcframework.zip --clobber -R "$GITHUB_REPOSITORY"
+            gh release edit "$tag" --notes "$notes" -R "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" out/NodeMobile.xcframework.zip --title "Node.js for tvOS ($NODEJS_MOBILE_TAG)" \
+              --notes "$notes" --target "$GITHUB_SHA" --latest=false -R "$GITHUB_REPOSITORY"
+          fi
+          echo "::notice::https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/NodeMobile.xcframework.zip · $CHECKSUM"

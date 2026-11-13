@@ -1,0 +1,8 @@
+{
+  "name": "bcryptjs",
+  "version": "3.0.3",
+  "description": "bcryptjs 3.0.3 (MIT, https://github.com/dcodeIO/bcrypt.js): its UMD build, vendored for the bcrypt shim.",
+  "type": "commonjs",
+  "main": "index.js",
+  "license": "MIT"
+}

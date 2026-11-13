@@ -1272,7 +1272,8 @@ struct WeTrakrProgressService {
         completionID: String,
         store: UserDefaults,
         profileId: String?,
-        context: WeTrakrRequestContext
+        context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool = true
     ) async -> Bool {
         guard let owner = livePlaybackOwners[context.accountID],
               owner.playbackID == completionID,
@@ -1280,7 +1281,7 @@ struct WeTrakrProgressService {
               owner.season == completion.season,
               owner.episode == completion.episode,
               WatchedStore.sameContent(owner.meta, completion.meta),
-              contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true),
+              contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource),
               let idempotencyKey = cancellationIdempotencyKey(for: completionID) else {
             return false
         }
@@ -1313,7 +1314,7 @@ struct WeTrakrProgressService {
                 idempotencyKey: idempotencyKey
             )
             _ = try response.valueOrThrow()
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true),
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource),
                   livePlaybackOwners[context.accountID]?.playbackID == completionID else {
                 return false
             }
@@ -1358,7 +1359,8 @@ struct WeTrakrProgressService {
         _ completion: WatchedPlaybackCompletionUpload,
         store: UserDefaults,
         profileId: String?,
-        context: WeTrakrRequestContext
+        context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool
     ) async -> Bool {
         guard let owner = livePlaybackOwners[context.accountID] else { return true }
         guard owner.playbackID == completion.completionID else { return true }
@@ -1380,7 +1382,8 @@ struct WeTrakrProgressService {
             completionID: completion.completionID,
             store: store,
             profileId: profileId,
-            context: context
+            context: context,
+            requiresWeTrakrSource: requiresWeTrakrSource
         )
     }
 
@@ -1509,17 +1512,13 @@ struct WeTrakrProgressService {
                 continue
             }
             guard completionAccountID == context.accountID else { continue }
-            let cancelledLivePlayback: Bool
-            if requiresWeTrakrSource {
-                cancelledLivePlayback = await cancelOwnedLivePlaybackIfPresent(
-                    completion,
-                    store: store,
-                    profileId: profileId,
-                    context: context
-                )
-            } else {
-                cancelledLivePlayback = true
-            }
+            let cancelledLivePlayback = await cancelOwnedLivePlaybackIfPresent(
+                completion,
+                store: store,
+                profileId: profileId,
+                context: context,
+                requiresWeTrakrSource: requiresWeTrakrSource
+            )
             guard cancelledLivePlayback,
                   await sendPlaybackCompletion(
                     completion,

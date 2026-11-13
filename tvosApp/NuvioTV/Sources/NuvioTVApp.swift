@@ -929,6 +929,7 @@ struct ContentView: View {
         .onAppear {
             Task { await releaseUpdateService.checkIfNeeded() }
             Task { await announcementService.checkIfNeeded() }
+            startAIOStreamsAndPlugins()
             if WatchPartyConfiguration.isEnabled {
                 watchPartyOwner.attach(authManager: authManager, profiles: profileViewModel)
             }
@@ -1031,6 +1032,7 @@ struct ContentView: View {
                     Task(priority: .utility) {
                         await JellyfinSessionManager.shared.handleForegroundSession()
                     }
+                    pluginsBecameActive()
                 }
                 Task { await releaseUpdateService.checkIfNeeded() }
                 Task { await announcementService.checkIfNeeded() }
@@ -1378,6 +1380,22 @@ struct ContentView: View {
               id.profileID == profileViewModel.activeProfile?.id else { return nil }
         return CollectionHomeDestination.configured(profileID: id.profileID)
             .first { $0.id == id }?.folder
+    }
+
+    /// AIOStreams (when it starts with Nuvio), and the plugins' repository
+    /// updates once the first screen has loaded. Out of `body`: its long chain of
+    /// modifiers is all the type checker gets through in time.
+    private func startAIOStreamsAndPlugins() {
+        AIOStreamsHost.shared.startIfWanted()
+        Task(priority: .utility) {
+            try? await Task.sleep(nanoseconds: 8_000_000_000)
+            await PluginStore.shared.appBecameActive()
+        }
+    }
+
+    /// The plugins' repository updates when Nuvio comes back.
+    private func pluginsBecameActive() {
+        Task(priority: .utility) { await PluginStore.shared.appBecameActive() }
     }
 
     /// Handles Top Shelf, `nuvio://` / `nuvio-tv://` title open, and

@@ -1,0 +1,7 @@
+{
+  "name": "yencode",
+  "version": "0.0.0-nuvio-tvos",
+  "description": "Nuvio on Apple TV: AIOStreams' own Usenet engine is off (Nuvio Usenet plays nzbUrl streams natively), so its yEnc native addon is a stub.",
+  "main": "index.js",
+  "license": "MIT"
+}

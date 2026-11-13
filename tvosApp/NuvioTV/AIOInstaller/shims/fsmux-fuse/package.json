@@ -1,0 +1,7 @@
+{
+  "name": "@viren070/fsmux-fuse",
+  "version": "0.0.0-nuvio-tvos",
+  "description": "Nuvio on Apple TV: FUSE mounts don't exist on tvOS; AIOStreams sees FUSE as unavailable.",
+  "main": "index.js",
+  "license": "MIT"
+}

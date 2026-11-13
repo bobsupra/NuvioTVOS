@@ -29,6 +29,12 @@ enum AniListStreamIds {
         return await ids(for: videoId)
     }
 
+    /// The ids an AniList title converts to, best first, whatever "Ask Other Add-ons" says: for
+    /// the AIOStreams addon (AIOStreamsHost), whose own setting decides.
+    static func convertedIDs(for videoId: String) async -> [String] {
+        await ids(for: videoId)
+    }
+
     /// The IMDb episode id (`tt…:season:episode`) of an AniList episode, for its ratings from the
     /// rating add-ons. nil for other ids, a film, or an episode nothing places.
     static func imdbEpisodeID(for videoId: String) async -> String? {

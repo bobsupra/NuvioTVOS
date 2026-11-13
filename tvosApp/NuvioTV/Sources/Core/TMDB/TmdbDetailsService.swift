@@ -314,6 +314,16 @@ enum TmdbDetailsService {
         return nil
     }
 
+    /// The TMDB id a plugin's `getStreams` receives for an IMDb title, as on
+    /// Android: any configured TMDB key is used, nil without one or a match.
+    static func pluginTmdbId(forImdb imdbId: String, mediaType: String) async -> Int? {
+        if requestContext == nil {
+            return await withRequestContext { await pluginTmdbId(forImdb: imdbId, mediaType: mediaType) }
+        }
+        guard apiKey != nil, imdbId.hasPrefix("tt") else { return nil }
+        return await findByImdb(imdbId, mediaTypeHint: mediaType)?.id
+    }
+
     static func fetchCompanies(for meta: NuvioMeta) async -> [MetaCompany] {
         if requestContext == nil {
             return await withRequestContext { await fetchCompanies(for: meta) }

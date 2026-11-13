@@ -1,0 +1,7 @@
+{
+  "name": "better-sqlite3",
+  "version": "0.0.0-nuvio-tvos",
+  "description": "Nuvio on Apple TV: the part of better-sqlite3 AIOStreams uses, on Node's built-in node:sqlite (no native addon).",
+  "main": "index.js",
+  "license": "MIT"
+}

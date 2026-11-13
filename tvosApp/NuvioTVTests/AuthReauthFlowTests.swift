@@ -1,6 +1,92 @@
 import XCTest
 @testable import NuvioTV
 
+private enum ProfileManagerTestDefaults {
+    private static let profilesKey = "nuvio.profiles"
+    private static let primaryProfileKey = "nuvio.tv.profile.settings.isPrimary"
+
+    static func seedEmptyProfiles() {
+        UserDefaults.standard.set(Data("[]".utf8), forKey: profilesKey)
+    }
+
+    static func restoreProfiles(_ value: Any?) {
+        if let value {
+            UserDefaults.standard.set(value, forKey: profilesKey)
+        } else {
+            UserDefaults.standard.removeObject(forKey: profilesKey)
+        }
+    }
+
+    static func seedIsolatedProfileScope(_ profileID: String) {
+        guard let suite = UserDefaults(suiteName: "nuvio.tv.profile.settings.\(profileID)") else { return }
+        suite.set(profileID, forKey: "nuvio.tv.profile.settings.profileID")
+        suite.set(true, forKey: "nuvio.tv.profile.settings.seeded")
+        suite.set(false, forKey: primaryProfileKey)
+        suite.set(true, forKey: "nuvio.tv.profile.settings.traktIsolation.v1")
+        suite.set(true, forKey: "nuvio.tv.profile.settings.simklIsolation.v1")
+        suite.set(true, forKey: "nuvio.tv.profile.settings.mdbListIsolation.v1")
+
+        // A scoped empty list prevents activation from consuming shared legacy history.
+        UserDefaults.standard.set(
+            Data("[]".utf8),
+            forKey: "nuvio.tv.continueWatching.items.\(profileID)"
+        )
+    }
+
+    static func cleanIsolatedProfileScopes(_ profileIDs: [String]) {
+        for profileID in profileIDs {
+            ContinueWatchingStore.eraseProfile(profileID)
+            UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(profileID)")
+            UserDefaults.standard.removeObject(forKey: "nuvio.tv.continueWatching.items.\(profileID)")
+        }
+    }
+}
+
+private struct ProfileTestContextSnapshot {
+    private static let primaryProfileKey = "nuvio.tv.profile.settings.isPrimary"
+    private static let lastActiveProfileKey = "nuvio.lastActiveProfileId"
+    private static let managerActiveProfileKey = "nuvio.active_profile_id"
+
+    private let profileSettingsID = ProfileSettings.activeProfileID
+    private let profileSettingsStore = ProfileSettings.current
+    private let primaryProfileValue = ProfileSettings.current.object(forKey: Self.primaryProfileKey)
+    private let continueWatchingID = ContinueWatchingStore.activeProfileId
+    private let watchProgressID = WatchProgressLedger.activeProfileId
+    private let continueWatchingDismissID = ContinueWatchingDismissStore.activeProfileId
+    private let libraryID = LibraryStore.activeProfileId
+    private let watchedID = WatchedStore.activeProfileId
+    private let collectionsID = CollectionsStore.activeProfileId
+    private let lastActiveProfileValue = UserDefaults.standard.object(forKey: Self.lastActiveProfileKey)
+    private let managerActiveProfileValue = UserDefaults.standard.object(forKey: Self.managerActiveProfileKey)
+
+    func restore() {
+        if let profileSettingsID {
+            ProfileSettings.setActiveProfile(profileSettingsID, isPrimary: primaryProfileValue as? Bool)
+        } else {
+            ProfileSettings.clearActiveProfile()
+        }
+        Self.restore(primaryProfileValue, key: Self.primaryProfileKey, in: profileSettingsStore)
+
+        ContinueWatchingStore.setActiveProfile(continueWatchingID)
+        WatchProgressLedger.setActiveProfile(watchProgressID)
+        ContinueWatchingDismissStore.setActiveProfile(continueWatchingDismissID)
+        LibraryStore.setActiveProfile(libraryID)
+        WatchedStore.setActiveProfile(watchedID)
+        CollectionsStore.setActiveProfile(collectionsID)
+
+        Self.restore(lastActiveProfileValue, key: Self.lastActiveProfileKey, in: .standard)
+        Self.restore(managerActiveProfileValue, key: Self.managerActiveProfileKey, in: .standard)
+    }
+
+    private static func restore(_ value: Any?, key: String, in defaults: UserDefaults) {
+        if let value {
+            defaults.set(value, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+}
+
 final class AuthReauthFlowTests: XCTestCase {
 
     func testAuthSessionExpiration() {
@@ -310,15 +396,25 @@ final class MdbListProfileIsolationTests: XCTestCase {
 
 final class ProfileManagerLimitTests: XCTestCase {
     private var tempDir: URL!
+    private var originalProfiles: Any?
+    private var profileContextSnapshot: ProfileTestContextSnapshot!
+    private var fixtureProfileIDs: [String] = []
 
     override func setUpWithError() throws {
         try super.setUpWithError()
+        originalProfiles = UserDefaults.standard.object(forKey: "nuvio.profiles")
+        profileContextSnapshot = ProfileTestContextSnapshot()
+        fixtureProfileIDs = []
+        ProfileManagerTestDefaults.seedEmptyProfiles()
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("profile-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
 
     override func tearDownWithError() throws {
+        profileContextSnapshot.restore()
+        ProfileManagerTestDefaults.cleanIsolatedProfileScopes(fixtureProfileIDs)
         try? FileManager.default.removeItem(at: tempDir)
+        ProfileManagerTestDefaults.restoreProfiles(originalProfiles)
         try super.tearDownWithError()
     }
 
@@ -351,10 +447,12 @@ final class ProfileManagerLimitTests: XCTestCase {
 
     @MainActor
     func testProfileViewModelCanAddProfileAndErrorHandling() throws {
+        let profiles = (1...6).map { Profile(id: UUID().uuidString, name: "User \($0)") }
+        fixtureProfileIDs = profiles.map(\.id)
+        ProfileManagerTestDefaults.seedIsolatedProfileScope(profiles[0].id)
+        let data = try JSONEncoder().encode(profiles.map(StoredProfile.init(from:)))
+        try data.write(to: tempDir.appendingPathComponent("nuvio-profiles.json"))
         let manager = try ProfileManager(baseDir: tempDir.path)
-        for i in 1...6 {
-            _ = try manager.createProfile(input: CreateProfileInput(name: "User \(i)", profileType: .adult, avatarId: "", pin: nil))
-        }
 
         let viewModel = ProfileViewModel(profileManager: manager)
         XCTAssertEqual(viewModel.profiles.count, 6)
@@ -364,25 +462,36 @@ final class ProfileManagerLimitTests: XCTestCase {
         XCTAssertEqual(viewModel.profileCreationError, "You've reached the maximum of 6 profiles. Remove one to create another.")
 
         // Delete one profile to free up a slot
-        if let first = viewModel.profiles.first {
-            try manager.deleteProfile(id: first.id)
-            viewModel.loadProfiles()
-            XCTAssertTrue(viewModel.canAddProfile, "canAddProfile should be true after deleting a profile")
-        }
+        let profileToDelete = try XCTUnwrap(profiles.first)
+        XCTAssertTrue(viewModel.profiles.contains(where: { $0.id == profileToDelete.id }))
+        try manager.deleteProfile(id: profileToDelete.id)
+        viewModel.loadProfiles()
+        XCTAssertFalse(viewModel.profiles.contains(where: { $0.id == profileToDelete.id }))
+        XCTAssertTrue(viewModel.canAddProfile, "canAddProfile should be true after deleting a profile")
     }
 }
 
 final class ProfileBackgroundTests: XCTestCase {
     private var tempDir: URL!
+    private var originalProfiles: Any?
+    private var profileContextSnapshot: ProfileTestContextSnapshot!
+    private var fixtureProfileIDs: [String] = []
 
     override func setUpWithError() throws {
         try super.setUpWithError()
+        originalProfiles = UserDefaults.standard.object(forKey: "nuvio.profiles")
+        profileContextSnapshot = ProfileTestContextSnapshot()
+        fixtureProfileIDs = []
+        ProfileManagerTestDefaults.seedEmptyProfiles()
         tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("profile-bg-test-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
     }
 
     override func tearDownWithError() throws {
+        profileContextSnapshot.restore()
+        ProfileManagerTestDefaults.cleanIsolatedProfileScopes(fixtureProfileIDs)
         try? FileManager.default.removeItem(at: tempDir)
+        ProfileManagerTestDefaults.restoreProfiles(originalProfiles)
         try super.tearDownWithError()
     }
 
@@ -459,20 +568,21 @@ final class ProfileBackgroundTests: XCTestCase {
 
     @MainActor
     func testProfileViewModelUpdateProfileBackground() throws {
+        let profile = Profile(id: UUID().uuidString, name: "Charlie")
+        fixtureProfileIDs = [profile.id]
+        ProfileManagerTestDefaults.seedIsolatedProfileScope(profile.id)
+        let data = try JSONEncoder().encode([StoredProfile(from: profile)])
+        try data.write(to: tempDir.appendingPathComponent("nuvio-profiles.json"))
         let manager = try ProfileManager(baseDir: tempDir.path)
-        let profile = try manager.createProfile(input: CreateProfileInput(
-            name: "Charlie",
-            profileType: .adult,
-            avatarId: "",
-            pin: nil
-        ))
 
         let viewModel = ProfileViewModel(profileManager: manager)
-        XCTAssertNil(viewModel.profiles.first?.profileBackgroundId)
+        let loadedProfile = try XCTUnwrap(viewModel.profiles.first(where: { $0.id == profile.id }))
+        XCTAssertNil(loadedProfile.profileBackgroundId)
 
         viewModel.updateProfileBackground(id: profile.id, backgroundId: "neon_pulse", backgroundUrl: nil)
-        XCTAssertEqual(viewModel.profiles.first?.profileBackgroundId, "neon_pulse")
-        XCTAssertNil(viewModel.profiles.first?.profileBackgroundUrl)
+        let updatedProfile = try XCTUnwrap(viewModel.profiles.first(where: { $0.id == profile.id }))
+        XCTAssertEqual(updatedProfile.profileBackgroundId, "neon_pulse")
+        XCTAssertNil(updatedProfile.profileBackgroundUrl)
     }
 
     @MainActor

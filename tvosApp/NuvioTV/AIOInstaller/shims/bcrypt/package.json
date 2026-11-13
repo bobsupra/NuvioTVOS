@@ -1,0 +1,7 @@
+{
+  "name": "bcrypt",
+  "version": "0.0.0-nuvio-tvos",
+  "description": "Nuvio on Apple TV: bcrypt's API on bcryptjs (pure JavaScript, no native addon).",
+  "main": "index.js",
+  "license": "MIT"
+}
