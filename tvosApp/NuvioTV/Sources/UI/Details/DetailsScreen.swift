@@ -11102,9 +11102,19 @@ private struct TvStreamPickerOverlay: View {
         return (profileID, episode?.season, episode?.episode)
     }
 
+    /// With Nuvio Recommended, the Best overall card sits above the list; focus starts there,
+    /// not on the first list row, which scrolled the recommendations out of view.
+    private var recommendedOverallFocusID: String? {
+        guard pickerSortOption == .recommended,
+              activeDisplayedStreams.contains(where: {
+                  !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0
+              }) else { return nil }
+        return "recommended::overall"
+    }
+
     private func initialStreamFocusID() -> String? {
         guard ProfileSettings.current.bool(forKey: SettingsKey.rememberLastSourceFocus),
-              let scope = rememberedSourceScope else { return activeDisplayedStreams.first?.id }
+              let scope = rememberedSourceScope else { return recommendedOverallFocusID ?? activeDisplayedStreams.first?.id }
         let candidates = activeDisplayedStreams.filter { !$0.isNotPlayable && $0.unavailabilityReason == nil }
         if let id = LastManualSourceStore.matchingID(
             in: candidates.map(\.id), profileID: scope.profileID, metaID: meta.id, type: meta.type,
@@ -11119,7 +11129,7 @@ private struct TvStreamPickerOverlay: View {
             profileID: scope.profileID, metaID: meta.id, type: meta.type,
             season: scope.season, episode: scope.episode
         ) { return nil }
-        return activeDisplayedStreams.first?.id
+        return recommendedOverallFocusID ?? activeDisplayedStreams.first?.id
     }
 
     private func seedInitialFocus() {
@@ -11131,7 +11141,7 @@ private struct TvStreamPickerOverlay: View {
                 let restored = restoredSourceFocusID.flatMap { id in
                     activeDisplayedStreams.contains(where: { $0.id == id }) ? id : nil
                 }
-                grabFocus(restored ?? activeDisplayedStreams.first?.id ?? filterAllKey, attempt: 0)
+                grabFocus(restored ?? recommendedOverallFocusID ?? activeDisplayedStreams.first?.id ?? filterAllKey, attempt: 0)
             } else if let id = initialStreamFocusID() {
                 didSeedStreamFocus = true
                 grabFocus(id, attempt: 0)
