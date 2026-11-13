@@ -40,6 +40,8 @@ final class JellyfinServerStore: ObservableObject {
         persist(updated)
         JellyfinCredentialStore.remove(forServerID: serverID)
         JellyfinLibraryIndex.shared.removeAll(forServerID: serverID)
+        // An interrupted sync leaves its checkpoint and listing pages behind.
+        JellyfinSyncCheckpoints.remove(profileID: ProfileSettings.activeProfileID ?? "default", serverID: serverID)
     }
 
     private func persist(_ servers: [JellyfinServerConfig]) {
