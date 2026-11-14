@@ -494,7 +494,37 @@ struct JellyfinClient {
         }
         var request = URLRequest(url: url)
         request.setValue(Self.authorizationHeader(token: accessToken), forHTTPHeaderField: "Authorization")
-        return try await session.data(for: request)
+        // A library sync sends many requests in a row (one or more per series for
+        // episodes). Servers behind a reverse proxy or a hosted plan can answer
+        // 429 Too Many Requests, or 503 while busy. Wait and ask again instead of
+        // failing the whole sync; the last response goes to `validate` as before.
+        var attempt = 0
+        while true {
+            let (data, response) = try await session.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 429 || http.statusCode == 503,
+                  attempt < Self.rateLimitRetryLimit else {
+                return (data, response)
+            }
+            let delay = Self.retryDelay(
+                retryAfter: http.value(forHTTPHeaderField: "Retry-After"),
+                attempt: attempt
+            )
+            attempt += 1
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+    }
+
+    static let rateLimitRetryLimit = 5
+
+    /// Seconds to wait before retrying a rate-limited request: the server's
+    /// `Retry-After` in seconds when it sends one, otherwise 1, 2, 4, 8, 16 s.
+    /// Capped at 30 s so a sync never sits silently for minutes.
+    static func retryDelay(retryAfter: String?, attempt: Int) -> TimeInterval {
+        if let retryAfter, let seconds = TimeInterval(retryAfter.trimmingCharacters(in: .whitespaces)), seconds >= 0 {
+            return min(seconds, 30)
+        }
+        return min(pow(2, Double(attempt)), 30)
     }
 
     private static func validate(_ response: URLResponse, data: Data) throws {

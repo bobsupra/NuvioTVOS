@@ -38,6 +38,15 @@ final class JellyfinClientTests: XCTestCase {
         session = URLSession(configuration: config)
     }
 
+    func testRateLimitRetryDelayUsesRetryAfterThenBacksOff() {
+        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: "3", attempt: 0), 3)
+        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: " 120 ", attempt: 0), 30)
+        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: nil, attempt: 0), 1)
+        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: nil, attempt: 3), 8)
+        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: "Wed, 21 Oct 2026 07:28:00 GMT", attempt: 1), 2)
+        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: nil, attempt: 10), 30)
+    }
+
     override func tearDown() {
         JellyfinMockURLProtocol.requestHandler = nil
         session = nil
