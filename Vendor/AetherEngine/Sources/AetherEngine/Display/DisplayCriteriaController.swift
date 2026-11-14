@@ -664,7 +664,6 @@ final class DisplayCriteriaController {
     }
 
     nonisolated static let rateSwitchSinkSettleMs = 1000
-
     /// An unbroken run of the same panel reading, in Stage 2 milliseconds.
     struct PanelCadenceRun: Equatable {
         let relation: PanelRateRelation
@@ -1389,6 +1388,18 @@ final class DisplayCriteriaController {
         return sampler.finish()
         #else
         return nil
+        #endif
+    }
+
+    /// AE#1018: whether an HDR criteria write is expected to put the panel in HDR, before the switch has
+    /// answered. tvOS exposes one combined matching flag, so a rate-only setup reads true here too; the
+    /// display's refusal of the HDR master corrects that within the first second.
+    func hdrWriteExpectedToEngagePanel() -> Bool {
+        #if os(tvOS)
+        guard let window = resolveWindow() else { return false }
+        return window.avDisplayManager.isDisplayCriteriaMatchingEnabled && AVPlayer.eligibleForHDRPlayback
+        #else
+        return false
         #endif
     }
 

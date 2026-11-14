@@ -24,7 +24,7 @@ public protocol IOReader: AnyObject, Sendable {
     /// opening it as an ordinary media container. Keep the default for raw disc images. Remote
     /// readers that already know they represent a regular media file can return `false` to avoid
     /// the sparse signature reads performed by disc recognition. Independent readers should
-    /// preserve the same value.
+    /// preserve the same value. A `DiscDirectoryReader` is recognized as a disc whatever it returns.
     var discImageProbeEnabled: Bool { get }
 }
 
@@ -69,6 +69,8 @@ public extension IOReader {
 /// The source AetherEngine loads media from.
 public enum MediaSource: Sendable {
     case url(URL)
-    /// `formatHint`: optional container short name ("mp4", "matroska", "mpegts") to disambiguate probing when no filename is present; nil probes from content.
+    /// `formatHint`: optional libavformat demuxer name ("mp4", "matroska", "mpegts"). A known name
+    /// skips content probing and opens with exactly that demuxer, so a wrong one fails the open
+    /// instead of falling back. nil, or a name libavformat does not know, probes from content.
     case custom(IOReader, formatHint: String? = nil)
 }

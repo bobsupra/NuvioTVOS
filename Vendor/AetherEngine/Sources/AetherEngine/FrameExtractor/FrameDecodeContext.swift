@@ -361,6 +361,12 @@ final class FrameDecodeContext: @unchecked Sendable {
         codec: UnsafePointer<AVCodec>,
         useHardware: Bool
     ) throws -> UnsafeMutablePointer<AVCodecContext> {
+        // Software decoding 4K HEVC for still extraction easily exhausts Apple TV memory
+        // and pins CPU cores for tens of seconds. Refuse 4K software extraction.
+        if !useHardware, codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+           (codecpar.pointee.width > 1920 || codecpar.pointee.height > 1080) {
+            throw FrameDecodeError.unsupportedCodec
+        }
         guard let ctx = avcodec_alloc_context3(codec) else {
             throw FrameDecodeError.allocationFailed
         }

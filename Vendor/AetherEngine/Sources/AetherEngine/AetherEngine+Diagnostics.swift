@@ -659,8 +659,9 @@ extension AetherEngine {
     }
 
     /// What the object renderer is doing, for `LiveTelemetry.objectAudio`; nil off `objectAudioRendering`.
+    /// AE#1026: both routes render through a `SpatialAudioBridge`, so both report it.
     var objectAudioActivity: ObjectAudioActivity? {
-        nativeVideoSession?.objectAudioActivity ?? softwareHost?.objectAudioActivity
+        softwareHost?.objectAudioActivity ?? nativeVideoSession?.objectAudioActivity
     }
 
     /// Cumulative encoded-audio bytes the bridge has emitted this session. Zero when bridge is not active

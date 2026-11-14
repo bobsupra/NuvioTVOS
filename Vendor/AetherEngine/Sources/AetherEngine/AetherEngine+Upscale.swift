@@ -21,6 +21,7 @@ extension AetherEngine {
         var frameRate: Double?
         var isSDR = true
         var isEightBit420 = true
+        var isTenBit420 = false
         if let stream = videoStream, let cp = stream.pointee.codecpar {
             let sar = PixelAspectPolicy.declaredPixelAspect(
                 bitstream: cp.pointee.sample_aspect_ratio, container: stream.pointee.sample_aspect_ratio,
@@ -30,6 +31,8 @@ extension AetherEngine {
             frameRate = Self.detectFrameRate(stream: stream)
             isSDR = UpscaleRouteDecision.isSDR(colorTransfer: cp.pointee.color_trc)
             isEightBit420 = UpscaleRouteDecision.isEightBit420(
+                pixelFormat: cp.pointee.format, bitsPerRawSample: cp.pointee.bits_per_raw_sample)
+            isTenBit420 = UpscaleRouteDecision.isTenBit420(
                 pixelFormat: cp.pointee.format, bitsPerRawSample: cp.pointee.bits_per_raw_sample)
         }
 
@@ -49,13 +52,29 @@ extension AetherEngine {
         }
 
         sourceUpscaleFrameRate = frameRate
-        return UpscaleRouteDecision.decide(
-            preference: true, osSupportsStage: osSupportsStage, metalFXSupported: metalFXSupported,
-            source: source, isSDR: isSDR, isDolbyVision: dvProfile != nil, isEightBit420: isEightBit420,
-            display: DisplayPixelSize.current() ?? .zero,
-            wirelessAirPlayRoute: wirelessAirPlayRoute, demuxedAudioLive: demuxedAudioLive,
-            mlScaleFactors: mlScaleFactors,
-            stageFailedEarlier: { UpscaleFailureMemory.contains($0, frameRate: frameRate) })
+        let display = DisplayPixelSize.current() ?? .zero
+        func decide(_ scaler: UpscaleScaler) -> UpscaleRouteDecision {
+            UpscaleRouteDecision.decide(
+                preference: true, osSupportsStage: osSupportsStage, metalFXSupported: metalFXSupported,
+                source: source, isSDR: isSDR, isDolbyVision: dvProfile != nil, isEightBit420: isEightBit420,
+                display: display,
+                wirelessAirPlayRoute: wirelessAirPlayRoute, demuxedAudioLive: demuxedAudioLive,
+                mlScaleFactors: mlScaleFactors, scaler: scaler, isTenBit420: isTenBit420,
+                stageFailedEarlier: { UpscaleFailureMemory.contains($0, frameRate: frameRate) })
+        }
+        let decision = decide(options.upscaleScaler)
+        // AE#1039: line art that overran here before starts on the rung it fell back to.
+        if let plan = decision.plan, plan.scaler == .lineArt,
+           let overrun = LineArtCostMemory.overrun(covering: plan, frameInterval: frameRate.map { 1 / $0 }, rung: .upscale) {
+            let fallback = UpscaleRouteDecision.lineArtFallback(for: plan, mlScaleFactors: mlScaleFactors) != nil
+                ? decide(.automatic) : .notTaken(.stageFailedEarlier)
+            EngineLog.emit(String(format: "[Upscale] line art overran on this device earlier (%.1f ms at %.1f ms), %@",
+                                  overrun.meanMs, overrun.frameInterval * 1000,
+                                  fallback.plan != nil ? "using the automatic scaler" : "not upscaling"),
+                           category: .engine)
+            return fallback
+        }
+        return decision
     }
 
     /// Connects the stage `host`'s load built to `activeUpscale`. The host's load can already have run it

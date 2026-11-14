@@ -142,6 +142,19 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #544: decode on the calling thread with no frame-level threading. Set before .
     var decodesSingleThreaded = false
 
+    /// Decode threads on a playback path: one per core, at most 16.
+    ///
+    /// Under frame threading every thread past the first holds one frame back until more packets
+    /// arrive, so the count is also output delay, and libavcodec warns above 16 ("Using a thread
+    /// count greater than 16 is not recommended"), where its own automatic choice stops. Uncapped on
+    /// an 18-core Mac (Mac17,6) the decoder held 17 frames: a 40-packet progressive H.264 delivered
+    /// 23, and a Live source whose reads stalled kept 17 frames it had already received off the
+    /// screen. Capped it holds at most 15, as a 16-core Mac already did; that remaining delay is
+    /// frame threading's own. Apple TV, iPhone and iPad have far fewer cores.
+    nonisolated static func playbackThreadCount(activeProcessorCount: Int) -> Int {
+        max(1, min(16, activeProcessorCount))
+    }
+
     /// The pixel buffer format this decoder hands the display layer, read off the decoded frame (audit
     /// DEC-107). The container's declaration alone missed two cases: `color_range` was never read, so a
     /// full-range AV1 / VP9 / HEVC picture was labelled video range and shown crushed, and
@@ -268,7 +281,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             width: codecpar.pointee.width,
             height: codecpar.pointee.height,
             isLive: isLiveStream,
-            availableThreadCount: ProcessInfo.processInfo.activeProcessorCount
+            availableThreadCount: Self.playbackThreadCount(
+                activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
         )
 
         if decodesSingleThreaded {
@@ -593,6 +607,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func flush() {
         flush(resetFilterGraph: true)
+    }
+
+    /// AE#1024: `flush()` discards what libavcodec still holds, which at the end of a file is the last
+    /// frames of the stream (frame threading plus B-frame reorder). A session paused in the last half
+    /// second then never got a picture at all. The empty packet puts the decoder into draining mode,
+    /// the receive loop hands those frames over, and the `flush()` the host makes next takes it out of
+    /// that mode again.
+    func drainForEndOfStream() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
+        let ret = avcodec_send_packet(ctx, nil)
+        lock.unlock()
+        guard ret >= 0 else { return }
+        drainDecodedFrames()
     }
 
     /// `resetFilterGraph: false` keeps the deinterlace graph across still-extraction runs, avoiding

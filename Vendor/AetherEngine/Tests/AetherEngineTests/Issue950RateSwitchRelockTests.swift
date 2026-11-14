@@ -57,7 +57,6 @@ struct Issue950RateSwitchRelockTests {
         #expect(!DisplayCriteriaController.endBelongsToInFlightSwitch(
             switchInFlightAtWrite: false, startNotifiedSinceWrite: false))
     }
-
     // Round 2: one fresh start in four still flashed pink noise with a correctly observed end, 200 to 300 ms
     // before playback, and the engine logs of the clean and the noisy start were identical.
     @Test("A real rate switch holds for the sink after its end, measured from the end")

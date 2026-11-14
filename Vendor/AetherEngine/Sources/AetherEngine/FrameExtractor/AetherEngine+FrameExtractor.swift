@@ -203,6 +203,9 @@ extension AetherEngine {
                 return result(reason: "dv-reshaping-unavailable")
             }
             guard !isLive else { return result(reason: "live-resident-segment-unsupported") }
+            if sourceVideoWidth > 1920 || sourceVideoHeight > 1080 {
+                return result(reason: "software-4k-dv-unsupported")
+            }
             guard let session else { return result(reason: "native-session-unavailable") }
             let itemSeconds = native.avPlayer.currentTime().seconds
             guard itemSeconds.isFinite else { return result(reason: "native-item-time-unavailable") }

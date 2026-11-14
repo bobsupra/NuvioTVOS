@@ -204,6 +204,8 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    private let isHEVCVideo: Bool
+    private var shortHEVCHeadersRemoved = 0
     /// Latched from `VideoConfig.convertsAnnexBSamples`.
     private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
@@ -318,6 +320,8 @@ final class MP4SegmentMuxer {
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
         onStorageExhausted: (@Sendable () -> Void)? = nil,
+        admitStagingBytes: (@Sendable (URL, Int) -> SegmentWriteAdmission)? = nil,
+        discardStaging: (@Sendable (URL) -> Void)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -328,6 +332,7 @@ final class MP4SegmentMuxer {
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
         self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
+        self.isHEVCVideo = video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -362,6 +367,10 @@ final class MP4SegmentMuxer {
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.currentPath = firstPath
+        counter.ownedPaths.insert(firstPath)
+        counter.admitStagingBytes = admitStagingBytes
+        counter.discardStaging = discardStaging
         counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
@@ -391,6 +400,14 @@ final class MP4SegmentMuxer {
             },
             onFragmentBytes: { ptr, count in
                 guard !counter.writeFailed, counter.fd >= 0 else { return }
+                if let path = counter.currentPath, let admit = counter.admitStagingBytes {
+                    let admission = admit(path, count)
+                    guard admission == .admitted else {
+                        if admission == .storageExhausted { counter.onStorageExhausted?() }
+                        counter.writeFailed = true
+                        return
+                    }
+                }
                 var written = 0
                 while written < count {
                     let n = write(counter.fd, ptr.advanced(by: written), count - written)
@@ -778,6 +795,46 @@ final class MP4SegmentMuxer {
             av_shrink_packet(packet, Int32(complete))
         }
 
+        if streamIndex == videoOutputStreamIndex, isHEVCVideo,
+            !Self.nalChainSanitizerDisabled, let width = videoNALLengthPrefixSize,
+            let data = packet.pointee.data, packet.pointee.size > 0
+        {
+            let ranges = NALUnitChain.shortHEVCHeaderRanges(
+                UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
+                lengthPrefixSize: width,
+                framingConfirmed: convertsAnnexBVideoSamples || videoNALFraming.isConfirmed)
+            if !ranges.isEmpty {
+                let result = av_packet_make_writable(packet)
+                guard result >= 0, let writable = packet.pointee.data else { return (result, .none) }
+                let count = Int(packet.pointee.size)
+                var read = 0
+                var write = 0
+                for range in ranges {
+                    let kept = range.lowerBound - read
+                    if kept > 0 {
+                        memmove(writable + write, writable + read, kept)
+                        write += kept
+                    }
+                    read = range.upperBound
+                }
+                if read < count {
+                    memmove(writable + write, writable + read, count - read)
+                    write += count - read
+                }
+                shortHEVCHeadersRemoved += ranges.count
+                if shortHEVCHeadersRemoved <= 5 || shortHEVCHeadersRemoved % 100 == 0 {
+                    EngineLog.emit(
+                        "[MP4SegmentMuxer] removed \(ranges.count) incomplete HEVC NAL header(s) "
+                            + "at dts=\(packet.pointee.dts), preserving \(write) sample bytes", category: .session)
+                }
+                av_shrink_packet(packet, Int32(write))
+                if write == 0 {
+                    av_packet_unref(packet)
+                    return (0, .none)
+                }
+            }
+        }
+
         // The packet is consumed by the write below.
         let writtenDuration = max(packet.pointee.duration, 0)
 
@@ -941,6 +998,7 @@ final class MP4SegmentMuxer {
             return
         }
         byteCounter.bytesWrittenCurrentSegment = 0
+        byteCounter.discardStaging?(currentStagingPath)
     }
 
     /// Finalize the current segment and rotate fd to a fresh staging file for `nextIdx`.
@@ -996,6 +1054,8 @@ final class MP4SegmentMuxer {
             self.currentStagingPath = nextPath
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
+            byteCounter.currentPath = nextPath
+            byteCounter.ownedPaths.insert(nextPath)
         } catch {
             if Self.isOutOfSpace(error) { byteCounter.onStorageExhausted?() }
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
@@ -1107,10 +1167,13 @@ final class MP4SegmentMuxer {
     }
 
     deinit {
-        if fd >= 0 {
-            close(fd)
-        }
+        byteCounter.writeFailed = true  // cleanup must not append to an abandoned staging file.
         cleanup()
+        if fd >= 0 { close(fd) }
+        for path in byteCounter.ownedPaths {
+            try? FileManager.default.removeItem(at: path)  // adopted paths were renamed and no longer exist here.
+            byteCounter.discardStaging?(path)
+        }
     }
 
     // MARK: - AVIO
@@ -1320,6 +1383,10 @@ final class MP4SegmentMuxer {
 /// Ref-typed mutable state shared between the FragmentSplitter closures and the muxer
 /// (closures can't capture self during init).
 private final class ByteCounter {
+    var currentPath: URL?
+    var ownedPaths: Set<URL> = []
+    var admitStagingBytes: (@Sendable (URL, Int) -> SegmentWriteAdmission)?
+    var discardStaging: (@Sendable (URL) -> Void)?
     var fd: Int32 = -1
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false

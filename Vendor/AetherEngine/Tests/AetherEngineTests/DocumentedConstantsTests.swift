@@ -197,6 +197,16 @@ final class DocumentedConstantsTests: XCTestCase {
                          try documentation())
     }
 
+    /// docs/formats.md quotes the two bounds of the dual-reader merge (a demuxed audio rendition
+    /// across an SSAI seam).
+    func testDualSourceSeamBoundsMatchDocumentation() throws {
+        XCTAssertEqual(DualSourceSeamEpochs.forwardJumpMicros, 60_000_000)
+        XCTAssertEqual(DualSourceSeamEpochs.maxLagMicros, 10_000_000)
+        let docs = try documentation()
+        assertDocumented("two clocks more than 60 s apart", docs)
+        assertDocumented("stops holding the other back after 10 s of its media", docs)
+    }
+
     // MARK: - Documentation corpus
 
     private static var repoRoot: URL {
@@ -270,7 +280,7 @@ final class DocumentedConstantsTests: XCTestCase {
 
     // MARK: - Retention budget
 
-    /// The README's Seek row and the `forwardBufferSegments` entry both rest on the 2 GiB cap.
+    /// The Seek section of docs/features.md and the `forwardBufferSegments` entry both rest on the 2 GiB cap.
     func testRetentionBudgetCapIsTwoGiB() throws {
         let docs = try documentation()
         XCTAssertEqual(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: nil),
@@ -301,6 +311,15 @@ final class DocumentedConstantsTests: XCTestCase {
         XCTAssertEqual(DemuxerOpenProfile.playback.probesize, 50 * 1024 * 1024, "documented as 50 MB")
         XCTAssertEqual(DemuxerOpenProfile.playback.maxAnalyzeDuration, 60 * 1_000_000, "documented as 60 s")
         assertDocumented("defaults 50 MB / 60 s", docs)
+    }
+
+    /// docs/formats.md states when the MPEG-TS header wait for a PMT that never arrives is released.
+    func testMissingPMTReleaseWindowMatchesDocumentation() throws {
+        XCTAssertEqual(TransportStreamHeaderWait.releaseAfterNanoseconds, 2_500_000_000, "documented as 2.5 s")
+        XCTAssertEqual(TransportStreamHeaderWait.maxCountedGapNanoseconds, 500_000_000, "documented as 0.5 s")
+        let docs = try documentation()
+        assertDocumented("once the stream analysis has received data for 2.5 s", docs)
+        assertDocumented("A stall counts as at most 0.5 s of that window", docs)
     }
 
     // MARK: - Startup ladder
@@ -375,7 +394,7 @@ final class DocumentedConstantsTests: XCTestCase {
 
     // MARK: - The Atmos rendition's CHANNELS value
 
-    /// docs/formats.md and docs/architecture.md both print the CHANNELS value a stream-copied
+    /// docs/formats.md and docs/source-map.md both print the CHANNELS value a stream-copied
     /// E-AC-3 JOC rendition is advertised with, and the object count in it is the part a reader
     /// checks against Dolby's delivery kit. If the engine ever sources it from the `dec3` box's
     /// `complexity_index_type_a` instead of stating it, both sentences stop being true at once.
@@ -456,7 +475,19 @@ final class DocumentedConstantsTests: XCTestCase {
     /// A release already rewrites three statements of the same number, so the constant is pinned to
     /// all three. A forgotten bump is a red test here rather than a log line that lies.
     func testReportedVersionMatchesEveryPublishedStatementOfIt() throws {
-        assertDocumented(#"from: "\#(AetherEngine.version)""#, try documentation())
+        let docs = try documentation()
+        assertDocumented(#"from: "\#(AetherEngine.version)""#, docs)
+
+        // Every install snippet, not just one: the README and docs/installation.md both carry them,
+        // and a sweep that bumps one file and misses the other must not stay green.
+        let installSnippet = try NSRegularExpression(
+            pattern: #"(?:superuser404notfound/AetherEngine(?:\.git)?"\s*,\s*from:\s*|upToNextMinor\(\s*from:\s*)"([^"]+)""#)
+        let snippets = installSnippet.matches(in: docs, range: NSRange(docs.startIndex..., in: docs))
+            .compactMap { Range($0.range(at: 1), in: docs).map { String(docs[$0]) } }
+        XCTAssertFalse(snippets.isEmpty, "no install snippet found in README.md or docs/")
+        for stated in snippets where stated != AetherEngine.version {
+            XCTFail("an install snippet says \(stated), the engine reports \(AetherEngine.version)")
+        }
 
         let examples = try sourceFile("Examples/README.md")
         XCTAssertTrue(examples.contains("starting from `\(AetherEngine.version)`"), """
@@ -476,7 +507,7 @@ final class DocumentedConstantsTests: XCTestCase {
             """)
     }
 
-    /// The README's Swift and Xcode rows are the toolchain CI builds and tests with, not a taste
+    /// The Swift and Xcode rows in README and docs/installation.md are the toolchain CI builds and tests with, not a taste
     /// (audit OPS-103): every macOS job runs on the `xcode-27` image and none selects another Xcode.
     /// Moving CI to another image without the rows, or the rows without CI, fails here.
     func testToolchainRowsAreTheOnesCITestsWith() throws {

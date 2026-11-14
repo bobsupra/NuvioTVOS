@@ -538,6 +538,10 @@ struct FlushRecoveryHostTests {
                          pts: CMTime(seconds: seconds, preferredTimescale: 90000))
         renderer.drainReorderBuffer()
         try #require(renderer.acceptedFrameCount > 0)
+        // From here the queue's health is the test's to state. The real renderer on a loaded CI runner can
+        // ask for a flush on its own (lost decoder resources), and the recovery that starts then drops or
+        // re-reads packets the test counts, so its wait never ends (CI run 43153322814).
+        renderer.queueNeedsFlushForTesting = { false }
     }
 
     /// A decoder in the host that produces no frames and counts nothing: the demux loop would otherwise read the
@@ -680,7 +684,7 @@ struct FlushRecoveryHostTests {
         host.seekClockForTesting(to: 22)
         let renderer = host.videoRendererForTesting
         renderer.queueNeedsFlushForTesting = { true }
-        defer { renderer.queueNeedsFlushForTesting = nil }
+        defer { renderer.queueNeedsFlushForTesting = { false } }
         #expect(host.handleFlushTrigger(.videoQueueRequiresFlush) == .flushVideoOnly)
         #expect(host.handleFlushTrigger(.videoQueueRequiresFlush) == .ignore)
     }
@@ -926,11 +930,22 @@ struct FlushRecoveryHostTests {
     @Test("video dropped in the background takes the parked keyframes with it, so the owed recovery sees the hole")
     func backgroundDropFreesLedger() async throws {
         // A long clip, read through a source that stops answering half way: the end of media also frees what
-        // is parked, and would pass this test with the background drop taken out.
-        let data = try syntheticVideoFixture(keyFlags: (0..<8000).map { $0 % 30 == 0 }, withAudio: true)
+        // is parked, and would pass this test with the background drop taken out. The planted keyframe must
+        // be the only one: the foreground return clears the background flag before it judges the debt, so a
+        // keyframe the loop parks in between reads as one at hand (`.flushVideoOnly`). The waits below do not
+        // prove the loop got past packet 0: it frees the parked queue at the top of every background turn,
+        // and the read-ahead reaches the gate on its own. On a loaded CI runner (run 43366418813) packet 0
+        // was still unread at the return. The test reads it off the demuxer itself, because an unflagged
+        // first sample is still a keyframe (the MP4 demuxer makes it a sync sample).
+        let data = try syntheticVideoFixture(keyFlags: (0..<8000).map { $0 == 0 }, withAudio: true)
         let reader = GatedIOReader(data: data, blockFrom: data.count / 2)
         let dem = Demuxer()
         try dem.open(reader: reader, formatHint: "mp4")
+        while true {
+            var packet: UnsafeMutablePointer<AVPacket>? = try #require(try dem.readPacket())
+            defer { trackedPacketFree(&packet) }
+            if packet?.pointee.stream_index == dem.videoStreamIndex { break }
+        }
         reader.arm()
         let host = SoftwarePlaybackHost(reposition: { _, _, _, _, _ in .landed })
         defer { reader.release(); host.stop() }
@@ -980,14 +995,14 @@ struct FlushRecoveryHostTests {
         try await waitFor { host.flushRecoveriesCompleted == 1 }
 
         let renderer = host.videoRendererForTesting
-        defer { renderer.queueNeedsFlushForTesting = nil }
+        defer { renderer.queueNeedsFlushForTesting = { false } }
         for round in 1...2 {
             try await healthyPlaybackAfterRecovery(host, from: 21 + Double(round) * 10)
             // The queue is now flagged, as it is when the system's notification reaches the host.
             renderer.queueNeedsFlushForTesting = { true }
             host.keyframeLedgerForTesting.reset()
             #expect(host.handleFlushTrigger(.videoQueueRequiresFlush) == .reposition)
-            renderer.queueNeedsFlushForTesting = nil
+            renderer.queueNeedsFlushForTesting = { false }
             try await waitFor { host.flushRecoveriesCompleted == round + 1 }
         }
         #expect(host.flushRecoveryLog.map(\.action) == [.reposition, .reposition, .reposition])
@@ -1014,7 +1029,7 @@ struct FlushRecoveryHostTests {
         renderer.queueNeedsFlushForTesting = { true }
         renderer.enqueue(pixelBuffer: try #require(makePixelBuffer()), pts: CMTime(seconds: 23, preferredTimescale: 90000))
         renderer.drainReorderBuffer()
-        renderer.queueNeedsFlushForTesting = nil
+        renderer.queueNeedsFlushForTesting = { false }
         try await waitFor { host.flushRecoveryLog.count == 2 }
         #expect(host.flushRecoveryLog.map(\.action) == [.reposition, .reposition])
         try await waitFor { host.flushRecoveriesCompleted == 2 }

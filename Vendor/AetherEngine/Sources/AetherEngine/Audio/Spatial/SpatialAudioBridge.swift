@@ -502,8 +502,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         // it saw before the hold existed, rather than up to 100 ms of it landing in the next segment.
         renderHeldBlocks(into: &results)
         let settled = sink.settle()
-        wrap(settled.packets, into: &results)
-        noteEncodeErrors(settled.errors)
+        handleSinkOutput(packets: settled.packets, errors: settled.errors, into: &results)
         return results
     }
 
@@ -519,8 +518,7 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
         encodePending()
         logLevels(levelMeter.restart())
         let finished = sink.finish()
-        wrap(finished.packets, into: &results)
-        noteEncodeErrors(finished.errors)
+        handleSinkOutput(packets: finished.packets, errors: finished.errors, into: &results)
         if !results.isEmpty {
             EngineLog.emit("[SpatialAudioBridge] EOF flush emitted \(results.count) tail packet(s)", category: .session)
         }
@@ -746,12 +744,16 @@ final class SpatialAudioBridge: AudioTranscodingBridge, @unchecked Sendable {
     /// Caller holds `opLock`. Everything the encoder has finished since the last call.
     private func collectEncoded(into results: inout [UnsafeMutablePointer<AVPacket>], noteFailure: Bool = true) {
         let encoded = sink.collect()
-        if !encoded.packets.isEmpty {
+        handleSinkOutput(packets: encoded.packets, errors: encoded.errors, into: &results, noteFailure: noteFailure)
+    }
+
+    private func handleSinkOutput(packets: [SpatialBedPacket], errors: [Error], into results: inout [UnsafeMutablePointer<AVPacket>], noteFailure: Bool = true) {
+        if !packets.isEmpty {
             let emittedBefore = stats.packetsEmitted
-            wrap(encoded.packets, into: &results)
+            wrap(packets, into: &results)
             if stats.packetsEmitted > emittedBefore { consecutiveEncodeFailures = 0 }
         }
-        noteEncodeErrors(encoded.errors, noteFailure: noteFailure)
+        noteEncodeErrors(errors, noteFailure: noteFailure)
     }
 
     /// Caller holds `opLock`. A failed chunk is a gap the pipeline already stepped over; it counts

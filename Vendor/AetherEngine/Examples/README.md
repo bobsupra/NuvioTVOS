@@ -18,7 +18,7 @@ Three samples covering different audiences:
    ```
    https://github.com/superuser404notfound/AetherEngine
    ```
-   Dependency Rule: Up to Next Major Version, starting from `7.61.0`. Add the `AetherEngine` library product to your app target.
+   Dependency Rule: Up to Next Major Version, starting from `7.66.0`. Add the `AetherEngine` library product to your app target.
 
 3. **Drop the file in.** Replace the Xcode template's default `App.swift` (or whatever the generated `@main` file is called) with the contents of [`MinimalPlayerApp.swift`](MinimalPlayer/MinimalPlayerApp.swift). The file is self-contained: it defines both the `@main App` struct and the `ContentView`.
 
@@ -38,7 +38,7 @@ To stay readable the sample omits things real apps care about:
 - **Audio track switching.** `engine.audioTracks` + `engine.selectAudioTrack(index:)`.
 - **Resume position.** `engine.load(url:, startPosition: 347.5)`.
 - **HTTP headers** for authenticated sources. Pass them in `LoadOptions(httpHeaders: [...])`.
-- **HDR / Dolby Vision routing on tvOS.** Requires the engine-driven sole-writer pattern (see README › Host setup on tvOS). The minimal sample relies on default routing; for production tvOS hosts on HDR content, set `appliesPreferredDisplayCriteriaAutomatically = false` on your `AVPlayerViewController` and pass `LoadOptions(matchContentEnabled:, panelIsInHDRMode:)` populated from the runtime EDR state.
+- **HDR / Dolby Vision routing on tvOS.** Requires the engine-driven sole-writer pattern (see [docs/guide.md › tvOS host setup](../docs/guide.md#tvos-host-setup)). The minimal sample relies on default routing; for production tvOS hosts on HDR content, set `appliesPreferredDisplayCriteriaAutomatically = false` on your `AVPlayerViewController` and pass `LoadOptions(matchContentEnabled:, panelIsInHDRMode:)` populated from the runtime EDR state.
 - **Now Playing / lock-screen integration.** Subscribe to `engine.$currentAVPlayer` and feed it to `MPNowPlayingSession`. See `Sodalite` for a reference implementation.
 
 For all of these, read [docs/api.md](../docs/api.md), the full public surface with the contracts spelled out, or the inline docstrings on `AetherEngine`, `LoadOptions`, and `TrackInfo` in `Sources/AetherEngine/`.

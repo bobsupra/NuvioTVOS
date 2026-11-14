@@ -1,4 +1,5 @@
 import Foundation
+import CoreGraphics
 import Testing
 @testable import AetherEngine
 
@@ -17,8 +18,8 @@ struct Issue929OffsetReachTests {
     func defaultUnchanged() throws {
         let engine = try AetherEngine()
         #expect(engine.maximumSubtitleOffsetSeconds == AetherEngine.subtitleCueBitmapFloorSeconds)
-        #expect(AetherEngine.bitmapCueFloorSeconds(offsetReach: engine.bitmapSubtitleOffsetReach) == 60)
-        #expect(AetherEngine.subtitleDrainLead(isBitmap: true, offsetReach: engine.bitmapSubtitleOffsetReach)
+        #expect(AetherEngine.bitmapCueFloorSeconds(offsetReach: engine.bitmapSubtitleHistoryReach) == 60)
+        #expect(AetherEngine.subtitleDrainLead(isBitmap: true, offsetReach: engine.subtitleAdvanceReach)
                 == AetherEngine.subtitleDrainLeadSeconds)
     }
 
@@ -53,7 +54,11 @@ struct Issue929OffsetReachTests {
         let engine = try AetherEngine()
         engine.maximumSubtitleOffsetSeconds = 0
         engine.setSoftwareSubtitleDelay(-25)
-        #expect(engine.bitmapSubtitleOffsetReach == 25)
+        #expect(engine.subtitleAdvanceReach == 25)
+        #expect(engine.bitmapSubtitleHistoryReach == 0)
+        engine.setSoftwareSubtitleDelay(25)
+        #expect(engine.bitmapSubtitleHistoryReach == 25)
+        #expect(engine.subtitleAdvanceReach == 0)
     }
 
     @Test("negative and non-finite reaches are ignored")
@@ -64,6 +69,33 @@ struct Issue929OffsetReachTests {
         engine.maximumSubtitleOffsetSeconds = .nan
         engine.maximumSubtitleOffsetSeconds = .infinity
         #expect(engine.maximumSubtitleOffsetSeconds == 5)
+    }
+
+    @Test("only a declared reach gives up the bitmap history behind the floor")
+    func declaredReachDropsHistory() throws {
+        let engine = try AetherEngine()
+        #expect(engine.bitmapCueHistoryByteBudget == AetherEngine.subtitleCueBitmapByteBudget)
+        engine.maximumSubtitleOffsetSeconds = -1
+        #expect(engine.bitmapCueHistoryByteBudget == AetherEngine.subtitleCueBitmapByteBudget)
+        engine.maximumSubtitleOffsetSeconds = AetherEngine.subtitleCueBitmapFloorSeconds
+        #expect(engine.bitmapCueHistoryByteBudget == 0)
+    }
+
+    @Test("with no history budget every cue behind the floor goes and the floor stays")
+    func zeroBudgetKeepsOnlyFloor() {
+        let ctx = CGContext(data: nil, width: 4, height: 4, bitsPerComponent: 8, bytesPerRow: 16,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let image = SubtitleImage(cgImage: ctx.makeImage()!, position: .zero)
+        var cues = stride(from: 0.0, to: 120, by: 3).enumerated().map {
+            SubtitleCue(id: $0.offset, startTime: $0.element, endTime: $0.element + 2, body: .image(image))
+        }
+        let playhead = 100.0
+        let floor = playhead - AetherEngine.bitmapCueFloorSeconds(offsetReach: 0)
+        #expect(AetherEngine.pruneCues(&cues, toBitmapBytes: 0, endedBefore: floor))
+        #expect(cues.allSatisfy { $0.endTime >= floor })
+        #expect(cues.contains { $0.startTime <= playhead && $0.endTime >= floor })
+        #expect(cues.contains { $0.startTime > playhead })
     }
 
     @Test("a reach shrunk mid-session leaves the cursor's decoded lead alone until playback reaches it")

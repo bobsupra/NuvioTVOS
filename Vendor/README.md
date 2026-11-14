@@ -1,8 +1,21 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.61.0)
+## AetherEngine (pin 7.66.0)
 
-Local pin of [AetherEngine 7.61.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.61.0), upstream commit `fce76ca665272d7949dafc7bf821bcb7034a6da1`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, two enabled default traits (`DualLayerDolbyVision` and `DolbyVisionStillReshaping`, with `TrueHDObjectAudio`, `DTSXObjectAudio`, and `DolbyVisionFelCurves` remaining optional / off by default to prevent startup latency, FFT regression stalls, and data-wait buffering regressions on high-bitrate streams), local FFmpeg path dependency, and host integration patches are retained. The 7.61.0 upgrade incorporates Dolby Vision Profile 7 FEL curve folding (`DolbyVisionFelCurves` into Profile 8.1 RPU reshaping curves), LibDovi 2.2.0 (`dovi_rpu_set_polynomial_mapping`), LibTrueHD 3.2.0, autostarting load gate hold during HDMI display switches (`isAwaitingDisplaySwitch`), maximum subtitle offset memory reductions (`maximumSubtitleOffsetSeconds`), software E-AC-3 Atmos decoding (`SoftwareEAC3AtmosDecoder`), dedicated sidecar whole-body fetching (`SidecarTextFetch`), display cadence relock and sink settle hold (#950), and DVB/PGS cue start rounding (#1001). Nuvio's custom remote playback startup patches, frame extraction, disc image hints, and local traits are preserved.
+Local pin of [AetherEngine 7.66.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.66.0), upstream commit `8e74bbb5cfde75287305c535c243c1ef9d96549c`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, two enabled default traits (`DualLayerDolbyVision` and `DolbyVisionStillReshaping`, with `TrueHDObjectAudio`, `DTSXObjectAudio`, and `DolbyVisionFelCurves` remaining optional / off by default to prevent startup latency, FFT regression stalls, and data-wait buffering regressions on high-bitrate streams), local FFmpeg path dependency, and host integration patches are retained. The 7.66.0 upgrade incorporates:
+- Progressive range streaming (`ProgressiveRangeStream`) for HTTP disc/ISO reads (#1007).
+- Line-art upscale shader network for animation (`LineArtShaderSource`, `FrameChain`, `LoadOptions.upscaleScaler = .lineArt` #1039).
+- AVKit native audio track selection menu integration (`AetherEngine+AudioMenu.swift`).
+- Native video frame diagnostics and bounded recovery on SDR loopback (`nativeVideoFrameDiagnostics`, `nativeVideoFrameRecovery`).
+- TrueHD Atmos probe settlement and stream analysis fixes (#1035).
+- PGS subtitle PQ palette decoding (#1006).
+- Subtitle landing window reconstruction, seek generation tracking, and open-ended cue closing (#1022).
+- Video decoder end-of-stream packet draining and paused EOF handling (#1024).
+- Audio shaping downmix LFE level controls (`lfeMixLevel` #1044).
+- AAC program config element parsing (#1047).
+- Pulldown cadence retiming and source frame rate measurements.
+
+Nuvio's custom remote playback startup patches, frame extraction, disc image hints, Dav1d decode tuning policy, HDR tone-mapping scrub preview pipeline, and local spatial audio bridge failure reporting are fully preserved.
 
 Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests. The patch is merged with the 7.40 bed-split renderer and its telemetry reporting.
 

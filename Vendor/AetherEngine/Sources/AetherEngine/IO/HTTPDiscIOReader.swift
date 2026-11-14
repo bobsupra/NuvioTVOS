@@ -7,13 +7,14 @@ import Foundation
 /// selected title's m2ts/VOB extents). Without this a remote `.iso` is handed straight to
 /// libavformat, which fails to probe it (a disc image is a filesystem, not a media container) (#64).
 ///
-/// Reads are served from an adaptive read-ahead buffer plus a small per-reader LRU of prior base-size
-/// windows. The read-ahead window starts at `baseChunkSize` (so scattered, kilobyte-sized
-/// disc-structure reads at open do not each pull a megabyte) and doubles up to `maxChunkSize` while
-/// reads stay sequential (so steady playback of the title's extents costs few requests); any
-/// non-contiguous read resets it. The bounded LRU avoids refetching small windows when UDF metadata
-/// alternates between nearby regions. Each range request retries with backoff so a transient
-/// network blip does not end playback. The server
+/// Reads are served from a single sliding read-ahead buffer. The read-ahead window is ADAPTIVE: it
+/// starts at `baseChunkSize` (so the scattered, kilobyte-sized disc-structure reads at open do not
+/// each pull a megabyte) and doubles up to `maxChunkSize` while reads stay sequential (so steady
+/// playback of the title's extents costs few requests); any non-contiguous read resets it. Once the
+/// window would reach `maxChunkSize` on a sequential continuation, the read pattern is playback, and
+/// a `ProgressiveRangeStream` takes over: ranges of up to `streamRangeSize` whose bytes reach the
+/// demuxer as they arrive, with `maxChunkSize` as the buffer's watermark (#1007). Each
+/// range request retries with backoff so a transient network blip does not end playback. The server
 /// MUST honor range requests (any static file host does); if it does not, `init` returns nil after a
 /// clear log and `open` throws `AVIOReaderError.originIgnoresRange`, and the response is hung up on at
 /// its head, so a 40 GB image answered with a 200 is never downloaded to be rejected (audit NET-102).
@@ -27,62 +28,43 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     private let extraHeaders: [String: String]
     private let session: URLSession
     private let requestTimeout: TimeInterval
-    private let rangeCompletionGrace: TimeInterval
     private let baseChunkSize: Int
     private let maxChunkSize: Int
+    private let streamRangeSize: Int
     private let maxRetries: Int
     private let totalSize: Int64
-    /// Progressive response delivery is enabled only for the ISO disc opener. Other HTTP range
-    /// consumers keep the full-window-before-return behavior they already use.
-    private let allowsProgressiveReads: Bool
     /// Warmed bytes (#647), read before the network. Immutable, so a fork shares them without a copy.
     private let residentSpans: [ResidentSpan]
 
-    /// Guards cursor, active/cached buffers, and the selected progressive request. Never held while
-    /// waiting for network bytes, so seek/cancel can interrupt an in-flight read.
     private let lock = NSLock()
-    /// IOReader callers normally serialize reads, but keeping that invariant here lets seek and
-    /// cancel use `lock` while a read waits on its range request.
-    private let readLock = NSLock()
     private var position: Int64 = 0
-    private var cursorGeneration: UInt64 = 0
     private var bufferStart: Int64 = -1
-    private var buffer = Data()
-    private struct CachedWindow {
-        let start: Int64
-        let data: Data
-
-        var end: Int64 { start + Int64(data.count) }
-        func covers(_ position: Int64) -> Bool { position >= start && position < end }
-    }
-    /// Most recently used first. These are prior active windows only; large adaptive windows are
-    /// never retained, and the three-entry limit bounds extra storage to at most 768 KiB.
-    private var cachedWindows: [CachedWindow] = []
-    private let maxCachedWindows = 3
-    /// Give a normal exact-length HTTP response a brief chance to complete and keep its connection
-    /// reusable before a following range forces URLSession to cancel it.
-    private static let defaultRangeCompletionGrace: TimeInterval = 0.1
+    private var buffer: [UInt8] = []
     /// End offset of the last buffer refill; a read starting here continues sequentially.
     private var lastFetchEnd: Int64 = -1
     /// Current adaptive read-ahead window; grows on sequential refills, resets on a seek.
     private var currentChunkSize: Int
-    /// A single progressive adaptive window is active at a time. Its body stays in one bounded Data
-    /// allocation and is promoted into `buffer` after its task has finished.
-    private var activeFetch: ProgressiveRangeFetch?
+    /// `cancelled` has its own lock: `read` holds `lock` across the (slow) fetch, and the fetch's
+    /// retry loop must poll `cancelled` without re-entering the non-reentrant `lock`, and `cancel()`
+    /// must be able to set it from another thread while a read is in flight.
+    private let cancelLock = NSLock()
     private var cancelled = false
-    /// This reader's own share of `lifetimeFetchedBytes`: each validated body byte received,
-    /// including bytes retained across an interrupted attempt before retry.
+    /// The sequential stream (#1007), guarded by `lock`; `cancelLock` keeps a second reference so
+    /// `cancel()` can wake a read parked in it without taking `lock`.
+    private var stream: ProgressiveRangeStream?
+    /// Set by the first stream: disc discovery is over. From then on a sequential continuation
+    /// streams at once, so a seek pays one `baseChunkSize` fetch instead of re-ramping through
+    /// ~16 MiB of serial whole-body requests (#1007 retest: 3/5 seeks resumed late).
+    private var playbackStreaming = false
+    private var cancellableStream: ProgressiveRangeStream?
+    /// This reader's own share of `lifetimeFetchedBytes`: every response body `fetchWithRetry`
+    /// received, a rejected or retried one included, since it crossed the link either way.
     private let transferLock = NSLock()
     private var transferredBytes: Int64 = 0
 
     var sourceBytesFetched: Int64 {
         transferLock.lock(); defer { transferLock.unlock() }
         return transferredBytes
-    }
-
-    var hasRangeCompletionWaiterForTesting: Bool {
-        lock.lock(); let fetch = activeFetch; lock.unlock()
-        return fetch?.hasCompletionWaiterForTesting ?? false
     }
 
     /// Probes total size and range support with one (retried) `bytes=0-0` request, unless
@@ -92,13 +74,12 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                       extraHeaders: [String: String] = [:],
                       baseChunkSize: Int = 256 * 1024,
                       maxChunkSize: Int = 8 * 1024 * 1024,
+                      streamRangeSize: Int = 64 * 1024 * 1024,
                       maxRetries: Int = 3,
                       requestTimeout: TimeInterval = 30,
                       sessionConfiguration: URLSessionConfiguration? = nil,
                       prewarmed: PrewarmedSource? = nil,
-                      knownSize: Int64? = nil,
-                      progressiveReads: Bool = false,
-                      rangeCompletionGraceForTesting: TimeInterval? = nil) {
+                      knownSize: Int64? = nil) {
         let session = Self.makeSession(sessionConfiguration)
         guard case .size(let size) = Self.resolveSize(
             url: url, extraHeaders: extraHeaders, session: session, requestTimeout: requestTimeout,
@@ -107,12 +88,10 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
             return nil
         }
         self.init(url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
-                  maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
+                  maxChunkSize: maxChunkSize, streamRangeSize: streamRangeSize,
+                  maxRetries: maxRetries, requestTimeout: requestTimeout,
                   session: session, totalSize: size,
-                  residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [],
-                  allowsProgressiveReads: progressiveReads,
-                  rangeCompletionGrace: max(0, rangeCompletionGraceForTesting
-                                            ?? Self.defaultRangeCompletionGrace))
+                  residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
     }
 
     /// `init?` for a caller that has to say why a disc image cannot be read: an origin that answers the
@@ -123,6 +102,7 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                      extraHeaders: [String: String] = [:],
                      baseChunkSize: Int = 256 * 1024,
                      maxChunkSize: Int = 8 * 1024 * 1024,
+                     streamRangeSize: Int = 64 * 1024 * 1024,
                      maxRetries: Int = 3,
                      requestTimeout: TimeInterval = 30,
                      sessionConfiguration: URLSessionConfiguration? = nil,
@@ -134,11 +114,10 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         case .size(let size):
             return HTTPDiscIOReader(
                 url: url, extraHeaders: extraHeaders, baseChunkSize: baseChunkSize,
-                maxChunkSize: maxChunkSize, maxRetries: maxRetries, requestTimeout: requestTimeout,
+                maxChunkSize: maxChunkSize, streamRangeSize: streamRangeSize,
+                maxRetries: maxRetries, requestTimeout: requestTimeout,
                 session: session, totalSize: size,
-                residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [],
-                allowsProgressiveReads: true,
-                rangeCompletionGrace: defaultRangeCompletionGrace)
+                residentSpans: prewarmed.map { [$0.head] + ($0.tail.map { [$0] } ?? []) } ?? [])
         case .ignoresRange:
             session.invalidateAndCancel()
             throw AVIOReaderError.originIgnoresRange
@@ -152,25 +131,23 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
                  extraHeaders: [String: String],
                  baseChunkSize: Int,
                  maxChunkSize: Int,
+                 streamRangeSize: Int,
                  maxRetries: Int,
                  requestTimeout: TimeInterval,
                  session: URLSession,
                  totalSize: Int64,
-                 residentSpans: [ResidentSpan],
-                 allowsProgressiveReads: Bool,
-                 rangeCompletionGrace: TimeInterval) {
+                 residentSpans: [ResidentSpan]) {
         self.url = url
         self.extraHeaders = extraHeaders
         self.baseChunkSize = max(64 * 1024, baseChunkSize)
         self.maxChunkSize = max(max(64 * 1024, baseChunkSize), maxChunkSize)
         self.currentChunkSize = max(64 * 1024, baseChunkSize)
+        self.streamRangeSize = streamRangeSize
         self.maxRetries = max(0, maxRetries)
         self.requestTimeout = requestTimeout
         self.session = session
         self.residentSpans = residentSpans.filter { !$0.isEmpty }
         self.totalSize = totalSize
-        self.allowsProgressiveReads = allowsProgressiveReads
-        self.rangeCompletionGrace = rangeCompletionGrace
     }
 
     private static func makeSession(_ sessionConfiguration: URLSessionConfiguration?) -> URLSession {
@@ -247,345 +224,157 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         return min(current * 2, maxChunk)
     }
 
-    private var smallWindowLimit: Int { min(baseChunkSize, 256 * 1024) }
-
-    private func bufferContains(_ offset: Int64) -> Bool {
-        bufferStart >= 0 && offset >= bufferStart
-            && offset < bufferStart + Int64(buffer.count)
-    }
-
-    /// Called with `lock` held. Once the URL task has completed, its Data can be shared with the
-    /// active window without copying and the request slot is available for the next range.
-    private func promoteFinishedFetch() {
-        guard let fetch = activeFetch else { return }
-        let snapshot = fetch.finishedSnapshot()
-        guard snapshot.finished, let data = snapshot.data else { return }
-        if !data.isEmpty && (allowsProgressiveReads || snapshot.successful) {
-            parkActiveBuffer(excludingStart: fetch.start)
-            cachedWindows.removeAll { $0.start == fetch.start }
-            bufferStart = fetch.start
-            buffer = data
-            lastFetchEnd = fetch.start + Int64(data.count)
-        }
-        activeFetch = nil
-    }
-
-    /// Called with `lock` held.
-    private func copyFromBuffer(_ out: UnsafeMutablePointer<UInt8>, maximum: Int) -> Int {
-        let offset = Int(position - bufferStart)
-        let count = min(maximum, buffer.count - offset, Int(totalSize - position))
-        guard count > 0 else { return 0 }
-        buffer.withUnsafeBytes { src in
-            out.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self).advanced(by: offset),
-                       count: count)
-        }
-        position += Int64(count)
-        return count
-    }
-
-    /// Park the active window after a replacement is ready. Excluding the replacement's start
-    /// avoids retaining a stale, overlapping version of the same range.
-    private func parkActiveBuffer(excludingStart: Int64) {
-        guard bufferStart >= 0, !buffer.isEmpty,
-              buffer.count <= smallWindowLimit, bufferStart != excludingStart else { return }
-        cachedWindows.removeAll { $0.start == bufferStart }
-        cachedWindows.insert(CachedWindow(start: bufferStart, data: buffer), at: 0)
-        if cachedWindows.count > maxCachedWindows {
-            cachedWindows.removeLast(cachedWindows.count - maxCachedWindows)
-        }
-    }
-
     // MARK: - IOReader
 
     func read(_ outBuffer: UnsafeMutablePointer<UInt8>?, size n: Int32) -> Int32 {
         guard let out = outBuffer, n > 0 else { return -1 }
-        readLock.lock(); defer { readLock.unlock() }
+        lock.lock(); defer { lock.unlock() }
+        return read(locked: out, size: n)
+    }
 
-        while true {
-            lock.lock()
-            promoteFinishedFetch()
-            if position >= totalSize {
-                lock.unlock()
-                return 0
+    private func read(locked out: UnsafeMutablePointer<UInt8>, size n: Int32) -> Int32 {
+        if position >= totalSize { return 0 }
+
+        if let span = residentSpans.first(where: { $0.covers(position) }) {
+            let spanOffset = Int(position - span.start)
+            let toCopy = min(Int(n), span.data.count - spanOffset, Int(totalSize - position))
+            span.data.withUnsafeBytes { src in
+                out.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                    .advanced(by: spanOffset), count: toCopy)
             }
+            position += Int64(toCopy)
+            // Reading on past the span is the sequential continuation, so the window grows there.
+            lastFetchEnd = position
+            return Int32(toCopy)
+        }
 
-            if let span = residentSpans.first(where: { $0.covers(position) }) {
-                let spanOffset = Int(position - span.start)
-                let toCopy = min(Int(n), span.data.count - spanOffset, Int(totalSize - position))
-                span.data.withUnsafeBytes { src in
-                    out.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self)
-                        .advanced(by: spanOffset), count: toCopy)
-                }
-                position += Int64(toCopy)
-                // Reading on past the span is the sequential continuation, so the window grows there.
-                lastFetchEnd = position
-                lock.unlock()
-                return Int32(toCopy)
-            }
-
-            if bufferContains(position) {
-                let count = copyFromBuffer(out, maximum: Int(n))
-                lock.unlock()
-                return Int32(count)
-            }
-
-            if let cacheIndex = cachedWindows.firstIndex(where: { $0.covers(position) }) {
-                let hit = cachedWindows.remove(at: cacheIndex)
-                let continuesAtFrontier = position == lastFetchEnd
-                parkActiveBuffer(excludingStart: hit.start)
-                bufferStart = hit.start
-                buffer = hit.data
-                if !continuesAtFrontier { currentChunkSize = baseChunkSize }
-                // The cache window is now the active window. Its frontier remains eligible for
-                // ordinary sequential growth after the cached bytes have been consumed.
-                lastFetchEnd = hit.end
-                let count = copyFromBuffer(out, maximum: Int(n))
-                lock.unlock()
-                return Int32(count)
-            }
-
-            // Cancellation preserves already resident, active-buffer, and cached bytes, matching
-            // the reader's prior behavior. It only rejects work that would need another network read.
-            if cancelled {
-                if allowsProgressiveReads, let fetch = activeFetch, fetch.covers(position) {
-                    let copied = fetch.copyAvailable(at: position, maximum: Int(n), to: out)
-                    if copied > 0 {
-                        parkActiveBuffer(excludingStart: fetch.start)
-                        bufferStart = -1
-                        buffer = Data()
-                        position += Int64(copied)
-                        lock.unlock()
-                        return Int32(copied)
-                    }
-                }
-                lock.unlock()
-                return -1
-            }
-
-            let generation = cursorGeneration
-            let requestedPosition = position
-            let fetch: ProgressiveRangeFetch
-            var shouldStart = false
-            if let current = activeFetch {
-                if current.covers(requestedPosition) && !current.isCancelled {
-                    fetch = current
-                } else {
-                    // A cancelled or out-of-window task must finish before its replacement starts.
-                    // If it already delivered the exact bounded window, let URLSession finish it
-                    // naturally so a normal range can keep the connection alive.
-                    fetch = current
-                    let hasCompleteRange = current.hasCompleteRangeBytes
-                    let retirementWakeGeneration = current.currentWakeGeneration
-                    if !hasCompleteRange { current.cancel() }
-                    lock.unlock()
-                    var taskFinished: Bool
-                    if hasCompleteRange {
-                        taskFinished = current.waitUntilFinished(
-                            timeout: rangeCompletionGrace, wakeGeneration: retirementWakeGeneration)
-                        if !taskFinished {
-                            lock.lock()
-                            let stillObsolete = activeFetch === current && !current.covers(position)
-                                && !residentSpans.contains { $0.covers(position) }
-                                && !bufferContains(position)
-                                && !cachedWindows.contains { $0.covers(position) }
-                            if stillObsolete { current.cancel() }
-                            lock.unlock()
-                            if stillObsolete {
-                                current.waitUntilFinished()
-                                taskFinished = true
-                            }
-                        }
-                    } else {
-                        current.waitUntilFinished()
-                        taskFinished = true
-                    }
-                    lock.lock()
-                    if activeFetch === current && taskFinished {
-                        promoteFinishedFetch()
-                        if activeFetch === current { activeFetch = nil }
-                    }
-                    let cursorStillCurrent = cursorGeneration == generation && position == requestedPosition
-                    lock.unlock()
-                    if !cursorStillCurrent { return -1 }
-                    continue
-                }
-            } else {
-                currentChunkSize = Self.nextChunkSize(
-                    position: position, lastFetchEnd: lastFetchEnd,
-                    current: currentChunkSize, base: baseChunkSize, maxChunk: maxChunkSize)
-                // Stop at the next warmed span: its bytes are already here.
-                let limit = residentSpans.lazy.map(\.start).filter { $0 > self.position }.min() ?? totalSize
-                let want = Int(min(Int64(currentChunkSize), limit - position))
-                guard want > 0 else {
-                    lock.unlock()
+        if let s = stream {
+            if s.skip(to: position), position < s.end {
+                let got = s.read(into: out, size: min(Int(n), Int(totalSize - position)))
+                guard got > 0 else {
+                    dropStreamLocked()
                     return -1
                 }
-                fetch = ProgressiveRangeFetch(
-                    url: url, extraHeaders: extraHeaders, session: session,
-                    timeout: requestTimeout, offset: position, length: want,
-                    maxRetries: maxRetries,
-                    retriesPartialBodies: allowsProgressiveReads,
-                    onBytesReceived: { [weak self] count in
-                        guard let self else { return }
-                        self.transferLock.lock()
-                        self.transferredBytes &+= Int64(count)
-                        self.transferLock.unlock()
-                        Self.recordFetched(bytes: count)
-                    })
-                activeFetch = fetch
-                shouldStart = true
+                position += Int64(got)
+                lastFetchEnd = position
+                return Int32(got)
             }
-            // Capture while the cursor lock is still held: seek changes both cursor and wake
-            // generations under that same lock, so an older read cannot adopt a newer token.
-            let fetchWakeGeneration = fetch.currentWakeGeneration
-            lock.unlock()
-
-            if shouldStart { fetch.begin() }
-            if allowsProgressiveReads {
-                let minimumCount = fetch.readableCapacity(
-                    at: requestedPosition,
-                    maximum: min(Int(n), Int(totalSize - requestedPosition)))
-                _ = fetch.waitForData(at: requestedPosition, minimumCount: minimumCount,
-                                      wakeGeneration: fetchWakeGeneration)
-            } else {
-                _ = fetch.waitForCompletion(wakeGeneration: fetchWakeGeneration)
-            }
-
-            lock.lock()
-            guard cursorGeneration == generation, position == requestedPosition,
-                  activeFetch === fetch else {
-                lock.unlock()
-                return -1
-            }
-            let snapshot = fetch.finishedSnapshot()
-            if !allowsProgressiveReads && !snapshot.successful {
-                if snapshot.finished { activeFetch = nil }
-                lock.unlock()
-                return -1
-            }
-            let copied = fetch.copyAvailable(at: requestedPosition, maximum: Int(n), to: out)
-            if copied > 0 {
-                // Keep the former active window only after this range has passed response validation
-                // and supplied readable bytes. Rejected or empty responses leave it untouched.
-                parkActiveBuffer(excludingStart: fetch.start)
-                bufferStart = -1
-                buffer = Data()
-                position += Int64(copied)
-                promoteFinishedFetch()
-                lock.unlock()
-                return Int32(copied)
-            }
-
-            // A terminal short body is retained, then a later read resumes at its first missing
-            // byte. A no-data failure remains an error for this call.
-            if snapshot.finished {
-                let cleanShortBody = snapshot.successful && snapshot.data?.isEmpty == false
-                promoteFinishedFetch()
-                if allowsProgressiveReads, cleanShortBody {
-                    // This read was already parked at the missing frontier when a clean short 206
-                    // finished. Continue there now that its successful prefix is available.
-                    lock.unlock()
-                    continue
-                }
-            }
-            lock.unlock()
-            return -1
+            // A seek away from the stream, or its end (a warmed span or EOF): the window decides
+            // afresh, so a jump starts small again and a continuation streams again.
+            if s.position != position { lastFetchEnd = -1 }
+            dropStreamLocked()
         }
+
+        if position < bufferStart || position >= bufferStart + Int64(buffer.count) {
+            currentChunkSize = Self.nextChunkSize(
+                position: position, lastFetchEnd: lastFetchEnd,
+                current: currentChunkSize, base: baseChunkSize, maxChunk: maxChunkSize)
+            // Stop at the next warmed span: its bytes are already here.
+            let limit = residentSpans.lazy.map(\.start).filter { $0 > self.position }.min() ?? totalSize
+            if Self.streams(position: position, lastFetchEnd: lastFetchEnd, nextChunk: currentChunkSize,
+                            maxChunk: maxChunkSize, streamRange: streamRangeSize,
+                            playback: playbackStreaming),
+               limit - position > Int64(maxChunkSize) {
+                guard startStreamLocked(end: limit) else { return -1 }
+                buffer = []
+                bufferStart = -1
+                return read(locked: out, size: n)
+            }
+            let want = Int(min(Int64(currentChunkSize), limit - position))
+            guard want > 0, let data = fetchWithRetry(offset: position, length: want), !data.isEmpty else {
+                return -1
+            }
+            bufferStart = position
+            buffer = [UInt8](data)
+            lastFetchEnd = position + Int64(buffer.count)
+        }
+
+        let bufOffset = Int(position - bufferStart)
+        let available = buffer.count - bufOffset
+        let toCopy = min(Int(n), available, Int(totalSize - position))
+        guard toCopy > 0 else { return 0 }
+        buffer.withUnsafeBufferPointer { src in
+            out.update(from: src.baseAddress!.advanced(by: bufOffset), count: toCopy)
+        }
+        position += Int64(toCopy)
+        return Int32(toCopy)
     }
 
     func seek(offset: Int64, whence: Int32) -> Int64 {
         if whence == 65536 { return totalSize }  // AVSEEK_SIZE
-        lock.lock()
+        lock.lock(); defer { lock.unlock() }
         let target: Int64
         switch whence {
         case SEEK_SET: target = offset
         case SEEK_CUR: target = position + offset
         case SEEK_END: target = totalSize + offset
-        default:
-            lock.unlock()
-            return -1
+        default: return -1
         }
-        guard target >= 0 else {
-            lock.unlock()
-            return -1
-        }
-        let isInResident = residentSpans.contains { $0.covers(target) }
-        let isInBuffer = bufferContains(target)
-        let isInCache = cachedWindows.contains { $0.covers(target) }
-        let cursorChanged = target != position
-        var retirementWakeGeneration: UInt64?
-        let fetchToRetire = activeFetch.flatMap { fetch in
-            fetch.covers(target) || isInResident || isInBuffer || isInCache ? nil : fetch
-        }
-        let fetchToCancel = fetchToRetire.flatMap { $0.hasCompleteRangeBytes ? nil : $0 }
-        if cursorChanged {
-            position = target
-            cursorGeneration &+= 1
-            // Publish the wake generation under the same cursor lock that read captures it with.
-            // An in-range seek preserves the useful task while releasing any waiter on the old offset.
-            if let fetchToCancel {
-                fetchToCancel.cancel()
-            } else {
-                activeFetch?.wakeWaiters()
-                if fetchToRetire != nil {
-                    retirementWakeGeneration = fetchToRetire?.currentWakeGeneration
-                }
-            }
-        }
-        lock.unlock()
-        if cursorChanged, let fetchToRetire {
-            if fetchToCancel != nil {
-                fetchToRetire.waitUntilFinished()
-            } else {
-                let completedPromptly = fetchToRetire.waitUntilFinished(
-                    timeout: rangeCompletionGrace,
-                    wakeGeneration: retirementWakeGeneration)
-                if !completedPromptly {
-                    lock.lock()
-                    let stillObsolete = activeFetch === fetchToRetire
-                        && !fetchToRetire.covers(position)
-                        && !residentSpans.contains { $0.covers(position) }
-                        && !bufferContains(position)
-                        && !cachedWindows.contains { $0.covers(position) }
-                    if stillObsolete { fetchToRetire.cancel() }
-                    lock.unlock()
-                    if stillObsolete { fetchToRetire.waitUntilFinished() }
-                }
-            }
-        }
+        guard target >= 0 else { return -1 }
+        position = target
         return target
     }
 
     func close() {
-        lock.lock()
-        cancelled = true
-        let fetch = activeFetch
-        lock.unlock()
-        fetch?.cancel()
-        // `startAttempt` may have dropped its condition lock while constructing a URLSession task.
-        // Let it observe cancellation and finish task creation before invalidating the session.
-        fetch?.waitForAttemptStartup()
-        session.getAllTasks { $0.forEach { $0.cancel() } }
+        cancelLock.lock(); let s = cancellableStream; cancellableStream = nil; cancelLock.unlock()
+        s?.close()
         session.invalidateAndCancel()
     }
 
     func cancel() {
-        lock.lock()
-        cancelled = true
-        let fetch = activeFetch
-        lock.unlock()
-        fetch?.cancel()
+        cancelLock.lock(); cancelled = true; let s = cancellableStream; cancelLock.unlock()
+        s?.close()
         session.getAllTasks { $0.forEach { $0.cancel() } }
+    }
+
+    /// True when the refill at `position` is a sequential continuation that reaches the top of the
+    /// adaptive window, which is where disc discovery has ended and playback has begun (#1007).
+    /// Once `playback` is set any sequential continuation streams: the first read after a seek
+    /// still goes through the small adaptive fetch, so the demuxer's seek bisection stays cheap.
+    static func streams(position: Int64, lastFetchEnd: Int64, nextChunk: Int, maxChunk: Int,
+                        streamRange: Int, playback: Bool = false) -> Bool {
+        streamRange > maxChunk && position == lastFetchEnd && lastFetchEnd >= 0
+            && (nextChunk >= maxChunk || playback)
+    }
+
+    private func startStreamLocked(end: Int64) -> Bool {
+        let s = ProgressiveRangeStream(
+            url: url, extraHeaders: extraHeaders, session: session, timeout: requestTimeout,
+            start: position, end: end, rangeSize: streamRangeSize, watermark: maxChunkSize,
+            maxRetries: maxRetries) { [weak self] bytes in
+                guard let self, bytes > 0 else { return }
+                self.transferLock.lock(); self.transferredBytes &+= Int64(bytes); self.transferLock.unlock()
+                Self.recordFetched(bytes: bytes)
+            }
+        cancelLock.lock()
+        let stop = cancelled
+        if !stop { cancellableStream = s }
+        cancelLock.unlock()
+        if stop {
+            s.close()
+            return false
+        }
+        stream = s
+        playbackStreaming = true
+        return true
+    }
+
+    private func dropStreamLocked() {
+        guard let s = stream else { return }
+        stream = nil
+        cancelLock.lock()
+        if cancellableStream === s { cancellableStream = nil }
+        cancelLock.unlock()
+        s.close()
     }
 
     func makeIndependentReader() -> IOReader? {
         HTTPDiscIOReader(url: url, extraHeaders: extraHeaders,
                          baseChunkSize: baseChunkSize, maxChunkSize: maxChunkSize,
+                         streamRangeSize: streamRangeSize,
                          maxRetries: maxRetries, requestTimeout: requestTimeout,
                          session: Self.makeSession(nil),
-                         totalSize: totalSize, residentSpans: residentSpans,
-                         allowsProgressiveReads: allowsProgressiveReads,
-                         rangeCompletionGrace: rangeCompletionGrace)
+                         totalSize: totalSize, residentSpans: residentSpans)
     }
 
     // MARK: - HTTP
@@ -597,6 +386,27 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
     /// 206 that starts somewhere else places its body at `position` regardless, corrupting the disc
     /// structure or media stream read through it (audit NET-9). The body is also trimmed to `length`
     /// in case the server sent more than asked.
+    private func fetchWithRetry(offset: Int64, length: Int) -> Data? {
+        var attempt = 0
+        while true {
+            cancelLock.lock(); let stop = cancelled; cancelLock.unlock()
+            if stop { return nil }
+            let response = Self.rangeGet(url: url, extraHeaders: extraHeaders, session: session,
+                                         timeout: requestTimeout, offset: offset, length: length)
+            if let response, !response.body.isEmpty {
+                transferLock.lock(); transferredBytes &+= Int64(response.body.count); transferLock.unlock()
+            }
+            if let r = response, r.status == 206, !r.body.isEmpty,
+               let contentRange = r.contentRange,
+               Self.parseContentRangeStart(contentRange) == offset {
+                return r.body.count > length ? r.body.prefix(length) : r.body
+            }
+            attempt += 1
+            if attempt > maxRetries { return nil }
+            Thread.sleep(forTimeInterval: min(0.25 * Double(attempt), 1.0))
+        }
+    }
+
     private enum SizeProbe {
         case size(Int64)
         /// The origin answered the range probe with a 200 that is not the byte asked for.
@@ -641,9 +451,25 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         let answer: AVIOReader.RangeAnswer
     }
 
-    /// Synchronous one-byte size probe. Adaptive data windows use `ProgressiveRangeFetch` below so
-    /// validated bytes can be returned while the request continues. The short-lived autorelease
-    /// pool also keeps this Foundation bridge off the caller's long-lived demux thread.
+    /// Takes one range of the source. Only a 206 that starts where asked is taken at all, and what is
+    /// taken is capped at `length`: a 200 or a misplaced 206 is hung up on at its head, and a 206 that
+    /// runs past the range is cut where the range ends. The completion-handler form buffered the whole
+    /// body first, so an origin that ignored Range (or answered `bytes N-EOF`) put a disc image into
+    /// memory before the check ran (audit NET-102).
+    ///
+    /// #243: the pull path runs this synchronously on FFmpeg's read callback, i.e. on a demux pump
+    /// thread that lives for the whole session inside ONE dispatch block, so nothing ever drains
+    /// that thread's autorelease pool. Every response bridged out of the completion handler is then
+    /// stranded there for the session: up to 8 MB per request at the top of the adaptive window,
+    /// several requests a second, once per reader fork (main demuxer + subtitle side demuxer +
+    /// forward prefetcher), which is the ~30 MB/s of `mallocMB` growth reported on a remote UHD ISO.
+    ///
+    /// Draining per request is the fix. A per-request `URLSession` is NOT: measured against a local
+    /// range origin, 480 MB fetched leaves +968 MB in-use on a shared session and +973 MB with a
+    /// fresh session per request, and 0 MB with this pool. That also retires the older
+    /// "URLSession retains completed completion-handler bodies until invalidation" reading of the
+    /// AVIOReader leak (see `AVIOReader.persistentSession`): the owner was always the caller
+    /// thread's pool, and delegate-based delivery fixed that path by keeping the body off it.
     private static func rangeGet(url: URL, extraHeaders: [String: String], session: URLSession,
                                  timeout: TimeInterval, offset: Int64, length: Int) -> RangeResponse? {
         autoreleasepool {
@@ -706,384 +532,6 @@ final class HTTPDiscIOReader: IOReader, SourceTransferCounting, @unchecked Senda
         fetchedBytesTotal = 0
         fetchedResetCount &+= 1
         fetchedLock.unlock()
-    }
-}
-
-/// One adaptive range window, filled incrementally by a sequence of strictly single-flight HTTP
-/// requests. At every point its storage is capped at the requested window length.
-private final class ProgressiveRangeFetch: @unchecked Sendable {
-    let start: Int64
-    private let length: Int
-    private let url: URL
-    private let extraHeaders: [String: String]
-    private let session: URLSession
-    private let timeout: TimeInterval
-    private let maxRetries: Int
-    /// Legacy range callers accept a nonempty short body as soon as its task ends. The ISO path
-    /// alone resumes a failed body from its first missing byte.
-    private let retriesPartialBodies: Bool
-    private let onBytesReceived: (Int) -> Void
-
-    private let condition = NSCondition()
-    private var body = Data()
-    private var task: URLSessionDataTask?
-    private var attemptDelegate: ProgressiveRangeAttemptDelegate?
-    private var startingAttempt = false
-    private var attemptID = 0
-    private var attemptAccepted = false
-    private var attemptOverWide = false
-    private var cancelled = false
-    private var finished = false
-    private var lastAttemptErrored = false
-    private var wakeGeneration: UInt64 = 0
-    private var waitingForTaskCompletion = false
-
-    init(url: URL, extraHeaders: [String: String], session: URLSession, timeout: TimeInterval,
-         offset: Int64, length: Int, maxRetries: Int, retriesPartialBodies: Bool,
-         onBytesReceived: @escaping (Int) -> Void) {
-        self.url = url
-        self.extraHeaders = extraHeaders
-        self.session = session
-        self.timeout = timeout
-        self.start = offset
-        self.length = length
-        self.maxRetries = max(0, maxRetries)
-        self.retriesPartialBodies = retriesPartialBodies
-        self.onBytesReceived = onBytesReceived
-    }
-
-    var isCancelled: Bool {
-        condition.lock(); defer { condition.unlock() }
-        return cancelled
-    }
-
-    func covers(_ offset: Int64) -> Bool {
-        offset >= start && offset < start + Int64(length)
-    }
-
-    var hasCompleteRangeBytes: Bool {
-        condition.lock(); defer { condition.unlock() }
-        return body.count >= length
-    }
-
-    fileprivate var hasCompletionWaiterForTesting: Bool {
-        condition.lock(); defer { condition.unlock() }
-        return waitingForTaskCompletion
-    }
-
-    var currentWakeGeneration: UInt64 {
-        condition.lock(); defer { condition.unlock() }
-        return wakeGeneration
-    }
-
-    func readableCapacity(at absoluteOffset: Int64, maximum: Int) -> Int {
-        condition.lock(); defer { condition.unlock() }
-        let relative = Int(absoluteOffset - start)
-        guard relative >= 0, relative < length else { return 0 }
-        return min(maximum, length - relative)
-    }
-
-    func wakeWaiters() {
-        condition.lock()
-        wakeGeneration &+= 1
-        condition.broadcast()
-        condition.unlock()
-    }
-
-    func begin() { startAttempt() }
-
-    /// Waits for the caller's requested bytes (avoids handing short signature reads to disc sniffers),
-    /// unless the request completes/fails first. A cursor change interrupts a waiter without
-    /// cancelling an otherwise useful in-range download.
-    func waitForData(at absoluteOffset: Int64, minimumCount: Int, wakeGeneration expectedWake: UInt64) -> Bool {
-        wait(at: absoluteOffset, minimumCount: minimumCount, untilCompletion: false,
-             wakeGeneration: expectedWake)
-    }
-
-    func waitForCompletion(wakeGeneration expectedWake: UInt64) -> Bool {
-        wait(at: start, minimumCount: 0, untilCompletion: true, wakeGeneration: expectedWake)
-    }
-
-    private func wait(at absoluteOffset: Int64, minimumCount: Int, untilCompletion: Bool,
-                      wakeGeneration expectedWake: UInt64) -> Bool {
-        let relativeOffset = Int(absoluteOffset - start)
-        condition.lock()
-        while true {
-            if cancelled || wakeGeneration != expectedWake {
-                condition.unlock()
-                return false
-            }
-            let available = relativeOffset >= 0 && relativeOffset < body.count
-                ? body.count - relativeOffset : 0
-            if untilCompletion, finished {
-                condition.unlock()
-                return true
-            }
-            if !untilCompletion, available >= minimumCount {
-                condition.unlock()
-                return true
-            }
-            if finished {
-                let hasBytes = available > 0
-                condition.unlock()
-                return hasBytes
-            }
-            if task != nil || startingAttempt {
-                condition.wait()
-                continue
-            }
-            guard attemptID <= maxRetries else {
-                finished = true
-                condition.broadcast()
-                condition.unlock()
-                return false
-            }
-
-            // The previous task's completion callback has run before this retry is created. Keep
-            // its body and resume exactly at the first byte not yet received.
-            let retryNumber = attemptID
-            let retryDeadline = Date(timeIntervalSinceNow: min(0.25 * Double(retryNumber), 1.0))
-            while !cancelled, wakeGeneration == expectedWake, task == nil, !finished,
-                  Date() < retryDeadline {
-                condition.wait(until: retryDeadline)
-            }
-            let mayRetry = !cancelled && wakeGeneration == expectedWake && !finished && task == nil
-            condition.unlock()
-            if mayRetry { startAttempt() }
-            condition.lock()
-        }
-    }
-
-    func copyAvailable(at absoluteOffset: Int64, maximum: Int, to out: UnsafeMutablePointer<UInt8>) -> Int {
-        condition.lock(); defer { condition.unlock() }
-        let relativeOffset = Int(absoluteOffset - start)
-        guard relativeOffset >= 0, relativeOffset < body.count else { return 0 }
-        let count = min(maximum, body.count - relativeOffset, length - relativeOffset)
-        guard count > 0 else { return 0 }
-        body.withUnsafeBytes { src in
-            out.update(from: src.baseAddress!.assumingMemoryBound(to: UInt8.self).advanced(by: relativeOffset),
-                       count: count)
-        }
-        return count
-    }
-
-    func finishedSnapshot() -> (finished: Bool, data: Data?, successful: Bool) {
-        condition.lock(); defer { condition.unlock() }
-        guard finished else { return (false, nil, false) }
-        let successful = !cancelled && !body.isEmpty
-            && (!retriesPartialBodies || body.count >= length || !lastAttemptErrored)
-        return (true, body, successful)
-    }
-
-    func cancel() {
-        condition.lock()
-        cancelled = true
-        let activeTask = task
-        condition.broadcast()
-        condition.unlock()
-        activeTask?.cancel()
-    }
-
-    /// Seeking outside this window waits until URLSession confirms that the obsolete task has
-    /// finished. The caller can then start a replacement without overlapping source requests.
-    func cancelAndWait() {
-        cancel()
-        waitUntilFinished()
-    }
-
-    func waitUntilFinished() {
-        condition.lock()
-        while task != nil || startingAttempt { condition.wait() }
-        condition.unlock()
-    }
-
-    @discardableResult
-    func waitUntilFinished(timeout: TimeInterval, wakeGeneration expectedWake: UInt64? = nil) -> Bool {
-        let deadline = Date(timeIntervalSinceNow: timeout)
-        condition.lock()
-        waitingForTaskCompletion = true
-        condition.broadcast()
-        defer {
-            waitingForTaskCompletion = false
-            condition.broadcast()
-            condition.unlock()
-        }
-        while task != nil || startingAttempt {
-            if let expectedWake, wakeGeneration != expectedWake { return false }
-            if !condition.wait(until: deadline) {
-                return false
-            }
-        }
-        return true
-    }
-
-    func waitForAttemptStartup() {
-        condition.lock()
-        while startingAttempt { condition.wait() }
-        condition.unlock()
-    }
-
-    private func startAttempt() {
-        condition.lock()
-        guard !cancelled, !finished, task == nil, !startingAttempt, body.count < length,
-              attemptID <= maxRetries else {
-            if task == nil && !startingAttempt && (body.count >= length || attemptID > maxRetries) {
-                finished = true
-            }
-            condition.broadcast()
-            condition.unlock()
-            return
-        }
-        attemptID += 1
-        startingAttempt = true
-        let currentID = attemptID
-        let offset = start + Int64(body.count)
-        let remainingLength = length - body.count
-        attemptAccepted = false
-        condition.unlock()
-
-        let (task, delegate) = autoreleasepool { () -> (URLSessionDataTask, ProgressiveRangeAttemptDelegate) in
-            var request = URLRequest(url: url, timeoutInterval: timeout)
-            request.httpMethod = "GET"
-            request.setValue(HTTPDiscIOReader.rangeHeader(offset: offset, length: remainingLength),
-                             forHTTPHeaderField: "Range")
-            for (key, value) in extraHeaders { request.setValue(value, forHTTPHeaderField: key) }
-            let task = session.dataTask(with: request)
-            let delegate = ProgressiveRangeAttemptDelegate(
-                fetch: self, attemptID: currentID, offset: offset, length: remainingLength,
-                extraHeaders: extraHeaders)
-            task.delegate = delegate
-            return (task, delegate)
-        }
-
-        condition.lock()
-        guard !cancelled, !finished else {
-            startingAttempt = false
-            condition.broadcast()
-            condition.unlock()
-            task.cancel()
-            return
-        }
-        self.task = task
-        self.attemptDelegate = delegate
-        startingAttempt = false
-        condition.broadcast()
-        condition.unlock()
-        task.resume()
-    }
-
-    fileprivate func acceptResponse(_ response: HTTPURLResponse, attemptID: Int,
-                                    offset: Int64, length: Int) -> Bool {
-        condition.lock(); defer { condition.unlock() }
-        guard !cancelled, self.attemptID == attemptID,
-              response.statusCode == 206,
-              let contentRange = response.value(forHTTPHeaderField: "Content-Range"),
-              HTTPDiscIOReader.parseContentRangeStart(contentRange) == offset else { return false }
-        let answer = AVIOReader.rangeAnswer(
-            response, requestedStart: offset, requestedEnd: offset + Int64(length) - 1)
-        guard answer == .honoured || answer == .overWide else { return false }
-        if response.expectedContentLength > 0 {
-            body.reserveCapacity(Int(max(0, min(response.expectedContentLength, Int64(self.length)))))
-        }
-        attemptAccepted = true
-        attemptOverWide = answer == .overWide
-        condition.broadcast()
-        return true
-    }
-
-    fileprivate func append(_ data: Data, attemptID: Int) -> Bool {
-        condition.lock(); defer { condition.unlock() }
-        guard !cancelled, self.attemptID == attemptID, attemptAccepted else { return true }
-        let room = length - body.count
-        let count = min(data.count, room)
-        if count > 0 {
-            body.append(data.prefix(count))
-            onBytesReceived(count)
-            condition.broadcast()
-        }
-        // Even a nominally exact response is capped at the requested window. Cancelling at the
-        // boundary also handles chunked or inaccurate Content-Length responses safely.
-        return data.count > room || (attemptOverWide && body.count >= length)
-    }
-
-    fileprivate func attemptDidComplete(_ id: Int, error: Error?) {
-        condition.lock()
-        guard attemptID == id else {
-            condition.unlock()
-            return
-        }
-        task = nil
-        attemptDelegate = nil
-        lastAttemptErrored = error != nil
-        if body.count >= length || cancelled || attemptID > maxRetries
-            || (!retriesPartialBodies && !body.isEmpty) || (error == nil && !body.isEmpty) {
-            finished = true
-        }
-        condition.broadcast()
-        condition.unlock()
-    }
-}
-
-/// A task-specific delegate lets the range window validate response headers before it exposes any
-/// data, while keeping EngineTLS's trust handling and cross-origin redirect credential scrubbing.
-private final class ProgressiveRangeAttemptDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
-    private weak var fetch: ProgressiveRangeFetch?
-    private let attemptID: Int
-    private let offset: Int64
-    private let length: Int
-    private let extraHeaders: [String: String]
-
-    init(fetch: ProgressiveRangeFetch, attemptID: Int, offset: Int64, length: Int,
-         extraHeaders: [String: String]) {
-        self.fetch = fetch
-        self.attemptID = attemptID
-        self.offset = offset
-        self.length = length
-        self.extraHeaders = extraHeaders
-    }
-
-    func urlSession(
-        _ session: URLSession, task: URLSessionTask,
-        didReceive challenge: URLAuthenticationChallenge,
-        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
-    ) {
-        EngineTLS.resolve(challenge, completionHandler: completionHandler)
-    }
-
-    func urlSession(
-        _ session: URLSession, task: URLSessionTask,
-        willPerformHTTPRedirection response: HTTPURLResponse,
-        newRequest request: URLRequest,
-        completionHandler: @escaping (URLRequest?) -> Void
-    ) {
-        completionHandler(RedirectHeaderPolicy.redirectRequest(
-            request, originalURL: task.originalRequest?.url,
-            originalRange: task.originalRequest?.value(forHTTPHeaderField: "Range"),
-            extraHeaders: extraHeaders))
-    }
-
-    func urlSession(
-        _ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
-        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
-    ) {
-        guard let fetch = fetch, let http = response as? HTTPURLResponse,
-              fetch.acceptResponse(http, attemptID: attemptID, offset: offset, length: length) else {
-            completionHandler(.cancel)
-            return
-        }
-        completionHandler(.allow)
-    }
-
-    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
-        guard let fetch else {
-            dataTask.cancel()
-            return
-        }
-        if fetch.append(data, attemptID: attemptID) { dataTask.cancel() }
-    }
-
-    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
-        fetch?.attemptDidComplete(attemptID, error: error)
     }
 }
 

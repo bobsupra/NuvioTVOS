@@ -47,8 +47,13 @@ project has already learned the hard way.
    after the behaviour, waits use `waitFor`, no sleeps, no blocking syscall on the test's own thread
    (see `CONTRIBUTING.md`). A test that cannot fail without the fix is not a test of the fix.
 5. **Housekeeping.** `CHANGELOG.md` entry under `[Unreleased]` in the house style, Conventional
-   Commits, no em-dashes, docs updated in the same PR, numbers quoted in docs pinned by
-   `DocumentedConstantsTests`.
+   Commits, no em-dashes, numbers quoted in docs pinned by `DocumentedConstantsTests`.
+6. **Docs.** Every changed behaviour, option, format or CLI flag is described in the docs page that
+   owns that topic (`CLAUDE.md` lists them), not only in the CHANGELOG. Check the placement against the
+   current docs on the default branch: a branch that predates a restructure may write into a file that
+   no longer holds the topic. New text reads plainly: the answer first, short sentences, terms explained
+   the first time, one idea per paragraph or table row, never appended to an unrelated paragraph. A
+   missing or misplaced doc is a finding, not a nit.
 
 Skip style nits a formatter would catch. At most three nits per review, and label them as nits.
 
@@ -78,7 +83,7 @@ say so and leave the call to the maintainer.
 - **Turning on a patent-sensitive optional component by default** (`TrueHDObjectAudio`,
   `DTSXObjectAudio`, `DualLayerDolbyVision`, `DolbyVisionStillReshaping`): they are off by default on
   purpose and integrators opt in.
-- README "Non-goals": no UI, no analytics, no playlist management, no subtitle drawing, no
+- "What the engine does not do" (`docs/features.md`): no UI, no analytics, no playlist management, no subtitle drawing, no
   third-party networking.
 
 ## Load-bearing facts that PRs tend to trip over

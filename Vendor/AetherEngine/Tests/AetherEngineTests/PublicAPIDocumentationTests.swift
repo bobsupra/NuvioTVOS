@@ -40,6 +40,7 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "NativeVideoFrameTime.swift",
         "SoftwareVideoFrameTime.swift",
         "View/AetherPlayerView.swift",
+        "Decoder/A53SEIParser.swift",   // VideoNALFraming; the parser itself is internal
         "IO/IOReader.swift",
         "IO/HLSIngest/HLSIngestError.swift",
         "Subtitles/ExternalSubtitleTrack.swift",
@@ -83,6 +84,10 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "isTransportPlaying": "transport state query helper",
         "setAudioProcessing": "Nuvio local audio processing (dialogue enhancement, loudness reduction)",
         "supportsAudioProcessing": "Nuvio local audio processing capability query",
+        "closeAuxiliaryScrubExtractors": "Nuvio scrub preview extractor teardown",
+        "closeAuxiliaryScrubExtractorsAndWait": "Nuvio scrub preview extractor synchronous teardown",
+        "sourceElType": "Nuvio Dolby Vision enhancement layer query",
+        "isDualLayerOutputRouteActive": "Nuvio dual-layer route activity query",
     ]
 
     private static let declarationPattern = try! NSRegularExpression(

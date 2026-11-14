@@ -15,7 +15,7 @@ extension AetherEngine {
     ///
     /// - Parameters:
     ///   - url: Media source (`file://`, `http://`, or `https://`).
-    ///   - options: Uses `httpHeaders` and `discImageHint` for URL sources; other flags are ignored (no playback session).
+    ///   - options: Read for `httpHeaders`, `discImageHint`, and `skipsContainerAttachments`; other flags ignored (no playback session).
     ///   - limits: Optional shared input, packet and monotonic time limits.
     ///   - cancellation: Optional one-shot token, callable from another thread or a task cancellation handler.
     /// - Throws: Open errors, `ProbeError` for a controlled stop, or `CancellationError`.
@@ -66,7 +66,7 @@ extension AetherEngine {
     ///
     /// - Parameters:
     ///   - url: Media source, forwarded verbatim to `probe(url:)`.
-    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders` and `discImageHint`; other flags ignored).
+    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders`, `discImageHint`, and `skipsContainerAttachments` only, same as `probe(url:)`).
     ///   - atmosDetection: Bounds + optional explicit track override for the decode pass. Defaults resolve the
     ///     demuxer's own default audio track (`Demuxer.audioStreamIndex`) and cap the decode attempt at 64
     ///     packets / 8 MiB / 2 s wall clock (soft -- see `AtmosDetectionOptions` doc for the same
@@ -111,7 +111,9 @@ extension AetherEngine {
     /// - **HDR10+**, whose ST 2094-40 metadata rides an in-band ITU-T T.35 SEI that no demuxer parses
     ///   (`.hdr10Plus`, see `HDR10PlusDetectionOptions`), and
     /// - **HDR Vivid**, whose CUVA metadata rides the same kind of SEI in HEVC (`.hdrVivid`, scanned in
-    ///   the same pass and under the same `HDR10PlusDetectionOptions` budget).
+    ///   the same pass and under the same `HDR10PlusDetectionOptions` budget), and
+    /// - **the Dolby Vision enhancement layer**, FEL or MEL, which only the first RPU's `el_type` says
+    ///   (`.dolbyVisionEnhancementLayer`, same pass and budget, Profile 7 only).
     ///
     /// Both cost reads past `avformat_find_stream_info`, which is why `probe(url:)` does neither.
     /// Neither is for the playback-start critical path. Asking for both runs both
@@ -119,15 +121,16 @@ extension AetherEngine {
     /// queued, then the queue-flushing seek the Atmos decode pass needs.
     ///
     /// Both passes are additive and one-directional. They can only ever SET `isAtmos` /
-    /// `carriesHDR10PlusMetadata` / `carriesHDRVividMetadata`, never clear what the container already declared, and a pass that hits a cap
+    /// `carriesHDR10PlusMetadata` / `carriesHDRVividMetadata` / `dolbyVisionEnhancementLayer`, never clear what the container already declared, and a pass that hits a cap
     /// leaves the base probe's answer exactly where it was.
     ///
     /// - Parameters:
     ///   - url: Media source, forwarded verbatim to `probe(url:)`.
-    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders` and `discImageHint` for URL sources).
+    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders`, `discImageHint`, and `skipsContainerAttachments` only).
     ///   - detecting: Which extra passes to run. Empty is the header probe with the same controls.
     ///   - atmosDetection: Bounds + optional track override for the Atmos decode pass. Ignored without `.atmos`.
-    ///   - hdr10PlusDetection: Bounds for the HDR10+ / HDR Vivid scan. Ignored without either.
+    ///   - hdr10PlusDetection: Bounds for the HDR10+ / HDR Vivid / enhancement-layer scan. Ignored without
+    ///     any of them.
     ///   - limits: Whole-probe limits, shared across open, stream analysis, seeks and both passes.
     ///   - cancellation: Cancellation reaches HTTP I/O or the custom reader's `cancel()`.
     /// - Throws: Open errors, `ProbeError` for whole-probe stops, or `CancellationError`. Ordinary
@@ -208,21 +211,23 @@ extension AetherEngine {
                         // their own timeouts, and the byte budget, which counts one source, does not apply.
                         reader.close()
                         ownedReader = nil
-                        try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+                        try demuxer.open(url: u, extraHeaders: options.httpHeaders,
+                                         profile: probeOpenProfile(limits: nil, options: options))
                     } else {
-                        try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits))
+                        try demuxer.open(reader: counted, profile: probeOpenProfile(limits: limits, options: options))
                     }
                 } else {
                     try demuxer.open(url: u, extraHeaders: options.httpHeaders,
-                                     profile: DemuxerOpenProfile.playback.withDiscImageHint(options.discImageHint))
+                                     profile: probeOpenProfile(limits: nil, options: options))
                 }
             case .custom(let reader, let formatHint):
                 displayURL = URL(string: "aether-custom://source")!
                 if let control {
                     try demuxer.open(reader: ProbeIOReader(reader: reader, control: control),
-                                     formatHint: formatHint, profile: probeOpenProfile(limits: limits))
+                                     formatHint: formatHint, profile: probeOpenProfile(limits: limits, options: options))
                 } else {
-                    try demuxer.open(reader: reader, formatHint: formatHint)
+                    try demuxer.open(reader: reader, formatHint: formatHint,
+                                     profile: probeOpenProfile(limits: nil, options: options))
                 }
             }
             try control?.check()
@@ -236,7 +241,12 @@ extension AetherEngine {
         // HDR10+ first, and before any seek: `avformat_find_stream_info` leaves its packets queued and
         // `av_read_frame` hands those back first, so at the head of a container the scan gets video packets
         // that have already been paid for. Running it after the Atmos pass would mean re-reading them.
-        let dynamicTargets = detecting.intersection([.hdr10Plus, .hdrVivid])
+        // AE#1030: the enhancement layer rides the same walk, but only a declared Profile 7 has one, so
+        // any other source reads no packet for it.
+        var dynamicTargets = detecting.intersection([.hdr10Plus, .hdrVivid])
+        if detecting.contains(.dolbyVisionEnhancementLayer), probe.dvProfile == 7 {
+            dynamicTargets.insert(.dolbyVisionEnhancementLayer)
+        }
         if !dynamicTargets.isEmpty {
             let outcome = Self.detectHDR10Plus(
                 demuxer: demuxer, videoIndex: demuxer.videoStreamIndex, options: hdr10PlusDetection,
@@ -248,6 +258,7 @@ extension AetherEngine {
             if outcome.carriesHDRVivid {
                 probe.carriesHDRVividMetadata = true
             }
+            probe.dolbyVisionEnhancementLayer = outcome.enhancementLayer
         }
 
         let targetIndex = Self.atmosDecodeTargetIndex(
@@ -270,6 +281,22 @@ extension AetherEngine {
             if outcome.confirmedAtmos {
                 probe = Self.enrichAtmos(base: probe, confirmedTrackID: Int(targetIndex))
             }
+        } else if detecting.contains(.atmos),
+                  demuxer.stream(at: targetIndex)?.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_TRUEHD {
+            // AE#1035: TrueHD Atmos sits in the major sync, which the header probe reads only for a track
+            // it decoded a frame of. A profile it did name is already the answer and costs no read.
+            let named = probe.audioTracks.first(where: { $0.id == Int(targetIndex) })?.profile
+                == Self.trueHDAtmosProfileName
+            var verdict = TrueHDAtmosVerdict.atmos
+            if !named {
+                try control?.check()
+                // Same queue flush as the E-AC-3 pass, for the same reason.
+                demuxer.seekBounded(to: 0, timeout: Self.atmosProbeFlushSeekTimeout)
+                try control?.check()
+                verdict = Self.detectTrueHDAtmos(demuxer: demuxer, targetIndex: targetIndex, options: atmosDetection).verdict
+                try control?.check()
+            }
+            probe = Self.enrichTrueHDAtmos(base: probe, trackID: Int(targetIndex), verdict: verdict)
         }
 
         closeInput()
@@ -292,9 +319,16 @@ extension AetherEngine {
     /// this probe's budget and cancellation do not reach, and `open(reader:)` clears `auditSource`
     /// regardless. A controlled probe of an untagged 10-bit HEVC source therefore reports no Dolby
     /// Vision record where an uncontrolled one does (AE#567).
-    private nonisolated static func probeOpenProfile(limits: ProbeLimits?) -> DemuxerOpenProfile {
-        guard let limits else { return .playback }
-        var profile = DemuxerOpenProfile.playback
+    ///
+    /// `LoadOptions.skipsContainerAttachments` applies to every probe open (AE#1029), controlled or not:
+    /// a Matroska file's fonts otherwise cost the probe their whole size, which is more than any byte
+    /// budget sized for a header.
+    private nonisolated static func probeOpenProfile(limits: ProbeLimits?, options: LoadOptions) -> DemuxerOpenProfile {
+        let base = DemuxerOpenProfile.playback
+            .skippingAttachments(options.skipsContainerAttachments)
+            .withDiscImageHint(options.discImageHint)
+        guard let limits else { return base }
+        var profile = base
         // FFmpeg has a minimum probe size. The input seam still enforces smaller caller limits.
         profile.probesize = max(32, min(profile.probesize, limits.maxInputBytes))
         profile.auditsRecordlessDolbyVision = false
@@ -342,6 +376,7 @@ extension AetherEngine {
         var width: Int32 = 0
         var height: Int32 = 0
         var dvProfileNum: Int? = nil
+        var dvBLCompatID: Int? = nil
         var streamFormat: VideoStreamFormat? = nil
         let videoIdx = demuxer.videoStreamIndex
         if videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) {
@@ -350,7 +385,9 @@ extension AetherEngine {
             detectedCodecID = stream.pointee.codecpar.pointee.codec_id
             width = stream.pointee.codecpar.pointee.width
             height = stream.pointee.codecpar.pointee.height
-            dvProfileNum = Self.dvProfile(stream: stream)
+            let dvRecord = Self.dvConfig(stream: stream)
+            dvProfileNum = dvRecord?.profile
+            dvBLCompatID = dvRecord?.blCompatID
             streamFormat = VideoStreamFormat(codecpar: stream.pointee.codecpar)
         }
         let codecName: String? = {
@@ -376,6 +413,9 @@ extension AetherEngine {
             videoFrameRate: snappedRate,
             isDolbyVision: detectedFormat == .dolbyVision,
             dvProfile: dvProfileNum,
+            dvBLCompatID: dvBLCompatID,
+            containerFormat: demuxer.containerFormatName,
+            discTitles: demuxer.discTitleInfos(),
             audioTracks: demuxer.audioTrackInfos(),
             subtitleTracks: demuxer.subtitleTrackInfos(),
             metadata: demuxer.mediaMetadata(),
@@ -667,17 +707,19 @@ extension AetherEngine {
     /// (`AudioPlaybackHost`). AVPlayer needs a URL it can read and a codec on the whitelist, and
     /// takes neither a FLAC whose blocks are under CoreMedia's floor (AE#764), nor a FLAC whose frames
     /// are smaller than `STREAMINFO`'s `max_blocksize` (AE#946, AVPlayer mistimes it), nor a raw FLAC
-    /// file (AE#946, AVPlayer seeks it to the wrong place), nor a session the host asked onto `.software`.
+    /// file (AE#946, AVPlayer seeks it to the wrong place), nor an AAC whose layout lives in a PCE
+    /// (AE#1047, the item ends at 0 s), nor a session the host asked onto `.software`.
     nonisolated static func audioOnlyUsesAVPlayer(
         codecID: AVCodecID,
         isCustomSource: Bool,
         flacBlocksTooSmall: Bool,
         flacFramesMistimed: Bool,
         flacSeeksMisplaced: Bool,
+        aacLayoutInPCE: Bool = false,
         preferred: DecodePath
     ) -> Bool {
         !isCustomSource && avPlayerCanDecodeAudio(codecID) && !flacBlocksTooSmall && !flacFramesMistimed
-            && !flacSeeksMisplaced && preferred != .software
+            && !flacSeeksMisplaced && !aacLayoutInPCE && preferred != .software
     }
 
     /// AE#946: CoreMedia's parser for the raw FLAC container ignores `SEEKTABLE` and places a seek by
@@ -782,7 +824,7 @@ extension AetherEngine {
             && track.profile == trueHDAtmosProfileName
     }
 
-    nonisolated private static let trueHDAtmosProfileName =
+    nonisolated static let trueHDAtmosProfileName =
         VideoStreamFormat.profileName(codecID: AV_CODEC_ID_TRUEHD, profile: AV_PROFILE_TRUEHD_ATMOS)
 
     /// DTS that FFmpeg labelled DTS:X while probing, and not a commentary or an audio description. FFmpeg
@@ -947,6 +989,7 @@ extension AetherEngine {
     /// asked for; a session whose decoder refused to open serves none, and this label used to name one
     /// for it. `route` is the host's `audioRoute`: the PCM decode is libavcodec into CoreAudio, the Atmos
     /// routes are named the way the loopback route names its own APAC ("TRUEHD Atmos → APAC 7.1.4").
+    /// AE#1027: DTS arrives as the decoder name `dca`, so DTS:X is told by both names like `isRenderableDTSX`.
     nonisolated static func softwareAudioDecoderLabel(
         audioTracks: [TrackInfo],
         activeIndex: Int32,
@@ -957,14 +1000,15 @@ extension AetherEngine {
             return nil
         }
         let codec = track.codec.uppercased()
+        let isDTS = ["dca", "dts"].contains(track.codec.lowercased())
         switch route {
         case .pcm: return "libavcodec \(codec) → CoreAudio"
         case .compressedEAC3JOC: return "\(codec) Atmos → renderer (compressed)"
         case .decodedEAC3JOC(let layout): return "\(codec) Atmos → PCM \(layout.rawValue) (system decoder)"
         case .apac(let layout):
-            return codec.hasPrefix("DTS") ? "DTS:X → APAC \(layout.rawValue)" : "\(codec) Atmos → APAC \(layout.rawValue)"
+            return isDTS ? "DTS:X → APAC \(layout.rawValue)" : "\(codec) Atmos → APAC \(layout.rawValue)"
         case .pcmBed(let layout):
-            return codec.hasPrefix("DTS") ? "DTS:X → PCM \(layout.rawValue)" : "\(codec) Atmos → PCM \(layout.rawValue)"
+            return isDTS ? "DTS:X → PCM \(layout.rawValue)" : "\(codec) Atmos → PCM \(layout.rawValue)"
         }
     }
 
@@ -1071,6 +1115,16 @@ extension AetherEngine {
               sourceFormat == .dolbyVision,
               itemFormat == .dolbyVision else { return nil }
         return .dolbyVision
+    }
+
+    /// AE#1018: the panel answer the FEL fold gate starts a session with. The label alone arrives too late:
+    /// the first producer reads during the display switch, when the readout says 1.00 on the panels this
+    /// has to recognise. So an HDR criteria write with range matching on, on a display that has not refused
+    /// an HDR master in this process, counts as HDR from the start; a refusal clears it on the session.
+    nonisolated static func felGatePanelPresentsHDR(labelPresentsHDR: Bool, hdrWriteEngagesPanel: Bool,
+                                                    engineWritesHDRCriteria: Bool,
+                                                    panelRefusedHDRMaster: Bool) -> Bool {
+        labelPresentsHDR || (hdrWriteEngagesPanel && engineWritesHDRCriteria && !panelRefusedHDRMaster)
     }
 
     /// AE#459: what this session takes the panel to be presenting, from the host's assertion and the

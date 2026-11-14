@@ -300,7 +300,8 @@ public actor FrameExtractor {
                     relativeToPresentationStart: relativeToPresentationStart,
                     requiredDolbyVisionReshaping: requiredDolbyVisionReshaping,
                     isCancelled: { token.isCancelled || cancellation.isCancelled || control.isStopped || yieldWhile?() == true },
-                    reportDecodedTime: { actual = $0 }),
+                    reportDecodedTime: { actual = $0 },
+                    bounded: true),
                     !token.isCancelled, !cancellation.isCancelled else { return nil }
                 do { try control.complete() } catch { return nil }
                 return BoundedStillFrame(image: image, actualSeconds: actual)

@@ -235,6 +235,13 @@ extension AetherEngine {
                 // `liveItemPlacementPending`.
                 if ready {
                     self.noteLiveItemStart()
+                    // AE#1018: an HDR master reaching readyToPlay was accepted, and a display presenting SDR
+                    // refuses one at parse time (AE#459), so the panel presents HDR. The load-time readout
+                    // is taken mid-switch and reads 1.00 on exactly the panels this has to recognise.
+                    if let session = self.nativeVideoSession, session.servingMasterPlaylist,
+                       session.servedSourceIsHDR, !self.masterFallbackUsed {
+                        session.notePanelPresentsHDR(true)
+                    }
                     // The placement is spent here, on every path rather than only on the one that
                     // replays the stashed seek: a pre-ready seek can be superseded by a host scrub
                     // (latest-wins), and an arm left standing would be inherited by whatever item the
@@ -339,7 +346,7 @@ extension AetherEngine {
     /// a host preserved across a native->native reload (issue #15) keeps what it was created with,
     /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
     func makeNativeHost() -> NativeAVPlayerHost {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         let host = NativeAVPlayerHost(ownsNowPlayingSession: Self.ownsNowPlaying(
             hostOptIn: ownsVideoNowPlayingSession, role: loadedOptions.sharedOutputRole))
         #else
@@ -364,17 +371,21 @@ extension AetherEngine {
         return host
     }
 
-    /// Replay the staged Now-Playing identity onto a host, and re-assert session ownership. The
-    /// re-assert mirrors the audio path: a preserved host never re-runs init, so a session another
-    /// app took over in the meantime would otherwise never be claimed back. Both no-op for a host
-    /// that owns no session.
+    /// Replay the staged Now-Playing identity onto a host, re-assert session ownership, and start the
+    /// engine's publisher for the route. The re-assert mirrors the audio path: a preserved host never
+    /// re-runs init, so a session another app took over in the meantime would otherwise never be
+    /// claimed back. The first two no-op for a host that owns no session.
     func replayVideoNowPlayingInfo(to host: NativeAVPlayerHost) {
-        #if os(tvOS) || os(iOS)
-        guard host.ownsNowPlayingSession else { return }
-        if !pendingVideoNowPlayingInfo.isEmpty {
-            host.setNowPlayingInfo(pendingVideoNowPlayingInfo)
+        #if os(iOS) || os(tvOS) || os(visionOS)
+        if host.ownsNowPlayingSession {
+            if !pendingVideoNowPlayingInfo.isEmpty {
+                host.setNowPlayingInfo(pendingVideoNowPlayingInfo)
+            }
+            host.becomeActiveNowPlaying()
         }
-        host.becomeActiveNowPlaying()
+        startNowPlayingPublisher(.nativeVideo, sessionCenter: host.nowPlayingSession?.remoteCommandCenter)
+        #else
+        startNowPlayingPublisher(.nativeVideo, sessionCenter: nil)
         #endif
     }
 
@@ -654,6 +665,9 @@ extension AetherEngine {
                       // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                       surfaceEndFailures: true,
                       httpHeaders: options.httpHeaders,
+                      // AE#154 follow-up: only where the engine read the body itself. A host-declared bypass
+                      // keeps AVFoundation's own typing of the URL.
+                      declaresHLSPlaylistMIMEType: options.hlsPlaylistProvenByBody,
                       // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting
                       // it back would ping-pong), and hosts can opt out via LoadOptions.
                       armIngestFallback: RemoteHLSIngestFallback.shouldArm(
@@ -862,6 +876,7 @@ extension AetherEngine {
         forceDolbyVisionOnNonDVDisplay: Bool = false,
         dolbyVisionHandling: DolbyVisionHandling = .automatic,
         dolbyVisionRPUProfile: Int? = nil,
+        measuredFrameRate: AVRational? = nil,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
         sessionDisplayCaps: DisplayCapabilities,
@@ -873,7 +888,8 @@ extension AetherEngine {
         keepsMediaPlaylistRoute: Bool = false,
         autostarts: Bool,
         generation: UInt64,
-        resolvePanelRouting: (() async throws -> Bool)? = nil
+        resolvePanelRouting: (() async throws -> Bool)? = nil,
+        panelPresentsHDR: Bool = false
     ) async throws {
         // companionAudioReader is set by the reader's resolver before any main-stream byte flows, so it is
         // final by the time loadNative runs; nil means muxed audio.
@@ -939,12 +955,15 @@ extension AetherEngine {
             forceDolbyVisionOnNonDVDisplay: forceDolbyVisionOnNonDVDisplay,
             dolbyVisionHandling: dolbyVisionHandling,
             dolbyVisionRPUProfile: dolbyVisionRPUProfile,
+            measuredFrameRate: measuredFrameRate,
             matchContentEnabled: matchContentEnabled,
             panelIsInHDRMode: panelIsInHDRMode,
             audioSourceStreamIndexOverride: audioSourceStreamIndex,
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
+            foldsDolbyVisionFEL: loadedOptions.foldsDolbyVisionFEL,
+            panelPresentsHDR: panelPresentsHDR,
             stereoPresentation: loadedOptions.stereoPresentation,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
@@ -978,7 +997,9 @@ extension AetherEngine {
             heldSourceConnection: loadedOptions.heldSourceConnection,
             declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: forwardBufferSegmentsForSession(loadedOptions.forwardBufferSegments),
-            sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget
+            sessionCacheByteBudget: loadedOptions.sessionCacheByteBudget,
+            sessionCacheHardLimitBytes: loadedOptions.sessionCacheHardLimitBytes,
+            sessionCacheFreeReserveBytes: loadedOptions.sessionCacheFreeReserveBytes
         )
         let needsHDR10PlusPrepareCancellation = dolbyVisionHandling == .hdr10BaseLayerOnly && !isCustomSource
         if needsHDR10PlusPrepareCancellation {
@@ -1004,6 +1025,8 @@ extension AetherEngine {
         // AE#464: every producer this session builds reads it off the session. Set before start().
         session.audioDelaySeconds = loadedOptions.audioDelaySeconds
         session.audioShaping = loadedOptions.audioShaping
+        // AE#1049: no companion-demuxed audio here; its tracks are not the source's streams.
+        session.audioTrackChoicesForSession = companionAudioReader == nil ? audioMenuChoicesForSession() : []
         session.servesSegmentsProgressively = loadedOptions.progressiveSegmentDelivery
         // #240: the pump claims the source link through this gate while it is fetching, so the
         // subtitle side readers can stay out of its way. Set before start().
@@ -1265,7 +1288,9 @@ extension AetherEngine {
             NativeSubtitleTrackEntry(sourceStreamIndex: track.isExternal ? nil : track.id,
                                      externalID: track.isExternal ? track.id : nil,
                                      language: track.language,
-                                     isForced: track.isForced)
+                                     isForced: track.isForced,
+                                     title: track.sourceTitle,
+                                     isHearingImpaired: track.isHearingImpaired)
         }
         // Rendition metadata built ONCE (unique NAMEs + FORCED); the published track list and the
         // master's EXT-X-MEDIA tags must agree, and duplicate names collapse AVFoundation's
@@ -1396,6 +1421,10 @@ extension AetherEngine {
             let routesAsHDRPanel: Bool
             do {
                 routesAsHDRPanel = try await resolvePanelRouting()
+                if Self.sessionPanelPresentsHDR(hostAsserts: loadedOptions.panelIsInHDRMode,
+                                                criteriaReadout: sessionPanelHDRReadout) {
+                    session.notePanelPresentsHDR(true)
+                }
             } catch {
                 session.stop(reason: .loadFailed)
                 throw error
@@ -2058,6 +2087,7 @@ extension AetherEngine {
         // AE#458: what AVFoundation makes of the audio rendition this load just served, which is the
         // half of the exchange no log has ever carried.
         logAudibleReadback(host: host)
+        armAudioMenuPicks(host: host)
     }
 
     /// The active audio track's channel count from the published track list, nil when unknown.
@@ -2398,6 +2428,7 @@ extension AetherEngine {
         let sessionCacheByteBudget = loadedOptions.sessionCacheByteBudget
         let packetCacheStorage = loadedOptions.softwarePacketCacheStorage
         let dvrRetention = loadedOptions.softwareDVRRetention
+        let liveDVRByteBudget = loadedOptions.liveDVRByteBudget
         try await BlockingWork.detached(priority: .userInitiated) {
             [host, preopenedDemuxer, url, sourceHTTPHeaders, requestHeaders = sessionRequestHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, heldSourceConnection, sourceOpenPolicy, diagnosticContext, declaredDuration, discImageHint, networkPhaseSink] in
             let dem: Demuxer
@@ -2415,6 +2446,7 @@ extension AetherEngine {
                 isLive: isLive,
                 dvrWindowSeconds: dvrWindowSeconds,
                 dvrRetention: dvrRetention,
+                liveDVRByteBudget: liveDVRByteBudget,
                 forwardBufferSegments: forwardBufferSegments,
                 packetCacheStorage: packetCacheStorage,
                 sessionCacheByteBudget: sessionCacheByteBudget
@@ -2449,6 +2481,7 @@ extension AetherEngine {
 host.audioShaping = loadedOptions.audioShaping
             host.setAudioProcessing(audioProcessingSettings)
         self.audioHost = host
+        startNowPlayingPublisher(.audioFFmpeg, sessionCenter: nil)
         applyDesiredVolume(to: host)
         applyDesiredRate(to: host)
         self.playlistShiftSeconds = 0
@@ -2538,8 +2571,11 @@ host.audioShaping = loadedOptions.audioShaping
         // so the Home badge + remote commands stay bound across a pause.
         host.becomeActiveNowPlaying()
         host.setExternalMetadata(pendingExternalMetadata)
-        #if os(iOS) || os(tvOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         host.setNowPlayingInfo(pendingAudioNowPlayingInfo)
+        startNowPlayingPublisher(.audioAVPlayer, sessionCenter: host.nowPlayingSession.remoteCommandCenter)
+        #else
+        startNowPlayingPublisher(.audioAVPlayer, sessionCenter: nil)
         #endif
 
         audioNativeCancellables.removeAll()
@@ -3001,6 +3037,7 @@ host.audioShaping = loadedOptions.audioShaping
                     // AE#532: the verdict the load reached, not a second audit: the source has not
                     // changed and the probe that could answer it is gone.
                     dolbyVisionRPUProfile: sourceDolbyVisionRPUProfile,
+                    measuredFrameRate: sourceMeasuredFrameRate,
                     matchContentEnabled: loadedOptions.matchContentEnabled,
                     panelIsInHDRMode: reloadRoutingPanelHDR,
                     // AE#535: the load's table, for the same reason as the panel answer above.
@@ -3014,7 +3051,13 @@ host.audioShaping = loadedOptions.audioShaping
                     preopenedDemuxer: customPreopened,
                     keepsMediaPlaylistRoute: keepsMediaRoute,
                     autostarts: transportIntentUnderReconstruction ?? resumesPlaying,
-                    generation: gen
+                    generation: gen,
+                    panelPresentsHDR: Self.felGatePanelPresentsHDR(
+                        labelPresentsHDR: Self.sessionPanelPresentsHDR(
+                            hostAsserts: loadedOptions.panelIsInHDRMode, criteriaReadout: sessionPanelHDRReadout),
+                        hdrWriteEngagesPanel: displayCriteria.hdrWriteExpectedToEngagePanel(),
+                        engineWritesHDRCriteria: loadedOptions.engineWritesDisplayCriteria && videoFormat != .sdr,
+                        panelRefusedHDRMaster: Self.panelRefusedHDRMaster || masterFallbackUsed)
                 )
                 EngineLog.emit("[AetherEngine] reload: loadNative done (\(elapsedMs(since: loadStart))ms)", category: .engine)
                 playbackBackend = .native

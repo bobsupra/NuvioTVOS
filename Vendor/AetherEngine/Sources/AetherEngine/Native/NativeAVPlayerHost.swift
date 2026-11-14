@@ -4,7 +4,7 @@ import AVKit
 import Combine
 import CoreImage
 import CoreImage.CIFilterBuiltins
-#if os(tvOS) || os(iOS)
+#if os(iOS) || os(tvOS) || os(visionOS)
 import MediaPlayer
 #endif
 #if os(iOS) || os(tvOS) || os(visionOS)
@@ -394,7 +394,7 @@ final class NativeAVPlayerHost {
 
     // MARK: - Init
 
-    #if os(tvOS) || os(iOS)
+    #if os(iOS) || os(tvOS) || os(visionOS)
     /// Now-Playing session bound to THIS player (same rationale as
     /// AudioAVPlayerHost): the shared MPRemoteCommandCenter /
     /// MPNowPlayingInfoCenter aren't reliably bound to a bare AVPlayer, a
@@ -438,7 +438,7 @@ final class NativeAVPlayerHost {
         self.playerLayer = AVPlayerLayer(player: player)
         self.playerLayer.videoGravity = .resizeAspect
         self.ownsNowPlayingSession = ownsNowPlayingSession
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         if ownsNowPlayingSession {
             let session = MPNowPlayingSession(players: [player])
             session.automaticallyPublishesNowPlayingInfo = true
@@ -453,7 +453,7 @@ final class NativeAVPlayerHost {
     /// another engine path) took over in the meantime is never claimed back. No-op when no session
     /// is owned.
     func becomeActiveNowPlaying() {
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         nowPlayingSession?.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
@@ -463,7 +463,7 @@ final class NativeAVPlayerHost {
     /// elapsed/rate/duration. Empty clears.
     func setNowPlayingInfo(_ info: [String: Any]) {
         pendingNowPlayingInfo = info
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         // Only when this host owns the session. Writing item.nowPlayingInfo under an AVKit host
         // would feed AVKit's own Now-Playing publication a second, host-authored identity.
         guard ownsNowPlayingSession else { return }
@@ -483,9 +483,25 @@ final class NativeAVPlayerHost {
     /// loopback path's default asset untouched. AVFoundation applies AVURLAssetHTTPHeaderFieldsKey
     /// to playlist and segment requests, which is what header-enforcing remote-HLS origins
     /// (IPTV / Stremio per-stream Referer / User-Agent / Authorization) need (#119).
-    nonisolated static func assetCreationOptions(httpHeaders: [String: String]) -> [String: Any]? {
-        httpHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
+    ///
+    /// `declaresHLSPlaylist` adds `AVURLAssetOverrideMIMETypeKey` (AE#154 follow-up). AVFoundation
+    /// decides what a URL is from its path extension and the response's `Content-Type`, never from the
+    /// body. Measured on macOS 27 against a local origin: a playlist whose final URL has no `.m3u8` and
+    /// which is served as `video/mp4` or `application/octet-stream` fails in 0.2 to 0.3 s with -11829 /
+    /// -11828 (OSStatus -12848 / -12847); with the override the same cases play in 0.7 to 0.9 s. A
+    /// valid MP4 opened with the override still plays, so a wrong declaration is not fatal, but it is
+    /// set only where the engine has read the body.
+    nonisolated static func assetCreationOptions(
+        httpHeaders: [String: String], declaresHLSPlaylist: Bool = false
+    ) -> [String: Any]? {
+        var options: [String: Any] = [:]
+        if !httpHeaders.isEmpty { options["AVURLAssetHTTPHeaderFieldsKey"] = httpHeaders }
+        if declaresHLSPlaylist { options[AVURLAssetOverrideMIMETypeKey] = hlsPlaylistMIMEType }
+        return options.isEmpty ? nil : options
     }
+
+    /// RFC 8216's type for an HLS playlist, the one AVFoundation recognizes.
+    nonisolated static let hlsPlaylistMIMEType = "application/vnd.apple.mpegurl"
 
     /// Everything a load establishes about the SESSION rather than about the item it opens (#440 round 5).
     ///
@@ -525,6 +541,10 @@ final class NativeAVPlayerHost {
         /// Sent with every asset and segment request. The bypass path carries the origin's auth here, so
         /// a swap that dropped them would re-open the same URL unauthenticated.
         var httpHeaders: [String: String] = [:]
+        /// The engine read the body behind this URL and it is an HLS playlist (AE#154 reroute): the asset
+        /// declares the HLS MIME type instead of letting the URL's extension and `Content-Type` decide.
+        /// Session-wide for the same reason as the headers: a swap re-opens the same URL.
+        var declaresHLSPlaylistMIMEType: Bool = false
         /// #168 / #293: arm the carriage probe and the ingest reroute for a remote origin.
         var armIngestFallback: Bool = false
         /// #334: the ceiling on silence for a path with no other readiness watchdog.
@@ -602,6 +622,7 @@ final class NativeAVPlayerHost {
         }
         let forwardBufferDuration = contract.forwardBufferDuration
         let httpHeaders = contract.httpHeaders
+        let declaresHLSPlaylist = contract.declaresHLSPlaylistMIMEType
         let armIngestFallback = contract.armIngestFallback
         self.surfaceEndFailures = contract.surfaceEndFailures
         self.ingestFallbackArmed = armIngestFallback
@@ -630,7 +651,7 @@ final class NativeAVPlayerHost {
         let loadStart = DispatchTime.now()
         loadStartTime = loadStart
 
-        EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") headers=\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")", category: .engine)
+        EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") headers=\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")\(declaresHLSPlaylist ? " mime=hls(body)" : "")", category: .engine)
 
         // First frame on screen, published as `isVideoReadyForDisplay` and stamped for the
         // audio-leads-black-video gap (see `layerReadyObservation`).
@@ -664,7 +685,8 @@ final class NativeAVPlayerHost {
             }
         }
 
-        let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
+        let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(
+            httpHeaders: httpHeaders, declaresHLSPlaylist: declaresHLSPlaylist))
         let item = AVPlayerItem(asset: asset)
         AudioRatePolicy.apply(to: item)
         // 4s default matches loopback HLS segment cadence; raising it for live makes AVPlayer race to the edge and stall at the transcode warm-up gap.
@@ -696,7 +718,7 @@ final class NativeAVPlayerHost {
             item.externalMetadata = pendingExternalMetadata
         }
         #endif
-        #if os(tvOS) || os(iOS)
+        #if os(iOS) || os(tvOS) || os(visionOS)
         // Replay staged Now-Playing identity onto the fresh item (gate
         // reloads / media fallback / in-place swaps keep the system card).
         // Owned sessions only: see setNowPlayingInfo.
@@ -979,10 +1001,15 @@ final class NativeAVPlayerHost {
                     // token expiry, persistent segment 404) surfaces .error so the host can retune / show it.
                     self.handleItemFailed(desc, item: current)
                 } else if Self.shouldCountEndFailureForRevive(
-                    surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed) {
+                    surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed,
+                    hasPresentedFrame: current.presentationSize != .zero) {
                     // #93 round 3: loopback path. Count the death for the engine's revive
-                    // escalation; a startup death (never played) stays with the startup watchdogs.
+                    // escalation; a startup death before the first frame stays with the startup watchdogs.
                     self.endFailureCount += 1
+                } else {
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) failedToPlayToEndTime before the first frame; "
+                        + "left to the startup watchdogs", category: .engine)
                 }
             }
         }
@@ -1269,10 +1296,15 @@ final class NativeAVPlayerHost {
     /// revive escalation? The lean remote-live path (`surfaceEndFailures`) keeps its own
     /// deferred-failure contract; a startup death before the first frame stays with the
     /// startup watchdogs.
+    ///
+    /// AE#1043: "past startup" is the first frame, not the first `.playing`. The startup readiness
+    /// gate declares the item ready on a non-zero presentation size, so a death between that frame
+    /// and the first `.playing` (an HDMI re-handshake while the host waits for the display switch)
+    /// was owned by neither side and parked the session forever.
     nonisolated static func shouldCountEndFailureForRevive(
-        surfaceEndFailures: Bool, hasEverPlayed: Bool
+        surfaceEndFailures: Bool, hasEverPlayed: Bool, hasPresentedFrame: Bool
     ) -> Bool {
-        !surfaceEndFailures && hasEverPlayed
+        !surfaceEndFailures && (hasEverPlayed || hasPresentedFrame)
     }
 
     /// Pure decision for the rate-change mirror: an explicit rate write (`setRateCalled`, e.g. AVKit's

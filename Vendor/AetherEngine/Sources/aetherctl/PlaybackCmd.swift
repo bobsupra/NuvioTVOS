@@ -55,7 +55,9 @@ struct AudioShapingSwitchRequest {
     let delayMilliseconds: Int
 }
 
-/// `off`, or a comma list of `ch=N`, `dialogue=DB` and `night` (the engine's night preset).
+/// `off`, or a comma list of `ch=N`, `dialogue=DB`, `night` (the engine's night preset),
+/// `gain=DB` (a plain gain: a 1:1 compressor with that makeup), `loudness=LUFS` (AE#1036) and
+/// `lfe=DB` (the LFE level in a fold that drops it, AE#1044).
 func parseAudioShapingSpec(_ spec: String) -> AudioShaping? {
     var shaping = AudioShaping()
     guard spec != "off" else { return shaping }
@@ -65,6 +67,11 @@ func parseAudioShapingSpec(_ spec: String) -> AudioShaping? {
         case ("ch", let v?): guard let n = Int(v) else { return nil }; shaping.maxChannels = n
         case ("dialogue", let v?): guard let db = Double(v) else { return nil }; shaping.dialogueGainDB = db
         case ("night", nil): shaping.compressor = .night
+        case ("gain", let v?):
+            guard let db = Double(v) else { return nil }
+            shaping.compressor = .init(thresholdDB: 0, ratio: 1, makeupGainDB: db)
+        case ("loudness", let v?): guard let lufs = Double(v) else { return nil }; shaping.loudnessTargetLUFS = lufs
+        case ("lfe", let v?): guard let db = Double(v) else { return nil }; shaping.lfeMixDB = db
         default: return nil
         }
     }
@@ -129,7 +136,7 @@ enum LoadOptionChange {
 func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, liveCushion: Double? = nil, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false, softwareEscalation: Bool = true,
                     censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
-                    teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, subtitleOffsetReach: Double? = nil,
+                    teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, subtitleReach: SubtitleReachRequest? = nil,
                     audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [],
                     audioShaping: AudioShaping = AudioShaping(), audioShapingSwitches: [AudioShapingSwitchRequest] = [],
                     pausedMount: Bool = false,
@@ -142,7 +149,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
                     skipAttachments: Bool = false,
                     dolbyVisionHandling: DolbyVisionHandling = .automatic, preferDualLayerDolbyVision: Bool = false,
                     dualLayerRoute: DualLayerRoute = .softwareHost,
-                    upscalesLowResolutionVideo: Bool = false,
+                    upscalesLowResolutionVideo: Bool = false, upscaleScaler: UpscaleScaler = .automatic,
                     attachSurface: Bool = false, record: URL? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
@@ -165,7 +172,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, subtitleOffsetReach: subtitleOffsetReach, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, progressiveSegments: progressiveSegments, objectAudioRendering: objectAudioRendering, preferDualLayerDolbyVision: preferDualLayerDolbyVision, dualLayerRoute: dualLayerRoute, upscalesLowResolutionVideo: upscalesLowResolutionVideo, attachSurface: attachSurface, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, skipAttachments: skipAttachments, dolbyVisionHandling: dolbyVisionHandling, record: record)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, forceSoftware: forceSoftware, softwareEscalation: softwareEscalation, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, liveStartImmediately: liveStartImmediately, liveCushion: liveCushion, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, presentTimes: presentTimes, servedURL: servedURL, pictureProbe: pictureProbe, pictureOrigin: pictureOrigin, nativeVideoFrameDiagnostics: nativeVideoFrameDiagnostics, nativeVideoFrameRecovery: nativeVideoFrameRecovery, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, subtitleReach: subtitleReach, audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches, audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches, pausedMount: pausedMount, optionCorrection: optionCorrection, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, heldConnection: heldConnection, progressiveSegments: progressiveSegments, objectAudioRendering: objectAudioRendering, preferDualLayerDolbyVision: preferDualLayerDolbyVision, dualLayerRoute: dualLayerRoute, upscalesLowResolutionVideo: upscalesLowResolutionVideo, upscaleScaler: upscaleScaler, attachSurface: attachSurface, declaredDuration: declaredDuration, httpHeaders: httpHeaders, deinterlaceFieldRate: deinterlaceFieldRate, assertDolbyVision: assertDolbyVision, preserveASSMarkup: preserveASSMarkup, skipAttachments: skipAttachments, dolbyVisionHandling: dolbyVisionHandling, record: record)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -491,7 +498,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, liveCushion: Double? = nil, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, subtitleOffsetReach: Double? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], audioShaping: AudioShaping = AudioShaping(), audioShapingSwitches: [AudioShapingSwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, objectAudioRendering: ObjectAudioRendering = .off, preferDualLayerDolbyVision: Bool = false, dualLayerRoute: DualLayerRoute = .softwareHost, upscalesLowResolutionVideo: Bool = false, attachSurface: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, skipAttachments: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware: Bool = false, softwareEscalation: Bool = true, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, liveStartImmediately: Bool = true, liveCushion: Double? = nil, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, presentTimes: Bool = false, servedURL: Bool = false, pictureProbe: Bool = false, pictureOrigin: Double = 0, nativeVideoFrameDiagnostics: Bool = false, nativeVideoFrameRecovery: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, subtitleReach: SubtitleReachRequest? = nil, audioDelayMs: Int = 0, audioDelaySwitches: [AudioDelaySwitchRequest] = [], audioShaping: AudioShaping = AudioShaping(), audioShapingSwitches: [AudioShapingSwitchRequest] = [], pausedMount: Bool = false, optionCorrection: LoadOptionCorrectionRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, heldConnection: Bool = false, progressiveSegments: Bool = false, objectAudioRendering: ObjectAudioRendering = .off, preferDualLayerDolbyVision: Bool = false, dualLayerRoute: DualLayerRoute = .softwareHost, upscalesLowResolutionVideo: Bool = false, upscaleScaler: UpscaleScaler = .automatic, attachSurface: Bool = false, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:], deinterlaceFieldRate: DeinterlaceFieldRate = .field, assertDolbyVision: Bool = false, preserveASSMarkup: Bool = false, skipAttachments: Bool = false, dolbyVisionHandling: DolbyVisionHandling = .automatic, record: URL? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -500,9 +507,10 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         return 1
     }
     // AE#929: the host's declared subtitle offset reach, which sizes the retained bitmap windows.
-    if let subtitleOffsetReach {
-        engine.maximumSubtitleOffsetSeconds = subtitleOffsetReach
-        print("  SUBTITLE offset reach \(subtitleOffsetReach)s")
+    // AE#1031: per direction when asked.
+    if let subtitleReach, subtitleReach.isSet {
+        subtitleReach.apply(to: engine)
+        print("  SUBTITLE offset reach later=\(engine.maximumSubtitleDelaySeconds)s earlier=\(engine.maximumSubtitleAdvanceSeconds)s")
     }
 
     var cancellables = Set<AnyCancellable>()
@@ -542,8 +550,26 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
                 body = "'\(flat)' [\(colours) colour run(s)]"
             case .image: body = "[bitmap]"
             }
-            print(String(format: "  CUE #%d %.2f-%.2f %@", cue.id, cue.startTime, cue.endTime, body))
+            // AE#1021: the clock at arrival, so how far ahead of the playhead a cue lands is readable.
+            print(String(format: "  CUE #%d %.2f-%.2f %@ at=%.2f", cue.id, cue.startTime, cue.endTime, body,
+                         engine.currentTime))
         }
+    }.store(in: &cancellables)
+
+    // AE#1022: CUE says a cue ARRIVED, which is not what a viewer sees. A cue kept across a seek
+    // never arrives again, and one that arrives after its own end is never seen at all. ONSCREEN
+    // samples what a host overlay draws (the cues covering the playhead) four times a second and
+    // prints each change, which is the observable a landing report is measured in.
+    var lastOnScreen: [Double]? = nil
+    Timer.publish(every: 0.25, on: .main, in: .common).autoconnect().sink { _ in
+        let playhead = engine.sourceTime
+        let covering = engine.subtitleCues
+            .filter { $0.startTime <= playhead && $0.endTime > playhead }
+            .map(\.startTime).sorted()
+        guard covering != lastOnScreen else { return }
+        lastOnScreen = covering
+        let starts = covering.isEmpty ? "-" : covering.map { String(format: "%.2f", $0) }.joined(separator: ",")
+        print(String(format: "  ONSCREEN %@ at=%.2f", starts, playhead))
     }.store(in: &cancellables)
 
     // #315: the cover-lift edge, stamped from the load call. Both transitions are printed: the
@@ -590,7 +616,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         .sink { u in
             print("  UPSCALE \(Int(u.sourceSize.width))x\(Int(u.sourceSize.height)) -> "
                   + "\(Int(u.targetSize.width))x\(Int(u.targetSize.height)) "
-                  + "ml=\(u.mlScale.map { String(format: "%g", $0) } ?? "-")"
+                  + "ml=\(u.mlScale.map { String(format: "%g", $0) } ?? "-") scaler=\(u.scaler)"
                   + (u.disabledReason.map { " disabled: \($0)" } ?? ""))
         }
         .store(in: &cancellables)
@@ -607,6 +633,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
         preferDualLayerDolbyVision: preferDualLayerDolbyVision,
         dualLayerRoute: dualLayerRoute,
         upscalesLowResolutionVideo: upscalesLowResolutionVideo,
+        upscaleScaler: upscaleScaler,
         panelPresentsDolbyVision: assertDolbyVision,
         objectAudioRendering: objectAudioRendering,
         isLive: live,
@@ -811,15 +838,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
             // exists (the foreground retune's hold-paused policy). Resumed at tick 8.
             print("  HOSTCALL pause() right after load")
             engine.pause()
-        case "reloadlive", "reloadnext", "seekback", "overlapseek", "ratehold-tail", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
+        case "reloadlive", "reloadnext", "seekback", "overlapseek", "pauseseek", "pausehold", "still", "stallclock", "pausereload", "playreload", "extplayreload":
             break  // reloadlive handled at load time, seekback/overlapseek/pauseseek in the telemetry loop
         case "nativesubs":
             break  // Sodalite#156, read at load time into LoadOptions.prepareNativeSubtitles
+        case "subsatload":
+            break  // read at load time, picks the --subs track before the first tick
         case let call where call.hasPrefix("seekfar") || call.hasPrefix("subsoff")
             || call.hasPrefix("subson") || call.hasPrefix("nativerender") || call.hasPrefix("lanreload"):
             break  // #433 / Sodalite#156, all in the telemetry loop; `@N` picks the tick
         default:
-            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson)")
+            print("  HOSTCALL unknown '\(call)' (use play,extractor,setrate,ratehold,pausestart,reloadlive,reloadnext,seekback,seekfar,overlapseek,pauseseek,pausehold,still,stallclock,pausereload,playreload,extplayreload,nativesubs,nativerender,subsoff,subson,subsatload,lanreload)")
         }
     }
     defer { if let frameExtractor { Task { await frameExtractor.shutdown() } } }
@@ -987,6 +1016,21 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, forceSoftware:
     print("")
 
     var subsSelected = false
+    // AE#1021: `--host-calls subsatload` picks the `--subs` track as soon as `load` returns, before
+    // the first frame, the way a host restoring a remembered track does. The default tick-5 pick is
+    // a mid-session start, which takes a different path through the prefetch and the drain.
+    if let subsPick, hostCalls.contains("subsatload") {
+        let match = engine.subtitleTracks.first { track in
+            if let wanted = Int(subsPick) { return track.id == wanted }
+            return track.codec.localizedCaseInsensitiveContains(subsPick)
+                || (track.language?.localizedCaseInsensitiveContains(subsPick) ?? false)
+        }
+        if let match {
+            print("  SELECT (at load) subtitle id=\(match.id) codec=\(match.codec) clock=\(String(format: "%.2f", engine.currentTime))")
+            engine.selectSubtitleTrack(index: match.id)
+            subsSelected = true
+        }
+    }
     var seekPatternIndex = 0
     var seekLandings: [Double] = []
 
@@ -1874,4 +1918,21 @@ private func reportServedVTT(_ engine: AetherEngine, _ label: String, around pla
           + " picked=\(offsets[startIndex...].prefix(2).map(\.name).joined(separator: ",")) "
           + "of=\(offsets.count) relative=\(String(format: "%.1f", relative)) playhead=\(String(format: "%.1f", playhead))"
           + (checked > 0 && nonEmpty == 0 ? "   <- a caption box with nothing in it" : ""))
+}
+
+/// AE#1031: `--subtitle-offset-reach` sets both directions, `--subtitle-delay-reach` and
+/// `--subtitle-advance-reach` override one each.
+struct SubtitleReachRequest {
+    var offset: Double?
+    var delay: Double?
+    var advance: Double?
+
+    var isSet: Bool { offset != nil || delay != nil || advance != nil }
+
+    @MainActor
+    func apply(to engine: AetherEngine) {
+        if let offset { engine.maximumSubtitleOffsetSeconds = offset }
+        if let delay { engine.maximumSubtitleDelaySeconds = delay }
+        if let advance { engine.maximumSubtitleAdvanceSeconds = advance }
+    }
 }

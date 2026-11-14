@@ -37,6 +37,39 @@ struct BluRayFolderTests {
         func close() {}
     }
 
+    /// AE#1028: the flag's docs tell a host to return false for a source that is no disc IMAGE, and a
+    /// folder is none, so a host folder reader may well do that.
+    final class OptedOutFolder: DiscDirectoryReader, @unchecked Sendable {
+        let base: MemoryFolder
+        init(_ base: MemoryFolder) { self.base = base }
+        var discFiles: [(path: String, size: Int64)] { base.discFiles }
+        var preferredPlaylist: String? { base.preferredPlaylist }
+        var discImageProbeEnabled: Bool { false }
+        private let lock = NSLock()
+        private var files: [ClosingReader] = []
+        var unclosedFiles: Int { lock.withLock { files.filter { !$0.isClosed }.count } }
+        func openDiscFile(_ path: String) -> IOReader? {
+            guard let reader = base.openDiscFile(path) else { return nil }
+            let tracked = ClosingReader(reader)
+            lock.withLock { files.append(tracked) }
+            return tracked
+        }
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { -1 }
+        func seek(offset: Int64, whence: Int32) -> Int64 { -1 }
+        func close() {}
+    }
+
+    final class ClosingReader: IOReader, @unchecked Sendable {
+        let base: IOReader
+        private let lock = NSLock()
+        private var closed = false
+        init(_ base: IOReader) { self.base = base }
+        var isClosed: Bool { lock.withLock { closed } }
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { base.read(buffer, size: size) }
+        func seek(offset: Int64, whence: Int32) -> Int64 { base.seek(offset: offset, whence: whence) }
+        func close() { lock.withLock { closed = true }; base.close() }
+    }
+
     private static func be16(_ v: Int) -> [UInt8] { [UInt8((v >> 8) & 0xff), UInt8(v & 0xff)] }
     private static func be32(_ v: Int) -> [UInt8] {
         [UInt8((v >> 24) & 0xff), UInt8((v >> 16) & 0xff), UInt8((v >> 8) & 0xff), UInt8(v & 0xff)]
@@ -131,6 +164,30 @@ struct BluRayFolderTests {
         let info = try #require(try DiscReader.wrap(folder))
         #expect(info.titles.count == 1)
         #expect(folder.openedPaths.filter { $0.contains("/PLAYLIST/") } == ["BDMV/PLAYLIST/00800.mpls"])
+    }
+
+    @Test("each title names its playlist file, and that name opens the same title as the preferred playlist (#1034)")
+    func titlesNameTheirPlaylist() throws {
+        let (folder, _) = Self.tinyStreamFolder()
+        let info = try #require(try DiscReader.wrap(folder))
+        let published = info.titles.map { $0.titleInfo() }
+        #expect(published.map(\.playlist) == ["00800.mpls", "00000.mpls"])
+        #expect(published.allSatisfy { $0.titleSet == nil })
+
+        let (again, _) = Self.tinyStreamFolder(preferredPlaylist: try #require(published.first?.playlist))
+        let reopened = try #require(try DiscReader.wrap(again))
+        #expect(reopened.titles.map { $0.titleInfo().playlist } == ["00800.mpls"])
+        #expect(reopened.selectedTitle?.bdClipIDs == info.selectedTitle?.bdClipIDs)
+    }
+
+    @Test("a playlist listed in upper case is still read, and keeps the case it was listed in")
+    func upperCasePlaylistName() throws {
+        let folder = MemoryFolder([
+            ("BDMV/PLAYLIST/00007.MPLS", Self.mpls([(id: "00001", inT: 0, outT: 900_000)])),
+            ("BDMV/STREAM/00001.m2ts", Self.clipBytes(1, count: 1000)),
+        ])
+        let info = try #require(try DiscReader.wrap(folder))
+        #expect(info.selectedTitle?.titleInfo().playlist == "00007.MPLS")
     }
 
     @Test("a preferred playlist missing from the listing falls back to scanning every playlist")
@@ -355,5 +412,81 @@ struct BluRayFolderTests {
         #expect(probe.videoCodecName == "h264")
         #expect(abs(probe.durationSeconds - 8) < 1)
         #expect(folder.openedPaths.contains("BDMV/STREAM/00002.m2ts"))
+    }
+
+    @Test("a folder is recognized even when it opts out of disc-image probing (AE#1028)")
+    func folderThatOptsOutOfImageProbing() throws {
+        let (folder, _) = Self.tinyStreamFolder()
+        let optedOut = OptedOutFolder(folder)
+        let demuxer = Demuxer()
+        try demuxer.open(reader: optedOut)
+        #expect(demuxer.discTitles.count == 2)
+        #expect(optedOut.unclosedFiles > 0)
+        demuxer.close()
+        #expect(optedOut.unclosedFiles == 0)
+        let probe = try AetherEngine.probe(source: .custom(OptedOutFolder(Self.tinyStreamFolder().folder)))
+        #expect(probe.videoCodecName == "h264")
+    }
+
+    @Test("a probe with limits still reads a folder source (AE#1028)")
+    func limitedProbeOfAFolder() throws {
+        let (folder, _) = Self.tinyStreamFolder()
+        let probe = try AetherEngine.probe(source: .custom(folder), limits: ProbeLimits())
+        #expect(probe.videoCodecName == "h264")
+        #expect(abs(probe.durationSeconds - 8) < 1)
+
+        // The clips are counted against the input budget like any other source's bytes.
+        #expect(throws: ProbeError.self) {
+            try AetherEngine.probe(source: .custom(Self.tinyStreamFolder().folder),
+                                   limits: ProbeLimits(maxInputBytes: 4096))
+        }
+    }
+
+    /// AE#1033: the scan's files behind the probe's wrapper are still closed, here and in the clips.
+    @Test("a probe with limits closes the files of the folder's playlist scan (AE#1033)")
+    func limitedProbeClosesScanFiles() throws {
+        let folder = OptedOutFolder(Self.tinyStreamFolder().folder)
+        let probe = try AetherEngine.probe(source: .custom(folder), limits: ProbeLimits())
+        #expect(probe.videoCodecName == "h264")
+        #expect(folder.unclosedFiles == 0)
+    }
+
+    /// AE#1033: a playlist the size of the whole budget used to be read for free. Now it spends the budget,
+    /// and the scan opens nothing after it.
+    @Test("a folder's playlist scan counts against maxInputBytes (AE#1033)")
+    func limitedProbeCountsTheScan() throws {
+        let budget: Int64 = 256 * 1024
+        let base = Self.tinyStreamFolder().folder
+        let folder = MemoryFolder([("BDMV/PLAYLIST/00500.mpls", Data(count: Int(budget)))]
+                                  + base.order.map { ($0, base.files[$0]!) })
+        #expect(throws: ProbeError.inputLimit) {
+            try AetherEngine.probe(source: .custom(folder), limits: ProbeLimits(maxInputBytes: budget))
+        }
+        #expect(!folder.openedPaths.contains("BDMV/PLAYLIST/00800.mpls"))
+    }
+
+    /// Cancels the probe from inside the scan, the way a press on Play would while playlists load.
+    final class CancellingFolder: DiscDirectoryReader, @unchecked Sendable {
+        let base: MemoryFolder
+        let cancellation = ProbeCancellation()
+        init(_ base: MemoryFolder) { self.base = base }
+        var discFiles: [(path: String, size: Int64)] { base.discFiles }
+        var preferredPlaylist: String? { nil }
+        func openDiscFile(_ path: String) -> IOReader? {
+            defer { cancellation.cancel() }
+            return base.openDiscFile(path)
+        }
+        func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 { -1 }
+        func seek(offset: Int64, whence: Int32) -> Int64 { -1 }
+        func close() {}
+    }
+
+    @Test("a cancelled probe stops a folder's playlist scan (AE#1033)")
+    func cancelledProbeStopsTheScan() throws {
+        let folder = CancellingFolder(Self.tinyStreamFolder().folder)
+        #expect(throws: CancellationError.self) {
+            try AetherEngine.probe(source: .custom(folder), cancellation: folder.cancellation)
+        }
+        #expect(folder.base.openedPaths == ["BDMV/PLAYLIST/00000.mpls"])
     }
 }
