@@ -72,10 +72,50 @@ actor StreamSpeedProbe {
     }
 
     /// Speed verdict for a source, or nil when it can't be checked or the check failed.
+    /// Torrents that can't be downloaded from directly are judged by their seeders.
     func verdict(for stream: NuvioStream, resolution: Int) async -> StreamSpeedVerdict? {
-        guard let url = Self.probeURL(for: stream) else { return nil }
+        guard let url = Self.probeURL(for: stream) else {
+            return Self.seederVerdict(for: stream, resolution: resolution)
+        }
         guard let mbps = await measure(url: url, headers: stream.httpHeaders ?? [:]) else { return nil }
         return StreamSpeedVerdict.classify(mbps: mbps, resolution: resolution)
+    }
+
+    // MARK: - Torrents
+
+    /// The seeder count an add-on reports in the source text, as Torrentio-style
+    /// add-ons do ("👤 188"), or as "Seeders: 188" / "Seeds 188".
+    nonisolated static func seeders(in stream: NuvioStream) -> Int? {
+        let text = [stream.name, stream.description, stream.filename].compactMap { $0 }.joined(separator: "\n")
+        let patterns = [
+            #"👤\s*(\d[\d,.]*)"#,
+            #"(?i)\bseed(?:er)?s?\s*[:=]?\s*(\d[\d,.]*)"#,
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern),
+                  let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let range = Range(match.range(at: 1), in: text) else { continue }
+            let digits = text[range].filter(\.isNumber)
+            if let value = Int(digits) { return value }
+        }
+        return nil
+    }
+
+    /// For a torrent, more seeders means a faster, steadier download. Only used
+    /// when the source can't be downloaded from directly and isn't likely cached
+    /// on a debrid service, where seeders don't matter.
+    nonisolated static func seederVerdict(for stream: NuvioStream, resolution: Int) -> StreamSpeedVerdict? {
+        guard stream.isDebridResolvable, !stream.isLikelyCached,
+              let seeders = seeders(in: stream) else { return nil }
+        let (fast, ok): (Int, Int)
+        switch resolution {
+        case 2160...: (fast, ok) = (50, 15)
+        case 1080..<2160: (fast, ok) = (25, 8)
+        default: (fast, ok) = (10, 3)
+        }
+        if seeders >= fast { return .fast }
+        if seeders >= ok { return .ok }
+        return .slow
     }
 
     private func measure(url: URL, headers: [String: String]) async -> Double? {

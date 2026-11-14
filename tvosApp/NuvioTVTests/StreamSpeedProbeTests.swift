@@ -51,4 +51,31 @@ final class StreamSpeedProbeTests: XCTestCase {
         )
         XCTAssertNil(StreamSpeedProbe.probeURL(for: unplayable))
     }
+
+    private func torrent(_ description: String) -> NuvioStream {
+        NuvioStream(
+            url: nil, name: "Torrentio 1080p", description: description, addonName: "Torrentio",
+            infoHash: "abcdef0123456789abcdef0123456789abcdef01"
+        )
+    }
+
+    func testReadsSeedersFromTheSourceText() {
+        XCTAssertEqual(StreamSpeedProbe.seeders(in: torrent("Movie.1080p\n👤 188 💾 27.9 GB")), 188)
+        XCTAssertEqual(StreamSpeedProbe.seeders(in: torrent("Seeders: 1,204")), 1204)
+        XCTAssertEqual(StreamSpeedProbe.seeders(in: torrent("seeds 7 | 2.1 GB")), 7)
+        XCTAssertNil(StreamSpeedProbe.seeders(in: torrent("Movie.1080p 💾 2 GB")))
+    }
+
+    func testTorrentsAreJudgedBySeedersForTheirResolution() {
+        XCTAssertEqual(StreamSpeedProbe.seederVerdict(for: torrent("👤 60"), resolution: 2160), .fast)
+        XCTAssertEqual(StreamSpeedProbe.seederVerdict(for: torrent("👤 20"), resolution: 2160), .ok)
+        XCTAssertEqual(StreamSpeedProbe.seederVerdict(for: torrent("👤 5"), resolution: 2160), .slow)
+        XCTAssertEqual(StreamSpeedProbe.seederVerdict(for: torrent("👤 5"), resolution: 720), .ok)
+        XCTAssertNil(StreamSpeedProbe.seederVerdict(for: torrent("no count"), resolution: 1080))
+    }
+
+    func testDirectLinksAreNotJudgedBySeeders() {
+        let direct = NuvioStream(url: "https://cdn.example.com/a.mkv", name: "a", description: "👤 3", addonName: "Test")
+        XCTAssertNil(StreamSpeedProbe.seederVerdict(for: direct, resolution: 1080))
+    }
 }
