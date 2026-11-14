@@ -1,7 +1,13 @@
 import SwiftUI
 
-/// The Surprise Me tab: one movie from the catalogs on Home, chosen for the
-/// viewer's tastes, with a button to roll again.
+/// The Surprise Me tab: one movie chosen for the viewer's tastes, with a
+/// button to roll again. Configured in Settings > Integrations > Surprise Me.
+///
+/// Candidates come from the catalogs on Home and, when TMDB is on, from TMDB's
+/// recommendations for the viewer's favourite movies and its well-rated movies
+/// in their favourite genres. Anything already watched, in Nuvio or a connected
+/// tracker, is left out. With an AI key, the AI chooses among those candidates
+/// and says why.
 struct SurpriseMeView: View {
     @ObservedObject var homeStore: TVHomeStore
     let isActive: Bool
@@ -9,13 +15,19 @@ struct SurpriseMeView: View {
 
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.surpriseMeUseTMDB) private var useTMDB = true
+    @AppStorage(SettingsKey.surpriseMeUseTrackers) private var useTrackers = true
 
     @State private var profile = TasteProfile.empty
+    @State private var history = SurpriseMeHistory.empty
+    @State private var onlineCandidates: [NuvioMeta] = []
+    @State private var aiQueue: [SurpriseMeAIPick] = []
     @State private var pick: NuvioMeta?
+    @State private var pickReason: String?
     @State private var offered: Set<String> = []
     @State private var didLoad = false
+    @State private var isThinking = false
     @State private var noMovieFound = false
-    @State private var historyCount = 0
     @State private var historySources: [String] = []
 
     private enum FocusTarget: Hashable { case surprise, open, another }
@@ -36,10 +48,15 @@ struct SurpriseMeView: View {
             guard isActive else { return }
             refreshProfile()
             didLoad = true
-            // Then bring the connected trackers up to date and learn again.
-            await SurpriseMeTrackers.refreshHistoriesIfNeeded()
-            guard !Task.isCancelled else { return }
-            refreshProfile()
+            if useTrackers {
+                // Bring the connected trackers up to date, then learn again.
+                await SurpriseMeTrackers.refreshHistoriesIfNeeded()
+                guard !Task.isCancelled else { return }
+                refreshProfile()
+            }
+            if useTMDB, onlineCandidates.isEmpty {
+                onlineCandidates = await SurpriseMeOnline.candidates(history: history, profile: profile)
+            }
         }
     }
 
@@ -58,14 +75,18 @@ struct SurpriseMeView: View {
                 .multilineTextAlignment(.center)
                 .frame(maxWidth: 900)
             Button {
-                roll()
-                if pick != nil { focus = .open }
+                Task { await roll(); if pick != nil { focus = .open } }
             } label: {
-                Label(L10n.string("nav_surprise_me", fallback: "Surprise Me"), systemImage: "sparkles")
+                if isThinking {
+                    Label(L10n.string("surprise_me_thinking", fallback: "Thinking…"), systemImage: "sparkles")
+                } else {
+                    Label(L10n.string("nav_surprise_me", fallback: "Surprise Me"), systemImage: "sparkles")
+                }
             }
+            .disabled(isThinking)
             .focused($focus, equals: .surprise)
             if didLoad, noMovieFound {
-                Text(L10n.string("surprise_me_empty", fallback: "No unwatched movies in your Home catalogs yet."))
+                Text(L10n.string("surprise_me_empty", fallback: "No unwatched movies found yet. Add movie catalogs or turn on TMDB."))
                     .font(.system(size: 22))
                     .foregroundColor(.white.opacity(0.65))
             }
@@ -74,7 +95,7 @@ struct SurpriseMeView: View {
     }
 
     private var learningLine: String {
-        guard historyCount > 0 else {
+        guard history.titleCount > 0 else {
             return L10n.string(
                 "surprise_me_learning_empty",
                 fallback: "Watch a few titles and the suggestions will follow your tastes. Until then, you get well-rated picks."
@@ -84,13 +105,13 @@ struct SurpriseMeView: View {
             return L10n.format(
                 "surprise_me_learning_count",
                 fallback: "Based on %d titles you watched or saved",
-                historyCount
+                history.titleCount
             )
         }
         return L10n.format(
             "surprise_me_learning_sources",
             fallback: "Based on %1$d titles you watched or saved, from %2$@",
-            historyCount,
+            history.titleCount,
             historySources.joined(separator: ", ")
         )
     }
@@ -121,9 +142,10 @@ struct SurpriseMeView: View {
 
     private func details(for meta: NuvioMeta) -> some View {
         VStack(alignment: .leading, spacing: 18) {
-            Text(reason(for: meta))
+            Text(pickReason ?? reason(for: meta))
                 .font(.system(size: 24, weight: .semibold))
-                .foregroundColor(.white.opacity(0.7))
+                .foregroundColor(.white.opacity(0.75))
+                .frame(maxWidth: 900, alignment: .leading)
 
             Text(meta.name)
                 .font(.system(size: 64, weight: .bold))
@@ -151,10 +173,16 @@ struct SurpriseMeView: View {
                 .focused($focus, equals: .open)
 
                 Button {
-                    roll()
+                    Task { await roll() }
                 } label: {
-                    Label(L10n.string("surprise_me_another", fallback: "Another one"), systemImage: "dice")
+                    Label(
+                        isThinking
+                            ? L10n.string("surprise_me_thinking", fallback: "Thinking…")
+                            : L10n.string("surprise_me_another", fallback: "Another one"),
+                        systemImage: "dice"
+                    )
                 }
+                .disabled(isThinking)
                 .focused($focus, equals: .another)
             }
             .padding(.top, 12)
@@ -187,32 +215,77 @@ struct SurpriseMeView: View {
     private func refreshProfile() {
         // One history: what was watched in Nuvio and in every connected tracker.
         let watched = WatchedStore.items()
-        let library = LibraryStore.items().map(\.meta)
-        let continueWatching = ContinueWatchingStore.items().map(\.meta)
-        profile = TasteProfile.build(
+        history = SurpriseMeHistory(
             watched: watched.map(\.meta),
-            library: library,
-            continueWatching: continueWatching
+            library: LibraryStore.items().map(\.meta),
+            continueWatching: ContinueWatchingStore.items().map(\.meta)
         )
-        historyCount = Set((watched.map(\.meta) + library + continueWatching).map { $0.imdbId ?? $0.id }).count
-        historySources = SurpriseMeTrackers.sourceLabels(of: watched)
+        profile = TasteProfile.build(
+            watched: history.watched,
+            library: history.library,
+            continueWatching: history.continueWatching
+        )
+        historySources = useTrackers ? SurpriseMeTrackers.sourceLabels(of: watched) : []
     }
 
-    private func roll() {
-        let candidates = homeStore.sections.flatMap(\.items)
+    private var candidates: [NuvioMeta] {
+        homeStore.sections.flatMap(\.items) + onlineCandidates
+    }
+
+    private func roll() async {
+        let isWatched: (NuvioMeta) -> Bool = { history.contains($0) || WatchedStore.contains(meta: $0) }
+
+        // AI picks wait in a queue, so "Another one" doesn't ask again each time.
+        while let next = aiQueue.first {
+            aiQueue.removeFirst()
+            guard !offered.contains(next.meta.id), !isWatched(next.meta) else { continue }
+            show(next.meta, reason: next.reason)
+            return
+        }
+
+        let configuration = SurpriseMeAIConfiguration.current()
+        if configuration.isUsable {
+            let shortlist = SurpriseMe.shortlist(
+                from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
+                limit: SurpriseMeAI.maxCandidates
+            )
+            if !shortlist.isEmpty {
+                isThinking = true
+                let picks = await SurpriseMeAI.rank(
+                    candidates: shortlist,
+                    profile: profile,
+                    recentTitles: history.recentTitles,
+                    configuration: configuration,
+                    language: Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier)
+                        ?? "English"
+                )
+                isThinking = false
+                if let first = picks.first {
+                    aiQueue = Array(picks.dropFirst())
+                    show(first.meta, reason: first.reason.map { "✨ \($0)" })
+                    return
+                }
+            }
+        }
+
         guard let next = SurpriseMe.pick(
             from: candidates,
             profile: profile,
-            isWatched: { WatchedStore.contains(meta: $0) },
+            isWatched: isWatched,
             excluding: offered
         ) else {
             noMovieFound = true
             return
         }
+        show(next, reason: nil)
+    }
+
+    private func show(_ meta: NuvioMeta, reason: String?) {
         noMovieFound = false
         // Once everything was offered, start over but never repeat the current one.
-        if offered.contains(next.id) { offered = pick.map { [$0.id] } ?? [] }
-        offered.insert(next.id)
-        pick = next
+        if offered.contains(meta.id) { offered = pick.map { [$0.id] } ?? [] }
+        offered.insert(meta.id)
+        pickReason = reason
+        pick = meta
     }
 }

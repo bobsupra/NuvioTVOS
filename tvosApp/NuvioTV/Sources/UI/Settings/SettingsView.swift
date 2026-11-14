@@ -192,6 +192,10 @@ enum SettingsKey {
     /// Settings → Appearance → Sidebar → Calendar.
     static let showCalendarTab = "nuvio.tv.settings.layout.showCalendarTab"
     static let showSurpriseMeTab = "nuvio.tv.settings.layout.showSurpriseMeTab"
+    static let surpriseMeUseTMDB = "nuvio.tv.settings.integrations.surpriseMeUseTMDB"
+    static let surpriseMeUseTrackers = "nuvio.tv.settings.integrations.surpriseMeUseTrackers"
+    static let surpriseMeAIProvider = "nuvio.tv.settings.integrations.surpriseMeAIProvider"
+    static let surpriseMeAIModel = "nuvio.tv.settings.integrations.surpriseMeAIModel"
     static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
@@ -446,7 +450,7 @@ enum SettingsKey {
         homeLayout, sidebarClockFormat, gridRows, gridItemsPerRow, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, homeHeroRatingsEnabled, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
-        showCalendarTab, showSurpriseMeTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
+        showCalendarTab, showSurpriseMeTab, surpriseMeUseTMDB, surpriseMeUseTrackers, surpriseMeAIProvider, surpriseMeAIModel, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -2773,8 +2777,6 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
-    @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
-    @State private var confirmingSurpriseMe = false
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
@@ -2882,35 +2884,6 @@ private struct AppearanceSettingsView: View {
                     isOn: $showCalendarTab,
                     accentColor: accentColor
                 )
-                SettingsToggleRow(
-                    title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
-                    subtitle: L10n.string(
-                        "settings_show_surprise_me_tab_subtitle",
-                        fallback: "A tab that suggests a movie for your tastes"
-                    ),
-                    isOn: Binding(
-                        get: { showSurpriseMeTab },
-                        set: { isOn in
-                            // Turning it on asks first; turning it off is immediate.
-                            if isOn { confirmingSurpriseMe = true } else { showSurpriseMeTab = false }
-                        }
-                    ),
-                    accentColor: accentColor
-                )
-                .alert(
-                    L10n.string("surprise_me_consent_title", fallback: "Turn on Surprise Me?"),
-                    isPresented: $confirmingSurpriseMe
-                ) {
-                    Button(L10n.string("surprise_me_consent_confirm", fallback: "Turn On")) {
-                        showSurpriseMeTab = true
-                    }
-                    Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
-                } message: {
-                    Text(L10n.string(
-                        "surprise_me_consent_message",
-                        fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, including what your connected trackers (Trakt, Simkl, MDBList, WeTrakr) report, and suggests movies you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else. A Surprise Me tab will be added to the menu."
-                    ))
-                }
                 SettingsToggleRow(
                     title: L10n.string("nav_watch_party", fallback: "Watch Party"),
                     subtitle: L10n.string(
@@ -5630,6 +5603,8 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.aniListEnabled) private var aniListEnabled = false
     @State private var showingMdbListOptions = false
     @State private var showingAISubtitleOptions = false
+    @State private var showingSurpriseMeOptions = false
+    @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @State private var showingP2PConsent = false
     @State private var showingAddonsSettings = false
     @State private var showingPluginsSettings = false
@@ -5962,6 +5937,26 @@ private struct IntegrationSettingsView: View {
             }
 
             SettingsGroup(
+                title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
+                subtitle: L10n.string(
+                    "surprise_me_integration_subtitle",
+                    fallback: "Movie suggestions that learn from what you watch"
+                )
+            ) {
+                SettingsActionRow(
+                    title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
+                    subtitle: L10n.string(
+                        "surprise_me_integration_action_subtitle",
+                        fallback: "Learns from your history and trackers, finds movies on TMDB, and can use your own AI key"
+                    ),
+                    value: showSurpriseMeTab ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingSurpriseMeOptions = true
+                }
+            }
+
+            SettingsGroup(
                 title: L10n.string("settings_ai_subtitles_title", fallback: "AI Subtitles"),
                 subtitle: L10n.string("tvos_settings_ai_subtitles_integration_subtitle", fallback: "Translate active subtitle cues live with Gemini or OpenRouter")
             ) {
@@ -6257,6 +6252,10 @@ private struct IntegrationSettingsView: View {
         }
         .sheet(isPresented: $showingAISubtitleOptions) {
             AISubtitleOptionsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $showingSurpriseMeOptions) {
+            SurpriseMeOptionsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .fullScreenCover(isPresented: $showingAddonsSettings, onDismiss: refreshAddonSummaryCount) {
@@ -8478,6 +8477,189 @@ private struct CustomSubtitleFontRow: View {
             return .appFont(size: 24, weight: .semibold)
         }
         return .custom(face, size: 26)
+    }
+}
+
+/// Settings > Integrations > Surprise Me.
+private struct SurpriseMeOptionsSheet: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.showSurpriseMeTab) private var showTab = false
+    @AppStorage(SettingsKey.surpriseMeUseTMDB) private var useTMDB = true
+    @AppStorage(SettingsKey.surpriseMeUseTrackers) private var useTrackers = true
+    @AppStorage(SettingsKey.surpriseMeAIProvider) private var provider = SurpriseMeAIProvider.off.rawValue
+    @AppStorage(SettingsKey.surpriseMeAIModel) private var model = ""
+    @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
+    @State private var apiKey = ""
+    @State private var confirmingTab = false
+    @State private var confirmingAI = false
+    @State private var previousProvider = SurpriseMeAIProvider.off.rawValue
+
+    private var selectedProvider: SurpriseMeAIProvider { SurpriseMeAIProvider(rawValue: provider) ?? .off }
+    private var tmdbReady: Bool { tmdbEnabled && TmdbDetailsService.isAvailableForSurpriseMe }
+    private var usesSubtitleKey: Bool {
+        apiKey.isEmpty && !SurpriseMeAIKeyStore.apiKey(for: selectedProvider).isEmpty
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text(L10n.string("nav_surprise_me", fallback: "Surprise Me"))
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(L10n.string(
+                            "surprise_me_sheet_description",
+                            fallback: "A tab that suggests movies you haven't seen, chosen for your tastes. It learns from this profile's watch history, library and Continue Watching."
+                        ))
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("surprise_me_group_tab", fallback: "Tab"),
+                        subtitle: L10n.string("surprise_me_group_tab_subtitle", fallback: "Adds Surprise Me to the sidebar or top bar")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("surprise_me_show_tab", fallback: "Show Surprise Me"),
+                            subtitle: L10n.string("surprise_me_show_tab_subtitle", fallback: "Off by default. You are asked before it turns on."),
+                            isOn: Binding(
+                                get: { showTab },
+                                set: { isOn in if isOn { confirmingTab = true } else { showTab = false } }
+                            ),
+                            accentColor: accentColor
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("surprise_me_group_sources", fallback: "Where suggestions come from"),
+                        subtitle: L10n.string("surprise_me_group_sources_subtitle", fallback: "Anything you already watched is always left out")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("surprise_me_use_trackers", fallback: "Learn from connected trackers"),
+                            subtitle: L10n.string(
+                                "surprise_me_use_trackers_subtitle",
+                                fallback: "Refresh Trakt, Simkl, MDBList and WeTrakr history when the tab opens, at most every 30 minutes"
+                            ),
+                            isOn: $useTrackers,
+                            accentColor: accentColor
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("surprise_me_use_tmdb", fallback: "Find movies on TMDB"),
+                            subtitle: tmdbReady
+                                ? L10n.string("surprise_me_use_tmdb_subtitle", fallback: "Add TMDB's recommendations for your favourite movies and well-rated movies in your favourite genres, not only your Home catalogs")
+                                : L10n.string("surprise_me_use_tmdb_unavailable", fallback: "Turn on TMDB with an API key in Integrations > Metadata Providers to use this"),
+                            isOn: $useTMDB,
+                            accentColor: accentColor,
+                            isAvailable: tmdbReady
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("surprise_me_group_ai", fallback: "AI (optional)"),
+                        subtitle: L10n.string(
+                            "surprise_me_group_ai_subtitle",
+                            fallback: "With your own key, an AI chooses among the movies found and says why. It can only pick from that list, so it never suggests something that doesn't exist."
+                        )
+                    ) {
+                        SettingsOptionRow(
+                            title: L10n.string("surprise_me_ai_provider", fallback: "AI Provider"),
+                            subtitle: selectedProvider == .off
+                                ? L10n.string("surprise_me_ai_provider_off", fallback: "Off: Surprise Me chooses on its own")
+                                : selectedProvider.keyHint,
+                            selection: Binding(
+                                get: { provider },
+                                set: { newValue in
+                                    if newValue != SurpriseMeAIProvider.off.rawValue, provider == SurpriseMeAIProvider.off.rawValue {
+                                        previousProvider = provider
+                                        provider = newValue
+                                        confirmingAI = true
+                                    } else {
+                                        provider = newValue
+                                    }
+                                    model = ""
+                                    loadKey()
+                                }
+                            ),
+                            options: SurpriseMeAIProvider.allCases.map(\.rawValue),
+                            accentColor: accentColor
+                        )
+
+                        if selectedProvider != .off {
+                            SettingsNativeTextFieldRow(
+                                title: L10n.format("settings_ai_subtitles_provider_api_key_title", fallback: "%@ API Key", selectedProvider.rawValue),
+                                subtitle: usesSubtitleKey
+                                    ? L10n.string("surprise_me_ai_uses_subtitle_key", fallback: "Using the key saved for AI Subtitles. Enter one here to use a different key.")
+                                    : selectedProvider.keyHint,
+                                placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                                text: $apiKey,
+                                isSecure: true,
+                                onCommit: { SurpriseMeAIKeyStore.save(apiKey, for: selectedProvider) }
+                            )
+                            SettingsNativeTextFieldRow(
+                                title: L10n.string("surprise_me_ai_model", fallback: "Model"),
+                                subtitle: L10n.format("surprise_me_ai_model_subtitle", fallback: "Leave empty for %@", selectedProvider.defaultModel),
+                                placeholder: selectedProvider.defaultModel,
+                                text: $model,
+                                onCommit: { model = model.trimmingCharacters(in: .whitespacesAndNewlines) }
+                            )
+                            Text(L10n.string(
+                                "surprise_me_ai_privacy",
+                                fallback: "When you press Surprise Me, the titles you watched or saved recently, your favourite genres and the list of candidate movies are sent to the provider you chose, with your key. Your key stays in this Apple TV's Keychain and never syncs."
+                            ))
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.white.opacity(0.56))
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                }
+                .frame(width: 1_000, alignment: .leading)
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+        .onAppear(perform: loadKey)
+        .onChange(of: apiKey) { _, newValue in
+            SurpriseMeAIKeyStore.save(newValue, for: selectedProvider)
+        }
+        .alert(
+            L10n.string("surprise_me_consent_title", fallback: "Turn on Surprise Me?"),
+            isPresented: $confirmingTab
+        ) {
+            Button(L10n.string("surprise_me_consent_confirm", fallback: "Turn On")) { showTab = true }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        } message: {
+            Text(L10n.string(
+                "surprise_me_consent_message",
+                fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, including what your connected trackers (Trakt, Simkl, MDBList, WeTrakr) report, and suggests movies you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else unless you add an AI key below. A Surprise Me tab will be added to the menu."
+            ))
+        }
+        .alert(
+            L10n.string("surprise_me_ai_consent_title", fallback: "Use AI for Surprise Me?"),
+            isPresented: $confirmingAI
+        ) {
+            Button(L10n.string("surprise_me_consent_confirm", fallback: "Turn On")) {}
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {
+                provider = previousProvider
+                loadKey()
+            }
+        } message: {
+            Text(L10n.string(
+                "surprise_me_ai_consent_message",
+                fallback: "Each time you press Surprise Me, the titles you watched or saved recently, your favourite genres and a list of candidate movies are sent to the AI provider with your API key. Requests use your provider's quota."
+            ))
+        }
+    }
+
+    private func loadKey() {
+        apiKey = SurpriseMeAIKeyStore.ownKey(for: selectedProvider)
     }
 }
 

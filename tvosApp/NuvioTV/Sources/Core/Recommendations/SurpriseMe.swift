@@ -22,7 +22,9 @@ struct TasteProfile: Equatable {
     static let continueWatchingWeight = 1.0
 
     static func normalized(_ genre: String) -> String {
-        genre.lowercased().filter { $0.isLetter || $0.isNumber }
+        let key = genre.lowercased().filter { $0.isLetter || $0.isNumber }
+        // TMDB says "Science Fiction", Cinemeta "Sci-Fi".
+        return key == "sciencefiction" ? "scifi" : key
     }
 
     /// Each title counts once per source, however many episodes were watched,
@@ -136,16 +138,114 @@ enum SurpriseMe {
         excluding offered: Set<String> = [],
         random: () -> Double = { Double.random(in: 0..<1) }
     ) -> NuvioMeta? {
+        let shortlist = shortlist(
+            from: candidates, profile: profile, isWatched: isWatched, excluding: offered, limit: shortlistSize
+        )
+        guard !shortlist.isEmpty else { return nil }
+        let index = min(shortlist.count - 1, Int(random() * Double(shortlist.count)))
+        return shortlist[index]
+    }
+
+    /// Unwatched movies, best matches first, one per title. Titles not offered
+    /// yet come first; offered ones only when nothing else is left.
+    static func shortlist(
+        from candidates: [NuvioMeta],
+        profile: TasteProfile,
+        isWatched: (NuvioMeta) -> Bool,
+        excluding offered: Set<String>,
+        limit: Int
+    ) -> [NuvioMeta] {
         var seen = Set<String>()
-        let movies = candidates.filter { isMovie($0) && seen.insert($0.id).inserted && !isWatched($0) }
-        guard !movies.isEmpty else { return nil }
+        let movies = candidates.filter {
+            isMovie($0) && seen.insert(SurpriseMeHistory.titleKey($0)).inserted && !isWatched($0)
+        }
         let fresh = movies.filter { !offered.contains($0.id) }
         let pool = fresh.isEmpty ? movies : fresh
-        let shortlist = pool
+        return pool
             .map { (meta: $0, score: score($0, profile: profile)) }
             .sorted { $0.score == $1.score ? $0.meta.id < $1.meta.id : $0.score > $1.score }
-            .prefix(shortlistSize)
-        let index = min(shortlist.count - 1, Int(random() * Double(shortlist.count)))
-        return shortlist[shortlist.startIndex + index].meta
+            .prefix(limit)
+            .map(\.meta)
+    }
+}
+
+/// Everything the viewer watched or saved, for leaving those titles out. A
+/// title can carry an IMDb id from one source and a TMDB id from another, so
+/// it is matched by each id and by name and year.
+struct SurpriseMeHistory {
+    let watched: [NuvioMeta]
+    let library: [NuvioMeta]
+    let continueWatching: [NuvioMeta]
+    private let keys: Set<String>
+
+    static let empty = SurpriseMeHistory(watched: [], library: [], continueWatching: [])
+
+    init(watched: [NuvioMeta], library: [NuvioMeta], continueWatching: [NuvioMeta]) {
+        self.watched = watched
+        self.library = library
+        self.continueWatching = continueWatching
+        keys = Set((watched + continueWatching).flatMap(Self.keys(for:)))
+    }
+
+    /// Distinct titles across the three lists.
+    var titleCount: Int {
+        Set((watched + library + continueWatching).map(Self.titleKey)).count
+    }
+
+    /// Most recent first as stored; movies and shows, for the AI prompt.
+    var recentTitles: [NuvioMeta] {
+        var seen = Set<String>()
+        return (watched + continueWatching + library).filter { seen.insert(Self.titleKey($0)).inserted }
+    }
+
+    /// Movies from the history to ask TMDB for recommendations about.
+    var seedMovies: [NuvioMeta] {
+        var seen = Set<String>()
+        return (watched + library).filter { SurpriseMe.isMovie($0) && seen.insert(Self.titleKey($0)).inserted }
+    }
+
+    func contains(_ meta: NuvioMeta) -> Bool {
+        !keys.isDisjoint(with: Self.keys(for: meta))
+    }
+
+    static func titleKey(_ meta: NuvioMeta) -> String {
+        if let imdb = meta.imdbId, !imdb.isEmpty { return imdb }
+        if meta.id.hasPrefix("tt") { return meta.id }
+        if let tmdb = meta.tmdbId, tmdb > 0 { return "tmdb:\(tmdb)" }
+        return meta.id
+    }
+
+    static func keys(for meta: NuvioMeta) -> [String] {
+        var result = [meta.id]
+        if let imdb = meta.imdbId, !imdb.isEmpty { result.append(imdb) }
+        if let tmdb = meta.tmdbId, tmdb > 0 { result.append("tmdb:\(tmdb)") }
+        let name = meta.name.lowercased().filter { $0.isLetter || $0.isNumber }
+        if !name.isEmpty, let year = meta.year { result.append("name:\(name):\(year)") }
+        return result
+    }
+}
+
+/// Candidates from TMDB: its recommendations for the viewer's latest movies,
+/// and well-rated movies in their favourite genres. Needs TMDB turned on in
+/// Settings > Integrations; otherwise Surprise Me uses the catalogs on Home only.
+enum SurpriseMeOnline {
+    static let seedCount = 5
+
+    static func candidates(history: SurpriseMeHistory, profile: TasteProfile) async -> [NuvioMeta] {
+        guard TmdbDetailsService.isAvailableForSurpriseMe else { return [] }
+        let seeds = Array(history.seedMovies.prefix(seedCount))
+        let genres = Array(profile.topGenres.prefix(3))
+        return await withTaskGroup(of: [NuvioMeta].self) { group in
+            for seed in seeds {
+                group.addTask { await TmdbDetailsService.surpriseMeRecommendations(for: seed) }
+            }
+            if !genres.isEmpty {
+                group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres) }
+                group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres, page: 2) }
+            }
+            var all: [NuvioMeta] = []
+            for await batch in group { all += batch }
+            return all
+        }
     }
 }
