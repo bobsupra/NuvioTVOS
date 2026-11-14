@@ -30,11 +30,13 @@ final class TrailerSettingsTests: XCTestCase {
         XCTAssertEqual(SettingsKey.trailersEnabled, "nuvio.tv.settings.playback.trailersEnabled")
         XCTAssertEqual(SettingsKey.backgroundTrailersEnabled, "nuvio.tv.settings.playback.backgroundTrailersEnabled")
         XCTAssertEqual(SettingsKey.trailerPreviewSound, "nuvio.tv.settings.playback.trailerPreviewSound")
+        XCTAssertEqual(SettingsKey.trailerSound, "nuvio.tv.settings.playback.trailerSound")
         XCTAssertEqual(SettingsKey.trailerDelay, "nuvio.tv.settings.playback.trailerDelay")
 
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trailersEnabled))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.backgroundTrailersEnabled))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trailerPreviewSound))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trailerSound))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trailerDelay))
     }
 
@@ -42,12 +44,76 @@ final class TrailerSettingsTests: XCTestCase {
         let trailersEnabled = testDefaults.object(forKey: SettingsKey.trailersEnabled) as? Bool ?? true
         let backgroundTrailersEnabled = testDefaults.object(forKey: SettingsKey.backgroundTrailersEnabled) as? Bool ?? true
         let trailerPreviewSound = testDefaults.object(forKey: SettingsKey.trailerPreviewSound) as? Bool ?? false
+        let trailerSound = testDefaults.object(forKey: SettingsKey.trailerSound) as? Bool ?? false
         let trailerDelay = testDefaults.object(forKey: SettingsKey.trailerDelay) as? Int ?? 7
 
         XCTAssertTrue(trailersEnabled, "Autoplay trailers should default to true")
         XCTAssertTrue(backgroundTrailersEnabled, "Background trailers should default to true")
         XCTAssertFalse(trailerPreviewSound, "Trailer preview sound should default to false")
+        XCTAssertFalse(trailerSound, "Trailer sound should default to false")
         XCTAssertEqual(trailerDelay, 7, "Trailer delay should default to 7 seconds")
+    }
+
+    func testTrailerSoundMigratesLegacyValueOnlyWhenNewSettingIsUnset() {
+        testDefaults.set(true, forKey: SettingsKey.trailerPreviewSound)
+
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: testDefaults)
+
+        XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.trailerSound))
+        XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.trailerPreviewSound))
+
+        testDefaults.set(false, forKey: SettingsKey.trailerPreviewSound)
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: testDefaults)
+        XCTAssertTrue(testDefaults.bool(forKey: SettingsKey.trailerSound), "A later legacy value must not overwrite the migrated preference")
+
+        testDefaults.set(false, forKey: SettingsKey.trailerSound)
+        testDefaults.set(true, forKey: SettingsKey.trailerPreviewSound)
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: testDefaults)
+        ProfileSettings.markTrailerSoundExplicit(in: testDefaults)
+        ProfileSettings.importLegacyTrailerSoundIfNeeded(true, in: testDefaults)
+        XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.trailerSound), "An explicit new setting must take precedence")
+    }
+
+    func testProfileMigrationDoesNotCopyCardSoundChangedAfterFirstLoad() {
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: testDefaults)
+        XCTAssertEqual(testDefaults.object(forKey: SettingsKey.trailerSound) as? Bool, false)
+        XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.trailerSound))
+
+        testDefaults.set(true, forKey: SettingsKey.trailerPreviewSound)
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: testDefaults)
+
+        XCTAssertEqual(testDefaults.object(forKey: SettingsKey.trailerSound) as? Bool, false)
+        XCTAssertFalse(testDefaults.bool(forKey: SettingsKey.trailerSound), "A post-migration card preference must not turn on general trailer sound")
+    }
+
+    func testResetKeepsTrailerSoundDefaultExplicitAgainstLegacySync() {
+        testDefaults.set(true, forKey: SettingsKey.trailerSound)
+
+        ProfileSettings.resetTrailerSoundPreference(in: testDefaults)
+        testDefaults.set(true, forKey: SettingsKey.trailerPreviewSound)
+        ProfileSettings.importLegacyTrailerSoundIfNeeded(true, in: testDefaults)
+
+        XCTAssertEqual(testDefaults.object(forKey: SettingsKey.trailerSound) as? Bool, false)
+    }
+
+    func testSeededProfileKeepsDefaultTrailerSoundOffWhenCardSoundIsOn() {
+        let sourceName = "TrailerSoundSeedSource-\(UUID().uuidString)"
+        let destinationID = "trailer-sound-seed-\(UUID().uuidString)"
+        let source = UserDefaults(suiteName: sourceName)!
+        let destinationName = "nuvio.tv.profile.settings.\(destinationID)"
+        source.set(true, forKey: SettingsKey.trailerPreviewSound)
+        source.set(true, forKey: "nuvio.tv.profile.settings.trailerSound.v1")
+        defer {
+            source.removePersistentDomain(forName: sourceName)
+            UserDefaults.standard.removePersistentDomain(forName: destinationName)
+        }
+
+        ProfileSettings.seedNewProfile(destinationID, copyingFrom: source)
+        let destination = ProfileSettings.store(for: destinationID)
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: destination)
+
+        XCTAssertTrue(destination.bool(forKey: SettingsKey.trailerPreviewSound))
+        XCTAssertEqual(destination.object(forKey: SettingsKey.trailerSound) as? Bool, false)
     }
 
     func testZeroSecondTrailerDelay() {
@@ -93,15 +159,20 @@ final class TrailerSettingsTests: XCTestCase {
         profile1Defaults.set(false, forKey: SettingsKey.backgroundTrailersEnabled)
         profile1Defaults.set(0, forKey: SettingsKey.trailerDelay)
         profile1Defaults.set(true, forKey: SettingsKey.trailerPreviewSound)
+        profile1Defaults.set(false, forKey: SettingsKey.trailerSound)
 
         // Profile 2 has default unconfigured values
         let p2Background = profile2Defaults.object(forKey: SettingsKey.backgroundTrailersEnabled) as? Bool ?? true
         let p2Delay = profile2Defaults.object(forKey: SettingsKey.trailerDelay) as? Int ?? 7
         let p2Sound = profile2Defaults.object(forKey: SettingsKey.trailerPreviewSound) as? Bool ?? false
+        let p2TrailerSound = profile2Defaults.object(forKey: SettingsKey.trailerSound) as? Bool ?? false
 
         XCTAssertTrue(p2Background, "Profile 2 should retain default true for background trailers")
         XCTAssertEqual(p2Delay, 7, "Profile 2 should retain default 7s delay")
         XCTAssertFalse(p2Sound, "Profile 2 should retain default muted sound")
+        XCTAssertFalse(p2TrailerSound, "Profile 2 should retain default muted trailer sound")
+        XCTAssertTrue(profile1Defaults.bool(forKey: SettingsKey.trailerPreviewSound))
+        XCTAssertFalse(profile1Defaults.bool(forKey: SettingsKey.trailerSound), "Card and general trailer sound settings should remain independent")
 
         // Clean up
         profile1Defaults.removePersistentDomain(forName: "TrailerProfile1Suite")
@@ -369,7 +440,7 @@ final class TrailerSettingsTests: XCTestCase {
         XCTAssertEqual(state.calls, ["trailerio", "imdb:tt2560140"])
     }
 
-    func testBackgroundPreviewPrefersImdbHighResolutionEvenForNonEnglish() async {
+    func testBackgroundPreviewPrefersLocalizedYouTubeBeforeImdbForNonEnglish() async {
         let state = TrailerResolverTestState()
         state.language = "de-DE"
         let resolver = YouTubeTrailerResolver(
@@ -377,7 +448,7 @@ final class TrailerSettingsTests: XCTestCase {
             configurationIdentityProvider: { state.configuration },
             trailerYouTubeIdProvider: { _ in
                 state.calls.append("tmdb")
-                return "tmdb_de_1234"
+                return "tmdbde12345"
             },
             refreshedTrailerIdsProvider: { _ in nil },
             trailerioProvider: { _, _ in
@@ -391,16 +462,55 @@ final class TrailerSettingsTests: XCTestCase {
                     qualityLabel: "1080p (IMDb)"
                 )
             },
-            youtubeSourceProvider: { _, _, _, _ in
-                state.calls.append("youtube")
-                return nil
+            youtubeSourceProvider: { videoID, _, _, isPreview in
+                state.calls.append("youtube:\(videoID):\(isPreview)")
+                return TrailerPlaybackSource(
+                    videoUrl: "https://youtube.test/\(videoID).m3u8",
+                    qualityLabel: "Localized YouTube"
+                )
             }
         )
         let meta = NuvioMeta(id: "tt7654321", name: "Dune", imdbId: "tt7654321", type: "movie")
         let source = await resolver.resolvePreview(for: meta)
 
+        XCTAssertEqual(source?.videoUrl, "https://youtube.test/tmdbde12345.m3u8")
+        XCTAssertEqual(source?.qualityLabel, "Localized YouTube")
+        XCTAssertEqual(state.calls, ["tmdb", "youtube:tmdbde12345:true"])
+    }
+
+    func testNonEnglishPreviewFallsBackToImdbWhenLocalizedYouTubeFails() async {
+        let state = TrailerResolverTestState()
+        state.language = "de-DE"
+        let resolver = YouTubeTrailerResolver(
+            preferredLanguageProvider: { state.language },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return "tmdbde12345"
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in
+                state.calls.append("trailerio")
+                return nil
+            },
+            imdbTrailerProvider: { imdbId in
+                state.calls.append("imdb:\(imdbId)")
+                return TrailerPlaybackSource(
+                    videoUrl: "https://imdb-video.media-imdb.com/backdrop1080p.mp4",
+                    qualityLabel: "1080p (IMDb)"
+                )
+            },
+            youtubeSourceProvider: { videoID, _, _, isPreview in
+                state.calls.append("youtube:\(videoID):\(isPreview)")
+                return nil
+            }
+        )
+        let meta = NuvioMeta(id: "tt7654321", name: "Dune", imdbId: "tt7654321", type: "movie")
+
+        let source = await resolver.resolvePreview(for: meta)
+
         XCTAssertEqual(source?.videoUrl, "https://imdb-video.media-imdb.com/backdrop1080p.mp4")
-        XCTAssertEqual(state.calls, ["imdb:tt7654321"])
+        XCTAssertEqual(state.calls, ["tmdb", "youtube:tmdbde12345:true", "imdb:tt7654321"])
     }
 
     func testImdbTrailerFallbackToYouTubeWhenImdbUnavailable() async {

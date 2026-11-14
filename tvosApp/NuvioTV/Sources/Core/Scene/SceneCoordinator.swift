@@ -545,7 +545,22 @@ final class SceneCoordinator: ObservableObject {
                     generation: gen,
                     context: context,
                     providerWasSupported: providerWasSupported
-                ) == true else { return }
+                ) == true else {
+                    if let self, self.frameAnalysisIsCurrent(
+                        id: analysisID,
+                        generation: gen,
+                        context: context,
+                        providerWasSupported: providerWasSupported
+                    ) {
+                        let activeTracked = await self.actorRecognition.currentTrackedActors(at: requestedTime)
+                        if !activeTracked.isEmpty {
+                            self.updateActorStatus(.recognized(activeTracked))
+                        } else if case .analyzing = self.currentSnapshot.actorStatus {
+                            self.updateActorStatus(.noMatch)
+                        }
+                    }
+                    return
+                }
                 for actor in timelineMatch.actors {
                     guard self?.frameAnalysisIsCurrent(
                         id: analysisID,

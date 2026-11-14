@@ -3245,6 +3245,78 @@ final class NuvioSyncProfileSettingsTests: XCTestCase {
         XCTAssertTrue(defaults.bool(forKey: SettingsKey.nuvioSyncScrobbleEnabled))
     }
 
+    func testLegacyTrailerSoundImportReplacesLocalFallbackOnlyOnce() async throws {
+        let defaults = ProfileSettings.store(for: profileId)
+        defaults.removeObject(forKey: SettingsKey.trailerSound)
+        defaults.set(false, forKey: SettingsKey.trailerPreviewSound)
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: defaults)
+        XCTAssertFalse(defaults.bool(forKey: SettingsKey.trailerSound))
+        let oldSettings: [String: Any] = [
+            SettingsKey.trailerPreviewSound: ["type": "boolean", "value": true]
+        ]
+        ProfileSettingsSyncURLProtocol.install { request in
+            guard request.rpc == "sync_pull_profile_settings_blob" else { return self.response([]) }
+            return request.params["p_platform"] as? String == "tv"
+                ? self.settingsRow(["tvos_settings": oldSettings])
+                : self.response([])
+        }
+
+        let client = NuvioAPIClient(session: session)
+        _ = try await client.pullProfileSettings(
+            session: authSession,
+            remoteProfileId: 7,
+            localProfileId: profileId
+        )
+
+        XCTAssertTrue(defaults.bool(forKey: SettingsKey.trailerSound))
+        XCTAssertTrue(defaults.bool(forKey: SettingsKey.trailerPreviewSound))
+
+        defaults.set(false, forKey: SettingsKey.trailerSound)
+        _ = try await client.pullProfileSettings(
+            session: authSession,
+            remoteProfileId: 7,
+            localProfileId: profileId
+        )
+        XCTAssertFalse(defaults.bool(forKey: SettingsKey.trailerSound), "Repeated legacy sync must not replace the new preference")
+    }
+
+    func testModernSyncExportsCardAndGeneralTrailerSoundSeparately() async throws {
+        let defaults = ProfileSettings.store(for: profileId)
+        defaults.removeObject(forKey: SettingsKey.trailerSound)
+        ProfileSettings.migrateTrailerSoundIfNeeded(in: defaults)
+        defaults.set(true, forKey: SettingsKey.trailerPreviewSound)
+        XCTAssertFalse(defaults.bool(forKey: SettingsKey.trailerSound))
+
+        var tvDocument: [String: Any] = ["version": 1, "features": [:]]
+        ProfileSettingsSyncURLProtocol.install { request in
+            switch request.rpc {
+            case "sync_pull_profile_settings_blob":
+                return request.params["p_platform"] as? String == "tv"
+                    ? self.response([ ["settings_json": tvDocument] ]) : self.response([])
+            case "sync_push_profile_settings_blob":
+                if request.params["p_platform"] as? String == "tv" {
+                    tvDocument = request.params["p_settings_json"] as? [String: Any] ?? [:]
+                }
+                return self.response([])
+            default: return (404, Data("{}".utf8))
+            }
+        }
+
+        let client = NuvioAPIClient(session: session)
+        try await push(with: client)
+        let request = try XCTUnwrap(ProfileSettingsSyncURLProtocol.capturedRequests().first {
+            $0.rpc == "sync_push_profile_settings_blob" && $0.params["p_platform"] as? String == "tv"
+        })
+        let settings = try XCTUnwrap(request.params["p_settings_json"] as? [String: Any])
+        let features = try XCTUnwrap(settings["features"] as? [String: Any])
+        let trailerSettings = try XCTUnwrap(features["tvos_settings"] as? [String: Any])
+        let cardSound = try XCTUnwrap(trailerSettings[SettingsKey.trailerPreviewSound] as? [String: Any])
+        let trailerSound = try XCTUnwrap(trailerSettings[SettingsKey.trailerSound] as? [String: Any])
+
+        XCTAssertEqual(cardSound["value"] as? Bool, true)
+        XCTAssertEqual(trailerSound["value"] as? Bool, false)
+    }
+
     @MainActor
     func testNuvioProgressUploadExcludesRemoteCheckpointsAndPulledRows() async throws {
         defer { ContinueWatchingStore.eraseProfile(profileId) }

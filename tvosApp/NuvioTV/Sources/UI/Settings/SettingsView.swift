@@ -128,6 +128,7 @@ enum SettingsKey {
     static let homeLayout = "nuvio.tv.settings.layout.homeLayout"
     static let sidebarClockFormat = "nuvio.tv.settings.layout.sidebarClockFormat"
     static let gridRows = "nuvio.tv.settings.layout.gridRows"
+    static let gridItemsPerRow = "nuvio.tv.settings.layout.gridItemsPerRow"
     static let catalogAutoRefreshInterval = "nuvio.tv.settings.layout.catalogAutoRefreshInterval"
     /// JSON `[String]` of home section ids in the user's preferred order.
     static let homeCatalogOrder = "nuvio.tv.settings.layout.homeCatalogOrder"
@@ -307,9 +308,14 @@ enum SettingsKey {
     static let trueHDSpatialAudio = "nuvio.tv.settings.playback.trueHDSpatialAudio"
     static let preferDualLayerDolbyVision = "nuvio.tv.settings.playback.preferDualLayerDolbyVision"
     static let dualLayerRoute = "nuvio.tv.settings.playback.dualLayerRoute"
+    static let foldsDolbyVisionFEL = "nuvio.tv.settings.playback.foldsDolbyVisionFEL"
     static let preferHDR10Plus = "nuvio.tv.settings.playback.preferHDR10Plus"
     static let lowResUpscaling = "nuvio.tv.settings.playback.lowResUpscaling"
+    static let upscaleScaler = "nuvio.tv.settings.playback.upscaleScaler"
     static let losslessAudioBridge = "nuvio.tv.settings.playback.losslessAudioBridge"
+    static let preserveSubwooferBassInStereo = "nuvio.tv.settings.playback.preserveSubwooferBassInStereo"
+    static let loudnessNormalizer = "nuvio.tv.settings.playback.loudnessNormalizer"
+    static let loudnessTargetPreset = "nuvio.tv.settings.playback.loudnessTargetPreset"
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
     static let trickplayServer = "nuvio.tv.settings.playback.trickplayServer"
     static let externalPlayer = "nuvio.tv.settings.playback.externalPlayer"
@@ -339,6 +345,8 @@ enum SettingsKey {
     static let streamListEpisodeHeader = "nuvio.tv.settings.playback.streamListEpisodeHeader"
     static let streamListExpandFocused = "nuvio.tv.settings.playback.streamListExpandFocused"
     static let streamListHideFileSize = "nuvio.tv.settings.playback.streamListHideFileSize"
+    static let streamListHideAddonName = "nuvio.tv.settings.playback.streamListHideAddonName"
+    static let streamListHideDescription = "nuvio.tv.settings.playback.streamListHideDescription"
     static let streamListDetailSize = "nuvio.tv.settings.playback.streamListDetailSize"
     static let streamListBadgeSize = "nuvio.tv.settings.playback.streamListBadgeSize"
     static let streamListLogoSize = "nuvio.tv.settings.playback.streamListLogoSize"
@@ -356,6 +364,7 @@ enum SettingsKey {
     static let trailersEnabled = "nuvio.tv.settings.playback.trailersEnabled"
     static let backgroundTrailersEnabled = "nuvio.tv.settings.playback.backgroundTrailersEnabled"
     static let trailerPreviewSound = "nuvio.tv.settings.playback.trailerPreviewSound"
+    static let trailerSound = "nuvio.tv.settings.playback.trailerSound"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
     static let focusedPosterBackdropEnabled = "nuvio.tv.settings.playback.focusedPosterBackdropEnabled"
     static let focusedPosterBackdropDelay = "nuvio.tv.settings.playback.focusedPosterBackdropDelay"
@@ -433,7 +442,7 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
         accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
-        homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, homeHeroRatingsEnabled, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
+        homeLayout, sidebarClockFormat, gridRows, gridItemsPerRow, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, homeHeroRatingsEnabled, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
         showCalendarTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
@@ -471,12 +480,13 @@ enum SettingsKey {
         cinemetaDisabled, deletedLocalAddons,
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
-        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, preferHDR10Plus, lowResUpscaling, losslessAudioBridge, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
+        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, foldsDolbyVisionFEL, preferHDR10Plus, lowResUpscaling, upscaleScaler, losslessAudioBridge, preserveSubwooferBassInStereo, loudnessNormalizer, loudnessTargetPreset, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
+        streamListHideAddonName, streamListHideDescription,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
-        autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
+        autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
@@ -3243,6 +3253,7 @@ private struct HomeLayoutLivePreview: View {
     let catalogAddonNames: Bool
     var landscapePosters: Bool = false
     var gridRows: Int = TVHomeGridLayout.defaultRows
+    var gridItemsPerRow: Int = TVHomeGridLayout.defaultItemsPerRow
     let accentColor: Color
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
@@ -3604,18 +3615,29 @@ private struct HomeLayoutLivePreview: View {
 
     private var gridViewSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            rowHeader(title: "All Catalogs Grid", addon: "7 × \(gridRows) Grid")
+            let itemsPerRow = TVHomeGridLayout.clampedItemsPerRow(gridItemsPerRow)
+            let previewLimit = TVHomeGridLayout.previewItemCount(rows: gridRows, itemsPerRow: itemsPerRow)
+            let rowLayoutLabel = TVHomeGridLayout.showsAllItems(itemsPerRow: gridItemsPerRow)
+                ? "See All · \(gridRows) Rows"
+                : "\(itemsPerRow) × \(gridRows) Grid"
+            rowHeader(title: "All Catalogs Grid", addon: rowLayoutLabel)
 
-            LazyVGrid(
-                columns: Array(repeating: GridItem(.fixed(75), spacing: 10), count: 7),
-                spacing: 6
-            ) {
-                let previewCount = heroEnabled ? min(7, gridRows * 7) : min(14, gridRows * 7)
-                ForEach(0..<previewCount, id: \.self) { idx in
-                    let item = movies[idx % movies.count]
-                    miniPortraitCard(width: 75, height: heroEnabled ? 80 : 92, item: item, isFocused: idx == 0)
+            ScrollView(.horizontal) {
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.fixed(75), spacing: 10), count: itemsPerRow),
+                    spacing: 6
+                ) {
+                    let previewCount = heroEnabled
+                        ? min(itemsPerRow, previewLimit)
+                        : min(itemsPerRow * 2, previewLimit)
+                    ForEach(0..<previewCount, id: \.self) { idx in
+                        let item = movies[idx % movies.count]
+                        miniPortraitCard(width: 75, height: heroEnabled ? 80 : 92, item: item, isFocused: idx == 0)
+                    }
                 }
+                .frame(width: CGFloat(itemsPerRow) * 75 + CGFloat(itemsPerRow - 1) * 10, alignment: .leading)
             }
+            .scrollIndicators(.hidden)
         }
     }
 
@@ -3776,7 +3798,7 @@ private struct SettingsFeatureSummaryCard: View {
     }
 }
 
-/// Settings → Playback → Stream List: every size of the stream list on the left, and on the
+/// Settings → Layout → Stream List: every size of the stream list on the left, and on the
 /// right the list itself with sample streams, as it will look.
 private struct StreamListStyleEditor: View {
     let accentColor: Color
@@ -3790,6 +3812,7 @@ private struct StreamListStyleEditor: View {
     @AppStorage(SettingsKey.streamListBadgeSize) private var badgeSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListLogoSize) private var logoSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
+    @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
     @AppStorage(SettingsKey.streamListCardSize) private var cardSize = StreamListStyle.CardSize.standard.rawValue
     @AppStorage(SettingsKey.streamListSpacing) private var spacing = StreamListStyle.Spacing.standard.rawValue
     @AppStorage(SettingsKey.streamListWidth) private var width = StreamListStyle.Width.standard.rawValue
@@ -3799,6 +3822,13 @@ private struct StreamListStyleEditor: View {
     @AppStorage(SettingsKey.streamListDescriptionLines) private var descriptionLines = 6
     @AppStorage(SettingsKey.streamListExpandFocused) private var expandFocused = false
     @AppStorage(SettingsKey.streamListHideFileSize) private var hideFileSize = false
+    @AppStorage(SettingsKey.streamListHideAddonName) private var hideAddonName = false
+    @AppStorage(SettingsKey.streamListHideDescription) private var hideDescription = false
+
+    @State private var streamBadgeURL = ""
+    @State private var streamBadgeImportError: String?
+    @State private var isImportingStreamBadges = false
+    @State private var streamBadgeSettingsRevision = 0
 
     private var style: StreamListStyle {
         StreamListStyle(
@@ -3806,6 +3836,8 @@ private struct StreamListStyleEditor: View {
             nameLines: nameLines, descriptionLines: descriptionLines,
             episodeHeader: episodeHeader, expandFocused: expandFocused,
             hideFileSize: hideFileSize,
+            hideAddonName: hideAddonName,
+            hideDescription: hideDescription,
             detailSize: detailSize, badgeSize: badgeSize, logoSize: logoSize,
             spacing: spacing, height: height)
     }
@@ -3842,6 +3874,7 @@ private struct StreamListStyleEditor: View {
                             .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.white.opacity(0.55))
                         StreamListPreview(style: style, showAddonLogo: showAddonLogo, width: previewWidth)
+                            .id("\(streamBadgeSettingsRevision)_\(showAddonLogo)_\(hideAddonName)_\(hideDescription)_\(hideFileSize)")
                     }
                     .padding(.top, 110)
                 }
@@ -3849,10 +3882,24 @@ private struct StreamListStyleEditor: View {
             }
         }
         .onExitCommand { dismiss() }
+        .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            streamBadgeSettingsRevision &+= 1
+        }
     }
 
     @ViewBuilder
     private var rows: some View {
+        let _ = streamBadgeSettingsRevision
+        let importedRules = StreamBadgeSettingsStore.snapshot.rules
+        let placementBinding = Binding<String>(
+            get: { streamBadgePlacement == StreamBadgePlacement.top.rawValue ? "Top" : "Bottom" },
+            set: { value in
+                let placement: StreamBadgePlacement = value == "Top" ? .top : .bottom
+                streamBadgePlacement = placement.rawValue
+                StreamBadgeSettingsStore.setPlacement(placement)
+            }
+        )
+
         SettingsOptionRow(
             title: L10n.string("tvos_settings_stream_list_text_size", fallback: "Text Size"),
             subtitle: L10n.string("tvos_settings_stream_list_text_size_subtitle", fallback: "Everything in the list, 50 % to 150 %"),
@@ -3873,23 +3920,6 @@ private struct StreamListStyleEditor: View {
             title: L10n.string("tvos_settings_stream_list_badge_size", fallback: "Badge Size"),
             subtitle: L10n.string("tvos_settings_stream_list_badge_size_subtitle", fallback: "Imported badges and the file size"),
             value: $badgeSize)
-
-        SettingsOptionRow(
-            title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
-            subtitle: L10n.string("tvos_settings_stream_list_logo_subtitle", fallback: "The source add-on's logo beside each stream, and its size"),
-            selection: Binding(
-                get: { showAddonLogo ? (StreamListStyle.Step(rawValue: logoSize) ?? .standard).label : "Off" },
-                set: { label in
-                    if let step = StreamListStyle.Step.allCases.first(where: { $0.label == label }) {
-                        showAddonLogo = true
-                        logoSize = step.rawValue
-                    } else {
-                        showAddonLogo = false
-                    }
-                }),
-            options: ["Off"] + StreamListStyle.Step.allCases.map(\.label),
-            accentColor: accentColor
-        )
 
         SettingsOptionRow(
             title: L10n.string("tvos_settings_stream_list_card_size", fallback: "Card Size"),
@@ -3959,11 +3989,81 @@ private struct StreamListStyleEditor: View {
         )
 
         SettingsToggleRow(
+            title: L10n.string("tvos_settings_stream_list_hide_addon_name", fallback: "Hide Add-on Name"),
+            subtitle: L10n.string("tvos_settings_stream_list_hide_addon_name_subtitle", fallback: "Remove add-on names from stream titles and cards"),
+            isOn: $hideAddonName,
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
+            title: L10n.string("tvos_settings_stream_list_hide_description", fallback: "Hide Description"),
+            subtitle: L10n.string("tvos_settings_stream_list_hide_description_subtitle", fallback: "Hide the file name and description details"),
+            isOn: $hideDescription,
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
             title: L10n.string("tvos_settings_stream_list_expand_focused", fallback: "Expand Focused Card (Experimental)"),
             subtitle: L10n.string("tvos_settings_stream_list_expand_focused_subtitle", fallback: "The selected stream shows its whole name and description"),
             isOn: $expandFocused,
             accentColor: accentColor
         )
+
+        SettingsOptionRow(
+            title: L10n.string("tvos_settings_badge_placement", fallback: "Badge Placement"),
+            subtitle: L10n.string("tvos_settings_badge_placement_subtitle", fallback: "Place imported badges and file sizes above or below the stream details"),
+            selection: placementBinding,
+            options: ["Top", "Bottom"],
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
+            title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
+            subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
+            isOn: Binding(
+                get: { showAddonLogo },
+                set: { newValue in
+                    showAddonLogo = newValue
+                    StreamBadgeSettingsStore.setShowAddonLogo(newValue)
+                }
+            ),
+            accentColor: accentColor
+        )
+
+        SettingsNativeTextFieldRow(
+            title: L10n.string("tvos_settings_badge_pack_url", fallback: "Badge Pack URL"),
+            subtitle: streamBadgeImportError ?? L10n.string("tvos_settings_badge_pack_url_subtitle", fallback: "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)"),
+            placeholder: "https://…",
+            text: $streamBadgeURL,
+            fieldWidth: 220,
+            subtitleLineLimit: 3,
+            onCommit: importStreamBadgePack
+        )
+        .opacity(isImportingStreamBadges ? 0.55 : 1)
+        .disabled(isImportingStreamBadges)
+
+        if importedRules.imports.isEmpty {
+            SettingsInfoRow(
+                title: L10n.string("tvos_settings_imported_packs", fallback: "Imported Packs"),
+                value: L10n.string("action_none", fallback: "None")
+            )
+        } else {
+            ForEach(importedRules.imports) { imported in
+                StreamBadgePackSettingsRow(
+                    badgePack: imported,
+                    accentColor: accentColor,
+                    onEnabledChange: { isEnabled in
+                        StreamBadgeSettingsStore.setSourceEnabled(
+                            imported.sourceUrl,
+                            isEnabled: isEnabled
+                        )
+                    },
+                    onDelete: {
+                        StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
+                    }
+                )
+            }
+        }
 
         SettingsActionRow(
             title: L10n.string("tvos_settings_stream_list_reset", fallback: "Reset to Defaults"),
@@ -4005,6 +4105,9 @@ private struct StreamListStyleEditor: View {
         badgeSize = StreamListStyle.Step.standard.rawValue
         logoSize = StreamListStyle.Step.standard.rawValue
         showAddonLogo = false
+        StreamBadgeSettingsStore.setShowAddonLogo(false)
+        streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
+        StreamBadgeSettingsStore.setPlacement(.bottom)
         cardSize = StreamListStyle.CardSize.standard.rawValue
         spacing = StreamListStyle.Spacing.standard.rawValue
         width = StreamListStyle.Width.standard.rawValue
@@ -4014,6 +4117,30 @@ private struct StreamListStyleEditor: View {
         descriptionLines = 6
         expandFocused = false
         hideFileSize = false
+        hideAddonName = false
+        hideDescription = false
+    }
+
+    private func importStreamBadgePack() {
+        importStreamBadgePack(from: streamBadgeURL, clearDraft: true)
+    }
+
+    private func importStreamBadgePack(from rawURL: String, clearDraft: Bool) {
+        let url = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isImportingStreamBadges, !url.isEmpty else { return }
+        isImportingStreamBadges = true
+        streamBadgeImportError = nil
+        Task { @MainActor in
+            do {
+                _ = try await StreamBadgeSettingsStore.importRules(from: url)
+                if clearDraft {
+                    streamBadgeURL = ""
+                }
+            } catch {
+                streamBadgeImportError = error.localizedDescription
+            }
+            isImportingStreamBadges = false
+        }
     }
 }
 
@@ -4064,6 +4191,7 @@ private struct LayoutDiscoverySettingsView: View {
 
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
+    @AppStorage(SettingsKey.gridItemsPerRow) private var gridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.fullscreenHeroBackdrop) private var fullscreenHeroBackdrop = true
@@ -4095,6 +4223,8 @@ private struct LayoutDiscoverySettingsView: View {
     @State private var showingHomeCatalogOrderSettings = false
     @State private var showingCollectionsSettings = false
     @State private var showingDetailsSectionsSettings = false
+    @State private var showingStreamListEditor = false
+    @State private var streamListSummary = StreamListStyle.current().summary
     @State private var homeCatalogSummaryCount = 0
     @State private var collectionsSummaryCount = 0
     @State private var detailsSectionsActiveCount = TVDetailsSectionOrder.activeSectionCount()
@@ -4125,6 +4255,7 @@ private struct LayoutDiscoverySettingsView: View {
                     catalogAddonNames: catalogAddonNames,
                     landscapePosters: landscapePosters,
                     gridRows: gridRows,
+                    gridItemsPerRow: gridItemsPerRow,
                     accentColor: accentColor
                 )
 
@@ -4174,6 +4305,26 @@ private struct LayoutDiscoverySettingsView: View {
                         step: 1,
                         suffix: gridRows == 1 ? " row" : " rows",
                         accentColor: accentColor
+                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+
+                    SettingsStepperRow(
+                        title: L10n.string(
+                            "tvos_layout_grid_items_per_row",
+                            fallback: "Grid Items Per Row"
+                        ),
+                        subtitle: L10n.string(
+                            "tvos_layout_grid_items_per_row_subtitle",
+                            fallback: "Choose 4–20 items per row, or See All to show and page through the full catalog."
+                        ),
+                        value: $gridItemsPerRow,
+                        range: TVHomeGridLayout.minItemsPerRow...TVHomeGridLayout.seeAllItemsPerRow,
+                        step: 1,
+                        suffix: " items",
+                        accentColor: accentColor,
+                        displayValue: TVHomeGridLayout.showsAllItems(itemsPerRow: gridItemsPerRow)
+                            ? L10n.string("action_see_all", fallback: "See All")
+                            : "\(gridItemsPerRow) items"
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
@@ -4555,6 +4706,18 @@ private struct LayoutDiscoverySettingsView: View {
                 }
             }
 
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("tvos_settings_stream_list", fallback: "Stream List"),
+                status: streamListSummary,
+                actionSubtitle: L10n.string(
+                    "tvos_settings_stream_list_subtitle",
+                    fallback: "How the sources look when you open an episode or a film, with a live preview"
+                ),
+                accentColor: accentColor
+            ) {
+                showingStreamListEditor = true
+            }
+
             SettingsGroup(
                 title: L10n.string("tvos_settings_episode_spoilers", fallback: "Episode Spoilers"),
                 subtitle: L10n.string(
@@ -4664,12 +4827,18 @@ private struct LayoutDiscoverySettingsView: View {
             }
             .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .fullScreenCover(isPresented: $showingStreamListEditor, onDismiss: {
+            streamListSummary = StreamListStyle.current().summary
+        }) {
+            StreamListStyleEditor(accentColor: accentColor)
+        }
     }
 
     private func refreshSummaryCounts() {
         refreshHomeCatalogSummaryCount()
         refreshCollectionsSummaryCount()
         refreshDetailsSectionsSummary()
+        streamListSummary = StreamListStyle.current().summary
     }
 
     private func refreshDetailsSectionsSummary() {
@@ -11108,8 +11277,13 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
     @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
     @AppStorage(SettingsKey.dualLayerRoute) private var dualLayerRoute = "softwareHost"
+    @AppStorage(SettingsKey.foldsDolbyVisionFEL) private var foldsDolbyVisionFEL = true
     @AppStorage(SettingsKey.lowResUpscaling) private var lowResUpscaling = true
+    @AppStorage(SettingsKey.upscaleScaler) private var upscaleScaler = "smart"
     @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false
+    @AppStorage(SettingsKey.preserveSubwooferBassInStereo) private var preserveSubwooferBassInStereo = false
+    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
+    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
     @AppStorage(SettingsKey.externalPlayer) private var externalPlayer = ExternalPlayer.builtIn.rawValue
     @AppStorage(SettingsKey.externalPlayerForwardSubtitles) private var externalPlayerForwardSubtitles = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
@@ -11125,11 +11299,6 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonStreamOrder = false
     @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
     @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedStreamSort = false
-    @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
-    @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
-    @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
-    @State private var showingStreamListEditor = false
-    @State private var streamListSummary = StreamListStyle.current().summary
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
     @AppStorage(SettingsKey.autoSkipIntro) private var autoSkipIntro = false
     @AppStorage(SettingsKey.autoSkipRecap) private var autoSkipRecap = false
@@ -11153,6 +11322,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = false
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
+    @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
     @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
@@ -11174,16 +11344,14 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
     @AppStorage(SettingsKey.sceneFeatureEnabled) private var sceneFeatureEnabled = true
 
-    @State private var streamBadgeURL = ""
-    @State private var streamBadgeImportError: String?
-    @State private var isImportingStreamBadges = false
-    @State private var streamBadgeSettingsRevision = 0
     @State private var showingPlayerButtonSettings = false
     @State private var showingInSightSectionsSettings = false
     @State private var inSightSectionsEnabledCount = TVSceneTabOrder.enabledTabCount()
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
     private let dualLayerRoutes = ["softwareHost", "avPlayerOutput"]
+    private let upscaleScalers = ["smart", "lineArt", "automatic", "off"]
+    private let loudnessTargetPresets = ["standard", "night", "boost"]
     private let externalPlayers = ExternalPlayer.settingsOptions
     private let streamQualities = ["Highest", "4K", "1080p", "720p", "Smallest"]
     private let frameRateModes = ["Off", "On start/stop", "Always"]
@@ -11325,6 +11493,55 @@ private struct PlaybackSettingsView: View {
 
                 SettingsToggleRow(
                     title: L10n.string(
+                        "tvos_settings_preserve_subwoofer_bass",
+                        fallback: "Preserve Subwoofer Bass in Stereo"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_preserve_subwoofer_bass_subtitle",
+                        fallback: "AetherEngine only. When downmixing surround (5.1/7.1) to stereo for soundbars, headphones, or 2.1 systems, folds the LFE subwoofer channel into stereo instead of discarding it."
+                    ),
+                    isOn: $preserveSubwooferBassInStereo,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_loudness_normalizer",
+                        fallback: "Audio Loudness Normalizer (EBU R128)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_loudness_normalizer_subtitle",
+                        fallback: "AetherEngine only. Automatically lifts quiet audio and dialogue up to +18 dB using real-time EBU R128 integrated loudness tracking without latency or distortion."
+                    ),
+                    isOn: $loudnessNormalizer,
+                    accentColor: accentColor
+                )
+
+                if loudnessNormalizer {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"),
+                        subtitle: L10n.string(
+                            "tvos_settings_loudness_target_subtitle",
+                            fallback: "Standard (-24 LUFS) is the broadcast reference. Night (-20 LUFS) provides extra dialogue lift for quiet environments. Boost (-16 LUFS) provides maximum gain for quiet movies."
+                        ),
+                        selection: $loudnessTargetPreset,
+                        options: loudnessTargetPresets,
+                        accentColor: accentColor,
+                        optionLabel: { preset in
+                            switch preset {
+                            case "night":
+                                return "Night Listening (-20 LUFS)"
+                            case "boost":
+                                return "Quiet Source Boost (-16 LUFS)"
+                            default:
+                                return "Cinema / Standard (-24 LUFS)"
+                            }
+                        }
+                    )
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string(
                         "tvos_settings_prefer_dual_layer_dolby_vision",
                         fallback: "Full Dolby Vision P7 FEL (Experimental)"
                     ),
@@ -11371,15 +11588,53 @@ private struct PlaybackSettingsView: View {
 
                 SettingsToggleRow(
                     title: L10n.string(
-                        "tvos_settings_low_res_upscaling",
-                        fallback: "Super Resolution & MetalFX Upscaling"
+                        "tvos_settings_folds_dolby_vision_fel",
+                        fallback: "Dolby Vision FEL Dynamic Curves"
                     ),
                     subtitle: L10n.string(
-                        "tvos_settings_low_res_upscaling_subtitle",
-                        fallback: "AetherEngine only. Uses on-device Neural Engine super-resolution and MetalFX to upscale sub-1080p SDR content (480p, 576p, 720p) to native 4K. Applies next playback."
+                        "tvos_settings_folds_dolby_vision_fel_subtitle",
+                        fallback: "AetherEngine only. On performs full scene-by-scene Profile 7 FEL curve reshaping for HDR displays. Off uses fast Profile 8.1 fallback for instantaneous seeks on 4K remuxes."
                     ),
-                    isOn: $lowResUpscaling,
+                    isOn: $foldsDolbyVisionFEL,
                     accentColor: accentColor
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_upscale_scaler", fallback: "Upscaling Mode"),
+                    subtitle: L10n.string(
+                        "tvos_settings_upscale_scaler_subtitle",
+                        fallback: "AetherEngine only. Auto automatically applies Anime4K to animation and MetalFX to movies & TV shows. You can also force a specific engine or turn upscaling off."
+                    ),
+                    selection: Binding(
+                        get: {
+                            lowResUpscaling ? upscaleScaler : "off"
+                        },
+                        set: { newValue in
+                            if newValue == "off" {
+                                lowResUpscaling = false
+                                upscaleScaler = "off"
+                            } else {
+                                lowResUpscaling = true
+                                upscaleScaler = newValue
+                            }
+                        }
+                    ),
+                    options: upscaleScalers,
+                    accentColor: accentColor,
+                    optionLabel: { scaler in
+                        switch scaler {
+                        case "smart":
+                            return L10n.string("tvos_settings_upscale_auto", fallback: "Auto (Content-Adaptive)")
+                        case "lineArt":
+                            return L10n.string("tvos_settings_upscale_anime", fallback: "Anime (Anime4K)")
+                        case "automatic":
+                            return L10n.string("tvos_settings_upscale_metal", fallback: "MetalFX (Super Resolution)")
+                        case "off":
+                            return L10n.string("tvos_settings_upscale_off", fallback: "Off")
+                        default:
+                            return L10n.string("tvos_settings_upscale_auto", fallback: "Auto (Content-Adaptive)")
+                        }
+                    }
                 )
 
                 SettingsOptionRow(
@@ -11701,13 +11956,29 @@ private struct PlaybackSettingsView: View {
                 .disabled(!trailersEnabled)
 
                 SettingsToggleRow(
-                    title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
+                    title: L10n.string("tvos_settings_card_trailer_sound", fallback: "Card Trailer Sound"),
                     subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
                     isOn: $trailerPreviewSound,
                     accentColor: accentColor
                 )
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_trailer_sound", fallback: "Trailer Sound"),
+                    subtitle: L10n.string(
+                        "tvos_settings_trailer_sound_description",
+                        fallback: "Play sound for Details background trailers, post-play trailers, and the Grid hero carousel."
+                    ),
+                    isOn: Binding(
+                        get: { trailerSound },
+                        set: { soundEnabled in
+                            trailerSound = soundEnabled
+                            ProfileSettings.markTrailerSoundExplicit(in: ProfileSettings.current)
+                        }
+                    ),
+                    accentColor: accentColor
+                )
 
                 SettingsStepperRow(
                     title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
@@ -11864,33 +12135,6 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
-            SettingsFeatureSummaryCard(
-                featureName: L10n.string("tvos_settings_stream_list", fallback: "Stream List"),
-                status: streamListSummary,
-                actionSubtitle: L10n.string(
-                    "tvos_settings_stream_list_subtitle",
-                    fallback: "How the sources look when you open an episode or a film, with a live preview"
-                ),
-                accentColor: accentColor
-            ) {
-                showingStreamListEditor = true
-            }
-            .fullScreenCover(isPresented: $showingStreamListEditor, onDismiss: {
-                streamListSummary = StreamListStyle.current().summary
-            }) {
-                StreamListStyleEditor(accentColor: accentColor)
-            }
-
-            SettingsGroup(
-                title: L10n.string("tvos_settings_stream_badges", fallback: "Stream Badges"),
-                subtitle: L10n.string(
-                    "tvos_settings_stream_badges_subtitle",
-                    fallback: "Show the same stream badge packs and source details as Android TV"
-                )
-            ) {
-                streamBadgeSettingsRows
-            }
-
             SettingsGroup(
                 title: L10n.string("tvos_playback_audio_subtitles", fallback: "Audio & Subtitle Languages"),
                 subtitle: L10n.string(
@@ -11946,9 +12190,6 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
-        }
-        .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            streamBadgeSettingsRevision &+= 1
         }
         .onReceive(NotificationCenter.default.publisher(for: TVSceneTabOrder.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshInSightSectionsSummary()
@@ -12031,117 +12272,6 @@ private struct PlaybackSettingsView: View {
         guard !ordered.isEmpty else { return L10n.string("tvos_settings_system", fallback: "System") }
         guard ordered.count > 2 else { return ordered.joined(separator: ", ") }
         return "\(ordered[0]), \(ordered[1]) +\(ordered.count - 2)"
-    }
-
-    @ViewBuilder
-    private var streamBadgeSettingsRows: some View {
-        // Keep the view dependent on badge-store updates, but do not replace its
-        // identity: replacing it after a placement change sends tvOS focus back
-        // to the first row in the group.
-        let _ = streamBadgeSettingsRevision
-        let importedRules = StreamBadgeSettingsStore.snapshot.rules
-        let placementBinding = Binding<String>(
-            get: { streamBadgePlacement == StreamBadgePlacement.top.rawValue ? "Top" : "Bottom" },
-            set: { value in
-                let placement: StreamBadgePlacement = value == "Top" ? .top : .bottom
-                streamBadgePlacement = placement.rawValue
-                StreamBadgeSettingsStore.setPlacement(placement)
-            }
-        )
-
-        SettingsToggleRow(
-            title: L10n.string("tvos_settings_file_size_badges", fallback: "File Size Badges"),
-            subtitle: L10n.string("tvos_settings_file_size_badges_subtitle", fallback: "Show the stream file size when the add-on provides it"),
-            isOn: $showFileSizeBadges,
-            accentColor: accentColor
-        )
-
-        SettingsOptionRow(
-            title: L10n.string("tvos_settings_badge_placement", fallback: "Badge Placement"),
-            subtitle: L10n.string("tvos_settings_badge_placement_subtitle", fallback: "Place imported badges and file sizes above or below the stream details"),
-            selection: placementBinding,
-            options: ["Top", "Bottom"],
-            accentColor: accentColor
-        )
-
-        SettingsToggleRow(
-            title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
-            subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
-            isOn: $showAddonLogo,
-            accentColor: accentColor
-        )
-
-        SettingsActionRow(
-            title: L10n.string("tvos_settings_install_gold_badge_pack", fallback: "Install Gold Badge Pack"),
-            subtitle: L10n.string("tvos_settings_install_gold_badge_pack_subtitle", fallback: "Install the Android TV Gold pack without entering a URL"),
-            value: isImportingStreamBadges
-                ? L10n.string("tvos_settings_installing", fallback: "Installing…")
-                : L10n.string("action_install", fallback: "Install"),
-            accentColor: accentColor,
-            action: importGoldBadgePack
-        )
-        .opacity(isImportingStreamBadges ? 0.55 : 1)
-        .disabled(isImportingStreamBadges)
-
-        SettingsNativeTextFieldRow(
-            title: L10n.string("tvos_settings_badge_pack_url", fallback: "Badge Pack URL"),
-            subtitle: streamBadgeImportError ?? L10n.string("tvos_settings_badge_pack_url_subtitle", fallback: "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)"),
-            placeholder: "https://…",
-            text: $streamBadgeURL,
-            fieldWidth: 520,
-            onCommit: importStreamBadgePack
-        )
-        .opacity(isImportingStreamBadges ? 0.55 : 1)
-        .disabled(isImportingStreamBadges)
-
-        if importedRules.imports.isEmpty {
-            SettingsInfoRow(
-                title: L10n.string("tvos_settings_imported_packs", fallback: "Imported Packs"),
-                value: L10n.string("action_none", fallback: "None")
-            )
-        } else {
-            ForEach(importedRules.imports) { imported in
-                StreamBadgePackSettingsRow(
-                    badgePack: imported,
-                    accentColor: accentColor,
-                    onEnabledChange: { isEnabled in
-                        StreamBadgeSettingsStore.setSourceEnabled(
-                            imported.sourceUrl,
-                            isEnabled: isEnabled
-                        )
-                    },
-                    onDelete: {
-                        StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
-                    }
-                )
-            }
-        }
-    }
-
-    private func importStreamBadgePack() {
-        importStreamBadgePack(from: streamBadgeURL, clearDraft: true)
-    }
-
-    private func importGoldBadgePack() {
-        importStreamBadgePack(from: StreamBadgeSettingsStore.goldBadgePackURL, clearDraft: false)
-    }
-
-    private func importStreamBadgePack(from rawURL: String, clearDraft: Bool) {
-        let url = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !isImportingStreamBadges, !url.isEmpty else { return }
-        isImportingStreamBadges = true
-        streamBadgeImportError = nil
-        Task { @MainActor in
-            do {
-                _ = try await StreamBadgeSettingsStore.importRules(from: url)
-                if clearDraft {
-                    streamBadgeURL = ""
-                }
-            } catch {
-                streamBadgeImportError = error.localizedDescription
-            }
-            isImportingStreamBadges = false
-        }
     }
 }
 
@@ -13512,6 +13642,7 @@ private struct AdvancedSettingsView: View {
     @State private var isClearingCache = false
     @State private var clearedCacheStatus: String?
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @State private var continueWatchingRowDiagnostic: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -13617,9 +13748,14 @@ private struct AdvancedSettingsView: View {
                 // each stage between the ledger and the screen.
                 SettingsInfoRow(
                     title: L10n.string("tvos_settings_continue_watching_row", fallback: "Continue Watching Row"),
-                    value: ContinueWatchingStore.rowDiagnostic(),
+                    value: continueWatchingRowDiagnostic ?? "…",
                     isDiagnostic: true
                 )
+                .task {
+                    // Read once as the row appears, away from the main thread: read in the
+                    // body, every Continue Watching entry was decoded on each redraw.
+                    continueWatchingRowDiagnostic = await ContinueWatchingStore.rowDiagnosticInBackground()
+                }
 
                 // Scrobbles fail silently by design (the caller ignores the
                 // result), so this is the only place a rejected one is visible.
@@ -13720,6 +13856,7 @@ private struct AdvancedSettingsView: View {
         PlaybackTimelineRecorder.setEnabled(false)
         defaults.removeObject(forKey: PlaybackTimelineRecorder.enabledKey)
         SettingsKey.all.forEach { defaults.removeObject(forKey: $0) }
+        ProfileSettings.resetTrailerSoundPreference(in: defaults)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
         AISubtitleKeyStore.remove()
@@ -17958,7 +18095,7 @@ private struct StreamingServicesTemplateCard: View {
 
                     Spacer(minLength: 20)
 
-                    Text("Customize")
+                    Text(L10n.string("action_customize", fallback: "Customize"))
                         .font(.system(size: 21, weight: .semibold))
                         .foregroundColor(isFocused ? .black : .white.opacity(0.88))
                     Image(systemName: "chevron.right")
@@ -18064,7 +18201,7 @@ private struct CollectionTemplateSummaryCard: View {
 
                     Spacer(minLength: 20)
 
-                    Text("Customize")
+                    Text(L10n.string("action_customize", fallback: "Customize"))
                         .font(.system(size: 21, weight: .semibold))
                         .foregroundColor(isFocused ? .black : .white.opacity(0.88))
                     Image(systemName: "chevron.right")
@@ -21589,6 +21726,7 @@ private struct SettingsStepperRow: View {
     let step: Int
     let suffix: String
     let accentColor: Color
+    var displayValue: String? = nil
 
     @FocusState private var isFocused: Bool
 
@@ -21607,7 +21745,7 @@ private struct SettingsStepperRow: View {
                     value = max(range.lowerBound, value - step)
                 }
 
-                Text("\(value)\(suffix)")
+                Text(displayValue ?? "\(value)\(suffix)")
                     .font(.system(size: 20, weight: .bold))
                     .foregroundColor(.white)
                     .frame(width: 78)
@@ -21685,13 +21823,20 @@ private struct SettingsNativeTextFieldRow: View {
     var fieldWidth: CGFloat = 300
     var status: String? = nil
     var statusColor: Color = .white.opacity(0.56)
+    var subtitleLineLimit: Int = 2
     var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
 
     var body: some View {
         SettingsRowShell(isFocused: isFocused, accentColor: .white) {
-            SettingsRowText(title: title, subtitle: subtitle, status: status, statusColor: statusColor)
+            SettingsRowText(
+                title: title,
+                subtitle: subtitle,
+                status: status,
+                statusColor: statusColor,
+                subtitleLineLimit: subtitleLineLimit
+            )
 
             Spacer(minLength: 24)
 
@@ -22050,6 +22195,7 @@ private struct SettingsRowText: View {
     /// A status after the subtitle in its own color (a key's check, say).
     var status: String? = nil
     var statusColor: Color = .white.opacity(0.56)
+    var subtitleLineLimit: Int = 2
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -22061,7 +22207,7 @@ private struct SettingsRowText: View {
 
             subtitleText
                 .font(.appFont(size: 17, weight: .medium))
-                .lineLimit(2)
+                .lineLimit(subtitleLineLimit)
                 .minimumScaleFactor(0.82)
         }
     }
@@ -22872,7 +23018,8 @@ private struct AIOStreamsHostSheet: View {
 
     private var statusColor: Color {
         switch aio.phase {
-        case .running, .exited(0) where aio.runKind == .nodeTest: return .green
+        case .running: return .green
+        case .exited(0) where aio.runKind == .nodeTest: return .green
         case .starting, .stopped: return .white
         default: return .red
         }

@@ -484,6 +484,7 @@ struct PlayerControls: View {
         }
 
         if viewModel.moveSuppressed { return }
+        if viewModel.isScrubbing && (direction == .up || direction == .down) { return }
 
         switch direction {
         case .up:
@@ -763,6 +764,11 @@ struct PlayerControls: View {
                 },
                 onToggleReduceLoudSounds: {
                     viewModel.toggleReduceLoudSounds()
+                    viewModel.setControlsAutoHideSuspended(false)
+                    viewModel.scheduleControlsHide(after: 10.0)
+                },
+                onUpdateLoudnessTarget: {
+                    viewModel.updateLoudnessTarget()
                     viewModel.setControlsAutoHideSuspended(false)
                     viewModel.scheduleControlsHide(after: 10.0)
                 }
@@ -1272,6 +1278,10 @@ private struct PlayerAudioMenuButton: View, Equatable {
     let onSelectTrack: (AudioTrack) -> Void
     let onSetEnhanceDialogueMode: (EnhanceDialogueMode) -> Void
     let onToggleReduceLoudSounds: () -> Void
+    var onUpdateLoudnessTarget: (() -> Void)? = nil
+
+    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
+    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
 
     static func == (lhs: PlayerAudioMenuButton, rhs: PlayerAudioMenuButton) -> Bool {
         lhs.isFocused == rhs.isFocused
@@ -1279,6 +1289,8 @@ private struct PlayerAudioMenuButton: View, Equatable {
             && lhs.enhanceDialogueMode == rhs.enhanceDialogueMode
             && lhs.isReduceLoudSoundsActive == rhs.isReduceLoudSoundsActive
             && lhs.orderedTracks == rhs.orderedTracks
+            && lhs.loudnessNormalizer == rhs.loudnessNormalizer
+            && lhs.loudnessTargetPreset == rhs.loudnessTargetPreset
     }
 
     var body: some View {
@@ -1310,6 +1322,43 @@ private struct PlayerAudioMenuButton: View, Equatable {
                             title: L10n.string("player_reduce_loud_sounds", fallback: "Reduce Loud Sounds"),
                             isSelected: isReduceLoudSoundsActive
                         )
+                    }
+
+                    if loudnessNormalizer {
+                        Menu {
+                            Button {
+                                loudnessTargetPreset = "standard"
+                                onUpdateLoudnessTarget?()
+                            } label: {
+                                audioMenuItem(
+                                    title: L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)"),
+                                    isSelected: loudnessTargetPreset == "standard"
+                                )
+                            }
+                            Button {
+                                loudnessTargetPreset = "night"
+                                onUpdateLoudnessTarget?()
+                            } label: {
+                                audioMenuItem(
+                                    title: L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)"),
+                                    isSelected: loudnessTargetPreset == "night"
+                                )
+                            }
+                            Button {
+                                loudnessTargetPreset = "boost"
+                                onUpdateLoudnessTarget?()
+                            } label: {
+                                audioMenuItem(
+                                    title: L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)"),
+                                    isSelected: loudnessTargetPreset == "boost"
+                                )
+                            }
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"))
+                                Text(loudnessTargetPresetTitle(loudnessTargetPreset))
+                            }
+                        }
                     }
                 }
             }
@@ -1352,6 +1401,17 @@ private struct PlayerAudioMenuButton: View, Equatable {
             if isSelected {
                 Image(systemName: "checkmark")
             }
+        }
+    }
+
+    private func loudnessTargetPresetTitle(_ preset: String) -> String {
+        switch preset {
+        case "night":
+            return L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)")
+        case "boost":
+            return L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)")
+        default:
+            return L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)")
         }
     }
 
@@ -3726,18 +3786,18 @@ struct PlayerSettingsPanel: View {
                                 customShapeRow(shape)
                             }
 
-                            simpleRow(title: "Reset to defaults", isSelected: false, focusKey: .gestureReset) {
+                            simpleRow(title: L10n.string("player_gesture_reset_defaults", fallback: "Reset to defaults"), isSelected: false, focusKey: .gestureReset) {
                                 gestureBindings = .defaults
                                 PlayerGestureSettings.save(.defaults)
                                 gestureSensitivity = PlayerGestureSensitivity()
                                 viewModel.setGestureSensitivity(gestureSensitivity)
-                                gestureNote = "The ready-made gestures and the default sensitivity"
+                                gestureNote = L10n.string("player_gesture_reset_defaults_note", fallback: "The ready-made gestures and the default sensitivity")
                             }
                         }
 
                         Text(viewModel.isGestureExpert
-                             ? "With the controls hidden, a gesture with an action replaces what the player does with it (like click right = seek). With the controls shown or paused, a gesture with an action does it on top of what the controls do. With a double click or tap set, a single one waits to see whether a second one follows."
-                             : "Ready-made gestures that keep clear of what the player does itself. Turn on Expert mode to change them, draw your own and tune the sensitivity.")
+                             ? L10n.string("player_gesture_expert_description", fallback: "With the controls hidden, a gesture with an action replaces what the player does with it (like click right = seek). With the controls shown or paused, a gesture with an action does it on top of what the controls do. With a double click or tap set, a single one waits to see whether a second one follows.")
+                             : L10n.string("player_gesture_standard_description", fallback: "Ready-made gestures that keep clear of what the player does itself. Turn on Expert mode to change them, draw your own and tune the sensitivity."))
                             .font(.system(size: 20, weight: .medium))
                             .foregroundColor(.white.opacity(0.5))
                             .fixedSize(horizontal: false, vertical: true)
@@ -3751,7 +3811,7 @@ struct PlayerSettingsPanel: View {
                         }
 
                         if viewModel.isGestureExpert {
-                            Text("Sensitivity")
+                            Text(L10n.string("player_gesture_sensitivity_header", fallback: "Sensitivity"))
                                 .font(.system(size: 22, weight: .bold))
                                 .foregroundColor(.white.opacity(0.55))
                                 .padding(.top, 14)
@@ -4133,23 +4193,23 @@ private struct PlaybackLogsPage: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             HStack(spacing: 20) {
-                Text("Recent playback events · \(entries.count)")
+                Text(L10n.format("player_logs_recent_events", fallback: "Recent playback events · %d", entries.count))
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundColor(.white.opacity(0.78))
 
-                Button(isRefreshPaused ? "Resume refresh" : "Pause refresh") {
+                Button(isRefreshPaused ? L10n.string("player_logs_resume_refresh", fallback: "Resume refresh") : L10n.string("player_logs_pause_refresh", fallback: "Pause refresh")) {
                     isRefreshPaused.toggle()
                 }
                 .buttonStyle(PosterCardButtonStyle())
 
-                Button("Clear logs") {
+                Button(L10n.string("player_logs_clear", fallback: "Clear logs")) {
                     PlaybackDiagnosticLogStore.shared.clear()
                     entries = []
                 }
                 .buttonStyle(PosterCardButtonStyle())
             }
 
-            Text("Recent playback events are shown here. For crash details, collect the Apple TV unified log in Console (subsystem com.pyksel.nuviotvos, category playback-diagnostics).")
+            Text(L10n.string("player_logs_description", fallback: "Recent playback events are shown here. For crash details, collect the Apple TV unified log in Console (subsystem com.pyksel.nuviotvos, category playback-diagnostics)."))
                 .font(.system(size: 20))
                 .foregroundColor(.white.opacity(0.55))
 

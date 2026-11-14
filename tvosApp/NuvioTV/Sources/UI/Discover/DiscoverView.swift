@@ -42,6 +42,8 @@ struct DiscoverSection: View {
     @State private var overlayRestoreGeneration = 0
     @State private var scrollToTopGeneration = 0
     @State private var filterResultHandoffGeneration = 0
+    /// The items without unreleased titles, worked out once per list.
+    @State private var itemsMemo = ReleasedTitlesMemo()
     @Environment(\.isEnabled) private var isEnabled
     @Binding private var parentTransitionActive: Bool
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
@@ -270,8 +272,8 @@ struct DiscoverSection: View {
     // MARK: - Content
 
     private var visibleItems: [NuvioMeta] {
-        guard hideUnreleased else { return viewModel.items }
-        return viewModel.items.filter { !ContentReleasePolicy.isUnreleased($0) }
+        itemsMemo.update(viewModel.items, revision: viewModel.itemsRevision, hideUnreleased: hideUnreleased)
+        return itemsMemo.titles
     }
 
     @ViewBuilder

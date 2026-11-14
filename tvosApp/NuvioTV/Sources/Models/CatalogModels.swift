@@ -1725,6 +1725,24 @@ enum ContentReleasePolicy {
     }
 }
 
+/// Titles without the unreleased ones, worked out once per list: filtered in a computed
+/// property, every title's release date was checked several times on every redraw, which
+/// Search and Discover do on every focus move.
+final class ReleasedTitlesMemo {
+    private var revision = -1
+    private var hidesUnreleased = false
+    private(set) var titles: [NuvioMeta] = []
+    private(set) var ids: [String] = []
+
+    func update(_ source: [NuvioMeta], revision: Int, hideUnreleased: Bool) {
+        guard revision != self.revision || hideUnreleased != hidesUnreleased else { return }
+        self.revision = revision
+        hidesUnreleased = hideUnreleased
+        titles = hideUnreleased ? source.filter { !ContentReleasePolicy.isUnreleased($0) } : source
+        ids = titles.map(\.id)
+    }
+}
+
 /// Video stream information
 struct NuvioSubtitle: Identifiable, Codable, Equatable, Sendable {
     var id: String { url }
@@ -3068,17 +3086,35 @@ enum ContinueWatchingStore {
         guard let data = data(for: storageKey) else {
             return "stored file missing (rebuilds from ledger on next Home load)"
         }
+        return rowDiagnostic(decoding: data, persistence: persistenceDiagnostic)
+    }
+
+    /// `rowDiagnostic()` with the decoding (every entry, with its title's episodes) away from
+    /// the main thread: Settings showing it read it in its body, and it took 30-170 ms on each
+    /// redraw as Settings opened. (The file is read where the rest of the store runs.)
+    @MainActor
+    static func rowDiagnosticInBackground() async -> String {
+        guard let data = data(for: storageKey) else {
+            return "stored file missing (rebuilds from ledger on next Home load)"
+        }
+        let persistence = persistenceDiagnostic
+        return await Task.detached(priority: .utility) {
+            ContinueWatchingStore.rowDiagnostic(decoding: data, persistence: persistence)
+        }.value
+    }
+
+    private static func rowDiagnostic(decoding data: Data, persistence: String) -> String {
         let decoded: [ContinueWatchingItem]
         do {
             decoded = try makeDecoder().decode([ContinueWatchingItem].self, from: data)
         } catch {
-            return "stored file unreadable: \(diagnosticText(for: error))"
+            return "stored file unreadable: \(diagnosticText(for: error)); \(persistence)"
         }
         let kept = decoded.filter { shouldKeep(position: $0.position, duration: $0.duration) }
         let upNext = kept.filter(\.isUpNextEntry).count
         let unaired = kept.filter { $0.isUpNextEntry && !$0.hasAired }.count
         return "cap \(maxItems); stored \(decoded.count), passing filter \(kept.count), "
-            + "of those up-next \(upNext) (unaired \(unaired)); \(persistenceDiagnostic)"
+            + "of those up-next \(upNext) (unaired \(unaired)); \(persistence)"
     }
 
     /// Exact per-episode resume lookup. A series request never falls back to
@@ -12538,6 +12574,9 @@ enum ProfileSettings {
     private static let traktIsolationMigrationKey = "nuvio.tv.profile.settings.traktIsolation.v1"
     private static let simklIsolationMigrationKey = "nuvio.tv.profile.settings.simklIsolation.v1"
     private static let mdbListIsolationMigrationKey = "nuvio.tv.profile.settings.mdbListIsolation.v1"
+    private static let previousTrailerSoundMigrationKey = "nuvio.tv.profile.settings.trailerSound.v1"
+    private static let trailerSoundMigrationKey = "nuvio.tv.profile.settings.trailerSound.v2"
+    private static let trailerSoundLegacyFallbackKey = "nuvio.tv.profile.settings.trailerSound.legacyFallback"
     static let settingsChangedNotification = Notification.Name("nuvio.tv.profile.settings.changed")
 
     /// Values identifying connected external tracking/metadata accounts on the device.
@@ -12628,6 +12667,7 @@ enum ProfileSettings {
         migrateTraktIsolationIfNeeded(in: suite, isPrimary: primary)
         migrateSimklIsolationIfNeeded(in: suite, profileScope: id, isPrimary: primary)
         migrateMdbListIsolationIfNeeded(in: suite, profileScope: id, isPrimary: primary)
+        migrateTrailerSoundIfNeeded(in: suite)
         AISubtitleKeyStore.migrateLegacyKey(from: suite, profileScope: id)
         if needsSeed {
             AISubtitleKeyStore.migrateLegacyKey(from: .standard, profileScope: id)
@@ -12641,6 +12681,48 @@ enum ProfileSettings {
     static func clearActiveProfile() {
         current = .standard
         activeProfileID = nil
+    }
+
+    /// The old sound preference now belongs only to card previews. Copy its
+    /// value once into the new, broader trailer sound setting when a profile
+    /// first loads. Mark even profiles without the old key so a later card
+    /// preference change is never mistaken for upgrade data.
+    static func migrateTrailerSoundIfNeeded(in store: UserDefaults) {
+        guard !store.bool(forKey: trailerSoundMigrationKey) else { return }
+        if store.object(forKey: SettingsKey.trailerSound) == nil {
+            let previousMigrationAlreadyRan = store.bool(forKey: previousTrailerSoundMigrationKey)
+            let legacyValue = store.object(forKey: SettingsKey.trailerPreviewSound) as? Bool
+            if !previousMigrationAlreadyRan, let legacyValue {
+                store.set(legacyValue, forKey: SettingsKey.trailerSound)
+            } else {
+                store.set(false, forKey: SettingsKey.trailerSound)
+            }
+            store.set(true, forKey: trailerSoundLegacyFallbackKey)
+        }
+        store.set(true, forKey: trailerSoundMigrationKey)
+    }
+
+    /// A legacy account payload may arrive after profile activation. Import it
+    /// while the new setting is absent or still holds the local migration
+    /// fallback; subsequent syncs preserve the user's independent value.
+    static func importLegacyTrailerSoundIfNeeded(_ legacyValue: Bool, in store: UserDefaults) {
+        guard store.object(forKey: SettingsKey.trailerSound) == nil
+                || store.bool(forKey: trailerSoundLegacyFallbackKey) else { return }
+        store.set(legacyValue, forKey: SettingsKey.trailerSound)
+        store.removeObject(forKey: trailerSoundLegacyFallbackKey)
+    }
+
+    /// Called when the user changes Trailer Sound or a sync imports its new
+    /// key, so a later legacy import cannot replace the explicit preference.
+    static func markTrailerSoundExplicit(in store: UserDefaults) {
+        store.removeObject(forKey: trailerSoundLegacyFallbackKey)
+    }
+
+    /// Keep the default sound value exportable after Reset Settings removes
+    /// all published keys while the one-time migration marker remains.
+    static func resetTrailerSoundPreference(in store: UserDefaults) {
+        store.set(false, forKey: SettingsKey.trailerSound)
+        markTrailerSoundExplicit(in: store)
     }
 
     /// Returns whether a captured settings store still belongs to the active
@@ -12734,7 +12816,19 @@ enum ProfileSettings {
     /// mark it seeded so the global migration never overwrites the copy.
     static func seedNewProfile(_ profileId: String, copyingFrom source: UserDefaults? = nil) {
         let destination = store(for: profileId)
-        copySettings(from: source ?? current, to: destination, includeProfileLocalIntegrationSettings: false)
+        let sourceStore = source ?? current
+        copySettings(from: sourceStore, to: destination, includeProfileLocalIntegrationSettings: false)
+        if destination.object(forKey: SettingsKey.trailerSound) == nil,
+           sourceStore.bool(forKey: previousTrailerSoundMigrationKey)
+                || sourceStore.bool(forKey: trailerSoundMigrationKey) {
+            // Older migration code could mark a profile initialized before its
+            // card preference changed, leaving Trailer Sound absent. Preserve
+            // the new setting's off default when cloning that profile.
+            destination.set(false, forKey: SettingsKey.trailerSound)
+            destination.set(true, forKey: trailerSoundLegacyFallbackKey)
+        } else if sourceStore.bool(forKey: trailerSoundLegacyFallbackKey) {
+            destination.set(true, forKey: trailerSoundLegacyFallbackKey)
+        }
         clearTraktProfileState(in: destination)
         clearSimklProfileState(in: destination, profileScope: profileId)
         clearMdbListProfileState(in: destination, profileScope: profileId)

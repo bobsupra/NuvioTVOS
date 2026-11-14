@@ -234,5 +234,12 @@ final class ICloudSettingsSyncManager: ObservableObject {
                 defaults.set(arrayVal, forKey: key)
             }
         }
+
+        if payload[SettingsKey.trailerSound] as? Bool != nil {
+            ProfileSettings.markTrailerSoundExplicit(in: defaults)
+        } else if payload[SettingsKey.trailerSound] == nil,
+                  let legacySound = payload[SettingsKey.trailerPreviewSound] as? Bool {
+            ProfileSettings.importLegacyTrailerSoundIfNeeded(legacySound, in: defaults)
+        }
     }
 }

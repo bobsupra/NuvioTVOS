@@ -934,6 +934,19 @@ enum LibraryMutationIdentity {
         return !itemKeys.isDisjoint(with: mutationKeys)
     }
 
+    static func matches(
+        itemID: String,
+        itemType: String,
+        cachedMetadata: NuvioMeta?,
+        targetID: String,
+        targetType: String
+    ) -> Bool {
+        guard itemType.caseInsensitiveCompare(targetType) == .orderedSame else { return false }
+        let itemKeys = keys(id: itemID, metadata: cachedMetadata)
+        let targetKeys = keys(id: targetID, metadata: nil)
+        return !itemKeys.isDisjoint(with: targetKeys)
+    }
+
     private static func keys(id: String, metadata: NuvioMeta?) -> Set<String> {
         var keys = Set<String>()
 

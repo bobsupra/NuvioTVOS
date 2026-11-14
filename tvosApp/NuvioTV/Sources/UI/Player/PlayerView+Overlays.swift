@@ -95,7 +95,7 @@ extension PlayerView {
                 showSources: onRequestSources != nil || (diagnostic.isHostingIssue && (viewModel.availableSources.count > 1 || fetchPlaybackSources != nil)),
                 onSources: {
                     if let onRequestSources {
-                        onRequestSources()
+                        onRequestSources(viewModel.currentEpisodeVideo)
                     } else {
                         viewModel.openSidePanel(.sources)
                     }
@@ -198,7 +198,7 @@ struct PlaybackErrorOverlayView: View {
 
             if let supportReport {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("SUPPORT DETAILS")
+                    Text(L10n.string("player_support_details_header", fallback: "SUPPORT DETAILS"))
                         .font(.system(size: 12, weight: .bold))
                         .foregroundColor(Color.white.opacity(0.65))
 

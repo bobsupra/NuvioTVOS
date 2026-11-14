@@ -295,7 +295,10 @@ extension PlayerView {
                     nextEpisodeFocused = false
                     cancelAutoPlayFocused = false
                     skipSegmentFocused = false
-                } else if viewModel.isScrubbing || viewModel.showPauseOverlay {
+                } else if viewModel.isScrubbing {
+                    remoteInputFocused = false
+                    requestedControlFocus = .timeline
+                } else if viewModel.showPauseOverlay {
                     focusRemoteInput()
                 } else if viewModel.showNextEpisodeCard {
                     focusNextEpisode()
@@ -348,7 +351,8 @@ extension PlayerView {
                     nextEpisodeFocused = false
                     cancelAutoPlayFocused = false
                     skipSegmentFocused = false
-                    focusRemoteInput()
+                    remoteInputFocused = false
+                    requestedControlFocus = .timeline
                 } else if viewModel.showControls {
                     remoteInputFocused = false
                 } else {

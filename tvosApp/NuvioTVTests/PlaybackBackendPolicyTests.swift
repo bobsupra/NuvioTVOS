@@ -2399,7 +2399,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 preferredSubtitleLanguages: ["Spanish"],
                 allowForcedSubtitles: true
             ),
-            .forced(language: "English")
+            .preferredLanguages(["Spanish"])
         )
         XCTAssertEqual(
             PlayerViewModel.automaticSubtitlePolicy(
@@ -2415,9 +2415,27 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 selectedAudio: englishAudio,
                 preferredAudioLanguage: "English",
                 preferredSubtitleLanguages: ["English", "Arabic"],
+                allowForcedSubtitles: true
+            ),
+            .forced(language: "English")
+        )
+        XCTAssertEqual(
+            PlayerViewModel.automaticSubtitlePolicy(
+                selectedAudio: englishAudio,
+                preferredAudioLanguage: "English",
+                preferredSubtitleLanguages: ["English", "Arabic"],
                 allowForcedSubtitles: false
             ),
             .preferredLanguages(["English", "Arabic"])
+        )
+        XCTAssertEqual(
+            PlayerViewModel.automaticSubtitlePolicy(
+                selectedAudio: englishAudio,
+                preferredAudioLanguage: "English",
+                preferredSubtitleLanguages: [],
+                allowForcedSubtitles: true
+            ),
+            .forced(language: "English")
         )
         XCTAssertEqual(
             PlayerViewModel.automaticSubtitlePolicy(
@@ -2509,7 +2527,8 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         model.selectAudio(japaneseAudio)
 
         XCTAssertEqual(ShowAudioLanguageStore.getLanguage(for: meta.id), "Japanese")
-        XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "4")
+        // Preferred subtitle language is English; foreign Japanese audio automatically receives full English subtitles.
+        XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "5")
 
         let manualFullSubtitle = model.subtitles.first(where: { $0.id == "5" })!
         model.selectSubtitle(manualFullSubtitle)

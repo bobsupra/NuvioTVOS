@@ -533,7 +533,7 @@ class DetailsViewModel: ObservableObject {
                 isLoading: false,
                 meta: seedingCachedRatings(into: cached),
                 error: nil,
-                isInWatchlist: LibraryStore.contains(metaId: cached.id, type: cached.type),
+                isInWatchlist: SelectedLibraryService.isInLibrary(meta: cached),
                 isWatched: WatchedStore.contains(meta: cached),
                 moreLikeThis: relatedItemsSnapshot ?? [],
                 companies: relatedCompaniesSnapshot ?? [],
@@ -579,7 +579,7 @@ class DetailsViewModel: ObservableObject {
                 )
                 var primaryState = self.uiState
                 primaryState.meta = resolvedMeta
-                primaryState.isInWatchlist = LibraryStore.contains(metaId: resolvedMeta.id, type: resolvedMeta.type)
+                primaryState.isInWatchlist = SelectedLibraryService.isInLibrary(meta: resolvedMeta)
                 primaryState.isWatched = WatchedStore.contains(meta: resolvedMeta)
                 primaryState.isLoading = false
                 primaryState.error = nil
@@ -728,9 +728,10 @@ class DetailsViewModel: ObservableObject {
         case .wetrakr:
             return await WeTrakrLibraryService.isInWatchlist(libraryMeta)
         default:
-            if LibraryStore.contains(metaId: meta.id, type: meta.type) { return true }
-            guard let imdb = libraryMeta.imdbId else { return nil }
-            return LibraryStore.contains(metaId: imdb, type: meta.type) ? true : nil
+            let inLib = await MainActor.run {
+                SelectedLibraryService.isInLibrary(meta: meta) || SelectedLibraryService.isInLibrary(meta: libraryMeta)
+            }
+            return inLib ? true : nil
         }
     }
 
@@ -1251,7 +1252,7 @@ class DetailsViewModel: ObservableObject {
     func refreshWatchlistAndWatchedStatus() {
         guard let meta = uiState.meta else { return }
         var updatedState = uiState
-        updatedState.isInWatchlist = LibraryStore.contains(metaId: meta.id, type: meta.type)
+        updatedState.isInWatchlist = SelectedLibraryService.isInLibrary(meta: meta)
         updatedState.isWatched = WatchedStore.contains(meta: meta)
         uiState = updatedState
     }

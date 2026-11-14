@@ -413,21 +413,21 @@ final class StreamsRepository: ObservableObject {
 
         await withTaskGroup(of: GroupUpdate.self) { group in
             for target in targets {
-                group.addTask {
+                group.addTask { [weak self] in
                     await Self.fetchAddonGroup(target: target, type: type, videoId: videoId) { [weak self] partial in
                         await self?.applyPartial(partial, requestKey: requestKey)
                     }
                 }
             }
             if startingAIO {
-                group.addTask {
+                group.addTask { [weak self] in
                     await Self.fetchStartingAIOGroup(type: type, videoId: videoId) { [weak self] partial in
                         await self?.applyPartial(partial, requestKey: requestKey)
                     }
                 }
             }
             for target in pluginTargets {
-                group.addTask {
+                group.addTask { [weak self] in
                     let result = await PluginStreamDiscovery.fetchGroup(
                         target: target,
                         type: type,

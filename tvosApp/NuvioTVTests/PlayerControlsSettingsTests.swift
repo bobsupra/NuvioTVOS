@@ -1003,6 +1003,21 @@ final class PlayerControlsSettingsTests: XCTestCase {
         controller.destroyPlayer()
     }
 
+    func testSiriSkipIntervalKeepsRequestedMagnitudeAndDirection() {
+        guard case .skip(let forward)? = PlayerRemoteIntent.skipInterval(37.5, isForward: true),
+              case .skip(let backward)? = PlayerRemoteIntent.skipInterval(37.5, isForward: false) else {
+            return XCTFail("Expected forward and backward skip intents")
+        }
+        XCTAssertEqual(forward, 37.5)
+        XCTAssertEqual(backward, -37.5)
+    }
+
+    func testSiriSkipIntervalRejectsNegativeAndNonFiniteValues() {
+        XCTAssertNil(PlayerRemoteIntent.skipInterval(-1, isForward: true))
+        XCTAssertNil(PlayerRemoteIntent.skipInterval(.nan, isForward: true))
+        XCTAssertNil(PlayerRemoteIntent.skipInterval(.infinity, isForward: false))
+    }
+
     @MainActor
     func testAetherPlaybackControllerExternalSubtitleSelectionAndMapping() throws {
         guard let controller = AetherPlaybackController() else {

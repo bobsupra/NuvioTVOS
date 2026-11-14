@@ -257,10 +257,9 @@ final class AIOStreamsHost: ObservableObject {
     nonisolated static func waitForAddon(seconds: TimeInterval) async -> URL? {
         let deadline = Date().addingTimeInterval(seconds)
         while Date() < deadline, !Task.isCancelled {
-            addonLock.lock()
-            let current = currentAddonURL
-            let pending = pendingAddonURL
-            addonLock.unlock()
+            let (current, pending) = addonLock.withLock {
+                (currentAddonURL, pendingAddonURL)
+            }
             if let current { return current }
             if pending == nil { return nil }
             try? await Task.sleep(nanoseconds: 100_000_000)
@@ -1139,9 +1138,7 @@ final class AIOStreamsHost: ObservableObject {
     nonisolated static func waitWhileWaking(for url: URL) async {
         guard isAIOAddon(url) else { return }
         while !Task.isCancelled {
-            addonLock.lock()
-            let until = wakingUntil
-            addonLock.unlock()
+            let until = addonLock.withLock { wakingUntil }
             guard let until, until > Date() else { return }
             try? await Task.sleep(nanoseconds: 100_000_000)
         }

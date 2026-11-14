@@ -255,11 +255,11 @@ enum MALAccount {
 
     static func statusLabel(_ status: String?) -> String {
         switch status {
-        case "watching": return "Watching"
-        case "completed": return "Completed"
-        case "on_hold": return "On-Hold"
-        case "dropped": return "Dropped"
-        case "plan_to_watch": return "Plan to Watch"
+        case "watching": return L10n.string("anime_status_watching", fallback: "Watching")
+        case "completed": return L10n.string("anime_status_completed", fallback: "Completed")
+        case "on_hold": return L10n.string("anime_status_on_hold", fallback: "On-Hold")
+        case "dropped": return L10n.string("anime_status_dropped", fallback: "Dropped")
+        case "plan_to_watch": return L10n.string("anime_status_plan_to_watch", fallback: "Plan to Watch")
         default: return "MAL"
         }
     }
@@ -267,7 +267,7 @@ enum MALAccount {
     /// The details button's title: "Watching 5/12", "Plan to Watch", "Add" when not listed.
     static func buttonTitle(_ status: ListStatus?) -> String {
         guard let status else { return "MAL" }
-        guard let current = status.status else { return "Add" }
+        guard let current = status.status else { return L10n.string("action_add", fallback: "Add") }
         let label = statusLabel(current)
         if current == "plan_to_watch" || current == "completed" { return label }
         return status.episodes > 0 ? "\(label) \(status.watched)/\(status.episodes)" : "\(label) \(status.watched)"

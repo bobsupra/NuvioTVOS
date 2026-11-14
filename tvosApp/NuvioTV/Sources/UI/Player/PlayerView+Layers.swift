@@ -228,6 +228,7 @@ extension PlayerView {
         // Window-level trackpad capture for scrubbing. Active only during bare video / scrubbing,
         // never while transport controls or native menus are active so the Focus Engine can navigate.
         RemoteTouchCatcher(
+            allowsSimultaneousTap: { viewModel.status == .paused || viewModel.isScrubbing },
             isActive: {
                 PlayerWindowInputCapturePolicy.allowsCapture(
                     existingConditions: didReportPlaybackStarted

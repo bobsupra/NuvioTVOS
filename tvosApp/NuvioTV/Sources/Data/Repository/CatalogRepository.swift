@@ -3469,6 +3469,7 @@ struct CinemetaMeta: Decodable {
     enum CodingKeys: String, CodingKey {
         case id, name, type, description, poster, background, logo, imdbRating
         case genres, genre, releaseInfo, year, runtime, cast, director, writer, certification, country, language, released
+        case ageRating, contentRating, rated
         case status, videos, trailers, trailerStreams
         case moviedbId = "moviedb_id"
         case imdbId = "imdb_id"
@@ -3496,7 +3497,10 @@ struct CinemetaMeta: Decodable {
         cast = try? container.decodeIfPresent(FlexibleStringArray.self, forKey: .cast)
         director = try? container.decodeIfPresent(FlexibleStringArray.self, forKey: .director)
         writer = try? container.decodeIfPresent(FlexibleStringArray.self, forKey: .writer)
-        certification = try? container.decodeIfPresent(String.self, forKey: .certification)
+        certification = (try? container.decodeIfPresent(String.self, forKey: .certification))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .ageRating))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .contentRating))
+            ?? (try? container.decodeIfPresent(String.self, forKey: .rated))
         country = try? container.decodeIfPresent(String.self, forKey: .country)
         language = try? container.decodeIfPresent(String.self, forKey: .language)
         released = try? container.decodeIfPresent(String.self, forKey: .released)

@@ -101,14 +101,14 @@ struct PlayerSubtitleOverlay: View {
                     }
                     .frame(
                         width: max(videoRect.width - horizontalMargin * 2, 1),
-                        height: max(videoRect.height - verticalOffset, 1),
+                        height: max(geo.size.height - verticalOffset, 1),
                         alignment: isTopAligned ? .top : .bottom
                     )
                     .position(
                         x: videoRect.midX,
                         y: isTopAligned
-                            ? videoRect.minY + verticalOffset + max(videoRect.height - verticalOffset, 1) / 2
-                            : videoRect.minY + max(videoRect.height - verticalOffset, 1) / 2
+                            ? verticalOffset + max(geo.size.height - verticalOffset, 1) / 2
+                            : max(geo.size.height - verticalOffset, 1) / 2
                     )
                 } else {
                     ForEach(placedTextCues) { cue in
@@ -147,14 +147,14 @@ struct PlayerSubtitleOverlay: View {
                     }
                     .frame(
                         width: max(videoRect.width - horizontalMargin * 2, 1),
-                        height: max(videoRect.height - verticalOffset, 1),
+                        height: max(geo.size.height - verticalOffset, 1),
                         alignment: isTopAligned ? .top : .bottom
                     )
                     .position(
                         x: videoRect.midX,
                         y: isTopAligned
-                            ? videoRect.minY + verticalOffset + max(videoRect.height - verticalOffset, 1) / 2
-                            : videoRect.minY + max(videoRect.height - verticalOffset, 1) / 2
+                            ? verticalOffset + max(geo.size.height - verticalOffset, 1) / 2
+                            : max(geo.size.height - verticalOffset, 1) / 2
                     )
                 }
             }
@@ -321,14 +321,14 @@ struct MPVSubtitleOverlay: View {
                 }
                 .frame(
                     width: max(videoRect.width - horizontalMargin * 2, 1),
-                    height: max(videoRect.height - verticalOffset, 1),
+                    height: max(geo.size.height - verticalOffset, 1),
                     alignment: isTopAligned ? .top : .bottom
                 )
                 .position(
                     x: videoRect.midX,
                     y: isTopAligned
-                        ? videoRect.minY + verticalOffset + max(videoRect.height - verticalOffset, 1) / 2
-                        : videoRect.minY + max(videoRect.height - verticalOffset, 1) / 2
+                        ? verticalOffset + max(geo.size.height - verticalOffset, 1) / 2
+                        : max(geo.size.height - verticalOffset, 1) / 2
                 )
             }
         }

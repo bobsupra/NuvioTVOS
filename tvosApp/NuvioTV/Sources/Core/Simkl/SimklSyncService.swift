@@ -2470,6 +2470,28 @@ enum SelectedLibraryService {
         }
     }
 
+    static func isInLibrary(meta: NuvioMeta) -> Bool {
+        let source = TraktSettingsStore.librarySourceMode
+        guard source != .local else {
+            return LibraryStore.contains(metaId: meta.id, type: meta.type)
+        }
+        let profileId = LibraryStore.activeProfileId
+        let store = ProfileSettings.store(for: profileId)
+        let bindingId = RemoteLibraryStore.accountBindingID(for: source, profileId: profileId, in: store)
+        return RemoteLibraryStore.contains(meta: meta, source: source, profileId: profileId, accountBindingId: bindingId)
+    }
+
+    static func isInLibrary(metaId: String, type: String) -> Bool {
+        let source = TraktSettingsStore.librarySourceMode
+        guard source != .local else {
+            return LibraryStore.contains(metaId: metaId, type: type)
+        }
+        let profileId = LibraryStore.activeProfileId
+        let store = ProfileSettings.store(for: profileId)
+        let bindingId = RemoteLibraryStore.accountBindingID(for: source, profileId: profileId, in: store)
+        return RemoteLibraryStore.contains(metaId: metaId, type: type, source: source, profileId: profileId, accountBindingId: bindingId)
+    }
+
     @MainActor
     static func setWatchlist(_ meta: NuvioMeta, isInWatchlist: Bool) async -> Bool {
         // An AniList title goes by the IMDb/TMDB ids it maps to.

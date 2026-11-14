@@ -163,9 +163,9 @@ struct PlaybackDiagnosticHistoryView: View {
         .onDisappear { model.stopExport() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in model.stopExport() }
         .onExitCommand { dismiss() }
-        .confirmationDialog("Delete diagnostic history from this Apple TV?", isPresented: $confirmDelete) {
-            Button("Delete History", role: .destructive) { model.clearHistory() }
-            Button("Cancel", role: .cancel) {}
+        .confirmationDialog(L10n.string("diagnostic_history_delete_confirm", fallback: "Delete diagnostic history from this Apple TV?"), isPresented: $confirmDelete) {
+            Button(L10n.string("diagnostic_history_delete", fallback: "Delete History"), role: .destructive) { model.clearHistory() }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
         }
     }
 }

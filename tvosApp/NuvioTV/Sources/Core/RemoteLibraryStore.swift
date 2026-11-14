@@ -19,6 +19,7 @@ enum RemoteLibraryStore {
         let accountBindingId: String
     }
     private static var revisions: [RevisionKey: UInt64] = [:]
+    private static var memoryCache: [RevisionKey: [LibraryStoreItem]] = [:]
 
     static func storageKey(
         source: TraktLibrarySourceMode,
@@ -58,9 +59,62 @@ enum RemoteLibraryStore {
         accountBindingId: String?
     ) -> [LibraryStoreItem]? {
         guard source != .local, let accountBindingId, !accountBindingId.isEmpty else { return nil }
+        guard let revKey = revisionKey(source: source, profileId: profileId, accountBindingId: accountBindingId) else { return nil }
+        lock.lock()
+        if let cached = memoryCache[revKey] {
+            lock.unlock()
+            return cached
+        }
+        lock.unlock()
+
         let key = storageKey(source: source, profileId: profileId, accountBindingId: accountBindingId)
         guard let data = LargePayloadStore.read(key: key, directory: storageDirectoryName) else { return nil }
-        return try? JSONDecoder().decode([LibraryStoreItem].self, from: data)
+        guard let items = try? JSONDecoder().decode([LibraryStoreItem].self, from: data) else { return nil }
+
+        lock.lock()
+        memoryCache[revKey] = items
+        lock.unlock()
+        return items
+    }
+
+    static func contains(
+        meta: NuvioMeta,
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        accountBindingId: String?
+    ) -> Bool {
+        guard source != .local, let items = load(source: source, profileId: profileId, accountBindingId: accountBindingId) else {
+            return false
+        }
+        return items.contains {
+            LibraryMutationIdentity.matches(
+                itemID: $0.meta.id,
+                itemType: $0.meta.type,
+                cachedMetadata: $0.meta,
+                mutation: meta
+            )
+        }
+    }
+
+    static func contains(
+        metaId: String,
+        type: String,
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        accountBindingId: String?
+    ) -> Bool {
+        guard source != .local, let items = load(source: source, profileId: profileId, accountBindingId: accountBindingId) else {
+            return false
+        }
+        return items.contains {
+            LibraryMutationIdentity.matches(
+                itemID: $0.meta.id,
+                itemType: $0.meta.type,
+                cachedMetadata: $0.meta,
+                targetID: metaId,
+                targetType: type
+            )
+        }
     }
 
     /// Revision used to prevent an older in-flight fetch from replacing a newer
@@ -143,6 +197,9 @@ enum RemoteLibraryStore {
             revisionKey: revisionKey,
             incrementsRevision: true
         )
+        if success {
+            memoryCache[revisionKey] = items
+        }
         lock.unlock()
 
         if success {
@@ -200,6 +257,9 @@ enum RemoteLibraryStore {
                 incrementsRevision: false
             )
         } ?? false
+        if success {
+            memoryCache[revisionKey] = current
+        }
         lock.unlock()
 
         if success {
@@ -221,6 +281,7 @@ enum RemoteLibraryStore {
             accountBindingId: accountBindingId
         ) {
             advanceRevision(for: keyRevision)
+            memoryCache.removeValue(forKey: keyRevision)
         }
         untrackKey(key, profileId: profileId)
         lock.unlock()
@@ -242,6 +303,7 @@ enum RemoteLibraryStore {
         let profileKey = normalizedProfileId(profileId)
         for key in Array(revisions.keys.filter({ $0.source == source && $0.profileId == profileKey })) {
             advanceRevision(for: key)
+            memoryCache.removeValue(forKey: key)
         }
     }
 
@@ -254,6 +316,7 @@ enum RemoteLibraryStore {
         let profileKey = normalizedProfileId(profileId)
         for key in Array(revisions.keys.filter({ $0.profileId == profileKey })) {
             advanceRevision(for: key)
+            memoryCache.removeValue(forKey: key)
         }
         let trackedProfileKey = trackedKeysStorageKey(for: profileId)
         UserDefaults.standard.removeObject(forKey: trackedProfileKey)
@@ -264,6 +327,7 @@ enum RemoteLibraryStore {
         for key in Array(revisions.keys) {
             advanceRevision(for: key)
         }
+        memoryCache.removeAll()
         LargePayloadStore.removeDirectory(storageDirectoryName)
         lock.unlock()
     }

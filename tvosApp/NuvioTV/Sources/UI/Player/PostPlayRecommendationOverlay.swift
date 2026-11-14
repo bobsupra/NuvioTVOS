@@ -26,7 +26,7 @@ struct PostPlayRecommendationOverlay: View {
     @State private var trailerPlaybackGeneration: UInt64 = 0
     @State private var isTrailerReady = false
     @State private var showSynopsisModal = false
-    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
+    @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
 
     var body: some View {
         guard let recommendation = state.recommendation else {
@@ -56,6 +56,9 @@ struct PostPlayRecommendationOverlay: View {
             .ignoresSafeArea()
             .onExitCommand {
                 onBack()
+            }
+            .onChange(of: trailerSound) { _, soundEnabled in
+                applyTrailerSound(soundEnabled)
             }
             .sheet(isPresented: $showSynopsisModal) {
                 if let desc = recommendation.description, !desc.isEmpty {
@@ -525,9 +528,13 @@ struct PostPlayRecommendationOverlay: View {
     private func playTrailerItem(_ item: AVPlayerItem) {
         item.preferredForwardBufferDuration = 2.0
         trailerPlayer.replaceCurrentItem(with: item)
-        trailerPlayer.isMuted = !trailerPreviewSound
-        trailerPlayer.volume = trailerPreviewSound ? 1.0 : 0.0
+        applyTrailerSound(trailerSound)
         trailerPlayer.play()
+    }
+
+    private func applyTrailerSound(_ soundEnabled: Bool) {
+        trailerPlayer.isMuted = !soundEnabled
+        trailerPlayer.volume = soundEnabled ? 1.0 : 0.0
     }
 }
 

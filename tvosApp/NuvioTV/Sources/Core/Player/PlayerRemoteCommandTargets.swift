@@ -5,6 +5,11 @@ import MediaPlayer
 enum PlayerRemoteIntent: Sendable {
     case play, pause, toggle, position(Double), skip(Double)
 
+    static func skipInterval(_ interval: Double, isForward: Bool) -> Self? {
+        guard interval.isFinite, interval >= 0 else { return nil }
+        return .skip(isForward ? interval : -interval)
+    }
+
     @MainActor func localIntent(positionMs: Int64, isPlaying: Bool) -> WatchPartyLocalIntent? {
         switch self {
         case .play: return .play

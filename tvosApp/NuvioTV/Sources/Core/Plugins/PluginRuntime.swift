@@ -342,13 +342,14 @@ final class PluginInstance: @unchecked Sendable {
         emitArgument: Int? = nil,
         onEmit: (@Sendable (String) -> Void)? = nil
     ) async throws -> Any {
-        lock.lock()
-        let id = nextCallID
-        nextCallID += 1
-        let call = Call(id: id, function: function, onEmit: onEmit)
-        calls[id] = call
-        lastUsedDate = Date()
-        lock.unlock()
+        let (id, call) = lock.withLock {
+            let id = nextCallID
+            nextCallID += 1
+            let call = Call(id: id, function: function, onEmit: onEmit)
+            calls[id] = call
+            lastUsedDate = Date()
+            return (id, call)
+        }
 
         return try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Any, Error>) in

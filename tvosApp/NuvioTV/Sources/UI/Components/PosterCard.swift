@@ -234,6 +234,9 @@ struct PosterCard: View {
     /// Optional upward-focus fallback for Home's lazy vertical rows. The
     /// handler deliberately stays off the default path for other directions.
     var onMove: ((MoveCommandDirection) -> Void)? = nil
+    /// An off-screen row being built a few cards at a time (see `TVCatalogRow.stagesCardBuild`):
+    /// until its turn, the card is empty space of its own size.
+    var buildsLater: Bool = false
     var isWatched: Bool? = nil
     let onClick: () -> Void
 
@@ -270,6 +273,7 @@ struct PosterCard: View {
     @State private var landscapeArtworkPrepared = false
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @State private var isTrailerPreviewActive = false
@@ -286,6 +290,33 @@ struct PosterCard: View {
 
     var body: some View {
         #if os(tvOS)
+        if buildsLater {
+            Color.clear
+                .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
+        } else {
+            focusableCard
+        }
+        #else
+        Button(action: onClick) {
+            posterContent
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .titleActionsContextMenu(
+            meta: meta,
+            onOpenDetails: onOpenDetails ?? onClick,
+            continueProgress: continueProgress,
+            continueIsUpNext: continueIsUpNext,
+            onPlayManually: onPlayManually,
+            onStartFromBeginning: onStartFromBeginning,
+            onRemoveFromContinueWatching: onRemoveFromContinueWatching,
+            onRefreshCatalog: onRefreshCatalog
+        )
+        .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
+        #endif
+    }
+
+    #if os(tvOS)
+    private var focusableCard: some View {
         // Keep directional input in tvOS's focus engine. Per-card move
         // handlers bypass the clickpad dead zone and can turn a light touch
         // into an immediate focus change.
@@ -387,24 +418,8 @@ struct PosterCard: View {
                 : nil,
             value: effectiveLandscape
         )
-        #else
-        Button(action: onClick) {
-            posterContent
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .titleActionsContextMenu(
-            meta: meta,
-            onOpenDetails: onOpenDetails ?? onClick,
-            continueProgress: continueProgress,
-            continueIsUpNext: continueIsUpNext,
-            onPlayManually: onPlayManually,
-            onStartFromBeginning: onStartFromBeginning,
-            onRemoveFromContinueWatching: onRemoveFromContinueWatching,
-            onRefreshCatalog: onRefreshCatalog
-        )
-        .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
-        #endif
     }
+    #endif
 
     private var posterContent: some View {
         VStack(alignment: .leading, spacing: 9) {
@@ -449,6 +464,7 @@ struct PosterCard: View {
                     TrailerPreviewPlayer(
                         meta: meta,
                         isActive: isTrailerPreviewActive,
+                        soundEnabled: $trailerPreviewSound,
                         onPlaybackReady: {
                             guard isTrailerPreviewActive else { return }
                             isTrailerPreviewReady = true
@@ -1139,6 +1155,7 @@ extension PosterCard: Equatable {
             && lhs.retainFocusAppearance == rhs.retainFocusAppearance
             && lhs.allowsFocus == rhs.allowsFocus
             && lhs.focusCallbackContext == rhs.focusCallbackContext
+            && lhs.buildsLater == rhs.buildsLater
             && lhs.isWatched == rhs.isWatched
     }
 }
@@ -1298,6 +1315,7 @@ struct TrailerPreviewPlayer: View {
     /// Prepare while the caller's delay runs; playback and visibility remain
     /// gated by its activation state.
     let isActive: Bool
+    @Binding var soundEnabled: Bool
     let onPlaybackReady: () -> Void
     let onPlaybackFinished: () -> Void
     var onPlaybackProgress: ((Double, Double) -> Void)? = nil
@@ -1312,7 +1330,6 @@ struct TrailerPreviewPlayer: View {
     @State private var didReportUnavailable = false
     @State private var isPlaybackUnavailable = false
     @State private var playbackActiveOverride: Bool?
-    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     private let resolver = YouTubeTrailerResolver.shared
 
     var body: some View {
@@ -1339,14 +1356,14 @@ struct TrailerPreviewPlayer: View {
                     reportPlaybackUnavailable()
                     return
                 }
-                applySoundPreference(trailerPreviewSound)
+                applySoundPreference(soundEnabled)
                 player.play()
                 if isRenderReady { onPlaybackReady() }
             } else {
                 player.pause()
             }
         }
-        .onChange(of: trailerPreviewSound) { _, soundEnabled in
+        .onChange(of: soundEnabled) { _, soundEnabled in
             applySoundPreference(soundEnabled)
         }
         .onReceive(
@@ -1412,7 +1429,7 @@ struct TrailerPreviewPlayer: View {
 
         player.replaceCurrentItem(with: item)
         observePlaybackFailure(for: item)
-        applySoundPreference(trailerPreviewSound)
+        applySoundPreference(soundEnabled)
         setupTimeObserver()
         if wantsPlayback {
             player.play()
@@ -3591,7 +3608,7 @@ struct TitleActionsMenuContent: View {
                 }
             }
         } else {
-            let inLibrary = LibraryStore.contains(metaId: meta.id, type: meta.type)
+            let inLibrary = SelectedLibraryService.isInLibrary(meta: meta)
             let isItemWatched = libraryWatchedContext == nil
                 ? WatchedStore.contains(meta: meta)
                 : isLibraryWatched

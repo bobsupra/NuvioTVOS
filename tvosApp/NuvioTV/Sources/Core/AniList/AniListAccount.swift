@@ -559,13 +559,13 @@ enum AniListAccount {
 
     static func statusLabel(_ status: String?) -> String {
         switch status {
-        case "CURRENT": return "Watching"
-        case "PLANNING": return "Planning"
-        case "COMPLETED": return "Completed"
-        case "DROPPED": return "Dropped"
-        case "PAUSED": return "Paused"
-        case "REPEATING": return "Rewatching"
-        default: return "Not on a list"
+        case "CURRENT": return L10n.string("anime_status_watching", fallback: "Watching")
+        case "PLANNING": return L10n.string("anime_status_planning", fallback: "Planning")
+        case "COMPLETED": return L10n.string("anime_status_completed", fallback: "Completed")
+        case "DROPPED": return L10n.string("anime_status_dropped", fallback: "Dropped")
+        case "PAUSED": return L10n.string("anime_status_paused", fallback: "Paused")
+        case "REPEATING": return L10n.string("anime_status_rewatching", fallback: "Rewatching")
+        default: return L10n.string("anime_status_not_on_list", fallback: "Not on a list")
         }
     }
 

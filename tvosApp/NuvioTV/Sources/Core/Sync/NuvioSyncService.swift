@@ -4483,6 +4483,16 @@ final class NuvioAPIClient {
             }
             defaults.set(value, forKey: key)
         }
+        if let encoded = remote[SettingsKey.trailerSound] as? [String: Any],
+           Self.decodeSettingValue(encoded) != nil {
+            ProfileSettings.markTrailerSoundExplicit(in: defaults)
+        } else if remote[SettingsKey.trailerSound] == nil,
+                  let encoded = remote[SettingsKey.trailerPreviewSound] as? [String: Any],
+                  let legacyValue = Self.decodeSettingValue(encoded) as? Bool {
+            // Older account payloads know only Card Trailer Sound. Import it
+            // once, including over the local migration fallback if present.
+            ProfileSettings.importLegacyTrailerSoundIfNeeded(legacyValue, in: defaults)
+        }
     }
 
     // MARK: - Android-compatible debrid_settings feature

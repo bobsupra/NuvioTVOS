@@ -10,6 +10,7 @@ import SwiftUI
 import UIKit
 import Combine
 import ImageIO
+import CoreImage
 import AVFoundation
 import AVKit
 
@@ -603,6 +604,12 @@ struct DetailsScreen: View {
             }
             viewModel.cancelAllTasks()
             isPreparingPlayback = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
+            viewModel.refreshWatchlistAndWatchedStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            viewModel.refreshWatchlistAndWatchedStatus()
         }
     }
 
@@ -2450,8 +2457,8 @@ actor YouTubeTrailerResolver {
             return source
         }
 
-        // 2. High-resolution trailers from IMDb (1080p/720p direct MP4, language-scored)
-        if (isEnglish || preview), let source = await resolveImdbTrailer(for: meta) {
+        // 2. Keep the English IMDb fast path; non-English previews should try localized TMDB / YouTube first.
+        if isEnglish, let source = await resolveImdbTrailer(for: meta) {
             return source
         }
 
@@ -3925,6 +3932,112 @@ enum StreamPickerListBuilder {
         return Array(streams.prefix(limit))
     }
 
+
+    /// Distinct focus identities for rows with the same source identity. Use
+    /// source ID and add-on name only so progressive metadata cannot change a
+    /// row's focus identity; occurrence separates duplicates from one add-on.
+    static func rowFocusIDs(for streams: [NuvioStream]) -> [String] {
+        var occurrenceBySourceAndAddon: [String: Int] = [:]
+
+        return streams.map { stream in
+            let identityKey = rowIdentityKey(for: stream)
+            let occurrence = occurrenceBySourceAndAddon[identityKey, default: 0]
+            occurrenceBySourceAndAddon[identityKey] = occurrence + 1
+            return "stream-row::\(identityKey)::\(occurrence)"
+        }
+    }
+
+    /// Transfers the identities assigned in source order onto the sorted rows.
+    /// Equality distinguishes duplicate rows without using sort-dependent fields.
+    static func rowFocusIDs(
+        for displayedStreams: [NuvioStream],
+        inSourceOrder sourceStreams: [NuvioStream]
+    ) -> [String] {
+        let sourceRowFocusIDs = rowFocusIDs(for: sourceStreams)
+        var remainingIndicesByIdentity: [String: [Int]] = [:]
+        for index in sourceStreams.indices {
+            remainingIndicesByIdentity[rowIdentityKey(for: sourceStreams[index]), default: []].append(index)
+        }
+
+        return displayedStreams.enumerated().map { displayedIndex, stream in
+            let identityKey = rowIdentityKey(for: stream)
+            guard var remainingIndices = remainingIndicesByIdentity[identityKey],
+                  let matchingOffset = remainingIndices.firstIndex(where: {
+                      sourceStreams[$0] == stream
+                  }) else {
+                let sourceKey = Data(stream.id.utf8).base64EncodedString()
+                return "stream-row::unmatched::\(sourceKey)::\(displayedIndex)"
+            }
+            let sourceIndex = remainingIndices.remove(at: matchingOffset)
+            remainingIndicesByIdentity[identityKey] = remainingIndices
+            return sourceRowFocusIDs[sourceIndex]
+        }
+    }
+
+    private static func rowIdentityKey(for stream: NuvioStream) -> String {
+        let sourceKey = Data(stream.id.utf8).base64EncodedString()
+        let addonKey = Data((stream.addonName ?? "").utf8).base64EncodedString()
+        return "\(sourceKey)::\(addonKey)"
+    }
+
+    static func promotingRowFocusIDs(at index: Int?, in rowFocusIDs: [String]) -> [String] {
+        guard let index, rowFocusIDs.indices.contains(index), index > 0 else { return rowFocusIDs }
+        var promoted = rowFocusIDs
+        let rowFocusID = promoted.remove(at: index)
+        promoted.insert(rowFocusID, at: 0)
+        return promoted
+    }
+
+    /// The persisted history records a playable source ID, which can occur in
+    /// several add-ons. Pass each playable ID once to the history matcher, then
+    /// use `firstPlayableIndex` to select its deterministic displayed row.
+    static func uniquePlayableSourceIDs(in streams: [NuvioStream]) -> [String] {
+        var seen = Set<String>()
+        return streams.compactMap { stream in
+            guard !stream.isNotPlayable, stream.unavailabilityReason == nil,
+                  seen.insert(stream.id).inserted else { return nil }
+            return stream.id
+        }
+    }
+
+    static func firstPlayableIndex(for sourceID: String, in streams: [NuvioStream]) -> Int? {
+        streams.indices.first {
+            streams[$0].id == sourceID
+                && !streams[$0].isNotPlayable
+                && streams[$0].unavailabilityReason == nil
+        }
+    }
+
+    /// Returns a match only when its ID maps to one playable row. The picker
+    /// uses stream IDs for focus and row identity, so duplicates are ambiguous.
+    static func uniquePlayableIndex(for sourceID: String, in streams: [NuvioStream]) -> Int? {
+        let matchingIndices = streams.indices.filter { streams[$0].id == sourceID }
+        guard matchingIndices.count == 1,
+              let index = matchingIndices.first,
+              !streams[index].isNotPlayable,
+              streams[index].unavailabilityReason == nil else { return nil }
+        return index
+    }
+
+    /// Promotes the last played source while preserving the relative order of
+    /// every other result. Ambiguous or unavailable identities keep normal order.
+    static func promotingPlayableSource(_ sourceID: String?, in streams: [NuvioStream]) -> [NuvioStream] {
+        guard let sourceID,
+              let index = uniquePlayableIndex(for: sourceID, in: streams),
+              index > 0 else { return streams }
+        return promotingPlayableSource(at: index, in: streams)
+    }
+
+    static func promotingPlayableSource(at index: Int?, in streams: [NuvioStream]) -> [NuvioStream] {
+        guard let index, streams.indices.contains(index), index > 0,
+              !streams[index].isNotPlayable,
+              streams[index].unavailabilityReason == nil else { return streams }
+        var promoted = streams
+        let source = promoted.remove(at: index)
+        promoted.insert(source, at: 0)
+        return promoted
+    }
+
     /// Check whether more streams remain beyond the currently requested limit.
     static func hasMorePages(
         totalCount: Int,
@@ -4257,6 +4370,22 @@ private enum TvDetailsFocusSection: Hashable {
     case comments
 }
 
+private final class TvDetailsEpisodeFocusMemory {
+    var generation = 0
+    /// The episode control the strip last reported focused.
+    var focusedKey: String?
+}
+
+/// Details asking the episode strip to put focus on an episode control, a new generation each
+/// time. One that a strip only now built finds is applied if it is under a second old.
+struct TvEpisodeFocusRequest: Equatable {
+    var key: String?
+    var generation = 0
+    var issuedAt = ProcessInfo.processInfo.systemUptime
+
+    var isFresh: Bool { ProcessInfo.processInfo.systemUptime - issuedAt < 1 }
+}
+
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
     var libraryWatchedContext: LibraryWatchedContext? = nil
@@ -4290,13 +4419,22 @@ struct TvDetailsContent: View {
 
     @FocusState private var actionFocus: DetailsActionFocus?
     @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
-    /// Which episode control holds focus, as `TvEpisodeFocus` keys. Owned here
-    /// rather than per card so focus can be put back on a specific episode.
-    @FocusState private var episodeFocus: String?
     @FocusState private var relatedCardFocus: String?
     @FocusState private var castCardFocus: String?
     @FocusState private var networkCardFocus: String?
     @FocusState private var productionCardFocus: String?
+    /// Whether an episode control holds focus. Read by the body instead of the focused
+    /// episode, which changes on every move along the strip and would redraw all of Details
+    /// with it.
+    @State private var isEpisodeFocused = false
+    /// Counts episode focus changes, so a delayed "focus left the episodes" can tell whether
+    /// focus came back meanwhile, and holds the episode control the strip last reported focused.
+    /// A reference, so neither redraws anything.
+    @State private var episodeFocusMemory = TvDetailsEpisodeFocusMemory()
+    /// The episode strip holds its episodes' focus and Details only hears of it, so a move along
+    /// the strip redraws the strip, not all of Details. Details puts focus on an episode by asking the strip.
+    @State private var episodeFocusRequest = TvEpisodeFocusRequest()
+    @State private var isTrailerParkedForScroll = false
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
@@ -4332,7 +4470,7 @@ struct TvDetailsContent: View {
     @AppStorage(SettingsKey.reuseLastLink) private var reuseLastLink = false
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = true
-    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
+    @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
     @State private var configuredDetailsSections: [TVDetailsSection] = TVDetailsSectionOrder.currentOrder()
@@ -4407,7 +4545,7 @@ struct TvDetailsContent: View {
                     toleranceAfter: .zero
                 )
             }
-            applySoundPreference(trailerPreviewSound)
+            applySoundPreference(trailerSound)
             isTrailerPlaying = true
             trailerPlayer.play()
         }
@@ -4432,7 +4570,7 @@ struct TvDetailsContent: View {
         withAnimation(.easeInOut(duration: 0.22)) {
             isFullscreenTrailerPresented = false
         }
-        applySoundPreference(trailerPreviewSound)
+        applySoundPreference(trailerSound)
         if !isBackgroundTrailerAllowed() {
             stopBackgroundTrailer(manual: false)
         }
@@ -4485,8 +4623,59 @@ struct TvDetailsContent: View {
         }
         isTrailerPlaying = false
         isTrailerRenderReady = false
+        isTrailerParkedForScroll = false
         trailerPlayer.pause()
         trailerPlayer.replaceCurrentItem(with: nil)
+    }
+
+    private func updateTrailerParkingForScroll() {
+        let shouldPark = isScrolledDown
+            && isTrailerPlaying
+            && !isFullscreenTrailerPresented
+        guard shouldPark != isTrailerParkedForScroll else { return }
+        isTrailerParkedForScroll = shouldPark
+        if shouldPark {
+            trailerPlayer.pause()
+        } else if isTrailerPlaying, !isFullscreenTrailerPresented {
+            trailerPlayer.play()
+        }
+    }
+
+    private func handleEpisodeFocusChange(_ newFocus: String?) {
+        episodeFocusMemory.generation &+= 1
+        episodeFocusMemory.focusedKey = newFocus
+        if newFocus != nil {
+            setEpisodeFocused(true)
+        } else if isEpisodeFocused {
+            // A move along the strip passes through "no episode focused" for a moment, which
+            // redrew all of Details twice per move; only an exit that lasts counts.
+            let generation = episodeFocusMemory.generation
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                guard episodeFocusMemory.generation == generation else { return }
+                setEpisodeFocused(false)
+            }
+        }
+        // Restoration landed — lift the restriction.
+        if let newFocus, newFocus == restoreEpisodeKey {
+            restoreEpisodeKey = nil
+        }
+    }
+
+    private func setEpisodeFocused(_ focused: Bool) {
+        guard isEpisodeFocused != focused else { return }
+        isEpisodeFocused = focused
+        updateTrailerParkingForScroll()
+    }
+
+    /// The episode control holding focus, as the strip reported it.
+    private var currentEpisodeFocus: String? {
+        episodeFocusMemory.focusedKey
+    }
+
+    /// Puts focus on episode control `key`, by asking the strip.
+    private func setEpisodeFocus(_ key: String?) {
+        guard let key, episodeFocusMemory.focusedKey != key else { return }
+        episodeFocusRequest = TvEpisodeFocusRequest(key: key, generation: episodeFocusRequest.generation &+ 1)
     }
 
     private func applySoundPreference(_ soundEnabled: Bool) {
@@ -4515,7 +4704,7 @@ struct TvDetailsContent: View {
     }
 
     private var isScrolledDown: Bool {
-        focusedDetailsSection != .actions || episodeFocus != nil || castHeaderFocus != nil || scrollOffset > 30
+        focusedDetailsSection != .actions || isEpisodeFocused || castHeaderFocus != nil || scrollOffset > 30
     }
 
     private var backdropBlurRadius: CGFloat {
@@ -4539,7 +4728,7 @@ struct TvDetailsContent: View {
             meta: meta,
             blurRadius: backdropBlurRadius,
             player: isFullscreenTrailerPresented ? nil : trailerPlayer,
-            isTrailerVisible: isTrailerPlaying && isTrailerRenderReady && !isFullscreenTrailerPresented,
+            isTrailerVisible: isTrailerPlaying && isTrailerRenderReady && !isFullscreenTrailerPresented && !isTrailerParkedForScroll,
             onTrailerReadyForDisplay: handleTrailerReady
         )
     }
@@ -4710,7 +4899,8 @@ struct TvDetailsContent: View {
                         onEpisodeMenuPresented?(isPresented)
                     },
                     onBack: handleDetailsBack,
-                    episodeFocus: $episodeFocus,
+                    episodeFocusRequest: episodeFocusRequest,
+                    onEpisodeFocusChange: handleEpisodeFocusChange,
                     restrictFocusToKey: restoreEpisodeKey,
                     entryLocked: focusedDetailsSection != .episodes,
                     onMoveUpFromSeason: {
@@ -5010,7 +5200,7 @@ struct TvDetailsContent: View {
         let target = TvEpisodeFocus.card(episode.id)
         DispatchQueue.main.asyncAfter(deadline: .now() + TvDetailsScrollTiming.duration) {
             guard isChoosingWatchPartyEpisode else { return }
-            episodeFocus = target
+            setEpisodeFocus(target)
         }
     }
 
@@ -5135,8 +5325,8 @@ struct TvDetailsContent: View {
                                 scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
                             }
                         }
-                        .onChange(of: episodeFocus) { _, newFocus in
-                            guard newFocus != nil,
+                        .onChange(of: isEpisodeFocused) { _, focused in
+                            guard focused,
                                   focusRestoreAttemptTarget == nil,
                                   focusedDetailsSection == .episodes else { return }
                             var transaction = Transaction(animation: nil)
@@ -5144,6 +5334,9 @@ struct TvDetailsContent: View {
                             withTransaction(transaction) {
                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                             }
+                        }
+                        .onChange(of: isScrolledDown) { _, _ in
+                            updateTrailerParkingForScroll()
                         }
                         .onAppear {
                             if let initialFocusTarget {
@@ -5280,8 +5473,8 @@ struct TvDetailsContent: View {
                     scheduleBackgroundTrailer(for: meta)
                 }
             }
-            .onChange(of: trailerPreviewSound) { _, soundEnabled in
-                applySoundPreference(soundEnabled)
+            .onChange(of: trailerSound) { _, soundEnabled in
+                applySoundPreference(isFullscreenTrailerPresented ? true : soundEnabled)
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase != .active {
@@ -5313,19 +5506,13 @@ struct TvDetailsContent: View {
                 if !enabled {
                     cancelFocusRestoration()
                     restoreGeneration &+= 1
-                    restoreEpisodeKey = episodeFocus
+                    restoreEpisodeKey = currentEpisodeFocus
                     stopBackgroundTrailer(manual: false)
                 } else {
                     refreshProgressAfterReturn()
                     if let target = restoreEpisodeKey {
                         restoreEpisodeFocus(to: target, generation: restoreGeneration)
                     }
-                }
-            }
-            .onChange(of: episodeFocus) { _, newValue in
-                // Restoration landed — lift the restriction.
-                if let newValue, newValue == restoreEpisodeKey {
-                    restoreEpisodeKey = nil
                 }
             }
             // Marking an episode watched clears its progress across three
@@ -5695,7 +5882,7 @@ struct TvDetailsContent: View {
         for delay in [0.12, 0.45] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if restoreGeneration == generation, restoreEpisodeKey == target {
-                    episodeFocus = target
+                    setEpisodeFocus(target)
                 }
             }
         }
@@ -6078,6 +6265,9 @@ private struct TvDetailsBackdrop: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
     @State private var backdropImage: UIImage?
+    /// The backdrop blurred once, faded in over the sharp one instead of blurring it live (a
+    /// full-screen blur worked out again on every frame).
+    @State private var blurredBackdrop: UIImage?
 
     private var targetArtworkURL: URL? {
         for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
@@ -6120,12 +6310,24 @@ private struct TvDetailsBackdrop: View {
 
         ZStack {
             if let backdropImage {
+                // One sharp image throughout (switching between two versions of it when the
+                // blurred copy arrived could flash as Details opened); live blur only until the
+                // blurred copy is ready.
                 Image(uiImage: backdropImage)
                     .resizable()
                     .scaledToFill()
-                    .blur(radius: blurRadius, opaque: true)
+                    .blur(radius: blurredBackdrop != nil ? 0 : blurRadius, opaque: true)
                     .animation(.easeInOut(duration: 0.35), value: blurRadius)
                     .ignoresSafeArea()
+                if let blurredBackdrop {
+                    Image(uiImage: blurredBackdrop)
+                        .resizable()
+                        .scaledToFill()
+                        .opacity(blurRadius > 0 ? 1 : 0)
+                        .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+                }
             } else {
                 backdropColor.ignoresSafeArea()
             }
@@ -6172,7 +6374,58 @@ private struct TvDetailsBackdrop: View {
                 backdropImage = loaded
             }
         }
+        .task(id: BlurredBackdropKey(url: targetArtworkURL, hasImage: backdropImage != nil)) {
+            guard let url = targetArtworkURL, let backdropImage else {
+                if blurredBackdrop != nil { blurredBackdrop = nil }
+                return
+            }
+            let blurred = await TvDetailsBlurredBackdrop.image(for: url, from: backdropImage)
+            guard !Task.isCancelled else { return }
+            blurredBackdrop = blurred
+        }
         .ignoresSafeArea()
+    }
+
+    private struct BlurredBackdropKey: Equatable {
+        let url: URL?
+        let hasImage: Bool
+    }
+}
+
+/// The Details backdrop blurred once, small (the blur leaves no detail to keep), off the main
+/// thread, as the live blur would draw it at 22 points over a 1920-point-wide screen.
+enum TvDetailsBlurredBackdrop {
+    static let radius: CGFloat = 22
+    private static let pixelWidth: CGFloat = 640
+    private static let cache: NSCache<NSURL, UIImage> = {
+        let cache = NSCache<NSURL, UIImage>()
+        cache.countLimit = 12
+        return cache
+    }()
+    private static let context = CIContext(options: [.cacheIntermediates: false])
+
+    static func image(for url: URL, from image: UIImage) async -> UIImage? {
+        if let cached = cache.object(forKey: url as NSURL) { return cached }
+        let blurred = await Task.detached(priority: .userInitiated) {
+            TvDetailsBlurredBackdrop.render(image)
+        }.value
+        if let blurred { cache.setObject(blurred, forKey: url as NSURL) }
+        return blurred
+    }
+
+    static func render(_ image: UIImage, screenWidth: CGFloat = 1920) -> UIImage? {
+        guard let cgImage = image.cgImage, cgImage.width > 0, cgImage.height > 0 else { return nil }
+        let scale = min(1, pixelWidth / CGFloat(cgImage.width))
+        let input = CIImage(cgImage: cgImage).transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let extent = input.extent.integral
+        // The image is shown filling the screen's width, so a point there is this many pixels here.
+        let pixelsPerPoint = extent.width / screenWidth
+        guard let filter = CIFilter(name: "CIGaussianBlur") else { return nil }
+        filter.setValue(input.clampedToExtent(), forKey: kCIInputImageKey)
+        filter.setValue(radius * pixelsPerPoint, forKey: kCIInputRadiusKey)
+        guard let output = filter.outputImage?.cropped(to: extent),
+              let rendered = context.createCGImage(output, from: extent) else { return nil }
+        return UIImage(cgImage: rendered)
     }
 }
 
@@ -6447,12 +6700,14 @@ private struct TvDetailsAniListMenus: ViewModifier {
                     Task { await AniListAccount.setStatus(status, entryID: target.entryID) }
                 }
             }
-            Button("Score…") { showingScore = true }
-            Button(AniListAccount.mediaState(for: target.entryID)?.isFavourite == true ? "Remove from Favourites" : "Add to Favourites") {
+            Button(L10n.string("details_anime_score", fallback: "Score…")) { showingScore = true }
+            Button(AniListAccount.mediaState(for: target.entryID)?.isFavourite == true
+                ? L10n.string("details_anime_remove_favourite", fallback: "Remove from Favourites")
+                : L10n.string("details_anime_add_favourite", fallback: "Add to Favourites")) {
                 Task { await AniListAccount.toggleFavourite(entryID: target.entryID) }
             }
             if current != nil {
-                Button("Remove from List", role: .destructive) {
+                Button(L10n.string("details_anime_remove_list", fallback: "Remove from List"), role: .destructive) {
                     Task { await AniListAccount.remove(entryID: target.entryID) }
                 }
             }
@@ -6467,7 +6722,7 @@ private struct TvDetailsAniListMenus: ViewModifier {
                     Task { await AniListAccount.setScore(score * 10, entryID: target.entryID) }
                 }
             }
-            Button("Remove Score", role: .destructive) {
+            Button(L10n.string("details_anime_remove_score", fallback: "Remove Score"), role: .destructive) {
                 Task { await AniListAccount.setScore(0, entryID: target.entryID) }
             }
         }
@@ -6487,7 +6742,7 @@ private struct TvDetailsAniListMenus: ViewModifier {
 
     private var dialogMessage: String {
         guard let target else { return "" }
-        guard let entry = AniListAccount.entry(for: target.entryID) else { return "Not on your list yet" }
+        guard let entry = AniListAccount.entry(for: target.entryID) else { return L10n.string("details_anime_not_on_list", fallback: "Not on your list yet") }
         return AniListAccount.describe(entry)
     }
 
@@ -6551,9 +6806,9 @@ private struct TvDetailsMALMenus: ViewModifier {
                     Task { await MALAccount.setStatus(value, mal: malID, current: known) }
                 }
             }
-            Button("Score…") { showingScore = true }
+            Button(L10n.string("details_anime_score", fallback: "Score…")) { showingScore = true }
             if current != nil {
-                Button("Remove from List", role: .destructive) {
+                Button(L10n.string("details_anime_remove_list", fallback: "Remove from List"), role: .destructive) {
                     Task { await MALAccount.remove(mal: malID) }
                 }
             }
@@ -6568,17 +6823,19 @@ private struct TvDetailsMALMenus: ViewModifier {
                     Task { await MALAccount.setScore(score, mal: malID) }
                 }
             }
-            Button("Remove Score", role: .destructive) {
+            Button(L10n.string("details_anime_remove_score", fallback: "Remove Score"), role: .destructive) {
                 Task { await MALAccount.setScore(0, mal: malID) }
             }
         }
     }
 
     private var message: String {
-        guard let status, let current = status.status else { return "Not on your list yet" }
+        guard let status, let current = status.status else { return L10n.string("details_anime_not_on_list", fallback: "Not on your list yet") }
         var parts = [MALAccount.statusLabel(current)]
-        parts.append(status.episodes > 0 ? "\(status.watched)/\(status.episodes) episodes" : "\(status.watched) episodes")
-        if status.score > 0 { parts.append("Score \(status.score)/10") }
+        parts.append(status.episodes > 0
+            ? L10n.format("details_anime_episodes_progress", fallback: "%1$d/%2$d episodes", status.watched, status.episodes)
+            : L10n.format("details_anime_episodes_count", fallback: "%d episodes", status.watched))
+        if status.score > 0 { parts.append(L10n.format("details_anime_score_format", fallback: "Score %d/10", status.score)) }
         return parts.joined(separator: " · ")
     }
 }
@@ -8535,32 +8792,37 @@ private struct TvDetailsPersonCard: View {
             return
         }
 
-        let targetPixelSize: CGFloat = 376
-        let downsampledImage: UIImage? = {
-            let options: [CFString: Any] = [
-                kCGImageSourceShouldCache: false
-            ]
-            guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
-                return UIImage(data: data)
-            }
-            guard CGImageSourceGetCount(source) > 0, CGImageSourceGetType(source) != nil else {
-                return UIImage(data: data)
-            }
-            let thumbnailOptions: [CFString: Any] = [
-                kCGImageSourceCreateThumbnailFromImageAlways: true,
-                kCGImageSourceShouldCacheImmediately: true,
-                kCGImageSourceCreateThumbnailWithTransform: true,
-                kCGImageSourceThumbnailMaxPixelSize: targetPixelSize
-            ]
-            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
-                return UIImage(data: data)
-            }
-            return UIImage(cgImage: cgImage)
-        }()
+        // Decoded off the main thread: a cast row's photos decoded there held Details up for
+        // over a hundred milliseconds while it opened.
+        let downsampledImage = await Task.detached(priority: .userInitiated) {
+            Self.downsampledProfileImage(from: data, maxPixelSize: 376)
+        }.value
 
         guard let image = downsampledImage, !Task.isCancelled else { return }
         await PersonProfileImageCache.shared.insert(image, for: cacheKey)
         profileImage = image
+    }
+
+    nonisolated private static func downsampledProfileImage(from data: Data, maxPixelSize: CGFloat) -> UIImage? {
+        let options: [CFString: Any] = [
+            kCGImageSourceShouldCache: false
+        ]
+        guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
+            return UIImage(data: data)
+        }
+        guard CGImageSourceGetCount(source) > 0, CGImageSourceGetType(source) != nil else {
+            return UIImage(data: data)
+        }
+        let thumbnailOptions: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
+            return UIImage(data: data)
+        }
+        return UIImage(cgImage: cgImage)
     }
 }
 
@@ -8943,7 +9205,10 @@ private struct TvDetailsEpisodes: View {
     var onPlayManually: ((NuvioVideo) -> Void)? = nil
     let onEpisodeMenuPresented: (Bool) -> Void
     var onBack: (() -> Void)? = nil
-    var episodeFocus: FocusState<String?>.Binding
+    var episodeFocusRequest: TvEpisodeFocusRequest? = nil
+    var onEpisodeFocusChange: ((String?) -> Void)? = nil
+
+    @FocusState private var ownEpisodeFocus: String?
     /// While set, only the control with this key can take focus — see the
     /// restore in `TvDetailsContent`.
     let restrictFocusToKey: String?
@@ -8986,7 +9251,8 @@ private struct TvDetailsEpisodes: View {
         onPlayManually: ((NuvioVideo) -> Void)? = nil,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         onBack: (() -> Void)? = nil,
-        episodeFocus: FocusState<String?>.Binding,
+        episodeFocusRequest: TvEpisodeFocusRequest? = nil,
+        onEpisodeFocusChange: ((String?) -> Void)? = nil,
         restrictFocusToKey: String?,
         entryLocked: Bool,
         onMoveUpFromSeason: @escaping () -> Void,
@@ -9006,7 +9272,8 @@ private struct TvDetailsEpisodes: View {
         self.onPlayManually = onPlayManually
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.onBack = onBack
-        self.episodeFocus = episodeFocus
+        self.episodeFocusRequest = episodeFocusRequest
+        self.onEpisodeFocusChange = onEpisodeFocusChange
         self.restrictFocusToKey = restrictFocusToKey
         self.entryLocked = entryLocked
         self.onMoveUpFromSeason = onMoveUpFromSeason
@@ -9092,6 +9359,22 @@ private struct TvDetailsEpisodes: View {
         .onChange(of: revealNextEpisodeSpoilers) { _, _ in
             refreshWatchedState()
         }
+        .onChange(of: ownEpisodeFocus) { _, key in
+            onEpisodeFocusChange?(key)
+        }
+        .onChange(of: episodeFocusRequest) { _, request in
+            applyEpisodeFocusRequest(request)
+        }
+        .onAppear {
+            if let episodeFocusRequest, episodeFocusRequest.isFresh {
+                applyEpisodeFocusRequest(episodeFocusRequest)
+            }
+        }
+    }
+
+    private func applyEpisodeFocusRequest(_ request: TvEpisodeFocusRequest?) {
+        guard let key = request?.key, ownEpisodeFocus != key else { return }
+        ownEpisodeFocus = key
     }
 
     private var watchPartySelectionPrompt: some View {
@@ -9359,7 +9642,7 @@ private struct TvDetailsEpisodes: View {
                         onPlayManually: onPlayManually != nil ? { onPlayManually?(video) } : nil,
                         smartStreamSelection: smartStreamSelection || (reuseLastLink && itemIndex == episodeScrollIndex && LastPlaybackStreamStore.load(metaId: meta.id, season: video.season, episode: video.episode, meta: meta, profileId: ProfileSettings.activeProfileID) != nil),
                         onBack: onBack,
-                        focus: episodeFocus,
+                        focus: $ownEpisodeFocus,
                         onMoveDown: onMoveDownFromEpisode,
                         onMoveUp: seasons.count <= 1 ? onMoveUpFromSeason : nil
                     )
@@ -10118,6 +10401,12 @@ private struct TvStreamGlass<S: InsettableShape>: ViewModifier {
 }
 
 #if os(tvOS)
+private struct TvStreamPickerRow: Identifiable {
+    let stream: NuvioStream
+    let focusID: String
+    var id: String { focusID }
+}
+
 private struct TvStreamPickerOverlay: View {
     let meta: NuvioMeta
     let episode: NuvioVideo?
@@ -10158,6 +10447,8 @@ private struct TvStreamPickerOverlay: View {
     @AppStorage(SettingsKey.streamListEpisodeHeader) private var streamListEpisodeHeader = true
     @AppStorage(SettingsKey.streamListExpandFocused) private var streamListExpandFocused = false
     @AppStorage(SettingsKey.streamListHideFileSize) private var streamListHideFileSize = false
+    @AppStorage(SettingsKey.streamListHideAddonName) private var streamListHideAddonName = false
+    @AppStorage(SettingsKey.streamListHideDescription) private var streamListHideDescription = false
     @AppStorage(SettingsKey.streamListDetailSize) private var streamListDetailSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListBadgeSize) private var streamListBadgeSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListLogoSize) private var streamListLogoSize = StreamListStyle.Step.standard.rawValue
@@ -10166,6 +10457,10 @@ private struct TvStreamPickerOverlay: View {
     /// Cached filter+sort result. Rebuilt only when derivation inputs change —
     /// never when focus moves between cards.
     @State private var displayedStreams: [NuvioStream] = []
+    @State private var displayedStreamRowFocusIDs: [String] = []
+    /// The card list with a unique last-played playable source promoted.
+    @State private var promotedDisplayedStreams: [NuvioStream] = []
+    @State private var promotedDisplayedStreamRowFocusIDs: [String] = []
     @State private var displayedStreamsCacheKey: StreamPickerListCacheKey?
     /// Number of streams currently materialized in the picker list for lazy loading.
     @State private var visibleStreamLimit: Int = StreamPickerListBuilder.defaultPageSize
@@ -10184,6 +10479,10 @@ private struct TvStreamPickerOverlay: View {
     @State private var didSeedStreamFocus = false
     @State private var restoredSourceFocusID: String?
     @State private var pickerProfileID: String?
+    @State private var lastPlayedSourceMatch: LastManualSourceStore.Match?
+    @State private var lastPlayedSourceStream: NuvioStream?
+    @State private var lastPlayedSourceRowFocusID: String?
+    @State private var lastPlayedSourceIndex: Int?
     @State private var pickerIsVisible = false
     @State private var streamBadgeSettings = StreamBadgeSettingsStore.snapshot
     @State private var showRefreshToast = false
@@ -10234,6 +10533,8 @@ private struct TvStreamPickerOverlay: View {
             episodeHeader: streamListEpisodeHeader,
             expandFocused: streamListExpandFocused,
             hideFileSize: streamListHideFileSize,
+            hideAddonName: streamListHideAddonName,
+            hideDescription: streamListHideDescription,
             detailSize: streamListDetailSize,
             badgeSize: streamListBadgeSize,
             logoSize: streamListLogoSize,
@@ -10246,7 +10547,8 @@ private struct TvStreamPickerOverlay: View {
         TvStreamCardPresentationCacheKey(
             listKey: displayedStreamsCacheKey,
             badgeSettingsRevision: streamBadgeSettingsRevision,
-            visibleLimit: visibleStreamLimit
+            visibleLimit: visibleStreamLimit,
+            lastPlayedRowFocusID: lastPlayedSourceRowFocusID
         )
     }
 
@@ -10387,9 +10689,12 @@ private struct TvStreamPickerOverlay: View {
                     didSeedStreamFocus = true
                 }
                 focusedStreamWarmTask?.cancel()
-                if let streamId = newValue,
-                   !streamId.hasPrefix("filter::"),
-                   let stream = streams.first(where: { $0.id == streamId }),
+                let focusedStream = newValue.flatMap { focusID -> NuvioStream? in
+                    if focusID == lastPlayedSourceRowFocusID { return lastPlayedSourceStream }
+                    guard let index = activeSourceRowFocusIDs.firstIndex(of: focusID) else { return nil }
+                    return activeSourceRows[index]
+                }
+                if let stream = focusedStream,
                    let raw = stream.directURL,
                    let url = URL(string: raw),
                    ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
@@ -10499,19 +10804,46 @@ private struct TvStreamPickerOverlay: View {
         displayedStreams
     }
 
-    /// Paginated active slice of streams for instantaneous initial display and smooth scrolling.
-    private var activeVisibleStreams: [NuvioStream] {
-        StreamPickerListBuilder.paginatedSlice(
-            streams: activeDisplayedStreams,
-            limit: visibleStreamLimit
-        )
+    /// The deterministic last-played row leads ordinary cards. Recommendation
+    /// cards continue to use the original sorted list so history does not change
+    /// their selection.
+    private var activePickerStreams: [NuvioStream] {
+        promotedDisplayedStreams
+    }
+
+    private var activePickerRowFocusIDs: [String] {
+        promotedDisplayedStreamRowFocusIDs
+    }
+
+    private var activePickerRowsWithFocusIDs: [TvStreamPickerRow] {
+        zip(activePickerStreams, activePickerRowFocusIDs).map { stream, focusID in
+            TvStreamPickerRow(stream: stream, focusID: focusID)
+        }
+    }
+
+    /// Recommended mode renders the last-played source above its recommendation
+    /// cards. Remove that exact row from ordinary rows while preserving focus IDs
+    /// for other copies of the same source from different add-ons.
+    private var activeSourceRowsWithFocusIDs: [TvStreamPickerRow] {
+        let rows = activePickerRowsWithFocusIDs
+        guard pickerSortOption == .recommended,
+              let lastPlayedSourceRowFocusID else { return rows }
+        return rows.filter { $0.focusID != lastPlayedSourceRowFocusID }
+    }
+
+    private var activeSourceRows: [NuvioStream] {
+        activeSourceRowsWithFocusIDs.map(\.stream)
+    }
+
+    private var activeSourceRowFocusIDs: [String] {
+        activeSourceRowsWithFocusIDs.map(\.focusID)
     }
 
     private func loadMoreStreams() {
-        guard visibleStreamLimit < activeDisplayedStreams.count else { return }
+        guard visibleStreamLimit < activeSourceRows.count else { return }
         visibleStreamLimit = min(
             visibleStreamLimit + StreamPickerListBuilder.defaultPageSize,
-            activeDisplayedStreams.count
+            activeSourceRows.count
         )
     }
 
@@ -10533,7 +10865,18 @@ private struct TvStreamPickerOverlay: View {
     /// Rebuilds the cached list only when derivation inputs actually change.
     private func refreshDisplayedStreamsIfNeeded() {
         let key = listCacheKey
-        guard key != displayedStreamsCacheKey else { return }
+        guard key != displayedStreamsCacheKey else {
+            refreshLastPlayedSourceMatch(in: displayedStreams, rowFocusIDs: displayedStreamRowFocusIDs)
+            promotedDisplayedStreams = StreamPickerListBuilder.promotingPlayableSource(
+                at: lastPlayedSourceIndex,
+                in: displayedStreams
+            )
+            promotedDisplayedStreamRowFocusIDs = StreamPickerListBuilder.promotingRowFocusIDs(
+                at: lastPlayedSourceIndex,
+                in: displayedStreamRowFocusIDs
+            )
+            return
+        }
         let refreshedStreams = StreamPickerListBuilder.displayedStreams(
             streams: streams,
             groups: groups,
@@ -10544,32 +10887,83 @@ private struct TvStreamPickerOverlay: View {
             preserveAddonStreams: preserveAddonOrder,
             includeUnknownCacheStatus: true
         )
+        let sourceStreams = StreamPickerListBuilder.sourceStreams(
+            streams: streams,
+            groups: groups,
+            selectedAddonId: selectedAddonId
+        )
         displayedStreams = refreshedStreams
+        displayedStreamRowFocusIDs = StreamPickerListBuilder.rowFocusIDs(
+            for: refreshedStreams,
+            inSourceOrder: sourceStreams
+        )
         displayedStreamsCacheKey = key
-        let focusedIndex = focusedItem.flatMap { id in refreshedStreams.firstIndex { $0.id == id } }
+        refreshLastPlayedSourceMatch(in: refreshedStreams, rowFocusIDs: displayedStreamRowFocusIDs)
+        promotedDisplayedStreams = StreamPickerListBuilder.promotingPlayableSource(
+            at: lastPlayedSourceIndex,
+            in: refreshedStreams
+        )
+        promotedDisplayedStreamRowFocusIDs = StreamPickerListBuilder.promotingRowFocusIDs(
+            at: lastPlayedSourceIndex,
+            in: displayedStreamRowFocusIDs
+        )
+        let focusedIndex = focusedItem.flatMap { id in activeSourceRowFocusIDs.firstIndex(of: id) }
         visibleStreamLimit = max(StreamPickerListBuilder.defaultPageSize, (focusedIndex ?? -1) + 1)
+    }
+
+    private func refreshLastPlayedSourceMatch(in streams: [NuvioStream], rowFocusIDs: [String]) {
+        guard let scope = rememberedSourceScope else {
+            lastPlayedSourceMatch = nil
+            lastPlayedSourceStream = nil
+            lastPlayedSourceRowFocusID = nil
+            lastPlayedSourceIndex = nil
+            return
+        }
+        let playableStreams = streams.filter { !$0.isNotPlayable && $0.unavailabilityReason == nil }
+        guard let match = LastManualSourceStore.lastPlayedMatch(
+            in: StreamPickerListBuilder.uniquePlayableSourceIDs(in: playableStreams), profileID: scope.profileID,
+            metaID: meta.id, type: LastManualSourceStore.contentType(for: meta),
+            season: scope.season, episode: scope.episode
+        ), let index = StreamPickerListBuilder.firstPlayableIndex(
+            for: match.sourceID, in: streams
+        ), rowFocusIDs.indices.contains(index) else {
+            lastPlayedSourceMatch = nil
+            lastPlayedSourceStream = nil
+            lastPlayedSourceRowFocusID = nil
+            lastPlayedSourceIndex = nil
+            return
+        }
+        lastPlayedSourceMatch = match
+        lastPlayedSourceStream = streams[index]
+        lastPlayedSourceIndex = index
+        lastPlayedSourceRowFocusID = rowFocusIDs[index]
     }
 
     @MainActor
     private func rebuildStreamCardPresentations() async {
         let cacheKey = streamCardPresentationCacheKey
-        let maxNeeded = min(visibleStreamLimit + StreamPickerListBuilder.defaultPageSize, activeDisplayedStreams.count)
-        let streamsToBuild = Array(activeDisplayedStreams.prefix(maxNeeded))
+        let pickerStreams = activePickerStreams
+        let pickerRowFocusIDs = activePickerRowFocusIDs
+        let maxNeeded = min(visibleStreamLimit + StreamPickerListBuilder.defaultPageSize, pickerStreams.count)
+        let streamsToBuild = Array(pickerStreams.prefix(maxNeeded))
         let settings = streamBadgeSettings
-        let missingStreams = streamsToBuild.filter {
-            streamCardPresentations[$0.id] == nil
+        let missingIndices = streamsToBuild.indices.filter { index in
+            streamCardPresentations[pickerRowFocusIDs[index]] == nil
         }
-        guard !missingStreams.isEmpty else { return }
+        guard !missingIndices.isEmpty else { return }
 
         // Preserve completed cards as add-ons publish progressively. Larger
         // batches reduce whole-overlay SwiftUI invalidations while still giving
         // cancellation a chance between chunks when a new revision arrives.
-        for startIndex in stride(from: 0, to: missingStreams.count, by: 16) {
+        for startIndex in stride(from: 0, to: missingIndices.count, by: 16) {
             guard !Task.isCancelled else { return }
-            let endIndex = min(startIndex + 16, missingStreams.count)
-            let batch = Array(missingStreams[startIndex..<endIndex])
+            let endIndex = min(startIndex + 16, missingIndices.count)
+            let batchIndices = Array(missingIndices[startIndex..<endIndex])
+            let batch = batchIndices.map { streamsToBuild[$0] }
+            let batchFocusIDs = batchIndices.map { pickerRowFocusIDs[$0] }
             let batchPresentations = await TvStreamCardPresentationBuilder.shared.build(
                 streams: batch,
+                rowFocusIDs: batchFocusIDs,
                 settings: settings
             )
             guard !Task.isCancelled,
@@ -10829,8 +11223,9 @@ private struct TvStreamPickerOverlay: View {
     private var streamPanel: some View {
         // Resolve once per panel body — focus changes hit the cache path only.
         let style = streamListStyle
-        let streamsToShow = activeVisibleStreams
-        let totalCount = activeDisplayedStreams.count
+        let rowsToShow = Array(activeSourceRowsWithFocusIDs.prefix(visibleStreamLimit))
+        let streamsToShow = rowsToShow.map(\.stream)
+        let totalCount = activeSourceRows.count
         let badgeSettings = streamBadgeSettings
         let hasMore = totalCount > streamsToShow.count
         let picks = pickerSortOption == .recommended
@@ -10839,8 +11234,15 @@ private struct TvStreamPickerOverlay: View {
         let recommendedStream = pickerSortOption == .recommended
             ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })
             : nil
+        let lastPlayedID = pickerSortOption == .recommended ? lastPlayedSourceMatch?.sourceID : nil
+        let recommendationPicks = picks.filter { pick in
+            guard pick.stream.id != recommendedStream?.id else { return false }
+            return pick.stream.id != lastPlayedID
+        }
+        let hasPickerCards = !streamsToShow.isEmpty
+            || (pickerSortOption == .recommended && (recommendedStream != nil || lastPlayedSourceStream != nil))
         return ZStack {
-            if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
+            if isLoading && !hasPickerCards && selectedGroupError == nil {
                 VStack(spacing: 24) {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: .white))
@@ -10850,7 +11252,7 @@ private struct TvStreamPickerOverlay: View {
                         .font(.system(size: 30, weight: .semibold))
                         .foregroundColor(.white.opacity(0.74))
                 }
-            } else if streamsToShow.isEmpty {
+            } else if !hasPickerCards {
                 VStack(spacing: 18) {
                     if selectedGroupIsLoading {
                         ProgressView()
@@ -10882,30 +11284,50 @@ private struct TvStreamPickerOverlay: View {
                 ScrollViewReader { proxy in
                     ScrollView(.vertical, showsIndicators: false) {
                         LazyVStack(spacing: style.metrics.cardSpacing) {
-                            if let recommendedStream {
+                            if pickerSortOption == .recommended,
+                               let lastPlayedStream = lastPlayedSourceStream,
+                               let lastPlayedAt = lastPlayedSourceMatch?.updatedAt,
+                               let lastPlayedRowFocusID = lastPlayedSourceRowFocusID {
+                                TvStreamCard(
+                                    stream: lastPlayedStream,
+                                    presentation: streamCardPresentations[lastPlayedRowFocusID]
+                                        ?? TvStreamCardPresentation(pending: badgeSettings),
+                                    style: style,
+                                    focusID: lastPlayedRowFocusID,
+                                    lastPlayedAt: lastPlayedAt,
+                                    externalFocus: $focusedItem,
+                                    action: { select(lastPlayedStream, player: nil) },
+                                    onSelectPlayer: { player in select(lastPlayedStream, player: player) }
+                                )
+                                .id(lastPlayedRowFocusID)
+                            }
+                            if recommendedStream != nil || !recommendationPicks.isEmpty {
                                 VStack(alignment: .leading, spacing: 8) {
                                     Text(selectedAddonId == nil
                                          ? L10n.string("stream_recommendation_all_addons", fallback: "Among available results from all add-ons")
                                          : L10n.string("stream_recommendation_selected_addon", fallback: "Among results from the selected add-on"))
                                         .font(.system(size: 16))
                                         .foregroundColor(.white.opacity(0.65))
-                                    TvStreamRecommendationCard(
-                                        stream: recommendedStream,
-                                        title: isLoading || selectedGroupIsLoading
-                                            ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
-                                            : L10n.string("stream_best_overall", fallback: "Best overall"),
-                                        prominent: true,
-                                        focusBinding: $focusedItem,
-                                        focusValue: "recommended::overall",
-                                        action: { select(recommendedStream, player: nil) }
-                                    )
+                                    if let recommendedStream, recommendedStream.id != lastPlayedID {
+                                        TvStreamRecommendationCard(
+                                            stream: recommendedStream,
+                                            title: isLoading || selectedGroupIsLoading
+                                                ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
+                                                : L10n.string("stream_best_overall", fallback: "Best overall"),
+                                            prominent: true,
+                                            focusBinding: $focusedItem,
+                                            focusValue: "recommended::overall",
+                                            action: { select(recommendedStream, player: nil) }
+                                        )
+                                        .id("recommended::overall")
+                                    }
                                     Text(L10n.string("stream_recommended_criteria", fallback: "Based on reported resolution, HDR, release, audio, codec, availability and size"))
                                         .font(.system(size: 18))
                                         .foregroundColor(.white.opacity(0.65))
                                     // The overall pick already has its own card; its resolution's card
                                     // would repeat the same source.
-                                    ForEach(picks.filter { $0.stream.id != recommendedStream.id }.map { $0.resolution }, id: \.self) { resolution in
-                                        if let pick = picks.first(where: { $0.resolution == resolution }) {
+                                    ForEach(recommendationPicks.map(\.resolution), id: \.self) { resolution in
+                                        if let pick = recommendationPicks.first(where: { $0.resolution == resolution }) {
                                             let resolutionLabel = resolution == 2160 ? "4K" : "\(resolution)p"
                                             TvStreamRecommendationCard(
                                                 stream: pick.stream,
@@ -10915,30 +11337,35 @@ private struct TvStreamPickerOverlay: View {
                                                 focusValue: "recommended::\(resolution)",
                                                 action: { select(pick.stream, player: nil) }
                                             )
+                                            .id("recommended::\(resolution)")
                                         }
                                     }
                                 }
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .focusSection()
                             }
-                            ForEach(streamsToShow) { stream in
+                            ForEach(rowsToShow) { row in
+                                let stream = row.stream
+                                let rowFocusID = row.focusID
                                 // Focus appearance is owned by the card via local
                                 // @FocusState + ExternalFocusBinding so only the
                                 // old/new cards pay for outline/scale updates.
                                 TvStreamCard(
                                     stream: stream,
-                                    presentation: streamCardPresentations[stream.id]
+                                    presentation: streamCardPresentations[rowFocusID]
                                         ?? TvStreamCardPresentation(pending: badgeSettings),
                                     style: style,
+                                    focusID: rowFocusID,
+                                    lastPlayedAt: lastPlayedSourceRowFocusID == rowFocusID
+                                        ? lastPlayedSourceMatch?.updatedAt : nil,
                                     externalFocus: $focusedItem,
                                     action: { select(stream, player: nil) },
                                     onSelectPlayer: { player in select(stream, player: player) }
                                 )
-                                .id(stream.id)
+                                .id(rowFocusID)
                                 .onAppear {
-                                    if let index = streamsToShow.firstIndex(where: { $0.id == stream.id }),
-                                       index >= streamsToShow.count - 4,
-                                       hasMore {
+                                    if let index = rowsToShow.firstIndex(where: { $0.id == row.id }),
+                                       index >= rowsToShow.count - 4, hasMore {
                                         loadMoreStreams()
                                     }
                                 }
@@ -11102,34 +11529,45 @@ private struct TvStreamPickerOverlay: View {
         return (profileID, episode?.season, episode?.episode)
     }
 
-    /// With Nuvio Recommended, the Best overall card sits above the list; focus starts there,
-    /// not on the first list row, which scrolled the recommendations out of view.
-    private var recommendedOverallFocusID: String? {
-        guard pickerSortOption == .recommended,
-              activeDisplayedStreams.contains(where: {
-                  !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0
-              }) else { return nil }
-        return "recommended::overall"
+    private func firstRenderedStreamFocusID() -> String? {
+        if pickerSortOption == .recommended {
+            if lastPlayedSourceStream != nil, let lastPlayedSourceRowFocusID {
+                return lastPlayedSourceRowFocusID
+            }
+            let recommendedStream = activeDisplayedStreams.first {
+                !$0.isNotPlayable && $0.unavailabilityReason == nil
+                    && StreamPickerListBuilder.resolution(for: $0) > 0
+            }
+            let lastPlayedID = lastPlayedSourceMatch?.sourceID
+            if let recommendedStream, recommendedStream.id != lastPlayedID {
+                return "recommended::overall"
+            }
+            let recommendationPicks = StreamPickerListBuilder.recommendedByResolution(from: activeDisplayedStreams)
+                .filter { $0.stream.id != recommendedStream?.id && $0.stream.id != lastPlayedID }
+            if let pick = recommendationPicks.first {
+                return "recommended::\(pick.resolution)"
+            }
+        }
+        return activeSourceRowFocusIDs.first
     }
 
     private func initialStreamFocusID() -> String? {
         guard ProfileSettings.current.bool(forKey: SettingsKey.rememberLastSourceFocus),
-              let scope = rememberedSourceScope else { return recommendedOverallFocusID ?? activeDisplayedStreams.first?.id }
-        let candidates = activeDisplayedStreams.filter { !$0.isNotPlayable && $0.unavailabilityReason == nil }
-        if let id = LastManualSourceStore.matchingID(
-            in: candidates.map(\.id), profileID: scope.profileID, metaID: meta.id, type: meta.type,
-            season: scope.season, episode: scope.episode
-        ), let index = activeDisplayedStreams.firstIndex(where: { $0.id == id }) {
+              let scope = rememberedSourceScope else { return firstRenderedStreamFocusID() }
+        if lastPlayedSourceMatch != nil,
+           let lastPlayedSourceRowFocusID,
+           let index = activePickerRowFocusIDs.firstIndex(of: lastPlayedSourceRowFocusID) {
             visibleStreamLimit = max(visibleStreamLimit, index + 1)
-            restoredSourceFocusID = id
-            return id
+            restoredSourceFocusID = lastPlayedSourceRowFocusID
+            return lastPlayedSourceRowFocusID
         }
         // Let progressive discovery finish before deciding the saved source is absent.
         if isLoading, LastManualSourceStore.hasRememberedSource(
-            profileID: scope.profileID, metaID: meta.id, type: meta.type,
+            profileID: scope.profileID, metaID: meta.id,
+            type: LastManualSourceStore.contentType(for: meta),
             season: scope.season, episode: scope.episode
         ) { return nil }
-        return recommendedOverallFocusID ?? activeDisplayedStreams.first?.id
+        return firstRenderedStreamFocusID()
     }
 
     private func seedInitialFocus() {
@@ -11139,9 +11577,9 @@ private struct TvStreamPickerOverlay: View {
             guard focusedItem == nil || focusedItem == filterAllKey else { return }
             if didSeedStreamFocus {
                 let restored = restoredSourceFocusID.flatMap { id in
-                    activeDisplayedStreams.contains(where: { $0.id == id }) ? id : nil
+                    id == lastPlayedSourceRowFocusID || activeSourceRowFocusIDs.contains(id) ? id : nil
                 }
-                grabFocus(restored ?? recommendedOverallFocusID ?? activeDisplayedStreams.first?.id ?? filterAllKey, attempt: 0)
+                grabFocus(restored ?? firstRenderedStreamFocusID() ?? filterAllKey, attempt: 0)
             } else if let id = initialStreamFocusID() {
                 didSeedStreamFocus = true
                 grabFocus(id, attempt: 0)
@@ -11385,6 +11823,7 @@ struct StreamListPreview: View {
     let width: CGFloat
 
     @FocusState private var focus: String?
+    @State private var badgeRevision = 0
 
     private static let canvas = CGSize(width: 1920, height: 1080)
     private static let title = "Breaking Bad"
@@ -11419,6 +11858,7 @@ struct StreamListPreview: View {
     ]
 
     var body: some View {
+        let _ = badgeRevision
         let scale = width / Self.canvas.width
         let layout = style.layout(width: Self.canvas.width, height: Self.canvas.height)
         let settings = StreamBadgeSettingsStore.snapshot
@@ -11459,6 +11899,7 @@ struct StreamListPreview: View {
                             externalFocus: $focus,
                             action: {}
                         )
+                        .id("\(stream.id)-\(badges.rules.activeImport?.sourceUrl ?? "none")-\(badges.badgePlacement.rawValue)-\(badges.showFileSizeBadges)-\(showAddonLogo)-\(badgeRevision)-\(style.hideFileSize)-\(style.hideAddonName)-\(style.hideDescription)")
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
@@ -11482,6 +11923,9 @@ struct StreamListPreview: View {
             RoundedRectangle(cornerRadius: 24, style: .continuous)
                 .stroke(Color.white.opacity(0.18), lineWidth: 2)
         )
+        .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            badgeRevision &+= 1
+        }
     }
 
     /// In place of the title's backdrop: a warm, dark gradient under the same dimming.
@@ -11570,6 +12014,7 @@ private struct TvStreamCardPresentationCacheKey: Equatable {
     let listKey: StreamPickerListCacheKey?
     let badgeSettingsRevision: UInt64
     let visibleLimit: Int
+    let lastPlayedRowFocusID: String?
 }
 
 private struct TvStreamCardPresentation {
@@ -11621,13 +12066,14 @@ private actor TvStreamCardPresentationBuilder {
 
     func build(
         streams: [NuvioStream],
+        rowFocusIDs: [String],
         settings: StreamBadgeSettingsSnapshot
     ) -> [String: TvStreamCardPresentation] {
         var presentations: [String: TvStreamCardPresentation] = [:]
         presentations.reserveCapacity(streams.count)
-        for stream in streams {
+        for (stream, rowFocusID) in zip(streams, rowFocusIDs) {
             guard !Task.isCancelled else { return [:] }
-            presentations[stream.id] = TvStreamCardPresentation(
+            presentations[rowFocusID] = TvStreamCardPresentation(
                 stream: stream,
                 badgeSettings: settings
             )
@@ -11638,6 +12084,8 @@ private actor TvStreamCardPresentationBuilder {
 
 private struct TvStreamCard: View {
     let stream: NuvioStream
+    private let focusID: String
+    private let lastPlayedAt: Date?
     private let importedBadges: [StreamBadgeFilter]
     private let fileSizeLabel: String?
     private let badgePlacement: StreamBadgePlacement
@@ -11663,12 +12111,16 @@ private struct TvStreamCard: View {
         stream: NuvioStream,
         presentation: TvStreamCardPresentation,
         style: StreamListStyle = StreamListStyle(),
+        focusID: String? = nil,
+        lastPlayedAt: Date? = nil,
         previewFocused: Bool = false,
         externalFocus: FocusState<String?>.Binding,
         action: @escaping () -> Void,
         onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
     ) {
         self.stream = stream
+        self.focusID = focusID ?? stream.id
+        self.lastPlayedAt = lastPlayedAt
         self.style = style
         self.previewFocused = previewFocused
         self.importedBadges = presentation.importedBadges
@@ -11678,12 +12130,20 @@ private struct TvStreamCard: View {
         self.externalFocus = externalFocus
         self.action = action
         self.onSelectPlayer = onSelectPlayer
-        let lines = Self.nameLines(for: stream, hidingFileSize: style.hideFileSize)
+        let lines = Self.nameLines(
+            for: stream,
+            hidingFileSize: style.hideFileSize,
+            hidingAddonName: style.hideAddonName
+        )
         self.primaryName = lines.first ?? "Stream"
         let rest = lines.dropFirst().joined(separator: " ")
         self.secondaryName = rest.isEmpty ? nil : rest
-        self.descriptionText = stream.description.map {
-            StreamListStyle.displayText($0, hidingFileSize: style.hideFileSize)
+        if style.hideDescription {
+            self.descriptionText = nil
+        } else {
+            self.descriptionText = stream.description.map {
+                StreamListStyle.displayText($0, hidingFileSize: style.hideFileSize)
+            }
         }
     }
 
@@ -11732,6 +12192,17 @@ private struct TvStreamCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
+                    if let lastPlayedAt {
+                        HStack(spacing: 6) {
+                            Text(L10n.string("details_last_played", fallback: "Last played"))
+                            Text(lastPlayedAt, style: .relative)
+                        }
+                        .font(.system(size: style.detailFont(22), weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+
                     if stream.debridCacheStatusUnavailable == true {
                         Text(L10n.string(
                             "debrid_cache_status_unavailable",
@@ -11761,7 +12232,7 @@ private struct TvStreamCard: View {
                     VStack(spacing: 18) {
                         addonLogo
 
-                        if let addonName = stream.addonName {
+                        if !style.hideAddonName, let addonName = stream.addonName {
                             Text(addonName)
                                 .font(.system(size: style.font(22), weight: .medium))
                                 .foregroundColor(.white.opacity(0.42))
@@ -11791,7 +12262,7 @@ private struct TvStreamCard: View {
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)
-        .modifier(ExternalFocusBinding(binding: externalFocus, id: stream.id))
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: focusID))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(looksFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -11810,8 +12281,18 @@ private struct TvStreamCard: View {
         }
     }
 
-    static func nameLines(for stream: NuvioStream, hidingFileSize: Bool = false) -> [String] {
-        let displayedName = StreamListStyle.displayText(stream.name ?? "", hidingFileSize: hidingFileSize)
+    static func nameLines(
+        for stream: NuvioStream,
+        hidingFileSize: Bool = false,
+        hidingAddonName: Bool = false
+    ) -> [String] {
+        var displayedName = StreamListStyle.displayText(stream.name ?? "", hidingFileSize: hidingFileSize)
+        if hidingAddonName, let addon = stream.addonName, !addon.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            displayedName = StreamListStyle.displayText(
+                displayedName,
+                hidingAddonName: addon
+            )
+        }
         let raw = displayedName.trimmingCharacters(in: .whitespacesAndNewlines)
         let lines = raw
             .components(separatedBy: .newlines)

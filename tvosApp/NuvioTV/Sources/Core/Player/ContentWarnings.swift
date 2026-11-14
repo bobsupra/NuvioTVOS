@@ -64,7 +64,7 @@ actor ContentWarningsRepository {
         if let cached = cache[normalizedID] { return cached }
         guard !Task.isCancelled else { return [] }
 
-        var request = URLRequest(url: URL(string: "https://api.imdbapi.dev/titles/\(normalizedID)/parentsGuide")!)
+        var request = URLRequest(url: URL(string: "https://api.tiffara.com/titles/\(normalizedID)/parentsGuide")!)
         request.httpMethod = "GET"
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         request.timeoutInterval = 8

@@ -113,7 +113,7 @@ private struct CompanyBrowseContent: View {
     }
 
     private var scrollShadowProgress: CGFloat {
-        min(max(scrollOffset / 120, 0), 1)
+        min(max(scrollOffset / CompanyBrowseScrollTracker.shadowDistance, 0), 1)
     }
 
     var body: some View {
@@ -155,6 +155,7 @@ private struct CompanyBrowseContent: View {
                     } else {
                         ForEach(rails) { rail in
                             NetworkBrowseRail(rail: rail, onSelect: onSelect)
+                                .equatable()
                         }
                     }
                 }
@@ -294,16 +295,28 @@ private struct CompanyBrowseScrollOffsetKey: PreferenceKey {
 private struct CompanyBrowseScrollTracker: ViewModifier {
     @Binding var offset: CGFloat
 
+    /// The shadow is full past this far down; scrolling further changes nothing on screen.
+    static let shadowDistance: CGFloat = 120
+
+    /// The offset the page keeps: within the shadow's range, in steps of 4 points. Every point
+    /// of scrolling used to redraw the whole page, all its rails and cards with it, on every
+    /// frame of every scroll.
+    static func kept(_ offset: CGFloat) -> CGFloat {
+        let clamped = min(max(0, offset), shadowDistance)
+        return (clamped / 4).rounded() * 4
+    }
+
     func body(content: Content) -> some View {
         if #available(tvOS 18.0, *) {
             content.onScrollGeometryChange(for: CGFloat.self) { geometry in
-                geometry.contentOffset.y
+                Self.kept(geometry.contentOffset.y)
             } action: { _, newOffset in
-                offset = max(0, newOffset)
+                if offset != newOffset { offset = newOffset }
             }
         } else {
             content.onPreferenceChange(CompanyBrowseScrollOffsetKey.self) { minY in
-                offset = max(0, -minY)
+                let kept = Self.kept(-minY)
+                if offset != kept { offset = kept }
             }
         }
     }
@@ -333,10 +346,16 @@ private struct CompanyBrowseScrollTransitionShadow: View {
     }
 }
 
-struct NetworkBrowseRail: View {
+struct NetworkBrowseRail: View, Equatable {
     let rail: TmdbNetworkBrowseRail
     var externalFocus: FocusState<String?>.Binding? = nil
     let onSelect: (RelatedTitle) -> Void
+
+    /// What the rail shows; `onSelect` is left out (closures can't be compared), so the page
+    /// redrawing (loading, its scroll shadow) no longer rebuilds every card of every rail.
+    static func == (lhs: NetworkBrowseRail, rhs: NetworkBrowseRail) -> Bool {
+        lhs.rail == rhs.rail && (lhs.externalFocus == nil) == (rhs.externalFocus == nil)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -346,7 +365,9 @@ struct NetworkBrowseRail: View {
                 .padding(.horizontal, 80)
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(alignment: .top, spacing: TmdbBrowseGridMetrics.posterGap) {
+                // Lazy: an actor's rail can hold well over a hundred titles, and all their cards
+                // were built at once as the page opened (more than a second on an Apple TV 4K).
+                LazyHStack(alignment: .top, spacing: TmdbBrowseGridMetrics.posterGap) {
                     ForEach(rail.items) { title in
                         ProductionBrowseCard(
                             title: title,
@@ -372,6 +393,9 @@ struct PersonBrowseView: View {
     let onBack: () -> Void
 
     @State private var detail: ScenePersonDetail? = nil
+    /// Made once from `detail`: as a computed property it was made again (every title mapped)
+    /// several times on every redraw.
+    @State private var rails: [TmdbNetworkBrowseRail] = []
     @State private var isLoading = true
     @State private var scrollOffset: CGFloat = 0
     @FocusState private var focusedCardID: String?
@@ -381,7 +405,7 @@ struct PersonBrowseView: View {
 
     private var displayName: String { detail?.name ?? person.name }
 
-    private var rails: [TmdbNetworkBrowseRail] {
+    private static func makeRails(from detail: ScenePersonDetail?) -> [TmdbNetworkBrowseRail] {
         guard let detail else { return [] }
         var list: [TmdbNetworkBrowseRail] = []
         if !detail.movies.isEmpty {
@@ -412,7 +436,7 @@ struct PersonBrowseView: View {
     }
 
     private var scrollShadowProgress: CGFloat {
-        min(max(scrollOffset / 120, 0), 1)
+        min(max(scrollOffset / CompanyBrowseScrollTracker.shadowDistance, 0), 1)
     }
 
     var body: some View {
@@ -449,6 +473,7 @@ struct PersonBrowseView: View {
                     } else {
                         ForEach(rails) { rail in
                             NetworkBrowseRail(rail: rail, externalFocus: $focusedCardID, onSelect: onSelect)
+                                .equatable()
                         }
                     }
                 }
@@ -475,7 +500,9 @@ struct PersonBrowseView: View {
         .task(id: person.id) {
             isLoading = true
             let provider = TmdbSceneCastProvider()
-            detail = await provider.fetchPersonDetail(for: person)
+            let loaded = await provider.fetchPersonDetail(for: person)
+            detail = loaded
+            rails = Self.makeRails(from: loaded)
             isLoading = false
             if focusedCardID == nil, let firstID = rails.first?.items.first?.id {
                 focusedCardID = firstID

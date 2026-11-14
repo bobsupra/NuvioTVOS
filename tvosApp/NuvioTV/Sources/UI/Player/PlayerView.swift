@@ -69,7 +69,8 @@ struct PlayerView: View {
     var onWatchPartyIncomingMediaResolved: WatchPartyIncomingEpisodePlan.Completion? = nil
     var onWatchPartyEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = nil
     var onWatchPartySourceChanged: (@MainActor () async -> Void)? = nil
-    var onRequestSources: (() -> Void)? = nil
+    var onEpisodeChanged: ((NuvioVideo) -> Void)? = nil
+    var onRequestSources: ((NuvioVideo?) -> Void)? = nil
     var onFinished: (() -> Void)? = nil
     var onPlaybackStarted: (() -> Void)? = nil
     var onPlayRecommendation: ((_ meta: NuvioMeta, _ playManually: Bool) -> Void)? = nil
@@ -117,7 +118,8 @@ struct PlayerView: View {
         onWatchPartyIncomingMediaResolved: WatchPartyIncomingEpisodePlan.Completion? = nil,
         onWatchPartyEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = nil,
         onWatchPartySourceChanged: (@MainActor () async -> Void)? = nil,
-        onRequestSources: (() -> Void)? = nil,
+        onEpisodeChanged: ((NuvioVideo) -> Void)? = nil,
+        onRequestSources: ((NuvioVideo?) -> Void)? = nil,
         onFinished: (() -> Void)? = nil,
         onPlaybackStarted: (() -> Void)? = nil,
         onPlayRecommendation: ((NuvioMeta, Bool) -> Void)? = nil,
@@ -167,6 +169,7 @@ struct PlayerView: View {
         self.onWatchPartyIncomingMediaResolved = onWatchPartyIncomingMediaResolved
         self.onWatchPartyEpisodeResolved = onWatchPartyEpisodeResolved
         self.onWatchPartySourceChanged = onWatchPartySourceChanged
+        self.onEpisodeChanged = onEpisodeChanged
         self.onRequestSources = onRequestSources
         self.onFinished = onFinished
         self.onPlaybackStarted = onPlaybackStarted
@@ -201,6 +204,11 @@ struct PlayerView: View {
             }
             .onChange(of: viewModel.nextEpisode?.id) { _, _ in
                 refreshNextEpisodeSpoilerEligibility()
+            }
+            .onChange(of: viewModel.currentEpisodeVideo?.id) { _, _ in
+                if let ep = viewModel.currentEpisodeVideo {
+                    onEpisodeChanged?(ep)
+                }
             }
             .onChange(of: episodes.map(\.id)) { _, _ in
                 refreshNextEpisodeSpoilerEligibility()

@@ -1887,8 +1887,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             guard let event = event as? MPChangePlaybackPositionCommandEvent, event.positionTime.isFinite else { return nil }
             return .position(event.positionTime)
         }, action: action)
-        remoteCommandTargets.add(center.skipForwardCommand, intent: .skip(10), action: action)
-        remoteCommandTargets.add(center.skipBackwardCommand, intent: .skip(-10), action: action)
+        remoteCommandTargets.add(center.skipForwardCommand, resolve: { event in
+            guard let event = event as? MPSkipIntervalCommandEvent else { return nil }
+            return PlayerRemoteIntent.skipInterval(event.interval, isForward: true)
+        }, action: action)
+        remoteCommandTargets.add(center.skipBackwardCommand, resolve: { event in
+            guard let event = event as? MPSkipIntervalCommandEvent else { return nil }
+            return PlayerRemoteIntent.skipInterval(event.interval, isForward: false)
+        }, action: action)
     }
 
     private func teardownMPVRemoteCommands() {

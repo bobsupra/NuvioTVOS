@@ -2729,6 +2729,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var didLogSoftwareThumbnailResult = false
     private var softwareFrameExtractorCleanupTask: Task<Void, Never>?
     private var softwareFrameExtractorCleanupGeneration: UInt64 = 0
+    private var currentDialogueMode: EnhanceDialogueMode = .off
+    private var currentReduceLoud: Bool = false
     private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
     private let seekPreviewLaneHost = SeekPreviewLaneHost()
     /// When the current pause began; Aether releases its held source connection 5 s into one.
@@ -3881,7 +3883,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     var supportsAudioProcessing: Bool {
-        engine.supportsAudioProcessing
+        engine.supportsAudioProcessing || (engine.videoRoute != .remoteBypass && engine.videoRoute != .none)
     }
 
     var playbackDebugInfo: PlaybackDebugInfo {
@@ -4262,6 +4264,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     deinit {
+        pendingSeekTask?.cancel()
+        pendingSeekTask = nil
         foregroundReloadTask?.cancel()
         activeThumbnailTask?.cancel()
         activeThumbnailCancellation?.cancel()
@@ -5054,6 +5058,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         var parts: [String] = []
         if !t.codec.isEmpty { parts.append(t.codec.uppercased()) }
         let isTrueHDAtmos = t.codec.lowercased() == "truehd" && (
+            t.trueHDAtmos == .atmos ||
             t.profile?.lowercased().contains("atmos") == true ||
             t.name.lowercased().contains("atmos")
         )
@@ -5082,6 +5087,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         externalTrickplayProvider = nil
         teardownRemoteCommands()
         remoteCommandsAllowed = true
+        #if os(tvOS) || os(iOS)
+        configureRemoteCommandsIfNeeded()
+        #endif
         diagnosticPlayIntent = request.autoplay ? "play" : "pause"
         lastDiagnosticSnapshotUptime = 0
         let currentEngineGeneration = max(
@@ -5100,6 +5108,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         playbackWasPlayingBeforeBackground = false
         foregroundReloadTask?.cancel()
         foregroundReloadTask = nil
+        pendingSeekTask?.cancel()
+        pendingSeekTask = nil
+        shouldResumeAfterSeek = false
         resetAISubtitleStartupHold()
         loadGeneration = generation
         let isRemote = PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
@@ -5238,19 +5249,33 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
         let dualLayerRouteRaw = ProfileSettings.current.string(forKey: SettingsKey.dualLayerRoute) ?? "softwareHost"
         let dualLayerRoute: DualLayerRoute = dualLayerRouteRaw == "avPlayerOutput" ? .avPlayerOutput : .softwareHost
+        let foldsDolbyVisionFEL = ProfileSettings.current.object(forKey: SettingsKey.foldsDolbyVisionFEL) as? Bool ?? true
         let sourceSupportsHDR10PlusPreflight = ["file", "http", "https"].contains(
             request.videoURL.scheme?.lowercased() ?? "")
         let prefersHDR10PlusForThisLoad = !panelPresentsDV
             && !isLive && !isRemoteHLS && sourceSupportsHDR10PlusPreflight
-        let upscalesLowResolutionVideo = ProfileSettings.current.object(forKey: SettingsKey.lowResUpscaling) as? Bool ?? true
+        let upscaleScalerChoice = ProfileSettings.current.string(forKey: SettingsKey.upscaleScaler) ?? "smart"
+        let lowResUpscalingSetting = ProfileSettings.current.object(forKey: SettingsKey.lowResUpscaling) as? Bool ?? true
+        let upscalesLowResolutionVideo = lowResUpscalingSetting && upscaleScalerChoice != "off"
+        let upscaleScaler: UpscaleScaler
+        switch upscaleScalerChoice {
+        case "lineArt":
+            upscaleScaler = .lineArt
+        case "automatic":
+            upscaleScaler = .automatic
+        default:
+            upscaleScaler = request.isAnime ? .lineArt : .automatic
+        }
         let losslessAudioBridge = ProfileSettings.current.bool(forKey: SettingsKey.losslessAudioBridge)
-        // Bound find_stream_info probe budget for remote VOD streams (#68).
+        let initialAudioShaping = currentAudioShaping()
+        // Bound find_stream_info probe budget for remote VOD streams (#68, #461).
         // The 50 MiB default reads over the network to completion for sparse attachments (fonts, cover art),
-        // adding ~6-8s of startup latency. Bounding to 15 MiB / 10s safely resolves all video/audio tracks
-        // while avoiding multi-chunk remote stall. Local SMB and Live IPTV retain the full engine defaults.
+        // adding ~6-8s of startup latency. Bounding to 8 MiB / 5s safely resolves all video/audio tracks
+        // while avoiding multi-chunk remote stall on slower CDNs / Apple TV 4K 1st Gen.
+        // Local SMB and Live IPTV retain the full engine defaults.
         let isRemoteVOD = (isRemote || isLocalPlaybackCache || isUsenetStream) && !isLive
-        let probeBudgetBytes: Int64? = isRemoteVOD ? 15 * 1024 * 1024 : nil
-        let maxAnalyzeDurationMicroseconds: Int64? = isRemoteVOD ? 10 * 1_000_000 : nil
+        let probeBudgetBytes: Int64? = isRemoteVOD ? 8 * 1024 * 1024 : nil
+        let maxAnalyzeDurationMicroseconds: Int64? = isRemoteVOD ? 5 * 1_000_000 : nil
         // Skip embedded container font attachments on non-anime streams (and on anime when ASS styling is stripped),
         // preventing multi-megabyte font downloads during container open over remote connections.
         let skipsContainerAttachments = !request.isAnime || request.assMode == .strip
@@ -5264,7 +5289,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             dolbyVisionHandling: prefersHDR10PlusForThisLoad ? .hdr10BaseLayerOnly : .automatic,
             preferDualLayerDolbyVision: preferDualLayerDolbyVision,
             dualLayerRoute: dualLayerRoute,
+            foldsDolbyVisionFEL: foldsDolbyVisionFEL,
             upscalesLowResolutionVideo: upscalesLowResolutionVideo,
+            upscaleScaler: upscaleScaler,
             matchContentEnabled: matchContent,
             panelIsInHDRMode: panelInHDR,
             panelPresentsDolbyVision: panelPresentsDV,
@@ -5282,6 +5309,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             // subtitle decoders keep their normal styled/plain cue path.
             preserveASSMarkup: true,
             prepareNativeSubtitles: false,
+            nativeAudioTrackMenu: true,
             generatesBackgroundScrubPreviews: generatesBackgroundScrubPreviews,
             sequentialOrigin: forceSequentialOrigin || request.forceSequentialOrigin,
             maxConcurrentSourceRequests: isRemote || isUsenetStream ? 1 : nil,
@@ -5296,8 +5324,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
             externalSubtitles: externalRegistration.tracks,
             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments(isBackedByHybridDiskCache: isLocalPlaybackCache),
+            sessionCacheFreeReserveBytes: 2 * 1024 * 1024 * 1024,
             autoplay: request.autoplay,
             audioDelaySeconds: request.audioDelaySeconds,
+            audioShaping: initialAudioShaping,
             nativeVideoFrameRecovery: true
         )
 
@@ -5394,6 +5424,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         load(request, generation: loadGeneration)
     }
 
+    private var pendingSeekTask: Task<Void, Never>?
+    private var shouldResumeAfterSeek: Bool = false
+
     func playPlayback() {
         cancelScrubThumbnailWork()
         diagnosticPlayIntent = "play"
@@ -5401,11 +5434,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         if foregroundReloadTask != nil {
             playbackWasPlayingBeforeBackground = true
         }
+        if pendingSeekTask != nil {
+            shouldResumeAfterSeek = true
+        }
         engine.play()
     }
     func pausePlayback() {
         diagnosticPlayIntent = "pause"
         screensaverDebugLog("[ScreensaverDebug][AetherController] pausePlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
+        shouldResumeAfterSeek = false
         engine.pause()
     }
 
@@ -5416,8 +5453,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     func seekToMs(_ ms: Int64, exact: Bool) {
         screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms), exact=\(exact)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
         lastKnownPositionMs = max(0, ms)
-        Task { @MainActor in
-            await engine.seek(to: Double(ms) / 1000.0, exact: exact)
+        let wasPlaying = isTransportPlaying || isPlayerPlaying || diagnosticPlayIntent == "play"
+        shouldResumeAfterSeek = wasPlaying
+        pendingSeekTask?.cancel()
+        pendingSeekTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.engine.seek(to: Double(ms) / 1000.0, exact: exact)
+            guard !Task.isCancelled else { return }
+            let resume = self.shouldResumeAfterSeek
+            self.shouldResumeAfterSeek = false
+            self.pendingSeekTask = nil
+            if resume {
+                self.engine.play()
+            }
         }
     }
 
@@ -5467,15 +5515,57 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         _ = dB
     }
 
-    func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {
-        guard engine.supportsAudioProcessing else { return }
-        let mode: AudioDialogueEnhancement
-        switch dialogue {
-        case .off: mode = .off
-        case .enhance: mode = .enhance
-        case .boost: mode = .boost
+    private func currentAudioShaping(dialogue: EnhanceDialogueMode? = nil, reduceLoud: Bool? = nil) -> AudioShaping {
+        let activeDialogue = dialogue ?? currentDialogueMode
+        let activeReduceLoud = reduceLoud ?? currentReduceLoud
+        let loudnessNormalizer = ProfileSettings.current.bool(forKey: SettingsKey.loudnessNormalizer)
+        let loudnessPreset = ProfileSettings.current.string(forKey: SettingsKey.loudnessTargetPreset) ?? "standard"
+        let targetLUFS: Double?
+        if loudnessNormalizer {
+            switch loudnessPreset {
+            case "night": targetLUFS = -20.0
+            case "boost": targetLUFS = -16.0
+            default: targetLUFS = -24.0
+            }
+        } else {
+            targetLUFS = nil
         }
-        engine.setAudioProcessing(dialogue: mode, reduceLoudSounds: reduceLoud)
+
+        let preserveSubwooferBass = ProfileSettings.current.bool(forKey: SettingsKey.preserveSubwooferBassInStereo)
+        let lfeMixDB: Double? = preserveSubwooferBass ? 0.0 : nil
+        let maxChannels: Int? = preserveSubwooferBass ? 2 : nil
+
+        var dialogueGainDB: Double = 0
+        switch activeDialogue {
+        case .off: dialogueGainDB = 0
+        case .enhance: dialogueGainDB = 3.0
+        case .boost: dialogueGainDB = 6.0
+        }
+        let compressor: AudioShaping.Compressor? = activeReduceLoud ? .night : nil
+
+        return AudioShaping(
+            maxChannels: maxChannels,
+            dialogueGainDB: dialogueGainDB,
+            compressor: compressor,
+            loudnessTargetLUFS: targetLUFS,
+            lfeMixDB: lfeMixDB
+        )
+    }
+
+    func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {
+        currentDialogueMode = dialogue
+        currentReduceLoud = reduceLoud
+        if engine.supportsAudioProcessing {
+            let mode: AudioDialogueEnhancement
+            switch dialogue {
+            case .off: mode = .off
+            case .enhance: mode = .enhance
+            case .boost: mode = .boost
+            }
+            engine.setAudioProcessing(dialogue: mode, reduceLoudSounds: reduceLoud)
+        }
+        let shaping = currentAudioShaping(dialogue: dialogue, reduceLoud: reduceLoud)
+        engine.setAudioShaping(shaping)
     }
 
     func selectAudio(_ trackId: Int) {
@@ -5726,12 +5816,18 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     private func configureRemoteCommandsIfNeeded() {
-        guard remoteCommandsAllowed, let center = engine.videoNowPlayingSession?.remoteCommandCenter else { return }
-        if didConfigureRemoteCommands, remoteCommandCenter === center { return }
+        guard remoteCommandsAllowed else { return }
+        let sessionCenter = engine.videoNowPlayingSession?.remoteCommandCenter
+        if didConfigureRemoteCommands, remoteCommandCenter === sessionCenter { return }
         teardownRemoteCommands()
         didConfigureRemoteCommands = true
-        remoteCommandCenter = center
-        installRemoteCommands(center)
+        remoteCommandCenter = sessionCenter
+
+        let sharedCenter = MPRemoteCommandCenter.shared()
+        installRemoteCommands(sharedCenter)
+        if let sessionCenter, sessionCenter !== sharedCenter {
+            installRemoteCommands(sessionCenter)
+        }
     }
 
     private func installRemoteCommands(_ center: MPRemoteCommandCenter) {
@@ -5760,6 +5856,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         center.skipForwardCommand.preferredIntervals = [10]
         center.skipBackwardCommand.isEnabled = true
         center.skipBackwardCommand.preferredIntervals = [10]
+        remoteCommandTargets.retainRemoval { [weak center] in
+            guard let center else { return }
+            center.playCommand.isEnabled = false
+            center.pauseCommand.isEnabled = false
+            center.togglePlayPauseCommand.isEnabled = false
+            center.changePlaybackPositionCommand.isEnabled = false
+            center.skipForwardCommand.isEnabled = false
+            center.skipBackwardCommand.isEnabled = false
+        }
         remoteCommandTargets.add(center.playCommand, intent: .play, action: action)
         remoteCommandTargets.add(center.pauseCommand, intent: .pause, action: action)
         remoteCommandTargets.add(center.togglePlayPauseCommand, intent: .toggle, action: action)
@@ -5767,8 +5872,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             guard let event = event as? MPChangePlaybackPositionCommandEvent, event.positionTime.isFinite else { return nil }
             return .position(event.positionTime)
         }, action: action)
-        remoteCommandTargets.add(center.skipForwardCommand, intent: .skip(10), action: action)
-        remoteCommandTargets.add(center.skipBackwardCommand, intent: .skip(-10), action: action)
+        remoteCommandTargets.add(center.skipForwardCommand, resolve: { event in
+            guard let event = event as? MPSkipIntervalCommandEvent else { return nil }
+            return PlayerRemoteIntent.skipInterval(event.interval, isForward: true)
+        }, action: action)
+        remoteCommandTargets.add(center.skipBackwardCommand, resolve: { event in
+            guard let event = event as? MPSkipIntervalCommandEvent else { return nil }
+            return PlayerRemoteIntent.skipInterval(event.interval, isForward: false)
+        }, action: action)
     }
 
     private func teardownRemoteCommands() {

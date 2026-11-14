@@ -269,6 +269,17 @@ final class HomeLayoutSettingsTests: XCTestCase {
         )
     }
 
+    func testHorizontalGridRestoreUsesFixedRowCount() {
+        let keys = (0...8).map { "card-\($0)" }
+        XCTAssertNil(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-2", in: keys, layout: .horizontalGrid(rows: 3))
+        )
+        XCTAssertEqual(
+            TVHomeRestoreLeftNeighbor.predecessor(of: "card-3", in: keys, layout: .horizontalGrid(rows: 3)),
+            "card-0"
+        )
+    }
+
     func testGridAndHorizontalShelvesHandleTheSameColumnBoundaryDifferently() {
         let keys = (0...15).map { "card-\($0)" }
         XCTAssertEqual(
@@ -2401,10 +2412,14 @@ final class HomeLayoutSettingsTests: XCTestCase {
 
     func testTVHomeGridLayoutRowsAndPreviewItemCount() {
         XCTAssertEqual(TVHomeGridLayout.columns, 7)
+        XCTAssertEqual(TVHomeGridLayout.defaultItemsPerRow, 7)
         XCTAssertEqual(TVHomeGridLayout.defaultRows, 3)
         XCTAssertEqual(TVHomeGridLayout.rows, 3)
         XCTAssertEqual(TVHomeGridLayout.minRows, 1)
         XCTAssertEqual(TVHomeGridLayout.maxRows, 10)
+        XCTAssertEqual(TVHomeGridLayout.minItemsPerRow, 4)
+        XCTAssertEqual(TVHomeGridLayout.maxItemsPerRow, 20)
+        XCTAssertEqual(TVHomeGridLayout.seeAllItemsPerRow, 21)
 
         // Default 3 rows: 7 * 3 - 1 = 20 preview items + 1 See All card = 21 total items
         XCTAssertEqual(TVHomeGridLayout.previewItemCount, 20)
@@ -2429,6 +2444,14 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 0), 6)
         XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: -5), 6)
         XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 15), 69)
+
+        XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 1, itemsPerRow: 12), 11)
+        XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 3, itemsPerRow: 12), 35)
+        XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 1, itemsPerRow: 1), 3)
+        XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 1, itemsPerRow: 30), 19)
+        XCTAssertEqual(TVHomeGridLayout.gridColumns(itemsPerRow: 12).count, 12)
+        XCTAssertEqual(TVHomeGridLayout.previewItemCount(rows: 1, itemsPerRow: TVHomeGridLayout.seeAllItemsPerRow), Int.max)
+        XCTAssertEqual(TVHomeGridLayout.horizontalGridRows(rowCount: 2).count, 2)
     }
 
     func testGridRowsSettingKeyAndDefaults() {
@@ -2446,6 +2469,24 @@ final class HomeLayoutSettingsTests: XCTestCase {
 
         defaults.set(5, forKey: SettingsKey.gridRows)
         XCTAssertEqual(defaults.integer(forKey: SettingsKey.gridRows), 5)
+    }
+
+    func testGridItemsPerRowSettingKeyAndDefaults() {
+        XCTAssertEqual(SettingsKey.gridItemsPerRow, "nuvio.tv.settings.layout.gridItemsPerRow")
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.gridItemsPerRow))
+
+        let defaults = UserDefaults(suiteName: "GridItemsPerRowSettingsTestsDefaults")!
+        defaults.removePersistentDomain(forName: "GridItemsPerRowSettingsTestsDefaults")
+
+        let defaultItemsPerRow = defaults.object(forKey: SettingsKey.gridItemsPerRow) as? Int
+            ?? TVHomeGridLayout.defaultItemsPerRow
+        XCTAssertEqual(defaultItemsPerRow, 7)
+
+        defaults.set(12, forKey: SettingsKey.gridItemsPerRow)
+        XCTAssertEqual(defaults.integer(forKey: SettingsKey.gridItemsPerRow), 12)
+
+        defaults.set(TVHomeGridLayout.seeAllItemsPerRow, forKey: SettingsKey.gridItemsPerRow)
+        XCTAssertTrue(TVHomeGridLayout.showsAllItems(itemsPerRow: defaults.integer(forKey: SettingsKey.gridItemsPerRow)))
     }
 
     // MARK: - Details Sections Order and Toggles (Issue #104)

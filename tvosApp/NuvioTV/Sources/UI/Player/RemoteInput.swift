@@ -5,6 +5,7 @@ import UIKit
 /// restricted to `.indirect` touches so the focus engine does not swallow pans.
 /// Active only while the player needs it (bare video / scrubbing).
 struct RemoteTouchCatcher: UIViewRepresentable {
+    let allowsSimultaneousTap: () -> Bool
     let isActive: () -> Bool
     let onBegan: () -> Void
     let onMoved: (CGFloat, CGFloat) -> Void
@@ -12,12 +13,24 @@ struct RemoteTouchCatcher: UIViewRepresentable {
 
     func makeUIView(context: Context) -> TouchHostView {
         let view = TouchHostView()
-        view.configure(isActive: isActive, onBegan: onBegan, onMoved: onMoved, onEnded: onEnded)
+        view.configure(
+            allowsSimultaneousTap: allowsSimultaneousTap,
+            isActive: isActive,
+            onBegan: onBegan,
+            onMoved: onMoved,
+            onEnded: onEnded
+        )
         return view
     }
 
     func updateUIView(_ uiView: TouchHostView, context: Context) {
-        uiView.configure(isActive: isActive, onBegan: onBegan, onMoved: onMoved, onEnded: onEnded)
+        uiView.configure(
+            allowsSimultaneousTap: allowsSimultaneousTap,
+            isActive: isActive,
+            onBegan: onBegan,
+            onMoved: onMoved,
+            onEnded: onEnded
+        )
     }
 
     static func dismantleUIView(_ uiView: TouchHostView, coordinator: ()) {
@@ -29,17 +42,20 @@ final class TouchHostView: UIView, UIGestureRecognizerDelegate {
     private var pan: UIPanGestureRecognizer?
     private weak var attachedWindow: UIWindow?
 
+    private var allowsSimultaneousTap: () -> Bool = { false }
     private var isActive: () -> Bool = { false }
     private var onBegan: () -> Void = {}
     private var onMoved: (CGFloat, CGFloat) -> Void = { _, _ in }
     private var onEnded: (CGFloat, CGFloat) -> Void = { _, _ in }
 
     func configure(
+        allowsSimultaneousTap: @escaping () -> Bool,
         isActive: @escaping () -> Bool,
         onBegan: @escaping () -> Void,
         onMoved: @escaping (CGFloat, CGFloat) -> Void,
         onEnded: @escaping (CGFloat, CGFloat) -> Void
     ) {
+        self.allowsSimultaneousTap = allowsSimultaneousTap
         self.isActive = isActive
         self.onBegan = onBegan
         self.onMoved = onMoved
@@ -82,8 +98,11 @@ final class TouchHostView: UIView, UIGestureRecognizerDelegate {
         _ g: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
     ) -> Bool {
-        if other is UILongPressGestureRecognizer || other is UITapGestureRecognizer {
+        if other is UILongPressGestureRecognizer {
             return false
+        }
+        if other is UITapGestureRecognizer {
+            return allowsSimultaneousTap()
         }
         return true
     }

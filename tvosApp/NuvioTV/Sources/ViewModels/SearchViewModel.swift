@@ -24,7 +24,11 @@ enum SearchContentType: String, CaseIterable, Identifiable {
 @MainActor
 class SearchViewModel: ObservableObject {
     @Published var searchText = ""
-    @Published var results: [NuvioMeta] = []
+    @Published var results: [NuvioMeta] = [] {
+        didSet { resultsRevision &+= 1 }
+    }
+    /// Changes whenever `results` is set (see `ReleasedTitlesMemo`).
+    private(set) var resultsRevision = 0
     @Published var isLoading = false
     @Published var error: String?
     @Published var emptyStateReason: CatalogSearchReason?
