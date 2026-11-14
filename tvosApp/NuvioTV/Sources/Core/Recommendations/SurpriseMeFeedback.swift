@@ -20,6 +20,9 @@ struct SurpriseMeFeedbackEntry: Codable, Equatable {
     let title: String
     let year: Int?
     let genres: [String]
+    /// "movie" or "series". Missing in entries saved before series were
+    /// suggested, which were all movies.
+    let type: String?
     let verdict: Verdict
     let date: Date
 
@@ -28,12 +31,13 @@ struct SurpriseMeFeedbackEntry: Codable, Equatable {
         title = meta.name
         year = meta.year
         genres = meta.genres ?? []
+        type = meta.type
         self.verdict = verdict
         self.date = date
     }
 
     var meta: NuvioMeta {
-        NuvioMeta(id: id, name: title, type: "movie", year: year, genres: genres)
+        NuvioMeta(id: id, name: title, type: type ?? "movie", year: year, genres: genres)
     }
 }
 

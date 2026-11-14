@@ -1,11 +1,12 @@
 import SwiftUI
 
-/// The Surprise Me tab: one movie chosen for the viewer's tastes, with a
-/// button to roll again. Configured in Settings > Integrations > Surprise Me.
+/// The Surprise Me tab: one movie or series chosen for the viewer's tastes,
+/// with a button to roll again. Configured in Settings > Integrations > Surprise Me.
 ///
 /// Candidates come from the catalogs on Home and, when TMDB is on, from TMDB's
-/// recommendations for the viewer's favourite movies and its well-rated movies
-/// in their favourite genres. Anything already watched, in Nuvio or a connected
+/// recommendations for the viewer's favourite titles and its well-rated movies
+/// and series in their favourite genres. Settings decide whether it suggests
+/// movies, series or both. Anything already watched, in Nuvio or a connected
 /// tracker, is left out. With an AI key, the AI chooses among those candidates
 /// and says why.
 struct SurpriseMeView: View {
@@ -17,6 +18,7 @@ struct SurpriseMeView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.surpriseMeUseTMDB) private var useTMDB = true
     @AppStorage(SettingsKey.surpriseMeUseTrackers) private var useTrackers = true
+    @AppStorage(SettingsKey.surpriseMeContent) private var contentRaw = SurpriseMeContent.all.rawValue
 
     @State private var profile = TasteProfile.empty
     @State private var history = SurpriseMeHistory.empty
@@ -32,6 +34,10 @@ struct SurpriseMeView: View {
     @State private var isThinking = false
     @State private var noMovieFound = false
     @State private var historySources: [String] = []
+    /// What the TMDB candidates and AI queue were gathered for.
+    @State private var loadedContent: SurpriseMeContent?
+
+    private var content: SurpriseMeContent { SurpriseMeContent(rawValue: contentRaw) ?? .all }
 
     private enum FocusTarget: Hashable { case surprise, open, another }
     @FocusState private var focus: FocusTarget?
@@ -49,6 +55,13 @@ struct SurpriseMeView: View {
         }
         .task(id: isActive) {
             guard isActive else { return }
+            if loadedContent != content {
+                // Movies, series or both changed in Settings: gather again.
+                loadedContent = content
+                onlineCandidates = []
+                aiQueue = []
+                noMovieFound = false
+            }
             refreshProfile()
             didLoad = true
             if useTrackers {
@@ -58,7 +71,7 @@ struct SurpriseMeView: View {
                 refreshProfile()
             }
             if useTMDB, onlineCandidates.isEmpty {
-                onlineCandidates = await SurpriseMeOnline.candidates(history: history, profile: profile)
+                onlineCandidates = await SurpriseMeOnline.candidates(history: history, profile: profile, content: content)
             }
         }
     }
@@ -89,7 +102,7 @@ struct SurpriseMeView: View {
             .disabled(isThinking)
             .focused($focus, equals: .surprise)
             if didLoad, noMovieFound {
-                Text(L10n.string("surprise_me_empty", fallback: "No unwatched movies found yet. Add movie catalogs or turn on TMDB."))
+                Text(L10n.string("surprise_me_empty", fallback: "Nothing unwatched found yet. Add catalogs or turn on TMDB."))
                     .font(.system(size: 22))
                     .foregroundColor(.white.opacity(0.65))
             }
@@ -246,7 +259,7 @@ struct SurpriseMeView: View {
         // AI picks wait in a queue, so "Another one" doesn't ask again each time.
         while let next = aiQueue.first {
             aiQueue.removeFirst()
-            guard !offered.contains(next.meta.id), !isWatched(next.meta) else { continue }
+            guard !offered.contains(next.meta.id), !isWatched(next.meta), content.allows(next.meta) else { continue }
             show(next.meta, reason: next.reason.map { "✨ \($0)" })
             return
         }
@@ -255,7 +268,7 @@ struct SurpriseMeView: View {
         if configuration.isUsable {
             let shortlist = SurpriseMe.shortlist(
                 from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
-                limit: SurpriseMeAI.maxCandidates
+                content: content, limit: SurpriseMeAI.maxCandidates
             )
             do {
                 isThinking = true
@@ -263,7 +276,7 @@ struct SurpriseMeView: View {
                 let excluded = offered.union(feedback.skipped.map(\.id))
                 let picks = await SurpriseMeAI.rank(
                     candidates: shortlist,
-                    context: SurpriseMeAIContext(profile: profile, history: history, feedback: feedback),
+                    context: SurpriseMeAIContext(profile: profile, history: history, feedback: feedback, content: content),
                     configuration: configuration,
                     language: Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier)
                         ?? "English",
@@ -282,7 +295,8 @@ struct SurpriseMeView: View {
             from: candidates,
             profile: profile,
             isWatched: isWatched,
-            excluding: offered
+            excluding: offered,
+            content: content
         ) else {
             noMovieFound = true
             return

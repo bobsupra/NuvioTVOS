@@ -47,10 +47,10 @@ final class SurpriseMeAITests: XCTestCase {
         XCTAssertTrue(prompt.contains("then watched (loved): Arrival (2016)."))
         XCTAssertTrue(prompt.contains("they opened (liked): Arrival (2016)."))
         XCTAssertTrue(prompt.contains("they skipped (avoid similar ones): Notebook (2004)."))
-        XCTAssertTrue(prompt.contains("1. Blade Runner 2049 (2017) — Sci-Fi, Drama"))
+        XCTAssertTrue(prompt.contains("1. Blade Runner 2049 (2017) [movie] — Sci-Fi, Drama"))
         XCTAssertTrue(prompt.contains("in Spanish"))
         // The AI suggests first; the list comes second.
-        let own = try? XCTUnwrap(prompt.range(of: "1. Suggest the 10 real movies"))
+        let own = try? XCTUnwrap(prompt.range(of: "1. Suggest the 10 real titles"))
         let list = try? XCTUnwrap(prompt.range(of: "2. Then choose up to 3"))
         XCTAssertNotNil(own)
         XCTAssertNotNil(list)
@@ -101,6 +101,46 @@ final class SurpriseMeAITests: XCTestCase {
             [SurpriseMeAISuggestion(title: "Contact", year: 1997, reason: "Like Arrival.")]
         )
         XCTAssertTrue(SurpriseMeAI.parseOthers(#"{"picks":[]}"#).isEmpty)
+    }
+
+    func testTheAIsSuggestionsKeepTheirKindAndUnwantedKindsAreDropped() {
+        let answer = """
+        {"others":[{"title":"Severance","year":2022,"type":"series"},{"title":"Contact","year":1997,"type":"movie"},{"title":"Heat","year":1995}]}
+        """
+        XCTAssertEqual(SurpriseMeAI.parseOthers(answer).map(\.isSeries), [true, false, false])
+        XCTAssertEqual(SurpriseMeAI.parseOthers(answer, content: .movies).map(\.title), ["Contact", "Heat"])
+        // Without a type, a series-only request counts it as a series.
+        XCTAssertEqual(SurpriseMeAI.parseOthers(answer, content: .series).map(\.title), ["Severance", "Heat"])
+    }
+
+    func testThePromptAsksForTheMixTheViewerWatches() {
+        let show = NuvioMeta(id: "s", name: "Severance", type: "series", genres: ["Drama"])
+        let profile = TasteProfile.build(
+            watched: [show, NuvioMeta(id: "s2", name: "Lost", type: "series", genres: ["Drama"]),
+                      NuvioMeta(id: "s3", name: "Dark", type: "series", genres: ["Drama"]), movie("m", "Heat", genres: ["Drama"])],
+            library: [],
+            continueWatching: []
+        )
+        let history = SurpriseMeHistory(watched: [show], library: [], continueWatching: [])
+        let both = SurpriseMeAI.prompt(
+            context: SurpriseMeAIContext(profile: profile, history: history), candidates: [show], language: "English"
+        )
+        XCTAssertTrue(both.contains("You recommend movies and series"))
+        XCTAssertTrue(both.contains("Series are 75% of what they watch"))
+        XCTAssertTrue(both.contains("1. Severance [series] — Drama"))
+        let moviesOnly = SurpriseMeAI.prompt(
+            context: SurpriseMeAIContext(profile: profile, history: history, content: .movies), candidates: [], language: "English"
+        )
+        XCTAssertTrue(moviesOnly.contains("Only movies, no series."))
+    }
+
+    func testOldFeedbackWithoutATypeReadsAsMovies() throws {
+        let json = #"[{"id":"a","title":"Arrival","year":2016,"genres":["Sci-Fi"],"verdict":"liked","date":0}]"#
+        let entries = try JSONDecoder().decode([SurpriseMeFeedbackEntry].self, from: Data(json.utf8))
+        XCTAssertEqual(entries.first?.meta.type, "movie")
+        var feedback = SurpriseMeFeedback()
+        feedback.record(NuvioMeta(id: "s", name: "Severance", type: "series"), .liked)
+        XCTAssertEqual(feedback.liked.first?.type, "series")
     }
 
     func testRequestsUseEachProvidersFormat() throws {

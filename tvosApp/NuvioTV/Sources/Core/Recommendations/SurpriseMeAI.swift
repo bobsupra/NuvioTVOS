@@ -3,10 +3,11 @@ import Security
 
 /// Optional AI help for Surprise Me, with the viewer's own API key.
 ///
-/// The AI never invents titles: it gets a numbered list of real candidates
-/// (already filtered to movies the viewer hasn't watched) and answers with
-/// the numbers it picks and a short reason. Anything else in the answer is
-/// ignored. Without a key, or when a request fails, Surprise Me picks on its own.
+/// The AI picks from a numbered list of real candidates (already filtered to
+/// titles the viewer hasn't watched) and suggests its own movies or series,
+/// each with a short reason. Its own suggestions are only kept once TMDB
+/// confirms them. Without a key, or when a request fails, Surprise Me picks on
+/// its own.
 enum SurpriseMeAIProvider: String, CaseIterable, Identifiable {
     case off = "Off"
     case gemini = "Gemini"
@@ -153,6 +154,7 @@ struct SurpriseMeAISuggestion: Equatable {
     let title: String
     let year: Int?
     let reason: String?
+    var isSeries = false
 }
 
 /// What the AI learns from: the whole taste profile, compacted, and how the
@@ -162,6 +164,8 @@ struct SurpriseMeAIContext {
     let history: SurpriseMeHistory
     /// How the viewer reacted to earlier suggestions, across sessions.
     var feedback = SurpriseMeFeedback()
+    /// Whether to suggest movies, series or both.
+    var content: SurpriseMeContent = .all
 }
 
 enum SurpriseMeAI {
@@ -193,11 +197,26 @@ enum SurpriseMeAI {
             .joined(separator: ", ")
         let list = candidates.prefix(maxCandidates).enumerated().map { index, meta in
             let genres = (meta.genres ?? []).prefix(3).joined(separator: ", ")
-            return "\(index + 1). \(title(of: meta))\(genres.isEmpty ? "" : " — \(genres)")"
+            let kind = SurpriseMeContent.kind(of: meta) == .series ? "series" : "movie"
+            return "\(index + 1). \(title(of: meta)) [\(kind)]\(genres.isEmpty ? "" : " — \(genres)")"
         }.joined(separator: "\n")
+        let what: String
+        let mix: String
+        switch context.content {
+        case .movies:
+            what = "movies"
+            mix = "Only movies, no series."
+        case .series:
+            what = "series"
+            mix = "Only TV series, no movies."
+        case .all:
+            what = "movies and series"
+            let share = Int((context.profile.seriesShare * 100).rounded())
+            mix = "Series are \(share)% of what they watch: mix movies and series in about that proportion."
+        }
         return """
-        You recommend movies to one viewer. Learn their taste from everything below: \
-        directors, actors, eras, tone and themes, not only genres.
+        You recommend \(what) to one viewer. Learn their taste from everything below: \
+        directors, creators, actors, eras, tone and themes, not only genres.
 
         Genre shares of what they watch: \(genres.isEmpty ? "unknown yet" : genres).
         Watched (most recent first): \(titles(context.history.watched, limit: maxWatchedTitles)).
@@ -207,16 +226,17 @@ enum SurpriseMeAI {
         Earlier suggestions they opened (liked): \(titles(context.feedback.liked, limit: maxFeedbackTitles)).
         Earlier suggestions they skipped (avoid similar ones): \(titles(context.feedback.skipped, limit: maxFeedbackTitles)).
 
-        1. Suggest the \(maxOutsideSuggestions) real movies they are most likely to love, best first, \
-        from everything you know. Never anything already watched or listed above. \
-        Give the exact original title and release year.
+        1. Suggest the \(maxOutsideSuggestions) real titles they are most likely to love, best first, \
+        from everything you know. \(mix) Never anything already watched or listed above. \
+        Give the exact original title, the release year (first air year for a series) and \
+        "type": "movie" or "series".
 
-        2. Then choose up to \(maxListPicks) movies from this numbered list of recent or available \
+        2. Then choose up to \(maxListPicks) titles from this numbered list of recent or available \
         titles that also fit them. Only use numbers from the list.
         \(list)
 
         Answer with JSON only: \
-        {"picks":[{"number":1,"reason":"..."}],"others":[{"title":"...","year":2016,"reason":"..."}]}. \
+        {"picks":[{"number":1,"reason":"..."}],"others":[{"title":"...","year":2016,"type":"movie","reason":"..."}]}. \
         Each reason is one short sentence in \(language) that mentions what they watched when it helps.
         """
     }
@@ -233,6 +253,7 @@ enum SurpriseMeAI {
         struct Other: Decodable {
             let title: String
             let year: Int?
+            let type: String?
             let reason: String?
         }
         let picks: [Pick]?
@@ -262,13 +283,19 @@ enum SurpriseMeAI {
     }
 
     /// The AI's own suggestions outside the list, still to be confirmed on TMDB.
-    static func parseOthers(_ text: String) -> [SurpriseMeAISuggestion] {
+    /// Without a type they count as movies, unless only series are wanted.
+    /// Kinds that aren't wanted are dropped.
+    static func parseOthers(_ text: String, content: SurpriseMeContent = .all) -> [SurpriseMeAISuggestion] {
         guard let others = answer(from: text)?.others else { return [] }
         var seen = Set<String>()
         return others.prefix(maxOutsideSuggestions).compactMap { other in
             let title = other.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !title.isEmpty, seen.insert(title.lowercased()).inserted else { return nil }
-            return SurpriseMeAISuggestion(title: title, year: other.year, reason: cleaned(other.reason))
+            let type = other.type?.lowercased() ?? ""
+            let isSeries = type.isEmpty ? content == .series : NuvioMeta.isSeriesType(type)
+            guard !title.isEmpty,
+                  isSeries ? content.includesSeries : content.includesMovies,
+                  seen.insert("\(isSeries ? "s" : "m"):\(title.lowercased())").inserted else { return nil }
+            return SurpriseMeAISuggestion(title: title, year: other.year, reason: cleaned(other.reason), isSeries: isSeries)
         }
     }
 
@@ -291,7 +318,7 @@ enum SurpriseMeAI {
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let answer = responseText(from: data, provider: configuration.provider) else { return [] }
         let listPicks = Array(parse(answer, candidates: shortlist).prefix(maxListPicks))
-        let own = await confirm(parseOthers(answer)).filter { !isWatched($0.meta) }
+        let own = await confirm(parseOthers(answer, content: context.content)).filter { !isWatched($0.meta) }
         return merge(own: own, list: listPicks)
     }
 
@@ -320,7 +347,9 @@ enum SurpriseMeAI {
         return await withTaskGroup(of: (Int, SurpriseMeAIPick?).self) { group in
             for (index, suggestion) in suggestions.enumerated() {
                 group.addTask {
-                    let meta = await TmdbDetailsService.surpriseMeFindMovie(title: suggestion.title, year: suggestion.year)
+                    let meta = suggestion.isSeries
+                        ? await TmdbDetailsService.surpriseMeFindSeries(title: suggestion.title, year: suggestion.year)
+                        : await TmdbDetailsService.surpriseMeFindMovie(title: suggestion.title, year: suggestion.year)
                     return (index, meta.map { SurpriseMeAIPick(meta: $0, reason: suggestion.reason) })
                 }
             }

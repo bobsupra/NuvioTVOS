@@ -77,9 +77,44 @@ final class SurpriseMeTests: XCTestCase {
             profile: .empty,
             isWatched: { $0.id == "seen" },
             excluding: ["offered"],
+            content: .movies,
             random: { 0 }
         )
         XCTAssertEqual(pick?.id, "fresh")
+    }
+
+    private func series(_ id: String, _ genres: [String], rating: Double? = nil) -> NuvioMeta {
+        NuvioMeta(id: id, name: id, type: "series", genres: genres, rating: rating)
+    }
+
+    func testSeriesAreSuggestedByDefaultAndCanBeTheOnlyKind() {
+        let candidates = [movie("film", ["Action"], rating: 9), series("show", ["Action"], rating: 5)]
+        let both = SurpriseMe.shortlist(
+            from: candidates, profile: .empty, isWatched: { _ in false }, excluding: [], limit: 10
+        )
+        XCTAssertEqual(both.map(\.id), ["film", "show"])
+        XCTAssertEqual(
+            SurpriseMe.pick(from: candidates, profile: .empty, isWatched: { _ in false }, content: .series, random: { 0 })?.id,
+            "show"
+        )
+        XCTAssertEqual(
+            SurpriseMe.pick(from: candidates, profile: .empty, isWatched: { _ in false }, content: .movies, random: { 0 })?.id,
+            "film"
+        )
+    }
+
+    func testSomeoneWhoMostlyWatchesSeriesGetsSeriesFirst() {
+        let profile = TasteProfile.build(
+            watched: [series("s1", ["Drama"]), series("s2", ["Drama"]), series("s3", ["Drama"]), movie("m1", ["Drama"])],
+            library: [],
+            continueWatching: []
+        )
+        XCTAssertEqual(profile.seriesShare, 0.75, accuracy: 0.0001)
+        let candidates = [movie("film", ["Drama"], rating: 8), series("show", ["Drama"], rating: 8)]
+        XCTAssertEqual(
+            SurpriseMe.pick(from: candidates, profile: profile, isWatched: { _ in false }, random: { 0 })?.id,
+            "show"
+        )
     }
 
     func testWithoutHistoryTheBestRatedComesFirst() {

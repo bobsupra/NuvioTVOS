@@ -1919,18 +1919,25 @@ extension TmdbDetailsService {
         10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
     ]
 
-    static func surpriseMeGenreID(for name: String) -> Int? {
+    static func surpriseMeGenreID(for name: String, series: Bool = false) -> Int? {
         let key = TasteProfile.normalized(name)
-        return surpriseMeMovieGenres.first { TasteProfile.normalized($0.value) == key }?.key
+        // TMDB joins some genres for TV: "Action & Adventure", "Sci-Fi & Fantasy", "War & Politics".
+        if series, let joined = ["adventure": 10759, "fantasy": 10765, "politics": 10768][key] { return joined }
+        let genres = series ? surpriseMeTVGenres : surpriseMeMovieGenres
+        return genres.first { TasteProfile.normalized($0.value) == key }?.key
     }
 
     /// Whether TMDB is turned on with a key in Settings > Integrations.
     static var isAvailableForSurpriseMe: Bool { isEnabled && apiKey != nil }
 
-    /// Movies TMDB recommends to people who liked `meta`.
+    /// Movies or series TMDB recommends to people who liked `meta`, of the same kind.
     static func surpriseMeRecommendations(for meta: NuvioMeta) async -> [NuvioMeta] {
-        guard isEnabled, let apiKey,
-              let resolved = await resolveTmdbId(for: meta), resolved.mediaType == "movie" else { return [] }
+        guard isEnabled, let apiKey, let resolved = await resolveTmdbId(for: meta) else { return [] }
+        if resolved.mediaType == "tv" {
+            return await surpriseMeTitles(
+                path: "tv/\(resolved.id)/recommendations", query: [:], apiKey: apiKey, type: "series"
+            )
+        }
         return await surpriseMeMovies(path: "movie/\(resolved.id)/recommendations", query: [:], apiKey: apiKey)
     }
 
@@ -1956,18 +1963,19 @@ extension TmdbDetailsService {
         }
     }
 
-    /// Well-rated movies in any of `genres`, most popular first.
-    static func surpriseMeDiscover(genres: [String], page: Int = 1) async -> [NuvioMeta] {
+    /// Well-rated movies (or series) in any of `genres`, most popular first.
+    static func surpriseMeDiscover(genres: [String], page: Int = 1, series: Bool = false) async -> [NuvioMeta] {
         guard isEnabled, let apiKey else { return [] }
-        let ids = genres.compactMap(surpriseMeGenreID(for:))
+        let ids = Array(Set(genres.compactMap { surpriseMeGenreID(for: $0, series: series) })).sorted()
         guard !ids.isEmpty else { return [] }
-        return await surpriseMeMovies(path: "discover/movie", query: [
+        return await surpriseMeTitles(path: series ? "discover/tv" : "discover/movie", query: [
             "with_genres": ids.map(String.init).joined(separator: "|"),
             "sort_by": "popularity.desc",
             "vote_average.gte": "6.5",
-            "vote_count.gte": "300",
+            // Series get fewer votes than movies.
+            "vote_count.gte": series ? "150" : "300",
             "page": String(max(1, page)),
-        ], apiKey: apiKey)
+        ], apiKey: apiKey, type: series ? "series" : "movie")
     }
 
     /// TMDB's TV genre ids, with the names Nuvio's catalogs use.

@@ -195,6 +195,7 @@ enum SettingsKey {
     static let showSurpriseMeTab = "nuvio.tv.settings.layout.showSurpriseMeTab"
     static let surpriseMeUseTMDB = "nuvio.tv.settings.integrations.surpriseMeUseTMDB"
     static let surpriseMeUseTrackers = "nuvio.tv.settings.integrations.surpriseMeUseTrackers"
+    static let surpriseMeContent = "nuvio.tv.settings.integrations.surpriseMeContent"
     static let surpriseMeAIProvider = "nuvio.tv.settings.integrations.surpriseMeAIProvider"
     static let surpriseMeAIModel = "nuvio.tv.settings.integrations.surpriseMeAIModel"
     static let aiCatalogMovies = "nuvio.tv.settings.integrations.aiCatalogMovies"
@@ -456,7 +457,7 @@ enum SettingsKey {
         homeLayout, sidebarClockFormat, gridRows, gridItemsPerRow, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, homeHeroRatingsEnabled, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
-        showCalendarTab, showSurpriseMeTab, surpriseMeUseTMDB, surpriseMeUseTrackers, surpriseMeAIProvider, surpriseMeAIModel, aiCatalogMovies, aiCatalogSeries, aiCatalogAnimeMovies, aiCatalogAnimeSeries, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
+        showCalendarTab, showSurpriseMeTab, surpriseMeUseTMDB, surpriseMeUseTrackers, surpriseMeContent, surpriseMeAIProvider, surpriseMeAIModel, aiCatalogMovies, aiCatalogSeries, aiCatalogAnimeMovies, aiCatalogAnimeSeries, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -5957,14 +5958,14 @@ private struct IntegrationSettingsView: View {
                 title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
                 subtitle: L10n.string(
                     "surprise_me_integration_subtitle",
-                    fallback: "Movie suggestions that learn from what you watch"
+                    fallback: "Movie and series suggestions that learn from what you watch"
                 )
             ) {
                 SettingsActionRow(
                     title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
                     subtitle: L10n.string(
                         "surprise_me_integration_action_subtitle",
-                        fallback: "Learns from your history and trackers, finds movies on TMDB, and can use your own AI key"
+                        fallback: "Learns from your history and trackers, finds titles on TMDB, and can use your own AI key"
                     ),
                     value: showSurpriseMeTab ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
                     accentColor: accentColor
@@ -8506,6 +8507,7 @@ private struct SurpriseMeOptionsSheet: View {
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showTab = false
     @AppStorage(SettingsKey.surpriseMeUseTMDB) private var useTMDB = true
     @AppStorage(SettingsKey.surpriseMeUseTrackers) private var useTrackers = true
+    @AppStorage(SettingsKey.surpriseMeContent) private var content = SurpriseMeContent.all.rawValue
     @AppStorage(SettingsKey.surpriseMeAIProvider) private var provider = SurpriseMeAIProvider.off.rawValue
     @AppStorage(SettingsKey.surpriseMeAIModel) private var model = ""
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
@@ -8556,7 +8558,7 @@ private struct SurpriseMeOptionsSheet: View {
                             .foregroundColor(.white)
                         Text(L10n.string(
                             "surprise_me_sheet_description",
-                            fallback: "A tab that suggests movies you haven't seen, chosen for your tastes. It learns from this profile's watch history, library and Continue Watching."
+                            fallback: "A tab that suggests movies and series you haven't seen, chosen for your tastes. It learns from this profile's watch history, library and Continue Watching."
                         ))
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.62))
@@ -8582,6 +8584,17 @@ private struct SurpriseMeOptionsSheet: View {
                         title: L10n.string("surprise_me_group_sources", fallback: "Where suggestions come from"),
                         subtitle: L10n.string("surprise_me_group_sources_subtitle", fallback: "Anything you already watched is always left out")
                     ) {
+                        SettingsOptionRow(
+                            title: L10n.string("surprise_me_content", fallback: "Suggest"),
+                            subtitle: L10n.string(
+                                "surprise_me_content_subtitle",
+                                fallback: "With both, you get more of what you watch most"
+                            ),
+                            selection: $content,
+                            options: SurpriseMeContent.allCases.map(\.rawValue),
+                            accentColor: accentColor,
+                            optionLabel: { SurpriseMeContent(rawValue: $0)?.label ?? $0 }
+                        )
                         SettingsToggleRow(
                             title: L10n.string("surprise_me_use_trackers", fallback: "Learn from connected trackers"),
                             subtitle: L10n.string(
@@ -8592,9 +8605,9 @@ private struct SurpriseMeOptionsSheet: View {
                             accentColor: accentColor
                         )
                         SettingsToggleRow(
-                            title: L10n.string("surprise_me_use_tmdb", fallback: "Find movies on TMDB"),
+                            title: L10n.string("surprise_me_use_tmdb", fallback: "Find titles on TMDB"),
                             subtitle: tmdbReady
-                                ? L10n.string("surprise_me_use_tmdb_subtitle", fallback: "Add TMDB's recommendations for your favourite movies and well-rated movies in your favourite genres, not only your Home catalogs")
+                                ? L10n.string("surprise_me_use_tmdb_subtitle", fallback: "Add TMDB's recommendations for your favourite titles and well-rated ones in your favourite genres, not only your Home catalogs")
                                 : L10n.string("surprise_me_use_tmdb_unavailable", fallback: "Turn on TMDB with an API key in Integrations > Metadata Providers to use this"),
                             isOn: $useTMDB,
                             accentColor: accentColor,
@@ -8606,7 +8619,7 @@ private struct SurpriseMeOptionsSheet: View {
                         title: L10n.string("surprise_me_group_ai", fallback: "AI (optional)"),
                         subtitle: L10n.string(
                             "surprise_me_group_ai_subtitle",
-                            fallback: "With your own key, an AI learns your taste from your whole history, chooses among the movies found and suggests others, and says why. Its own suggestions are checked on TMDB, so it never shows something that doesn't exist or that you've already watched."
+                            fallback: "With your own key, an AI learns your taste from your whole history, chooses among the titles found and suggests others, and says why. Its own suggestions are checked on TMDB, so it never shows something that doesn't exist or that you've already watched."
                         )
                     ) {
                         SettingsOptionRow(
@@ -8663,7 +8676,7 @@ private struct SurpriseMeOptionsSheet: View {
                             .opacity(models.count <= 1 ? 0.6 : 1)
                             Text(L10n.string(
                                 "surprise_me_ai_privacy",
-                                fallback: "When you press Surprise Me, the provider you chose receives, with your key: the titles and years of up to 120 movies and shows you watched, 60 you saved and 20 you're watching, your genre shares, which suggestions you opened or skipped this session, and the candidate movies. The AI learns your taste from all of it, picks from the candidates and can suggest other movies, which are shown only if TMDB confirms they exist and you haven't watched them. Your key stays in this Apple TV's Keychain and never syncs."
+                                fallback: "When you press Surprise Me, the provider you chose receives, with your key: the titles and years of up to 120 movies and shows you watched, 60 you saved and 20 you're watching, your genre shares, which suggestions you opened or skipped this session, and the candidate titles. The AI learns your taste from all of it, picks from the candidates and can suggest other movies and series, which are shown only if TMDB confirms they exist and you haven't watched them. Your key stays in this Apple TV's Keychain and never syncs."
                             ))
                             .font(.system(size: 17, weight: .medium))
                             .foregroundColor(.white.opacity(0.56))
@@ -8747,7 +8760,7 @@ private struct SurpriseMeOptionsSheet: View {
         } message: {
             Text(L10n.string(
                 "surprise_me_consent_message",
-                fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, including what your connected trackers (Trakt, Simkl, MDBList, WeTrakr) report, and suggests movies you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else unless you add an AI key below. A Surprise Me tab will be added to the menu."
+                fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, including what your connected trackers (Trakt, Simkl, MDBList, WeTrakr) report, and suggests movies and series you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else unless you add an AI key below. A Surprise Me tab will be added to the menu."
             ))
         }
         .alert(
@@ -8762,7 +8775,7 @@ private struct SurpriseMeOptionsSheet: View {
         } message: {
             Text(L10n.string(
                 "surprise_me_ai_consent_message",
-                fallback: "Each time Surprise Me asks the AI, the titles of what you watched, saved and are watching (up to 200), your genre shares, how you reacted to this session's suggestions and a list of candidate movies are sent to the AI provider with your API key. Requests use your provider's quota."
+                fallback: "Each time Surprise Me asks the AI, the titles of what you watched, saved and are watching (up to 200), your genre shares, how you reacted to this session's suggestions and a list of candidate titles are sent to the AI provider with your API key. Requests use your provider's quota."
             ))
         }
     }

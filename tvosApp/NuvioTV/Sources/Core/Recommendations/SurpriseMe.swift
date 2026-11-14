@@ -14,6 +14,10 @@ struct TasteProfile: Equatable {
     let topGenres: [String]
     /// Display name for each normalized genre key.
     var displayNames: [String: String] = [:]
+    /// Share of series among the titles the viewer watched, saved or is
+    /// watching (0...1), so someone who mostly watches series gets mostly
+    /// series. 0.5 when there is no history yet.
+    var seriesShare: Double = 0.5
 
     func displayName(for key: String) -> String { displayNames[key] ?? key }
 
@@ -64,13 +68,19 @@ struct TasteProfile: Equatable {
         add(feedback.skipped, weight: skippedSuggestionWeight)
         totals = totals.filter { $0.value > 0 }
 
+        let titles = SurpriseMeHistory.unique(watched + library + continueWatching)
+            .filter { SurpriseMeContent.kind(of: $0) != nil }
+        let seriesCount = titles.filter { SurpriseMeContent.kind(of: $0) == .series }.count
+        let seriesShare = titles.isEmpty ? 0.5 : Double(seriesCount) / Double(titles.count)
+
         let sum = totals.values.reduce(0, +)
         guard sum > 0 else { return .empty }
         let ordered = totals.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
         return TasteProfile(
             weights: totals.mapValues { $0 / sum },
             topGenres: ordered.prefix(3).compactMap { names[$0.key] },
-            displayNames: names
+            displayNames: names,
+            seriesShare: seriesShare
         )
     }
 
@@ -127,53 +137,99 @@ enum SurpriseMeTrackers {
     }
 }
 
+/// What Surprise Me may suggest: movies and series (the default), or only one
+/// of them. Chosen in Settings > Integrations > Surprise Me.
+enum SurpriseMeContent: String, CaseIterable, Identifiable {
+    case all = "All"
+    case movies = "Movies"
+    case series = "Series"
+
+    enum Kind { case movie, series }
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .all: return L10n.string("surprise_me_content_all", fallback: "Movies and series")
+        case .movies: return L10n.string("surprise_me_content_movies", fallback: "Movies")
+        case .series: return L10n.string("surprise_me_content_series", fallback: "Series")
+        }
+    }
+
+    /// Movie or series; nil for anything else (channels, TV, events).
+    static func kind(of meta: NuvioMeta) -> Kind? {
+        if AddonTransportUrls.isTypeEquivalent(meta.type, "movie") { return .movie }
+        if NuvioMeta.isSeriesType(meta.type) { return .series }
+        return nil
+    }
+
+    func allows(_ meta: NuvioMeta) -> Bool {
+        guard let kind = Self.kind(of: meta) else { return false }
+        switch self {
+        case .all: return true
+        case .movies: return kind == .movie
+        case .series: return kind == .series
+        }
+    }
+
+    var includesMovies: Bool { self != .series }
+    var includesSeries: Bool { self != .movies }
+
+    static func current(defaults: UserDefaults = ProfileSettings.current) -> SurpriseMeContent {
+        SurpriseMeContent(rawValue: defaults.string(forKey: SettingsKey.surpriseMeContent) ?? "") ?? .all
+    }
+}
+
 enum SurpriseMe {
     /// Random among this many of the best matches, so the pick varies.
     static let shortlistSize = 12
 
-    static func isMovie(_ meta: NuvioMeta) -> Bool {
-        AddonTransportUrls.isTypeEquivalent(meta.type, "movie")
-    }
-
-    /// Taste match first, the title's rating as a smaller part.
+    /// Taste match first, then the title's rating, then whether it is the kind
+    /// the viewer watches more (movies or series).
     static func score(_ meta: NuvioMeta, profile: TasteProfile) -> Double {
         let rating = min(max((meta.rating ?? 0) / 10, 0), 1)
-        return profile.isEmpty ? rating : profile.affinity(for: meta) * 0.75 + rating * 0.25
+        guard !profile.isEmpty else { return rating }
+        let kindFit = SurpriseMeContent.kind(of: meta) == .series ? profile.seriesShare : 1 - profile.seriesShare
+        return profile.affinity(for: meta) * 0.65 + rating * 0.2 + kindFit * 0.15
     }
 
-    /// A movie the viewer hasn't watched and wasn't just offered, picked at
-    /// random among the best matches for their tastes. With no history yet,
-    /// the best rated ones.
+    /// A movie or series the viewer hasn't watched and wasn't just offered,
+    /// picked at random among the best matches for their tastes. With no
+    /// history yet, the best rated ones.
     static func pick(
         from candidates: [NuvioMeta],
         profile: TasteProfile,
         isWatched: (NuvioMeta) -> Bool,
         excluding offered: Set<String> = [],
+        content: SurpriseMeContent = .all,
         random: () -> Double = { Double.random(in: 0..<1) }
     ) -> NuvioMeta? {
         let shortlist = shortlist(
-            from: candidates, profile: profile, isWatched: isWatched, excluding: offered, limit: shortlistSize
+            from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
+            content: content, limit: shortlistSize
         )
         guard !shortlist.isEmpty else { return nil }
         let index = min(shortlist.count - 1, Int(random() * Double(shortlist.count)))
         return shortlist[index]
     }
 
-    /// Unwatched movies, best matches first, one per title. Titles not offered
-    /// yet come first; offered ones only when nothing else is left.
+    /// Unwatched titles of the allowed kinds, best matches first, one per
+    /// title. Titles not offered yet come first; offered ones only when nothing
+    /// else is left.
     static func shortlist(
         from candidates: [NuvioMeta],
         profile: TasteProfile,
         isWatched: (NuvioMeta) -> Bool,
         excluding offered: Set<String>,
+        content: SurpriseMeContent = .all,
         limit: Int
     ) -> [NuvioMeta] {
         var seen = Set<String>()
-        let movies = candidates.filter {
-            isMovie($0) && seen.insert(SurpriseMeHistory.titleKey($0)).inserted && !isWatched($0)
+        let titles = candidates.filter {
+            content.allows($0) && seen.insert(SurpriseMeHistory.titleKey($0)).inserted && !isWatched($0)
         }
-        let fresh = movies.filter { !offered.contains($0.id) }
-        let pool = fresh.isEmpty ? movies : fresh
+        let fresh = titles.filter { !offered.contains($0.id) }
+        let pool = fresh.isEmpty ? titles : fresh
         return pool
             .map { (meta: $0, score: score($0, profile: profile)) }
             .sorted { $0.score == $1.score ? $0.meta.id < $1.meta.id : $0.score > $1.score }
@@ -210,9 +266,10 @@ struct SurpriseMeHistory {
         Self.unique(watched + continueWatching + library)
     }
 
-    /// Movies from the history to ask TMDB for recommendations about.
-    var seedMovies: [NuvioMeta] {
-        Self.unique(watched + library).filter(SurpriseMe.isMovie)
+    /// Titles from the history to ask TMDB for recommendations about, most
+    /// recent first, of the kinds Surprise Me may suggest.
+    func seeds(for content: SurpriseMeContent) -> [NuvioMeta] {
+        Self.unique(watched + library).filter(content.allows)
     }
 
     /// One entry per title, first occurrence kept. Two entries are the same
@@ -276,23 +333,34 @@ enum SurpriseMeLibraries {
     }
 }
 
-/// Candidates from TMDB: its recommendations for the viewer's latest movies,
-/// and well-rated movies in their favourite genres. Needs TMDB turned on in
-/// Settings > Integrations; otherwise Surprise Me uses the catalogs on Home only.
+/// Candidates from TMDB: its recommendations for the viewer's latest movies
+/// and series, and well-rated ones in their favourite genres. Needs TMDB turned
+/// on in Settings > Integrations; otherwise Surprise Me uses the catalogs on
+/// Home only.
 enum SurpriseMeOnline {
-    static let seedCount = 5
+    static let seedCount = 6
 
-    static func candidates(history: SurpriseMeHistory, profile: TasteProfile) async -> [NuvioMeta] {
+    static func candidates(
+        history: SurpriseMeHistory,
+        profile: TasteProfile,
+        content: SurpriseMeContent = .all
+    ) async -> [NuvioMeta] {
         guard TmdbDetailsService.isAvailableForSurpriseMe else { return [] }
-        let seeds = Array(history.seedMovies.prefix(seedCount))
+        let seeds = Array(history.seeds(for: content).prefix(seedCount))
         let genres = Array(profile.topGenres.prefix(3))
         return await withTaskGroup(of: [NuvioMeta].self) { group in
             for seed in seeds {
                 group.addTask { await TmdbDetailsService.surpriseMeRecommendations(for: seed) }
             }
             if !genres.isEmpty {
-                group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres) }
-                group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres, page: 2) }
+                if content.includesMovies {
+                    group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres) }
+                    group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres, page: 2) }
+                }
+                if content.includesSeries {
+                    group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres, series: true) }
+                    group.addTask { await TmdbDetailsService.surpriseMeDiscover(genres: genres, page: 2, series: true) }
+                }
             }
             var all: [NuvioMeta] = []
             for await batch in group { all += batch }
