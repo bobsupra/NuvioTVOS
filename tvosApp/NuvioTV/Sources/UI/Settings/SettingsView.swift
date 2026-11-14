@@ -15528,6 +15528,92 @@ private struct JellyfinLibrarySelectionSheet: View {
 
 // MARK: - Addons (moved here from the former Addons tab)
 
+/// Installed add-ons that declare Stremio's `player` or `library` resource.
+/// They receive the user's watch activity, so each one stays off until the
+/// user turns it on here. Hidden when none is installed.
+private struct TrackingAddonsSettingsGroup: View {
+    struct Entry: Identifiable, Equatable {
+        let manifestURL: URL
+        let name: String
+        let tracksPlayback: Bool
+        let tracksLibrary: Bool
+        var id: String { manifestURL.absoluteString }
+    }
+
+    let accentColor: Color
+    let addonsSignature: String
+
+    @State private var entries: [Entry] = []
+    @State private var approved: Set<String> = TrackingAddonService.approvedManifestURLs()
+
+    var body: some View {
+        Group {
+            if !entries.isEmpty {
+                SettingsGroup(
+                    title: L10n.string("tvos_settings_tracking_addons", fallback: "Tracking Add-ons"),
+                    subtitle: L10n.string(
+                        "tvos_settings_tracking_addons_subtitle",
+                        fallback: "These add-ons can follow what you watch for a tracking service. Turning one on shares your playback and library activity (what you watch, when and how far) with it."
+                    )
+                ) {
+                    ForEach(entries) { entry in
+                        SettingsToggleRow(
+                            title: entry.name,
+                            subtitle: subtitle(for: entry),
+                            isOn: binding(for: entry),
+                            accentColor: accentColor
+                        )
+                    }
+                }
+            }
+        }
+        .task(id: addonsSignature) {
+            await loadEntries()
+        }
+    }
+
+    private func subtitle(for entry: Entry) -> String {
+        var parts: [String] = []
+        if entry.tracksPlayback {
+            parts.append(L10n.string("tvos_settings_tracking_addons_playback", fallback: "Playback"))
+        }
+        if entry.tracksLibrary {
+            parts.append(L10n.string("tvos_settings_tracking_addons_library", fallback: "Library"))
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    private func binding(for entry: Entry) -> Binding<Bool> {
+        Binding(
+            get: { approved.contains(entry.id) },
+            set: { isOn in
+                TrackingAddonService.setApproved(isOn, manifestURL: entry.manifestURL)
+                approved = TrackingAddonService.approvedManifestURLs()
+            }
+        )
+    }
+
+    private func loadEntries() async {
+        let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+        var loaded: [Entry] = []
+        for manifestURL in manifestURLs {
+            guard let manifest = await TrackingAddonService.manifest(for: manifestURL),
+                  manifest.isTrackingAddon else { continue }
+            let name = manifest.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            loaded.append(Entry(
+                manifestURL: manifestURL,
+                name: (name?.isEmpty == false ? name : nil)
+                    ?? CinemetaCatalogRepository.streamAddonName(for: manifestURL),
+                tracksPlayback: manifest.tracksPlayback,
+                tracksLibrary: manifest.tracksLibrary
+            ))
+        }
+        guard !Task.isCancelled else { return }
+        entries = loaded
+        approved = TrackingAddonService.approvedManifestURLs()
+    }
+}
+
 private struct AddonsSettingsSection: View {
     let accentColor: Color
     var onSyncedAddonsChange: (([SyncedAddon]) -> Void)? = nil
@@ -15653,6 +15739,11 @@ private struct AddonsSettingsSection: View {
                     )
                 }
             }
+
+            TrackingAddonsSettingsGroup(
+                accentColor: accentColor,
+                addonsSignature: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates
+            )
         }
         .task(id: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates) {
             await loadSyncedAddons()

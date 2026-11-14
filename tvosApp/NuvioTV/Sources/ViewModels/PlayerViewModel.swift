@@ -201,6 +201,7 @@ class PlayerViewModel: ObservableObject {
             if status == .playing {
                 tryPresentContentWarningsIfReady()
             }
+            if status != oldValue { reportTrackingAddonState() }
             if case .error = status, oldValue != status {
                 PlaybackTimelineRecorder.record(.playbackError, engine: activeEngineKind)
             }
@@ -223,6 +224,30 @@ class PlayerViewModel: ObservableObject {
         }
     }
     private var scenePauseIntentPending = false
+    private let trackingAddonReporter = TrackingAddonPlaybackReporter()
+
+    /// The item Stremio tracking add-ons receive events for: the episode's video
+    /// id for series (e.g. `tt0898266:9:17`), the meta id for movies.
+    private var trackingAddonItem: TrackingAddonPlaybackReporter.Item? {
+        guard isTrackablePlayback, !isLiveStream, let activeMeta else { return nil }
+        let videoId = activeMeta.isSeries ? (currentEpisodeVideo?.id ?? activeMeta.id) : activeMeta.id
+        return TrackingAddonPlaybackReporter.Item(type: activeMeta.type, videoId: videoId)
+    }
+
+    /// Stremio tracking add-ons get `start` while playing and `pause` while paused;
+    /// `stop` goes out when the player closes, the video changes or it ends.
+    private func reportTrackingAddonState() {
+        let action: TrackingAddonService.PlayerAction
+        switch status {
+        case .playing: action = .start
+        case .paused: action = .pause
+        case .ended: action = .stop
+        default: return
+        }
+        guard let item = trackingAddonItem else { return }
+        let duration = time.duration > 0 ? time.duration : clock.duration
+        trackingAddonReporter.report(action, item: item, currentTime: time.current, duration: duration)
+    }
     private var scenePauseAlreadyNotified = false
     private var lastPlaybackIssueReportUptime = -Double.infinity
     var time: PlayerTime = PlayerTime()
@@ -4772,6 +4797,7 @@ class PlayerViewModel: ObservableObject {
             cancelPauseOverlaySchedule()
             return
         }
+        trackingAddonReporter.stop(currentTime: time.current, duration: time.duration)
         rememberManualSourceIfReady(refreshTimestamp: true)
         detachWatchPartyPlayerBridge()
         cancelPendingAdvanceResolution()
@@ -5056,6 +5082,7 @@ class PlayerViewModel: ObservableObject {
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
         let prevCurrent = time.current
+        trackingAddonReporter.seeked(to: target, duration: duration)
         seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s, exact: \(exact))")
         screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds), exact: \(exact)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
         engine.seekToMs(Int64(target * 1000), exact: exact)

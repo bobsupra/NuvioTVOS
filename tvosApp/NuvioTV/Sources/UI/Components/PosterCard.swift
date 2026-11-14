@@ -3663,13 +3663,15 @@ struct TitleActionsMenuContent: View {
 
     private func toggleLibrary(currentlyInLibrary: Bool) {
         guard TraktSettingsStore.librarySourceMode != .local else {
-            _ = LibraryStore.toggle(meta: meta)
+            let isInLibrary = LibraryStore.toggle(meta: meta)
+            TrackingAddonService.sendLibraryMembership(isInLibrary, meta: meta)
             return
         }
 
         guard SelectedLibraryService.isSelectedAndAuthenticated else { return }
 
         let desiredMembership = !currentlyInLibrary
+        TrackingAddonService.sendLibraryMembership(desiredMembership, meta: meta)
         Task {
             _ = await SelectedLibraryService.setWatchlist(
                 meta,
@@ -3679,6 +3681,7 @@ struct TitleActionsMenuContent: View {
     }
 
     private func scheduleWatchedToggle(desiredIsWatched: Bool) {
+        TrackingAddonService.sendWatched(desiredIsWatched, meta: meta)
         let capturedContext = libraryWatchedContext?.recaptureForCurrentAction()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
             guard libraryWatchedContext != nil else {
