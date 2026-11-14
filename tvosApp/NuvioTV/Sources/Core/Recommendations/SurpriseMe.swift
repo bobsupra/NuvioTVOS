@@ -161,11 +161,15 @@ enum SurpriseMe {
         }
         let fresh = movies.filter { !offered.contains($0.id) }
         let pool = fresh.isEmpty ? movies : fresh
-        return pool
-            .map { (meta: $0, score: score($0, profile: profile)) }
-            .sorted { $0.score == $1.score ? $0.meta.id < $1.meta.id : $0.score > $1.score }
-            .prefix(limit)
-            .map(\.meta)
+        // Typed in steps: as one chained expression, this exceeds the type
+        // checker's time limit on Xcode 27.1 and fails the build.
+        let scored: [(meta: NuvioMeta, score: Double)] = pool.map { meta in
+            (meta: meta, score: score(meta, profile: profile))
+        }
+        let ranked = scored.sorted { (lhs: (meta: NuvioMeta, score: Double), rhs: (meta: NuvioMeta, score: Double)) -> Bool in
+            lhs.score == rhs.score ? lhs.meta.id < rhs.meta.id : lhs.score > rhs.score
+        }
+        return ranked.prefix(limit).map(\.meta)
     }
 }
 
