@@ -293,7 +293,7 @@ private enum DetailsReturnDestination {
 }
 
 enum TVTab: Hashable, Identifiable, CaseIterable {
-    case profile, home, party, search, library, calendar, settings, liveTV
+    case profile, home, party, search, library, calendar, settings, liveTV, surprise
     case collection(CollectionHomeID)
 
     static var allCases: [Self] {
@@ -302,6 +302,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         tabs += [.search, .library]
         if ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
         if isCalendarEnabled { tabs.append(.calendar) }
+        if ProfileSettings.current.bool(forKey: SettingsKey.showSurpriseMeTab) { tabs.append(.surprise) }
         tabs.append(.settings)
         return tabs
     }
@@ -327,6 +328,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .settings: return "Settings"
         case .party: return "Watch Party"
         case .liveTV: return "Live TV"
+        case .surprise: return "Surprise Me"
         case .collection(let id): return "Collection:\(id.key)"
         }
     }
@@ -340,6 +342,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .settings: return L10n.string("nav_settings", fallback: "Settings")
         case .party: return L10n.string("nav_watch_party", fallback: "Watch Party")
         case .liveTV: return L10n.string("nav_live_tv", fallback: "Live TV")
+        case .surprise: return L10n.string("nav_surprise_me", fallback: "Surprise Me")
         case .collection: return L10n.string("tmdb_collections_title", fallback: "Collections")
         }
     }
@@ -353,6 +356,7 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         case .settings: return "gearshape"
         case .party: return "person.2.fill"
         case .liveTV: return "tv"
+        case .surprise: return "dice"
         case .collection: return "rectangle.stack.fill"
         }
     }
@@ -4706,6 +4710,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
@@ -4745,6 +4750,9 @@ private struct TVMainTabView: View {
         }
         .onChange(of: showWatchPartyTab) { _, isShown in
             if !isShown, selectedTab == .party { selectedTab = .home }
+        }
+        .onChange(of: showSurpriseMeTab) { _, isShown in
+            if !isShown, selectedTab == .surprise { selectedTab = .home }
         }
         .onChange(of: nativeIPTVEnabled) { _, enabled in
             if !enabled, selectedTab == .liveTV { selectedTab = .home }
@@ -4902,6 +4910,16 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
     }
 
+    /// Settings → Appearance → Sidebar → Surprise Me (off until the viewer turns it on).
+    private var surpriseMeTabContent: some View {
+        SurpriseMeView(
+            homeStore: homeStore,
+            isActive: selectedTab == .surprise,
+            onOpenDetails: { meta in onNavigateToDetails(meta.id, meta.type) }
+        )
+            .id(activeProfile?.id ?? "none")
+    }
+
     private var liveTVTabContent: some View {
         IPTVLiveView(profileID: activeProfile?.id ?? "", onPlay: onPlayLiveChannel)
             .id(activeProfile?.id ?? "none")
@@ -5003,6 +5021,11 @@ private struct TVMainTabView: View {
                     .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
                     .tag(TVTab.calendar)
             }
+            if showSurpriseMeTab {
+                surpriseMeTabContent
+                    .tabItem { Label(TVTab.surprise.title, systemImage: TVTab.surprise.symbol) }
+                    .tag(TVTab.surprise)
+            }
             settingsTabContent
                 .tabItem { settingsTabLabel }.tag(TVTab.settings)
             ForEach(directCollectionDestinations + genreCollectionDestinations) { destination in
@@ -5083,6 +5106,11 @@ private struct TVMainTabView: View {
             if showCalendarTab {
                 Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
                     calendarTabContent
+                }
+            }
+            if showSurpriseMeTab {
+                Tab(TVTab.surprise.title, systemImage: TVTab.surprise.symbol, value: TVTab.surprise) {
+                    surpriseMeTabContent
                 }
             }
             Tab(value: TVTab.settings) { settingsTabContent } label: { settingsTabLabel }

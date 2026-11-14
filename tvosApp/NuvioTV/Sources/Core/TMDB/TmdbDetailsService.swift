@@ -1908,6 +1908,75 @@ private struct TmdbCompanyDTO: Decodable {
     }
 }
 
+// MARK: - Surprise Me
+
+extension TmdbDetailsService {
+    /// TMDB's movie genre ids, with the English names Nuvio's catalogs use.
+    static let surpriseMeMovieGenres: [Int: String] = [
+        28: "Action", 12: "Adventure", 16: "Animation", 35: "Comedy", 80: "Crime",
+        99: "Documentary", 18: "Drama", 10751: "Family", 14: "Fantasy", 36: "History",
+        27: "Horror", 10402: "Music", 9648: "Mystery", 10749: "Romance", 878: "Sci-Fi",
+        10770: "TV Movie", 53: "Thriller", 10752: "War", 37: "Western",
+    ]
+
+    static func surpriseMeGenreID(for name: String) -> Int? {
+        let key = TasteProfile.normalized(name)
+        return surpriseMeMovieGenres.first { TasteProfile.normalized($0.value) == key }?.key
+    }
+
+    /// Whether TMDB is turned on with a key in Settings > Integrations.
+    static var isAvailableForSurpriseMe: Bool { isEnabled && apiKey != nil }
+
+    /// Movies TMDB recommends to people who liked `meta`.
+    static func surpriseMeRecommendations(for meta: NuvioMeta) async -> [NuvioMeta] {
+        guard isEnabled, let apiKey,
+              let resolved = await resolveTmdbId(for: meta), resolved.mediaType == "movie" else { return [] }
+        return await surpriseMeMovies(path: "movie/\(resolved.id)/recommendations", query: [:], apiKey: apiKey)
+    }
+
+    /// Well-rated movies in any of `genres`, most popular first.
+    static func surpriseMeDiscover(genres: [String], page: Int = 1) async -> [NuvioMeta] {
+        guard isEnabled, let apiKey else { return [] }
+        let ids = genres.compactMap(surpriseMeGenreID(for:))
+        guard !ids.isEmpty else { return [] }
+        return await surpriseMeMovies(path: "discover/movie", query: [
+            "with_genres": ids.map(String.init).joined(separator: "|"),
+            "sort_by": "popularity.desc",
+            "vote_average.gte": "6.5",
+            "vote_count.gte": "300",
+            "page": String(max(1, page)),
+        ], apiKey: apiKey)
+    }
+
+    private static func surpriseMeMovies(path: String, query: [String: String], apiKey: String) async -> [NuvioMeta] {
+        var components = URLComponents(url: apiBase.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: preferredLanguage),
+        ] + query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        guard let url = components.url,
+              let (data, response) = try? await data(for: url),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(TmdbPagedResults.self, from: data) else { return [] }
+        return decoded.results.compactMap { item in
+            let name = (item.title ?? item.name)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard item.id > 0, !name.isEmpty else { return nil }
+            return NuvioMeta(
+                id: "tmdb:\(item.id)",
+                name: name,
+                description: item.overview?.trimmingCharacters(in: .whitespacesAndNewlines),
+                posterUrl: imageURL(item.posterPath, size: "w500"),
+                backgroundUrl: imageURL(item.backdropPath, size: "w1280"),
+                tmdbId: item.id,
+                type: "movie",
+                year: item.releaseDate.flatMap { Int($0.prefix(4)) },
+                genres: (item.genreIds ?? []).compactMap { surpriseMeMovieGenres[$0] },
+                rating: item.voteAverage.flatMap { $0 > 0 ? $0 : nil }
+            )
+        }
+    }
+}
+
 private struct TmdbPagedResults: Decodable {
     let results: [TmdbListItem]
 }
@@ -1928,6 +1997,7 @@ private struct TmdbListItem: Decodable {
     let firstAirDate: String?
     let voteAverage: Double?
     let mediaType: String?
+    var genreIds: [Int]? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, title, name, overview
@@ -1937,6 +2007,7 @@ private struct TmdbListItem: Decodable {
         case firstAirDate = "first_air_date"
         case voteAverage = "vote_average"
         case mediaType = "media_type"
+        case genreIds = "genre_ids"
     }
 }
 
