@@ -6789,10 +6789,24 @@ struct TVHomeView: View {
     var body: some View {
         let _ = TVHomeDebugTrace.breadcrumb("home.body.render active=\(isActive) row=\(focusedRowIndex)")
         bodyWithModifiers
+            .overlay { ambientModeOverlay }
+            .background(UserActivityMonitorInstaller().frame(width: 0, height: 0))
             .fullScreenCover(item: $browsingSection) { section in
                 browseSectionView(section: section)
             }
             .onExitCommand(perform: canHandleExitCommand ? handleBackCommand : nil)
+    }
+
+    /// Settings > Layout > Ambient Mode: backdrops from the rows on Home after
+    /// two idle minutes, only while Home is on screen with nothing over it.
+    private var ambientModeOverlay: some View {
+        AmbientModeOverlay(
+            isEligible: isActive && !isFullScreenOverlayPresented && browsingSection == nil && !showsLoading,
+            slides: AmbientModeOverlay.slides(
+                from: Array(store.sections.lazy.flatMap(\.items).prefix(200)),
+                backdropURL: { Self.preferredBackdropURL(for: $0) }
+            )
+        )
     }
 
     @ViewBuilder

@@ -166,6 +166,7 @@ enum SettingsKey {
     /// Empty means all available catalog rows.
     static let heroCatalogs = "nuvio.tv.settings.layout.heroCatalogs"
     static let fullscreenHeroBackdrop = "nuvio.tv.settings.layout.fullscreenHeroBackdrop"
+    static let ambientMode = "nuvio.tv.settings.layout.ambientMode"
     static let homeHeroRatingSource = "nuvio.tv.settings.layout.homeHeroRatingSource"
     static let homeHeroRatingsEnabled = "nuvio.tv.settings.layout.homeHeroRatingsEnabled"
     static let continueWatchingLabels = "nuvio.tv.settings.layout.continueWatchingLabels"
@@ -4195,6 +4196,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.fullscreenHeroBackdrop) private var fullscreenHeroBackdrop = true
+    @AppStorage(SettingsKey.ambientMode) private var ambientMode = false
     @AppStorage(SettingsKey.homeHeroRatingsEnabled) private var homeHeroRatingsEnabled = true
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.continueWatchingLabels) private var continueWatchingLabels = CardLabelVisibility.always.rawValue
@@ -4343,6 +4345,16 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(heroEnabled ? 1 : 0.46)
                 .disabled(!heroEnabled)
+
+                SettingsToggleRow(
+                    title: L10n.string("layout_ambient_mode", fallback: "Ambient Mode"),
+                    subtitle: L10n.string(
+                        "layout_ambient_mode_sub",
+                        fallback: "After two idle minutes on Home, show a slideshow of backdrops from your catalogs. The Apple TV screensaver still starts at its usual time."
+                    ),
+                    isOn: $ambientMode,
+                    accentColor: accentColor
+                )
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_hero_ratings", fallback: "Hero Ratings"),
