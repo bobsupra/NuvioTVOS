@@ -17,7 +17,7 @@ struct IPTVLoadedPlaylist {
 /// Downloads only user-configured playlists. Callers own any previously loaded
 /// list and decide whether to replace it after this operation succeeds.
 struct IPTVPlaylistLoader {
-    static let maximumBytes = 16 * 1024 * 1024
+    static let maximumBytes = 64 * 1024 * 1024
     private let session: URLSession
 
     init(session: URLSession = .shared) {
@@ -58,8 +58,18 @@ struct IPTVPlaylistLoader {
         guard !sourceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { throw IPTVPlaylistLoadError.invalidSourceID }
         guard data.count <= maximumBytes else { throw IPTVPlaylistLoadError.tooLarge }
         guard let text = String(data: data, encoding: .utf8) else { throw IPTVPlaylistLoadError.invalidEncoding }
-        let playlists = try IPTVPlaylistParser(string: text).parse()
-        let channels = IPTVChannelImporter.channels(from: playlists, sourceID: sourceID, baseURL: baseURL)
+        let playlists: [IPTVPlaylistParser.Playlist]
+        do {
+            playlists = try IPTVPlaylistParser(string: text).parse()
+        } catch IPTVPlaylistParser.ParserError.tooLarge {
+            throw IPTVPlaylistLoadError.tooLarge
+        }
+        let channels: [IPTVChannel]
+        do {
+            channels = try IPTVChannelImporter.channels(from: playlists, sourceID: sourceID, baseURL: baseURL)
+        } catch IPTVChannelImportError.tooLarge {
+            throw IPTVPlaylistLoadError.tooLarge
+        }
         let guideURL = playlists.lazy.compactMap { playlist -> URL? in
             for raw in [playlist.tvgURL, playlist.xTvgURL].compactMap({ $0 }) {
                 let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -21,7 +21,7 @@ enum IPTVXtreamError: Error, Equatable {
 
 struct IPTVXtreamClient {
     private let session: URLSession
-    private static let maxBytes = 16 * 1024 * 1024
+    private static let maxBytes = 64 * 1024 * 1024
 
     init(session: URLSession = IPTVAuthenticatedSession.shared) { self.session = session }
 
@@ -35,7 +35,7 @@ struct IPTVXtreamClient {
         var categoryNames: [String: String] = [:]
         do {
             let categories = try await request(credentials: credentials, action: "get_live_categories")
-            let decoded = try JSONDecoder().decode([Lossy<Category>].self, from: categories)
+            let decoded = try JSONDecoder().decode(BoundedArray<Lossy<Category>>.self, from: categories).values
             for category in decoded.compactMap(\.value) {
                 if let id = category.id.value, let name = category.name, !name.isEmpty { categoryNames[id] = name }
             }
@@ -43,21 +43,29 @@ struct IPTVXtreamClient {
             try Task.checkCancellation()
         }
         let data = try await request(credentials: credentials, action: "get_live_streams")
-        let entries = try JSONDecoder().decode([Lossy<LiveStream>].self, from: data)
+        let entries = try JSONDecoder().decode(BoundedArray<Lossy<LiveStream>>.self, from: data).values
         try Task.checkCancellation()
         let source = sourceID
-        let streams = entries.compactMap(\.value).compactMap { entry -> IPTVPlaylistParser.Stream? in
-            guard let id = entry.streamID.value, !id.isEmpty,
+        var streams: [IPTVPlaylistParser.Stream] = []
+        streams.reserveCapacity(entries.count)
+        for (index, lossy) in entries.enumerated() {
+            if index.isMultiple(of: 512) { try Task.checkCancellation() }
+            guard let entry = lossy.value,
+                  let id = entry.streamID.value, !id.isEmpty,
                   let name = entry.name?.trimmingCharacters(in: .whitespacesAndNewlines), !name.isEmpty,
-                  let url = Self.liveURL(credentials: credentials, streamID: id) else { return nil }
+                  let url = Self.liveURL(credentials: credentials, streamID: id) else { continue }
             var stream = IPTVPlaylistParser.Stream(title: name, url: url.absoluteString,
                                                     tvgLogo: entry.icon, tvgID: entry.guideID,
                                                     tvgName: nil, groupTitle: entry.categoryID.flatMap { $0.value }.flatMap { categoryNames[$0] })
             stream.providerID = id
-            return stream
+            streams.append(stream)
         }
         let playlist = IPTVPlaylistParser.Playlist(tvgURL: nil, imageURL: nil, xTvgURL: nil, tvgLogo: nil, streams: streams)
-        return IPTVChannelImporter.channels(from: [playlist], sourceID: source, baseURL: nil)
+        do {
+            return try IPTVChannelImporter.channels(from: [playlist], sourceID: source, baseURL: nil)
+        } catch IPTVChannelImportError.tooLarge {
+            throw IPTVXtreamError.tooLarge
+        }
     }
 
     private func request(credentials: IPTVXtreamCredentials, action: String?) async throws -> Data {
@@ -154,5 +162,20 @@ struct IPTVXtreamClient {
     private struct Lossy<T: Decodable>: Decodable {
         let value: T?
         init(from decoder: Decoder) throws { value = try? T(from: decoder) }
+    }
+
+    private struct BoundedArray<Element: Decodable>: Decodable {
+        let values: [Element]
+
+        init(from decoder: Decoder) throws {
+            var container = try decoder.unkeyedContainer()
+            var values: [Element] = []
+            while !container.isAtEnd {
+                guard values.count < IPTVImportLimits.maximumChannels else { throw IPTVXtreamError.tooLarge }
+                values.append(try container.decode(Element.self))
+                if values.count.isMultiple(of: 512) { try Task.checkCancellation() }
+            }
+            self.values = values
+        }
     }
 }

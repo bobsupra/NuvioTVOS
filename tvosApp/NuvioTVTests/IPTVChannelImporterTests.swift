@@ -9,14 +9,14 @@ final class IPTVChannelImporterTests: XCTestCase {
         live.m3u8?token=fixture-secret
         """
         let parsed = try IPTVPlaylistParser(string: input).parse()
-        let channels = IPTVChannelImporter.channels(from: parsed, sourceID: "source-1", baseURL: URL(string: "https://example.test/list.m3u"))
+        let channels = try IPTVChannelImporter.channels(from: parsed, sourceID: "source-1", baseURL: URL(string: "https://example.test/list.m3u"))
         let channel = try XCTUnwrap(channels.first)
         XCTAssertEqual(channel.streamURL.absoluteString, "https://example.test/live.m3u8?token=fixture-secret")
         XCTAssertEqual(channel.logoURL?.absoluteString, "https://example.test/logo.png")
         XCTAssertEqual(channel.guideID, "news")
         XCTAssertFalse(channel.id.contains("fixture-secret"))
-        XCTAssertEqual(channels, IPTVChannelImporter.channels(from: parsed, sourceID: "source-1", baseURL: URL(string: "https://example.test/list.m3u")))
-        XCTAssertNotEqual(channel.id, IPTVChannelImporter.channels(from: parsed, sourceID: "source-2", baseURL: URL(string: "https://example.test/list.m3u")).first?.id)
+        XCTAssertEqual(channels, try IPTVChannelImporter.channels(from: parsed, sourceID: "source-1", baseURL: URL(string: "https://example.test/list.m3u")))
+        XCTAssertNotEqual(channel.id, try IPTVChannelImporter.channels(from: parsed, sourceID: "source-2", baseURL: URL(string: "https://example.test/list.m3u")).first?.id)
     }
 
     func testIgnoresInvalidLinksAndDeduplicatesWithinSource() throws {
@@ -32,9 +32,9 @@ final class IPTVChannelImporterTests: XCTestCase {
         relative.m3u8
         """
         let parsed = try IPTVPlaylistParser(string: input).parse()
-        let channels = IPTVChannelImporter.channels(from: parsed, sourceID: "a", baseURL: nil)
+        let channels = try IPTVChannelImporter.channels(from: parsed, sourceID: "a", baseURL: nil)
         XCTAssertEqual(channels.map(\.name), ["Fallback"])
-        XCTAssertTrue(IPTVChannelImporter.channels(from: parsed, sourceID: " ", baseURL: nil).isEmpty)
+        XCTAssertTrue(try IPTVChannelImporter.channels(from: parsed, sourceID: " ", baseURL: nil).isEmpty)
     }
 
     func testProviderIdentitySurvivesCredentialAndMetadataChanges() throws {

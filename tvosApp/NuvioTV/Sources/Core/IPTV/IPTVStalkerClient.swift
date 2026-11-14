@@ -7,19 +7,34 @@ struct IPTVStalkerPlayback: Sendable {
 
 /// One portal session. The token remains in memory and is never persisted.
 actor IPTVStalkerClient {
-    private let portal: URL
+    private var portal: URL
+    private let handshakeFallbackPortals: [URL]
     private let mac: String
     private let session: URLSession
+    private let ownsSession: Bool
     private var token: String?
     private var generation = 0
-    private static let maxBytes = 16 * 1024 * 1024
+    private static let maxBytes = 64 * 1024 * 1024
+    private static let maximumOrderedPages = 1_000
 
     init(portal: URL, mac: String, session: URLSession? = nil) throws {
         guard IPTVStalkerProtocol.requestURL(portal: portal, type: "stb", action: "handshake") != nil else { throw IPTVStalkerError.invalidPortal }
         guard let normalized = IPTVStalkerProtocol.normalizedMAC(mac) else { throw IPTVStalkerError.invalidMAC }
-        self.portal = portal
+        let endpoints = IPTVStalkerProtocol.portalEndpoints(for: portal)
+        self.portal = endpoints.first ?? portal
+        self.handshakeFallbackPortals = Array(endpoints.dropFirst())
         self.mac = normalized
-        self.session = session ?? URLSession(configuration: .ephemeral, delegate: IPTVStalkerRedirectGuard(portal: portal), delegateQueue: nil)
+        if let session {
+            self.session = session
+            self.ownsSession = false
+        } else {
+            self.session = URLSession(configuration: .ephemeral, delegate: IPTVStalkerRedirectGuard(portal: portal), delegateQueue: nil)
+            self.ownsSession = true
+        }
+    }
+
+    deinit {
+        if ownsSession { session.invalidateAndCancel() }
     }
 
     func loadChannels() async throws -> [IPTVStalkerChannel] {
@@ -63,28 +78,46 @@ actor IPTVStalkerClient {
     private func loadOrderedChannels(attempt: Int) async throws -> [IPTVStalkerChannel] {
         var channels: [IPTVStalkerChannel] = []
         var seen = Set<String>()
+        var pagination = IPTVStalkerPagination()
         // A hard ceiling prevents an endpoint that repeats pages from running forever.
-        for page in 1...200 {
+        for page in 1...Self.maximumOrderedPages {
             let data = try await request(type: "itv", action: "get_ordered_list", extra: [URLQueryItem(name: "p", value: String(page))], authorized: true)
             try Task.checkCancellation()
             guard generation == attempt else { throw CancellationError() }
             let response = try IPTVStalkerProtocol.page(from: data)
-            if response.rawCount == 0 { return channels }
+            let reachedMetadataEnd = pagination.didLoad(response, number: page)
+            if pagination.rawRowsReceived > IPTVImportLimits.maximumChannels { throw IPTVStalkerError.tooLarge }
+            if response.rawCount == 0 {
+                if pagination.totalItems != nil && !reachedMetadataEnd { throw IPTVStalkerError.invalidResponse }
+                return channels
+            }
             guard !response.channels.isEmpty else { throw IPTVStalkerError.invalidResponse }
             let fresh = response.channels.filter { seen.insert($0.id).inserted }
             // Repeated pages are an incomplete result, not a valid end marker.
             guard !fresh.isEmpty else { throw IPTVStalkerError.invalidResponse }
             channels.append(contentsOf: fresh)
+            if reachedMetadataEnd { return channels }
         }
         throw IPTVStalkerError.tooLarge
     }
 
     private func refreshToken(attempt: Int) async throws {
-        let data = try await request(type: "stb", action: "handshake", extra: [URLQueryItem(name: "token", value: "")], authorized: false)
-        let newToken = try IPTVStalkerProtocol.handshakeToken(from: data)
-        try Task.checkCancellation()
-        guard generation == attempt else { throw CancellationError() }
-        token = newToken
+        let endpoints = [portal] + handshakeFallbackPortals
+        for (index, endpoint) in endpoints.enumerated() {
+            do {
+                let data = try await request(type: "stb", action: "handshake", extra: [URLQueryItem(name: "token", value: "")], authorized: false, endpoint: endpoint)
+                let newToken = try IPTVStalkerProtocol.handshakeToken(from: data)
+                try Task.checkCancellation()
+                guard generation == attempt else { throw CancellationError() }
+                portal = endpoint
+                token = newToken
+                break
+            } catch {
+                try Task.checkCancellation()
+                guard generation == attempt else { throw CancellationError() }
+                guard index + 1 < endpoints.count, IPTVStalkerProtocol.shouldTryHandshakeFallback(after: error) else { throw error }
+            }
+        }
         // Some portals require a profile request before listing channels.
         // Others do not implement it, so a failed optional request is not fatal.
         do { _ = try await request(type: "stb", action: "get_profile", authorized: true) }
@@ -113,11 +146,11 @@ actor IPTVStalkerClient {
         return IPTVStalkerPlayback(url: url, headers: Self.playbackHeaders())
     }
 
-    private func request(type: String, action: String, extra: [URLQueryItem] = [], authorized: Bool) async throws -> Data {
+    private func request(type: String, action: String, extra: [URLQueryItem] = [], authorized: Bool, endpoint: URL? = nil) async throws -> Data {
         if authorized && token == nil { throw IPTVStalkerError.invalidResponse }
         var parameters = extra
         if authorized, let token { parameters.append(URLQueryItem(name: "token", value: token)) }
-        guard let url = IPTVStalkerProtocol.requestURL(portal: portal, type: type, action: action, extra: parameters) else { throw IPTVStalkerError.invalidPortal }
+        guard let url = IPTVStalkerProtocol.requestURL(portal: endpoint ?? portal, type: type, action: action, extra: parameters) else { throw IPTVStalkerError.invalidPortal }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         request.setValue(Self.deviceAgent, forHTTPHeaderField: "X-User-Agent")

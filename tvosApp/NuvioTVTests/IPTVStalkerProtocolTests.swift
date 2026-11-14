@@ -16,6 +16,33 @@ final class IPTVStalkerProtocolTests: XCTestCase {
         XCTAssertNil(IPTVStalkerProtocol.requestURL(portal: URL(string: "https://example.test/load.php?existing=1")!, type: "itv", action: "handshake"))
     }
 
+    func testRecognizedClientPathsResolveToLoadEndpointAndOtherPathsStayExplicit() throws {
+        let cases = [
+            ("https://example.test/stalker_portal/c", "/stalker_portal/server/load.php"),
+            ("https://example.test/stalker_portal/c/", "/stalker_portal/server/load.php"),
+            ("https://example.test/stalker_portal/c/index.html", "/stalker_portal/server/load.php"),
+            ("https://example.test/stalker_portal/server/load.php", "/stalker_portal/server/load.php"),
+            ("https://example.test/custom/portal.php", "/custom/portal.php")
+        ]
+
+        for (portal, expectedPath) in cases {
+            let url = try XCTUnwrap(IPTVStalkerProtocol.requestURL(
+                portal: try XCTUnwrap(URL(string: portal)), type: "stb", action: "handshake"))
+            XCTAssertEqual(URLComponents(url: url, resolvingAgainstBaseURL: false)?.path, expectedPath, portal)
+        }
+
+        let clientPortal = try XCTUnwrap(URL(string: "https://example.test/deploy/c/index.html"))
+        XCTAssertEqual(IPTVStalkerProtocol.portalEndpoints(for: clientPortal).map(\.path), [
+            "/deploy/server/load.php", "/deploy/c/portal.php", "/deploy/portal.php"
+        ])
+        let explicit = try XCTUnwrap(URL(string: "https://example.test/deploy/custom.php"))
+        XCTAssertEqual(IPTVStalkerProtocol.portalEndpoints(for: explicit), [explicit])
+        XCTAssertTrue(IPTVStalkerProtocol.shouldTryHandshakeFallback(after: IPTVStalkerError.httpStatus(404)))
+        XCTAssertTrue(IPTVStalkerProtocol.shouldTryHandshakeFallback(after: IPTVStalkerError.invalidResponse))
+        XCTAssertFalse(IPTVStalkerProtocol.shouldTryHandshakeFallback(after: IPTVStalkerError.httpStatus(401)))
+        XCTAssertFalse(IPTVStalkerProtocol.shouldTryHandshakeFallback(after: IPTVStalkerError.httpStatus(403)))
+    }
+
     func testParsesHandshakeAndValidatesResolvedPlaybackURL() throws {
         XCTAssertEqual(try IPTVStalkerProtocol.handshakeToken(from: Data(#"{"js":{"token":"fixture"}}"#.utf8)), "fixture")
         XCTAssertEqual(try IPTVStalkerProtocol.handshakeToken(from: Data(#"{"js":{"Token":"legacy"}}"#.utf8)), "legacy")
@@ -53,6 +80,29 @@ final class IPTVStalkerProtocolTests: XCTestCase {
         let malformed = try IPTVStalkerProtocol.page(from: Data(#"{"js":{"data":[{"id":"1"}]}}"#.utf8))
         XCTAssertEqual(malformed.rawCount, 1)
         XCTAssertTrue(malformed.channels.isEmpty)
+    }
+
+    func testPageReadsOptionalPaginationMetadata() throws {
+        let row = #"{"id":"1","name":"News","cmd":"ffmpeg channel"}"#
+        let tenRowsText = Array(repeating: row, count: 10).joined(separator: ",")
+        let underfilledBody = "{\"js\":{\"data\":[\(tenRowsText)],\"total_items\":\"100\",\"max_page_items\":100}}"
+        let underfilled = try IPTVStalkerProtocol.page(from: Data(underfilledBody.utf8))
+        XCTAssertEqual(underfilled.totalItems, 100)
+        XCTAssertNil(underfilled.lastPage)
+
+        var pagination = IPTVStalkerPagination()
+        XCTAssertFalse(pagination.didLoad(underfilled, number: 1))
+        for pageNumber in 2...9 { XCTAssertFalse(pagination.didLoad(underfilled, number: pageNumber)) }
+        XCTAssertTrue(pagination.didLoad(underfilled, number: 10))
+
+        let explicit = try IPTVStalkerProtocol.page(from: Data("{\"js\":{\"data\":[\(row)],\"total_pages\":4}}".utf8))
+        XCTAssertEqual(explicit.lastPage, 4)
+        var explicitPagination = IPTVStalkerPagination()
+        XCTAssertFalse(explicitPagination.didLoad(explicit, number: 3))
+        XCTAssertTrue(explicitPagination.didLoad(explicit, number: 4))
+
+        let legacy = try IPTVStalkerProtocol.page(from: Data("{\"js\":{\"data\":[\(row)]}}".utf8))
+        XCTAssertNil(legacy.lastPage)
     }
 
     func testReadsBothCommonCategoryEnvelopes() throws {

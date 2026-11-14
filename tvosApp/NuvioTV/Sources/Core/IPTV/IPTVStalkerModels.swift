@@ -14,6 +14,24 @@ struct IPTVStalkerChannel: Equatable, Identifiable, Sendable {
 struct IPTVStalkerPage {
     let channels: [IPTVStalkerChannel]
     let rawCount: Int
+    let totalItems: Int?
+    let lastPage: Int?
+}
+
+struct IPTVStalkerPagination {
+    private(set) var rawRowsReceived = 0
+    private(set) var totalItems: Int?
+    private(set) var lastPage: Int?
+
+    mutating func didLoad(_ page: IPTVStalkerPage, number pageNumber: Int) -> Bool {
+        let (updatedCount, overflow) = rawRowsReceived.addingReportingOverflow(page.rawCount)
+        rawRowsReceived = overflow ? Int.max : updatedCount
+        if let totalItems = page.totalItems, totalItems > 0 { self.totalItems = totalItems }
+        if let lastPage = page.lastPage { self.lastPage = lastPage }
+
+        if let totalItems { return rawRowsReceived >= totalItems }
+        return lastPage.map { pageNumber >= $0 } ?? false
+    }
 }
 
 enum IPTVStalkerError: Error, Equatable {
@@ -36,15 +54,49 @@ enum IPTVStalkerProtocol {
     }
 
     /// The user provides the portal endpoint explicitly; guessing an endpoint
-    /// can silently send account identifiers to the wrong path.
+    /// can silently send account identifiers to the wrong path. Only the
+    /// common client landing paths are translated to the API endpoint.
     static func requestURL(portal: URL, type: String, action: String, extra: [URLQueryItem] = []) -> URL? {
         guard var components = URLComponents(url: portal, resolvingAgainstBaseURL: false),
               let scheme = components.scheme?.lowercased(), ["http", "https"].contains(scheme),
               let host = components.host, !host.isEmpty, components.user == nil, components.password == nil,
               components.query == nil, components.fragment == nil else { return nil }
+        if let endpointPath = clientEndpointPaths(components.percentEncodedPath).first {
+            components.percentEncodedPath = endpointPath
+        }
         components.queryItems = [URLQueryItem(name: "type", value: type), URLQueryItem(name: "action", value: action),
                                  URLQueryItem(name: "JsHttpRequest", value: "1-xml")] + extra
         return components.url
+    }
+
+    static func portalEndpoints(for portal: URL) -> [URL] {
+        guard let components = URLComponents(url: portal, resolvingAgainstBaseURL: false) else { return [portal] }
+        let paths = clientEndpointPaths(components.percentEncodedPath)
+        guard !paths.isEmpty else { return [portal] }
+        return paths.compactMap { path in
+            var endpoint = components
+            endpoint.percentEncodedPath = path
+            return endpoint.url
+        }
+    }
+
+    static func shouldTryHandshakeFallback(after error: Error) -> Bool {
+        if error is IPTVStalkerError, let stalkerError = error as? IPTVStalkerError {
+            switch stalkerError {
+            case .invalidResponse, .httpStatus(404): return true
+            default: return false
+            }
+        }
+        return false
+    }
+
+    private static func clientEndpointPaths(_ path: String) -> [String] {
+        let lowercasedPath = path.lowercased()
+        for suffix in ["/c/index.html", "/c/", "/c"] where lowercasedPath.hasSuffix(suffix) {
+            let prefix = String(path.dropLast(suffix.count))
+            return [prefix + "/server/load.php", prefix + "/c/portal.php", prefix + "/portal.php"]
+        }
+        return []
     }
 
     static func handshakeToken(from data: Data) throws -> String {
@@ -115,17 +167,70 @@ enum IPTVStalkerProtocol {
             let value: Entry?
             init(from decoder: Decoder) throws { value = try? Entry(from: decoder) }
         }
-        struct Payload: Decodable { let data: [Lossy] }
+        struct FlexibleInt: Decodable {
+            let value: Int?
+            init(from decoder: Decoder) throws {
+                let container = try decoder.singleValueContainer()
+                if let number = try? container.decode(Int.self) { value = number }
+                else if let text = try? container.decode(String.self) { value = Int(text) }
+                else { value = nil }
+            }
+        }
+        struct BoundedRows: Decodable {
+            let values: [Lossy]
+
+            init(from decoder: Decoder) throws {
+                var container = try decoder.unkeyedContainer()
+                var values: [Lossy] = []
+                while !container.isAtEnd {
+                    guard values.count < IPTVImportLimits.maximumChannels else { throw IPTVStalkerError.tooLarge }
+                    values.append(try container.decode(Lossy.self))
+                    if values.count.isMultiple(of: 512) { try Task.checkCancellation() }
+                }
+                self.values = values
+            }
+        }
+        struct Payload: Decodable {
+            let data: BoundedRows
+            let totalItems: FlexibleInt?
+            let totalPages: FlexibleInt?
+            enum CodingKeys: String, CodingKey {
+                case data
+                case totalItems = "total_items"
+                case totalPages = "total_pages"
+            }
+
+            var lastPage: Int? {
+                if let totalPages = totalPages?.value, totalPages > 0 { return totalPages }
+                return nil
+            }
+        }
         struct Envelope: Decodable { let js: Payload }
-        guard let decoded = try? JSONDecoder().decode(Envelope.self, from: data) else { throw IPTVStalkerError.invalidResponse }
+        let decoded: Envelope
+        do {
+            decoded = try JSONDecoder().decode(Envelope.self, from: data)
+        } catch let error as IPTVStalkerError {
+            throw error
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            throw IPTVStalkerError.invalidResponse
+        }
         var seen = Set<String>()
-        let channels = decoded.js.data.compactMap(\.value).compactMap { entry -> IPTVStalkerChannel? in
-            guard let id = entry.id.value, !id.isEmpty,
+        var channels: [IPTVStalkerChannel] = []
+        channels.reserveCapacity(decoded.js.data.values.count)
+        for (index, lossy) in decoded.js.data.values.enumerated() {
+            if index.isMultiple(of: 512) { try Task.checkCancellation() }
+            guard let entry = lossy.value,
+                  let id = entry.id.value, !id.isEmpty,
                   !entry.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   !entry.cmd.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-                  seen.insert(id).inserted else { return nil }
-            return IPTVStalkerChannel(id: id, name: entry.name, command: entry.cmd, logo: entry.logo, categoryID: entry.category?.value)
+                  seen.insert(id).inserted else { continue }
+            channels.append(IPTVStalkerChannel(id: id, name: entry.name, command: entry.cmd,
+                                               logo: entry.logo, categoryID: entry.category?.value))
         }
-        return IPTVStalkerPage(channels: channels, rawCount: decoded.js.data.count)
+        try Task.checkCancellation()
+        return IPTVStalkerPage(channels: channels, rawCount: decoded.js.data.values.count,
+                               totalItems: decoded.js.totalItems?.value, lastPage: decoded.js.lastPage)
     }
 }

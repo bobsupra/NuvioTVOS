@@ -51,4 +51,15 @@ final class IPTVPlaylistTests: XCTestCase {
         XCTAssertEqual(playlist.streams.first?.title, "Channel 0")
         XCTAssertEqual(playlist.streams.last?.title, "Channel 4999")
     }
+
+    func testEnforcesStreamAndPlaylistBlockBudgets() {
+        let tooManyStreams = "#EXTM3U\n#EXTINF:-1,One\nhttps://example.test/1\n#EXTINF:-1,Two\nhttps://example.test/2"
+        XCTAssertThrowsError(try IPTVPlaylistParser(string: tooManyStreams).parse(maximumItems: 1)) {
+            XCTAssertEqual($0 as? IPTVPlaylistParser.ParserError, .tooLarge)
+        }
+
+        XCTAssertThrowsError(try IPTVPlaylistParser(string: "#EXTM3U\n#EXTM3U\n").parse(maximumItems: 1)) {
+            XCTAssertEqual($0 as? IPTVPlaylistParser.ParserError, .tooLarge)
+        }
+    }
 }

@@ -3,6 +3,10 @@
 // Copyright (c) 2026 Mikhail Demidov. See ThirdParty/BroIPTV-LICENSE.txt.
 import Foundation
 
+enum IPTVImportLimits {
+    static let maximumChannels = 100_000
+}
+
 struct IPTVPlaylistParser {
 
     struct Playlist: Equatable, Sendable {
@@ -28,6 +32,7 @@ struct IPTVPlaylistParser {
         case invalidEncoding
         case invalidFormat
         case hlsPlaylist
+        case tooLarge
     }
 
     private struct PlaylistBuilder {
@@ -87,55 +92,85 @@ struct IPTVPlaylistParser {
         content = Self.normalize(string)
     }
 
-    func parse() throws -> [Playlist] {
+    func parse(maximumItems: Int = IPTVImportLimits.maximumChannels) throws -> [Playlist] {
         var playlists: [Playlist] = []
         var currentPlaylist: PlaylistBuilder?
         var pendingStream: PendingStream?
         var hasHeader = false
-        do {
-            for rawLine in content.components(separatedBy: .newlines) {
-                let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
-
-                if line.isEmpty {
-                    continue
-                }
-
-                if line.uppercased().hasPrefix("#EXT-X-") {
-                    throw ParserError.hlsPlaylist
-                }
-
-                if line.hasPrefix(Self.m3uHeader) {
-                    if let currentPlaylist {
-                        playlists.append(currentPlaylist.playlist)
-                    }
-
-                    currentPlaylist = Self.buildPlaylist(from: line)
-                    pendingStream = nil
-                    hasHeader = true
-                    continue
-                }
-
-                guard currentPlaylist != nil else {
-                    continue
-                }
-
-                if line.hasPrefix(Self.streamInfoHeader) {
-                    pendingStream = Self.buildStream(from: line)
-                    continue
-                }
-
-                if line.hasPrefix("#") {
-                    continue
-                }
-
-                guard let resolvedStream = pendingStream else {
-                    continue
-                }
-
-                currentPlaylist?.streams.append(resolvedStream.resolve(url: line))
-                pendingStream = nil
+        var parserError: ParserError?
+        var streamCount = 0
+        var playlistCount = 0
+        var lineCount = 0
+        var wasCancelled = false
+        content.enumerateLines { rawLine, stop in
+            lineCount += 1
+            if lineCount.isMultiple(of: 1_024), Task<Never, Never>.isCancelled {
+                wasCancelled = true
+                stop = true
+                return
             }
+            guard parserError == nil else {
+                stop = true
+                return
+            }
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if line.isEmpty {
+                return
+            }
+
+            if line.uppercased().hasPrefix("#EXT-X-") {
+                parserError = .hlsPlaylist
+                stop = true
+                return
+            }
+
+            if line.hasPrefix(Self.m3uHeader) {
+                guard playlistCount < maximumItems else {
+                    parserError = .tooLarge
+                    stop = true
+                    return
+                }
+                playlistCount += 1
+                if let currentPlaylist {
+                    playlists.append(currentPlaylist.playlist)
+                }
+
+                currentPlaylist = Self.buildPlaylist(from: line)
+                pendingStream = nil
+                hasHeader = true
+                return
+            }
+
+            guard currentPlaylist != nil else {
+                return
+            }
+
+            if line.hasPrefix(Self.streamInfoHeader) {
+                pendingStream = Self.buildStream(from: line)
+                return
+            }
+
+            if line.hasPrefix("#") {
+                return
+            }
+
+            guard let resolvedStream = pendingStream else {
+                return
+            }
+
+            guard streamCount < maximumItems else {
+                parserError = .tooLarge
+                stop = true
+                return
+            }
+            currentPlaylist?.streams.append(resolvedStream.resolve(url: line))
+            streamCount += 1
+            pendingStream = nil
         }
+
+        if wasCancelled { throw CancellationError() }
+        if let parserError { throw parserError }
 
         guard hasHeader else {
             throw ParserError.invalidFormat

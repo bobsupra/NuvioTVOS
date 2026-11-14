@@ -21,12 +21,18 @@ enum IPTVChannelImporter {
         from playlists: [IPTVPlaylistParser.Playlist],
         sourceID: String,
         baseURL: URL?
-    ) -> [IPTVChannel] {
+    ) throws -> [IPTVChannel] {
         guard !sourceID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         var result: [IPTVChannel] = []
         var seen = Set<String>()
+        var processedStreams = 0
         for playlist in playlists {
             for stream in playlist.streams {
+                processedStreams += 1
+                if processedStreams.isMultiple(of: 512) { try Task.checkCancellation() }
+                guard processedStreams <= IPTVImportLimits.maximumChannels else {
+                    throw IPTVChannelImportError.tooLarge
+                }
                 guard let url = webURL(stream.url, relativeTo: baseURL) else { continue }
                 let title = nonempty(stream.title) ?? nonempty(stream.tvgName)
                 guard let title else { continue }
@@ -50,6 +56,7 @@ enum IPTVChannelImporter {
                 ))
             }
         }
+        try Task.checkCancellation()
         return result
     }
 
@@ -64,4 +71,8 @@ enum IPTVChannelImporter {
               let host = url.host, !host.isEmpty else { return nil }
         return url
     }
+}
+
+enum IPTVChannelImportError: Error, Equatable {
+    case tooLarge
 }
