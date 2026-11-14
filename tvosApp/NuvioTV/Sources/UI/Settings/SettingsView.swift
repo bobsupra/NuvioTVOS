@@ -191,6 +191,7 @@ enum SettingsKey {
     static let liquidGlassCards = "nuvio.tv.settings.layout.liquidGlassCards"
     /// Settings → Appearance → Sidebar → Calendar.
     static let showCalendarTab = "nuvio.tv.settings.layout.showCalendarTab"
+    static let showSurpriseMeTab = "nuvio.tv.settings.layout.showSurpriseMeTab"
     static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
@@ -445,7 +446,7 @@ enum SettingsKey {
         homeLayout, sidebarClockFormat, gridRows, gridItemsPerRow, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, homeHeroRatingSource, homeHeroRatingsEnabled, posterLabels, continueWatchingLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
-        showCalendarTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
+        showCalendarTab, showSurpriseMeTab, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
@@ -2772,6 +2773,8 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
+    @State private var confirmingSurpriseMe = false
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
@@ -2879,6 +2882,35 @@ private struct AppearanceSettingsView: View {
                     isOn: $showCalendarTab,
                     accentColor: accentColor
                 )
+                SettingsToggleRow(
+                    title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
+                    subtitle: L10n.string(
+                        "settings_show_surprise_me_tab_subtitle",
+                        fallback: "A tab that suggests a movie for your tastes"
+                    ),
+                    isOn: Binding(
+                        get: { showSurpriseMeTab },
+                        set: { isOn in
+                            // Turning it on asks first; turning it off is immediate.
+                            if isOn { confirmingSurpriseMe = true } else { showSurpriseMeTab = false }
+                        }
+                    ),
+                    accentColor: accentColor
+                )
+                .alert(
+                    L10n.string("surprise_me_consent_title", fallback: "Turn on Surprise Me?"),
+                    isPresented: $confirmingSurpriseMe
+                ) {
+                    Button(L10n.string("surprise_me_consent_confirm", fallback: "Turn On")) {
+                        showSurpriseMeTab = true
+                    }
+                    Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+                } message: {
+                    Text(L10n.string(
+                        "surprise_me_consent_message",
+                        fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, and suggests movies you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else. A Surprise Me tab will be added to the menu."
+                    ))
+                }
                 SettingsToggleRow(
                     title: L10n.string("nav_watch_party", fallback: "Watch Party"),
                     subtitle: L10n.string(
