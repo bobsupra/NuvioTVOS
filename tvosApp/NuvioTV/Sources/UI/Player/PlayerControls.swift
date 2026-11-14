@@ -630,7 +630,8 @@ struct PlayerControls: View {
             ) {
                 viewModel.openSidePanel(.episodes)
             } icon: {
-                Image(systemName: "list.bullet")
+                // Shows that the series is playing in shuffle.
+                Image(systemName: viewModel.isShufflingEpisodes ? "shuffle" : "list.bullet")
             }
             .id("episodes_button")
 
