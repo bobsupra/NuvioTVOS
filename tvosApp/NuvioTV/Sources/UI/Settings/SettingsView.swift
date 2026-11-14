@@ -390,6 +390,7 @@ enum SettingsKey {
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
     static let playerShowSpeed = "nuvio.tv.settings.playback.showSpeed"
     static let playerShowFinishTime = "nuvio.tv.settings.playback.showFinishTime"
+    static let shuffleAllSeries = "nuvio.tv.settings.playback.shuffleAllSeries"
     /// JSON `[String]` of player transport button ids in preferred order.
     static let playerButtonOrder = "nuvio.tv.settings.playback.playerButtonOrder"
     /// JSON `[String]` of InSight tab ids in preferred order.
@@ -491,7 +492,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerShowFinishTime, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerShowFinishTime, shuffleAllSeries, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
         subtitleAutoSync, subtitleAutoSyncToleranceMs,
         audioDelayPersistEnabled, persistentAudioDelayMs,
@@ -11342,6 +11343,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
     @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
+    @AppStorage(SettingsKey.shuffleAllSeries) private var shuffleAllSeries = false
     @AppStorage(SettingsKey.sceneFeatureEnabled) private var sceneFeatureEnabled = true
 
     @State private var showingPlayerButtonSettings = false
@@ -11867,6 +11869,15 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("player_show_finish_time", fallback: "Show estimated finish time"),
                     subtitle: L10n.string("player_show_finish_time_subtitle", fallback: "Show when the current video is expected to finish in the player controls."),
                     isOn: $playerShowFinishTime,
+                    accentColor: accentColor
+                )
+                SettingsToggleRow(
+                    title: L10n.string("details_shuffle_all_series", fallback: "Shuffle for all series"),
+                    subtitle: L10n.string(
+                        "details_shuffle_all_series_subtitle",
+                        fallback: "The Shuffle button normally appears only on shows with stand-alone episodes, such as sitcoms. Turn this on to show it on every series."
+                    ),
+                    isOn: $shuffleAllSeries,
                     accentColor: accentColor
                 )
                 SettingsToggleRow(

@@ -4466,6 +4466,7 @@ struct TvDetailsContent: View {
     @State private var restoreGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(SettingsKey.shuffleAllSeries) private var shuffleAllSeries = false
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.reuseLastLink) private var reuseLastLink = false
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -5157,7 +5158,7 @@ struct TvDetailsContent: View {
     /// least two episodes that can play.
     private func shuffleAction(meta: NuvioMeta, episodes: [NuvioVideo]) -> (() -> Void)? {
         guard meta.isSeries,
-              EpisodeShuffle.suitsShuffle(genres: meta.genres),
+              shuffleAllSeries || EpisodeShuffle.suitsShuffle(genres: meta.genres),
               episodes.filter(EpisodeShuffle.isEligible).count > 1 else { return nil }
         return {
             cancelFocusRestoration()
