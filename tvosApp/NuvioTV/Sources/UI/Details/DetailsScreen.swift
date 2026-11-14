@@ -10429,6 +10429,8 @@ private struct TvStreamPickerOverlay: View {
     @AppStorage(SettingsKey.streamSortOption) private var sortOption: StreamSortOption = .quality
     @AppStorage(SettingsKey.recommendedStreamSort) private var recommendedSort = false
     private var pickerSortOption: StreamSortOption { recommendedSort ? .recommended : sortOption }
+    /// Nuvio Recommended speed checks, by stream id.
+    @State private var speedVerdicts: [String: StreamSpeedVerdict] = [:]
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
@@ -11231,9 +11233,14 @@ private struct TvStreamPickerOverlay: View {
         let picks = pickerSortOption == .recommended
             ? StreamPickerListBuilder.recommendedByResolution(from: activeDisplayedStreams)
             : []
-        let recommendedStream = pickerSortOption == .recommended
-            ? activeDisplayedStreams.first(where: { !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0 })
-            : nil
+        // The top recommended sources get a short speed check; a slow top pick
+        // gives way to the best checked one that keeps up with its resolution.
+        let speedCandidates = pickerSortOption == .recommended
+            ? Array(activeDisplayedStreams.lazy.filter {
+                !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0
+            }.prefix(Self.speedCheckCandidateCount))
+            : []
+        let recommendedStream = StreamSpeedRanking.overallPick(ranked: speedCandidates, verdicts: speedVerdicts)
         let lastPlayedID = pickerSortOption == .recommended ? lastPlayedSourceMatch?.sourceID : nil
         let recommendationPicks = picks.filter { pick in
             guard pick.stream.id != recommendedStream?.id else { return false }
@@ -11315,6 +11322,7 @@ private struct TvStreamPickerOverlay: View {
                                                 ? L10n.string("stream_best_overall_so_far", fallback: "Best overall so far")
                                                 : L10n.string("stream_best_overall", fallback: "Best overall"),
                                             prominent: true,
+                                            speedVerdict: speedVerdicts[recommendedStream.id],
                                             focusBinding: $focusedItem,
                                             focusValue: "recommended::overall",
                                             action: { select(recommendedStream, player: nil) }
@@ -11333,6 +11341,7 @@ private struct TvStreamPickerOverlay: View {
                                                 stream: pick.stream,
                                                 title: L10n.format("stream_best_resolution", fallback: "Best %@", resolutionLabel),
                                                 prominent: false,
+                                                speedVerdict: speedVerdicts[pick.stream.id],
                                                 focusBinding: $focusedItem,
                                                 focusValue: "recommended::\(resolution)",
                                                 action: { select(pick.stream, player: nil) }
@@ -11447,6 +11456,30 @@ private struct TvStreamPickerOverlay: View {
             RoundedRectangle(cornerRadius: 32, style: .continuous)
                 .stroke(Color.white.opacity(0.10), lineWidth: 1)
         )
+        .task(id: speedCandidates.map(\.id).joined(separator: "|")) {
+            await checkSpeed(of: speedCandidates)
+        }
+    }
+
+    static let speedCheckCandidateCount = 3
+
+    /// Checks the candidates that have no result yet, all at once, while the
+    /// user looks at the list.
+    private func checkSpeed(of candidates: [NuvioStream]) async {
+        let pending = candidates.filter { speedVerdicts[$0.id] == nil }
+        guard !pending.isEmpty else { return }
+        await withTaskGroup(of: (String, StreamSpeedVerdict?).self) { group in
+            for stream in pending {
+                let resolution = StreamPickerListBuilder.resolution(for: stream)
+                group.addTask {
+                    (stream.id, await StreamSpeedProbe.shared.verdict(for: stream, resolution: resolution))
+                }
+            }
+            for await (id, verdict) in group {
+                guard !Task.isCancelled else { return }
+                if let verdict { speedVerdicts[id] = verdict }
+            }
+        }
     }
 
     /// Groups shown as filter chips (configured order; includes loading/error).
@@ -11728,11 +11761,20 @@ private struct TvStreamRecommendationCard: View {
     let stream: NuvioStream
     let title: String
     let prominent: Bool
+    var speedVerdict: StreamSpeedVerdict? = nil
     let focusBinding: FocusState<String?>.Binding
     let focusValue: String
     let action: () -> Void
 
     private var isFocused: Bool { focusBinding.wrappedValue == focusValue }
+
+    private var speedLabel: String? {
+        switch speedVerdict {
+        case .fast: return L10n.string("stream_speed_fast", fallback: "⚡ Fast")
+        case .slow: return L10n.string("stream_speed_slow", fallback: "🐢 Slow")
+        case .ok, nil: return nil
+        }
+    }
 
     var body: some View {
         Button(action: action) {
@@ -11753,6 +11795,9 @@ private struct TvStreamRecommendationCard: View {
                             .lineLimit(prominent ? 2 : 1)
                     }
                     HStack(spacing: 12) {
+                        if let speedLabel {
+                            Text(speedLabel)
+                        }
                         if let size = StreamBadgeSizing.fileSizeLabel(for: stream) {
                             Text(size)
                         }
