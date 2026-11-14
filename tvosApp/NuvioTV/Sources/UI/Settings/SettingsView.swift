@@ -8643,39 +8643,24 @@ private struct SurpriseMeOptionsSheet: View {
                                 isSecure: true,
                                 onCommit: { SurpriseMeAIKeyStore.save(apiKey, for: selectedProvider) }
                             )
-                            if !selectedProvider.suggestedModels.isEmpty {
-                                SettingsOptionRow(
-                                    title: L10n.string("surprise_me_ai_model_preset", fallback: "Suggested Model"),
-                                    subtitle: L10n.string(
-                                        "surprise_me_ai_model_preset_subtitle",
-                                        fallback: "Pick a model, or type another one below"
-                                    ),
-                                    selection: Binding(
-                                        get: {
-                                            let current = model.isEmpty ? selectedProvider.defaultModel : model
-                                            return selectedProvider.suggestedModels.first { $0.id == current }?.id
-                                                ?? L10n.string("surprise_me_ai_model_custom", fallback: "Custom")
-                                        },
-                                        set: { newValue in
-                                            if selectedProvider.suggestedModels.contains(where: { $0.id == newValue }) {
-                                                model = newValue
-                                            }
-                                        }
-                                    ),
-                                    options: selectedProvider.suggestedModels.map(\.id),
-                                    accentColor: accentColor,
-                                    optionLabel: { id in
-                                        selectedProvider.suggestedModels.first { $0.id == id }?.name ?? id
-                                    }
-                                )
-                            }
-                            SettingsNativeTextFieldRow(
+                            // A list of models known to work, never a text field. With a
+                            // single model the row only shows which one is used.
+                            let models = selectedProvider.suggestedModels
+                            SettingsOptionRow(
                                 title: L10n.string("surprise_me_ai_model", fallback: "Model"),
-                                subtitle: L10n.format("surprise_me_ai_model_subtitle", fallback: "Leave empty for %@", selectedProvider.defaultModel),
-                                placeholder: selectedProvider.defaultModel,
-                                text: $model,
-                                onCommit: { model = model.trimmingCharacters(in: .whitespacesAndNewlines) }
+                                subtitle: models.count > 1
+                                    ? L10n.string("surprise_me_ai_model_choose", fallback: "Choose which model suggests titles")
+                                    : L10n.string("surprise_me_ai_model_only", fallback: "The only model available for this provider"),
+                                selection: Binding(
+                                    get: { SurpriseMeAIConfiguration.normalizedModel(model, for: selectedProvider) },
+                                    set: { model = $0 }
+                                ),
+                                options: models.map(\.id),
+                                accentColor: accentColor,
+                                optionLabel: { id in models.first { $0.id == id }?.name ?? id }
                             )
+                            .disabled(models.count <= 1)
+                            .opacity(models.count <= 1 ? 0.6 : 1)
                             Text(L10n.string(
                                 "surprise_me_ai_privacy",
                                 fallback: "When you press Surprise Me, the provider you chose receives, with your key: the titles and years of up to 120 movies and shows you watched, 60 you saved and 20 you're watching, your genre shares, which suggestions you opened or skipped this session, and the candidate movies. The AI learns your taste from all of it, picks from the candidates and can suggest other movies, which are shown only if TMDB confirms they exist and you haven't watched them. Your key stays in this Apple TV's Keychain and never syncs."

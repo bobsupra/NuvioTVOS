@@ -111,4 +111,14 @@ final class SurpriseMeAITests: XCTestCase {
         XCTAssertEqual(TasteProfile.normalized("Science Fiction"), TasteProfile.normalized("Sci-Fi"))
         XCTAssertEqual(TmdbDetailsService.surpriseMeGenreID(for: "Science Fiction"), 878)
     }
+
+    func testOnlyListedModelsAreUsed() {
+        XCTAssertEqual(SurpriseMeAIConfiguration.normalizedModel("gemini-3.8-flash", for: .gemini), "gemini-3.8-flash")
+        XCTAssertEqual(SurpriseMeAIConfiguration.normalizedModel("deepseek-chat", for: .deepSeek), "deepseek-flash")
+        XCTAssertEqual(SurpriseMeAIConfiguration.normalizedModel(nil, for: .openRouter), "qwen/qwen3.7-flash")
+        XCTAssertEqual(SurpriseMeAIConfiguration.normalizedModel(" ", for: .gemini), "gemini-3.6-flash")
+        for provider in SurpriseMeAIProvider.allCases where provider != .off {
+            XCTAssertEqual(provider.defaultModel, provider.suggestedModels.first?.id)
+        }
+    }
 }

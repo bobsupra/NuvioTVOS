@@ -27,8 +27,8 @@ enum SurpriseMeAIProvider: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Models offered in Settings: (API model id, name shown). Any other model
-    /// can still be typed in the Model field.
+    /// The models offered in Settings: (API model id, name shown). Only these
+    /// can be chosen; the first is the default.
     var suggestedModels: [(id: String, name: String)] {
         switch self {
         case .deepSeek: return [("deepseek-flash", "DeepSeek-V4.1-Flash")]
@@ -127,13 +127,18 @@ struct SurpriseMeAIConfiguration: Equatable {
 
     static func current(defaults: UserDefaults = ProfileSettings.current) -> Self {
         let provider = SurpriseMeAIProvider(rawValue: defaults.string(forKey: SettingsKey.surpriseMeAIProvider) ?? "") ?? .off
-        let storedModel = (defaults.string(forKey: SettingsKey.surpriseMeAIModel) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         return Self(
             provider: provider,
             apiKey: SurpriseMeAIKeyStore.apiKey(for: provider),
-            model: storedModel.isEmpty ? provider.defaultModel : storedModel
+            model: normalizedModel(defaults.string(forKey: SettingsKey.surpriseMeAIModel), for: provider)
         )
+    }
+
+    /// The stored model when it is one of the provider's models; otherwise,
+    /// including a model typed in an older version, the provider's default.
+    static func normalizedModel(_ stored: String?, for provider: SurpriseMeAIProvider) -> String {
+        let model = (stored ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return provider.suggestedModels.contains { $0.id == model } ? model : provider.defaultModel
     }
 }
 
