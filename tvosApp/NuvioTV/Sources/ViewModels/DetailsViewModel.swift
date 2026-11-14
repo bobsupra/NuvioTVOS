@@ -1262,6 +1262,7 @@ class DetailsViewModel: ObservableObject {
         if TraktSettingsStore.librarySourceMode == .local {
             watchlistMutationGeneration &+= 1
             uiState.isInWatchlist = LibraryStore.toggle(meta: meta)
+            TrackingAddonService.sendLibraryMembership(uiState.isInWatchlist, meta: meta)
             return
         }
 
@@ -1276,6 +1277,7 @@ class DetailsViewModel: ObservableObject {
         let mutationGeneration = watchlistMutationGeneration
         let requestGeneration = detailsRequestGeneration
         uiState.isInWatchlist = desiredMembership
+        TrackingAddonService.sendLibraryMembership(desiredMembership, meta: meta)
         let previousMutation = watchlistMutationTask
         watchlistMutationTask = Task { @MainActor in
             if let previousMutation { await previousMutation.value }
@@ -1310,6 +1312,7 @@ class DetailsViewModel: ObservableObject {
         } else {
             uiState.isWatched = WatchedStore.toggle(meta: meta)
         }
+        TrackingAddonService.sendWatched(uiState.isWatched, meta: meta)
     }
 
     func setMdbListUserRating(_ rating: Int?) {

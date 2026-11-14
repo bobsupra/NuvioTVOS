@@ -14031,6 +14031,7 @@ private struct TVGridHeroSlideshowView: View {
         let currentlyInLibrary = SelectedLibraryService.isInLibrary(meta: item)
         if TraktSettingsStore.librarySourceMode != .local && SelectedLibraryService.isSelectedAndAuthenticated {
             let desiredMembership = !currentlyInLibrary
+            TrackingAddonService.sendLibraryMembership(desiredMembership, meta: item)
             Task {
                 _ = await SelectedLibraryService.setWatchlist(item, isInWatchlist: desiredMembership)
                 await MainActor.run {
@@ -14038,7 +14039,8 @@ private struct TVGridHeroSlideshowView: View {
                 }
             }
         } else {
-            _ = LibraryStore.toggle(meta: item)
+            let isInLibrary = LibraryStore.toggle(meta: item)
+            TrackingAddonService.sendLibraryMembership(isInLibrary, meta: item)
             updateLibraryStatus()
         }
     }
