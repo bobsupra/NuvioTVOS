@@ -746,6 +746,8 @@ struct TVCatalogRow: View {
         let rowCardFocusAnimations = smoothFocus && !suppressFocusAnimations && !fastNavigation
         let rowCardSpacing: CGFloat = rowHomeLayout == "Compact" ? 22 : 28
         let cards = TVHomeCardIdentity.materializedTitles(rowID: id, items: items, indices: Array(items.indices))
+        // Where the cards start, under the row's title, in the strip's own coordinates.
+        let titleLeading = horizontalEdgeInset + TVLayout.rowLeading
         return ScrollViewReader { proxy in
             ScrollView(.horizontal, showsIndicators: false) {
                 LazyHStack(alignment: .top, spacing: rowCardSpacing) {
@@ -754,8 +756,7 @@ struct TVCatalogRow: View {
                             .id(card.id)
                     }
                 }
-                .padding(.leading, horizontalEdgeInset + TVLayout.rowLeading)
-                .padding(.trailing, horizontalEdgeInset + TVLayout.rowLeading)
+                .scrollTargetLayout()
                 .padding(.vertical, TVHomeLayout.stripVerticalPadding)
                 .animation(
                     rowCardFocusAnimations && restrictFocusToCardKey == nil
@@ -763,6 +764,17 @@ struct TVCatalogRow: View {
                     value: landscapeFocusedId
                 )
             }
+            // The focused card stays under the row's title, as in the rows before the system
+            // scroll view, and tvOS still does the scrolling: the room left for the focused card
+            // is one card wide, under the title, so tvOS scrolls the row on each move to keep it
+            // there, and the scroll comes to rest with a card's leading edge there.
+            .contentMargins(.leading, titleLeading, for: .scrollContent)
+            .contentMargins(
+                .trailing,
+                max(titleLeading, stripWidth - titleLeading - rowPosterWidth),
+                for: .scrollContent
+            )
+            .scrollTargetBehavior(.viewAligned(limitBehavior: .never))
             .scrollClipDisabled()
             .frame(width: stripWidth, height: stripHeight, alignment: .topLeading)
             .offset(x: -horizontalEdgeInset)
