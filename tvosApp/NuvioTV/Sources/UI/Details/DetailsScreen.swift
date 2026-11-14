@@ -8898,6 +8898,8 @@ private struct TvDetailsEpisodes: View {
     @State private var systemStripScrollGeneration = 0
     /// What the system strip is to scroll to, a new count each time.
     @State private var systemStripScrollRequest = TvEpisodeStripScrollRequest()
+    /// The strip's UIKit scroll view, which the strip moves itself.
+    @State private var episodeScrollBox = TVScrollViewBox()
     @State private var watchedEpisodeKeys: Set<String>
     @State private var episodeWatchCounts: [String: Int]
     @State private var watchedSummary: WatchedEpisodeSummary?
@@ -9238,9 +9240,10 @@ private struct TvDetailsEpisodes: View {
         }
     }
 
-    /// The strip as a system scroll view, as Home's rows. tvOS scrolls it as focus moves, outside
-    /// the main thread, so a move that costs some work no longer holds the scroll up as the
-    /// strip's own animation (an offset of its cards) was.
+    /// The strip as a scroll view, as Home's rows. Each move puts the focused episode at the
+    /// column's start, as Nuvio's strip did, with a Core Animation move: it goes on outside the
+    /// main thread, so a move that costs some work no longer holds the scroll up as the strip's
+    /// own animation (an offset of its cards) did. tvOS's scroll for focus is off.
     ///
     /// Not lazy: the cards near the screen, near the remembered episode and near where focus
     /// is being put back are built, and the rest of the strip is empty space of the same width.
@@ -9273,11 +9276,27 @@ private struct TvDetailsEpisodes: View {
                 }
             }
             .padding(.leading, edgeInset + CGFloat(first) * TvEpisodeCardLayout.step)
-            .padding(.trailing, edgeInset + TVLayout.rowLeading + CGFloat(after) * TvEpisodeCardLayout.step)
+            // Room after the last episode, so it too comes to the column's start.
+            .padding(.trailing, stripWidth + CGFloat(after) * TvEpisodeCardLayout.step)
             .padding(.vertical, TvEpisodeCardLayout.verticalPadding)
+            .background {
+                TVScrollViewFinder(box: episodeScrollBox)
+                    .frame(width: 1, height: 1)
+                    .allowsHitTesting(false)
+            }
         }
+        .scrollDisabled(true)
         .frame(width: stripWidth, height: TvEpisodeCardLayout.stripHeight, alignment: .leading)
         .offset(x: -edgeInset)
+        .onChange(of: episodeScrollIndex) { _, index in
+            // Episode i starts `i * step` in.
+            guard let scrollView = episodeScrollBox.scrollView else { return }
+            TVScrollMove.move(
+                scrollView,
+                to: CGPoint(x: CGFloat(index) * TvEpisodeCardLayout.step, y: scrollView.contentOffset.y),
+                animated: true
+            )
+        }
         .onAppear {
             // Where the strip was left, or the card focus goes back to.
             keepScrolling(to: restoreIndex ?? episodeScrollIndex)

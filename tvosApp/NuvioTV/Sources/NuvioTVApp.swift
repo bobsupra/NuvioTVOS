@@ -5247,6 +5247,8 @@ private final class TVHomeFocusWork {
     /// or built again, and with rows of other shapes (wide cards, a label under each card) Home
     /// jumped in the middle of a run of moves.
     var rowHeights: [String: CGFloat] = [:]
+    /// Where each row built so far starts in Home's scroll content, for `moveHome`.
+    var rowTops: [String: CGFloat] = [:]
     /// Rows built since focus last rested on a row. They stay built until it rests again: in a
     /// fast run of moves the scroll is still on its way and can show a row two or three behind
     /// the focused one, which vanished when the rows around focus moved on without it.
@@ -5410,6 +5412,7 @@ struct TVScrollViewFocusConfigurator: UIViewRepresentable {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.showsVerticalScrollIndicator = false
         scrollView.isScrollEnabled = false
+        TVHomeVerticalScroll.scrollView = scrollView
     }
 
     private func findScrollView(from view: UIView) -> UIScrollView? {
@@ -6115,12 +6118,13 @@ struct TVHomeView: View {
                                                     horizontalEdgeInset: horizontalEdgeInset,
                                                     verticalScrollProxy: verticalScrollProxy
                                                 )
-                                                .onGeometryChange(for: CGFloat.self) { proxy in
-                                                    proxy.size.height
-                                                } action: { height in
-                                                    if height > 0 {
-                                                        focusWork.rowHeights[section.id] = height
+                                                .onGeometryChange(for: CGRect.self) { proxy in
+                                                    proxy.frame(in: .named(TVHomeVerticalScroll.space))
+                                                } action: { frame in
+                                                    if frame.height > 0 {
+                                                        focusWork.rowHeights[section.id] = frame.height
                                                     }
+                                                    focusWork.rowTops[section.id] = frame.minY
                                                 }
                                             } else {
                                                 Color.clear
@@ -6137,6 +6141,9 @@ struct TVHomeView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.top, TVHomeLayout.rowsTopPadding)
                                     .padding(.bottom, 80)
+                                    // The scroll content's own space (this is its first view), where
+                                    // each row's top is read for `moveHome`.
+                                    .coordinateSpace(.named(TVHomeVerticalScroll.space))
                                     .task(id: focusedRowIndex) {
                                         let row = focusedRowIndex
                                         // Past the vertical scroll's spring (0.28 s).
@@ -6192,8 +6199,11 @@ struct TVHomeView: View {
                                         let animation = (isFastScrolling || fastNavigation)
                                             ? TVHomeLayout.fastVerticalScrollAnimation
                                             : TVHomeLayout.verticalScrollAnimation
+                                        let targetId = targetScrollToTopSectionId ?? firstFocusableSectionId
+                                        if let targetId, moveHome(to: targetId, fast: isFastScrolling || fastNavigation) {
+                                            return
+                                        }
                                         withAnimation(animation) {
-                                            let targetId = targetScrollToTopSectionId ?? firstFocusableSectionId
                                             if let targetId {
                                                 verticalScrollProxy.scrollTo(targetId, anchor: .top)
                                             }
@@ -7962,6 +7972,24 @@ struct TVHomeView: View {
         handleBackCommand()
     }
 
+    /// Puts row `sectionID` at the top of Home, where scrollTo(_:anchor: .top) would, with a Core
+    /// Animation move of Home's UIKit scroll view (as the rows move). Home's SwiftUI scroll
+    /// animation was worked out on the main thread frame by frame, and stalled with the work of
+    /// the move (the hero, the rows being built). False until the row's place is known (then
+    /// SwiftUI scrolls, as before).
+    private func moveHome(to sectionID: String, fast: Bool) -> Bool {
+        guard let scrollView = TVHomeVerticalScroll.scrollView, scrollView.window != nil,
+              let top = focusWork.rowTops[sectionID]
+        else { return false }
+        TVScrollMove.move(
+            scrollView,
+            to: CGPoint(x: scrollView.contentOffset.x, y: top - scrollView.adjustedContentInset.top),
+            animated: true,
+            duration: fast ? 0.18 : 0.3
+        )
+        return true
+    }
+
     private func returnFocusToRowBeginning(sectionID: String, cardKey: String) {
         TVHomeDebugTrace.log("home.returnFocusToRowBeginning section=\(sectionID) cardKey=\(cardKey)")
         focusWork.upwardFocusTask?.cancel()
@@ -8215,8 +8243,10 @@ struct TVHomeView: View {
                             ? TVHomeLayout.fastVerticalScrollAnimation
                             : TVHomeLayout.verticalScrollAnimation
                         TVHomeDebugTrace.log("🚀 [SCROLL_TO] section=\(section.id) anchor=top anim=\(isFastScrolling || fastNavigation ? "FAST" : "NORMAL")")
-                        withAnimation(animation) {
-                            verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                        if !moveHome(to: section.id, fast: isFastScrolling || fastNavigation) {
+                            withAnimation(animation) {
+                                verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                            }
                         }
                     } else {
                         var transaction = Transaction(animation: nil)
@@ -8288,8 +8318,10 @@ struct TVHomeView: View {
                                 ? TVHomeLayout.fastVerticalScrollAnimation
                                 : TVHomeLayout.verticalScrollAnimation
                             TVHomeDebugTrace.log("🚀 [SCROLL_TO] section=\(section.id) anchor=top anim=\(isFastScrolling || fastNavigation ? "FAST" : "NORMAL")")
-                            withAnimation(animation) {
-                                verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                            if !moveHome(to: section.id, fast: isFastScrolling || fastNavigation) {
+                                withAnimation(animation) {
+                                    verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                }
                             }
                         }
                     } else {
@@ -8393,8 +8425,10 @@ struct TVHomeView: View {
                             TVHomeDebugTrace.log(
                                 "🚀 [SCROLL_TO] section=\(section.id) anchor=top fromRow=\(focusedRowIndex) toRow=\(index) anim=\(isFastScrolling || fastNavigation ? "FAST(0.18s)" : "NORMAL(0.28s)")"
                             )
-                            withAnimation(animation) {
-                                verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                            if !moveHome(to: section.id, fast: isFastScrolling || fastNavigation) {
+                                withAnimation(animation) {
+                                    verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                }
                             }
                         }
                     } else {
