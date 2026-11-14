@@ -27,6 +27,25 @@ final class SurpriseMeTests: XCTestCase {
         XCTAssertEqual(profile.weights["drama"], profile.weights["action"])
     }
 
+    func testTheSameTitleFromTwoTrackersCountsOnce() {
+        let fromTrakt = NuvioMeta(id: "tt100", name: "Film", imdbId: "tt100", type: "movie", genres: ["Action"])
+        let fromSimkl = NuvioMeta(id: "tmdb:55", name: "Film", imdbId: "tt100", type: "movie", genres: ["Action"])
+        let profile = TasteProfile.build(
+            watched: [fromTrakt, fromSimkl, movie("other", ["Comedy"])],
+            library: [],
+            continueWatching: []
+        )
+        XCTAssertEqual(profile.weights["action"], profile.weights["comedy"])
+    }
+
+    @MainActor
+    func testTrackerHistoriesRefreshAtMostEvery30Minutes() {
+        let now = Date()
+        XCTAssertTrue(SurpriseMeTrackers.needsRefresh(lastRefresh: nil, now: now))
+        XCTAssertFalse(SurpriseMeTrackers.needsRefresh(lastRefresh: now.addingTimeInterval(-60), now: now))
+        XCTAssertTrue(SurpriseMeTrackers.needsRefresh(lastRefresh: now.addingTimeInterval(-31 * 60), now: now))
+    }
+
     func testEmptyHistoryGivesAnEmptyProfile() {
         XCTAssertTrue(TasteProfile.build(watched: [], library: [], continueWatching: []).isEmpty)
     }

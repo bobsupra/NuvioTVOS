@@ -14,8 +14,11 @@ struct SurpriseMeView: View {
     @State private var pick: NuvioMeta?
     @State private var offered: Set<String> = []
     @State private var didLoad = false
+    @State private var noMovieFound = false
+    @State private var historyCount = 0
+    @State private var historySources: [String] = []
 
-    private enum FocusTarget: Hashable { case open, another }
+    private enum FocusTarget: Hashable { case surprise, open, another }
     @FocusState private var focus: FocusTarget?
 
     var body: some View {
@@ -26,18 +29,70 @@ struct SurpriseMeView: View {
                 backdrop(for: pick)
                 details(for: pick)
             } else {
-                emptyState
+                landing
             }
         }
         .task(id: isActive) {
             guard isActive else { return }
             refreshProfile()
-            if pick == nil { roll() }
             didLoad = true
+            // Then bring the connected trackers up to date and learn again.
+            await SurpriseMeTrackers.refreshHistoriesIfNeeded()
+            guard !Task.isCancelled else { return }
+            refreshProfile()
         }
-        .onChange(of: homeStore.sectionsRevision) { _, _ in
-            if isActive, pick == nil { roll() }
+    }
+
+    /// The tab opens on a button, like the profile tab: nothing is suggested
+    /// until the viewer asks for it.
+    private var landing: some View {
+        VStack(spacing: 24) {
+            Image(systemName: "dice.fill")
+                .font(.system(size: 120))
+                .foregroundColor(.white.opacity(0.9))
+            Text(L10n.string("nav_surprise_me", fallback: "Surprise Me"))
+                .font(.title2.bold())
+            Text(learningLine)
+                .font(.system(size: 24))
+                .foregroundColor(.white.opacity(0.65))
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 900)
+            Button {
+                roll()
+                if pick != nil { focus = .open }
+            } label: {
+                Label(L10n.string("nav_surprise_me", fallback: "Surprise Me"), systemImage: "sparkles")
+            }
+            .focused($focus, equals: .surprise)
+            if didLoad, noMovieFound {
+                Text(L10n.string("surprise_me_empty", fallback: "No unwatched movies in your Home catalogs yet."))
+                    .font(.system(size: 22))
+                    .foregroundColor(.white.opacity(0.65))
+            }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var learningLine: String {
+        guard historyCount > 0 else {
+            return L10n.string(
+                "surprise_me_learning_empty",
+                fallback: "Watch a few titles and the suggestions will follow your tastes. Until then, you get well-rated picks."
+            )
+        }
+        guard !historySources.isEmpty else {
+            return L10n.format(
+                "surprise_me_learning_count",
+                fallback: "Based on %d titles you watched or saved",
+                historyCount
+            )
+        }
+        return L10n.format(
+            "surprise_me_learning_sources",
+            fallback: "Based on %1$d titles you watched or saved, from %2$@",
+            historyCount,
+            historySources.joined(separator: ", ")
+        )
     }
 
     private func backdrop(for meta: NuvioMeta) -> some View {
@@ -109,19 +164,6 @@ struct SurpriseMeView: View {
         .focusSection()
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "dice")
-                .font(.system(size: 72))
-            Text(didLoad
-                 ? L10n.string("surprise_me_empty", fallback: "No unwatched movies in your Home catalogs yet.")
-                 : L10n.string("surprise_me_loading", fallback: "Finding something for you…"))
-                .font(.system(size: 30, weight: .semibold))
-        }
-        .foregroundColor(.white.opacity(0.7))
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
     private func reason(for meta: NuvioMeta) -> String {
         let genres = profile.matchingGenres(for: meta)
         guard !genres.isEmpty else {
@@ -143,11 +185,17 @@ struct SurpriseMeView: View {
     }
 
     private func refreshProfile() {
+        // One history: what was watched in Nuvio and in every connected tracker.
+        let watched = WatchedStore.items()
+        let library = LibraryStore.items().map(\.meta)
+        let continueWatching = ContinueWatchingStore.items().map(\.meta)
         profile = TasteProfile.build(
-            watched: WatchedStore.items().map(\.meta),
-            library: LibraryStore.items().map(\.meta),
-            continueWatching: ContinueWatchingStore.items().map(\.meta)
+            watched: watched.map(\.meta),
+            library: library,
+            continueWatching: continueWatching
         )
+        historyCount = Set((watched.map(\.meta) + library + continueWatching).map { $0.imdbId ?? $0.id }).count
+        historySources = SurpriseMeTrackers.sourceLabels(of: watched)
     }
 
     private func roll() {
@@ -157,7 +205,11 @@ struct SurpriseMeView: View {
             profile: profile,
             isWatched: { WatchedStore.contains(meta: $0) },
             excluding: offered
-        ) else { return }
+        ) else {
+            noMovieFound = true
+            return
+        }
+        noMovieFound = false
         // Once everything was offered, start over but never repeat the current one.
         if offered.contains(next.id) { offered = pick.map { [$0.id] } ?? [] }
         offered.insert(next.id)

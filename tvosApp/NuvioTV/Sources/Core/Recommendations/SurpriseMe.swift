@@ -3,8 +3,10 @@ import Foundation
 /// What the viewer tends to watch, as a weight per genre.
 ///
 /// Built on the device from the profile's watch history, library and Continue
-/// Watching. Nothing new is stored or uploaded: those three already sync with
-/// the Nuvio account, so the same tastes are rebuilt on every device.
+/// Watching. The watch history is the app's one shared list, which holds what
+/// was watched in Nuvio and what every connected tracker (Trakt, Simkl,
+/// MDBList, WeTrakr) reports, so all of them count as one history. Nothing new
+/// is stored or uploaded: the same tastes are rebuilt on every device.
 struct TasteProfile: Equatable {
     /// Normalized genre name -> share of the total weight (0...1).
     let weights: [String: Double]
@@ -33,8 +35,9 @@ struct TasteProfile: Equatable {
         var totals: [String: Double] = [:]
         var names: [String: String] = [:]
         func add(_ metas: [NuvioMeta], weight: Double) {
+            // The same title can come from two trackers under different ids.
             var seen = Set<String>()
-            for meta in metas where seen.insert(meta.id).inserted {
+            for meta in metas where seen.insert(meta.imdbId ?? meta.id).inserted {
                 for genre in meta.genres ?? [] {
                     let key = normalized(genre)
                     guard !key.isEmpty else { continue }
@@ -72,6 +75,40 @@ struct TasteProfile: Equatable {
             .sorted { (weights[Self.normalized($0)] ?? 0) > (weights[Self.normalized($1)] ?? 0) }
             .prefix(limit)
             .map { $0 }
+    }
+}
+
+/// Brings the connected trackers' watch histories up to date, so tastes are
+/// learned from all of them. Each tracker's own sync decides whether it runs
+/// (connected, and selected or enabled in Settings); nothing is pulled from an
+/// account the user hasn't set up for this profile.
+@MainActor
+enum SurpriseMeTrackers {
+    static let refreshInterval: TimeInterval = 30 * 60
+    private static var lastRefreshByProfile: [String: Date] = [:]
+
+    static func needsRefresh(lastRefresh: Date?, now: Date = Date()) -> Bool {
+        guard let lastRefresh else { return true }
+        return now.timeIntervalSince(lastRefresh) >= refreshInterval
+    }
+
+    static func refreshHistoriesIfNeeded() async {
+        let profileID = ProfileSettings.activeProfileID ?? ""
+        guard needsRefresh(lastRefresh: lastRefreshByProfile[profileID]) else { return }
+        lastRefreshByProfile[profileID] = Date()
+        async let trakt = TraktHistoryService.syncWatchedHistory()
+        async let simkl = SimklHistoryService.syncWatchedHistory()
+        async let mdblist = MdbListProgressService.syncWatchedHistory()
+        async let wetrakr = WeTrakrProgressService.syncWatchedHistory()
+        _ = await (trakt, simkl, mdblist, wetrakr)
+    }
+
+    /// Names of the places the watch history came from, e.g. ["Trakt", "Simkl"].
+    static func sourceLabels(of items: [WatchedStoreItem]) -> [String] {
+        let present = Set(items.flatMap(\.sources).map { $0.uppercased() })
+        return TraktWatchProgressSource.allCases
+            .filter { present.contains($0.rawValue.uppercased()) }
+            .map(\.label)
     }
 }
 
