@@ -6977,7 +6977,10 @@ struct TVHomeView: View {
         let heroItems = heroEnabled ? gridHeroItems : []
         ScrollViewReader { verticalScrollProxy in
             ScrollView(.vertical) {
-                LazyVStack(alignment: .leading, spacing: TVHomeGridLayout.sectionSpacing) {
+                // The hero stays outside the lazy stack, so it always exists: after Down
+                // scrolled the first row to the top, a lazily dropped hero left Up with
+                // nothing to move to until Back scrolled it into view again.
+                VStack(alignment: .leading, spacing: TVHomeGridLayout.sectionSpacing) {
                     if sessionNeedsReauthentication && !isBannerDismissed {
                         TVReauthBannerView(
                             onSignIn: onRequestReauth,
@@ -7039,6 +7042,7 @@ struct TVHomeView: View {
                         .id("home-grid-hero-top")
                     }
 
+                LazyVStack(alignment: .leading, spacing: TVHomeGridLayout.sectionSpacing) {
                     ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
                         if !section.collectionFolders.isEmpty {
                             TVCollectionFolderRow(
@@ -7227,6 +7231,8 @@ struct TVHomeView: View {
                             .id(section.id)
                         }
                     }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 // The poster grids have a narrower intrinsic width than the screen.
                 // Without this, LazyVStack proposes that width to the hero too,
