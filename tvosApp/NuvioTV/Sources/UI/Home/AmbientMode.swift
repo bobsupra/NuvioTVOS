@@ -1,7 +1,7 @@
 import SwiftUI
 import UIKit
 
-/// Ambient Mode: after a couple of minutes without remote input on Home, a
+/// Ambient Mode: after a minute without remote input on Home, a
 /// full-screen slideshow of backdrops from the user's catalogs fades in. Any
 /// press or swipe dismisses it, and that input does nothing else.
 ///
@@ -15,13 +15,26 @@ final class UserActivityMonitor: ObservableObject {
     /// When set, the next remote input is consumed and handed here instead of
     /// reaching the app (used to dismiss Ambient Mode).
     var interceptNextInput: (() -> Void)?
+    /// After the intercepted input, the rest of that gesture is swallowed too.
+    /// On the Siri Remote a click arrives as a touch on the clickpad followed by
+    /// the press itself: the touch dismisses Ambient Mode, and without this the
+    /// press would reach the focused card behind it and open a title.
+    private var swallowInputUntil = Date.distantPast
+    static let swallowAfterIntercept: TimeInterval = 0.8
 
-    fileprivate func noteInput() -> Bool {
-        lastActivity = Date()
+    fileprivate func noteInput(now: Date = Date()) -> Bool {
+        lastActivity = now
+        if now < swallowInputUntil { return true }
         guard let intercept = interceptNextInput else { return false }
         interceptNextInput = nil
+        swallowInputUntil = now.addingTimeInterval(Self.swallowAfterIntercept)
         intercept()
         return true
+    }
+
+    /// For tests: whether `noteInput` would consume input at `now`.
+    func consumesInput(at now: Date) -> Bool {
+        noteInput(now: now)
     }
 
     func secondsSinceLastActivity(now: Date = Date()) -> TimeInterval {
@@ -48,7 +61,9 @@ private final class ActivityGestureRecognizer: UIGestureRecognizer {
         self.monitor = monitor
         super.init(target: nil, action: nil)
         cancelsTouchesInView = true
-        delaysTouchesBegan = false
+        // Views only see a press once this recognizer has let it go, so a
+        // press it consumes never reaches the focused card.
+        delaysTouchesBegan = true
         delaysTouchesEnded = false
         allowedPressTypes = [
             UIPress.PressType.select, .menu, .playPause,
@@ -105,7 +120,9 @@ struct AmbientModeOverlay: View {
     let isEligible: Bool
     let slides: [Slide]
 
-    static let idleDelay: TimeInterval = 120
+    /// Short enough to show before the tvOS screensaver, whose shortest
+    /// setting is two minutes.
+    static let idleDelay: TimeInterval = 60
     static let slideDuration: TimeInterval = 9
 
     @AppStorage(SettingsKey.ambientMode) private var ambientModeEnabled = false

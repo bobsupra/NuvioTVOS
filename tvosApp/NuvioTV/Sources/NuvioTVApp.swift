@@ -6827,8 +6827,8 @@ struct TVHomeView: View {
             .onExitCommand(perform: canHandleExitCommand ? handleBackCommand : nil)
     }
 
-    /// Settings > Layout > Ambient Mode: backdrops from the rows on Home after
-    /// two idle minutes, only while Home is on screen with nothing over it.
+    /// Settings > Layout > Ambient Mode: backdrops from the rows on Home after a
+    /// minute without remote input, only while Home is on screen with nothing over it.
     private var ambientModeOverlay: some View {
         AmbientModeOverlay(
             isEligible: isActive && !isFullScreenOverlayPresented && browsingSection == nil && !showsLoading,
