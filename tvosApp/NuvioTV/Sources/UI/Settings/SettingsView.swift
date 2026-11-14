@@ -2908,7 +2908,7 @@ private struct AppearanceSettingsView: View {
                 } message: {
                     Text(L10n.string(
                         "surprise_me_consent_message",
-                        fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, and suggests movies you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else. A Surprise Me tab will be added to the menu."
+                        fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, including what your connected trackers (Trakt, Simkl, MDBList, WeTrakr) report, and suggests movies you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else. A Surprise Me tab will be added to the menu."
                     ))
                 }
                 SettingsToggleRow(
