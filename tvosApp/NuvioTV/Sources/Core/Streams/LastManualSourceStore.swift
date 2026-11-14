@@ -7,8 +7,13 @@ enum LastManualSourceStore {
     private static let storageKey = "nuvio.tv.manualSourceFocus.v1"
     private static let maximumEntries = 400
 
-    private static func isEnabled(_ preferences: UserDefaults?) -> Bool {
-        (preferences ?? ProfileSettings.current).bool(forKey: SettingsKey.rememberLastSourceFocus)
+    struct Match: Equatable {
+        let sourceID: String
+        let updatedAt: Date
+    }
+
+    static func contentType(for meta: NuvioMeta) -> String {
+        meta.isSeries ? "series" : "movie"
     }
 
     static func eraseAll(store: UserDefaults = .standard) {
@@ -22,10 +27,9 @@ enum LastManualSourceStore {
 
     static func remember(
         sourceID: String, profileID: String, metaID: String, type: String,
-        season: Int?, episode: Int?, store: UserDefaults = .standard, preferences: UserDefaults? = nil
+        season: Int?, episode: Int?, store: UserDefaults = .standard
     ) {
-        guard isEnabled(preferences),
-              let key = contentKey(profileID: profileID, metaID: metaID, type: type,
+        guard let key = contentKey(profileID: profileID, metaID: metaID, type: type,
                                    season: season, episode: episode),
               isPlayableIdentity(sourceID) else { return }
         var entries = read(store)
@@ -42,25 +46,34 @@ enum LastManualSourceStore {
 
     static func hasRememberedSource(
         profileID: String, metaID: String, type: String, season: Int?, episode: Int?,
-        store: UserDefaults = .standard, preferences: UserDefaults? = nil
+        store: UserDefaults = .standard
     ) -> Bool {
-        guard isEnabled(preferences),
-              let key = contentKey(profileID: profileID, metaID: metaID, type: type,
+        guard let key = contentKey(profileID: profileID, metaID: metaID, type: type,
                                    season: season, episode: episode) else { return false }
         return read(store)[key] != nil
     }
 
     /// An ambiguous identity deliberately falls back to normal picker behavior.
-    static func matchingID(
+    static func lastPlayedMatch(
         in sourceIDs: [String], profileID: String, metaID: String, type: String,
-        season: Int?, episode: Int?, store: UserDefaults = .standard, preferences: UserDefaults? = nil
-    ) -> String? {
-        guard isEnabled(preferences),
-              let key = contentKey(profileID: profileID, metaID: metaID, type: type,
+        season: Int?, episode: Int?, store: UserDefaults = .standard
+    ) -> Match? {
+        guard let key = contentKey(profileID: profileID, metaID: metaID, type: type,
                                    season: season, episode: episode),
               let entry = read(store)[key] else { return nil }
         let matches = sourceIDs.filter { isPlayableIdentity($0) && digest($0) == entry.sourceDigest }
-        return matches.count == 1 ? matches[0] : nil
+        guard matches.count == 1, let sourceID = matches.first else { return nil }
+        return Match(sourceID: sourceID, updatedAt: entry.updatedAt)
+    }
+
+    static func matchingID(
+        in sourceIDs: [String], profileID: String, metaID: String, type: String,
+        season: Int?, episode: Int?, store: UserDefaults = .standard
+    ) -> String? {
+        lastPlayedMatch(
+            in: sourceIDs, profileID: profileID, metaID: metaID, type: type,
+            season: season, episode: episode, store: store
+        )?.sourceID
     }
 
     private static func contentKey(

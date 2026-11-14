@@ -178,6 +178,8 @@ final class StreamListStyleTests: XCTestCase {
         settings.set("large", forKey: SettingsKey.streamListLogoSize)
         settings.set("loose", forKey: SettingsKey.streamListSpacing)
         settings.set("tall", forKey: SettingsKey.streamListHeight)
+        settings.set(true, forKey: SettingsKey.streamListHideAddonName)
+        settings.set(true, forKey: SettingsKey.streamListHideDescription)
         let style = StreamListStyle.current(in: settings)
         XCTAssertEqual(style.textScale, 80)
         XCTAssertEqual(style.cardSize, .compact)
@@ -185,10 +187,22 @@ final class StreamListStyleTests: XCTestCase {
         XCTAssertEqual(style.nameLines, 2)
         XCTAssertNil(style.descriptionLines)
         XCTAssertFalse(style.episodeHeader)
+        XCTAssertTrue(style.hideAddonName)
+        XCTAssertTrue(style.hideDescription)
         XCTAssertEqual(style.detailSize, .large)
         XCTAssertEqual(style.badgeSize, .small)
         XCTAssertEqual(style.logoSize, .large)
         XCTAssertEqual(style.spacing, .loose)
         XCTAssertEqual(style.height, .tall)
+    }
+
+    func testHidingAddonNameStripsAddonFromText() {
+        let input = "Torrentio\n1080p"
+        let output = StreamListStyle.displayText(input, hidingAddonName: "Torrentio")
+        XCTAssertEqual(output, "1080p")
+
+        let bracketInput = "[RD+] Torrentio\n1080p"
+        let bracketOutput = StreamListStyle.displayText(bracketInput, hidingAddonName: "Torrentio")
+        XCTAssertEqual(bracketOutput, "[RD+]\n1080p")
     }
 }
