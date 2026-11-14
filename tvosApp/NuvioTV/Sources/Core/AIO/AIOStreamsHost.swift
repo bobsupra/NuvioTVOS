@@ -479,6 +479,11 @@ final class AIOStreamsHost: ObservableObject {
             // Everything Nuvio asks comes from 127.0.0.1, one address for AIOStreams' limits
             // (15 metadata requests in 5 s, …): a busy search would answer "rate limit exceeded".
             "DISABLE_RATE_LIMITS": "true",
+            // One user's own instance: filters synced from a link (release-group regexes and
+            // stream expressions, as community templates such as Tamtaro's set up) are allowed.
+            // AIOStreams' default keeps them for an instance's trusted users only.
+            "REGEX_FILTER_ACCESS": "all",
+            "SEL_SYNC_ACCESS": "all",
             // Every request in the log costs work on the TV: warnings and errors unless asked.
             "LOG_LEVEL": detailedLog ? "info" : "warn",
             // process.exit() would close Nuvio: nuvio-main.mjs turns it into a stop.
