@@ -64,6 +64,12 @@ final class PlayerGestureBindingTests: XCTestCase {
         XCTAssertEqual(RemoteGesture.tap(.center, double: true).title, "Double tap center")
         XCTAssertEqual(RemoteGesture.hold(.top).title, "Touch and hold top")
         XCTAssertEqual(PlayerGestureAction.nextChapter.title, "Next chapter")
+        XCTAssertEqual(PlayerGestureAction.toggleDebugOverlay.title, "Debug overlay on / off")
+    }
+
+    func testTheDebugOverlayActionStartsWithoutAGesture() {
+        // Bound only in Expert mode: the ready-made gestures stay as they were.
+        XCTAssertNil(PlayerGestureBindings.defaults.gesture(for: .toggleDebugOverlay))
     }
 
     // MARK: Expert mode

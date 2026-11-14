@@ -40,6 +40,10 @@ extension PlayerViewModel {
             let next = speeds[(index + 1) % speeds.count]
             setSpeed(next)
             showPlayerToast("Speed \(next.label)")
+        case .toggleDebugOverlay:
+            // The same switch as Playback Debug Overlay in the player's panel and in Settings.
+            togglePlaybackDebugHUD()
+            showPlayerToast(isPlaybackDebugEnabled ? "Debug overlay on" : "Debug overlay off")
         }
     }
 
