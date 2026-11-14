@@ -1904,6 +1904,8 @@ struct NextEpisodeOverlay: View {
     let isAdvancing: Bool
     var isFocused: Bool
     let isAutoPlayCancelled: Bool
+    /// The series plays in shuffle: this is a random episode, not the following one.
+    var isShuffled: Bool = false
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
@@ -1940,7 +1942,9 @@ struct NextEpisodeOverlay: View {
             thumbnail
 
             VStack(alignment: .leading, spacing: 4) {
-                Text(L10n.string("player_next_episode", fallback: "Next Episode"))
+                Text(isShuffled
+                    ? L10n.string("player_next_episode_shuffled", fallback: "🔀 Shuffle")
+                    : L10n.string("player_next_episode", fallback: "Next Episode"))
                     .font(.system(size: 21, weight: .semibold))
                     .foregroundColor(.white.opacity(0.62))
                 Text(episodeLine)

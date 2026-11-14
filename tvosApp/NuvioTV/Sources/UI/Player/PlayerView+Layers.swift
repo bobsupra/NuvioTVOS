@@ -766,7 +766,8 @@ extension PlayerView {
                             == EpisodeSpoilerPolicy.episodeKey(for: next),
                         isAdvancing: viewModel.isAdvancingEpisode,
                         isFocused: nextEpisodeFocused,
-                        isAutoPlayCancelled: viewModel.isAutoPlayCancelled
+                        isAutoPlayCancelled: viewModel.isAutoPlayCancelled,
+                        isShuffled: viewModel.isShufflingEpisodes
                     )
                 }
                 .buttonStyle(PosterCardButtonStyle())
