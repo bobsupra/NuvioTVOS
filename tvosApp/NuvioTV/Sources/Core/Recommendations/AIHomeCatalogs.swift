@@ -300,12 +300,14 @@ final class AIHomeCatalogStore: ObservableObject {
         ) else { return }
 
         isBuilding = true
+        let feedback = SurpriseMeFeedback.load()
         let profile = TasteProfile.build(
             watched: history.watched,
             library: history.library,
-            continueWatching: history.continueWatching
+            continueWatching: history.continueWatching,
+            feedback: feedback
         )
-        let context = SurpriseMeAIContext(profile: profile, history: history)
+        let context = SurpriseMeAIContext(profile: profile, history: history, feedback: feedback)
         let language = Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier) ?? "English"
         let profileID = loadedProfileID
         let isWatched: @Sendable (NuvioMeta) -> Bool = { meta in

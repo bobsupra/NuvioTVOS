@@ -25,9 +25,9 @@ struct SurpriseMeView: View {
     @State private var pick: NuvioMeta?
     @State private var pickReason: String?
     @State private var offered: Set<String> = []
-    /// This session's reactions, so the AI learns what landed and what didn't.
-    @State private var opened: [NuvioMeta] = []
-    @State private var skipped: [NuvioMeta] = []
+    /// What the viewer did with earlier suggestions, kept across launches, so
+    /// both the AI and the taste profile learn what lands and what doesn't.
+    @State private var feedback = SurpriseMeFeedback()
     @State private var didLoad = false
     @State private var isThinking = false
     @State private var noMovieFound = false
@@ -169,7 +169,7 @@ struct SurpriseMeView: View {
 
             HStack(spacing: 24) {
                 Button {
-                    if !opened.contains(where: { $0.id == meta.id }) { opened.insert(meta, at: 0) }
+                    remember(meta, .liked)
                     onOpenDetails(meta)
                 } label: {
                     Label(L10n.string("surprise_me_open", fallback: "View"), systemImage: "play.fill")
@@ -177,7 +177,8 @@ struct SurpriseMeView: View {
                 .focused($focus, equals: .open)
 
                 Button {
-                    if !opened.contains(where: { $0.id == meta.id }) { skipped.insert(meta, at: 0) }
+                    // Skipping counts only if they didn't open it first.
+                    if feedback.verdict(for: meta) != .liked { remember(meta, .skipped) }
                     Task { await roll() }
                 } label: {
                     Label(
@@ -225,10 +226,12 @@ struct SurpriseMeView: View {
             library: SurpriseMeLibraries.allItems(),
             continueWatching: ContinueWatchingStore.items().map(\.meta)
         )
+        feedback = SurpriseMeFeedback.load()
         profile = TasteProfile.build(
             watched: history.watched,
             library: history.library,
-            continueWatching: history.continueWatching
+            continueWatching: history.continueWatching,
+            feedback: feedback
         )
         historySources = useTrackers ? SurpriseMeTrackers.sourceLabels(of: watched) : []
     }
@@ -254,12 +257,13 @@ struct SurpriseMeView: View {
                 from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
                 limit: SurpriseMeAI.maxCandidates
             )
-            if !shortlist.isEmpty {
+            do {
                 isThinking = true
-                let excluded = offered
+                // Never offer again what was offered this session or skipped before.
+                let excluded = offered.union(feedback.skipped.map(\.id))
                 let picks = await SurpriseMeAI.rank(
                     candidates: shortlist,
-                    context: SurpriseMeAIContext(profile: profile, history: history, opened: opened, skipped: skipped),
+                    context: SurpriseMeAIContext(profile: profile, history: history, feedback: feedback),
                     configuration: configuration,
                     language: Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier)
                         ?? "English",
@@ -284,6 +288,11 @@ struct SurpriseMeView: View {
             return
         }
         show(next, reason: nil)
+    }
+
+    private func remember(_ meta: NuvioMeta, _ verdict: SurpriseMeFeedbackEntry.Verdict) {
+        feedback.record(meta, verdict)
+        feedback.save()
     }
 
     private func show(_ meta: NuvioMeta, reason: String?) {

@@ -33,10 +33,16 @@ struct TasteProfile: Equatable {
 
     /// Each title counts once per source, however many episodes were watched,
     /// so one long series doesn't decide the whole profile.
+    /// Suggestions the viewer opened pull their genres up, and ones they
+    /// skipped push theirs down (a genre never goes below zero).
+    static let likedSuggestionWeight = 2.0
+    static let skippedSuggestionWeight = -1.0
+
     static func build(
         watched: [NuvioMeta],
         library: [NuvioMeta],
-        continueWatching: [NuvioMeta]
+        continueWatching: [NuvioMeta],
+        feedback: SurpriseMeFeedback = SurpriseMeFeedback()
     ) -> TasteProfile {
         var totals: [String: Double] = [:]
         var names: [String: String] = [:]
@@ -54,6 +60,9 @@ struct TasteProfile: Equatable {
         add(watched, weight: watchedWeight)
         add(library, weight: libraryWeight)
         add(continueWatching, weight: continueWatchingWeight)
+        add(feedback.liked, weight: likedSuggestionWeight)
+        add(feedback.skipped, weight: skippedSuggestionWeight)
+        totals = totals.filter { $0.value > 0 }
 
         let sum = totals.values.reduce(0, +)
         guard sum > 0 else { return .empty }

@@ -25,30 +25,71 @@ final class SurpriseMeAITests: XCTestCase {
 
     func testPromptGivesTheAIEverythingItLearnsFrom() {
         let interstellar = movie("i", "Interstellar", year: 2014)
+        let arrival = movie("a", "Arrival", year: 2016)
         let history = SurpriseMeHistory(
-            watched: [interstellar, interstellar],
+            watched: [interstellar, interstellar, arrival],
             library: [movie("d", "Dune", year: 2021)],
             continueWatching: [movie("s", "Severance", year: 2022)]
         )
+        var feedback = SurpriseMeFeedback()
+        feedback.record(movie("n", "Notebook", year: 2004), .skipped)
+        feedback.record(arrival, .liked)
         let profile = TasteProfile.build(watched: [movie("x", "X", genres: ["Sci-Fi"])], library: [], continueWatching: [])
         let prompt = SurpriseMeAI.prompt(
-            context: SurpriseMeAIContext(
-                profile: profile,
-                history: history,
-                opened: [movie("a", "Arrival", year: 2016)],
-                skipped: [movie("n", "Notebook", year: 2004)]
-            ),
+            context: SurpriseMeAIContext(profile: profile, history: history, feedback: feedback),
             candidates: [movie("b", "Blade Runner 2049", year: 2017, genres: ["Sci-Fi", "Drama"])],
             language: "Spanish"
         )
         XCTAssertTrue(prompt.contains("Sci-Fi 100%"))
-        XCTAssertTrue(prompt.contains("Watched (most recent first): Interstellar (2014)."))
+        XCTAssertTrue(prompt.contains("Watched (most recent first): Interstellar (2014); Arrival (2016)."))
         XCTAssertTrue(prompt.contains("Saved to watch later: Dune (2021)."))
         XCTAssertTrue(prompt.contains("Watching now: Severance (2022)."))
-        XCTAssertTrue(prompt.contains("they opened: Arrival (2016)."))
+        XCTAssertTrue(prompt.contains("then watched (loved): Arrival (2016)."))
+        XCTAssertTrue(prompt.contains("they opened (liked): Arrival (2016)."))
         XCTAssertTrue(prompt.contains("they skipped (avoid similar ones): Notebook (2004)."))
         XCTAssertTrue(prompt.contains("1. Blade Runner 2049 (2017) — Sci-Fi, Drama"))
         XCTAssertTrue(prompt.contains("in Spanish"))
+        // The AI suggests first; the list comes second.
+        let own = try? XCTUnwrap(prompt.range(of: "1. Suggest the 10 real movies"))
+        let list = try? XCTUnwrap(prompt.range(of: "2. Then choose up to 3"))
+        XCTAssertNotNil(own)
+        XCTAssertNotNil(list)
+        if let own, let list { XCTAssertLessThan(own.lowerBound, list.lowerBound) }
+    }
+
+    func testTheAIsOwnPicksComeFirstWithAListPickAfterEveryFour() {
+        let own = (1...6).map { SurpriseMeAIPick(meta: movie("o\($0)", "Own \($0)"), reason: nil) }
+        let list = (1...3).map { SurpriseMeAIPick(meta: movie("l\($0)", "List \($0)"), reason: nil) }
+        XCTAssertEqual(
+            SurpriseMeAI.merge(own: own, list: list).map(\.meta.id),
+            ["o1", "o2", "o3", "o4", "l1", "o5", "o6", "l2", "l3"]
+        )
+        let repeated = SurpriseMeAIPick(meta: movie("o1", "Own 1"), reason: nil)
+        XCTAssertEqual(SurpriseMeAI.merge(own: [own[0]], list: [repeated]).map(\.meta.id), ["o1"])
+    }
+
+    func testFeedbackKeepsTheLatestVerdictPerTitle() {
+        var feedback = SurpriseMeFeedback()
+        let arrival = movie("a", "Arrival", year: 2016, genres: ["Sci-Fi"])
+        feedback.record(arrival, .skipped)
+        feedback.record(arrival, .liked)
+        XCTAssertEqual(feedback.entries.count, 1)
+        XCTAssertEqual(feedback.verdict(for: arrival), .liked)
+        for index in 0..<(SurpriseMeFeedback.maxEntries + 10) {
+            feedback.record(movie("m\(index)", "M\(index)"), .skipped)
+        }
+        XCTAssertEqual(feedback.entries.count, SurpriseMeFeedback.maxEntries)
+    }
+
+    func testTheTasteProfileLearnsFromReactions() {
+        let watched = [movie("w1", "W1", genres: ["Comedy"]), movie("w2", "W2", genres: ["Horror"])]
+        var feedback = SurpriseMeFeedback()
+        feedback.record(movie("l", "Liked", genres: ["Comedy"]), .liked)
+        feedback.record(movie("s", "Skipped", genres: ["Horror"]), .skipped)
+        let before = TasteProfile.build(watched: watched, library: [], continueWatching: [])
+        let after = TasteProfile.build(watched: watched, library: [], continueWatching: [], feedback: feedback)
+        XCTAssertEqual(before.weights["comedy"], before.weights["horror"])
+        XCTAssertGreaterThan(after.weights["comedy"] ?? 0, after.weights["horror"] ?? 0)
     }
 
     func testReadsTheAIsOwnSuggestions() {

@@ -160,10 +160,8 @@ struct SurpriseMeAISuggestion: Equatable {
 struct SurpriseMeAIContext {
     let profile: TasteProfile
     let history: SurpriseMeHistory
-    /// Suggestions the viewer opened in this session.
-    var opened: [NuvioMeta] = []
-    /// Suggestions the viewer skipped with Another one in this session.
-    var skipped: [NuvioMeta] = []
+    /// How the viewer reacted to earlier suggestions, across sessions.
+    var feedback = SurpriseMeFeedback()
 }
 
 enum SurpriseMeAI {
@@ -171,13 +169,18 @@ enum SurpriseMeAI {
     static let maxWatchedTitles = 120
     static let maxSavedTitles = 60
     static let maxInProgressTitles = 20
-    static let maxSessionTitles = 15
-    static let maxOutsideSuggestions = 5
+    static let maxFeedbackTitles = 25
+    /// The AI's own suggestions come first; the list adds what it may not know
+    /// (recent releases) or what the viewer's add-ons surely have.
+    static let maxOutsideSuggestions = 10
+    static let maxListPicks = 3
+    /// Order of the queue: this many of the AI's own picks, then one from the list.
+    static let ownPicksPerListPick = 4
 
     /// The prompt: the viewer's genre shares, everything they watched, saved
     /// and are watching (most recent first, capped so the request stays small),
-    /// how they reacted to this session's suggestions, and the numbered
-    /// candidates. Titles and years only, nothing else about the viewer.
+    /// how they reacted to earlier suggestions, and the numbered candidates.
+    /// Titles and years only, nothing else about the viewer.
     static func prompt(context: SurpriseMeAIContext, candidates: [NuvioMeta], language: String) -> String {
         func titles(_ metas: [NuvioMeta], limit: Int) -> String {
             let list = SurpriseMeHistory.unique(metas).prefix(limit).map(title(of:))
@@ -200,15 +203,17 @@ enum SurpriseMeAI {
         Watched (most recent first): \(titles(context.history.watched, limit: maxWatchedTitles)).
         Saved to watch later: \(titles(context.history.library, limit: maxSavedTitles)).
         Watching now: \(titles(context.history.continueWatching, limit: maxInProgressTitles)).
-        In this session they opened: \(titles(context.opened, limit: maxSessionTitles)).
-        In this session they skipped (avoid similar ones): \(titles(context.skipped, limit: maxSessionTitles)).
+        Earlier suggestions they then watched (loved): \(titles(context.feedback.watched(in: context.history), limit: maxFeedbackTitles)).
+        Earlier suggestions they opened (liked): \(titles(context.feedback.liked, limit: maxFeedbackTitles)).
+        Earlier suggestions they skipped (avoid similar ones): \(titles(context.feedback.skipped, limit: maxFeedbackTitles)).
 
-        1. Choose the 5 movies from this numbered list they are most likely to enjoy, best first. \
-        Only use numbers from the list.
+        1. Suggest the \(maxOutsideSuggestions) real movies they are most likely to love, best first, \
+        from everything you know. Never anything already watched or listed above. \
+        Give the exact original title and release year.
+
+        2. Then choose up to \(maxListPicks) movies from this numbered list of recent or available \
+        titles that also fit them. Only use numbers from the list.
         \(list)
-
-        2. Then suggest up to \(maxOutsideSuggestions) other real movies, not in the list and not \
-        already watched, that fit them even better. Give the exact original title and release year.
 
         Answer with JSON only: \
         {"picks":[{"number":1,"reason":"..."}],"others":[{"title":"...","year":2016,"reason":"..."}]}. \
@@ -277,21 +282,36 @@ enum SurpriseMeAI {
         isWatched: @escaping (NuvioMeta) -> Bool,
         session: URLSession = .shared
     ) async -> [SurpriseMeAIPick] {
-        guard configuration.isUsable, !candidates.isEmpty else { return [] }
+        // The AI suggests first, so an empty candidate list is fine.
+        guard configuration.isUsable else { return [] }
         let shortlist = Array(candidates.prefix(maxCandidates))
         let text = prompt(context: context, candidates: shortlist, language: language)
         guard let request = request(for: text, configuration: configuration),
               let (data, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let answer = responseText(from: data, provider: configuration.provider) else { return [] }
-        var picks = parse(answer, candidates: shortlist)
-        let confirmed = await confirm(parseOthers(answer))
-        var seen = Set(picks.flatMap { SurpriseMeHistory.keys(for: $0.meta) })
-        for pick in confirmed where !isWatched(pick.meta) && seen.isDisjoint(with: SurpriseMeHistory.keys(for: pick.meta)) {
-            seen.formUnion(SurpriseMeHistory.keys(for: pick.meta))
-            picks.append(pick)
+        let listPicks = Array(parse(answer, candidates: shortlist).prefix(maxListPicks))
+        let own = await confirm(parseOthers(answer)).filter { !isWatched($0.meta) }
+        return merge(own: own, list: listPicks)
+    }
+
+    /// The AI's own picks first, with one list pick after every few, each title once.
+    static func merge(own: [SurpriseMeAIPick], list: [SurpriseMeAIPick]) -> [SurpriseMeAIPick] {
+        var result: [SurpriseMeAIPick] = []
+        var seen = Set<String>()
+        func add(_ pick: SurpriseMeAIPick) {
+            let keys = SurpriseMeHistory.keys(for: pick.meta)
+            guard seen.isDisjoint(with: keys) else { return }
+            seen.formUnion(keys)
+            result.append(pick)
         }
-        return picks
+        var listQueue = list[...]
+        for (index, pick) in own.enumerated() {
+            add(pick)
+            if (index + 1) % ownPicksPerListPick == 0, let next = listQueue.popFirst() { add(next) }
+        }
+        listQueue.forEach(add)
+        return result
     }
 
     /// Looks each suggestion up on TMDB; ones it can't find are dropped.
