@@ -1381,30 +1381,39 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         if !addonURLs.isEmpty {
-            let addonResult: NuvioMeta? = await withTaskGroup(of: NuvioMeta?.self) { group in
-                for (metaURL, candidateType) in addonURLs {
+            let addonResult = await withTaskGroup(of: (Int, NuvioMeta?).self, returning: NuvioMeta?.self) { group in
+                for (index, (metaURL, candidateType)) in addonURLs.enumerated() {
                     group.addTask { [self] in
                         do {
                             let response: CinemetaMetaResponse = try await self.fetch(metaURL)
-                            let meta = await TmdbDetailsService.localizedMetadata(
-                                for: response.meta.toMeta(fallbackType: candidateType)
-                            )
-                            return meta
+                            return (index, response.meta.toMeta(fallbackType: candidateType))
                         } catch {
-                            return nil
+                            return (index, nil)
                         }
                     }
                 }
-                for await result in group {
-                    if let result {
-                        return result
+
+                // A faster fallback must wait until the add-ons ahead of it have failed.
+                var results = [NuvioMeta?](repeating: nil, count: addonURLs.count)
+                var finished = [Bool](repeating: false, count: addonURLs.count)
+                var next = 0
+                for await (index, meta) in group {
+                    results[index] = meta
+                    finished[index] = true
+                    while next < finished.count && finished[next] {
+                        if let result = results[next] {
+                            group.cancelAll()
+                            return result
+                        }
+                        next += 1
                     }
                 }
                 return nil
             }
             if let addonResult {
-                cacheMetadata(addonResult, requestedID: id, context: metadataContext)
-                return addonResult
+                let localized = await TmdbDetailsService.localizedMetadata(for: addonResult)
+                cacheMetadata(localized, requestedID: id, context: metadataContext)
+                return localized
             }
         }
 
