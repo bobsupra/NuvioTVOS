@@ -1522,9 +1522,20 @@ struct AISubtitleTranslationSettings: Equatable {
         return availableModels.contains(model) ? model : defaultModel
     }
 
+    /// OpenRouter models offered for live translation: (model id, name shown).
+    /// Qwen and Claude Haiku run without reasoning, so cues come back quickly;
+    /// Gemini 3.6 Flash uses minimal reasoning.
+    static let availableOpenRouterModels: [(id: String, name: String)] = [
+        ("qwen/qwen3.7-flash", "Qwen 3.7 Flash"),
+        ("anthropic/claude-haiku-4.5", "Claude Haiku 4.5"),
+        ("google/gemini-3.6-flash", "Gemini 3.6 Flash"),
+    ]
+
+    /// The stored model when it is on the list; otherwise, including a model
+    /// typed in an older version, the default.
     static func normalizedOpenRouterModel(_ storedModel: String?) -> String {
         let model = (storedModel ?? defaultOpenRouterModel).trimmingCharacters(in: .whitespacesAndNewlines)
-        return model.isEmpty ? defaultOpenRouterModel : model
+        return availableOpenRouterModels.contains { $0.id == model } ? model : defaultOpenRouterModel
     }
 
     var cacheModelIdentifier: String { "\(provider.rawValue):\(model)" }
@@ -8763,15 +8774,21 @@ private struct AISubtitleOptionsSheet: View {
                                 accentColor: accentColor
                             )
                         } else {
-                            SettingsNativeTextFieldRow(
+                            // Chosen from a list of models known to work, never typed.
+                            let models = AISubtitleTranslationSettings.availableOpenRouterModels
+                            SettingsOptionRow(
                                 title: L10n.string("settings_ai_subtitles_openrouter_model", fallback: "OpenRouter Model"),
                                 subtitle: L10n.string(
-                                    "settings_ai_subtitles_openrouter_model_subtitle",
-                                    fallback: "Use any OpenRouter model ID, for example qwen/qwen3.7-flash"
+                                    "settings_ai_subtitles_openrouter_model_choose",
+                                    fallback: "Choose which model translates subtitles"
                                 ),
-                                placeholder: AISubtitleTranslationSettings.defaultOpenRouterModel,
-                                text: $openRouterModel,
-                                onCommit: normalizeOpenRouterModel
+                                selection: Binding(
+                                    get: { AISubtitleTranslationSettings.normalizedOpenRouterModel(openRouterModel) },
+                                    set: { openRouterModel = $0 }
+                                ),
+                                options: models.map(\.id),
+                                accentColor: accentColor,
+                                optionLabel: { id in models.first { $0.id == id }?.name ?? id }
                             )
                         }
 
