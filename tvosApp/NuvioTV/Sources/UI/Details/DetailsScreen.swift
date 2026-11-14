@@ -5153,9 +5153,12 @@ struct TvDetailsContent: View {
         }
     }
 
-    /// Offered for a series with at least two episodes that can play.
+    /// Offered for an episodic series (see `EpisodeShuffle.suitsShuffle`) with at
+    /// least two episodes that can play.
     private func shuffleAction(meta: NuvioMeta, episodes: [NuvioVideo]) -> (() -> Void)? {
-        guard meta.isSeries, episodes.filter(EpisodeShuffle.isEligible).count > 1 else { return nil }
+        guard meta.isSeries,
+              EpisodeShuffle.suitsShuffle(genres: meta.genres),
+              episodes.filter(EpisodeShuffle.isEligible).count > 1 else { return nil }
         return {
             cancelFocusRestoration()
             stopBackgroundTrailer(manual: false)

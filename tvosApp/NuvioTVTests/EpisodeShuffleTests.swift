@@ -58,6 +58,21 @@ final class EpisodeShuffleTests: XCTestCase {
         XCTAssertEqual(shuffle.start(seriesID: seriesID, episodes: list, isWatched: { _ in false })?.id, "tt1:1:2")
     }
 
+    func testShuffleIsOfferedOnlyForEpisodicShows() {
+        // The Simpsons, The Office, Brooklyn Nine-Nine, a reality show
+        XCTAssertTrue(EpisodeShuffle.suitsShuffle(genres: ["Animation", "Comedy"]))
+        XCTAssertTrue(EpisodeShuffle.suitsShuffle(genres: ["Comedy"]))
+        XCTAssertTrue(EpisodeShuffle.suitsShuffle(genres: ["Comedy", "Crime"]))
+        XCTAssertTrue(EpisodeShuffle.suitsShuffle(genres: ["Reality-TV"]))
+        XCTAssertTrue(EpisodeShuffle.suitsShuffle(genres: ["Talk Show"]))
+        // Breaking Bad, Attack on Titan, a comedy-drama, unknown genres
+        XCTAssertFalse(EpisodeShuffle.suitsShuffle(genres: ["Crime", "Drama", "Thriller"]))
+        XCTAssertFalse(EpisodeShuffle.suitsShuffle(genres: ["Animation", "Action", "Drama"]))
+        XCTAssertFalse(EpisodeShuffle.suitsShuffle(genres: ["Comedy", "Drama"]))
+        XCTAssertFalse(EpisodeShuffle.suitsShuffle(genres: ["Animation", "Action"]))
+        XCTAssertFalse(EpisodeShuffle.suitsShuffle(genres: nil))
+    }
+
     func testStopEndsShuffle() {
         let shuffle = EpisodeShuffle()
         _ = shuffle.start(seriesID: seriesID, episodes: episodes(3), isWatched: { _ in false })

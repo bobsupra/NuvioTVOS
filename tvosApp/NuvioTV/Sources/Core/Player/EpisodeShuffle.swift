@@ -79,6 +79,23 @@ final class EpisodeShuffle {
         return choice
     }
 
+    /// Shuffle only makes sense for shows whose episodes stand on their own
+    /// (sitcoms, animated comedies, reality, talk and game shows, kids' shows),
+    /// not for a story told in order. Judged from the genres the metadata
+    /// reports: an episodic genre, and none that marks a serialized story.
+    static func suitsShuffle(genres: [String]?) -> Bool {
+        let normalized = Set((genres ?? []).map {
+            $0.lowercased().filter { $0.isLetter }
+        })
+        guard !normalized.isEmpty else { return false }
+        let episodic: Set<String> = [
+            "comedy", "sitcom", "reality", "realitytv", "talk", "talkshow", "gameshow",
+            "kids", "family", "children", "news", "sketch", "standup",
+        ]
+        let serialized: Set<String> = ["drama", "thriller", "mystery", "horror", "soap", "war"]
+        return !normalized.isDisjoint(with: episodic) && normalized.isDisjoint(with: serialized)
+    }
+
     static func isEligible(_ episode: NuvioVideo) -> Bool {
         episode.season > 0 && EpisodeReleasePolicy.hasAired(episode.released)
     }
