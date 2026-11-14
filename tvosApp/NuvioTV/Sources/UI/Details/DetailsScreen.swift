@@ -4467,6 +4467,8 @@ struct TvDetailsContent: View {
     @Environment(\.isEnabled) private var isEnabled
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SettingsKey.shuffleAllSeries) private var shuffleAllSeries = false
+    /// Redraws the Shuffle button after it's turned on or off.
+    @State private var shuffleRevision = 0
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.reuseLastLink) private var reuseLastLink = false
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -4774,6 +4776,7 @@ struct TvDetailsContent: View {
                 handlePlayLongPress(playTarget: playTarget)
             } : nil,
             onShuffleClick: shuffleAction(meta: meta, episodes: episodes),
+            isShuffleOn: shuffleRevision >= 0 && EpisodeShuffle.shared.isActive(seriesID: meta.id),
             onHostWatchParty: onHostWatchParty == nil ? nil : {
                 beginWatchPartyEpisodeSelection(
                     meta: meta,
@@ -4889,7 +4892,6 @@ struct TvDetailsContent: View {
                             isChoosingWatchPartyEpisode = false
                             onHostWatchParty?(video)
                         } else {
-                            if let meta = uiState.meta { EpisodeShuffle.shared.stop(seriesID: meta.id) }
                             onEpisodeSelected(video)
                         }
                     },
@@ -5156,13 +5158,22 @@ struct TvDetailsContent: View {
 
     /// Offered for an episodic series (see `EpisodeShuffle.suitsShuffle`) with at
     /// least two episodes that can play.
+    /// Shuffle stays on, across launches, until the viewer turns it off: here
+    /// (pressing the button again) or with Turn Off Shuffle in the player.
     private func shuffleAction(meta: NuvioMeta, episodes: [NuvioVideo]) -> (() -> Void)? {
+        let isOn = EpisodeShuffle.shared.isActive(seriesID: meta.id)
         guard meta.isSeries,
-              shuffleAllSeries || EpisodeShuffle.suitsShuffle(genres: meta.genres),
+              isOn || shuffleAllSeries || EpisodeShuffle.suitsShuffle(genres: meta.genres),
               episodes.filter(EpisodeShuffle.isEligible).count > 1 else { return nil }
         return {
             cancelFocusRestoration()
+            if isOn {
+                EpisodeShuffle.shared.stop(seriesID: meta.id)
+                shuffleRevision &+= 1
+                return
+            }
             stopBackgroundTrailer(manual: false)
+            shuffleRevision &+= 1
             guard let first = EpisodeShuffle.shared.start(
                 seriesID: meta.id,
                 episodes: episodes,
@@ -5175,7 +5186,6 @@ struct TvDetailsContent: View {
     private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
         cancelFocusRestoration()
         stopBackgroundTrailer(manual: false)
-        if let meta = uiState.meta { EpisodeShuffle.shared.stop(seriesID: meta.id) }
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
             onEpisodeSelected(episode)
@@ -6529,6 +6539,8 @@ private struct TvDetailsActionRow: View {
     var onPlayLongPress: (() -> Void)? = nil
     /// Series only: plays a random episode, and Up Next stays random.
     var onShuffleClick: (() -> Void)? = nil
+    /// The series is playing in shuffle: the button turns it off.
+    var isShuffleOn = false
     var onHostWatchParty: (() -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
@@ -6566,9 +6578,13 @@ private struct TvDetailsActionRow: View {
             if let onShuffleClick {
                 TvDetailsActionButton(
                     title: nil,
-                    systemName: "shuffle",
-                    accessibilityLabel: L10n.string("details_shuffle", fallback: "Shuffle"),
-                    accessibilityHint: L10n.string("details_shuffle_hint", fallback: "Plays a random episode, then keeps Up Next random"),
+                    systemName: isShuffleOn ? "shuffle.circle.fill" : "shuffle",
+                    accessibilityLabel: isShuffleOn
+                        ? L10n.string("details_shuffle_on", fallback: "Shuffle On")
+                        : L10n.string("details_shuffle", fallback: "Shuffle"),
+                    accessibilityHint: isShuffleOn
+                        ? L10n.string("details_shuffle_on_hint", fallback: "Turns shuffle off for this series")
+                        : L10n.string("details_shuffle_hint", fallback: "Plays a random episode, then keeps Up Next random"),
                     isPrimary: false,
                     focus: focus,
                     tag: .shuffle,

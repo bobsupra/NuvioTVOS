@@ -8,28 +8,61 @@ import Foundation
 /// - Unwatched episodes come first; once all are watched, any aired one can play.
 /// - Specials (season 0) and episodes that haven't aired are skipped.
 ///
-/// A session lasts until the app closes or the user plays the series normally
-/// (a regular Play or episode pick ends it).
+/// Shuffle is remembered per profile, across launches, until the viewer turns
+/// it off (Turn Off Shuffle in the player, or the Shuffle button in Details).
+/// Resuming the series from Continue Watching keeps playing in shuffle.
 @MainActor
 final class EpisodeShuffle {
-    static let shared = EpisodeShuffle()
+    static let shared = EpisodeShuffle(persists: true)
 
-    private struct Session {
+    static let storageKey = "nuvio.tv.episodeShuffle.sessions"
+
+    private struct Session: Codable {
         var played: Set<String> = []
         /// The pick shown as Up Next for a given current episode, so the card
         /// and the autoplay agree.
         var nextPickByCurrentID: [String: String] = [:]
     }
 
-    private var sessions: [String: Session] = [:]
+    private var sessions: [String: Session] = [:] {
+        didSet { save() }
+    }
     private var random: () -> Double
+    /// Whether sessions are kept in the profile's settings (the shared
+    /// instance) or only in memory (tests).
+    private let persists: Bool
+    private var loadedProfileID: String??
 
-    init(random: @escaping () -> Double = { Double.random(in: 0..<1) }) {
+    init(random: @escaping () -> Double = { Double.random(in: 0..<1) }, persists: Bool = false) {
         self.random = random
+        self.persists = persists
     }
 
     func isActive(seriesID: String) -> Bool {
-        sessions[seriesID] != nil
+        loadIfNeeded()
+        return sessions[seriesID] != nil
+    }
+
+    /// Reads the active profile's sessions the first time, and again after a
+    /// profile switch, so one profile's shuffle never shows under another.
+    private func loadIfNeeded() {
+        guard persists else { return }
+        let profileID = ProfileSettings.activeProfileID
+        guard loadedProfileID != .some(profileID) else { return }
+        loadedProfileID = .some(profileID)
+        let stored = ProfileSettings.current.data(forKey: Self.storageKey)
+            .flatMap { try? JSONDecoder().decode([String: Session].self, from: $0) } ?? [:]
+        // Assigning would save the same data straight back; that's harmless.
+        sessions = stored
+    }
+
+    private func save() {
+        guard persists, loadedProfileID != nil else { return }
+        if sessions.isEmpty {
+            ProfileSettings.current.removeObject(forKey: Self.storageKey)
+        } else if let data = try? JSONEncoder().encode(sessions) {
+            ProfileSettings.current.set(data, forKey: Self.storageKey)
+        }
     }
 
     /// Starts shuffle for a series and returns the first episode to play.
@@ -38,6 +71,7 @@ final class EpisodeShuffle {
         episodes: [NuvioVideo],
         isWatched: (NuvioVideo) -> Bool
     ) -> NuvioVideo? {
+        loadIfNeeded()
         sessions[seriesID] = Session()
         guard let first = pick(from: episodes, excluding: nil, played: [], isWatched: isWatched) else {
             sessions[seriesID] = nil
@@ -48,6 +82,7 @@ final class EpisodeShuffle {
     }
 
     func stop(seriesID: String) {
+        loadIfNeeded()
         sessions[seriesID] = nil
     }
 
@@ -59,6 +94,7 @@ final class EpisodeShuffle {
         episodes: [NuvioVideo],
         isWatched: (NuvioVideo) -> Bool
     ) -> NuvioVideo? {
+        loadIfNeeded()
         guard var session = sessions[seriesID] else { return nil }
         if let current { session.played.insert(current.id) }
         let currentKey = current?.id ?? ""

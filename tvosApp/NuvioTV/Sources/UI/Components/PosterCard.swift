@@ -487,6 +487,7 @@ struct PosterCard: View {
             }
             .overlay(alignment: .bottomLeading) {
                 continueProgressOverlay
+                continueShuffleBadge
             }
             .overlay(alignment: effectiveLandscape ? .topTrailing : .top) {
                 continueBadge
@@ -707,6 +708,26 @@ struct PosterCard: View {
             return "\(continueEpisodeText) • \(continueRemainingText)"
         }
         return continueRemainingText
+    }
+
+    /// Continue Watching: the series is playing in shuffle, and resuming it
+    /// keeps going in shuffle. Bottom right, above the progress bar.
+    @ViewBuilder
+    private var continueShuffleBadge: some View {
+        if continueProgress != nil || continueIsUpNext,
+           meta.isSeries,
+           EpisodeShuffle.shared.isActive(seriesID: meta.id) {
+            Image(systemName: "shuffle")
+                .font(.system(size: 20, weight: .bold))
+                .foregroundColor(.white)
+                .padding(9)
+                .background(Circle().fill(Color.black.opacity(0.62)))
+                .padding(.trailing, 22)
+                .padding(.bottom, continueProgress != nil && !continueIsUpNext ? 32 : 16)
+                .frame(width: cardWidth, height: cardHeight, alignment: .bottomTrailing)
+                .allowsHitTesting(false)
+                .accessibilityLabel(L10n.string("details_shuffle_on", fallback: "Shuffle On"))
+        }
     }
 
     @ViewBuilder
