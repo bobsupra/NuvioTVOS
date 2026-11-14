@@ -8,6 +8,7 @@ enum PlayerGestureAction: String, Codable, CaseIterable, Identifiable, Sendable 
     case nextChapter, previousChapter, openChapters, skipIntro
     case forward30, back30, playPause, nextEpisode
     case toggleSubtitles, cycleAudio, faster
+    case toggleDebugOverlay
 
     var id: String { rawValue }
 
@@ -24,6 +25,7 @@ enum PlayerGestureAction: String, Codable, CaseIterable, Identifiable, Sendable 
         case .toggleSubtitles: return "Subtitles on / off"
         case .cycleAudio: return "Next audio track"
         case .faster: return "Playback speed"
+        case .toggleDebugOverlay: return "Debug overlay on / off"
         }
     }
 }
