@@ -22,8 +22,21 @@ final class TraktKeychainStorage {
     private let service = "com.nuvio.tv.trakt.auth"
     private static let lock = NSLock()
     private static var stringCache: [String: String] = [:]
+    /// Strings the Keychain doesn't have, so they aren't looked for again until one is written.
+    /// With Trakt not set up, its client ID was looked for in the Keychain (for each profile
+    /// scope) every time something asked whether Trakt is signed in, which views do as they are
+    /// drawn, on the main thread; a Keychain query is a call into another process.
+    private static var missingStrings: Set<String> = []
     private static var sessionCache: [String: TraktStoredSession] = [:]
     private static var negativeCache: Set<String> = []
+
+    /// How a string is looked up in the Keychain. Tests count the lookups with their own (test
+    /// runs are unsigned and have no Keychain).
+    private let copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+
+    init(copyMatching: @escaping (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) {
+        self.copyMatching = copyMatching
+    }
 
     func clientID(for profileScope: String) -> String? {
         readString(accountType: "clientID", profileScope: profileScope)
@@ -105,6 +118,7 @@ final class TraktKeychainStorage {
     func clearAll() {
         Self.lock.withLock {
             Self.stringCache.removeAll()
+            Self.missingStrings.removeAll()
             Self.sessionCache.removeAll()
             Self.negativeCache.removeAll()
         }
@@ -116,20 +130,29 @@ final class TraktKeychainStorage {
 
     private func readString(accountType: String, profileScope: String) -> String? {
         let cacheKey = "\(accountType):\(profileScope)"
-        if let cached = Self.lock.withLock({ Self.stringCache[cacheKey] }), !cached.isEmpty {
+        let (cached, isMissing) = Self.lock.withLock {
+            (Self.stringCache[cacheKey], Self.missingStrings.contains(cacheKey))
+        }
+        if let cached, !cached.isEmpty {
             return cached
         }
+        if isMissing { return nil }
 
         var query = keychainQuery(for: profileScope, accountType: accountType)
         query[kSecReturnData as String] = kCFBooleanTrue
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var item: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+        let status = copyMatching(query as CFDictionary, &item)
+        if status == errSecSuccess,
            let data = item as? Data,
            let str = String(data: data, encoding: .utf8), !str.isEmpty {
             Self.lock.withLock { Self.stringCache[cacheKey] = str }
             return str
+        }
+        // Only "not there" is remembered: a Keychain that can't be read now is asked again.
+        if status == errSecItemNotFound {
+            Self.lock.withLock { _ = Self.missingStrings.insert(cacheKey) }
         }
         return nil
     }
@@ -139,8 +162,10 @@ final class TraktKeychainStorage {
         Self.lock.withLock {
             if let value, !value.isEmpty {
                 Self.stringCache[cacheKey] = value
+                Self.missingStrings.remove(cacheKey)
             } else {
                 Self.stringCache.removeValue(forKey: cacheKey)
+                Self.missingStrings.insert(cacheKey)
             }
         }
         _ = SecItemDelete(keychainQuery(for: profileScope, accountType: accountType) as CFDictionary)
