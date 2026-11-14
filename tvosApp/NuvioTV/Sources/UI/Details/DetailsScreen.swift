@@ -4755,6 +4755,7 @@ struct TvDetailsContent: View {
     private func actionRowView(
         meta: NuvioMeta,
         playTarget: TvDetailsPlayTarget,
+        episodes: [NuvioVideo],
         scrollProxy: ScrollViewProxy
     ) -> some View {
         let canBypassPicker = smartStreamSelection || (reuseLastLink && hasStoredPlaybackStream(for: playTarget))
@@ -4771,6 +4772,7 @@ struct TvDetailsContent: View {
             onPlayLongPress: canBypassPicker ? {
                 handlePlayLongPress(playTarget: playTarget)
             } : nil,
+            onShuffleClick: shuffleAction(meta: meta, episodes: episodes),
             onHostWatchParty: onHostWatchParty == nil ? nil : {
                 beginWatchPartyEpisodeSelection(
                     meta: meta,
@@ -4886,6 +4888,7 @@ struct TvDetailsContent: View {
                             isChoosingWatchPartyEpisode = false
                             onHostWatchParty?(video)
                         } else {
+                            if let meta = uiState.meta { EpisodeShuffle.shared.stop(seriesID: meta.id) }
                             onEpisodeSelected(video)
                         }
                     },
@@ -5150,9 +5153,25 @@ struct TvDetailsContent: View {
         }
     }
 
+    /// Offered for a series with at least two episodes that can play.
+    private func shuffleAction(meta: NuvioMeta, episodes: [NuvioVideo]) -> (() -> Void)? {
+        guard meta.isSeries, episodes.filter(EpisodeShuffle.isEligible).count > 1 else { return nil }
+        return {
+            cancelFocusRestoration()
+            stopBackgroundTrailer(manual: false)
+            guard let first = EpisodeShuffle.shared.start(
+                seriesID: meta.id,
+                episodes: episodes,
+                isWatched: { WatchedStore.containsEpisode(meta: meta, season: $0.season, episode: $0.episode) }
+            ) else { return }
+            onEpisodeSelected(first)
+        }
+    }
+
     private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
         cancelFocusRestoration()
         stopBackgroundTrailer(manual: false)
+        if let meta = uiState.meta { EpisodeShuffle.shared.stop(seriesID: meta.id) }
         guard playTarget.isPlayable else { return }
         if let episode = playTarget.episode {
             onEpisodeSelected(episode)
@@ -5269,9 +5288,9 @@ struct TvDetailsContent: View {
                                             isSynopsisFocused: false
                                         )
 
-                                        actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
+                                        actionRowView(meta: meta, playTarget: playTarget, episodes: episodes, scrollProxy: scrollProxy)
                                     } else {
-                                        actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
+                                        actionRowView(meta: meta, playTarget: playTarget, episodes: episodes, scrollProxy: scrollProxy)
 
                                         TvDetailsSummary(
                                             meta: meta,
@@ -6490,7 +6509,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, party, watchlist, watched, rate, anilist, mal, trailer
+    case play, shuffle, party, watchlist, watched, rate, anilist, mal, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -6504,6 +6523,8 @@ private struct TvDetailsActionRow: View {
     var playHint: String = L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources")
     let onPlayClick: () -> Void
     var onPlayLongPress: (() -> Void)? = nil
+    /// Series only: plays a random episode, and Up Next stays random.
+    var onShuffleClick: (() -> Void)? = nil
     var onHostWatchParty: (() -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
@@ -6537,6 +6558,22 @@ private struct TvDetailsActionRow: View {
                 longPressAction: onPlayLongPress,
                 onBack: onBack
             )
+
+            if let onShuffleClick {
+                TvDetailsActionButton(
+                    title: nil,
+                    systemName: "shuffle",
+                    accessibilityLabel: L10n.string("details_shuffle", fallback: "Shuffle"),
+                    accessibilityHint: L10n.string("details_shuffle_hint", fallback: "Plays a random episode, then keeps Up Next random"),
+                    isPrimary: false,
+                    focus: focus,
+                    tag: .shuffle,
+                    action: onShuffleClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
 
             if let onHostWatchParty {
                 TvDetailsActionButton(

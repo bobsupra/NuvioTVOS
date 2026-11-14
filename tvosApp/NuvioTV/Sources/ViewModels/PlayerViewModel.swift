@@ -2193,7 +2193,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
         isAutoPlayCancelled = false
-        nextEpisode = Self.nextEpisode(after: resolvedCurrentEpisode, in: episodes)
+        nextEpisode = resolvedNextEpisode(after: resolvedCurrentEpisode, in: episodes)
 
         if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
             let context = ActivePlaybackContext(
@@ -2306,6 +2306,21 @@ class PlayerViewModel: ObservableObject {
                 activeMeta, episode: episode, room: media
               ) else { return false }
         return expected.key == media.key
+    }
+
+    /// The following episode, or a random one while the series plays in shuffle.
+    private func resolvedNextEpisode(after current: NuvioVideo?, in episodes: [NuvioVideo]) -> NuvioVideo? {
+        if let meta = activeMeta, meta.isSeries, EpisodeShuffle.shared.isActive(seriesID: meta.id) {
+            return EpisodeShuffle.shared.next(seriesID: meta.id, after: current, episodes: episodes) { episode in
+                WatchedStore.containsEpisode(meta: meta, season: episode.season, episode: episode.episode)
+            }
+        }
+        return Self.nextEpisode(after: current, in: episodes)
+    }
+
+    var isShufflingEpisodes: Bool {
+        guard let meta = activeMeta, meta.isSeries else { return false }
+        return EpisodeShuffle.shared.isActive(seriesID: meta.id)
     }
 
     private static func nextEpisode(after current: NuvioVideo?, in episodes: [NuvioVideo]) -> NuvioVideo? {
@@ -2974,7 +2989,7 @@ class PlayerViewModel: ObservableObject {
         }
         if let episode {
             currentEpisodeVideo = episode
-            nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
+            nextEpisode = resolvedNextEpisode(after: episode, in: seriesEpisodes)
             isAutoPlayCancelled = false
             fetchExternalSubtitles(
                 contentId: episode.id,
