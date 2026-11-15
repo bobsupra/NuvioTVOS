@@ -37,7 +37,7 @@ struct PremiumizeResolver: DebridProvider {
 
             guard let file = DebridFileSelection.select(
                 from: decoded.content ?? [], request: request,
-                name: { $0.displayName }, size: { $0.size }
+                name: { $0.path ?? $0.displayName }, size: { $0.size }
             ), let link = file.link, !link.isEmpty, let url = URL(string: link) else {
                 return .stale
             }

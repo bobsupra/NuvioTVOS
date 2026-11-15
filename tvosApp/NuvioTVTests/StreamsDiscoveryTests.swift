@@ -61,6 +61,62 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(Set(result.map(\.id)), Set([first.id, second.id]))
     }
 
+    func testManualPickerKeepsUnknownAndLowQualitySources() {
+        let unknown = NuvioStream(
+            url: "https://example.com/one.mkv", name: "Unknown quality",
+            description: nil, addonName: "Addon"
+        )
+        let low = NuvioStream(
+            url: "https://example.com/two.mkv", name: "Movie 360",
+            description: nil, addonName: "Addon"
+        )
+        let hd = NuvioStream(
+            url: "https://example.com/three.mkv", name: "1080p",
+            description: nil, addonName: "Addon"
+        )
+        let sortOptions: [StreamSortOption] = [.default, .quality, .recommended]
+        for preserve in [false, true] {
+            for sort in sortOptions {
+                let result = StreamPickerListBuilder.displayedStreams(
+                    streams: [unknown, low, hd], groups: [], selectedAddonId: nil,
+                    sortOption: sort, includeDebrid: false, preserveAddonStreams: preserve
+                )
+                XCTAssertEqual(Set(result.map(\.id)), Set([unknown.id, low.id, hd.id]))
+            }
+        }
+        let automatic = StreamPickerListBuilder.displayedStreams(
+            streams: [unknown, low, hd], groups: [], selectedAddonId: nil,
+            sortOption: .quality, includeDebrid: false, selectionMode: .automatic
+        )
+        XCTAssertEqual(automatic.map(\.id), [hd.id])
+    }
+
+    func testManualPickerPreservesTitleWithTrailerForEitherCachePreference() {
+        let cached = NuvioStream(
+            url: "https://example.com/cached.mkv", name: "1080p",
+            description: "Trailer.Park.Boys.S01E01.1080p.mkv", addonName: "Debridio", isCached: true
+        )
+        let uncached = NuvioStream(
+            url: "https://example.com/uncached.mkv", name: "720p",
+            description: "Trailer.Park.Boys.S01E01.720p.mkv", addonName: "Debridio", isCached: false
+        )
+        let unrelated = NuvioStream(
+            url: "https://example.com/other.mkv", name: "1080p",
+            description: "Other.S01E01.1080p.mkv", addonName: "Another Addon", isCached: true
+        )
+        for preserve in [false, true] {
+            for cachedOnly in [false, true] {
+                let result = StreamPickerListBuilder.displayedStreams(
+                    streams: [cached, uncached, unrelated], groups: [], selectedAddonId: nil,
+                    sortOption: .default, includeDebrid: false, cachedOnly: cachedOnly,
+                    preserveAddonStreams: preserve
+                )
+                let expected = cachedOnly ? [cached.id, unrelated.id] : [cached.id, uncached.id, unrelated.id]
+                XCTAssertEqual(Set(result.map(\.id)), Set(expected))
+            }
+        }
+    }
+
     func testAutomaticSelectionStillExcludesPromotionalStreamsWhenAlternativesExist() {
         let trailer = NuvioStream(
             url: "https://example.com/trailer.mkv", name: "Official trailer 1080p",
@@ -77,9 +133,120 @@ final class StreamsDiscoveryTests: XCTestCase {
         let automaticList = StreamPickerListBuilder.displayedStreams(
             streams: [trailer, movie], groups: [], selectedAddonId: nil,
             sortOption: .default, includeDebrid: false, preserveAddonStreams: true,
-            filterPromotional: true
+            selectionMode: .automatic
         )
         XCTAssertEqual(automaticList.map(\.id), [movie.id])
+    }
+
+    func testAutomaticCachedOnlyFallsBackAfterCacheFiltering() {
+        let cachedEpisode = NuvioStream(
+            url: "https://example.com/one.mkv", name: "Official trailer 1080p",
+            description: "Trailer.Park.Boys.S01E01.1080p", addonName: "Debridio", isCached: true
+        )
+        let other = NuvioStream(
+            url: "https://example.com/two.mkv", name: "1080p",
+            description: "Other.1080p", addonName: "Debridio"
+        )
+        let pool = SmartPlaybackSelector.playableStreams(
+            from: [cachedEpisode, other], cachedOnly: true, preserveAddonStreams: true
+        )
+        XCTAssertEqual(pool.map(\.id), [cachedEpisode.id])
+        let ranked = SmartPlaybackSelector.rankedStreams(
+            from: [cachedEpisode, other], qualityPreference: "Highest", subtitleLanguages: [],
+            shouldMatchSubtitles: false, cachedOnly: true
+        )
+        XCTAssertEqual(ranked.map(\.id), [cachedEpisode.id])
+    }
+
+    func testAutomaticSelectionKeepsEpisodeWhenTitleContainsTrailer() {
+        let episode = NuvioStream(
+            url: "https://example.com/preview/video.mkv", name: "1080p",
+            description: "Trailer.Park.Boys.The.Animated.Series.S01E01.1080p.mkv",
+            addonName: "Preview Addon"
+        )
+        let other = NuvioStream(
+            url: "https://example.com/other.mkv", name: "1080p",
+            description: "Other.1080p", addonName: "Addon"
+        )
+        let pool = SmartPlaybackSelector.playableStreams(
+            from: [episode, other], preserveAddonStreams: true
+        )
+        XCTAssertEqual(Set(pool.map(\.id)), Set([episode.id, other.id]))
+        let ranked = SmartPlaybackSelector.rankedStreams(
+            from: [episode, other], qualityPreference: "Highest", subtitleLanguages: [],
+            shouldMatchSubtitles: false
+        )
+        XCTAssertEqual(Set(ranked.map(\.id)), Set([episode.id, other.id]))
+    }
+
+    func testAutomaticSelectionPreservesPromotionalWordsInsideTitles() {
+        let titles = ["Trailer Park Boys", "Sample of Life", "Preview Night", "Promo Story", "Teaser Town", "Featurette House"]
+        let other = NuvioStream(
+            url: "https://example.com/other.mkv", name: "1080p",
+            description: "Other.1080p", addonName: "Debridio", isCached: true
+        )
+        for (index, title) in titles.enumerated() {
+            let stream = NuvioStream(
+                url: "https://example.com/episode-\(index).mkv", name: "1080p",
+                description: "\(title) S01E01 1080p", addonName: "Debridio", isCached: true
+            )
+            for cachedOnly in [false, true] {
+                let result = SmartPlaybackSelector.playableStreams(
+                    from: [stream, other], cachedOnly: cachedOnly, preserveAddonStreams: true
+                )
+                XCTAssertEqual(Set(result.map(\.id)), Set([stream.id, other.id]), title)
+            }
+        }
+    }
+
+    func testAutomaticSelectionRecognizesExplicitPromotionalLabels() {
+        let labels = ["Trailer", "Official Trailer 1080p", "Teaser", "Preview", "Promo", "Sample", "Featurette"]
+        let episode = NuvioStream(
+            url: "https://example.com/episode.mkv", name: "1080p",
+            description: "Episode 1080p", addonName: "Addon"
+        )
+        for (index, label) in labels.enumerated() {
+            let promotional = NuvioStream(
+                url: "https://example.com/clip-\(index).mkv", name: label,
+                description: nil, addonName: "Addon"
+            )
+            let result = SmartPlaybackSelector.playableStreams(
+                from: [promotional, episode], preserveAddonStreams: true
+            )
+            XCTAssertEqual(result.map(\.id), [episode.id], label)
+        }
+    }
+
+    func testAutomaticSelectionUsesYouTubeHostNotURLSubstring() {
+        let youtube = NuvioStream(
+            url: "https://www.youtube.com/watch?v=example", name: "1080p",
+            description: nil, addonName: "Addon"
+        )
+        let ordinary = NuvioStream(
+            url: "https://example.com/youtube.com/video.mkv", name: "1080p",
+            description: nil, addonName: "Addon"
+        )
+        let pool = SmartPlaybackSelector.playableStreams(
+            from: [youtube, ordinary], preserveAddonStreams: true
+        )
+        XCTAssertEqual(pool.map(\.id), [ordinary.id])
+    }
+
+    func testActionDoesNotSuppressAutomaticPlayableFallback() {
+        let action = NuvioStream(
+            url: "https://example.com/action", name: "Action",
+            description: nil, addonName: "Addon", notPlayable: true
+        )
+        let episode = NuvioStream(
+            url: "https://example.com/episode.mkv", name: "480p",
+            description: "Trailer.Park.Boys.S01E01", addonName: "Addon"
+        )
+        for preserve in [false, true] {
+            let result = SmartPlaybackSelector.playableStreams(
+                from: [action, episode], preserveAddonStreams: preserve
+            )
+            XCTAssertEqual(Set(result.map(\.id)), Set([action.id, episode.id]))
+        }
     }
 
     func testManualPickerStillHonorsCachedOnly() {

@@ -389,8 +389,16 @@ struct UsenetReleaseResolver {
     }
 
     private static func isSample(_ name: String) -> Bool {
-        let lower = name.lowercased()
-        return lower.contains("sample") || lower.contains("trailer")
+        if DebridVideo.isSample(name) { return true }
+        let filename = name.replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/").last.map(String.init) ?? ""
+        let stem = (filename as NSString).deletingPathExtension
+        // Require a trailing trailer label, rather than matching a title such
+        // as Trailer Park Boys anywhere in the file or parent directory.
+        return stem.range(
+            of: #"(?i)(?:^|[.\s_-])trailer$"#,
+            options: .regularExpression
+        ) != nil
     }
 
     private static func fileSize(_ head: UsenetYEncSegment) -> Int64 {

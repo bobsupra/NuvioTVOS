@@ -222,6 +222,21 @@ final class UsenetNZBTests: XCTestCase {
         XCTAssertEqual(chosen?.name, "Show.S01E01.1080p.mkv")
     }
 
+    func testTrailerInSeriesTitleDoesNotExcludeEpisode() {
+        let candidates = [
+            UsenetPlayableEntry(name: "Trailer.Park.Boys.S01E01.1080p.mkv", source: .plain(0), size: 200, order: 0),
+            UsenetPlayableEntry(name: "Other.S01E01.mkv", source: .plain(1), size: 100, order: 1),
+            UsenetPlayableEntry(name: "Trailer.Park.Boys.S01E01.sample.mkv", source: .plain(2), size: 400, order: 2),
+            UsenetPlayableEntry(name: "Show.S01E01.trailer.mkv", source: .plain(3), size: 500, order: 3),
+        ]
+        XCTAssertEqual(
+            UsenetReleaseResolver.choose(candidates, mustInclude: nil, fileIdx: nil)?.name,
+            candidates[0].name
+        )
+        // Explicit addon selections continue to take precedence.
+        XCTAssertEqual(UsenetReleaseResolver.choose(candidates, mustInclude: nil, fileIdx: 2)?.name, candidates[2].name)
+    }
+
     func testFileMustIncludeRegexWins() throws {
         let chosen = UsenetReleaseResolver.choose(entries(try sampleNZB()), mustInclude: "(?:sample)|(?:trailer)", fileIdx: nil)
         XCTAssertEqual(chosen?.name, "Show.S01E01.sample.mkv")

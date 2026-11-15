@@ -1368,7 +1368,9 @@ final class StreamQualityTagsTests: XCTestCase {
             cachedOnly: false,
             preserveAddonStreams: false
         )
-        XCTAssertFalse(defaultDisplayed.contains(where: { $0.id == usenetPriorityModeStream.id }))
+        // Manual selection keeps Priority Mode available even when other
+        // results advertise a known resolution.
+        XCTAssertTrue(defaultDisplayed.contains(where: { $0.id == usenetPriorityModeStream.id }))
 
         // Enabled behavior (preserveAddonStreams == true):
         // All playable results are kept and exact add-on ordering is preserved as the source of truth

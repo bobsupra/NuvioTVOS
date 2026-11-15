@@ -84,7 +84,7 @@ struct RealDebridResolver: DebridProvider {
     private func selectFile(from files: [TorrentInfo.File], request: DebridRequest) -> TorrentInfo.File? {
         DebridFileSelection.select(
             from: files, request: request,
-            name: { $0.displayName }, size: { $0.bytes }, fileId: { $0.id }
+            name: { $0.path ?? $0.displayName }, size: { $0.bytes }, fileId: { $0.id }
         )
     }
 
