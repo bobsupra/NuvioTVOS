@@ -28,6 +28,11 @@ struct IPTVLiveView: View {
     @State private var guideByChannel: [String: [IPTVProgramme]] = [:]
     @State private var guideUnavailable = false
     @State private var guideNow = Date()
+    /// When the guide is due to be fetched again (see IPTVGuideRefreshPolicy),
+    /// how many loads in a row failed, and the load the guide may still come from.
+    @State private var guideNextRefresh: Date?
+    @State private var guideFailures = 0
+    @State private var guideRequestID: UUID?
     @State private var selectedGuideURL: URL?
     @State private var selectedGuideNeedsSameOrigin = false
     @State private var searchText = ""
@@ -157,8 +162,12 @@ struct IPTVLiveView: View {
             .padding(70)
         }
         .onAppear(perform: restoreSources)
-        .onReceive(guideClock) { guideNow = $0 }
-        .onDisappear { requestID = UUID(); loadTask?.cancel(); loadTask = nil; guideTask?.cancel(); guideTask = nil; loading = false }
+        .onReceive(guideClock) { now in
+            guideNow = now
+            // Only checks whether a refresh is due; it isn't a fetch every minute.
+            refreshGuideIfDue(now: now)
+        }
+        .onDisappear { requestID = UUID(); loadTask?.cancel(); loadTask = nil; guideTask?.cancel(); guideTask = nil; guideRequestID = nil; loading = false }
     }
 
     private var filteredChannels: [IPTVChannel] {
@@ -196,9 +205,9 @@ struct IPTVLiveView: View {
                let sourceID = recent.sourceID(), let source = sources.first(where: { $0.id == sourceID }) {
                 load(source)
             }
-            if let id = selectedID, let url = selectedGuideURL, guideByChannel.isEmpty {
-                loadGuide(url: url, for: id, channels: channels, sameOrigin: selectedGuideNeedsSameOrigin)
-            }
+            // Back on the view: the first load, or a refresh or retry that is due.
+            // An empty guide after a failure waits for its retry like any other.
+            refreshGuideIfDue(now: Date())
         }
         catch { sourcesLoaded = false; errorMessage = L10n.string("iptv_storage_read_error", fallback: "Could not read IPTV sources.") }
     }
@@ -273,8 +282,12 @@ struct IPTVLiveView: View {
                 }
                 channels = loaded
                 guideTask?.cancel()
+                guideTask = nil
+                guideRequestID = nil
                 guideByChannel = [:]
                 guideUnavailable = false
+                guideNextRefresh = nil
+                guideFailures = 0
                 selectedGuideURL = guideURL
                 selectedGuideNeedsSameOrigin = guideNeedsSameOrigin
                 stalkerChannels = portalChannels
@@ -308,7 +321,7 @@ struct IPTVLiveView: View {
             if selectedID == source.id {
                 selectedID = nil; channels = []; stalkerChannels = []; stalkerClient = nil
                 favoriteKeys = [:]
-                guideTask?.cancel(); guideTask = nil; guideByChannel = [:]; guideUnavailable = false; selectedGuideURL = nil; selectedGuideNeedsSameOrigin = false
+                guideTask?.cancel(); guideTask = nil; guideRequestID = nil; guideByChannel = [:]; guideUnavailable = false; guideNextRefresh = nil; guideFailures = 0; selectedGuideURL = nil; selectedGuideNeedsSameOrigin = false
                 searchText = ""; selectedGroup = nil
             }
             if editingID == source.id { clearEditor() }
@@ -389,23 +402,48 @@ struct IPTVLiveView: View {
         return guideByChannel[id]?.first { $0.start <= guideNow && guideNow < $0.end }
     }
 
+    /// Fetches the guide when IPTVGuideRefreshPolicy.shouldLoad says so.
+    private func refreshGuideIfDue(now: Date) {
+        guard let sourceID = selectedID, let url = selectedGuideURL,
+              IPTVGuideRefreshPolicy.shouldLoad(isLoading: guideTask != nil, nextRefresh: guideNextRefresh, now: now)
+        else { return }
+        loadGuide(url: url, for: sourceID, channels: channels, sameOrigin: selectedGuideNeedsSameOrigin)
+    }
+
+    /// Loads the guide for the selected source. The guide already shown stays
+    /// until a new one arrives; a failure keeps it and schedules a retry. An
+    /// answer only applies if it is still the latest request, for the same
+    /// source and profile.
     private func loadGuide(url: URL, for sourceID: UUID, channels: [IPTVChannel], sameOrigin: Bool) {
         let ids = Set(channels.compactMap(\.guideID))
         guard !ids.isEmpty else { return }
         let now = Date()
-        let window = now.addingTimeInterval(-6 * 3600)..<now.addingTimeInterval(48 * 3600)
+        let window = IPTVGuideRefreshPolicy.window(around: now)
+        let token = UUID()
+        guideRequestID = token
+        guideTask?.cancel()
         guideTask = Task { @MainActor in
+            func stillCurrent() -> Bool {
+                !Task.isCancelled && guideRequestID == token && selectedID == sourceID
+                    && ProfileSettings.activeProfileID == profileID
+            }
             do {
                 let reader = sameOrigin ? IPTVGuideLoader(session: IPTVAuthenticatedSession.shared) : guideLoader
                 let programmes = try await reader.load(url: url, channelIDs: ids, window: window)
-                guard !Task.isCancelled, selectedID == sourceID, ProfileSettings.activeProfileID == profileID else { return }
+                guard stillCurrent() else { return }
                 guideByChannel = Dictionary(grouping: programmes, by: \.channelID)
                 guideNow = Date()
                 guideUnavailable = false
+                guideFailures = 0
+                guideNextRefresh = IPTVGuideRefreshPolicy.nextRefresh(after: programmes, loadedAt: now)
             } catch {
-                guard !Task.isCancelled, selectedID == sourceID, ProfileSettings.activeProfileID == profileID else { return }
-                guideUnavailable = true
+                guard stillCurrent() else { return }
+                guideFailures += 1
+                guideNextRefresh = IPTVGuideRefreshPolicy.retry(afterFailures: guideFailures, at: Date())
+                // Programmes still on air keep showing; only say unavailable with nothing to show.
+                guideUnavailable = guideByChannel.isEmpty
             }
+            guideTask = nil
         }
     }
 
