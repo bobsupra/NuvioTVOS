@@ -256,6 +256,18 @@ struct SurpriseMeHistory {
         keys = Set((watched + continueWatching).flatMap(Self.keys(for:)))
     }
 
+    /// Changes whenever a title is added to, removed from or moved within any
+    /// of the three lists (most recent first), even if the count stays the
+    /// same. In-memory only: not stable across launches.
+    var signature: Int {
+        var hasher = Hasher()
+        for (index, list) in [watched, library, continueWatching].enumerated() {
+            hasher.combine(index)
+            for meta in list { hasher.combine(Self.titleKey(meta)) }
+        }
+        return hasher.finalize()
+    }
+
     /// Distinct titles across the three lists.
     var titleCount: Int {
         Self.unique(watched + library + continueWatching).count
