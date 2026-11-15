@@ -112,11 +112,15 @@ enum MdbListLibraryService {
                 method: .post,
                 body: data
             )
-            guard (200..<300).contains(response.statusCode), ProfileSettings.isActiveStore(store) else { return false }
-            NotificationCenter.default.post(
-                name: mutationNotification,
-                object: MdbListLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
-            )
+            guard (200..<300).contains(response.statusCode) else { return false }
+            // MDBList applied it: that's the result, even if the profile switched
+            // while the request was out. Only the active UI is left alone then.
+            if ProfileSettings.isActiveStore(store) {
+                NotificationCenter.default.post(
+                    name: mutationNotification,
+                    object: MdbListLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
+                )
+            }
             return true
         } catch {
             return false

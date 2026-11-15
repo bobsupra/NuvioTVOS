@@ -392,3 +392,165 @@ final class SelectedLibraryWriteOwnershipTests: XCTestCase {
     }
 }
 
+/// Holds every request until the test lets the server answer, so the test can switch
+/// profiles while a write is in flight.
+private final class HeldResponseURLProtocol: URLProtocol {
+    private static let lock = NSLock()
+    private static var _requests = 0
+    private static var gate = DispatchSemaphore(value: 0)
+    static var started: (() -> Void)?
+
+    static var requests: Int { lock.withLock { _requests } }
+
+    static func reset() {
+        lock.withLock { _requests = 0 }
+        gate = DispatchSemaphore(value: 0)
+        started = nil
+    }
+
+    static func answer() { gate.signal() }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        Self.lock.withLock { Self._requests += 1 }
+        let started = Self.started
+        DispatchQueue.main.async { started?() }
+        let gate = Self.gate
+        DispatchQueue.global().async { [self] in
+            gate.wait()
+            let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
+                                           headerFields: ["Content-Type": "application/json"])!
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: Data("{}".utf8))
+            client?.urlProtocolDidFinishLoading(self)
+        }
+    }
+
+    override func stopLoading() {}
+
+    static func session() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [HeldResponseURLProtocol.self]
+        return URLSession(configuration: configuration)
+    }
+}
+
+/// The real Simkl, MDBList and WeTrakr write paths when the profile switches while A's
+/// request is in flight: a change the server applied is still a success (so it's reported
+/// for A), but nothing updates the UI or cache that now belong to B.
+@MainActor
+final class LibraryServiceInFlightSwitchTests: XCTestCase {
+    private let meta = NuvioMeta(id: "tt0111161", name: "Film", imdbId: "tt0111161", tmdbId: 278, type: "movie", year: 1994)
+    private let uiNotifications = [
+        TraktLibraryService.mutationNotification,
+        TraktSettingsStore.libraryChangedNotification,
+        MdbListLibraryService.mutationNotification,
+        WeTrakrLibraryService.mutationNotification,
+    ]
+
+    override func setUp() {
+        super.setUp()
+        HeldResponseURLProtocol.reset()
+    }
+
+    private func write(_ mode: QueueOwnershipMode, _ fixture: QueueOwnershipFixture, session: URLSession) async -> Bool {
+        switch mode {
+        case .simklV1, .simklV2:
+            return await SimklLibraryService.setWatchlist(
+                meta, isInWatchlist: true, store: fixture.store, client: SimklAPIClient(session: session),
+                tokenStorage: fixture.tokens, profileScope: fixture.profile
+            )
+        case .mdbOAuth, .mdbAPIKey:
+            return await MdbListLibraryService.setWatchlist(
+                meta, isInWatchlist: true, store: fixture.store, client: MdbListAPIClient(session: session),
+                tokenStorage: fixture.tokens, profileScope: fixture.profile
+            )
+        case .weTrakr:
+            return await WeTrakrLibraryService.setWatchlist(
+                meta, isInWatchlist: true, store: fixture.store, profileScope: fixture.profile,
+                tokenStorage: fixture.tokens, client: WeTrakrAPIClient(session: session)
+            )
+        case .trakt:
+            return false
+        }
+    }
+
+    /// Runs A's write, optionally switching to another profile while it's in flight.
+    /// Returns the result, the UI notifications posted, and the other profile's id.
+    private func run(_ mode: QueueOwnershipMode, _ fixture: QueueOwnershipFixture, switchDuringRequest: Bool,
+                     beforeAnswer: ((String?) -> Void)? = nil) async -> (Bool, Int, String?) {
+        let inFlight = expectation(description: "A's request in flight: \(mode)")
+        HeldResponseURLProtocol.started = { inFlight.fulfill() }
+        let session = HeldResponseURLProtocol.session()
+
+        let task = Task { await self.write(mode, fixture, session: session) }
+        await fulfillment(of: [inFlight], timeout: 3)
+        var other: String?
+        if switchDuringRequest {
+            let id = "details-other-\(UUID().uuidString)"
+            ProfileSettings.setActiveProfile(id, isPrimary: false)
+            LibraryStore.setActiveProfile(id)
+            other = id
+        }
+        beforeAnswer?(other)
+        // Counted from here on: only what the server's answer causes, not the switch itself.
+        var posted = 0
+        let tokens = uiNotifications.map {
+            NotificationCenter.default.addObserver(forName: $0, object: nil, queue: nil) { _ in posted += 1 }
+        }
+        defer { tokens.forEach(NotificationCenter.default.removeObserver) }
+        HeldResponseURLProtocol.answer()
+        let result = await task.value
+        return (result, posted, other)
+    }
+
+    private func cleanUp(_ id: String?) {
+        guard let id else { return }
+        UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(id)")
+    }
+
+    func testASuccessConfirmedAfterASwitchIsStillASuccessButLeavesTheNewProfilesUIAlone() async {
+        for mode in [QueueOwnershipMode.simklV1, .simklV2, .mdbOAuth, .mdbAPIKey, .weTrakr] {
+            HeldResponseURLProtocol.reset()
+            let fixture = QueueOwnershipFixture(mode)
+            defer { fixture.restore() }
+            let (result, posted, other) = await run(mode, fixture, switchDuringRequest: true)
+            defer { cleanUp(other) }
+            XCTAssertEqual(HeldResponseURLProtocol.requests, 1, "\(mode)")
+            XCTAssertTrue(result, "The server applied A's change, so it must be reported for A: \(mode)")
+            XCTAssertEqual(posted, 0, "B's library UI must not get A's change: \(mode)")
+        }
+    }
+
+    func testWithoutASwitchTheSuccessAlsoUpdatesTheUI() async {
+        for mode in [QueueOwnershipMode.simklV1, .simklV2, .mdbOAuth, .mdbAPIKey, .weTrakr] {
+            HeldResponseURLProtocol.reset()
+            let fixture = QueueOwnershipFixture(mode)
+            defer { fixture.restore() }
+            let (result, posted, _) = await run(mode, fixture, switchDuringRequest: false)
+            XCTAssertTrue(result, "\(mode)")
+            XCTAssertGreaterThan(posted, 0, "\(mode)")
+        }
+    }
+
+    func testWeTrakrNeverPutsAChangeIntoAnotherProfilesCache() async {
+        let fixture = QueueOwnershipFixture(.weTrakr)
+        defer { fixture.restore() }
+        let ownerStore = fixture.store
+        let bTitle = NuvioMeta(id: "tt-b", name: "B's title", type: "movie")
+        let (result, _, other) = await run(.weTrakr, fixture, switchDuringRequest: true) { otherID in
+            // B's library was loaded after the switch, while A's request was still out.
+            WeTrakrLibraryService.replaceCachedItems(
+                [LibraryStoreItem(meta: bTitle, addedAt: Date())], for: ProfileSettings.store(for: otherID)
+            )
+        }
+        defer { cleanUp(other) }
+        XCTAssertTrue(result)
+        let bCache = WeTrakrLibraryService.cachedItems(for: ProfileSettings.store(for: other))
+        XCTAssertEqual(bCache?.map(\.meta.id), ["tt-b"], "A's add must not appear in B's cache")
+        XCTAssertNil(WeTrakrLibraryService.cachedItems(for: ownerStore), "B's cache is never handed to A either")
+    }
+}
+

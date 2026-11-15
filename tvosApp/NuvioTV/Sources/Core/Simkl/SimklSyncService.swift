@@ -2174,16 +2174,20 @@ struct SimklLibraryService {
                 path: isInWatchlist ? "sync/add-to-list" : "sync/history/remove",
                 body: body
             )
-            guard (200..<300).contains(status), service.isCurrentAuthorization(),
-                  TraktSettingsStore.librarySourceMode(in: store) == .simkl else { return false }
-            NotificationCenter.default.post(
-                name: TraktLibraryService.mutationNotification,
-                object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
-            )
-            NotificationCenter.default.post(
-                name: TraktSettingsStore.libraryChangedNotification,
-                object: nil
-            )
+            guard (200..<300).contains(status) else { return false }
+            // Simkl applied it: that's the result, even if the profile switched or
+            // the account was relinked while the request was out. Only the active
+            // UI is left alone then, since it no longer shows this library.
+            if service.isCurrentAuthorization(), TraktSettingsStore.librarySourceMode(in: store) == .simkl {
+                NotificationCenter.default.post(
+                    name: TraktLibraryService.mutationNotification,
+                    object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
+                )
+                NotificationCenter.default.post(
+                    name: TraktSettingsStore.libraryChangedNotification,
+                    object: nil
+                )
+            }
             return true
         } catch {
             return false

@@ -3,8 +3,29 @@ import Foundation
 @MainActor
 enum WeTrakrLibraryService {
     static let mutationNotification = Notification.Name("nuvio.tv.wetrakr.library.mutation")
-    private static let client = WeTrakrAPIClient()
-    private static var cachedLibraryItems: [LibraryStoreItem]?
+    static let client = WeTrakrAPIClient()
+    /// The last fetched library, for the profile it was fetched for. One cache
+    /// for every profile would let one profile's mutation, or its list, show
+    /// under another.
+    private static var cachedLibrary: (owner: String, items: [LibraryStoreItem])?
+
+    /// The profile a settings store belongs to.
+    static func cacheOwner(for store: UserDefaults) -> String {
+        let id = store.string(forKey: "nuvio.tv.profile.settings.profileID")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return id.isEmpty ? "default" : id
+    }
+
+    /// Replaces the cache with `store`'s profile's items.
+    static func replaceCachedItems(_ items: [LibraryStoreItem], for store: UserDefaults) {
+        cachedLibrary = (cacheOwner(for: store), items)
+    }
+
+    /// The cached items, only if they belong to `store`'s profile.
+    static func cachedItems(for store: UserDefaults) -> [LibraryStoreItem]? {
+        guard let cachedLibrary, cachedLibrary.owner == cacheOwner(for: store) else { return nil }
+        return cachedLibrary.items
+    }
 
     static func fetchLibrary(
         repository: CatalogRepository? = nil,
@@ -61,7 +82,7 @@ enum WeTrakrLibraryService {
         }
 
         if updateCachedLibraryItems {
-            cachedLibraryItems = items
+            replaceCachedItems(items, for: store)
         }
         return items
     }
@@ -70,9 +91,13 @@ enum WeTrakrLibraryService {
         _ meta: NuvioMeta,
         isInWatchlist: Bool,
         store: UserDefaults = ProfileSettings.current,
-        profileScope: String? = nil
+        profileScope: String? = nil,
+        tokenStorage: WeTrakrTokenStorage = WeTrakrKeychainTokenStorage(),
+        client: WeTrakrAPIClient = WeTrakrLibraryService.client
     ) async -> Bool {
-        guard let token = WeTrakrRuntimeSession.authenticatedState(store: store, profileScope: profileScope)?.accessToken,
+        guard let token = WeTrakrRuntimeSession.authenticatedState(
+            store: store, tokenStorage: tokenStorage, profileScope: profileScope
+        )?.accessToken,
               !token.isEmpty else { return false }
         let clientID = WeTrakrConfig.clientID(in: store)
         let ids = WeTrakrProgressService.wetrakrIDs(for: meta)
@@ -94,11 +119,11 @@ enum WeTrakrLibraryService {
                 )
                 _ = try result.valueOrThrow()
 
-                if var current = cachedLibraryItems {
-                    if !current.contains(where: { $0.meta.id == meta.id || WatchedStore.sameContent($0.meta, meta) }) {
-                        current.insert(LibraryStoreItem(meta: meta, addedAt: Date()), at: 0)
-                        cachedLibraryItems = current
-                    }
+                // Only this profile's cache, never another profile's.
+                if var current = cachedItems(for: store),
+                   !current.contains(where: { $0.meta.id == meta.id || WatchedStore.sameContent($0.meta, meta) }) {
+                    current.insert(LibraryStoreItem(meta: meta, addedAt: Date()), at: 0)
+                    cachedLibrary = (cacheOwner(for: store), current)
                 }
             } else {
                 let payload = WeTrakrTrackingRemovePayload(
@@ -113,17 +138,21 @@ enum WeTrakrLibraryService {
                 )
                 _ = try result.valueOrThrow()
 
-                if var current = cachedLibraryItems {
+                if var current = cachedItems(for: store) {
                     current.removeAll(where: { $0.meta.id == meta.id || WatchedStore.sameContent($0.meta, meta) })
-                    cachedLibraryItems = current
+                    cachedLibrary = (cacheOwner(for: store), current)
                 }
             }
 
-            NotificationCenter.default.post(
-                name: TraktLibraryService.mutationNotification,
-                object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
-            )
-            NotificationCenter.default.post(name: mutationNotification, object: nil)
+            // WeTrakr applied it: that's the result. The visible library is only
+            // told while this profile is still the active one.
+            if ProfileSettings.isActiveStore(store) {
+                NotificationCenter.default.post(
+                    name: TraktLibraryService.mutationNotification,
+                    object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
+                )
+                NotificationCenter.default.post(name: mutationNotification, object: nil)
+            }
             return true
         } catch {
             print("[WeTrakrLibraryService] setWatchlist failed: \(error.localizedDescription)")
@@ -137,7 +166,7 @@ enum WeTrakrLibraryService {
     ) async -> Bool? {
         guard let token = WeTrakrRuntimeSession.authenticatedState(store: store)?.accessToken,
               !token.isEmpty else { return nil }
-        if let cached = cachedLibraryItems {
+        if let cached = cachedItems(for: store) {
             return cached.contains { $0.meta.id == meta.id || WatchedStore.sameContent($0.meta, meta) }
         }
         let fetched = await fetchLibrary(repository: nil, store: store)
