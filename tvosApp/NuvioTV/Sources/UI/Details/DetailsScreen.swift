@@ -3802,7 +3802,7 @@ enum SmartPlaybackSelector {
     }
 
     private static let explicitPromotionalLabel = try! NSRegularExpression(
-        pattern: #"^(?:official\s+)?(?:trailer|teaser|preview|promo|sample|featurette)(?:\s+(?:\d{3,4}p|4k|hd|uhd))?$"#,
+        pattern: #"^(?:(?:official|final)\s+)?(?:teaser\s+trailer|trailer|teaser|preview|promo|sample|featurette)(?:\s*#?\d{1,2})?(?:\s+(?:\d{3,4}p|4k|hd|uhd))?$"#,
         options: .caseInsensitive
     )
 
@@ -4080,9 +4080,7 @@ enum StreamPickerListBuilder {
             from: source,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
-            // Manual selection keeps low/unknown quality sources available;
-            // automatic selection retains the existing quality filter.
-            preserveAddonStreams: preserveAddonStreams || selectionMode == .manual,
+            preserveAddonStreams: preserveAddonStreams,
             includeUnavailable: true,
             includeUnknownCacheStatus: includeUnknownCacheStatus,
             filterPromotional: selectionMode == .automatic

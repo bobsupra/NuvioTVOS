@@ -61,7 +61,7 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(Set(result.map(\.id)), Set([first.id, second.id]))
     }
 
-    func testManualPickerKeepsUnknownAndLowQualitySources() {
+    func testManualPickerRespectsQualityAndPreserveSettings() {
         let unknown = NuvioStream(
             url: "https://example.com/one.mkv", name: "Unknown quality",
             description: nil, addonName: "Addon"
@@ -81,7 +81,8 @@ final class StreamsDiscoveryTests: XCTestCase {
                     streams: [unknown, low, hd], groups: [], selectedAddonId: nil,
                     sortOption: sort, includeDebrid: false, preserveAddonStreams: preserve
                 )
-                XCTAssertEqual(Set(result.map(\.id)), Set([unknown.id, low.id, hd.id]))
+                let expected = preserve || sort == .recommended ? [unknown.id, low.id, hd.id] : [hd.id]
+                XCTAssertEqual(Set(result.map(\.id)), Set(expected))
             }
         }
         let automatic = StreamPickerListBuilder.displayedStreams(
@@ -200,7 +201,7 @@ final class StreamsDiscoveryTests: XCTestCase {
     }
 
     func testAutomaticSelectionRecognizesExplicitPromotionalLabels() {
-        let labels = ["Trailer", "Official Trailer 1080p", "Teaser", "Preview", "Promo", "Sample", "Featurette"]
+        let labels = ["Trailer", "Official Trailer 1080p", "Official Trailer 2", "Final Trailer", "Teaser Trailer", "Trailer #2", "Teaser", "Preview", "Promo", "Sample", "Featurette"]
         let episode = NuvioStream(
             url: "https://example.com/episode.mkv", name: "1080p",
             description: "Episode 1080p", addonName: "Addon"
