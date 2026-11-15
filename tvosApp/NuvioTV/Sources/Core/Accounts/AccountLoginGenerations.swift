@@ -38,10 +38,20 @@ final class AccountLoginGenerations: @unchecked Sendable {
         }
     }
 
+    /// Invalidates a group atomically, for operations such as signing out.
+    func invalidate(_ profileScopes: Set<String>, _ remove: () -> Void) {
+        lock.withLock {
+            for scope in profileScopes {
+                generations[scope] = (generations[scope] ?? 0) &+ 1
+            }
+            remove()
+        }
+    }
+
     /// Runs `body` with no login saved or removed meanwhile, for a
     /// read-then-write such as keeping a renewed token.
-    func exclusive<T>(_ body: () -> T) -> T {
-        lock.withLock(body)
+    func exclusive<T>(_ body: () throws -> T) rethrows -> T {
+        try lock.withLock(body)
     }
 
     /// Runs `save` only if `generation` is still the profile's current one. The

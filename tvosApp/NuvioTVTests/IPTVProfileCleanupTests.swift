@@ -222,4 +222,47 @@ final class IPTVProfileCleanupTests: XCTestCase {
         XCTAssertTrue(IPTVSourceStore.pendingRemovals.contains(kept))
         XCTAssertEqual(try store.load(profileID: kept), [])
     }
+
+    func testFailedFullWipeProtectsEveryRetiredSlotAndRejectsPendingSaves() throws {
+        let failing = FailingRemovalStorage()
+        IPTVSourceStore.defaultStorage = failing
+        let store = IPTVSourceStore()
+        try store.save([source("old-a")], profileID: removed)
+        try store.save([source("old-b")], profileID: kept)
+        let oldGeneration = IPTVSourceStore.generation(for: kept)
+
+        IPTVSourceStore.removeAllSources(profileIDs: [removed, kept]) {
+            throw IPTVSourceStoreError.keychain(errSecInteractionNotAllowed)
+        }
+
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.contains(removed))
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.contains(kept))
+        XCTAssertEqual(try store.load(profileID: removed), [])
+        XCTAssertEqual(try store.load(profileID: kept), [])
+        XCTAssertFalse(try store.save([source("late")], profileID: kept, ifGeneration: oldGeneration))
+
+        // One slot can be reused even while another still awaits deletion.
+        let new = source("new")
+        try store.save([new], profileID: kept)
+        failing.failsRemoval = false
+        IPTVSourceStore.retryPendingRemovals()
+        XCTAssertNil(failing.data[removed])
+        XCTAssertEqual(try store.load(profileID: kept), [new])
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.all.isEmpty)
+    }
+
+    func testSuccessfulFullWipeClearsExistingMarksAndRejectsPendingSaves() throws {
+        let store = IPTVSourceStore()
+        try store.save([source("old")], profileID: removed)
+        IPTVSourceStore.pendingRemovals.insert(kept)
+        let oldGeneration = IPTVSourceStore.generation(for: removed)
+
+        IPTVSourceStore.removeAllSources(profileIDs: [removed, kept]) {
+            self.backend.data.removeAll()
+        }
+
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.all.isEmpty)
+        XCTAssertEqual(try store.load(profileID: removed), [])
+        XCTAssertFalse(try store.save([source("late")], profileID: removed, ifGeneration: oldGeneration))
+    }
 }

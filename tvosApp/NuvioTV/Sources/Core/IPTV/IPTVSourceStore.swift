@@ -62,19 +62,22 @@ struct IPTVSourceStore {
     }
 
     /// Profiles whose sources are still waiting to be deleted (see `removeProfile`).
-    /// Kept in preferences so the mark survives a restart; tests swap it.
+    /// Kept in preferences for subsequent launches; tests swap it. Preferences
+    /// are written asynchronously and do not guarantee crash durability.
     static var pendingRemovals = IPTVPendingSourceRemovals(defaults: .standard)
 
     func load(profileID: String) throws -> [IPTVSource] {
         guard !profileID.isEmpty else { throw IPTVSourceStoreError.invalidProfile }
-        // A deleted profile's sources whose deletion failed: try again, and
-        // never read them meanwhile, as a profile reusing the id would see them.
-        if Self.pendingRemovals.contains(profileID) {
-            Self.retryRemoval(profileID, storage: storage)
-            return []
+        // Keep the check and read together with removals and saves. Otherwise a
+        // failed deletion could mark the profile between the check and read.
+        return try Self.profileGenerations.exclusive {
+            if Self.pendingRemovals.contains(profileID) {
+                Self.removeMarked(profileID, storage: storage)
+                return []
+            }
+            guard let data = try storage.read(profileID: profileID) else { return [] }
+            return try JSONDecoder().decode([IPTVSource].self, from: data)
         }
-        guard let data = try storage.read(profileID: profileID) else { return [] }
-        return try JSONDecoder().decode([IPTVSource].self, from: data)
     }
 
     /// The generation to capture before work that saves later (see `save(_:profileID:ifGeneration:)`).
@@ -100,15 +103,16 @@ struct IPTVSourceStore {
     /// channel must not pass to a new profile; a pending save for it is stopped.
     /// Other profiles' sources are untouched.
     ///
-    /// If Keychain refuses the deletion, the profile stays marked (across
-    /// restarts too): its sources aren't read again, and the deletion is retried
+    /// If Keychain refuses the deletion, the profile stays marked: its sources
+    /// aren't read again, and the deletion is retried
     /// on the next load and at launch. A later successful save for the id
     /// replaces the whole Keychain item, which also clears the mark.
     static func removeProfile(_ profileID: String, defaults: UserDefaults? = nil) {
         guard !profileID.isEmpty else { return }
         let storage = defaultStorage
         profileGenerations.invalidate(profileID) {
-            // Marked before deleting, so a failure or a crash in between leaves it marked.
+            // Mark before deleting. Preferences are persisted asynchronously;
+            // this does not guarantee durability across an immediate crash.
             pendingRemovals.insert(profileID)
             removeMarked(profileID, storage: storage)
         }
@@ -125,9 +129,19 @@ struct IPTVSourceStore {
         }
     }
 
-    /// Full sign-out deleted every profile's sources, so nothing is pending.
-    static func allSourcesRemoved() {
-        profileGenerations.exclusive { pendingRemovals.removeAll() }
+    /// Mark every retired slot before attempting the full wipe. A failed wipe
+    /// leaves those slots unreadable and eligible for the normal retry path.
+    static func removeAllSources(profileIDs: [String], removeAll: () throws -> Void = IPTVKeychainStorage.removeAll) {
+        let ids = Set(profileIDs.filter { !$0.isEmpty })
+        profileGenerations.invalidate(ids) {
+            for id in ids { pendingRemovals.insert(id) }
+            do {
+                try removeAll()
+                pendingRemovals.removeAll()
+            } catch {
+                print("Failed to clear IPTV sources from Keychain; retrying later")
+            }
+        }
     }
 
     private static func retryRemoval(_ profileID: String, storage: any IPTVSourceStorage) {
