@@ -2276,6 +2276,7 @@ enum EpisodeSpoilerPolicy {
         if includeAniList {
             result.formUnion(AniListAccount.watchedEpisodeKeys(meta: meta))
         }
+        result.formUnion(PlexWatched.watchedEpisodeKeys(meta: meta))
 
         let ledgerKeys = completedLedgerKeysByContentID ?? completedLedgerEpisodeKeysByContentID()
         return trustedWatchedEpisodeKeys(
@@ -9365,14 +9366,14 @@ enum WatchedStore {
     /// have only episode rows after a Trakt pull, so the aggregate episode
     /// policy must be considered alongside an explicit title marker.
     static func isWatchedForDisplay(meta: NuvioMeta) -> Bool {
-        contains(meta: meta) || (meta.isSeries && hasSeriesWatchedState(meta))
+        contains(meta: meta) || (meta.isSeries && hasSeriesWatchedState(meta)) || PlexWatched.isWatched(meta: meta)
     }
 
     /// Catalog cards can use a provider-local id while the watched marker was
     /// saved from the canonical Details response. Fall back to the normalized
     /// series title/year in that case so the portrait checkmark still appears.
     static func containsCatalogTitle(meta: NuvioMeta) -> Bool {
-        currentSnapshot().containsCatalogTitle(meta: meta)
+        currentSnapshot().containsCatalogTitle(meta: meta) || PlexWatched.isWatched(meta: meta)
     }
 
     static func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {

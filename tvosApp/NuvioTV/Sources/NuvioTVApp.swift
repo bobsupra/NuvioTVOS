@@ -6401,6 +6401,10 @@ struct TVHomeView: View {
             guard isActive && !isFullScreenOverlayPresented else { return }
             Task { await loadPlexSections() }
         }
+        .onReceive(NotificationCenter.default.publisher(for: PlexLibraryIndex.watchStateChangedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive && !isFullScreenOverlayPresented else { return }
+            Task { await loadPlexSections() }
+        }
         .modifier(CalendarTodayHomeFeed(
             enabled: homeCalendarToday && collectionHome == nil,
             homeReady: store.hasLoaded,
@@ -10874,7 +10878,24 @@ extension TVHomeView {
             if lo != ro { return lo < ro }
             return (l.libraryName, lhs) < (r.libraryName, rhs)
         }
-        plexSections = orderedKeys.compactMap { key in
+        // Titles with a saved position on Plex, most recently played first, so
+        // something started in another Plex app can be picked up here.
+        var inProgress: [(playedAt: Int64, title: PlexIndexedTitle)] = []
+        for title in index.titles() {
+            guard let states = index.watchStatesByServerID[title.serverID] else { continue }
+            let playedAt = title.items.compactMap { item -> Int64? in
+                guard let state = states[item.ratingKey], state.viewOffsetMs > 0 else { return nil }
+                return state.lastViewedAt
+            }.max()
+            if let playedAt { inProgress.append((playedAt, title)) }
+        }
+        let continueMetas = inProgress.sorted { $0.playedAt > $1.playedAt }.compactMap { index.meta(for: $0.title) }
+        let continueSection = continueMetas.isEmpty ? [] : [TVHomeSection(
+            id: TVHomeSection.plexContinueId,
+            title: L10n.string("home_plex_continue", fallback: "Continue Watching on Plex"),
+            items: continueMetas
+        )]
+        plexSections = continueSection + orderedKeys.compactMap { key in
             guard let titles = grouped[key], let first = titles.first else { return nil }
             let metas = titles
                 .sorted { ($0.name, $0.contentId) < ($1.name, $1.contentId) }
@@ -10905,6 +10926,7 @@ struct TVHomeSection: Identifiable {
     static func jellyfinLibraryId(serverID: String, libraryID: String) -> String {
         "\(jellyfinLibraryIdPrefix)\(serverID):\(libraryID)"
     }
+    static let plexContinueId = "plex_library_continue"
     static let plexLibraryIdPrefix = "plex_library_"
     static func plexLibraryId(serverID: String, libraryID: String) -> String {
         "\(plexLibraryIdPrefix)\(serverID):\(libraryID)"

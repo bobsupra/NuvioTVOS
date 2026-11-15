@@ -7,6 +7,9 @@ struct PlexLibrary: Identifiable, Equatable {
     /// `"movie"` or `"show"`. Other section types (music, photos) are listed
     /// by the server but never synced.
     let type: String
+    /// Changes whenever the library's contents do (items added, removed, or
+    /// re-matched), so an unchanged library needn't be listed again.
+    var changeMarker: String? = nil
 }
 
 /// One Plex Media Server the signed-in account can reach, as plex.tv's
@@ -30,6 +33,17 @@ struct PlexResource: Equatable {
     let accessToken: String?
     let isOwned: Bool
     let connections: [Connection]
+}
+
+/// One playable file of a movie or episode. An item has several when the
+/// library holds more than one version (4K and 1080p) or a split file.
+struct PlexFile: Codable, Equatable {
+    /// `/library/parts/<id>/<ts>/file.<ext>`.
+    let partKey: String
+    let container: String?
+    let sizeBytes: Int64?
+    /// What sets this file apart, for the stream list: "4K · 18.2 Mbps", "Part 2 of 2".
+    let label: String?
 }
 
 /// One movie, show, or episode from a section listing. Plex returns all three
@@ -65,6 +79,8 @@ struct PlexMediaItem: Codable, Equatable {
     var viewOffsetMs: Int64? = nil
     var viewCount: Int? = nil
     var lastViewedAt: Int64? = nil
+    /// Every file of the item, the first one included.
+    var files: [PlexFile] = []
 }
 
 /// Thin client for plex.tv (sign-in, server discovery) and for one Plex Media
@@ -83,6 +99,8 @@ struct PlexClient {
 
     struct ClientError: LocalizedError {
         let message: String
+        /// The token was refused: the user has to sign in again.
+        var isUnauthorized = false
         var errorDescription: String? { message }
     }
 
@@ -178,6 +196,63 @@ struct PlexClient {
         return [payload.friendlyName, payload.title, payload.username]
             .compactMap { $0 }
             .first { !$0.isEmpty } ?? "Plex"
+    }
+
+    // MARK: - Plex Home
+
+    /// One member of the account's Plex Home, each with their own watch state
+    /// and library access.
+    struct HomeUser: Identifiable, Equatable {
+        /// The user's uuid.
+        let id: String
+        let name: String
+        let isProtected: Bool
+        let isAdmin: Bool
+    }
+
+    static func homeUsers(accountToken: String, session: URLSession = .shared) async throws -> [HomeUser] {
+        var request = URLRequest(url: plexClients.appendingPathComponent("home/users"))
+        apply(identityHeaders(token: accountToken), to: &request)
+        let (data, response) = try await session.data(for: request)
+        try validate(response)
+        struct Payload: Decodable {
+            struct User: Decodable {
+                let uuid: String
+                let title: String?
+                let friendlyName: String?
+                let username: String?
+                let protected: Bool?
+                let admin: Bool?
+            }
+            let users: [User]?
+        }
+        return (try JSONDecoder().decode(Payload.self, from: data).users ?? []).map { user in
+            HomeUser(
+                id: user.uuid,
+                name: [user.friendlyName, user.title, user.username].compactMap { $0 }.first { !$0.isEmpty } ?? "Plex",
+                isProtected: user.protected ?? false,
+                isAdmin: user.admin ?? false
+            )
+        }
+    }
+
+    /// A token that acts as `user`. `pin` is required for protected users.
+    static func switchHomeUser(_ user: HomeUser, pin: String?, accountToken: String, session: URLSession = .shared) async throws -> String {
+        var components = URLComponents(url: plexClients.appendingPathComponent("home/users/\(user.id)/switch"), resolvingAgainstBaseURL: false)!
+        if let pin, !pin.isEmpty { components.queryItems = [URLQueryItem(name: "pin", value: pin)] }
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "POST"
+        apply(identityHeaders(token: accountToken), to: &request)
+        let (data, response) = try await session.data(for: request)
+        if let http = response as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
+            throw ClientError(message: L10n.string("plex_home_wrong_pin", fallback: "That PIN isn't right for this user."))
+        }
+        try validate(response)
+        struct Payload: Decodable { let authToken: String? }
+        guard let token = try JSONDecoder().decode(Payload.self, from: data).authToken, !token.isEmpty else {
+            throw ClientError(message: L10n.string("plex_home_switch_failed", fallback: "Plex didn't switch to that user."))
+        }
+        return token
     }
 
     /// Plex documents resource discovery on this host rather than plex.tv.
@@ -318,6 +393,8 @@ struct PlexClient {
                     let key: String
                     let title: String
                     let type: String
+                    let contentChangedAt: Int64?
+                    let updatedAt: Int64?
                 }
                 let Directory: [DirectoryDTO]?
             }
@@ -326,7 +403,14 @@ struct PlexClient {
         let payload = try JSONDecoder().decode(Payload.self, from: data)
         return (payload.MediaContainer.Directory ?? [])
             .filter { $0.type == "movie" || $0.type == "show" }
-            .map { PlexLibrary(id: $0.key, name: $0.title, type: $0.type) }
+            .map { directory in
+                PlexLibrary(
+                    id: directory.key,
+                    name: directory.title,
+                    type: directory.type,
+                    changeMarker: "\(directory.contentChangedAt ?? 0)-\(directory.updatedAt ?? 0)"
+                )
+            }
     }
 
     /// Plex's numeric item types for `/library/sections/<id>/all?type=`.
@@ -412,7 +496,82 @@ struct PlexClient {
         ])
     }
 
+    /// Subtitle files Plex keeps beside the video (not inside it).
+    struct ExternalSubtitle: Equatable {
+        let key: String
+        let languageCode: String
+        let title: String
+    }
+
+    func externalSubtitles(ratingKey: String) async throws -> [ExternalSubtitle] {
+        let data = try await get("library/metadata/\(ratingKey)")
+        struct Payload: Decodable {
+            struct Container: Decodable { let Metadata: [Item]? }
+            struct Item: Decodable { let Media: [MediaDTO]? }
+            struct MediaDTO: Decodable { let Part: [PartDTO]? }
+            struct PartDTO: Decodable { let Stream: [StreamDTO]? }
+            struct StreamDTO: Decodable {
+                let streamType: Int?
+                let key: String?
+                let languageCode: String?
+                let displayTitle: String?
+            }
+            let MediaContainer: Container
+        }
+        let streams = try JSONDecoder().decode(Payload.self, from: data)
+            .MediaContainer.Metadata?.first?.Media?.flatMap { $0.Part ?? [] }.flatMap { $0.Stream ?? [] } ?? []
+        return streams.compactMap { stream in
+            guard stream.streamType == 3, let key = stream.key, !key.isEmpty else { return nil }
+            return ExternalSubtitle(key: key, languageCode: stream.languageCode ?? "und", title: stream.displayTitle ?? "Plex")
+        }
+    }
+
+    /// Ends a conversion started through `transcodeURL`, freeing the server.
+    func stopTranscode(session: String) async {
+        _ = try? await get("video/:/transcode/universal/stop", query: ["session": session])
+    }
+
     // MARK: - Media URLs
+
+    static let transcodePath = "/video/:/transcode/universal/start.m3u8"
+
+    /// An HLS stream the server converts on the fly, for files the player
+    /// can't decode. Video is converted to 1080p H.264 only when needed
+    /// (`directStream`), audio likewise.
+    static func transcodeURL(baseURL: URL, ratingKey: String, session: String) -> URL? {
+        url(baseURL: baseURL, path: transcodePath, query: [
+            "path": "/library/metadata/\(ratingKey)",
+            "mediaIndex": "0",
+            "partIndex": "0",
+            "protocol": "hls",
+            "directPlay": "0",
+            "directStream": "1",
+            "fastSeek": "1",
+            "videoResolution": "1920x1080",
+            "maxVideoBitrate": "20000",
+            "videoQuality": "100",
+            "session": session,
+            "X-Plex-Session-Identifier": session,
+            "X-Plex-Client-Identifier": clientIdentifier,
+            "X-Plex-Product": product,
+            "X-Plex-Platform": "tvOS"
+        ])
+    }
+
+    /// The rating key a `transcodeURL` plays.
+    static func transcodedRatingKey(_ url: URL) -> (ratingKey: String, session: String?)? {
+        guard url.path == transcodePath,
+              let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems,
+              let path = items.first(where: { $0.name == "path" })?.value,
+              path.hasPrefix("/library/metadata/") else { return nil }
+        return (String(path.dropFirst("/library/metadata/".count)), items.first { $0.name == "session" }?.value)
+    }
+
+    /// A sidecar subtitle file. Subtitle loaders fetch a plain URL, so this
+    /// one carries the token; it is used for the play in progress and not stored.
+    static func subtitleURL(baseURL: URL, key: String, token: String) -> URL? {
+        url(baseURL: baseURL, path: key, query: [tokenHeader: token])
+    }
 
     static let tokenHeader = "X-Plex-Token"
 
@@ -462,6 +621,8 @@ struct PlexClient {
         }
         struct MediaDTO: Decodable {
             let container: String?
+            let videoResolution: String?
+            let bitrate: Int?
             let Part: [PartDTO]?
         }
         struct Item: Decodable {
@@ -498,6 +659,28 @@ struct PlexClient {
         let tmdb = guids.first { $0.hasPrefix("tmdb://") }.flatMap { Int($0.dropFirst("tmdb://".count)) }
         let media = item.Media?.first
         let part = media?.Part?.first
+        var files: [PlexFile] = []
+        for version in item.Media ?? [] {
+            let parts = (version.Part ?? []).filter { $0.key != nil }
+            for (index, filePart) in parts.enumerated() {
+                var labels: [String] = []
+                if let resolution = version.videoResolution, !resolution.isEmpty {
+                    labels.append(resolution.lowercased() == "4k" ? "4K" : (Int(resolution) != nil ? "\(resolution)p" : resolution.uppercased()))
+                }
+                if let bitrate = version.bitrate, bitrate > 0 {
+                    labels.append(String(format: "%.1f Mbps", Double(bitrate) / 1000))
+                }
+                if parts.count > 1 {
+                    labels.append("Part \(index + 1) of \(parts.count)")
+                }
+                files.append(PlexFile(
+                    partKey: filePart.key ?? "",
+                    container: filePart.container ?? version.container,
+                    sizeBytes: filePart.size,
+                    label: labels.isEmpty ? nil : labels.joined(separator: " · ")
+                ))
+            }
+        }
         return PlexMediaItem(
             ratingKey: item.ratingKey,
             type: item.type ?? "movie",
@@ -523,7 +706,8 @@ struct PlexClient {
             sizeBytes: part?.size,
             viewOffsetMs: item.viewOffset,
             viewCount: item.viewCount,
-            lastViewedAt: item.lastViewedAt
+            lastViewedAt: item.lastViewedAt,
+            files: files
         )
     }
 
@@ -572,7 +756,10 @@ struct PlexClient {
         }
         guard (200...299).contains(http.statusCode) else {
             if http.statusCode == 401 {
-                throw ClientError(message: L10n.string("plex_error_unauthorized", fallback: "Plex sign-in expired. Sign in again."))
+                throw ClientError(
+                    message: L10n.string("plex_error_unauthorized", fallback: "Plex sign-in expired. Sign in again."),
+                    isUnauthorized: true
+                )
             }
             throw ClientError(message: L10n.format("plex_error_status", fallback: "Plex returned status %d", http.statusCode))
         }

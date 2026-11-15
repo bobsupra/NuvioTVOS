@@ -14,6 +14,15 @@ struct PlexIndexedItem: Codable, Equatable {
     var episodeOverview: String?
     var episodePremiereDate: String?
     var episodeThumb: String?
+    /// What sets the main file apart when there are others ("4K · 18.2 Mbps").
+    var label: String? = nil
+    /// Other versions and parts of the same movie or episode.
+    var alternates: [PlexFile]? = nil
+
+    /// Every file, the main one first.
+    var files: [PlexFile] {
+        [PlexFile(partKey: partKey, container: container, sizeBytes: size, label: label)] + (alternates ?? [])
+    }
 }
 
 /// One Plex movie or show with everything Home and Details need, stored
@@ -108,7 +117,9 @@ enum PlexLibraryResolver {
                     partKey: partKey,
                     container: movie.container,
                     size: movie.sizeBytes,
-                    durationMs: movie.durationMs
+                    durationMs: movie.durationMs,
+                    label: movie.files.count > 1 ? movie.files.first?.label : nil,
+                    alternates: movie.files.count > 1 ? Array(movie.files.dropFirst()) : nil
                 )
             ])
         }
@@ -127,7 +138,9 @@ enum PlexLibraryResolver {
                     episodeName: episode.title,
                     episodeOverview: episode.summary,
                     episodePremiereDate: episode.originallyAvailableAt,
-                    episodeThumb: episode.thumb
+                    episodeThumb: episode.thumb,
+                    label: episode.files.count > 1 ? episode.files.first?.label : nil,
+                    alternates: episode.files.count > 1 ? Array(episode.files.dropFirst()) : nil
                 )
             }
             guard !files.isEmpty else { continue }
@@ -163,11 +176,13 @@ final class PlexLibraryIndex: ObservableObject {
     private init() {
         titlesByServerID = Self.load()
         watchStatesByServerID = Self.loadWatchStates()
+        PlexWatched.rebuild(titles: titlesByServerID, states: watchStatesByServerID)
     }
 
     func reload() {
         titlesByServerID = Self.load()
         watchStatesByServerID = Self.loadWatchStates()
+        PlexWatched.rebuild(titles: titlesByServerID, states: watchStatesByServerID)
     }
 
     // MARK: - Watch state
@@ -189,6 +204,7 @@ final class PlexLibraryIndex: ObservableObject {
         }
         guard updated != watchStatesByServerID else { return }
         watchStatesByServerID = updated
+        PlexWatched.rebuild(titles: titlesByServerID, states: updated)
         if let data = try? JSONEncoder().encode(updated) {
             _ = LargePayloadStore.write(data, key: Self.watchStateKey, directory: Self.storageDirectoryName)
         }
@@ -197,13 +213,27 @@ final class PlexLibraryIndex: ObservableObject {
 
     static let watchStateChangedNotification = Notification.Name("nuvio.tv.plex.watchState.changed")
 
+    /// The server, title, and item with this rating key (a movie or an episode).
+    func locate(ratingKey: String, preferredHost: String? = nil) -> (server: PlexServerConfig, title: PlexIndexedTitle, item: PlexIndexedItem)? {
+        let servers = PlexServerStore.shared.servers
+        let preferred = servers.filter { preferredHost != nil && $0.baseURL?.host == preferredHost }
+        for server in preferred + servers.filter({ candidate in !preferred.contains(where: { $0.id == candidate.id }) }) {
+            for title in titlesByServerID[server.id] ?? [] {
+                if let item = title.items.first(where: { $0.ratingKey == ratingKey }) {
+                    return (server, title, item)
+                }
+            }
+        }
+        return nil
+    }
+
     /// The server, title, and file a `/library/parts/...` path belongs to.
     func locate(partPath: String, preferredHost: String? = nil) -> (server: PlexServerConfig, title: PlexIndexedTitle, item: PlexIndexedItem)? {
         let servers = PlexServerStore.shared.servers
         let preferred = servers.filter { preferredHost != nil && $0.baseURL?.host == preferredHost }
         for server in preferred + servers.filter({ candidate in !preferred.contains(where: { $0.id == candidate.id }) }) {
             for title in titlesByServerID[server.id] ?? [] {
-                if let item = title.items.first(where: { $0.partKey == partPath }) {
+                if let item = title.items.first(where: { $0.files.contains { $0.partKey == partPath } }) {
                     return (server, title, item)
                 }
             }
@@ -306,6 +336,7 @@ final class PlexLibraryIndex: ObservableObject {
         updated[serverID] = titles
         guard persist(updated) else { throw IndexError.persistenceFailed }
         titlesByServerID = updated
+        PlexWatched.rebuild(titles: updated, states: watchStatesByServerID)
         NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     }
 
@@ -322,6 +353,7 @@ final class PlexLibraryIndex: ObservableObject {
         guard updated.removeValue(forKey: serverID) != nil else { return }
         guard persist(updated) else { return }
         titlesByServerID = updated
+        PlexWatched.rebuild(titles: updated, states: watchStatesByServerID)
         NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     }
 

@@ -18,6 +18,8 @@ struct PlexServerConfig: Codable, Identifiable, Equatable {
     var syncAutomatically: Bool
     /// When watch state was last read from the server (Unix seconds).
     var watchStateReadAt: Int64?
+    /// Each synced library's change marker at its last sync.
+    var libraryChangeMarkers: [String: String]?
 
     init(
         id: String,
@@ -72,6 +74,14 @@ final class PlexServerStore: ObservableObject {
         servers.first { $0.id == id }
     }
 
+    /// A fresh sign-in: `token` is the account owner's, and also the one in use
+    /// until a Plex Home user is chosen.
+    func signedIn(name: String, token: String) {
+        PlexCredentialStore.saveOwnerToken(token)
+        setAccount(name: name, token: token)
+    }
+
+    /// The token and name in use: the owner's, or a Plex Home user's.
     func setAccount(name: String, token: String) {
         PlexCredentialStore.saveAccountToken(token)
         ProfileSettings.current.set(name, forKey: SettingsKey.plexAccountName)
@@ -124,6 +134,7 @@ final class PlexServerStore: ObservableObject {
             PlexLibraryIndex.shared.removeAll(forServerID: server.id)
         }
         PlexCredentialStore.removeAccountToken()
+        PlexCredentialStore.removeOwnerToken()
         ProfileSettings.current.removeObject(forKey: SettingsKey.plexAccountName)
         accountName = nil
         persist([])
@@ -160,6 +171,22 @@ enum PlexCredentialStore {
 
     static func removeAccountToken(profileScope: String = ProfileSettings.activeProfileScope) {
         delete(account: "\(accountKey).\(profileScope)")
+    }
+
+    /// The token from sign-in itself, needed to switch between Plex Home
+    /// users. Falls back to the account token for sign-ins made before Plex
+    /// Home support.
+    static func ownerToken(profileScope: String = ProfileSettings.activeProfileScope) -> String {
+        if let token = read(account: "owner.\(profileScope)"), !token.isEmpty { return token }
+        return accountToken(profileScope: profileScope)
+    }
+
+    static func saveOwnerToken(_ token: String, profileScope: String = ProfileSettings.activeProfileScope) {
+        write(token, account: "owner.\(profileScope)")
+    }
+
+    static func removeOwnerToken(profileScope: String = ProfileSettings.activeProfileScope) {
+        delete(account: "owner.\(profileScope)")
     }
 
     /// The server's own token, falling back to the account token (the same

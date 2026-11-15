@@ -15776,6 +15776,7 @@ private struct PlexSettingsSection: View {
     @ObservedObject private var serverStore = PlexServerStore.shared
     @ObservedObject private var sessionManager = PlexSessionManager.shared
     @State private var isSigningIn = false
+    @State private var isChoosingHomeUser = false
     @State private var syncingServer: PlexServerConfig?
     @State private var refreshError: String?
 
@@ -15787,6 +15788,24 @@ private struct PlexSettingsSection: View {
                 : L10n.string("plex_group_subtitle", fallback: "Browse and play your Plex Media Server libraries, with resume position kept in sync with other Plex apps")
         ) {
             if serverStore.isSignedIn {
+                if sessionManager.needsSignIn {
+                    SettingsActionRow(
+                        title: L10n.string("plex_sign_in_again", fallback: "Sign In Again"),
+                        subtitle: L10n.string("plex_sign_in_again_subtitle", fallback: "Plex no longer accepts this Apple TV's sign-in. Your servers and libraries are kept."),
+                        value: "",
+                        accentColor: accentColor
+                    ) {
+                        isSigningIn = true
+                    }
+                }
+                SettingsActionRow(
+                    title: L10n.string("plex_home_user", fallback: "Plex Home User"),
+                    subtitle: L10n.string("plex_home_user_subtitle", fallback: "Watch as another member of your Plex Home, with their own progress"),
+                    value: serverStore.accountName ?? "",
+                    accentColor: accentColor
+                ) {
+                    isChoosingHomeUser = true
+                }
                 SettingsActionRow(
                     title: L10n.string("plex_refresh_servers", fallback: "Refresh Servers"),
                     subtitle: refreshError ?? L10n.string("plex_refresh_servers_subtitle", fallback: "Find servers added to your Plex account since sign-in"),
@@ -15841,6 +15860,10 @@ private struct PlexSettingsSection: View {
         }
         .sheet(isPresented: $isSigningIn) {
             PlexSignInSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $isChoosingHomeUser) {
+            PlexHomeUserSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(item: $syncingServer) { server in
@@ -15958,15 +15981,26 @@ private struct PlexSignInSheet: View {
                     .font(.system(size: 36, weight: .bold))
                     .foregroundColor(.white)
 
-                Text(L10n.string("plex_sign_in_steps", fallback: "On your phone or computer, open plex.tv/link, sign in to Plex (Google and Apple accounts work), and enter this code:"))
+                Text(L10n.string("plex_sign_in_steps", fallback: "Scan the QR code with your phone, or open plex.tv/link on any device, sign in to Plex (Google and Apple accounts work), and enter this code:"))
                     .font(.system(size: 22, weight: .regular))
                     .foregroundColor(.white.opacity(0.8))
                     .fixedSize(horizontal: false, vertical: true)
 
-                Text(pin?.code ?? "····")
-                    .font(.system(size: 84, weight: .heavy, design: .monospaced))
-                    .kerning(12)
-                    .foregroundColor(.white)
+                HStack(alignment: .center, spacing: 48) {
+                    // Scanning opens plex.tv/link with the code already filled in.
+                    if let code = pin?.code, let image = QRCode.image(from: "https://plex.tv/link/?pin=\(code)", scale: 10) {
+                        Image(uiImage: image)
+                            .interpolation(.none)
+                            .resizable()
+                            .frame(width: 240, height: 240)
+                            .padding(14)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    }
+                    Text(pin?.code ?? "····")
+                        .font(.system(size: 84, weight: .heavy, design: .monospaced))
+                        .kerning(12)
+                        .foregroundColor(.white)
+                }
 
                 Text(status ?? L10n.string("plex_waiting_for_code", fallback: "Waiting for the code to be entered…"))
                     .font(.system(size: 18, weight: .regular))
@@ -16008,9 +16042,7 @@ private struct PlexSignInSheet: View {
                     guard let token = try? await PlexClient.checkPin(created) else { continue }
                     status = L10n.string("plex_finding_servers", fallback: "Signed in. Finding your servers…")
                     let name = (try? await PlexClient.accountName(token: token)) ?? "Plex"
-                    PlexServerStore.shared.setAccount(name: name, token: token)
-                    try await PlexSessionManager.shared.refreshServers()
-                    await PlexSessionManager.shared.connectAll(autoSync: false)
+                    try await PlexSessionManager.shared.signedIn(name: name, token: token)
                     dismiss()
                     return
                 }
@@ -16020,6 +16052,98 @@ private struct PlexSignInSheet: View {
             } catch is CancellationError {
             } catch {
                 status = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// Choose which member of the Plex Home to watch as.
+private struct PlexHomeUserSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @State private var users: [PlexClient.HomeUser] = []
+    @State private var pin = ""
+    @State private var message: String?
+    @State private var isWorking = false
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(L10n.string("plex_home_user", fallback: "Plex Home User"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("plex_home_pin", fallback: "PIN"),
+                        subtitle: L10n.string("plex_home_pin_subtitle", fallback: "Only needed for users marked as protected. Enter it before choosing the user.")
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("plex_home_pin", fallback: "PIN"),
+                            subtitle: "",
+                            placeholder: "0000",
+                            text: $pin,
+                            isSecure: true
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("plex_home_users", fallback: "Users"),
+                        subtitle: message ?? L10n.string("plex_home_users_subtitle", fallback: "Switching re-syncs your libraries with that user's access and progress")
+                    ) {
+                        ForEach(users) { user in
+                            SettingsActionRow(
+                                title: user.name,
+                                subtitle: user.isProtected
+                                    ? L10n.string("plex_home_protected", fallback: "Protected with a PIN")
+                                    : (user.isAdmin ? L10n.string("plex_home_owner", fallback: "Account owner") : ""),
+                                value: user.name == PlexServerStore.shared.accountName
+                                    ? L10n.string("plex_home_current", fallback: "Current") : "",
+                                accentColor: accentColor
+                            ) {
+                                choose(user)
+                            }
+                        }
+                    }
+
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_close", fallback: "Close"), isPrimary: false) { dismiss() }
+                        Spacer()
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+        .task {
+            do {
+                users = try await PlexSessionManager.shared.homeUsers()
+            } catch {
+                message = error.localizedDescription
+            }
+        }
+    }
+
+    private func choose(_ user: PlexClient.HomeUser) {
+        guard !isWorking else { return }
+        if user.isProtected, pin.isEmpty {
+            message = L10n.string("plex_home_pin_needed", fallback: "Enter this user's PIN above first.")
+            return
+        }
+        isWorking = true
+        message = L10n.string("plex_home_switching", fallback: "Switching user…")
+        Task { @MainActor in
+            defer { isWorking = false }
+            do {
+                try await PlexSessionManager.shared.switchHomeUser(user, pin: user.isProtected ? pin : nil)
+                dismiss()
+            } catch {
+                message = error.localizedDescription
             }
         }
     }
@@ -16103,7 +16227,7 @@ private struct PlexLibrarySelectionSheet: View {
                             updated.selectedLibraryIDs = Array(selectedLibraryIDs)
                             updated.syncAutomatically = syncAutomatically
                             PlexServerStore.shared.upsert(updated)
-                            sessionManager.sync(updated)
+                            sessionManager.sync(updated, force: true)
                         }
                     }
                     .focusSection()

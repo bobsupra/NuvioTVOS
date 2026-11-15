@@ -39,6 +39,7 @@ final class PlexPlaybackSync {
                 try await client.reportTimeline(ratingKey: item.ratingKey, state: state, timeMs: timeMs, durationMs: durationMs)
             } catch {
                 print("[Plex] timeline report failed: \(error.localizedDescription)")
+                await PlexSessionManager.shared.reconnectIfNeeded(serverID: item.serverID)
             }
         }
     }
@@ -52,9 +53,16 @@ final class PlexPlaybackSync {
 
     /// The Plex item a stream URL plays, or `nil` for any other stream.
     func item(for url: URL) -> Item? {
-        guard url.path.hasPrefix("/library/parts/"),
-              let found = PlexLibraryIndex.shared.locate(partPath: url.path, preferredHost: url.host) else { return nil }
-        return Item(serverID: found.server.id, ratingKey: found.item.ratingKey, durationMs: found.item.durationMs)
+        let index = PlexLibraryIndex.shared
+        let found: (server: PlexServerConfig, title: PlexIndexedTitle, item: PlexIndexedItem)?
+        if url.path.hasPrefix("/library/parts/") {
+            found = index.locate(partPath: url.path, preferredHost: url.host)
+        } else if let converted = PlexClient.transcodedRatingKey(url) {
+            found = index.locate(ratingKey: converted.ratingKey, preferredHost: url.host)
+        } else {
+            found = nil
+        }
+        return found.map { Item(serverID: $0.server.id, ratingKey: $0.item.ratingKey, durationMs: $0.item.durationMs) }
     }
 
     private func item(forString url: String?) -> Item? {
@@ -68,8 +76,18 @@ final class PlexPlaybackSync {
     func resolve(url: URL, headers: [String: String]) -> (url: URL, headers: [String: String]) {
         guard let item = item(for: url),
               let server = PlexServerStore.shared.server(id: item.serverID),
-              let baseURL = server.baseURL,
-              let current = PlexClient.streamURL(baseURL: baseURL, partKey: url.path) else { return (url, headers) }
+              let baseURL = server.baseURL else { return (url, headers) }
+        let rebuilt: URL?
+        if let converted = PlexClient.transcodedRatingKey(url) {
+            rebuilt = PlexClient.transcodeURL(
+                baseURL: baseURL,
+                ratingKey: converted.ratingKey,
+                session: converted.session ?? UUID().uuidString
+            )
+        } else {
+            rebuilt = PlexClient.streamURL(baseURL: baseURL, partKey: url.path)
+        }
+        guard let current = rebuilt else { return (url, headers) }
         var merged = headers
         merged[PlexClient.tokenHeader] = PlexCredentialStore.token(forServerID: server.id)
         return (current, merged)
@@ -146,6 +164,12 @@ final class PlexPlaybackSync {
         let timeMs = Int64(currentTime * 1000)
         rememberPosition(item, timeMs: timeMs, durationMs: durationMs)
         sendTimeline(item, timelineState, timeMs, durationMs)
+        if timelineState == .stopped,
+           let session = url.flatMap(URL.init(string:)).flatMap(PlexClient.transcodedRatingKey)?.session,
+           let client = PlexSessionManager.shared.client(forServerID: item.serverID) {
+            // A conversion keeps the server busy until it is told to stop.
+            Task.detached(priority: .utility) { await client.stopTranscode(session: session) }
+        }
     }
 
     /// A seek: report the new position now, whatever the heartbeat timing.

@@ -37,11 +37,16 @@ final class PlexSessionManager: ObservableObject {
 
     @Published private(set) var connectionStates: [String: PlexConnectionState] = [:]
     @Published private(set) var syncStates: [String: PlexSyncState] = [:]
+    /// Plex refused the saved token: Settings offers to sign in again.
+    @Published private(set) var needsSignIn = false
 
     private var clients: [String: PlexClient] = [:]
     private var syncTasks: [String: Task<Void, Never>] = [:]
     private var connectionGenerations: [String: Int] = [:]
     private var connectionProfileIDs: [String: String] = [:]
+    private var lastReconnectAttempt: [String: Date] = [:]
+
+    nonisolated static let reconnectInterval: TimeInterval = 30
 
     private init() {}
 
@@ -70,8 +75,71 @@ final class PlexSessionManager: ObservableObject {
     func refreshServers() async throws {
         let token = PlexCredentialStore.accountToken()
         guard !token.isEmpty else { return }
-        let resources = try await PlexClient.servers(accountToken: token)
+        let resources = try await servers(accountToken: token)
         PlexServerStore.shared.merge(resources)
+    }
+
+    /// The account's servers, noting when plex.tv refuses the token.
+    private func servers(accountToken: String) async throws -> [PlexResource] {
+        do {
+            let resources = try await PlexClient.servers(accountToken: accountToken)
+            needsSignIn = false
+            return resources
+        } catch let error as PlexClient.ClientError where error.isUnauthorized {
+            needsSignIn = true
+            throw error
+        }
+    }
+
+    /// Completes a sign-in (or a repeat one after the token expired).
+    func signedIn(name: String, token: String) async throws {
+        PlexServerStore.shared.signedIn(name: name, token: token)
+        needsSignIn = false
+        try await refreshServers()
+        for server in PlexServerStore.shared.servers { disconnect(server) }
+        await connectAll(autoSync: true)
+    }
+
+    // MARK: - Plex Home
+
+    func homeUsers() async throws -> [PlexClient.HomeUser] {
+        try await PlexClient.homeUsers(accountToken: PlexCredentialStore.ownerToken())
+    }
+
+    /// Acts as another member of the Plex Home from now on: their library
+    /// access, their watch state, and their resume positions.
+    func switchHomeUser(_ user: PlexClient.HomeUser, pin: String?) async throws {
+        let token = try await PlexClient.switchHomeUser(user, pin: pin, accountToken: PlexCredentialStore.ownerToken())
+        let store = PlexServerStore.shared
+        for server in store.servers {
+            disconnect(server)
+            // Server tokens and watch state belong to the previous user.
+            PlexCredentialStore.remove(forServerID: server.id)
+            PlexLibraryIndex.shared.removeAll(forServerID: server.id)
+            var reset = server
+            reset.watchStateReadAt = nil
+            reset.libraryChangeMarkers = nil
+            reset.lastSyncDate = nil
+            store.upsert(reset)
+        }
+        store.setAccount(name: user.name, token: token)
+        try await refreshServers()
+        await connectAll(autoSync: true)
+    }
+
+    /// After a failed request to a server: try to reach it again, at most
+    /// every `reconnectInterval` seconds. Covers a server that slept, moved
+    /// address, or restarted while the app stayed open.
+    func reconnectIfNeeded(serverID: String) async {
+        guard let server = PlexServerStore.shared.server(id: serverID) else { return }
+        if case .connecting = connectionState(for: serverID) { return }
+        if let last = lastReconnectAttempt[serverID], Date().timeIntervalSince(last) < Self.reconnectInterval { return }
+        lastReconnectAttempt[serverID] = Date()
+        if let client = client(forServerID: serverID),
+           await PlexClient.isServer(client.baseURL, machineIdentifier: serverID) {
+            return
+        }
+        await connect(server)
     }
 
     func signOut() {
@@ -87,7 +155,7 @@ final class PlexSessionManager: ObservableObject {
     /// switch, then a background sync for servers that are due.
     func connectAll(autoSync: Bool = true) async {
         guard PlexServerStore.shared.isSignedIn else { return }
-        let resources = try? await PlexClient.servers(accountToken: PlexCredentialStore.accountToken())
+        let resources = try? await servers(accountToken: PlexCredentialStore.accountToken())
         if let resources { PlexServerStore.shared.merge(resources) }
         await withTaskGroup(of: Void.self) { group in
             for server in PlexServerStore.shared.servers {
@@ -187,6 +255,7 @@ final class PlexSessionManager: ObservableObject {
             await refreshWatchStates(forServerID: server.id)
         } catch {
             guard isCurrent() else { return }
+            if (error as? PlexClient.ClientError)?.isUnauthorized == true { needsSignIn = true }
             connectionStates[server.id] = .failed(error.localizedDescription)
         }
     }
@@ -233,24 +302,42 @@ final class PlexSessionManager: ObservableObject {
 
     // MARK: - Sync
 
-    func sync(_ server: PlexServerConfig) {
+    /// Lists the selected libraries and stores their titles. A library whose
+    /// contents haven't changed since its last sync is kept as it is, so a
+    /// routine sync of a large, unchanged library is one small request.
+    /// `force` lists everything again (the Sync button).
+    func sync(_ server: PlexServerConfig, force: Bool = false) {
         guard !server.selectedLibraryIDs.isEmpty,
               let client = client(forServerID: server.id),
-              case .connected(let libraries) = connectionState(for: server.id) else { return }
+              case .connected(let connectedLibraries) = connectionState(for: server.id) else { return }
         let profileID = activeProfileID
-        let selected = libraries.filter { server.selectedLibraryIDs.contains($0.id) }
         syncTasks[server.id]?.cancel()
-        syncStates[server.id] = .syncing(found: 0, library: selected.first?.name ?? "")
+        syncStates[server.id] = .syncing(found: 0, library: "")
 
         syncTasks[server.id] = Task { [weak self] in
             guard let self else { return }
             do {
+                // Fresh change markers; the connected list can be hours old.
+                let libraries = (try? await client.libraries()) ?? connectedLibraries
+                let selected = libraries.filter { server.selectedLibraryIDs.contains($0.id) }
+                let previousMarkers = server.libraryChangeMarkers ?? [:]
+                let previousTitles = PlexLibraryIndex.shared.titlesByServerID[server.id] ?? []
+                var markers: [String: String] = [:]
                 var titles: [PlexIndexedTitle] = []
                 var states: [String: PlexWatchState] = [:]
                 let readAt = Int64(Date().timeIntervalSince1970)
+                var listedEverything = true
                 var found = 0
                 for library in selected {
                     try Task.checkCancellation()
+                    markers[library.id] = library.changeMarker
+                    if !force, let marker = library.changeMarker, previousMarkers[library.id] == marker {
+                        let kept = previousTitles.filter { $0.libraryID == library.id }
+                        titles += kept
+                        found += kept.reduce(0) { $0 + $1.items.count }
+                        listedEverything = false
+                        continue
+                    }
                     let foundBefore = found
                     let libraryName = library.name
                     let serverID = server.id
@@ -276,12 +363,18 @@ final class PlexSessionManager: ObservableObject {
                 }
                 try Task.checkCancellation()
                 guard self.activeProfileID == profileID else { return }
-                try PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
-                PlexLibraryIndex.shared.setWatchStates(states, forServerID: server.id, merging: false)
+                if titles != previousTitles {
+                    try PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
+                }
+                // Kept libraries' states stay; what was played in them since
+                // the last read arrives through `refreshWatchStates`.
+                PlexLibraryIndex.shared.setWatchStates(states, forServerID: server.id, merging: !listedEverything)
+                if !listedEverything { await self.refreshWatchStates(forServerID: server.id) }
                 if var updated = PlexServerStore.shared.server(id: server.id) {
                     updated.lastSyncDate = Date()
                     updated.lastSyncTitleCount = titles.count
-                    updated.watchStateReadAt = readAt
+                    updated.libraryChangeMarkers = markers
+                    if listedEverything { updated.watchStateReadAt = readAt }
                     PlexServerStore.shared.upsert(updated)
                 }
                 self.syncStates[server.id] = .done(PlexSyncReport(
@@ -292,6 +385,7 @@ final class PlexSessionManager: ObservableObject {
                 // Superseded by a newer sync or a disconnect.
             } catch {
                 if self.activeProfileID == profileID {
+                    if (error as? PlexClient.ClientError)?.isUnauthorized == true { self.needsSignIn = true }
                     self.syncStates[server.id] = .failed(error.localizedDescription)
                 }
             }
