@@ -50,7 +50,9 @@ final class AccountLoginGenerations: @unchecked Sendable {
     @discardableResult
     func commit(_ generation: UInt64, for profileScope: String, _ save: () -> Void) -> Bool {
         lock.withLock {
-            guard generations[profileScope] == generation else { return false }
+            // A profile nothing was started or removed for is at generation 0,
+            // the same value `current(for:)` reports for it.
+            guard (generations[profileScope] ?? 0) == generation else { return false }
             save()
             return true
         }

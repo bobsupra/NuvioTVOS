@@ -95,6 +95,30 @@ final class IPTVProfileCleanupTests: XCTestCase {
         try assertRemovedProfileIsEmptyAndKeptOneIntact(keptSource)
     }
 
+    func testABrandNewProfileCanSaveItsFirstSource() throws {
+        // Nothing was ever saved or removed for this profile id.
+        let fresh = "iptv-fresh-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(fresh)") }
+        let generation = IPTVSourceStore.generation(for: fresh)
+        XCTAssertEqual(generation, 0)
+
+        let first = source("first")
+        XCTAssertTrue(try IPTVSourceStore().save([first], profileID: fresh, ifGeneration: generation))
+        XCTAssertEqual(try IPTVSourceStore().load(profileID: fresh), [first])
+    }
+
+    func testAGenerationCapturedBeforeDeletionIsRejectedForANewProfile() throws {
+        let fresh = "iptv-fresh-\(UUID().uuidString)"
+        defer { UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(fresh)") }
+        let beforeDeletion = IPTVSourceStore.generation(for: fresh)
+        IPTVSourceStore.removeProfile(fresh)
+        XCTAssertFalse(try IPTVSourceStore().save([source("late")], profileID: fresh, ifGeneration: beforeDeletion))
+        XCTAssertEqual(try IPTVSourceStore().load(profileID: fresh), [])
+        // A load started after the deletion saves normally.
+        let afterDeletion = IPTVSourceStore.generation(for: fresh)
+        XCTAssertTrue(try IPTVSourceStore().save([source("new")], profileID: fresh, ifGeneration: afterDeletion))
+    }
+
     func testASavePendingWhenTheProfileIsDeletedSavesNothing() throws {
         let (_, keptSource) = try seed()
         let store = IPTVSourceStore()
