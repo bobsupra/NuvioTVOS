@@ -12731,9 +12731,10 @@ struct ErrorView: View {
 enum DetailsCreditLine {
     static let maxNames = 2
 
-    /// Creator names from the TMDB people list (role "Creator").
+    /// Creator names from the TMDB people list: those credited as creator,
+    /// never a cast member whose character happens to be called "Creator".
     static func creators(in people: [TmdbPersonMetadata]) -> [String] {
-        people.filter { $0.role == TmdbPersonMetadata.creatorRole }.map(\.name)
+        people.filter { $0.credit == .creator }.map(\.name)
     }
 
     static func text(for meta: NuvioMeta, creators: [String]) -> String? {

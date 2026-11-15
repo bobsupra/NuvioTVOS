@@ -17,14 +17,25 @@ struct MetaCompany: Identifiable, Equatable, Hashable {
 }
 
 struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
-    /// The role given to a series' creators (TMDB's "created by").
+    /// What kind of credit this person has. Separate from `role`, which for
+    /// cast is the character's name and so can be any text, "Creator" included.
+    enum Credit: Hashable {
+        case creator
+        case director
+        case cast
+    }
+
+    /// The role shown for a series' creators (TMDB's "created by").
     static let creatorRole = "Creator"
 
     var id: String { tmdbId.map(String.init) ?? name }
     let name: String
+    /// Shown under the name: "Creator", "Director", or a cast member's character.
     let role: String?
     let profileURL: String?
     let tmdbId: Int?
+    /// Nil when the source doesn't say (AniList, fallbacks).
+    var credit: Credit? = nil
 }
 
 struct TmdbCreditMetadata {
@@ -460,7 +471,8 @@ enum TmdbDetailsService {
                     name: name,
                     role: "Director",
                     profileURL: imageURL(person.profilePath, size: "w500"),
-                    tmdbId: person.id
+                    tmdbId: person.id,
+                    credit: .director
                 )
             }
         let castPeople = (decoded.cast ?? [])
@@ -471,7 +483,8 @@ enum TmdbDetailsService {
                     name: name,
                     role: nonEmpty(person.character),
                     profileURL: imageURL(person.profilePath, size: "w500"),
-                    tmdbId: person.id
+                    tmdbId: person.id,
+                    credit: .cast
                 )
             }
 
@@ -501,7 +514,8 @@ enum TmdbDetailsService {
                 name: name,
                 role: TmdbPersonMetadata.creatorRole,
                 profileURL: imageURL(creator.profilePath, size: "w500"),
-                tmdbId: creator.id
+                tmdbId: creator.id,
+                credit: .creator
             )
         }
     }

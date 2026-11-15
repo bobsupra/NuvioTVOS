@@ -62,12 +62,26 @@ final class DetailsCreditLineTests: XCTestCase {
         )
     }
 
-    func testCreatorsAreTheTMDBPeopleWithTheCreatorRole() {
+    func testCreatorsAreThePeopleCreditedAsCreator() {
         let people = [
-            TmdbPersonMetadata(name: "Creator A", role: TmdbPersonMetadata.creatorRole, profileURL: nil, tmdbId: 1),
-            TmdbPersonMetadata(name: "Director B", role: "Director", profileURL: nil, tmdbId: 2),
-            TmdbPersonMetadata(name: "Actor C", role: "Walter White", profileURL: nil, tmdbId: 3),
+            TmdbPersonMetadata(name: "Creator A", role: TmdbPersonMetadata.creatorRole, profileURL: nil, tmdbId: 1, credit: .creator),
+            TmdbPersonMetadata(name: "Director B", role: "Director", profileURL: nil, tmdbId: 2, credit: .director),
+            TmdbPersonMetadata(name: "Actor C", role: "Walter White", profileURL: nil, tmdbId: 3, credit: .cast),
         ]
         XCTAssertEqual(DetailsCreditLine.creators(in: people), ["Creator A"])
+    }
+
+    func testAnActorPlayingACharacterCalledCreatorIsNotTheCreator() {
+        let people = [
+            TmdbPersonMetadata(name: "Actor D", role: "Creator", profileURL: nil, tmdbId: 4, credit: .cast),
+            // From a source that doesn't say what the credit is (AniList, fallbacks).
+            TmdbPersonMetadata(name: "Unknown E", role: "Creator", profileURL: nil, tmdbId: 5),
+        ]
+        XCTAssertEqual(DetailsCreditLine.creators(in: people), [])
+        let meta = NuvioMeta(id: "tt3", name: "Show", type: "series", writer: ["W"])
+        XCTAssertEqual(
+            DetailsCreditLine.text(for: meta, creators: DetailsCreditLine.creators(in: people)),
+            label("details_credit_writer", "Writer: %@", "W")
+        )
     }
 }
