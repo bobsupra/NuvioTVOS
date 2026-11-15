@@ -1841,10 +1841,8 @@ final class SearchProfileSwitchTests: XCTestCase {
         let repo = ControllableLifecycleRepository()
         let slowStarted = expectation(description: "slow search started")
         let slowCanFinish = expectation(description: "slow search may finish")
-        let counter = SearchRequestCounter()
         var matrixRequests = 0
         repo.searchHandler = { query in
-            _ = await counter.next()
             if query == "Dune" {
                 slowStarted.fulfill()
                 await self.fulfillment(of: [slowCanFinish], timeout: 5)
