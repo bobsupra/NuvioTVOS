@@ -151,4 +151,40 @@ final class TrackingAddonServiceTests: XCTestCase {
         reporter.stop()
         XCTAssertEqual(events, [])
     }
+
+    private actor Recorder {
+        private(set) var events: [String] = []
+        func add(_ event: String) { events.append(event) }
+    }
+
+    func testEventsForOneAddonArriveInOrderEvenWhenTheFirstIsSlow() async {
+        let queue = TrackingEventQueue()
+        let recorder = Recorder()
+        queue.enqueue(key: "addon") {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+            await recorder.add("start")
+        }
+        queue.enqueue(key: "addon") {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+            await recorder.add("pause")
+        }
+        let last = queue.enqueue(key: "addon") { await recorder.add("stop") }
+        await last.value
+        let events = await recorder.events
+        XCTAssertEqual(events, ["start", "pause", "stop"])
+    }
+
+    func testASlowAddonDoesNotHoldUpAnother() async {
+        let queue = TrackingEventQueue()
+        let recorder = Recorder()
+        let slow = queue.enqueue(key: "slow") {
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            await recorder.add("slow")
+        }
+        let fast = queue.enqueue(key: "fast") { await recorder.add("fast") }
+        await fast.value
+        let afterFast = await recorder.events
+        XCTAssertEqual(afterFast, ["fast"])
+        await slow.value
+    }
 }

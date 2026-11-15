@@ -149,8 +149,13 @@ enum TrackingAddonService {
         sendLibraryEvent(isWatched ? .watched : .unwatched, type: meta.type, id: meta.id)
     }
 
+    /// One queue per add-on, so its events arrive in the order they happened.
+    static let eventQueue = TrackingEventQueue()
+
     /// Sends to every approved, installed and enabled add-on whose manifest
-    /// declares `resource` for this type and id. Fire and forget.
+    /// declares `resource` for this type and id. Fire and forget, but in
+    /// order per add-on: a quick start, pause and stop must not reach it as
+    /// stop before start.
     private static func dispatch(
         resource: String,
         type: String,
@@ -163,10 +168,10 @@ enum TrackingAddonService {
         let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs(in: defaults)
             .filter { approved.contains($0.absoluteString) }
         guard !manifestURLs.isEmpty else { return }
-        Task.detached(priority: .utility) {
-            for manifestURL in manifestURLs {
+        for manifestURL in manifestURLs {
+            eventQueue.enqueue(key: manifestURL.absoluteString) {
                 guard let manifest = await TrackingAddonService.manifest(for: manifestURL),
-                      manifest.supports(resource, type: type, id: id) else { continue }
+                      manifest.supports(resource, type: type, id: id) else { return }
                 for url in urls(manifestURL) {
                     var request = URLRequest(url: url)
                     request.timeoutInterval = 10
@@ -340,5 +345,27 @@ final class TrackingAddonPlaybackReporter {
     private func remember(_ currentTime: TimeInterval, _ duration: TimeInterval) {
         lastTime = currentTime
         lastDuration = duration
+    }
+}
+
+/// Runs work for each key strictly one after another, in the order it was
+/// enqueued, while different keys run independently. Enqueueing is
+/// synchronous, so the order is the order of the calls, not of whichever task
+/// the system happens to start first.
+final class TrackingEventQueue: @unchecked Sendable {
+    private let lock = NSLock()
+    private var tails: [String: Task<Void, Never>] = [:]
+
+    @discardableResult
+    func enqueue(key: String, _ work: @escaping @Sendable () async -> Void) -> Task<Void, Never> {
+        lock.lock()
+        defer { lock.unlock() }
+        let previous = tails[key]
+        let task = Task.detached(priority: .utility) {
+            await previous?.value
+            await work()
+        }
+        tails[key] = task
+        return task
     }
 }
