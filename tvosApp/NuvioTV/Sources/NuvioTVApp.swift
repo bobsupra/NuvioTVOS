@@ -7271,8 +7271,16 @@ struct TVHomeView: View {
                         // sees nothing to scroll when Down moves into it. The page stayed on
                         // the hero, and the next section below was not laid out yet, so Down
                         // found nothing until focus went back up. Bring the row to the top.
+                        //
+                        // Only when a card in that row really has focus. Leaving the hero for
+                        // the top bar, or the hero briefly taking focus while Home comes back
+                        // from another tab, must not scroll: focusedSectionId can still name
+                        // the row focused before, and the page jumped down to it.
                         DispatchQueue.main.async {
-                            guard !isGridHeroFocused, let sectionID = focusedSectionId else { return }
+                            guard !isGridHeroFocused,
+                                  let sectionID = focusedSectionId,
+                                  let cardID = focusedCardID,
+                                  cardID.hasPrefix("\(sectionID)\u{1}") else { return }
                             let animation = (isFastScrolling || fastNavigation)
                                 ? TVHomeLayout.fastVerticalScrollAnimation
                                 : TVHomeLayout.verticalScrollAnimation
