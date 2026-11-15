@@ -467,6 +467,27 @@ struct PlexClient {
         return (item?.viewOffset, item?.viewCount)
     }
 
+    /// A span Plex detected in a file: an intro or credits. Plex finds these
+    /// when the library has intro or credits detection turned on.
+    struct Marker: Equatable {
+        let type: String
+        let startTimeOffset: Int64
+        let endTimeOffset: Int64
+        /// Set on the credits marker after which the file has nothing more.
+        let final: Bool?
+    }
+
+    /// The intro and credits markers of an episode or movie.
+    func markers(ratingKey: String) async throws -> [Marker] {
+        struct Payload: Decodable {
+            struct Container: Decodable { let Metadata: [Item]? }
+            struct Item: Decodable { let Marker: [Marker]? }
+            let MediaContainer: Container
+        }
+        let data = try await get("library/metadata/\(ratingKey)", query: ["includeMarkers": "1"])
+        return try JSONDecoder().decode(Payload.self, from: data).MediaContainer.Metadata?.first?.Marker ?? []
+    }
+
     enum TimelineState: String {
         case playing, paused, stopped
     }
@@ -762,6 +783,27 @@ struct PlexClient {
                 )
             }
             throw ClientError(message: L10n.format("plex_error_status", fallback: "Plex returned status %d", http.statusCode))
+        }
+    }
+}
+
+extension PlexClient.Marker: Decodable {
+    private enum CodingKeys: String, CodingKey {
+        case type, startTimeOffset, endTimeOffset, final
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(String.self, forKey: .type)
+        startTimeOffset = try container.decode(Int64.self, forKey: .startTimeOffset)
+        endTimeOffset = try container.decode(Int64.self, forKey: .endTimeOffset)
+        // `true` in JSON from current servers; accept 1 / 0 as well.
+        if let flag = try? container.decodeIfPresent(Bool.self, forKey: .final) {
+            final = flag
+        } else if let flag = try? container.decodeIfPresent(Int.self, forKey: .final) {
+            final = flag != 0
+        } else {
+            final = nil
         }
     }
 }

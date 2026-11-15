@@ -645,8 +645,17 @@ class PlayerViewModel: ObservableObject {
     /// aligned to the chapter they line up with). The IntroDB season template
     /// keeps learning from `skipIntervals` alone.
     private var effectiveSkipIntervals: [SkipInterval] {
-        PlaybackChapters.merged(introDB: skipIntervals, chapters: chapterSkipIntervals, chapterList: chapters)
+        PlexSkipMarkers.merged(
+            plex: plexSkipIntervals,
+            others: PlaybackChapters.merged(introDB: skipIntervals, chapters: chapterSkipIntervals, chapterList: chapters)
+        )
     }
+    /// Plex's intro and credits markers for a Plex file: measured on the file,
+    /// so they take the place of the other sources' segment of the same kind.
+    private var plexSkipIntervals: [SkipInterval] = [] {
+        didSet { publishSkipSegments() }
+    }
+    private var plexSkipIntervalLoadTask: Task<Void, Never>?
     /// The same segments for the views: the opening and the ending colored on
     /// the timeline, their badges in the chapter list.
     @Published private(set) var skipSegments: [SkipInterval] = []
@@ -1770,6 +1779,7 @@ class PlayerViewModel: ObservableObject {
         }
         self.skipIntervals = []
         self.chapterSkipIntervals = []
+        self.plexSkipIntervals = []
         self.didSeedIntroDBSeasonTemplate = false
         self.didRefreshIntroDBForKnownDuration = false
         self.activeSkipInterval = nil
@@ -1792,6 +1802,7 @@ class PlayerViewModel: ObservableObject {
         self.hasExplicitSubtitleSelection = false
         self.sceneSessionID = UUID()
         loadSkipIntervalsIfNeeded(meta: meta, isStandalonePlaybackSession: isStandalonePlaybackSession)
+        loadPlexSkipIntervals(meta: meta)
     }
 
     private var effectiveFilename: String? {
@@ -2617,6 +2628,31 @@ class PlayerViewModel: ObservableObject {
                 }
                 self.updateSkipIntervalState()
             }
+        }
+    }
+
+    private func loadPlexSkipIntervals(meta: NuvioMeta) {
+        plexSkipIntervalLoadTask?.cancel()
+        guard !isStandalonePlaybackSession else { return }
+        let streamURL = activeStreamURL
+        let isMovie = !meta.isSeries && activeEpisodeNumbers == nil
+        plexSkipIntervalLoadTask = Task { [weak self] in
+            let intervals = await PlexSkipMarkers.intervals(forStreamURL: streamURL, isMovie: isMovie)
+            guard let self, !Task.isCancelled, self.activeStreamURL == streamURL, !intervals.isEmpty else { return }
+            // Markers that land after another source's segment of the same kind
+            // was skipped or dismissed keep that choice.
+            let replaced = self.effectiveSkipIntervals
+            for interval in intervals {
+                let sameKind = replaced.filter { PlexSkipMarkers.replaces(interval, $0) }
+                if sameKind.contains(where: { self.autoSkippedIntervalIds.contains($0.id) }) {
+                    self.autoSkippedIntervalIds.insert(interval.id)
+                }
+                if sameKind.contains(where: { self.dismissedSkipIntervalIds.contains($0.id) }) {
+                    self.dismissedSkipIntervalIds.insert(interval.id)
+                }
+            }
+            self.plexSkipIntervals = intervals
+            self.updateSkipIntervalState()
         }
     }
 
