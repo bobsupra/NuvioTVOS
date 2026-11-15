@@ -497,34 +497,113 @@ struct JellyfinClient {
         // A library sync sends many requests in a row (one or more per series for
         // episodes). Servers behind a reverse proxy or a hosted plan can answer
         // 429 Too Many Requests, or 503 while busy. Wait and ask again instead of
-        // failing the whole sync; the last response goes to `validate` as before.
+        // failing the whole sync, but never sooner than the server asked, and
+        // never for longer than we're willing to sit silently: then stop and say
+        // when to try again.
         var attempt = 0
         while true {
+            try Task.checkCancellation()
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse,
-                  http.statusCode == 429 || http.statusCode == 503,
-                  attempt < Self.rateLimitRetryLimit else {
+                  http.statusCode == 429 || http.statusCode == 503 else {
                 return (data, response)
             }
-            let delay = Self.retryDelay(
-                retryAfter: http.value(forHTTPHeaderField: "Retry-After"),
-                attempt: attempt
-            )
-            attempt += 1
-            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            let retryAfter = http.value(forHTTPHeaderField: "Retry-After")
+            guard attempt < Self.rateLimitRetryLimit else {
+                throw RateLimitedError(retryAfter: Self.retryAfterSeconds(retryAfter))
+            }
+            switch Self.retryDecision(retryAfter: retryAfter, attempt: attempt) {
+            case .retry(let delay):
+                attempt += 1
+                // Throws CancellationError at once if the sync is cancelled.
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            case .giveUp(let serverWait):
+                throw RateLimitedError(retryAfter: serverWait)
+            }
         }
     }
 
     static let rateLimitRetryLimit = 5
+    /// The longest we wait before a retry. A server asking for more gets no
+    /// early retry (that would only hit its limit again); the request fails
+    /// with a "try again in" message instead.
+    static let maxRetryWait: TimeInterval = 30
 
-    /// Seconds to wait before retrying a rate-limited request: the server's
-    /// `Retry-After` in seconds when it sends one, otherwise 1, 2, 4, 8, 16 s.
-    /// Capped at 30 s so a sync never sits silently for minutes.
-    static func retryDelay(retryAfter: String?, attempt: Int) -> TimeInterval {
-        if let retryAfter, let seconds = TimeInterval(retryAfter.trimmingCharacters(in: .whitespaces)), seconds >= 0 {
-            return min(seconds, 30)
+    enum RetryDecision: Equatable {
+        case retry(after: TimeInterval)
+        case giveUp(serverWait: TimeInterval)
+    }
+
+    /// The server's `Retry-After` when it sends one: wait exactly that long,
+    /// or give up when it's longer than `maxRetryWait`. Otherwise back off
+    /// 1, 2, 4, 8, 16 s.
+    static func retryDecision(retryAfter: String?, attempt: Int, now: Date = Date()) -> RetryDecision {
+        if let serverWait = retryAfterSeconds(retryAfter, now: now) {
+            return serverWait <= maxRetryWait ? .retry(after: serverWait) : .giveUp(serverWait: serverWait)
         }
-        return min(pow(2, Double(attempt)), 30)
+        return .retry(after: min(pow(2, Double(max(0, attempt))), maxRetryWait))
+    }
+
+    /// Seconds from `now` that a `Retry-After` value asks for: either a number
+    /// of seconds or an HTTP date (RFC 9110: IMF-fixdate, or the obsolete
+    /// RFC 850 and asctime forms). A date in the past means now. Nil when
+    /// missing or unreadable.
+    static func retryAfterSeconds(_ value: String?, now: Date = Date()) -> TimeInterval? {
+        guard let trimmed = value?.trimmingCharacters(in: .whitespaces), !trimmed.isEmpty else { return nil }
+        if let seconds = TimeInterval(trimmed) {
+            return seconds.isFinite && seconds >= 0 ? seconds : nil
+        }
+        for formatter in httpDateFormatters {
+            if let date = formatter.date(from: trimmed) {
+                return max(0, date.timeIntervalSince(now))
+            }
+        }
+        return nil
+    }
+
+    private static let httpDateFormatters: [DateFormatter] = [
+        "EEE, dd MMM yyyy HH:mm:ss zzz",   // Sun, 06 Nov 1994 08:49:37 GMT
+        "EEEE, dd-MMM-yy HH:mm:ss zzz",    // Sunday, 06-Nov-94 08:49:37 GMT
+        "EEE MMM d HH:mm:ss yyyy",         // Sun Nov  6 08:49:37 1994
+    ].map { format in
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = format
+        formatter.isLenient = true
+        return formatter
+    }
+
+    /// The server keeps refusing requests (429/503) for longer than we wait.
+    struct RateLimitedError: LocalizedError, Equatable {
+        /// What the server asked for, in seconds, when it said.
+        let retryAfter: TimeInterval?
+
+        /// Longer waits than this (a day) get the generic message: a huge
+        /// minute count wouldn't help, and converting an oversized header
+        /// value to Int would trap.
+        static let longestWaitShown: TimeInterval = 24 * 60 * 60
+
+        /// Whole minutes to show, or nil for the generic "try again later".
+        var minutesToShow: Int? {
+            guard let retryAfter, retryAfter.isFinite, retryAfter > 0,
+                  retryAfter <= Self.longestWaitShown else { return nil }
+            return max(1, Int((retryAfter / 60).rounded(.up)))
+        }
+
+        var errorDescription: String? {
+            guard let minutes = minutesToShow else {
+                return L10n.string(
+                    "jellyfin_error_rate_limited",
+                    fallback: "The Jellyfin server is limiting requests. Try again later."
+                )
+            }
+            return L10n.format(
+                "jellyfin_error_rate_limited_minutes",
+                fallback: "The Jellyfin server is limiting requests. Try again in about %d min.",
+                minutes
+            )
+        }
     }
 
     private static func validate(_ response: URLResponse, data: Data) throws {
