@@ -25,67 +25,26 @@ enum StreamSpeedVerdict: Equatable, Sendable {
     }
 }
 
-/// A short speed check for Nuvio Recommended: downloads a few megabytes of a
-/// source's file and measures the rate, so a top pick that would buffer on this
-/// connection can be moved down.
+/// How fast a source is likely to be for Nuvio Recommended, judged without
+/// contacting it.
 ///
-/// Only direct HTTP sources that are likely cached are checked, so a check never
-/// makes a debrid service start downloading a torrent. Results are remembered
-/// per host for a while so the same server isn't checked again and again.
-actor StreamSpeedProbe {
-    static let shared = StreamSpeedProbe()
-
-    static let sampleBytes = 4 * 1024 * 1024
-    static let timeLimit: TimeInterval = 6
-    static let cacheLifetime: TimeInterval = 10 * 60
-
-    private struct CachedResult {
-        let mbps: Double
-        let measuredAt: Date
-    }
-
-    private var resultsByHost: [String: CachedResult] = [:]
-    private let session: URLSession
-
-    init(session: URLSession? = nil) {
-        if let session {
-            self.session = session
-        } else {
-            let configuration = URLSessionConfiguration.ephemeral
-            configuration.timeoutIntervalForRequest = Self.timeLimit
-            configuration.timeoutIntervalForResource = Self.timeLimit + 2
-            configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
-            configuration.urlCache = nil
-            self.session = URLSession(configuration: configuration)
-        }
-    }
-
-    /// The URL to check, or nil when the source shouldn't be checked.
-    nonisolated static func probeURL(for stream: NuvioStream) -> URL? {
-        guard !stream.isNotPlayable, stream.unavailabilityReason == nil,
-              stream.isDirectProviderStream || stream.isLikelyCached,
-              let direct = stream.directURL,
-              let url = URL(string: direct),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "http" || scheme == "https" else { return nil }
-        return url
-    }
-
-    /// Speed verdict for a source, or nil when it can't be checked or the check failed.
-    /// Torrents that can't be downloaded from directly are judged by their seeders.
-    func verdict(for stream: NuvioStream, resolution: Int) async -> StreamSpeedVerdict? {
-        guard let url = Self.probeURL(for: stream) else {
-            return Self.seederVerdict(for: stream, resolution: resolution)
-        }
-        guard let mbps = await measure(url: url, headers: stream.httpHeaders ?? [:]) else { return nil }
-        return StreamSpeedVerdict.classify(mbps: mbps, resolution: resolution)
+/// It never opens a source's URL before the viewer picks it. Many add-ons
+/// (AIOStreams, Comet, Torrentio, MediaFusion...) return links that look direct
+/// or cached but resolve on request: opening one adds the torrent to the
+/// debrid account or makes NzbDav fetch the NZB, which fills the viewer's
+/// library and uses indexer quota. So only what the source itself says is
+/// used: the seeders a torrent add-on reports.
+enum StreamSpeedProbe {
+    /// Speed verdict for a source, or nil when there is nothing to judge it by.
+    static func verdict(for stream: NuvioStream, resolution: Int) -> StreamSpeedVerdict? {
+        seederVerdict(for: stream, resolution: resolution)
     }
 
     // MARK: - Torrents
 
     /// The seeder count an add-on reports in the source text, as Torrentio-style
     /// add-ons do ("👤 188"), or as "Seeders: 188" / "Seeds 188".
-    nonisolated static func seeders(in stream: NuvioStream) -> Int? {
+    static func seeders(in stream: NuvioStream) -> Int? {
         let text = [stream.name, stream.description, stream.filename].compactMap { $0 }.joined(separator: "\n")
         let patterns = [
             #"👤\s*(\d[\d,.]*)"#,
@@ -104,7 +63,7 @@ actor StreamSpeedProbe {
     /// For a torrent, more seeders means a faster, steadier download. Only used
     /// when the source can't be downloaded from directly and isn't likely cached
     /// on a debrid service, where seeders don't matter.
-    nonisolated static func seederVerdict(for stream: NuvioStream, resolution: Int) -> StreamSpeedVerdict? {
+    static func seederVerdict(for stream: NuvioStream, resolution: Int) -> StreamSpeedVerdict? {
         guard stream.isDebridResolvable, !stream.isLikelyCached,
               let seeders = seeders(in: stream) else { return nil }
         let (fast, ok): (Int, Int)
@@ -116,46 +75,6 @@ actor StreamSpeedProbe {
         if seeders >= fast { return .fast }
         if seeders >= ok { return .ok }
         return .slow
-    }
-
-    private func measure(url: URL, headers: [String: String]) async -> Double? {
-        let host = url.host?.lowercased() ?? url.absoluteString
-        if let cached = resultsByHost[host], Date().timeIntervalSince(cached.measuredAt) < Self.cacheLifetime {
-            return cached.mbps
-        }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = Self.timeLimit
-        for (field, value) in headers { request.setValue(value, forHTTPHeaderField: field) }
-        // Ask for the start of the file only; reading stops at the sample size
-        // even if the server ignores the range.
-        request.setValue("bytes=0-\(Self.sampleBytes - 1)", forHTTPHeaderField: "Range")
-
-        do {
-            let (bytes, response) = try await session.bytes(for: request)
-            guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
-                bytes.task.cancel()
-                return nil
-            }
-            // Time from the first byte, so redirects and the server's response
-            // delay don't count as download speed.
-            var received = 0
-            var firstByteAt: Date?
-            let deadline = Date().addingTimeInterval(Self.timeLimit)
-            for try await _ in bytes {
-                if firstByteAt == nil { firstByteAt = Date() }
-                received += 1
-                if received >= Self.sampleBytes { break }
-                if received % 65_536 == 0, Date() > deadline { break }
-            }
-            bytes.task.cancel()
-            guard let firstByteAt, received >= 256 * 1024 else { return nil }
-            let elapsed = max(Date().timeIntervalSince(firstByteAt), 0.05)
-            let mbps = Double(received) * 8 / elapsed / 1_000_000
-            resultsByHost[host] = CachedResult(mbps: mbps, measuredAt: Date())
-            return mbps
-        } catch {
-            return nil
-        }
     }
 }
 

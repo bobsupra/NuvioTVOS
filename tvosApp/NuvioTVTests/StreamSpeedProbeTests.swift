@@ -40,16 +40,15 @@ final class StreamSpeedProbeTests: XCTestCase {
         XCTAssertNil(StreamSpeedRanking.overallPick(ranked: [], verdicts: [:]))
     }
 
-    func testTorrentAndUnplayableSourcesAreNotChecked() {
-        let torrent = NuvioStream(
-            url: nil, name: "P2P 1080p", description: nil, addonName: "Test",
-            infoHash: "abcdef0123456789abcdef0123456789abcdef01"
+    func testSourcesAreNeverOpenedToJudgeThem() {
+        // A cached-looking AIOStreams / TorBox link resolves on request; judging
+        // it must not open it, so with nothing to go by there is no verdict.
+        let cached = NuvioStream(
+            url: "https://aiostreams.example.com/api/v1/debrid/playback/abc/file.mkv",
+            name: "⚡ [TB] 1080p", description: "Movie.1080p.mkv", addonName: "AIOStreams"
         )
-        XCTAssertNil(StreamSpeedProbe.probeURL(for: torrent))
-        let unplayable = NuvioStream(
-            url: "https://cdn.example.com/x.mkv", name: "x", description: nil, addonName: "Test", notPlayable: true
-        )
-        XCTAssertNil(StreamSpeedProbe.probeURL(for: unplayable))
+        XCTAssertNil(StreamSpeedProbe.verdict(for: cached, resolution: 1080))
+        XCTAssertNil(StreamSpeedProbe.verdict(for: stream("direct"), resolution: 1080))
     }
 
     private func torrent(_ description: String) -> NuvioStream {
