@@ -242,7 +242,7 @@ struct PlayerEpisodesPanel: View {
             .foregroundColor(.white)
             Text(L10n.string(
                 "player_shuffle_on_subtitle",
-                fallback: "Episodes play in random order, without repeats."
+                fallback: "Episodes play in random order. None repeats until every episode has played."
             ))
             .font(.system(size: 20))
             .foregroundColor(.white.opacity(0.7))
