@@ -9142,7 +9142,8 @@ struct TvDetailsEpisodeWatchedKeys {
 
     init(meta: NuvioMeta, progressSnapshot: WatchedSnapshot, librarySnapshot: WatchedSnapshot?) {
         // Settings → Integrations → AniList: episodes as far as the viewer's AniList progress.
-        let aniList = AniListAccount.watchedEpisodeKeys(meta: meta)
+        // AniList progress, and episodes Plex has as watched.
+        let aniList = AniListAccount.watchedEpisodeKeys(meta: meta).union(PlexWatched.watchedEpisodeKeys(meta: meta))
         playTarget = progressSnapshot.watchedEpisodeKeys(meta: meta).union(aniList)
         display = (librarySnapshot?.catalogWatchedEpisodeKeys(meta: meta) ?? playTarget).union(aniList)
     }
@@ -9498,7 +9499,8 @@ private struct TvDetailsEpisodes: View {
             using: (libraryWatchedContext == nil
                 ? snapshot.watchedEpisodeKeys(meta: meta)
                 : snapshot.catalogWatchedEpisodeKeys(meta: meta))
-                .union(AniListAccount.watchedEpisodeKeys(meta: meta)),
+                .union(AniListAccount.watchedEpisodeKeys(meta: meta))
+                .union(PlexWatched.watchedEpisodeKeys(meta: meta)),
             episodeWatchCounts: snapshot.catalogEpisodeWatchCounts(meta: meta),
             refreshCompletedLedgerEvidence: refreshCompletedLedgerEvidence,
             snapshot: snapshot
@@ -9667,6 +9669,7 @@ private struct TvDetailsEpisodes: View {
                         onToggleWatched: {
                             let isWatched = watchedEpisodeKeys.contains(watchKey)
                             AniListScrobbler.markEpisode(meta: meta, video: video, watched: !isWatched)
+                            PlexWatched.markEpisode(meta: meta, video: video, watched: !isWatched)
                             if let libraryWatchedContext {
                                 _ = libraryWatchedContext.setWatched(
                                     meta,
@@ -9684,6 +9687,13 @@ private struct TvDetailsEpisodes: View {
                         },
                         onMarkWatchedUpTo: {
                             AniListScrobbler.markEpisode(meta: meta, video: video, watched: true)
+                            PlexWatched.markEpisodes(
+                                meta: meta,
+                                videos: (meta.videos ?? []).filter {
+                                    $0.season > 0 && ($0.season, $0.episode) <= (video.season, video.episode)
+                                },
+                                watched: true
+                            )
                             if let libraryWatchedContext {
                                 _ = libraryWatchedContext.setWatchedUpTo(
                                     meta,
@@ -9700,6 +9710,7 @@ private struct TvDetailsEpisodes: View {
                         },
                         onToggleSeasonWatched: {
                             AniListScrobbler.markSeason(meta: meta, videos: seasonEpisodes, watched: !isSeasonWatched)
+                            PlexWatched.markEpisodes(meta: meta, videos: seasonEpisodes, watched: !isSeasonWatched)
                             if let libraryWatchedContext {
                                 _ = libraryWatchedContext.setSeasonWatched(
                                     meta,

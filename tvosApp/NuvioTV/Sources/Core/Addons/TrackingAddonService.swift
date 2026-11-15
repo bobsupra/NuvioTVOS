@@ -146,6 +146,7 @@ enum TrackingAddonService {
 
     /// A user marked a whole title watched or unwatched.
     static func sendWatched(_ isWatched: Bool, meta: NuvioMeta) {
+        PlexWatched.markTitle(meta: meta, watched: isWatched)
         sendLibraryEvent(isWatched ? .watched : .unwatched, type: meta.type, id: meta.id)
     }
 

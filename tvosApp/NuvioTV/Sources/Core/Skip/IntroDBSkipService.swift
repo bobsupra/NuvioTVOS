@@ -26,6 +26,10 @@ enum IntroDBConfig {
 }
 
 struct SkipInterval: Identifiable, Equatable {
+    /// Credits with a scene after them (Plex marks these): skippable, but not
+    /// the ending.
+    static let creditsBeforeSceneType = "credits-before-scene"
+
     var id: String { "\(provider):\(type):\(startTime):\(endTime)" }
     let startTime: Double
     let endTime: Double
@@ -78,6 +82,8 @@ struct SkipInterval: Identifiable, Equatable {
             return L10n.string("skip_intro", fallback: "Skip Intro")
         case "recap":
             return L10n.string("skip_recap", fallback: "Skip Recap")
+        case "credits-before-scene":
+            return L10n.string("skip_movie_credits", fallback: "Skip Credits")
         case "movie-credits":
             return targetsPostCredits
                 ? L10n.string("skip_to_post_credits", fallback: "Skip to Post-Credits")

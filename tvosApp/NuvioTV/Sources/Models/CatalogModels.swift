@@ -2276,6 +2276,7 @@ enum EpisodeSpoilerPolicy {
         if includeAniList {
             result.formUnion(AniListAccount.watchedEpisodeKeys(meta: meta))
         }
+        result.formUnion(PlexWatched.watchedEpisodeKeys(meta: meta))
 
         let ledgerKeys = completedLedgerKeysByContentID ?? completedLedgerEpisodeKeysByContentID()
         return trustedWatchedEpisodeKeys(
@@ -2981,6 +2982,8 @@ enum ContinueWatchingStore {
         // reading progress during this switch sees the new profile's rows.
         WatchProgressLedger.setActiveProfile(profileId)
         ContinueWatchingDismissStore.setActiveProfile(profileId)
+        // Plex cards Home merged belong to the previous profile.
+        PlexContinueWatchingMerge.reset()
         migrateLegacyHistoryIfNeeded()
         // Carry a pre-ledger install's history across, so upgrading users keep
         // their row and it becomes syncable.
@@ -3896,6 +3899,14 @@ enum ContinueWatchingStore {
     }
 
     private static func writeTopShelfFeedLocked(from selectedItems: [ContinueWatchingItem]) {
+        // Plex's titles in progress join the shelf as they join Home's row,
+        // and take the place Home's sort gives them.
+        var selectedItems = selectedItems
+        let withPlex = PlexContinueWatchingMerge.mergedWithLatest(into: selectedItems)
+        if !withPlex.elementsEqual(selectedItems, by: { $0.isContentEqual(to: $1) }) {
+            let preference = ProfileSettings.current.string(forKey: SettingsKey.continueWatchingSort) ?? "Default"
+            selectedItems = ContinueWatchingSortPolicy.sorted(withPlex, preference: preference)
+        }
         // Each entry keeps its place on Home's row, so the shelf can show both
         // sections as one row in that order.
         let allItems = Array(selectedItems.enumerated())
@@ -9389,14 +9400,14 @@ enum WatchedStore {
     /// have only episode rows after a Trakt pull, so the aggregate episode
     /// policy must be considered alongside an explicit title marker.
     static func isWatchedForDisplay(meta: NuvioMeta) -> Bool {
-        contains(meta: meta) || (meta.isSeries && hasSeriesWatchedState(meta))
+        contains(meta: meta) || (meta.isSeries && hasSeriesWatchedState(meta)) || PlexWatched.isWatched(meta: meta)
     }
 
     /// Catalog cards can use a provider-local id while the watched marker was
     /// saved from the canonical Details response. Fall back to the normalized
     /// series title/year in that case so the portrait checkmark still appears.
     static func containsCatalogTitle(meta: NuvioMeta) -> Bool {
-        currentSnapshot().containsCatalogTitle(meta: meta)
+        currentSnapshot().containsCatalogTitle(meta: meta) || PlexWatched.isWatched(meta: meta)
     }
 
     static func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {

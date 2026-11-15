@@ -1020,9 +1020,12 @@ struct ContentView: View {
             guard profile != nil else { return }
             SMBServerStore.shared.reload()
             JellyfinServerStore.shared.reload()
+            PlexServerStore.shared.reload()
+            PlexLibraryIndex.shared.reload()
             Task(priority: .utility) {
                 await SMBSessionManager.shared.connectAll()
                 await JellyfinSessionManager.shared.connectAll()
+                await PlexSessionManager.shared.connectAll()
             }
         }
         .onChange(of: scenePhase) { _, phase in
@@ -1040,6 +1043,7 @@ struct ContentView: View {
                     announcementService.beginForegroundSession()
                     Task(priority: .utility) {
                         await JellyfinSessionManager.shared.handleForegroundSession()
+                        await PlexSessionManager.shared.handleForegroundSession()
                     }
                     pluginsBecameActive()
                 }
@@ -1401,6 +1405,15 @@ struct ContentView: View {
         Task(priority: .utility) { await PluginStore.shared.appBecameActive() }
     }
 
+    /// The card a Top Shelf Continue Watching entry resumes: the stored one,
+    /// or the Plex card that Home shows in its place.
+    @MainActor
+    private static func continueWatchingItem(forShelfID id: String) -> ContinueWatchingItem? {
+        let stored = ContinueWatchingStore.item(for: id)
+        return PlexContinueWatchingMerge.mergedNow(into: stored.map { [$0] } ?? [])
+            .first { $0.meta.id == id } ?? stored
+    }
+
     /// Handles Top Shelf, `nuvio://` / `nuvio-tv://` title open, and
     /// `stremio://` add-on install deep links. Deferred while login/profile gate
     /// is up so Top Shelf cold-launch still works.
@@ -1463,7 +1476,7 @@ struct ContentView: View {
             ?? "movie"
 
         if host == "continue-watching" || pathParts.first == "continue-watching",
-           let item = ContinueWatchingStore.item(for: id) {
+           let item = Self.continueWatchingItem(forShelfID: id) {
             resumePlayback(item)
             return
         }
@@ -2175,7 +2188,7 @@ struct ContentView: View {
         if !isStandalonePlaybackSession,
            url.scheme?.lowercased() != "smb",
            let launchURL = player.launchURL(
-               for: url,
+               for: PlexPlaybackSync.shared.urlForExternalPlayer(url),
                filename: mediaFilename,
                subtitleURLs: subtitleURLs,
                position: resumeFrom,
@@ -5307,6 +5320,7 @@ private final class TVHomeFocusWork {
         let upFirstId: String?
         let localCount: Int
         let jellyfinCount: Int
+        let plexCount: Int
         let storeRevision: UInt
         let hideUnreleased: Bool
         let cwLandscape: Bool
@@ -5891,6 +5905,7 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.tmdbApplyToHome) private var tmdbApplyToHome = false
     @AppStorage(SettingsKey.smbLocalRowEnabled) private var smbLocalRowEnabled = true
     @AppStorage(SettingsKey.jellyfinLocalRowEnabled) private var jellyfinLocalRowEnabled = true
+    @AppStorage(SettingsKey.plexLocalRowEnabled) private var plexLocalRowEnabled = true
     @AppStorage(SettingsKey.catalogAutoRefreshInterval) private var catalogAutoRefreshInterval = "30 Minutes"
     @Environment(\.scenePhase) private var scenePhase
 
@@ -5898,6 +5913,7 @@ struct TVHomeView: View {
 
     @State private var localTitlesSection: TVHomeSection?
     @State private var jellyfinSections: [TVHomeSection] = []
+    @State private var plexSections: [TVHomeSection] = []
     @State private var isLoading = true
     @State private var settledRowIndex: Int = 0
     @State private var rowBuildReach: Int = 3
@@ -6361,6 +6377,20 @@ struct TVHomeView: View {
             guard isActive && !isFullScreenOverlayPresented else { return }
             Task { await loadJellyfinSection() }
         }
+        .task(id: "\(contentIdentity.profileId):plexTitles:\(plexLocalRowEnabled)") {
+            await loadPlexSections()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PlexLibraryIndex.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive && !isFullScreenOverlayPresented else { return }
+            Task { await loadPlexSections() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PlexLibraryIndex.watchStateChangedNotification).receive(on: RunLoop.main)) { _ in
+            // Progress on Plex (here or in another Plex app) moves, adds, or
+            // retires Continue Watching cards.
+            guard collectionHome == nil, isActive, !isFullScreenOverlayPresented else { return }
+            setContinueWatching(rawContinueWatchingItems)
+            writeDisplayedContinueWatchingToTopShelf()
+        }
         .modifier(CalendarTodayHomeFeed(
             enabled: homeCalendarToday && collectionHome == nil,
             homeReady: store.hasLoaded,
@@ -6417,6 +6447,9 @@ struct TVHomeView: View {
             let remaining = all.filter { !ContinueWatchingDismissStore.isDismissed($0) }
             if remaining.count != all.count {
                 setContinueWatching(remaining)
+                // A dismissed Plex card leaves no stored change behind to
+                // rewrite the shelf.
+                writeDisplayedContinueWatchingToTopShelf()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: CollectionPlaybackOriginStore.changedNotification)
@@ -8916,6 +8949,7 @@ struct TVHomeView: View {
             upFirstId: continueWatchingVisible ? upcomingMetas.first?.id : nil,
             localCount: localTitlesSection?.items.count ?? 0,
             jellyfinCount: jellyfinSections.reduce(0) { $0 + $1.items.count },
+            plexCount: plexSections.reduce(0) { $0 + $1.items.count },
             storeRevision: store.sectionsRevision,
             hideUnreleased: hideUnreleased,
             cwLandscape: continueWatchingLandscape,
@@ -8950,6 +8984,7 @@ struct TVHomeView: View {
             + ((calendarToday.isEmpty || !homeCalendarToday) ? [] : [calendarTodaySection])
             + [localTitlesSection].compactMap { $0 }
             + jellyfinSections
+            + plexSections
         let allSections = collectionHome == nil ? pinnedSections + store.sections : store.sections
 
         let result: [TVHomeSection]
@@ -8962,7 +8997,8 @@ struct TVHomeView: View {
                 if !section.collectionFolders.isEmpty
                     || section.id == TVHomeSection.localTitlesId
                     || section.id == TVHomeSection.jellyfinId
-                    || section.id.hasPrefix(TVHomeSection.jellyfinLibraryIdPrefix) {
+                    || section.id.hasPrefix(TVHomeSection.jellyfinLibraryIdPrefix)
+                    || section.id.hasPrefix(TVHomeSection.plexLibraryIdPrefix) {
                     return section
                 }
                 var copy = section
@@ -10267,7 +10303,14 @@ struct TVHomeView: View {
     }
 
     /// Publish Continue Watching and derived lookups together, outside body.
-    private func setContinueWatching(_ rawItems: [ContinueWatchingItem]) {
+    /// The Top Shelf's Continue Watching in the order Home shows it.
+    private func writeDisplayedContinueWatchingToTopShelf() {
+        ContinueWatchingStore.writeTopShelfFeed(from: continueWatching + upcomingItems)
+    }
+
+    private func setContinueWatching(_ sourceItems: [ContinueWatchingItem]) {
+        // Titles in progress on Plex join the row; see PlexContinueWatchingMerge.
+        let rawItems = PlexContinueWatchingMerge.merged(into: sourceItems, displayable: shouldDisplayContinueWatchingItem)
         refreshContinueWatchingOrigins(rawItems)
         if appliedContinueWatchingSort == continueWatchingSort,
            rawContinueWatchingItems.count == rawItems.count {
@@ -10825,6 +10868,41 @@ struct TVHomeView: View {
     }
 }
 
+extension TVHomeView {
+    /// One Home row per synced Plex library, in server then library order.
+    @MainActor
+    fileprivate func loadPlexSections() async {
+        focusWork.cachedVisibleSections = nil
+        guard collectionHome == nil,
+              contentIdentity.profileId != "none", !contentIdentity.profileId.isEmpty,
+              plexLocalRowEnabled else {
+            plexSections = []
+            return
+        }
+        let index = PlexLibraryIndex.shared
+        let grouped = Dictionary(grouping: index.titles()) { "\($0.serverID):\($0.libraryID)" }
+        let serverOrder = Dictionary(uniqueKeysWithValues: PlexServerStore.shared.servers.enumerated().map { ($0.element.id, $0.offset) })
+        let orderedKeys = grouped.keys.sorted { lhs, rhs in
+            let l = grouped[lhs]!.first!, r = grouped[rhs]!.first!
+            let lo = serverOrder[l.serverID] ?? Int.max, ro = serverOrder[r.serverID] ?? Int.max
+            if lo != ro { return lo < ro }
+            return (l.libraryName, lhs) < (r.libraryName, rhs)
+        }
+        plexSections = orderedKeys.compactMap { key in
+            guard let titles = grouped[key], let first = titles.first else { return nil }
+            let metas = titles
+                .sorted { ($0.name, $0.contentId) < ($1.name, $1.contentId) }
+                .compactMap { index.meta(for: $0) }
+            guard !metas.isEmpty else { return nil }
+            return TVHomeSection(
+                id: TVHomeSection.plexLibraryId(serverID: first.serverID, libraryID: first.libraryID),
+                title: first.libraryName,
+                items: metas
+            )
+        }
+    }
+}
+
 private struct JellyfinHomeLibraryKey: Hashable {
     let serverID: String
     let libraryID: String
@@ -10840,6 +10918,10 @@ struct TVHomeSection: Identifiable {
     static let jellyfinLibraryIdPrefix = "jellyfin_library_"
     static func jellyfinLibraryId(serverID: String, libraryID: String) -> String {
         "\(jellyfinLibraryIdPrefix)\(serverID):\(libraryID)"
+    }
+    static let plexLibraryIdPrefix = "plex_library_"
+    static func plexLibraryId(serverID: String, libraryID: String) -> String {
+        "\(plexLibraryIdPrefix)\(serverID):\(libraryID)"
     }
     /// Id prefix for rows built from account-synced collections.
     static let collectionIdPrefix = "collection_"

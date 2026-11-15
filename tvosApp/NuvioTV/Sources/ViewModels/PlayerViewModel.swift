@@ -244,8 +244,10 @@ class PlayerViewModel: ObservableObject {
         case .ended: action = .stop
         default: return
         }
-        guard let item = trackingAddonItem else { return }
         let duration = time.duration > 0 ? time.duration : clock.duration
+        let plexState: PlexPlaybackSync.PlayerState = action == .start ? .playing : (action == .pause ? .paused : .stopped)
+        PlexPlaybackSync.shared.report(plexState, url: activeStreamURL, currentTime: time.current, duration: duration)
+        guard let item = trackingAddonItem else { return }
         trackingAddonReporter.report(action, item: item, currentTime: time.current, duration: duration)
     }
     private var scenePauseAlreadyNotified = false
@@ -643,8 +645,17 @@ class PlayerViewModel: ObservableObject {
     /// aligned to the chapter they line up with). The IntroDB season template
     /// keeps learning from `skipIntervals` alone.
     private var effectiveSkipIntervals: [SkipInterval] {
-        PlaybackChapters.merged(introDB: skipIntervals, chapters: chapterSkipIntervals, chapterList: chapters)
+        PlexSkipMarkers.merged(
+            plex: plexSkipIntervals,
+            others: PlaybackChapters.merged(introDB: skipIntervals, chapters: chapterSkipIntervals, chapterList: chapters)
+        )
     }
+    /// Plex's intro and credits markers for a Plex file: measured on the file,
+    /// so they take the place of the other sources' segment of the same kind.
+    private var plexSkipIntervals: [SkipInterval] = [] {
+        didSet { publishSkipSegments() }
+    }
+    private var plexSkipIntervalLoadTask: Task<Void, Never>?
     /// The same segments for the views: the opening and the ending colored on
     /// the timeline, their badges in the chapter list.
     @Published private(set) var skipSegments: [SkipInterval] = []
@@ -1198,6 +1209,9 @@ class PlayerViewModel: ObservableObject {
         currentEpisode: NuvioVideo? = nil,
         isActionPlaybackSession: Bool = false
     ) {
+        // A Plex link is pointed at the server's current address, with its
+        // token as a header; any other stream is unchanged.
+        let (url, httpHeaders) = PlexPlaybackSync.shared.resolve(url: url, headers: httpHeaders)
         PlaybackTimelineRecorder.record(.playbackLoadRequested)
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         self.isActionPlaybackSession = isActionPlaybackSession
@@ -1261,7 +1275,7 @@ class PlayerViewModel: ObservableObject {
             subtitle: subtitle,
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
-            resumeFrom: resumeFrom,
+            resumeFrom: PlexPlaybackSync.shared.resumePosition(for: url, fallback: resumeFrom),
             currentEpisode: currentEpisode,
             beginsNewPlaybackCompletionSession: !hasLoaded
         )
@@ -1765,6 +1779,7 @@ class PlayerViewModel: ObservableObject {
         }
         self.skipIntervals = []
         self.chapterSkipIntervals = []
+        self.plexSkipIntervals = []
         self.didSeedIntroDBSeasonTemplate = false
         self.didRefreshIntroDBForKnownDuration = false
         self.activeSkipInterval = nil
@@ -1787,6 +1802,7 @@ class PlayerViewModel: ObservableObject {
         self.hasExplicitSubtitleSelection = false
         self.sceneSessionID = UUID()
         loadSkipIntervalsIfNeeded(meta: meta, isStandalonePlaybackSession: isStandalonePlaybackSession)
+        loadPlexSkipIntervals(meta: meta)
     }
 
     private var effectiveFilename: String? {
@@ -2626,6 +2642,31 @@ class PlayerViewModel: ObservableObject {
                 }
                 self.updateSkipIntervalState()
             }
+        }
+    }
+
+    private func loadPlexSkipIntervals(meta: NuvioMeta) {
+        plexSkipIntervalLoadTask?.cancel()
+        guard !isStandalonePlaybackSession else { return }
+        let streamURL = activeStreamURL
+        let isMovie = !meta.isSeries && activeEpisodeNumbers == nil
+        plexSkipIntervalLoadTask = Task { [weak self] in
+            let intervals = await PlexSkipMarkers.intervals(forStreamURL: streamURL, isMovie: isMovie)
+            guard let self, !Task.isCancelled, self.activeStreamURL == streamURL, !intervals.isEmpty else { return }
+            // Markers that land after another source's segment of the same kind
+            // was skipped or dismissed keep that choice.
+            let replaced = self.effectiveSkipIntervals
+            for interval in intervals {
+                let sameKind = replaced.filter { PlexSkipMarkers.replaces(interval, $0) }
+                if sameKind.contains(where: { self.autoSkippedIntervalIds.contains($0.id) }) {
+                    self.autoSkippedIntervalIds.insert(interval.id)
+                }
+                if sameKind.contains(where: { self.dismissedSkipIntervalIds.contains($0.id) }) {
+                    self.dismissedSkipIntervalIds.insert(interval.id)
+                }
+            }
+            self.plexSkipIntervals = intervals
+            self.updateSkipIntervalState()
         }
     }
 
@@ -4827,6 +4868,7 @@ class PlayerViewModel: ObservableObject {
             return
         }
         trackingAddonReporter.stop(currentTime: time.current, duration: time.duration)
+        PlexPlaybackSync.shared.report(.stopped, url: activeStreamURL, currentTime: time.current, duration: time.duration)
         rememberManualSourceIfReady(refreshTimestamp: true)
         detachWatchPartyPlayerBridge()
         cancelPendingAdvanceResolution()
@@ -5112,6 +5154,7 @@ class PlayerViewModel: ObservableObject {
             : max(seconds, 0)
         let prevCurrent = time.current
         trackingAddonReporter.seeked(to: target, duration: duration)
+        PlexPlaybackSync.shared.seeked(url: activeStreamURL, to: target, duration: duration)
         seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s, exact: \(exact))")
         screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds), exact: \(exact)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
         engine.seekToMs(Int64(target * 1000), exact: exact)
@@ -5208,7 +5251,11 @@ class PlayerViewModel: ObservableObject {
         }
         let targetTime = postCredits?.startTime ?? interval.endTime
         let wasPlaying = status == .playing
-        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)), exact: true)
+        // Stay half a second inside the file: a segment can end on the last
+        // frame (Plex's credits do) or a hair past it, and a seek beyond the
+        // end restarts some engines from the beginning.
+        let lastSafePosition = time.duration > 1 ? time.duration - 0.5 : Double.infinity
+        seek(to: min(targetTime + 0.25, lastSafePosition), exact: true)
         if wasPlaying {
             play()
         }
@@ -8502,6 +8549,9 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveProgressIfNeeded() {
+        if status == .playing {
+            PlexPlaybackSync.shared.report(.playing, url: activeStreamURL, currentTime: time.current, duration: time.duration)
+        }
         guard isTrackablePlayback else { return }
         guard status == .playing else { return }
         didRefreshManualSourceTimestamp = false
@@ -8635,7 +8685,7 @@ class PlayerViewModel: ObservableObject {
             LastPlaybackStreamStore.save(
                 metaId: activeMeta.id,
                 url: activeStreamURL,
-                httpHeaders: activeHTTPHeaders,
+                httpHeaders: PlexPlaybackSync.shared.headersForStorage(url: activeStreamURL, headers: activeHTTPHeaders),
                 season: season,
                 episode: episode,
                 meta: activeMeta,

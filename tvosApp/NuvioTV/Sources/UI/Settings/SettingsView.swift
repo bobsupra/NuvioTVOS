@@ -310,6 +310,9 @@ enum SettingsKey {
     static let jellyfinServers = "nuvio.tv.settings.integrations.jellyfinServers"
     static let jellyfinLibraryIndex = "nuvio.tv.settings.integrations.jellyfinLibraryIndex"
     static let jellyfinLocalRowEnabled = "nuvio.tv.settings.integrations.jellyfinLocalRowEnabled"
+    static let plexServers = "nuvio.tv.settings.integrations.plexServers"
+    static let plexAccountName = "nuvio.tv.settings.integrations.plexAccountName"
+    static let plexLocalRowEnabled = "nuvio.tv.settings.integrations.plexLocalRowEnabled"
 
     static let trueHDSpatialAudio = "nuvio.tv.settings.playback.trueHDSpatialAudio"
     static let preferDualLayerDolbyVision = "nuvio.tv.settings.playback.preferDualLayerDolbyVision"
@@ -487,6 +490,7 @@ enum SettingsKey {
         cinemetaDisabled, deletedLocalAddons,
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
+        plexServers, plexAccountName, plexLocalRowEnabled,
         playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, foldsDolbyVisionFEL, preferHDR10Plus, lowResUpscaling, upscaleScaler, losslessAudioBridge, preserveSubwooferBassInStereo, loudnessNormalizer, loudnessTargetPreset, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
@@ -6171,6 +6175,7 @@ private struct IntegrationSettingsView: View {
             UsenetSettingsSection(accentColor: accentColor)
 
             JellyfinSettingsSection(accentColor: accentColor)
+            PlexSettingsSection(accentColor: accentColor)
         }
         .onAppear {
             currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
@@ -15803,6 +15808,520 @@ private struct JellyfinLibrarySelectionSheet: View {
             return L10n.string("jellyfin_syncing_resolving", fallback: "Matching titles…")
         case .saving:
             return L10n.string("jellyfin_syncing_saving", fallback: "Saving library index…")
+        }
+    }
+}
+
+// MARK: - Plex (self-hosted media servers)
+
+private struct PlexSettingsSection: View {
+    let accentColor: Color
+
+    @ObservedObject private var serverStore = PlexServerStore.shared
+    @ObservedObject private var sessionManager = PlexSessionManager.shared
+    @State private var isSigningIn = false
+    @State private var isChoosingHomeUser = false
+    @State private var syncingServer: PlexServerConfig?
+    @State private var refreshError: String?
+    @AppStorage(SettingsKey.plexLocalRowEnabled) private var showsOnHome = true
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("plex_group_title", fallback: "Plex"),
+            subtitle: serverStore.isSignedIn
+                ? L10n.format("plex_signed_in_as", fallback: "Signed in as %@", serverStore.accountName ?? "Plex")
+                : L10n.string("plex_group_subtitle", fallback: "Browse and play your Plex Media Server libraries, with resume position kept in sync with other Plex apps")
+        ) {
+            if serverStore.isSignedIn {
+                if sessionManager.needsSignIn {
+                    SettingsActionRow(
+                        title: L10n.string("plex_sign_in_again", fallback: "Sign In Again"),
+                        subtitle: L10n.string("plex_sign_in_again_subtitle", fallback: "Plex no longer accepts this Apple TV's sign-in. Your servers and libraries are kept."),
+                        value: "",
+                        accentColor: accentColor
+                    ) {
+                        isSigningIn = true
+                    }
+                }
+                SettingsActionRow(
+                    title: L10n.string("plex_home_user", fallback: "Plex Home User"),
+                    subtitle: L10n.string("plex_home_user_subtitle", fallback: "Watch as another member of your Plex Home, with their own progress"),
+                    value: serverStore.accountName ?? "",
+                    accentColor: accentColor
+                ) {
+                    isChoosingHomeUser = true
+                }
+                SettingsActionRow(
+                    title: L10n.string("plex_refresh_servers", fallback: "Refresh Servers"),
+                    subtitle: refreshError ?? L10n.string("plex_refresh_servers_subtitle", fallback: "Find servers added to your Plex account since sign-in"),
+                    value: "",
+                    accentColor: accentColor
+                ) {
+                    Task {
+                        do {
+                            try await sessionManager.refreshServers()
+                            refreshError = nil
+                            await sessionManager.connectAll(autoSync: false)
+                        } catch {
+                            refreshError = error.localizedDescription
+                        }
+                    }
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string("plex_show_on_home", fallback: "Show on Home"),
+                    subtitle: L10n.string(
+                        "plex_show_on_home_subtitle",
+                        fallback: "Show your Plex libraries as rows on Home. Plex streams and Continue Watching keep working when this is off."
+                    ),
+                    isOn: $showsOnHome,
+                    accentColor: accentColor
+                )
+
+                ForEach(serverStore.servers) { server in
+                    PlexServerRow(
+                        server: server,
+                        accentColor: accentColor,
+                        connectionState: sessionManager.connectionState(for: server.id),
+                        syncState: sessionManager.syncState(for: server.id),
+                        onConnect: { Task { await sessionManager.connect(server) } },
+                        onDisconnect: { sessionManager.disconnect(server) },
+                        onSync: { syncingServer = server },
+                        onDelete: {
+                            sessionManager.disconnect(server)
+                            serverStore.remove(server.id)
+                        }
+                    )
+                }
+
+                SettingsActionRow(
+                    title: L10n.string("plex_sign_out", fallback: "Sign Out"),
+                    subtitle: L10n.string("plex_sign_out_subtitle", fallback: "Removes your Plex servers and their titles from this profile"),
+                    value: "",
+                    accentColor: accentColor
+                ) {
+                    sessionManager.signOut()
+                }
+            } else {
+                SettingsActionRow(
+                    title: L10n.string("plex_sign_in", fallback: "Sign In with Plex"),
+                    subtitle: L10n.string("plex_sign_in_subtitle", fallback: "Link this Apple TV at plex.tv/link with a code"),
+                    value: "",
+                    accentColor: accentColor
+                ) {
+                    isSigningIn = true
+                }
+            }
+        }
+        .sheet(isPresented: $isSigningIn) {
+            PlexSignInSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $isChoosingHomeUser) {
+            PlexHomeUserSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(item: $syncingServer) { server in
+            PlexLibrarySelectionSheet(server: server, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+}
+
+private struct PlexServerRow: View {
+    let server: PlexServerConfig
+    let accentColor: Color
+    let connectionState: PlexConnectionState
+    let syncState: PlexSyncState
+    let onConnect: () -> Void
+    let onDisconnect: () -> Void
+    let onSync: () -> Void
+    let onDelete: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Button(action: { connectionState.isConnected ? onSync() : onConnect() }) {
+                SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                    SettingsRowText(title: server.displayName, subtitle: subtitleText)
+                    Spacer(minLength: 24)
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(connectionState.isConnected ? Color.green : Color.white.opacity(0.3))
+                            .frame(width: 10, height: 10)
+                        Text(statusText)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+            .entryLockable()
+
+            HStack(spacing: 12) {
+                if connectionState.isConnected {
+                    SMBRowButton(title: L10n.string("smb_disconnect", fallback: "Disconnect"), accentColor: accentColor, action: onDisconnect)
+                } else {
+                    SMBRowButton(
+                        title: connectionState == .connecting
+                            ? L10n.string("smb_connecting", fallback: "Connecting…")
+                            : L10n.string("smb_connect", fallback: "Connect"),
+                        accentColor: accentColor,
+                        enabled: connectionState != .connecting,
+                        action: onConnect
+                    )
+                }
+                SMBRowButton(
+                    title: syncTitle,
+                    accentColor: accentColor,
+                    enabled: connectionState.isConnected,
+                    action: onSync
+                )
+                Spacer()
+                SMBDeleteButton(action: onDelete)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var subtitleText: String {
+        var parts: [String] = []
+        if !server.baseURLString.isEmpty { parts.append(server.baseURLString) }
+        if !server.isOwned { parts.append(L10n.string("plex_shared_server", fallback: "Shared with you")) }
+        if let count = server.lastSyncTitleCount {
+            parts.append(L10n.format("smb_title_count", fallback: "%d titles", count))
+        }
+        if case .failed(let message) = connectionState { parts.append(message) }
+        if case .failed(let message) = syncState { parts.append(message) }
+        return parts.joined(separator: " — ")
+    }
+
+    private var statusText: String {
+        switch connectionState {
+        case .disconnected: return L10n.string("debrid_not_set", fallback: "Not set")
+        case .connecting: return L10n.string("smb_connecting", fallback: "Connecting…")
+        case .connected: return L10n.string("debrid_connected", fallback: "Connected")
+        case .failed: return L10n.string("smb_failed", fallback: "Failed")
+        }
+    }
+
+    private var syncTitle: String {
+        if case .syncing(let found, _) = syncState {
+            return L10n.format("jellyfin_syncing_count", fallback: "Syncing (%d)…", found)
+        }
+        return L10n.string("jellyfin_sync", fallback: "Sync")
+    }
+}
+
+/// Shows a plex.tv/link code and waits for it to be entered on another device.
+private struct PlexSignInSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @State private var pin: PlexClient.Pin?
+    @State private var status: String?
+    @State private var task: Task<Void, Never>?
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 28) {
+                Text(L10n.string("plex_sign_in", fallback: "Sign In with Plex"))
+                    .font(.system(size: 36, weight: .bold))
+                    .foregroundColor(.white)
+
+                Text(L10n.string("plex_sign_in_steps", fallback: "Scan the QR code with your phone, or open plex.tv/link on any device, sign in to Plex (Google and Apple accounts work), and enter this code:"))
+                    .font(.system(size: 22, weight: .regular))
+                    .foregroundColor(.white.opacity(0.8))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(alignment: .center, spacing: 48) {
+                    // Scanning opens plex.tv/link with the code already filled in.
+                    if let code = pin?.code, let image = QRCode.image(from: "https://plex.tv/link/?pin=\(code)", scale: 10) {
+                        Image(uiImage: image)
+                            .interpolation(.none)
+                            .resizable()
+                            .frame(width: 240, height: 240)
+                            .padding(14)
+                            .background(Color.white, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+                    }
+                    Text(pin?.code ?? "····")
+                        .font(.system(size: 84, weight: .heavy, design: .monospaced))
+                        .kerning(12)
+                        .foregroundColor(.white)
+                }
+
+                Text(status ?? L10n.string("plex_waiting_for_code", fallback: "Waiting for the code to be entered…"))
+                    .font(.system(size: 18, weight: .regular))
+                    .foregroundColor(.white.opacity(0.6))
+
+                HStack {
+                    SMBDialogButton(title: L10n.string("action_cancel", fallback: "Cancel"), isPrimary: false) {
+                        dismiss()
+                    }
+                    Spacer()
+                    SMBDialogButton(title: L10n.string("plex_new_code", fallback: "New Code"), isPrimary: true) {
+                        start()
+                    }
+                }
+                .focusSection()
+            }
+            .padding(60)
+        }
+        .onAppear(perform: start)
+        .onDisappear {
+            task?.cancel()
+            task = nil
+        }
+    }
+
+    private func start() {
+        task?.cancel()
+        pin = nil
+        status = nil
+        task = Task { @MainActor in
+            do {
+                let created = try await PlexClient.createPin()
+                guard !Task.isCancelled else { return }
+                pin = created
+                // Plex asks clients to check the PIN about once per second.
+                while !Task.isCancelled, Date() < created.expiresAt {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                    guard !Task.isCancelled else { return }
+                    guard let token = try? await PlexClient.checkPin(created) else { continue }
+                    status = L10n.string("plex_finding_servers", fallback: "Signed in. Finding your servers…")
+                    let name = (try? await PlexClient.accountName(token: token)) ?? "Plex"
+                    try await PlexSessionManager.shared.signedIn(name: name, token: token)
+                    dismiss()
+                    return
+                }
+                if !Task.isCancelled {
+                    status = L10n.string("plex_code_expired", fallback: "This code expired. Choose New Code to get another.")
+                }
+            } catch is CancellationError {
+            } catch {
+                status = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// Choose which member of the Plex Home to watch as.
+private struct PlexHomeUserSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @State private var users: [PlexClient.HomeUser] = []
+    @State private var pin = ""
+    @State private var message: String?
+    @State private var isWorking = false
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(L10n.string("plex_home_user", fallback: "Plex Home User"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("plex_home_pin", fallback: "PIN"),
+                        subtitle: L10n.string("plex_home_pin_subtitle", fallback: "Only needed for users marked as protected. Enter it before choosing the user.")
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("plex_home_pin", fallback: "PIN"),
+                            subtitle: "",
+                            placeholder: "0000",
+                            text: $pin,
+                            isSecure: true
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("plex_home_users", fallback: "Users"),
+                        subtitle: message ?? L10n.string("plex_home_users_subtitle", fallback: "Switching re-syncs your libraries with that user's access and progress")
+                    ) {
+                        ForEach(users) { user in
+                            SettingsActionRow(
+                                title: user.name,
+                                subtitle: user.isProtected
+                                    ? L10n.string("plex_home_protected", fallback: "Protected with a PIN")
+                                    : (user.isAdmin ? L10n.string("plex_home_owner", fallback: "Account owner") : ""),
+                                value: user.name == PlexServerStore.shared.accountName
+                                    ? L10n.string("plex_home_current", fallback: "Current") : "",
+                                accentColor: accentColor
+                            ) {
+                                choose(user)
+                            }
+                        }
+                    }
+
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_close", fallback: "Close"), isPrimary: false) { dismiss() }
+                        Spacer()
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+        .task {
+            do {
+                users = try await PlexSessionManager.shared.homeUsers()
+            } catch {
+                message = error.localizedDescription
+            }
+        }
+    }
+
+    private func choose(_ user: PlexClient.HomeUser) {
+        guard !isWorking else { return }
+        if user.isProtected, pin.isEmpty {
+            message = L10n.string("plex_home_pin_needed", fallback: "Enter this user's PIN above first.")
+            return
+        }
+        isWorking = true
+        message = L10n.string("plex_home_switching", fallback: "Switching user…")
+        Task { @MainActor in
+            defer { isWorking = false }
+            do {
+                try await PlexSessionManager.shared.switchHomeUser(user, pin: user.isProtected ? pin : nil)
+                dismiss()
+            } catch {
+                message = error.localizedDescription
+            }
+        }
+    }
+}
+
+/// Pick which libraries to sync from a connected server, then follow progress.
+private struct PlexLibrarySelectionSheet: View {
+    let server: PlexServerConfig
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @ObservedObject private var sessionManager = PlexSessionManager.shared
+    @State private var selectedLibraryIDs: Set<String>
+    @State private var syncAutomatically: Bool
+
+    init(server: PlexServerConfig, accentColor: Color) {
+        self.server = server
+        self.accentColor = accentColor
+        _selectedLibraryIDs = State(initialValue: Set(server.selectedLibraryIDs))
+        _syncAutomatically = State(initialValue: server.syncAutomatically)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(L10n.format("jellyfin_libraries_on_server", fallback: "Libraries on %@", server.displayName))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("jellyfin_sync_options", fallback: "Sync Options"),
+                        subtitle: L10n.string("jellyfin_sync_options_subtitle", fallback: "Automatic background updates for this server")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("jellyfin_sync_automatically", fallback: "Sync Automatically"),
+                            subtitle: L10n.string("jellyfin_sync_automatically_subtitle", fallback: "Refresh library content on launch and when returning to the app"),
+                            isOn: $syncAutomatically,
+                            accentColor: accentColor
+                        )
+                    }
+
+                    if case .connected(let libraries) = sessionManager.connectionState(for: server.id) {
+                        SettingsGroup(
+                            title: L10n.string("jellyfin_libraries", fallback: "Libraries"),
+                            subtitle: L10n.string("jellyfin_libraries_subtitle", fallback: "Choose which libraries to sync")
+                        ) {
+                            ForEach(libraries) { library in
+                                SettingsToggleRow(
+                                    title: library.name,
+                                    subtitle: library.type == "movie"
+                                        ? L10n.string("plex_library_movies", fallback: "Movies")
+                                        : L10n.string("plex_library_shows", fallback: "TV Shows"),
+                                    isOn: Binding(
+                                        get: { selectedLibraryIDs.contains(library.id) },
+                                        set: { isOn in
+                                            if isOn { selectedLibraryIDs.insert(library.id) } else { selectedLibraryIDs.remove(library.id) }
+                                        }
+                                    ),
+                                    accentColor: accentColor
+                                )
+                            }
+                        }
+                    }
+
+                    syncStatusView
+
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_close", fallback: "Close"), isPrimary: false) { dismiss() }
+                        Spacer()
+                        SMBDialogButton(
+                            title: L10n.string("jellyfin_start_sync", fallback: "Start Sync"),
+                            isPrimary: true,
+                            enabled: !selectedLibraryIDs.isEmpty && !isSyncing
+                        ) {
+                            var updated = PlexServerStore.shared.server(id: server.id) ?? server
+                            updated.selectedLibraryIDs = Array(selectedLibraryIDs)
+                            updated.syncAutomatically = syncAutomatically
+                            PlexServerStore.shared.upsert(updated)
+                            sessionManager.sync(updated, force: true)
+                        }
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+    }
+
+    private var isSyncing: Bool {
+        if case .syncing = sessionManager.syncState(for: server.id) { return true }
+        return false
+    }
+
+    @ViewBuilder
+    private var syncStatusView: some View {
+        switch sessionManager.syncState(for: server.id) {
+        case .idle:
+            EmptyView()
+        case .syncing(let found, let library):
+            SettingsGroup(
+                title: L10n.string("jellyfin_syncing_items", fallback: "Syncing library items…"),
+                subtitle: library
+            ) {
+                SettingsInfoRow(title: L10n.string("smb_found_so_far", fallback: "Found so far"), value: "\(found)")
+            }
+        case .done(let report):
+            SettingsGroup(
+                title: L10n.string("smb_scan_complete", fallback: "Scan Complete"),
+                subtitle: L10n.string("plex_sync_complete_subtitle", fallback: "Synced libraries appear on Home, and their files show as Plex streams")
+            ) {
+                SettingsInfoRow(title: L10n.string("smb_matched_titles", fallback: "Matched Titles"), value: "\(report.titles)")
+                SettingsInfoRow(title: L10n.string("smb_matched_episodes", fallback: "Matched Episodes"), value: "\(report.episodes)")
+            }
+        case .failed(let message):
+            SettingsGroup(
+                title: L10n.string("smb_scan_failed", fallback: "Scan Failed"),
+                subtitle: message
+            ) { EmptyView() }
         }
     }
 }

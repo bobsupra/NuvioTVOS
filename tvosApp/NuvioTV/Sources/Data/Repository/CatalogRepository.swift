@@ -1276,6 +1276,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
             return jellyfinMeta
         }
+        if let plexMeta = await PlexLibraryIndex.shared.meta(forContentId: id) {
+            return plexMeta
+        }
         let cached = cachedMetadata(for: id)
         if let cached, isCachedFullMetadata(id: id) {
             return await TmdbDetailsService.localizedMetadata(for: cached)
@@ -1287,6 +1290,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
     func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
         if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
             return jellyfinMeta
+        }
+        if let plexMeta = await PlexLibraryIndex.shared.meta(forContentId: id) {
+            return plexMeta
         }
         // A catalog can report `type: movie` while its nonempty videos prove
         // that it is a series. Keep that inference while replacing the cache,
