@@ -71,13 +71,21 @@ final class PlexPlaybackSync {
     /// Reports a state change right away and repeats `playing` at most every
     /// `heartbeatInterval` seconds. Not a Plex stream: nothing happens.
     func report(_ state: PlayerState, url: String?, currentTime: TimeInterval, duration: TimeInterval) {
-        guard let url, var entry = entries[url],
+        guard let url, var entry = entry(for: url),
               currentTime.isFinite, currentTime >= 0 else { return }
         let timelineState: PlexClient.TimelineState
         switch state {
         case .playing: timelineState = .playing
         case .paused: timelineState = .paused
         case .stopped: timelineState = .stopped
+        }
+        // Playback reaches `playing` before the resume seek lands, so the first
+        // report would say 0:00 and briefly reset the resume point every Plex
+        // app sees. Wait for a real position; a stop before any report was
+        // sent leaves the saved point alone too.
+        if currentTime < 1 {
+            let sessionReported = lastState[url] == .playing || lastState[url] == .paused
+            if timelineState != .stopped || !sessionReported { return }
         }
         let now = Date()
         if lastState[url] == timelineState, timelineState != .stopped,
@@ -101,6 +109,33 @@ final class PlexPlaybackSync {
                 print("[Plex] timeline report failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    /// The registered entry for `url`, or one recovered from the synced library.
+    /// Continue Watching and other shortcuts replay a stored stream URL without
+    /// building a stream list, so the URL was never registered in this launch;
+    /// its `/library/parts/...` path still identifies the item.
+    private func entry(for url: String) -> Entry? {
+        if let existing = entries[url] { return existing }
+        guard let recovered = Self.entryFromLibrary(url) else { return nil }
+        entries[url] = recovered
+        return recovered
+    }
+
+    private static func entryFromLibrary(_ urlString: String) -> Entry? {
+        guard let url = URL(string: urlString), url.path.hasPrefix("/library/parts/") else { return nil }
+        let servers = PlexServerStore.shared.servers
+        // Prefer the server this URL points at; a stored link can predate an
+        // address change, so fall back to any added server.
+        let sameAddress = servers.filter { $0.baseURL?.host == url.host && $0.baseURL?.port == url.port }
+        for server in sameAddress.isEmpty ? servers : sameAddress {
+            for title in PlexLibraryIndex.shared.titlesByServerID[server.id] ?? [] {
+                if let item = title.items.first(where: { $0.partKey == url.path }) {
+                    return Entry(serverID: server.id, ratingKey: item.ratingKey, durationMs: item.durationMs)
+                }
+            }
+        }
+        return nil
     }
 
     /// A seek: report the new position now, whatever the heartbeat timing.
