@@ -17,6 +17,9 @@ struct MetaCompany: Identifiable, Equatable, Hashable {
 }
 
 struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
+    /// The role given to a series' creators (TMDB's "created by").
+    static let creatorRole = "Creator"
+
     var id: String { tmdbId.map(String.init) ?? name }
     let name: String
     let role: String?
@@ -496,7 +499,7 @@ enum TmdbDetailsService {
             guard let name = nonEmpty(creator.name) else { return nil }
             return TmdbPersonMetadata(
                 name: name,
-                role: "Creator",
+                role: TmdbPersonMetadata.creatorRole,
                 profileURL: imageURL(creator.profilePath, size: "w500"),
                 tmdbId: creator.id
             )
