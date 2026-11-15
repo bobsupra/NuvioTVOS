@@ -10576,8 +10576,6 @@ private struct TvStreamPickerOverlay: View {
     @State private var ratingOrderRevision: UInt64 = 0
     @State private var showingP2PConsent = false
     @State private var pendingTorrentSelection: (stream: NuvioStream, player: ExternalPlayer?)? = nil
-    @State private var focusedStreamWarmTask: Task<Void, Never>? = nil
-    @State private var focusedStreamWarmToken: UUID? = nil
 
 
     private let filterAllKey = "filter::all"
@@ -10770,31 +10768,8 @@ private struct TvStreamPickerOverlay: View {
                 if let newValue, newValue != filterAllKey, !didSeedStreamFocus {
                     didSeedStreamFocus = true
                 }
-                focusedStreamWarmTask?.cancel()
-                let focusedStream = newValue.flatMap { focusID -> NuvioStream? in
-                    if focusID == lastPlayedSourceRowFocusID { return lastPlayedSourceStream }
-                    guard let index = activeSourceRowFocusIDs.firstIndex(of: focusID) else { return nil }
-                    return activeSourceRows[index]
-                }
-                if let stream = focusedStream,
-                   let raw = stream.directURL,
-                   let url = URL(string: raw),
-                   ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
-                    let token = UUID()
-                    focusedStreamWarmToken = token
-                    let profileID = pickerProfileID ?? ProfileSettings.activeProfileID ?? ""
-                    let headers = stream.httpHeaders ?? [:]
-                    focusedStreamWarmTask = Task { @MainActor in
-                        try? await Task.sleep(nanoseconds: 300_000_000)
-                        guard !Task.isCancelled else { return }
-                        _ = await PlaybackStreamCacheManager.shared.warmRangeProbeMemo(
-                            url: url,
-                            headers: headers,
-                            profileID: profileID,
-                            token: token
-                        )
-                    }
-                }
+                // Focusing a source must not request its URL: even a small
+                // range probe can cause an add-on to add or download a release.
                 guard newValue == nil else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     if focusedItem == nil {
@@ -10818,12 +10793,6 @@ private struct TvStreamPickerOverlay: View {
         }
             .onDisappear {
                 pickerIsVisible = false
-                focusedStreamWarmTask?.cancel()
-                focusedStreamWarmTask = nil
-                if let token = focusedStreamWarmToken {
-                    PlaybackStreamCacheManager.discardRangeProbeMemo(token: token)
-                    focusedStreamWarmToken = nil
-                }
             }
             .onExitCommand(perform: onDismiss)
         }
