@@ -271,6 +271,14 @@ final class AIHomeCatalogStore: ObservableObject {
     /// Changes whenever Home should redraw the For You rows.
     @Published private(set) var revision = 0
     private var loadedProfileID: String?
+    /// Bumped when what a running build was for no longer holds (rows or the
+    /// AI turned off, settings changed, another profile). A build only saves
+    /// its rows if the generation it started with is still current.
+    private(set) var generation = 0
+    private var buildTask: Task<Void, Never>?
+    /// A refresh asked for while a build was running (true when forced), run
+    /// once it ends.
+    private var pendingRefresh: Bool?
 
     /// Home rows to show now, from the cache.
     func sections() -> [TVHomeSection] {
@@ -287,7 +295,10 @@ final class AIHomeCatalogStore: ObservableObject {
     /// or the history moved on. `force` rebuilds now (Settings > Refresh).
     func refreshIfNeeded(force: Bool = false) {
         reloadIfProfileChanged()
-        guard !isBuilding else { return }
+        guard !isBuilding else {
+            pendingRefresh = force || pendingRefresh == true
+            return
+        }
         let configuration = SurpriseMeAIConfiguration.current()
         let kinds = AIHomeCatalogs.enabledKinds()
         guard configuration.isUsable, !kinds.isEmpty, TmdbDetailsService.isAvailableForSurpriseMe else { return }
@@ -310,12 +321,14 @@ final class AIHomeCatalogStore: ObservableObject {
         let context = SurpriseMeAIContext(profile: profile, history: history, feedback: feedback)
         let language = Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier) ?? "English"
         let profileID = loadedProfileID
+        let buildGeneration = generation
         let isWatched: @Sendable (NuvioMeta) -> Bool = { meta in
             history.contains(meta) || WatchedStore.contains(meta: meta)
         }
-        Task {
+        buildTask = Task {
             var rows: [AIHomeCatalogCache.Row] = []
             for kind in kinds {
+                guard !Task.isCancelled, buildGeneration == generation else { break }
                 let items = await AIHomeCatalogs.buildRow(
                     kind: kind,
                     context: context,
@@ -331,7 +344,10 @@ final class AIHomeCatalogStore: ObservableObject {
                 }
             }
             isBuilding = false
-            guard profileID == ProfileSettings.activeProfileID, !rows.isEmpty else { return }
+            buildTask = nil
+            defer { runPendingRefresh() }
+            guard buildGeneration == generation, !Task.isCancelled,
+                  profileID == ProfileSettings.activeProfileID, !rows.isEmpty else { return }
             let built = AIHomeCatalogCache(
                 rows: rows,
                 builtAt: Date(),
@@ -345,12 +361,15 @@ final class AIHomeCatalogStore: ObservableObject {
 
     /// Settings changed which rows are on: redraw Home, and build what's missing.
     func settingsChanged() {
+        invalidateRunningBuild()
         revision &+= 1
         refreshIfNeeded()
     }
 
     /// Settings turned a kind off or the AI off: forget rows that no longer apply.
+    /// A build already running is dropped, so it can't bring them back.
     func clear() {
+        invalidateRunningBuild()
         AIHomeCatalogs.saveCache(nil)
         cache = nil
     }
@@ -358,8 +377,20 @@ final class AIHomeCatalogStore: ObservableObject {
     private func reloadIfProfileChanged() {
         let profileID = ProfileSettings.activeProfileID
         guard loadedProfileID != profileID || (cache == nil && loadedProfileID == nil) else { return }
+        if loadedProfileID != profileID { invalidateRunningBuild() }
         loadedProfileID = profileID
         cache = AIHomeCatalogs.loadCache()
+    }
+
+    private func invalidateRunningBuild() {
+        generation &+= 1
+        buildTask?.cancel()
+    }
+
+    private func runPendingRefresh() {
+        guard let pending = pendingRefresh else { return }
+        pendingRefresh = nil
+        refreshIfNeeded(force: pending)
     }
 
     private static func currentHistory() -> SurpriseMeHistory {
