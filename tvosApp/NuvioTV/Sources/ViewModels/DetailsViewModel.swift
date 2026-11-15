@@ -1277,21 +1277,27 @@ class DetailsViewModel: ObservableObject {
         let mutationGeneration = watchlistMutationGeneration
         let requestGeneration = detailsRequestGeneration
         uiState.isInWatchlist = desiredMembership
-        TrackingAddonService.sendLibraryMembership(desiredMembership, meta: meta)
-        let previousMutation = watchlistMutationTask
-        watchlistMutationTask = Task { @MainActor in
-            if let previousMutation { await previousMutation.value }
-            guard !Task.isCancelled, context.isCurrent else { return }
-            let succeeded = await remoteWatchlistMutation(meta, desiredMembership)
-            guard !Task.isCancelled, context.isCurrent,
-                  watchlistMutationGeneration == mutationGeneration,
-                  detailsRequestGeneration == requestGeneration,
-                  uiState.meta?.id == meta.id,
-                  uiState.meta?.type == meta.type else { return }
-            if !succeeded, uiState.isInWatchlist == desiredMembership {
-                uiState.isInWatchlist = !desiredMembership
+        // Runs after earlier changes to this title; tracking add-ons hear of it
+        // only once the library service confirms it.
+        let mutation = remoteWatchlistMutation
+        watchlistMutationTask = TrackingAddonLibraryChanges.perform(
+            desiredMembership,
+            meta: meta,
+            mutation: {
+                guard context.isCurrent else { return false }
+                return await mutation(meta, desiredMembership)
+            },
+            completion: { [weak self] succeeded in
+                guard let self, !Task.isCancelled, context.isCurrent,
+                      self.watchlistMutationGeneration == mutationGeneration,
+                      self.detailsRequestGeneration == requestGeneration,
+                      self.uiState.meta?.id == meta.id,
+                      self.uiState.meta?.type == meta.type else { return }
+                if !succeeded, self.uiState.isInWatchlist == desiredMembership {
+                    self.uiState.isInWatchlist = !desiredMembership
+                }
             }
-        }
+        )
     }
 
     func toggleWatched(libraryContext: LibraryWatchedContext? = nil) {

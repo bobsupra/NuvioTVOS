@@ -3671,17 +3671,15 @@ struct TitleActionsMenuContent: View {
         guard SelectedLibraryService.isSelectedAndAuthenticated else { return }
 
         let desiredMembership = !currentlyInLibrary
-        TrackingAddonService.sendLibraryMembership(desiredMembership, meta: meta)
-        Task {
-            _ = await SelectedLibraryService.setWatchlist(
-                meta,
-                isInWatchlist: desiredMembership
-            )
+        let meta = meta
+        TrackingAddonLibraryChanges.perform(desiredMembership, meta: meta) {
+            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: desiredMembership)
         }
     }
 
+    /// Tracking add-ons hear of a watched change only once it is applied
+    /// (below), never for one that ends up not happening.
     private func scheduleWatchedToggle(desiredIsWatched: Bool) {
-        TrackingAddonService.sendWatched(desiredIsWatched, meta: meta)
         let capturedContext = libraryWatchedContext?.recaptureForCurrentAction()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
             guard libraryWatchedContext != nil else {
@@ -3701,10 +3699,9 @@ struct TitleActionsMenuContent: View {
                 }
                 guard !Task.isCancelled, capturedContext.isCurrent else { return }
                 guard !meta.isSeries || resolvedMeta.videos?.isEmpty == false else { return }
-                _ = capturedContext.setWatchedUsingCapturedAction(
-                    resolvedMeta,
-                    isWatched: desiredIsWatched
-                )
+                if capturedContext.setWatchedUsingCapturedAction(resolvedMeta, isWatched: desiredIsWatched) {
+                    TrackingAddonService.sendWatched(desiredIsWatched, meta: meta)
+                }
             }
         }
     }
@@ -3717,7 +3714,7 @@ struct TitleActionsMenuContent: View {
                 currentlyWatched: currentlyWatched,
                 desiredIsWatched: desiredIsWatched
             ) else { return }
-            _ = WatchedStore.toggle(meta: meta)
+            TrackingAddonService.sendWatched(WatchedStore.toggle(meta: meta), meta: meta)
             return
         }
 
@@ -3733,7 +3730,8 @@ struct TitleActionsMenuContent: View {
                 currentlyWatched: currentlyWatched,
                 desiredIsWatched: desiredIsWatched
             ) else { return }
-            _ = WatchedStore.toggle(meta: fullMeta)
+            let isWatched = WatchedStore.toggle(meta: fullMeta)
+            TrackingAddonService.sendWatched(isWatched, meta: meta)
         }
     }
 }
