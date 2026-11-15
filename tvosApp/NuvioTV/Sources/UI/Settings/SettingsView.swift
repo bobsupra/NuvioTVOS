@@ -15851,6 +15851,9 @@ private struct TrackingAddonsSettingsGroup: View {
 
     @State private var entries: [Entry] = []
     @State private var others: [OtherAddon] = []
+    /// Add-ons whose manifest couldn't be read: whether they track is unknown,
+    /// so they are neither offered for tracking nor listed as not tracking.
+    @State private var unreadable: [OtherAddon] = []
     @State private var didLoad = false
     @State private var approved: Set<String> = TrackingAddonService.approvedManifestURLs()
 
@@ -15875,6 +15878,26 @@ private struct TrackingAddonsSettingsGroup: View {
                                     value: "",
                                     accentColor: accentColor
                                 ) {}
+                            }
+                        }
+                    }
+                    if !unreadable.isEmpty {
+                        SettingsGroup(
+                            title: L10n.string("tvos_settings_tracking_addons_unknown", fallback: "Couldn't check"),
+                            subtitle: L10n.string(
+                                "tvos_settings_tracking_addons_unknown_subtitle",
+                                fallback: "Their manifest couldn't be read, so it isn't known whether they support tracking. Select one to check again."
+                            )
+                        ) {
+                            ForEach(unreadable) { addon in
+                                SettingsActionRow(
+                                    title: addon.name,
+                                    subtitle: addon.resources,
+                                    value: "",
+                                    accentColor: accentColor
+                                ) {
+                                    Task { await loadEntries() }
+                                }
                             }
                         }
                     }
@@ -15947,19 +15970,26 @@ private struct TrackingAddonsSettingsGroup: View {
         let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
         var loaded: [Entry] = []
         var otherAddons: [OtherAddon] = []
+        var unreadableAddons: [OtherAddon] = []
         for manifestURL in manifestURLs {
             let manifest = await TrackingAddonService.manifest(for: manifestURL)
             let trimmed = manifest?.name?.trimmingCharacters(in: .whitespacesAndNewlines)
             let name = (trimmed?.isEmpty == false ? trimmed : nil)
                 ?? CinemetaCatalogRepository.streamAddonName(for: manifestURL)
-            guard let manifest, manifest.isTrackingAddon else {
-                let resources = manifest?.resources.map(\.name).filter { !$0.isEmpty } ?? []
+            guard let manifest else {
+                unreadableAddons.append(OtherAddon(
+                    id: manifestURL.absoluteString,
+                    name: name,
+                    resources: L10n.string("tvos_settings_tracking_addons_unreadable", fallback: "Manifest couldn't be read")
+                ))
+                continue
+            }
+            guard manifest.isTrackingAddon else {
+                let resources = manifest.resources.map(\.name).filter { !$0.isEmpty }
                 otherAddons.append(OtherAddon(
                     id: manifestURL.absoluteString,
                     name: name,
-                    resources: manifest == nil
-                        ? L10n.string("tvos_settings_tracking_addons_unreadable", fallback: "Manifest couldn't be read")
-                        : (resources.isEmpty ? "—" : resources.joined(separator: ", "))
+                    resources: resources.isEmpty ? "—" : resources.joined(separator: ", ")
                 ))
                 continue
             }
@@ -15973,6 +16003,7 @@ private struct TrackingAddonsSettingsGroup: View {
         guard !Task.isCancelled else { return }
         entries = loaded
         others = otherAddons
+        unreadable = unreadableAddons
         didLoad = true
         approved = TrackingAddonService.approvedManifestURLs()
     }
