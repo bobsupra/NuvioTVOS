@@ -37,7 +37,15 @@ enum TVLayout {
 
 /// The UIKit scroll view under a SwiftUI ScrollView, found from a view in its content.
 final class TVScrollViewBox {
-    weak var scrollView: UIScrollView?
+    weak var scrollView: UIScrollView? {
+        didSet {
+            guard scrollView !== oldValue, let scrollView, oldValue != nil else { return }
+            onReplaced?(scrollView)
+        }
+    }
+
+    /// Called when SwiftUI put the content in another scroll view than the one found before.
+    var onReplaced: ((UIScrollView) -> Void)?
 }
 
 struct TVScrollViewFinder: UIViewRepresentable {
@@ -63,12 +71,15 @@ struct TVScrollViewFinder: UIViewRepresentable {
             findScrollView()
         }
 
+        /// Looked for again whenever this is on screen: SwiftUI may put the content in another
+        /// scroll view (Details while its metadata loads), and the one found first, kept alive
+        /// off screen, was moved instead of the one on screen.
         func findScrollView() {
-            guard let box, box.scrollView == nil else { return }
+            guard let box, window != nil else { return }
             var view = superview
             while let current = view {
                 if let scrollView = current as? UIScrollView {
-                    box.scrollView = scrollView
+                    if box.scrollView !== scrollView { box.scrollView = scrollView }
                     return
                 }
                 view = current.superview

@@ -118,28 +118,67 @@ struct TVScrollLock: UIViewRepresentable {
 
 /// A page's UIKit scroll view, and where each of its parts starts in its content, so the page
 /// can move to a part by Core Animation (with `TVScrollLock`, tvOS doesn't scroll it).
+///
+/// The page goes on following the part it was last asked to move to: asked before the part was
+/// laid out (metadata still loading, the main thread held up), it moves once the part's place is
+/// known; if the part moves later (the content above it changed), it moves with it.
 final class TVScrollTops {
     let scrollBox = TVScrollViewBox()
     private(set) var tops: [String: CGFloat] = [:]
+    private var target: Target?
 
-    /// `visibleMinY`: the part's top in the scroll view's own space (where it is on screen);
-    /// with the scroll's offset, where it is in the content.
-    func record(_ key: String, visibleMinY: CGFloat) {
-        tops[key] = visibleMinY + (scrollBox.scrollView?.contentOffset.y ?? 0)
+    private struct Target {
+        let key: String
+        let margin: CGFloat
+        let toTop: Bool
+    }
+
+    init() {
+        // The page's content put in another scroll view: that one goes where the page was.
+        scrollBox.onReplaced = { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                guard let self, let target = self.target else { return }
+                self.apply(target)
+            }
+        }
+    }
+
+    /// The page's scroll view, while it is on screen.
+    var scrollView: UIScrollView? {
+        guard let scrollView = scrollBox.scrollView, scrollView.window != nil else { return nil }
+        return scrollView
+    }
+
+    /// `contentMinY`: where the part starts in the page's content (`TVScrollTopReader`, in a
+    /// space on the content itself, so it doesn't change as the page scrolls).
+    func record(_ key: String, contentMinY: CGFloat) {
+        guard tops[key] != contentMinY else { return }
+        tops[key] = contentMinY
+        if let target, target.key == key, !target.toTop {
+            apply(target)
+        }
     }
 
     /// Moves the page so part `key` starts `margin` below the top of the screen, or to the very
-    /// top (`toTop`, the page's first part).
+    /// top (`toTop`, the page's first part). False while the page's scroll view, or the part's
+    /// place, isn't known yet: the move is made once the part's place comes.
     @discardableResult
     func move(to key: String, margin: CGFloat, toTop: Bool) -> Bool {
-        guard let scrollView = scrollBox.scrollView else { return false }
+        let target = Target(key: key, margin: margin, toTop: toTop)
+        self.target = target
+        return apply(target)
+    }
+
+    @discardableResult
+    private func apply(_ target: Target) -> Bool {
+        guard let scrollView else { return false }
         let inset = scrollView.adjustedContentInset
-        let target: CGFloat
-        if toTop {
-            target = -inset.top
+        let y: CGFloat
+        if target.toTop {
+            y = -inset.top
         } else {
-            guard let top = tops[key] else { return false }
-            target = top - margin - inset.top
+            guard let top = tops[target.key] else { return false }
+            y = top - target.margin - inset.top
         }
         // A scroll UIKit may be running (tvOS's for focus, were it ever on) stops where it is, so
         // it doesn't add up with the move.
@@ -147,13 +186,14 @@ final class TVScrollTops {
         let current = scrollView.contentOffset
         let maxY = max(-inset.top, scrollView.contentSize.height + inset.bottom - scrollView.bounds.height)
         // Already there (or going there: the move sets where the scroll ends at once).
-        guard abs(current.y - min(max(target, -inset.top), maxY)) >= 1 else { return true }
-        TVScrollMove.move(scrollView, to: CGPoint(x: current.x, y: target), animated: true)
+        guard abs(current.y - min(max(y, -inset.top), maxY)) >= 1 else { return true }
+        TVScrollMove.move(scrollView, to: CGPoint(x: current.x, y: y), animated: true)
         return true
     }
 }
 
-/// Records where the view starts in `space` (the page's scroll view) for `TVScrollTops`.
+/// Records where the view starts in `space`, a coordinate space on the page's content (put on
+/// the outermost view inside the scroll view), for `TVScrollTops`.
 struct TVScrollTopReader: ViewModifier {
     let key: String
     let tops: TVScrollTops
@@ -163,7 +203,7 @@ struct TVScrollTopReader: ViewModifier {
         content.onGeometryChange(for: CGFloat.self) { proxy in
             proxy.frame(in: .named(space)).minY
         } action: { minY in
-            tops.record(key, visibleMinY: minY)
+            tops.record(key, contentMinY: minY)
         }
     }
 }

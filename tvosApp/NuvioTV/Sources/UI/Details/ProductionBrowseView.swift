@@ -165,7 +165,7 @@ private struct CompanyBrowseContent: View {
                                 onSelect: onSelect
                             )
                             .equatable()
-                            .modifier(TVScrollTopReader(key: rail.id, tops: railTops, space: "company-browse-scroll"))
+                            .modifier(TVScrollTopReader(key: rail.id, tops: railTops, space: "company-browse-content"))
                         }
                     }
                 }
@@ -178,6 +178,7 @@ private struct CompanyBrowseContent: View {
                         .frame(width: 1, height: 1)
                         .allowsHitTesting(false)
                 }
+                .coordinateSpace(name: "company-browse-content")
             }
             .focusSection()
             .coordinateSpace(name: "company-browse-scroll")
@@ -544,7 +545,7 @@ struct PersonBrowseView: View {
                                 onSelect: onSelect
                             )
                             .equatable()
-                            .modifier(TVScrollTopReader(key: rail.id, tops: railTops, space: "person-browse-scroll"))
+                            .modifier(TVScrollTopReader(key: rail.id, tops: railTops, space: "person-browse-content"))
                         }
                     }
                 }
@@ -557,6 +558,7 @@ struct PersonBrowseView: View {
                         .frame(width: 1, height: 1)
                         .allowsHitTesting(false)
                 }
+                .coordinateSpace(name: "person-browse-content")
             }
             .focusSection()
             .coordinateSpace(name: "person-browse-scroll")

@@ -4308,6 +4308,9 @@ struct TvDetailsContent: View {
     @State private var progressRevision = 0
     @State private var scrollOffset: CGFloat = 0
     @State private var hasAppearedBefore = false
+    /// Details just opened (or came back) asking for Play, and focus hasn't come to the actions
+    /// yet (`keepAskingForPlay`, `settleOpeningPlayFocus`).
+    @State private var openingPlayFocusPending = false
     /// Opened from the calendar before the title listed that episode (a
     /// cached copy shows first): focus it once the full title arrives.
     @State private var calendarFocusPending = false
@@ -5008,7 +5011,7 @@ struct TvDetailsContent: View {
                                     .modifier(TVScrollTopReader(
                                         key: String(describing: section),
                                         tops: detailsSectionTops,
-                                        space: "tv-details-scroll"
+                                        space: "tv-details-content"
                                     ))
                                 }
                             }
@@ -5051,6 +5054,8 @@ struct TvDetailsContent: View {
                             .padding(.bottom, 96)
                             .frame(width: detailsWidth(proxy, hasEpisodes: !episodes.isEmpty), alignment: .leading)
                             .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .topLeading)
+                            // Where the sections start in the content, for `moveDetails`.
+                            .coordinateSpace(name: "tv-details-content")
                         }
                         .scrollClipDisabledIfAvailable()
                         .coordinateSpace(name: "tv-details-scroll")
@@ -5129,6 +5134,8 @@ struct TvDetailsContent: View {
                     } else {
                         focusedDetailsSection = .actions
                         DispatchQueue.main.async { actionFocus = .play }
+                        openingPlayFocusPending = true
+                        keepAskingForPlay()
                     }
                 }
                 scheduleBackgroundTrailer(for: meta)
@@ -5149,7 +5156,11 @@ struct TvDetailsContent: View {
                 guard focusedDetailsSection == .actions, actionFocus == nil || actionFocus == .play else { return }
                 focusCalendarEpisode(key)
             }
+            .onChange(of: actionFocus) { _, focus in
+                settleOpeningPlayFocus(focus)
+            }
             .onDisappear {
+                openingPlayFocusPending = false
                 cancelRelatedFocusRestoration()
                 let seconds = trailerPlayer.currentTime().seconds
                 if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
@@ -5481,9 +5492,10 @@ struct TvDetailsContent: View {
     /// Moves Details to the top of the section focus went to (to the very top for the actions),
     /// by Core Animation: tvOS doesn't scroll Details (`TVScrollLock`), whose scroll for focus
     /// went frame by frame on the main thread and stuttered while the main thread built what
-    /// focus brought. tvOS still moves focus to a section off screen. Just after Details opened,
-    /// or a section was built, the section may not be laid out yet: tried again a few times
-    /// while focus stays there.
+    /// focus brought. tvOS still moves focus to a section off screen. A section not laid out yet
+    /// (metadata still loading, the main thread held up) is moved to once its place is known
+    /// (`TVScrollTops`); Details' scroll view not on screen yet (just after it opened), tried
+    /// again while focus stays in the section.
     private func moveDetails(to section: TvDetailsFocusSection, attempt: Int = 0) {
         let key: String
         if section == .actions {
@@ -5493,13 +5505,39 @@ struct TvDetailsContent: View {
         } else {
             return
         }
-        guard !detailsSectionTops.move(to: key, margin: 0, toTop: section == .actions),
-              attempt < 6 else { return }
+        let moved = detailsSectionTops.move(to: key, margin: 0, toTop: section == .actions)
+        guard !moved,
+              detailsSectionTops.scrollView == nil,
+              attempt < 40 else { return }
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(30))
+            try? await Task.sleep(for: .milliseconds(50))
             guard focusedDetailsSection == section else { return }
             moveDetails(to: section, attempt: attempt + 1)
         }
+    }
+
+    /// Play asked for again while focus is nowhere as Details opens: the first ask can find Play
+    /// not focusable yet, and nothing had focus until tvOS put it on Trailer by itself most of a
+    /// second later. Every 100 ms for up to two seconds, while focus stays out of the sections.
+    private func keepAskingForPlay(attempt: Int = 0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            guard openingPlayFocusPending else { return }
+            guard focusedDetailsSection == .actions, attempt < 20 else {
+                openingPlayFocusPending = false
+                return
+            }
+            if actionFocus == nil { actionFocus = .play }
+            keepAskingForPlay(attempt: attempt + 1)
+        }
+    }
+
+    /// Focus coming to the actions first as Details opens goes to Play: anywhere else (Trailer)
+    /// was tvOS's own pick, as a press from nowhere goes where the screen prefers.
+    private func settleOpeningPlayFocus(_ focus: DetailsActionFocus?) {
+        guard openingPlayFocusPending, let focus else { return }
+        openingPlayFocusPending = false
+        guard focus != .play else { return }
+        actionFocus = .play
     }
 
     /// The section below the one focus moved into, built now if it isn't yet.
@@ -6015,18 +6053,30 @@ private struct TvDetailsBackdrop: View {
                 // One sharp image throughout (switching between two versions of it when the
                 // blurred copy arrived could flash as Details opened); live blur only until the
                 // blurred copy is ready.
-                Image(uiImage: backdropImage)
-                    .resizable()
-                    .scaledToFill()
-                    .blur(radius: blurredBackdrop != nil ? 0 : blurRadius, opaque: true)
-                    .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                //
+                // The images fill the screen and no more: one taller than the screen (a poster
+                // as the backdrop, ~2700 points filled to the screen's width) made Details as
+                // tall, its scroll view too, and Details could no longer move to its sections.
+                Color.clear
+                    .overlay(alignment: .topLeading) {
+                        Image(uiImage: backdropImage)
+                            .resizable()
+                            .scaledToFill()
+                            .blur(radius: blurredBackdrop != nil ? 0 : blurRadius, opaque: true)
+                            .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                    }
+                    .clipped()
                     .ignoresSafeArea()
                 if let blurredBackdrop {
-                    Image(uiImage: blurredBackdrop)
-                        .resizable()
-                        .scaledToFill()
-                        .opacity(blurRadius > 0 ? 1 : 0)
-                        .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                    Color.clear
+                        .overlay(alignment: .topLeading) {
+                            Image(uiImage: blurredBackdrop)
+                                .resizable()
+                                .scaledToFill()
+                                .opacity(blurRadius > 0 ? 1 : 0)
+                                .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                        }
+                        .clipped()
                         .ignoresSafeArea()
                         .allowsHitTesting(false)
                 }
