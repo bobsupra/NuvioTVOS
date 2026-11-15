@@ -45,7 +45,7 @@ struct JellyfinSyncReport: Equatable {
     var unmatched: [String]
 }
 
-private struct JellyfinSyncCheckpoint: Codable {
+struct JellyfinSyncCheckpoint: Codable {
     struct Identity: Codable, Equatable {
         var profileID: String
         var serverID: String
@@ -80,7 +80,7 @@ private struct JellyfinSyncCheckpoint: Codable {
 /// that no checkpoint lists (the process stopped before the manifest was
 /// saved, the manifest is unreadable, or a reset stopped halfway) can still be
 /// found and removed for that profile and server alone.
-private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
+final class JellyfinSyncCheckpointStore: @unchecked Sendable {
     struct PageProgress {
         var found: Int
         var total: Int?
