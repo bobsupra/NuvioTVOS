@@ -80,6 +80,36 @@ final class PlexPlaybackSyncTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
+    func testInProgressTakesEachTitlesLatestEpisodeWithinSixteenWeeks() throws {
+        let now = Date(timeIntervalSince1970: 1_700_000_000)
+        func episode(_ key: String, _ number: Int) -> PlexIndexedItem {
+            PlexIndexedItem(ratingKey: key, partKey: "/library/parts/\(key)/1/file.mkv", container: nil, size: nil, durationMs: 600_000, season: 1, episode: number)
+        }
+        func show(_ key: String, _ items: [PlexIndexedItem]) -> PlexIndexedTitle {
+            PlexIndexedTitle(
+                contentId: "plex-\(serverID)-\(key)", serverID: serverID, libraryID: "4", libraryName: "TV", ratingKey: key,
+                type: "series", name: key, overview: nil, year: nil, genres: nil, rating: nil, contentRating: nil,
+                premiereDate: nil, durationMs: nil, imdbId: nil, tmdbId: nil, thumb: nil, art: nil, cast: nil, directors: nil,
+                items: items
+            )
+        }
+        try PlexLibraryIndex.shared.replace(titles: [
+            show("A", [episode("a1", 1), episode("a2", 2)]),
+            show("B", [episode("b1", 1)]),
+            show("C", [episode("c1", 1)])
+        ], forServerID: serverID)
+        let recent = Int64(now.timeIntervalSince1970) - 3600
+        PlexLibraryIndex.shared.setWatchStates([
+            "a1": PlexWatchState(viewOffsetMs: 60_000, lastViewedAt: recent - 100),
+            "a2": PlexWatchState(viewOffsetMs: 30_000, lastViewedAt: recent),          // A's latest
+            "b1": PlexWatchState(viewOffsetMs: 0, viewCount: 1, lastViewedAt: recent), // finished
+            "c1": PlexWatchState(viewOffsetMs: 90_000, lastViewedAt: recent - 17 * 7 * 24 * 3600) // too old
+        ], forServerID: serverID, merging: false)
+        let found = PlexLibraryIndex.shared.inProgress(now: now)
+        XCTAssertEqual(found.map(\.title.ratingKey), ["A"])
+        XCTAssertEqual(found.first?.item.ratingKey, "a2")
+    }
+
     func testFinishingMarksWatchedLocallyAndClearsThePosition() {
         sync.report(.playing, url: storedLink, currentTime: 100, duration: 600)
         sync.report(.stopped, url: storedLink, currentTime: 590, duration: 600)

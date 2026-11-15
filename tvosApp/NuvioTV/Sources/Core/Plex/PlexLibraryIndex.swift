@@ -213,6 +213,37 @@ final class PlexLibraryIndex: ObservableObject {
 
     static let watchStateChangedNotification = Notification.Name("nuvio.tv.plex.watchState.changed")
 
+    /// One title's most recently played movie or episode that Plex has a
+    /// saved position for.
+    struct InProgress: Equatable {
+        let title: PlexIndexedTitle
+        let item: PlexIndexedItem
+        let state: PlexWatchState
+    }
+
+    /// Plex's own Continue Watching leaves out anything not played for this
+    /// long (16 weeks by default).
+    nonisolated static let inProgressWindow: TimeInterval = 16 * 7 * 24 * 3600
+
+    /// Titles with a saved position on Plex, newest first, one entry per title.
+    func inProgress(now: Date = Date()) -> [InProgress] {
+        let cutoff = Int64(now.timeIntervalSince1970 - Self.inProgressWindow)
+        var result: [InProgress] = []
+        for title in titles() {
+            guard let states = watchStatesByServerID[title.serverID] else { continue }
+            let latest = title.items
+                .compactMap { item -> (PlexIndexedItem, PlexWatchState)? in
+                    guard let state = states[item.ratingKey], state.viewOffsetMs > 0, state.lastViewedAt >= cutoff else { return nil }
+                    return (item, state)
+                }
+                .max { $0.1.lastViewedAt < $1.1.lastViewedAt }
+            if let (item, state) = latest {
+                result.append(InProgress(title: title, item: item, state: state))
+            }
+        }
+        return result.sorted { $0.state.lastViewedAt > $1.state.lastViewedAt }
+    }
+
     /// The server, title, and item with this rating key (a movie or an episode).
     func locate(ratingKey: String, preferredHost: String? = nil) -> (server: PlexServerConfig, title: PlexIndexedTitle, item: PlexIndexedItem)? {
         let servers = PlexServerStore.shared.servers
