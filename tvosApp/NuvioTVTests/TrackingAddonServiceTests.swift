@@ -298,4 +298,29 @@ final class TrackingAddonServiceTests: XCTestCase {
         let sent = await recorder.events
         XCTAssertEqual(sent, [])
     }
+
+    // MARK: Events owned by another profile
+
+    func testAnEventGoesWhereItsOwnProfileConsentedEvenIfAnotherIsActive() {
+        let owner = "tracking-owner-\(UUID().uuidString)"
+        let other = "tracking-other-\(UUID().uuidString)"
+        defer {
+            for id in [owner, other] {
+                UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(id)")
+            }
+        }
+        let ownerDefaults = ProfileSettings.store(for: owner)
+        ownerDefaults.set(#"[{"url":"\#(manifestURL.absoluteString)","enabled":true}]"#, forKey: SettingsKey.streamAddonManifestStates)
+        TrackingAddonService.setApproved(true, manifestURL: manifestURL, in: ownerDefaults)
+        // The other profile has the add-on installed but never consented.
+        ProfileSettings.store(for: other).set(
+            #"[{"url":"\#(manifestURL.absoluteString)","enabled":true}]"#, forKey: SettingsKey.streamAddonManifestStates
+        )
+
+        let forOwner = TrackingAddonService.eventTargets(profileID: .some(owner))
+        XCTAssertEqual(forOwner.profileID, owner)
+        XCTAssertEqual(forOwner.manifestURLs, [manifestURL])
+        XCTAssertEqual(TrackingAddonService.eventTargets(profileID: .some(other)).manifestURLs, [])
+    }
 }
+

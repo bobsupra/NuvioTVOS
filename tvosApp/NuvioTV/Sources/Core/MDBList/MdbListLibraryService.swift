@@ -100,27 +100,47 @@ enum MdbListLibraryService {
         guard JSONSerialization.isValidJSONObject(body),
               let data = try? JSONSerialization.data(withJSONObject: body) else { return false }
 
+        let scope = profileScope ?? MdbListRuntimeSession.profileScope()
         let service = MdbListAuthService(
             client: client,
             store: store,
-            profileScope: profileScope ?? MdbListRuntimeSession.profileScope(),
+            profileScope: scope,
             tokenStorage: tokenStorage
         )
+        // The account this write is for (an OAuth link, or the API key). Its
+        // answer only updates the UI if the same account is still linked.
+        let owner = accountOwner(in: store, tokenStorage: tokenStorage, profileScope: scope)
         do {
             let response = try await service.authorizedRequest(
                 path: isInWatchlist ? "/watchlist/items/add" : "/watchlist/items/remove",
                 method: .post,
                 body: data
             )
-            guard (200..<300).contains(response.statusCode), ProfileSettings.isActiveStore(store) else { return false }
-            NotificationCenter.default.post(
-                name: mutationNotification,
-                object: MdbListLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
-            )
+            guard (200..<300).contains(response.statusCode) else { return false }
+            // MDBList applied it: that's the result, even if the profile switched or
+            // the account was relinked while the request was out. Only the active
+            // UI is left alone then.
+            if ProfileSettings.isActiveStore(store),
+               accountOwner(in: store, tokenStorage: tokenStorage, profileScope: scope) == owner {
+                NotificationCenter.default.post(
+                    name: mutationNotification,
+                    object: MdbListLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
+                )
+            }
             return true
         } catch {
             return false
         }
+    }
+
+    /// Identifies the linked account: the OAuth link's binding, or the API key
+    /// when there is no OAuth link. In memory only.
+    static func accountOwner(in store: UserDefaults, tokenStorage: MdbListTokenStorage, profileScope: String) -> String {
+        if tokenStorage.tokens(for: profileScope) != nil {
+            return "oauth:\(MdbListAuthStore.accountBindingID(in: store))"
+        }
+        let key = store.string(forKey: SettingsKey.mdbListApiKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return "key:\(key)"
     }
 
     static func isInWatchlist(

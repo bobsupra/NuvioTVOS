@@ -4733,8 +4733,22 @@ struct TraktLibraryService {
     /// Trakt as the library source, add/remove the title from Trakt's watchlist
     /// instead of writing only to the hidden local library.
     static func setWatchlist(_ meta: NuvioMeta, isInWatchlist: Bool) async -> Bool {
+        guard let context = await MainActor.run(body: { TraktLibraryMutationContext() }) else {
+            return false
+        }
+        return await setWatchlist(meta, isInWatchlist: isInWatchlist, context: context)
+    }
+
+    /// Writes to the account `context` captured, and only while it is still
+    /// current (checked on the main actor right before the request), so a
+    /// change started on one profile or account never writes to another.
+    static func setWatchlist(
+        _ meta: NuvioMeta,
+        isInWatchlist: Bool,
+        context: TraktLibraryMutationContext
+    ) async -> Bool {
         guard let body = watchlistMutation(for: meta),
-              let context = await MainActor.run(body: { TraktLibraryMutationContext() }) else {
+              await MainActor.run(body: { context.isCurrent }) else {
             return false
         }
 

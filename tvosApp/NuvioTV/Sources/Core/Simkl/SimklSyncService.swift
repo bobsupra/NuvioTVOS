@@ -2174,16 +2174,20 @@ struct SimklLibraryService {
                 path: isInWatchlist ? "sync/add-to-list" : "sync/history/remove",
                 body: body
             )
-            guard (200..<300).contains(status), service.isCurrentAuthorization(),
-                  TraktSettingsStore.librarySourceMode(in: store) == .simkl else { return false }
-            NotificationCenter.default.post(
-                name: TraktLibraryService.mutationNotification,
-                object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
-            )
-            NotificationCenter.default.post(
-                name: TraktSettingsStore.libraryChangedNotification,
-                object: nil
-            )
+            guard (200..<300).contains(status) else { return false }
+            // Simkl applied it: that's the result, even if the profile switched or
+            // the account was relinked while the request was out. Only the active
+            // UI is left alone then, since it no longer shows this library.
+            if service.isCurrentAuthorization(), TraktSettingsStore.librarySourceMode(in: store) == .simkl {
+                NotificationCenter.default.post(
+                    name: TraktLibraryService.mutationNotification,
+                    object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
+                )
+                NotificationCenter.default.post(
+                    name: TraktSettingsStore.libraryChangedNotification,
+                    object: nil
+                )
+            }
             return true
         } catch {
             return false
@@ -2493,6 +2497,51 @@ enum SelectedLibraryService {
     }
 
     @MainActor
+    /// Writes for the owner `context` captured. The AniList id mapping can
+    /// take a while; once it's done, the write happens only if that profile
+    /// and account are still current, and always to the store, scope and
+    /// account captured, so it never lands in another profile's or account's
+    /// library while being reported for this one.
+    @MainActor
+    static func setWatchlist(
+        _ meta: NuvioMeta,
+        isInWatchlist: Bool,
+        context: SelectedLibraryMutationContext,
+        resolve: (NuvioMeta) async -> NuvioMeta = { await AniListService.libraryMeta(for: $0) },
+        write: (NuvioMeta, Bool, LibraryWriteTarget) async -> Bool = { await writeWatchlist($0, isInWatchlist: $1, to: $2) }
+    ) async -> Bool {
+        let target = context.target
+        let resolved = await resolve(meta)
+        guard context.isCurrent else { return false }
+        return await write(resolved, isInWatchlist, target)
+    }
+
+    /// Writes to exactly `target`; never reads the active profile.
+    static func writeWatchlist(_ meta: NuvioMeta, isInWatchlist: Bool, to target: LibraryWriteTarget) async -> Bool {
+        switch target.source {
+        case .local:
+            return false
+        case .trakt:
+            guard let trakt = target.trakt else { return false }
+            return await TraktLibraryService.setWatchlist(meta, isInWatchlist: isInWatchlist, context: trakt)
+        case .simkl:
+            return await SimklLibraryService.setWatchlist(
+                meta, isInWatchlist: isInWatchlist, store: target.store, profileScope: target.profileScope
+            )
+        case .mdblist:
+            return await MdbListLibraryService.setWatchlist(
+                meta, isInWatchlist: isInWatchlist, store: target.store, profileScope: target.profileScope
+            )
+        case .wetrakr:
+            return await WeTrakrLibraryService.setWatchlist(
+                meta, isInWatchlist: isInWatchlist, store: target.store, profileScope: target.profileScope
+            )
+        }
+    }
+
+    /// Writes for whichever profile and account are active when the mapping
+    /// finishes. Prefer `setWatchlist(_:isInWatchlist:context:)` for anything
+    /// that is queued or reported later; no app code calls this one any more.
     static func setWatchlist(_ meta: NuvioMeta, isInWatchlist: Bool) async -> Bool {
         // An AniList title goes by the IMDb/TMDB ids it maps to.
         let meta = await AniListService.libraryMeta(for: meta)

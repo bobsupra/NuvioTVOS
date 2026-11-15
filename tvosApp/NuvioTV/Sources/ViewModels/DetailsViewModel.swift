@@ -470,7 +470,7 @@ class DetailsViewModel: ObservableObject {
     private let deferredPreparationDelay: AsyncDelay
     private let injectedEnrichmentStarter: EnrichmentStarter?
     private let watchlistContext: @MainActor () -> SelectedLibraryMutationContext?
-    private let remoteWatchlistMutation: @MainActor (NuvioMeta, Bool) async -> Bool
+    private let remoteWatchlistMutation: @MainActor (NuvioMeta, Bool, SelectedLibraryMutationContext) async -> Bool
 
     init(
         repository: CatalogRepository,
@@ -482,8 +482,8 @@ class DetailsViewModel: ObservableObject {
         watchlistContext: @escaping @MainActor () -> SelectedLibraryMutationContext? = {
             SelectedLibraryMutationContext()
         },
-        remoteWatchlistMutation: @escaping @MainActor (NuvioMeta, Bool) async -> Bool = { meta, membership in
-            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: membership)
+        remoteWatchlistMutation: @escaping @MainActor (NuvioMeta, Bool, SelectedLibraryMutationContext) async -> Bool = { meta, membership, context in
+            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: membership, context: context)
         }
     ) {
         self.repository = repository
@@ -1277,21 +1277,29 @@ class DetailsViewModel: ObservableObject {
         let mutationGeneration = watchlistMutationGeneration
         let requestGeneration = detailsRequestGeneration
         uiState.isInWatchlist = desiredMembership
-        TrackingAddonService.sendLibraryMembership(desiredMembership, meta: meta)
-        let previousMutation = watchlistMutationTask
-        watchlistMutationTask = Task { @MainActor in
-            if let previousMutation { await previousMutation.value }
-            guard !Task.isCancelled, context.isCurrent else { return }
-            let succeeded = await remoteWatchlistMutation(meta, desiredMembership)
-            guard !Task.isCancelled, context.isCurrent,
-                  watchlistMutationGeneration == mutationGeneration,
-                  detailsRequestGeneration == requestGeneration,
-                  uiState.meta?.id == meta.id,
-                  uiState.meta?.type == meta.type else { return }
-            if !succeeded, uiState.isInWatchlist == desiredMembership {
-                uiState.isInWatchlist = !desiredMembership
+        // Runs after earlier changes to this title; tracking add-ons hear of it
+        // only once the library service confirms it.
+        let mutation = remoteWatchlistMutation
+        let owner = TrackingAddonLibraryChanges.Owner(
+            profileID: ProfileSettings.activeProfileID,
+            isCurrent: { context.isCurrent }
+        )
+        watchlistMutationTask = TrackingAddonLibraryChanges.perform(
+            desiredMembership,
+            meta: meta,
+            owner: owner,
+            mutation: { await mutation(meta, desiredMembership, context) },
+            completion: { [weak self] succeeded in
+                guard let self, !Task.isCancelled, context.isCurrent,
+                      self.watchlistMutationGeneration == mutationGeneration,
+                      self.detailsRequestGeneration == requestGeneration,
+                      self.uiState.meta?.id == meta.id,
+                      self.uiState.meta?.type == meta.type else { return }
+                if !succeeded, self.uiState.isInWatchlist == desiredMembership {
+                    self.uiState.isInWatchlist = !desiredMembership
+                }
             }
-        }
+        )
     }
 
     func toggleWatched(libraryContext: LibraryWatchedContext? = nil) {
