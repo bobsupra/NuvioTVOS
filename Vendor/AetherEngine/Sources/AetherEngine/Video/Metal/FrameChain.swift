@@ -6,7 +6,16 @@ import Metal
 /// A chain of GPU stages over one decoded frame (AE#957, AE#1039): the 4:2:0 picture (8 or 10-bit) goes to
 /// RGB in a half-float texture, through each stage in order, and back to the input's pixel format at the
 /// target size, resampled bilinearly where the last stage does not land on it. Everything runs in one
-/// command buffer. Stages see gamma-coded RGB in 0...1 (SDR only, so there is no transfer handling).
+/// command buffer. Stages see the input's non-linear RGB in 0...1 (gamma or PQ coded); the chain does no
+/// transfer handling, and a stage that needs one (the tone map, on PQ) is built for it.
+///
+/// When no stage needs the RGB picture (`FrameChainStage.isIdentity`) and the size stays, one kernel does
+/// the whole round trip with the same arithmetic and no RGB texture between the passes. At 4K that texture
+/// is 66 MB written and read back per frame, which kept an A12 Apple TV's GPU busy about 10 ms per frame.
+/// No playback path builds such a chain yet: line art changes the picture and the size.
+/// Where the width and the picture's x origin are multiples of 4 (`roundTripIsWide`), that kernel moves
+/// four luma samples per access and folds the colour arithmetic: 2.7 ms instead of 4.0 on the A12, where
+/// the arithmetic, not the memory or the sampler, set the time.
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 final class FrameChain {
 
@@ -28,7 +37,12 @@ final class FrameChain {
     private let kernels: FrameChainKernels
     private let textureCache: CVMetalTextureCache
     private let stages: [any FrameChainStage]
-    private let rgb: MTLTexture
+    /// Nil when the chain runs as one round-trip kernel (`isRoundTripOnly`).
+    private let rgb: MTLTexture?
+    /// One kernel from the input planes to the output planes, no RGB texture.
+    let isRoundTripOnly: Bool
+    /// The tone map the round-trip kernel runs on each sample, when a stage fuses one into it.
+    private let roundTripToneMap: FrameChainToneMapParams?
     private var outputPools: [OSType: CVPixelBufferPool] = [:]
 
     /// The formats the chain reads and writes: 8 and 10-bit bi-planar 4:2:0, video and full range.
@@ -37,8 +51,9 @@ final class FrameChain {
         kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
     ]
 
+    /// `fusesRoundTrip: false` keeps the two passes even where one kernel would do; for comparing the two.
     init(device: MTLDevice, queue: MTLCommandQueue, sourceWidth: Int, sourceHeight: Int,
-         targetWidth: Int, targetHeight: Int, stages: [any FrameChainStage]) throws {
+         targetWidth: Int, targetHeight: Int, stages: [any FrameChainStage], fusesRoundTrip: Bool = true) throws {
         guard let kernels = FrameChainKernels.shared(for: device) else { throw Failure("chain kernels not built") }
         var cache: CVMetalTextureCache?
         guard CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &cache) == kCVReturnSuccess, let cache
@@ -53,9 +68,15 @@ final class FrameChain {
         self.targetWidth = targetWidth
         self.targetHeight = targetHeight
         self.stages = stages
-        rgb = try Self.texture(device, sourceWidth, sourceHeight)
+        let toneMaps = stages.compactMap(\.fusedToneMap)
+        isRoundTripOnly = fusesRoundTrip && toneMaps.count <= 1
+            && stages.allSatisfy { $0.isIdentity || $0.fusedToneMap != nil }
+            && sourceWidth == targetWidth && sourceHeight == targetHeight
+        roundTripToneMap = isRoundTripOnly ? toneMaps.first : nil
+        rgb = isRoundTripOnly ? nil : try Self.texture(device, sourceWidth, sourceHeight)
         var size = (sourceWidth, sourceHeight)
-        for (i, stage) in stages.enumerated() {
+        // The one kernel runs a fused stage's arithmetic itself: nothing to allocate.
+        for (i, stage) in stages.enumerated() where !isRoundTripOnly {
             let last = i == stages.count - 1
             size = try stage.prepare(device: device, kernels: kernels, input: size,
                                      finalTarget: last ? (targetWidth, targetHeight) : nil)
@@ -71,9 +92,20 @@ final class FrameChain {
         return t
     }
 
+    /// The colour volume the chain's output fits in: the last stage that declares one sets it.
+    var outputColorVolume: FrameChainColorVolume {
+        FrameChainColorVolume.ofChain(stages.map(\.outputColorVolume))
+    }
+
+    /// Gives `output` the attachments of `input`, minus its geometry keys, with the HDR10 metadata of
+    /// `outputColorVolume`. Callers run it on every buffer `process` returns.
+    func attach(from input: CVPixelBuffer, to output: CVPixelBuffer) {
+        FrameChainOutputAttachments.carry(from: input, to: output, volume: outputColorVolume)
+    }
+
     /// `picture` is the region of `input` the chain scales (the clean aperture), with an even origin.
-    /// Returns a buffer of the input's format at the target size, attachments left to the caller, and
-    /// the command buffer's GPU time in milliseconds.
+    /// Returns a buffer of the input's format at the target size, its attachments not yet set (`attach`
+    /// replaces them), and the command buffer's GPU time in milliseconds.
     func process(_ input: CVPixelBuffer, picture: FrameUpscaler.PictureRegion) throws -> (CVPixelBuffer, Double) {
         let format = CVPixelBufferGetPixelFormatType(input)
         guard Self.supportedFormats.contains(format) else { throw Failure("pixel format \(format) not supported") }
@@ -89,28 +121,46 @@ final class FrameChain {
         let output = try makeOutput(format: format)
         let lumaFormat: MTLPixelFormat = tenBit ? .r16Unorm : .r8Unorm
         let chromaFormat: MTLPixelFormat = tenBit ? .rg16Unorm : .rg8Unorm
-        let iy = try planeTexture(input, plane: 0, format: lumaFormat)
+        // The wide round trip sees luma and the output chroma as 4-sample texels (2 CbCr pairs for chroma).
+        let wide = rgb == nil && Self.roundTripIsWide(targetWidth: targetWidth, pictureX: picture.x)
+        let wideFormat: MTLPixelFormat = tenBit ? .rgba16Unorm : .rgba8Unorm
+        let iy = try planeTexture(input, plane: 0, format: wide ? wideFormat : lumaFormat, widthDivisor: wide ? 4 : 1)
         let ic = try planeTexture(input, plane: 1, format: chromaFormat)
-        let oy = try planeTexture(output, plane: 0, format: lumaFormat)
-        let oc = try planeTexture(output, plane: 1, format: chromaFormat)
+        let oy = try planeTexture(output, plane: 0, format: wide ? wideFormat : lumaFormat, widthDivisor: wide ? 4 : 1)
+        let oc = try planeTexture(output, plane: 1, format: wide ? wideFormat : chromaFormat, widthDivisor: wide ? 2 : 1)
 
         guard let cb = queue.makeCommandBuffer(), let enc = cb.makeComputeCommandEncoder() else {
             throw Failure("no command buffer")
         }
         enc.setBytes(&params, length: MemoryLayout<FrameChainColorParams>.size, index: 0)
-        Self.dispatch(enc, kernels.toRGB, textures: [iy.0, ic.0, rgb], grid: (sourceWidth, sourceHeight))
-        var current = rgb
-        var written = false
-        for (i, stage) in stages.enumerated() {
-            if i == stages.count - 1, stage.encodeFinal(enc, input: current, luma: oy.0, chroma: oc.0) {
-                written = true
-            } else {
-                current = stage.encode(enc, input: current)
+        if let rgb {
+            Self.dispatch(enc, kernels.toRGB, textures: [iy.0, ic.0, rgb], grid: (sourceWidth, sourceHeight))
+            var current = rgb
+            var written = false
+            for (i, stage) in stages.enumerated() {
+                if i == stages.count - 1, stage.encodeFinal(enc, input: current, luma: oy.0, chroma: oc.0) {
+                    written = true
+                } else {
+                    current = stage.encode(enc, input: current)
+                }
             }
-        }
-        if !written {
-            enc.setBytes(&params, length: MemoryLayout<FrameChainColorParams>.size, index: 0)
-            Self.dispatch(enc, kernels.toYCbCr, textures: [current, oy.0, oc.0], grid: (targetWidth / 2, targetHeight / 2))
+            if !written {
+                enc.setBytes(&params, length: MemoryLayout<FrameChainColorParams>.size, index: 0)
+                Self.dispatch(enc, kernels.toYCbCr, textures: [current, oy.0, oc.0],
+                              grid: (targetWidth / 2, targetHeight / 2))
+            }
+        } else {
+            if var toneMap = roundTripToneMap {
+                enc.setBytes(&toneMap, length: MemoryLayout<FrameChainToneMapParams>.size, index: 1)
+            }
+            let mapped = roundTripToneMap != nil
+            if wide {
+                Self.dispatch(enc, mapped ? kernels.roundTripWideToneMapped : kernels.roundTripWide,
+                              textures: [iy.0, ic.0, oy.0, oc.0], grid: (targetWidth / 4, targetHeight / 2))
+            } else {
+                Self.dispatch(enc, mapped ? kernels.roundTripToneMapped : kernels.roundTrip,
+                              textures: [iy.0, ic.0, oy.0, oc.0], grid: (targetWidth / 2, targetHeight / 2))
+            }
         }
         enc.endEncoding()
         cb.commit()
@@ -124,6 +174,12 @@ final class FrameChain {
         return (output, max(0, (cb.gpuEndTime - cb.gpuStartTime) * 1000))
     }
 
+    /// The wide round trip reads luma four samples at a time, so the width and the picture's x origin
+    /// must land on those texels.
+    static func roundTripIsWide(targetWidth: Int, pictureX: Int) -> Bool {
+        targetWidth % 4 == 0 && pictureX % 4 == 0
+    }
+
     static func dispatch(_ encoder: MTLComputeCommandEncoder, _ pipeline: MTLComputePipelineState,
                          textures: [MTLTexture], grid: (Int, Int)) {
         encoder.setComputePipelineState(pipeline)
@@ -134,9 +190,10 @@ final class FrameChain {
                                 threadsPerThreadgroup: MTLSize(width: w, height: h, depth: 1))
     }
 
-    private func planeTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat) throws -> (MTLTexture, CVMetalTexture) {
+    private func planeTexture(_ buffer: CVPixelBuffer, plane: Int, format: MTLPixelFormat,
+                              widthDivisor: Int = 1) throws -> (MTLTexture, CVMetalTexture) {
         var ref: CVMetalTexture?
-        let w = CVPixelBufferGetWidthOfPlane(buffer, plane), h = CVPixelBufferGetHeightOfPlane(buffer, plane)
+        let w = CVPixelBufferGetWidthOfPlane(buffer, plane) / widthDivisor, h = CVPixelBufferGetHeightOfPlane(buffer, plane)
         guard CVMetalTextureCacheCreateTextureFromImage(
                 kCFAllocatorDefault, textureCache, buffer, nil, format, w, h, plane, &ref) == kCVReturnSuccess,
               let ref, let texture = CVMetalTextureGetTexture(ref)
@@ -170,16 +227,28 @@ final class FrameChain {
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 protocol FrameChainStage: AnyObject {
     /// Allocates what the stage needs for an input of `input` size and returns its output size.
-    /// `finalTarget` is the chain's target size when this is the last stage, else nil.
+    /// `finalTarget` is the chain's target size when this is the last stage, else nil. Not called when the
+    /// chain runs as one round-trip kernel.
     func prepare(device: MTLDevice, kernels: FrameChainKernels, input: (Int, Int), finalTarget: (Int, Int)?) throws -> (Int, Int)
     func encode(_ encoder: MTLComputeCommandEncoder, input: MTLTexture) -> MTLTexture
+    /// True for a stage that leaves every sample as it is: a chain of only such stages needs no RGB texture.
+    var isIdentity: Bool { get }
     /// The last stage may write the output planes itself (the colour parameters are bound at buffer 0),
     /// which spares the chain a target-size RGB texture. False leaves the conversion to the chain.
     func encodeFinal(_ encoder: MTLComputeCommandEncoder, input: MTLTexture, luma: MTLTexture, chroma: MTLTexture) -> Bool
+    /// The colour volume of what the stage outputs; the chain writes the frames' HDR10 metadata from it.
+    /// A stage that changes the picture's brightness or gamut must declare it.
+    var outputColorVolume: FrameChainColorVolume { get }
+    /// A per-pixel stage the one round-trip kernel can run on each sample instead of `encode`: a chain of
+    /// identity stages and one such stage, at its own size, needs no RGB texture.
+    var fusedToneMap: FrameChainToneMapParams? { get }
 }
 
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 extension FrameChainStage {
+    var isIdentity: Bool { false }
+    var outputColorVolume: FrameChainColorVolume { .unchanged }
+    var fusedToneMap: FrameChainToneMapParams? { nil }
     func encodeFinal(_ encoder: MTLComputeCommandEncoder, input: MTLTexture, luma: MTLTexture, chroma: MTLTexture) -> Bool {
         false
     }
@@ -188,10 +257,47 @@ extension FrameChainStage {
 /// Hands its input on unchanged. A chain of only this stage is the plain colour round trip.
 @available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
 final class PassThroughStage: FrameChainStage {
+    var isIdentity: Bool { true }
     func prepare(device: MTLDevice, kernels: FrameChainKernels, input: (Int, Int), finalTarget: (Int, Int)?) throws -> (Int, Int) {
         input
     }
     func encode(_ encoder: MTLComputeCommandEncoder, input: MTLTexture) -> MTLTexture { input }
+}
+
+/// AE#957: BT.2390 tone mapping from the source's peak to a target peak (`BT2390ToneCurve`), on the PQ-coded
+/// RGB of an HDR10 frame. It declares the mapped picture's HDR10 metadata, so the display does not tone map
+/// again. Per pixel and without a branch, so its cost does not depend on the picture, and a chain of it and
+/// identity stages at its own size runs it inside the one round-trip kernel (`frameChainRoundTrip` with
+/// `toneMapsInRoundTrip`).
+@available(tvOS 26, iOS 26, macOS 26, visionOS 26, *)
+final class ToneMapStage: FrameChainStage {
+    let curve: BT2390ToneCurve
+    let outputColorVolume: FrameChainColorVolume
+    private var params: FrameChainToneMapParams
+    private var pipeline: MTLComputePipelineState?
+    private var output: MTLTexture?
+
+    /// `source` is the title's HDR10 metadata; the declared volume is that metadata after the curve.
+    init(curve: BT2390ToneCurve, source: HDR10StaticMetadata) {
+        self.curve = curve
+        params = FrameChainToneMapParams(curve)
+        outputColorVolume = .hdr10(curve.outputMetadata(from: source))
+    }
+
+    var fusedToneMap: FrameChainToneMapParams? { params }
+
+    func prepare(device: MTLDevice, kernels: FrameChainKernels, input: (Int, Int), finalTarget: (Int, Int)?) throws -> (Int, Int) {
+        pipeline = kernels.toneMap
+        output = try FrameChain.texture(device, input.0, input.1)
+        return input
+    }
+
+    func encode(_ encoder: MTLComputeCommandEncoder, input: MTLTexture) -> MTLTexture {
+        guard let pipeline, let output else { return input }
+        encoder.setBytes(&params, length: MemoryLayout<FrameChainToneMapParams>.size, index: 1)
+        FrameChain.dispatch(encoder, pipeline, textures: [input, output], grid: (output.width, output.height))
+        return output
+    }
 }
 
 /// The line-art scaler (`LineArtShaderSource`, Anime4K): with `restores`, its "mode A" in the small size:
@@ -324,6 +430,11 @@ struct FrameChainColorParams {
 final class FrameChainKernels: @unchecked Sendable {
     let toRGB: MTLComputePipelineState
     let toYCbCr: MTLComputePipelineState
+    let roundTrip: MTLComputePipelineState
+    let roundTripWide: MTLComputePipelineState
+    let roundTripToneMapped: MTLComputePipelineState
+    let roundTripWideToneMapped: MTLComputePipelineState
+    let toneMap: MTLComputePipelineState
     let lineArtConvolutions: [MTLComputePipelineState]
     let lineArtDepthToSpace: MTLComputePipelineState
     let lineArtOutput: MTLComputePipelineState
@@ -336,7 +447,9 @@ final class FrameChainKernels: @unchecked Sendable {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var byDevice: [UInt64: FrameChainKernels] = [:]
 
-    private init(toRGB: MTLComputePipelineState, toYCbCr: MTLComputePipelineState,
+    private init(toRGB: MTLComputePipelineState, toYCbCr: MTLComputePipelineState, roundTrip: MTLComputePipelineState,
+                 roundTripWide: MTLComputePipelineState, roundTripToneMapped: MTLComputePipelineState,
+                 roundTripWideToneMapped: MTLComputePipelineState, toneMap: MTLComputePipelineState,
                  lineArtConvolutions: [MTLComputePipelineState], lineArtDepthToSpace: MTLComputePipelineState,
                  lineArtOutput: MTLComputePipelineState, lineArtOutputClamped: MTLComputePipelineState,
                  restoreConvolutions: [MTLComputePipelineState], clampStatsRows: MTLComputePipelineState,
@@ -349,6 +462,11 @@ final class FrameChainKernels: @unchecked Sendable {
         self.clampHighlights = clampHighlights
         self.toRGB = toRGB
         self.toYCbCr = toYCbCr
+        self.roundTrip = roundTrip
+        self.roundTripWide = roundTripWide
+        self.roundTripToneMapped = roundTripToneMapped
+        self.roundTripWideToneMapped = roundTripWideToneMapped
+        self.toneMap = toneMap
         self.lineArtConvolutions = lineArtConvolutions
         self.lineArtDepthToSpace = lineArtDepthToSpace
     }
@@ -356,13 +474,16 @@ final class FrameChainKernels: @unchecked Sendable {
     static func shared(for device: MTLDevice) -> FrameChainKernels? {
         lock.lock(); defer { lock.unlock() }
         if let kernels = byDevice[device.registryID] { return kernels }
-        func pipeline(_ library: MTLLibrary, _ name: String, clamps: Bool? = nil) -> MTLComputePipelineState? {
+        /// `constants` are bool function constants by index: 0 `clampsHighlights`, 1 `toneMapsInRoundTrip`.
+        func pipeline(_ library: MTLLibrary, _ name: String, constants: [Int: Bool] = [:]) -> MTLComputePipelineState? {
             let function: MTLFunction?
-            if let clamps {
-                var value = clamps
-                let constants = MTLFunctionConstantValues()
-                constants.setConstantValue(&value, type: .bool, index: 0)
-                function = try? library.makeFunction(name: name, constantValues: constants)
+            if !constants.isEmpty {
+                let values = MTLFunctionConstantValues()
+                for (index, value) in constants {
+                    var v = value
+                    values.setConstantValue(&v, type: .bool, index: index)
+                }
+                function = try? library.makeFunction(name: name, constantValues: values)
             } else {
                 function = library.makeFunction(name: name)
             }
@@ -371,8 +492,13 @@ final class FrameChainKernels: @unchecked Sendable {
         guard let chain = try? device.makeLibrary(source: FrameChainShaderSource.source, options: nil),
               let lineArt = try? device.makeLibrary(source: LineArtShaderSource.source, options: nil),
               let toRGB = pipeline(chain, "frameChainToRGB"), let toYCbCr = pipeline(chain, "frameChainToYCbCr"),
-              let lineArtOutput = pipeline(chain, "frameChainLineArtOutput", clamps: false),
-              let lineArtOutputClamped = pipeline(chain, "frameChainLineArtOutput", clamps: true),
+              let roundTrip = pipeline(chain, "frameChainRoundTrip", constants: [1: false]),
+              let roundTripWide = pipeline(chain, "frameChainRoundTripWide", constants: [1: false]),
+              let roundTripToneMapped = pipeline(chain, "frameChainRoundTrip", constants: [1: true]),
+              let roundTripWideToneMapped = pipeline(chain, "frameChainRoundTripWide", constants: [1: true]),
+              let toneMap = pipeline(chain, "frameChainToneMap"),
+              let lineArtOutput = pipeline(chain, "frameChainLineArtOutput", constants: [0: false]),
+              let lineArtOutputClamped = pipeline(chain, "frameChainLineArtOutput", constants: [0: true]),
               let clampStatsRows = pipeline(chain, "frameChainClampStatsRows"),
               let clampStatsColumns = pipeline(chain, "frameChainClampStatsColumns"),
               let clampHighlights = pipeline(chain, "frameChainClampHighlights"),
@@ -383,7 +509,9 @@ final class FrameChainKernels: @unchecked Sendable {
         guard convolutions.count == LineArtShaderSource.convolutionKernels.count,
               restore.count == LineArtShaderSource.restoreKernels.count else { return nil }
         let kernels = FrameChainKernels(
-            toRGB: toRGB, toYCbCr: toYCbCr, lineArtConvolutions: convolutions, lineArtDepthToSpace: depthToSpace,
+            toRGB: toRGB, toYCbCr: toYCbCr, roundTrip: roundTrip, roundTripWide: roundTripWide,
+            roundTripToneMapped: roundTripToneMapped, roundTripWideToneMapped: roundTripWideToneMapped, toneMap: toneMap,
+            lineArtConvolutions: convolutions, lineArtDepthToSpace: depthToSpace,
             lineArtOutput: lineArtOutput, lineArtOutputClamped: lineArtOutputClamped, restoreConvolutions: restore,
             clampStatsRows: clampStatsRows, clampStatsColumns: clampStatsColumns, clampHighlights: clampHighlights)
         byDevice[device.registryID] = kernels
@@ -403,13 +531,33 @@ enum FrameChainShaderSource {
         float kr; float kb;
     };
 
+    // AE#957: BT2390ToneCurve.map on each PQ-coded component, its spline as one cubic (FrameChainToneMapParams).
+    // Both sides of the knee are computed and one is picked, so the cost does not depend on the picture.
+    // Below the knee the value comes back unchanged.
+    struct FrameChainToneMapParams {
+        float kneePQ; float xScale; float xOffset; float c0; float c1; float c2; float c3;
+    };
+    inline float3 frameChainToneMap(float3 e, constant FrameChainToneMapParams &t) {
+        float3 x = saturate(fma(e, float3(t.xScale), float3(-t.xOffset)));
+        float3 p = fma(fma(fma(float3(t.c3), x, float3(t.c2)), x, float3(t.c1)), x, float3(t.c0));
+        return select(p, e, e < t.kneePQ);
+    }
+    // The tone map as its own pass over the RGB texture, for a chain that keeps the two passes.
+    kernel void frameChainToneMap(constant FrameChainToneMapParams &t [[buffer(1)]],
+                                  texture2d<half, access::read> src [[texture(0)]],
+                                  texture2d<half, access::write> out [[texture(1)]],
+                                  uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= out.get_width() || gid.y >= out.get_height()) { return; }
+        out.write(half4(half3(frameChainToneMap(float3(src.read(gid).rgb), t)), 1.0h), gid);
+    }
+    // Set for the round-trip kernels that run a fused tone map; its parameters are at buffer 1. Each mapped
+    // sample is rounded to half, as the two passes store it, so both give the same picture.
+    constant bool toneMapsInRoundTrip [[function_constant(1)]];
+
     // The picture region starts at the origin (even); chroma is sampled at each luma sample's centre.
-    kernel void frameChainToRGB(constant FrameChainColorParams &p [[buffer(0)]],
-                                texture2d<float, access::read> yTex [[texture(0)]],
-                                texture2d<float, access::sample> cTex [[texture(1)]],
-                                texture2d<half, access::write> outTex [[texture(2)]],
-                                uint2 gid [[thread_position_in_grid]]) {
-        if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) { return; }
+    // Rounded to half, which is what the RGB texture holds.
+    inline half3 frameChainRGB(constant FrameChainColorParams &p, texture2d<float, access::read> yTex,
+                               texture2d<float, access::sample> cTex, uint2 gid) {
         constexpr sampler bilinear(coord::pixel, address::clamp_to_edge, filter::linear);
         uint2 origin = uint2(p.originX, p.originY);
         float y = (yTex.read(gid + origin).r * p.codeScale - p.yOffset) / p.yRange;
@@ -419,11 +567,55 @@ enum FrameChainShaderSource {
         float r = y + 2.0 * (1.0 - p.kr) * c.y;
         float b = y + 2.0 * (1.0 - p.kb) * c.x;
         float g = (y - p.kr * r - p.kb * b) / kg;
-        outTex.write(half4(half3(saturate(float3(r, g, b))), 1.0h), gid);
+        return half3(saturate(float3(r, g, b)));
+    }
+
+    kernel void frameChainToRGB(constant FrameChainColorParams &p [[buffer(0)]],
+                                texture2d<float, access::read> yTex [[texture(0)]],
+                                texture2d<float, access::sample> cTex [[texture(1)]],
+                                texture2d<half, access::write> outTex [[texture(2)]],
+                                uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= outTex.get_width() || gid.y >= outTex.get_height()) { return; }
+        outTex.write(half4(frameChainRGB(p, yTex, cTex, gid), 1.0h), gid);
     }
 
     inline float quantize(float v, float offset, float range, constant FrameChainColorParams &p) {
         return clamp(rint(v * range + offset), 0.0, p.maxCode) / p.codeScale;
+    }
+
+    // Four RGB samples of one 2x2 block to their Y samples and the block's CbCr.
+    inline void frameChainWriteBlock(constant FrameChainColorParams &p, float3 rgb[4], uint2 block,
+                                     texture2d<float, access::write> yTex, texture2d<float, access::write> cTex) {
+        float3 w = float3(p.kr, 1.0 - p.kr - p.kb, p.kb);
+        float3 sum = float3(0.0);
+        for (uint k = 0; k < 4; k++) {
+            sum += rgb[k];
+            yTex.write(float4(quantize(dot(rgb[k], w), p.yOffset, p.yRange, p), 0.0, 0.0, 1.0),
+                       block * 2 + uint2(k & 1, k >> 1));
+        }
+        float3 mean = sum * 0.25;
+        float y = dot(mean, w);
+        float cb = (mean.b - y) / (2.0 * (1.0 - p.kb));
+        float cr = (mean.r - y) / (2.0 * (1.0 - p.kr));
+        cTex.write(float4(quantize(cb, p.cOffset, p.cRange, p), quantize(cr, p.cOffset, p.cRange, p), 0.0, 1.0), block);
+    }
+
+    // The whole chain when no stage needs the RGB picture and the size stays: frameChainToRGB then
+    // frameChainToYCbCr for one 2x2 block, without the RGB texture between them.
+    kernel void frameChainRoundTrip(constant FrameChainColorParams &p [[buffer(0)]],
+                                    texture2d<float, access::read> yIn [[texture(0)]],
+                                    texture2d<float, access::sample> cIn [[texture(1)]],
+                                    texture2d<float, access::write> yOut [[texture(2)]],
+                                    texture2d<float, access::write> cOut [[texture(3)]],
+                                    constant FrameChainToneMapParams &t [[buffer(1), function_constant(toneMapsInRoundTrip)]],
+                                    uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x * 2 >= yOut.get_width() || gid.y * 2 >= yOut.get_height()) { return; }
+        float3 rgb[4];
+        for (uint k = 0; k < 4; k++) {
+            rgb[k] = float3(frameChainRGB(p, yIn, cIn, gid * 2 + uint2(k & 1, k >> 1)));
+            if (toneMapsInRoundTrip) { rgb[k] = float3(half3(frameChainToneMap(rgb[k], t))); }
+        }
+        frameChainWriteBlock(p, rgb, gid, yOut, cOut);
     }
 
     // One thread per 2x2 output luma block: the chain's last texture sampled bilinearly at the target size,
@@ -437,21 +629,79 @@ enum FrameChainShaderSource {
         if (base.x >= yTex.get_width() || base.y >= yTex.get_height()) { return; }
         constexpr sampler bilinear(coord::normalized, address::clamp_to_edge, filter::linear);
         float2 size = float2(yTex.get_width(), yTex.get_height());
-        float3 w = float3(p.kr, 1.0 - p.kr - p.kb, p.kb);
-        float3 sum = float3(0.0);
-        for (uint dy = 0; dy < 2; dy++) {
-            for (uint dx = 0; dx < 2; dx++) {
-                uint2 pos = base + uint2(dx, dy);
-                float3 rgb = saturate(inTex.sample(bilinear, (float2(pos) + 0.5) / size).rgb);
-                sum += rgb;
-                yTex.write(float4(quantize(dot(rgb, w), p.yOffset, p.yRange, p), 0.0, 0.0, 1.0), pos);
-            }
+        float3 rgb[4];
+        for (uint k = 0; k < 4; k++) {
+            uint2 pos = base + uint2(k & 1, k >> 1);
+            rgb[k] = saturate(inTex.sample(bilinear, (float2(pos) + 0.5) / size).rgb);
         }
-        float3 rgb = sum * 0.25;
-        float y = dot(rgb, w);
-        float cb = (rgb.b - y) / (2.0 * (1.0 - p.kb));
-        float cr = (rgb.r - y) / (2.0 * (1.0 - p.kr));
-        cTex.write(float4(quantize(cb, p.cOffset, p.cRange, p), quantize(cr, p.cOffset, p.cRange, p), 0.0, 1.0), gid);
+        frameChainWriteBlock(p, rgb, gid, yTex, cTex);
+    }
+
+    // frameChainRoundTrip for a 4x2 luma block, with luma and the output chroma as 4-sample texels and the
+    // colour arithmetic folded into per-thread coefficients; RGB still rounded to half, as the stages see it.
+    // On an A12 the arithmetic set this kernel's time, not the memory or the sampler.
+    struct FrameChainFolded {
+        float ys, yo, cs, co, rCr, gCb, gCr, bCb, cbScale, crScale, rcpCode;
+        float3 w;
+    };
+    inline FrameChainFolded frameChainFold(constant FrameChainColorParams &p) {
+        FrameChainFolded k;
+        k.ys = p.codeScale / p.yRange; k.yo = p.yOffset / p.yRange;
+        k.cs = p.codeScale / p.cRange; k.co = p.cOffset / p.cRange;
+        float kg = 1.0 - p.kr - p.kb;
+        k.rCr = 2.0 * (1.0 - p.kr); k.bCb = 2.0 * (1.0 - p.kb);
+        k.gCb = p.kb * k.bCb / kg; k.gCr = p.kr * k.rCr / kg;
+        k.cbScale = 1.0 / k.bCb; k.crScale = 1.0 / k.rCr;
+        k.rcpCode = 1.0 / p.codeScale;
+        k.w = float3(p.kr, kg, p.kb);
+        return k;
+    }
+    inline float3 frameChainFoldedRGB(thread const FrameChainFolded &k, float yRaw, float2 cRaw) {
+        float y = yRaw * k.ys - k.yo;
+        float2 c = cRaw * k.cs - k.co;
+        return float3(half3(saturate(float3(y + k.rCr * c.y, y - k.gCb * c.x - k.gCr * c.y, y + k.bCb * c.x))));
+    }
+    inline float frameChainFoldedQuantize(thread const FrameChainFolded &k, constant FrameChainColorParams &p,
+                                          float v, float range, float offset) {
+        return clamp(rint(v * range + offset), 0.0, p.maxCode) * k.rcpCode;
+    }
+    kernel void frameChainRoundTripWide(constant FrameChainColorParams &p [[buffer(0)]],
+                                        texture2d<float, access::read> yIn4 [[texture(0)]],
+                                        texture2d<float, access::sample> cIn [[texture(1)]],
+                                        texture2d<float, access::write> yOut4 [[texture(2)]],
+                                        texture2d<float, access::write> cOut2 [[texture(3)]],
+                                        constant FrameChainToneMapParams &t [[buffer(1), function_constant(toneMapsInRoundTrip)]],
+                                        uint2 gid [[thread_position_in_grid]]) {
+        if (gid.x >= yOut4.get_width() || gid.y * 2 >= yOut4.get_height()) { return; }
+        constexpr sampler bilinear(coord::pixel, address::clamp_to_edge, filter::linear);
+        FrameChainFolded k = frameChainFold(p);
+        uint2 inBase = uint2(gid.x + p.originX / 4, gid.y * 2 + p.originY);
+        float4 row0 = yIn4.read(inBase), row1 = yIn4.read(inBase + uint2(0, 1));
+        // Chroma at each luma sample's centre, in input coordinates.
+        float2 c0 = (float2(gid.x * 4 + p.originX, gid.y * 2 + p.originY) + 0.5) * 0.5;
+        float3 s[8];
+        for (uint i = 0; i < 4; i++) {
+            s[i] = frameChainFoldedRGB(k, row0[i], cIn.sample(bilinear, c0 + float2(i, 0) * 0.5).rg);
+            s[i + 4] = frameChainFoldedRGB(k, row1[i], cIn.sample(bilinear, c0 + float2(i, 1) * 0.5).rg);
+        }
+        if (toneMapsInRoundTrip) {
+            for (uint i = 0; i < 8; i++) { s[i] = float3(half3(frameChainToneMap(s[i], t))); }
+        }
+        float4 out0, out1;
+        for (uint i = 0; i < 4; i++) {
+            out0[i] = frameChainFoldedQuantize(k, p, dot(s[i], k.w), p.yRange, p.yOffset);
+            out1[i] = frameChainFoldedQuantize(k, p, dot(s[i + 4], k.w), p.yRange, p.yOffset);
+        }
+        yOut4.write(out0, uint2(gid.x, gid.y * 2));
+        yOut4.write(out1, uint2(gid.x, gid.y * 2 + 1));
+        float4 chroma;
+        for (uint b = 0; b < 2; b++) {
+            float3 mean = (s[b * 2] + s[b * 2 + 1] + s[b * 2 + 4] + s[b * 2 + 5]) * 0.25;
+            float y = dot(mean, k.w);
+            chroma[b * 2] = frameChainFoldedQuantize(k, p, (mean.b - y) * k.cbScale, p.cRange, p.cOffset);
+            chroma[b * 2 + 1] = frameChainFoldedQuantize(k, p, (mean.r - y) * k.crScale, p.cRange, p.cOffset);
+        }
+        cOut2.write(chroma, gid);
     }
 
     // Anime4K's Clamp_Highlights: the luma maximum over 5 samples, along rows then columns, at the source

@@ -962,6 +962,7 @@ extension AetherEngine {
             undecodableAudioStreamIndices: undecodableLiveAudioStreamIndices,
             audioBridgeMode: audioBridgeMode,
             objectAudioRendering: loadedOptions.objectAudioRendering,
+            rendersDTSXObjectAudio: loadedOptions.rendersDTSXObjectAudio,
             foldsDolbyVisionFEL: loadedOptions.foldsDolbyVisionFEL,
             panelPresentsHDR: panelPresentsHDR,
             stereoPresentation: loadedOptions.stereoPresentation,
@@ -1046,9 +1047,9 @@ extension AetherEngine {
         prepareDualLayerOutputRoute(session: session)
         // A load that fails or is superseded before the session is handed over stops only its own route: a
         // newer load may already have prepared the next one.
-        let preparedOutputRoute = dualLayerOutputRouteObject
+        let preparedOutputRoute = { [weak route = dualLayerOutputRouteObject] in route }
         var outputRouteHandedOver = false
-        defer { if !outputRouteHandedOver { stopDualLayerOutputRoute(ifStill: preparedOutputRoute) } }
+        defer { if !outputRouteHandedOver { stopDualLayerOutputRoute(ifStill: preparedOutputRoute()) } }
         // Audit Vcore-101: every hop below is dropped once this session has ended (`hop(for:)`).
         session.onFirstHDR10PlusDetected = { [weak self] in
             self?.hop(for: generation) { [weak self] in self?.handleHDR10PlusDetected() }
@@ -1975,6 +1976,18 @@ extension AetherEngine {
             }
             .store(in: &nativeCancellables)
 
+        // A 3D session refused at startup is rebuilt once in 2D (`fallBackToTwoDimensional`). Assigned on
+        // every mount, since a kept host still carries the previous session's flag.
+        host.armStereoRefusalFallback(session.stereoSignal != nil)
+        host.$pendingStereoRefusal
+            .compactMap { $0 }
+            .sink { [weak self] message in
+                self?.hop(for: generation) { [weak self] in
+                    await self?.fallBackToTwoDimensional(message, expectedGeneration: generation)
+                }
+            }
+            .store(in: &nativeCancellables)
+
         // #98: a display rejecting the served master fails the item at startup; reload the media
         // playlist in place instead of hard-failing. Gated + single-shot in fallBackToMediaPlaylist.
         host.$pendingDisplayRejection
@@ -2205,8 +2218,13 @@ extension AetherEngine {
         host.dolbyVisionHandling = loadedOptions.dolbyVisionHandling
         host.preferDualLayerDolbyVision = loadedOptions.preferDualLayerDolbyVision
         host.upscalePlan = upscaleRebuild.plan
+        let processingRebuild = VideoProcessingRouteDecision.forRebuild(
+            sessionPlan: sourceVideoProcessingPlan, optionOn: loadedOptions.videoProcessing != nil,
+            disabled: sourceVideoProcessingDisabled)
+        host.videoProcessingPlan = processingRebuild.plan
         host.elType = elType ?? sourceElType
         host.objectAudioRendering = loadedOptions.objectAudioRendering
+        host.rendersDTSXObjectAudio = loadedOptions.rendersDTSXObjectAudio
         host.setAudioDelay(loadedOptions.audioDelaySeconds)   // AE#464: before the decoder opens
         host.audioShaping = loadedOptions.audioShaping        // AE#923: likewise
         if isLive { host.liveEdgeCushionSeconds = loadedOptions.liveEdgeCushionSeconds }
@@ -2462,6 +2480,8 @@ extension AetherEngine {
         #endif
         if let status = upscaleRebuild.status { activeUpscale = status }
         wireUpscaleStatus(from: host)
+        if let status = processingRebuild.status { activeVideoProcessing = status }
+        wireVideoProcessingStatus(from: host)
         // The audio route is settled by `load`: an object-audio one keeps the HDMI link in Atmos.
         followAtmosOutput()
     }
@@ -2709,6 +2729,7 @@ host.audioShaping = loadedOptions.audioShaping
         let activeTrackToResume = activeSubtitleTrackIndex
         let reapplyOrdinalToRestore = nativeSubtitleReapplyOrdinal
         let reapplyMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
+        let markerOrdinalToRestore = nativeSubtitleMarkerOrdinal
         // #112 full umbau: an audio-track switch does not move the playhead, so the PGS line already on screen is
         // still valid. Snapshot the visible bitmap cues before stopInternal wipes them; they are restored after the
         // subtitle re-arm so the line stays up while the re-armed reader re-primes forward (old path reconstructed
@@ -2998,6 +3019,14 @@ host.audioShaping = loadedOptions.audioShaping
                     attemptWhenUnproven: loadedOptions.attemptsHDRMasterOnUnprovenPanel,
                     displayEligibleForHDR: sessionDisplayEligibleForHDR,
                     panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
+                // AE#1061: a rebuild that superseded its load before the handshake settled has no load-time
+                // answer, and without this line the media route it then takes reads like any other.
+                if sessionObservedDisplayCaps == nil, sourceVideoFormat != .sdr {
+                    EngineLog.emit(
+                        "[DisplayCriteria] reload found no load-time panel answer (the load it replaced never "
+                        + "settled its route): an HDR source routes as on an SDR panel (#1061)",
+                        category: .session)
+                }
                 if reloadRoutingPanelHDR != loadedOptions.panelIsInHDRMode {
                     EngineLog.emit(
                         "[DisplayCriteria] AE#541 reload routes on the load's panel answer: panelIsHDR="
@@ -3169,6 +3198,7 @@ host.audioShaping = loadedOptions.audioShaping
         restoreSecondarySubtitleAfterRebuild(
             externalID: secondaryToResume.externalID, sidecarURL: secondaryToResume.sidecarURL,
             embeddedIndex: secondaryToResume.embeddedIndex, startAt: preSwitchSourceTime)
+        nativeSubtitleMarkerOrdinal = markerOrdinalToRestore   // AE#1052: before the replay reads it
         // #170: replay the native-rendition pick onto the rebuilt item, the way the #65 recovery
         // does; the table was rebuilt from the preserved track list, so a rendering-derived
         // ordinal recomputes to the same rendition and a host-positional one replays as-is.
@@ -3183,7 +3213,7 @@ host.audioShaping = loadedOptions.audioShaping
                 "[AetherEngine] #170 re-applying native subtitle ordinal=\(ordinal) after audio-switch reload",
                 category: .engine
             )
-            setNativeSubtitleSelected(track: ordinal)
+            applyNativeSubtitleSelection(track: ordinal)
         }
         return nil
     }

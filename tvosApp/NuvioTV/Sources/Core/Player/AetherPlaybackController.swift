@@ -3883,7 +3883,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     var supportsAudioProcessing: Bool {
-        engine.supportsAudioProcessing || (engine.videoRoute != .remoteBypass && engine.videoRoute != .none)
+        engine.videoRoute != .remoteBypass && engine.playbackBackend != .none
     }
 
     var playbackDebugInfo: PlaybackDebugInfo {
@@ -5555,15 +5555,6 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {
         currentDialogueMode = dialogue
         currentReduceLoud = reduceLoud
-        if engine.supportsAudioProcessing {
-            let mode: AudioDialogueEnhancement
-            switch dialogue {
-            case .off: mode = .off
-            case .enhance: mode = .enhance
-            case .boost: mode = .boost
-            }
-            engine.setAudioProcessing(dialogue: mode, reduceLoudSounds: reduceLoud)
-        }
         let shaping = currentAudioShaping(dialogue: dialogue, reduceLoud: reduceLoud)
         engine.setAudioShaping(shaping)
     }

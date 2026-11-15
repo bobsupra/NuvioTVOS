@@ -31,6 +31,11 @@ final class DocumentedConstantsTests: XCTestCase {
         assertDocumented("Quarantine is bounded to 96 MiB and 10,000 packets", try documentation())
     }
 
+    func testEndedSwitchFlagGraceMatchesDocumentation() throws {
+        XCTAssertEqual(DisplayCriteriaController.endedSwitchFlagGraceMs, 1000)
+        assertDocumented("until one second after the recorded end", try documentation())
+    }
+
     func testSoftwarePositioningBudgetMatchesDocumentation() throws {
         XCTAssertEqual(SoftwarePlaybackHost.seekBudgetSeconds, 30)
         assertDocumented("**30 s positioning\nbudget**", try documentation())
@@ -205,6 +210,32 @@ final class DocumentedConstantsTests: XCTestCase {
         let docs = try documentation()
         assertDocumented("two clocks more than 60 s apart", docs)
         assertDocumented("stops holding the other back after 10 s of its media", docs)
+    }
+
+    /// docs/architecture-software.md quotes how many key frames the HDR10 static metadata scan reads (AE#957).
+    func testHDR10KeyFrameScanMatchesDocumentation() throws {
+        XCTAssertEqual(HDR10StaticMetadataSEI.keyFramesToScan, 3)
+        assertDocumented("then from the first 3 key frames", try documentation())
+    }
+
+    /// docs/cli.md quotes the bench gate's floor (AE#957).
+    func testBenchRegressionFloorMatchesDocumentation() throws {
+        XCTAssertEqual(PerFrameBenchmarkReport.regressionFloorMicroseconds, 50)
+        assertDocumented("by more than the tolerance and by more than 50 us", try documentation())
+    }
+
+    /// docs/architecture-software.md and docs/cli.md quote the tone curve's knee, the probe's default target
+    /// and the bench's curve (AE#957).
+    func testToneMapNumbersMatchDocumentation() throws {
+        let docs = try documentation()
+        let curve = try XCTUnwrap(BT2390ToneCurve(sourcePeakNits: 1000, targetPeakNits: 600))
+        let knee = BT2390ToneCurve.nits(pq: curve.kneeStart * curve.sourcePeakPQ)
+        XCTAssertEqual(knee.rounded(), 464)
+        assertDocumented("A 1000 nit source to a 600 nit target starts rolling off at 464 nit", docs)
+        XCTAssertEqual(HDR10ProbeSettings.defaultTargetPeakNits, 600)
+        assertDocumented("`AETHER_HDR10_PROBE_TARGET` nit (600 by default)", docs)
+        XCTAssertEqual(PerFrameBenchmark.toneMapCurve, curve)
+        assertDocumented("a 1000 nit master to a 600 nit target", docs)
     }
 
     // MARK: - Documentation corpus

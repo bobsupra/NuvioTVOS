@@ -1185,6 +1185,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         undecodableAudioStreamIndices: Set<Int32> = [],
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         objectAudioRendering: ObjectAudioRendering = .off,
+        rendersDTSXObjectAudio: Bool = true,
         foldsDolbyVisionFEL: Bool = true,
         panelPresentsHDR: Bool = false,
         stereoPresentation: StereoPresentation = .automatic,
@@ -1252,6 +1253,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.undecodableAudioStreamIndices = undecodableAudioStreamIndices
         self.audioBridgeMode = audioBridgeMode
         self.objectAudioRendering = objectAudioRendering
+        self.rendersDTSXObjectAudio = rendersDTSXObjectAudio
         self.foldsDolbyVisionFEL = foldsDolbyVisionFEL
         self.panelPresentsHDRFlag = OSAllocatedUnfairLock(initialState: panelPresentsHDR)
         self.stereoPresentation = stereoPresentation
@@ -1439,6 +1441,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// TrueHD Atmos and DTS:X delivery (#731, see `ObjectAudioRendering`); consulted before `audioBridgeMode`.
     let objectAudioRendering: ObjectAudioRendering
+
+    /// From `LoadOptions.rendersDTSXObjectAudio`: false keeps DTS on the channel bridge (AE#1060).
+    let rendersDTSXObjectAudio: Bool
 
     /// From `LoadOptions.foldsDolbyVisionFEL`; handed to every producer this session builds.
     let foldsDolbyVisionFEL: Bool
@@ -1854,8 +1859,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
         }
 
+        // Resolved before the route (a Dolby Vision Profile 20 source is packaged by it) and before the
+        // config record is rebuilt: an MV-HEVC session keeps one SEI the AE#187 canonicalization would
+        // drop (`canonicalizeHEVCConfigRecord`).
+        let stereo = StereoVideoSignal.resolve(
+            presentation: stereoPresentation,
+            codecID: codecpar.pointee.codec_id,
+            multilayer: (videoStream.pointee.disposition & AV_DISPOSITION_MULTILAYER) != 0,
+            containerStereo: StereoVideoSignal.containerStereo(codecpar),
+            systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
+        )
+
         // 4. Classify DV variant; per-profile policy in `resolveCodecRoute`.
-        let route = try resolveCodecRoute(codecpar: codecpar)
+        let route = try resolveCodecRoute(codecpar: codecpar, stereoMultiview: stereo.signal == .multiview)
         preparedHDR10PlusInBaseLayer = false
         usesPreferredHDR10BaseLayerRoute =
             dolbyVisionHandling == .hdr10BaseLayerOnly && route.usesDolbyVisionBaseLayer
@@ -1899,15 +1915,6 @@ public final class HLSVideoEngine: @unchecked Sendable {
         )
         let measuredVideoNALFraming = framingNormalization.measuredFraming
 
-        // Resolved here, before the config record is rebuilt: an MV-HEVC session keeps one SEI the AE#187
-        // canonicalization would drop (`canonicalizeHEVCConfigRecord`).
-        let stereo = StereoVideoSignal.resolve(
-            presentation: stereoPresentation,
-            codecID: codecpar.pointee.codec_id,
-            multilayer: (videoStream.pointee.disposition & AV_DISPOSITION_MULTILAYER) != 0,
-            containerStereo: StereoVideoSignal.containerStereo(codecpar),
-            systemPresentsStereo: stereoOnAnySystem || StereoVideoSignal.systemPresentsStereo
-        )
         let videoExtradataOverride: [UInt8]?
         if let normalized = framingNormalization.extradataOverride {
             videoExtradataOverride = normalized
@@ -2333,7 +2340,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                         ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
                         : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + "
                           + (Self.spatialRenderingLayout(
-                                rendering: objectAudioRendering, codecID: acpForHE.codec_id,
+                                rendering: objectAudioRendering(for: acpForHE.codec_id), codecID: acpForHE.codec_id,
                                 profile: acpForHE.profile, sampleRate: acpForHE.sample_rate)
                              .map { layout in
                                  Self.objectAudioSource(codecID: acpForHE.codec_id, profile: acpForHE.profile) == .trueHDAtmos

@@ -47,9 +47,9 @@ extension HLSVideoEngine {
     /// markers, so the label misses some DTS:X, and a DTS-HD MA track that turns out not to be DTS:X
     /// is refused before the bridge is built (`buildSpatialAudioProducerIfEligible`). 48 kHz, or not
     /// yet known, since TrueHD reports its rate from the first frame and both formats are only ever
-    /// authored at 48 kHz. Nil as well when the build lacks the source's decoder trait, and for DTS
-    /// when the layout does not carry DTS:X's 7.1 bed and four heights one to one (see
-    /// `SpatialSpeakerLayout.carriesDTSXOneToOne`).
+    /// authored at 48 kHz. Nil as well when the build lacks the source's decoder trait. DTS:X gets
+    /// `SpatialSpeakerLayout.dtsxBed`: the host's layout when it carries the 7.1 bed and four heights
+    /// one to one, 7.1.4 when it does not.
     static func spatialRenderingLayout(
         rendering: ObjectAudioRendering,
         codecID: AVCodecID,
@@ -60,11 +60,23 @@ extension HLSVideoEngine {
               objectAudioSource(codecID: codecID, profile: profile)?.isBuiltIn == true,
               sampleRate == 0 || sampleRate == Int32(ObjectAudioRendering.sampleRate)
         else { return nil }
-        if objectAudioSource(codecID: codecID, profile: profile) == .dtsHDMasterAudio,
-           !layout.carriesDTSXOneToOne {
-            return nil
+        if objectAudioSource(codecID: codecID, profile: profile) == .dtsHDMasterAudio {
+            return layout.dtsxBed
         }
         return layout
+    }
+
+    /// `rendering` as it applies to one codec: `.off` for DTS when the host kept DTS:X on the channel
+    /// bridge for this load (`LoadOptions.rendersDTSXObjectAudio`, AE#1060), unchanged otherwise.
+    static func objectAudioRendering(
+        _ rendering: ObjectAudioRendering, codecID: AVCodecID, rendersDTSX: Bool
+    ) -> ObjectAudioRendering {
+        codecID == AV_CODEC_ID_DTS && !rendersDTSX ? .off : rendering
+    }
+
+    /// This session's `objectAudioRendering` for a track of `codecID`.
+    func objectAudioRendering(for codecID: AVCodecID) -> ObjectAudioRendering {
+        Self.objectAudioRendering(objectAudioRendering, codecID: codecID, rendersDTSX: rendersDTSXObjectAudio)
     }
 
     static func objectAudioSource(codecID: AVCodecID, profile: Int32) -> ObjectAudioSource? {
@@ -208,12 +220,13 @@ extension HLSVideoEngine {
         audioLanguage: String?
     ) -> HLSSegmentProducer? {
         let par = audioStream.pointee.codecpar.pointee
+        let rendering = objectAudioRendering(for: par.codec_id)
         guard let layout = Self.spatialRenderingLayout(
-            rendering: objectAudioRendering, codecID: par.codec_id,
+            rendering: rendering, codecID: par.codec_id,
             profile: par.profile, sampleRate: par.sample_rate),
               let source = Self.objectAudioSource(codecID: par.codec_id, profile: par.profile)
         else {
-            if objectAudioRendering != .off,
+            if rendering != .off,
                let source = Self.objectAudioSource(codecID: par.codec_id, profile: par.profile),
                !source.isBuiltIn {
                 EngineLog.emit(
@@ -222,7 +235,7 @@ extension HLSVideoEngine {
                     category: .session
                 )
             } else if par.codec_id == AV_CODEC_ID_TRUEHD {
-                if objectAudioRendering != .off {
+                if rendering != .off {
                     EngineLog.emit(
                         "[HLSVideoEngine] object rendering requested but TrueHD is not 48 kHz Atmos "
                         + "(profile=\(par.profile) rate=\(par.sample_rate)); keeping the channel bridge",
@@ -238,14 +251,13 @@ extension HLSVideoEngine {
                         category: .session
                     )
                 }
-            } else if par.codec_id == AV_CODEC_ID_DTS, let layout = objectAudioRendering.layout,
-                      !layout.carriesDTSXOneToOne {
+            } else if par.codec_id == AV_CODEC_ID_DTS, objectAudioRendering != .off, !rendersDTSXObjectAudio {
                 EngineLog.emit(
-                    "[HLSVideoEngine] DTS:X is rendered into 7.1.4 or 9.1.6 only, not \(layout.rawValue); "
+                    "[HLSVideoEngine] DTS:X rendering is off for this load (rendersDTSXObjectAudio false); "
                     + "keeping the channel bridge",
                     category: .session
                 )
-            } else if par.codec_id == AV_CODEC_ID_DTS, objectAudioRendering != .off {
+            } else if par.codec_id == AV_CODEC_ID_DTS, rendering != .off {
                 // Lossy DTS has no DTS:X to render; only the lossless profiles reach the DTS:X decoder.
                 EngineLog.emit(
                     "[HLSVideoEngine] object rendering requested but DTS is not 48 kHz DTS-HD Master Audio "
@@ -254,6 +266,13 @@ extension HLSVideoEngine {
                 )
             }
             return nil
+        }
+        if let asked = rendering.layout, asked != layout {
+            EngineLog.emit(
+                "[HLSVideoEngine] DTS:X is rendered into \(layout.rawValue) instead of \(asked.rawValue), "
+                + "the smallest bed that carries its channels one to one",
+                category: .session
+            )
         }
         // VOD only: the live reopen and splice paths re-time the bridge in ways this one's encoder
         // latency and fixed packet stamping do not follow.

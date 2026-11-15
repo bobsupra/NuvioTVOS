@@ -1,0 +1,397 @@
+import Foundation
+import CoreMedia
+import CoreVideo
+#if !targetEnvironment(simulator)
+import Metal
+#endif
+
+/// The HDR10 pass-through check (AE#957, step 2): whether the HDR10 metadata the engine attaches to its own
+/// frames reaches the television. Tone mapping to a panel's real peak only pays off if it does, so this runs
+/// before any tone-mapping shader exists.
+///
+/// Off unless `AETHER_HDR10_PROBE` is set, read at every software-path load. Modes:
+///
+/// | value | what happens to each decoded frame |
+/// |---|---|
+/// | `log` | nothing; the first frame's colour tags and HDR10 metadata are logged |
+/// | `meta` | the decoder's buffer gets the probe's mastering display and content light level values |
+/// | `chain` | the frame goes through `FrameChain` (`PassThroughStage`) into a buffer of our own, attachments copied |
+/// | `chain+meta` | both: our own buffer, carrying the probe's values |
+/// | `pulse` | as `meta`, but every 72 frames (3 s at 24p) the values switch to a 4000 nit set and back |
+/// | `chain+pulse` | as `chain+meta`, with the same switching |
+/// | `chain+tonemap` | the chain with `ToneMapStage`: BT.2390 from the frame's own HDR10 peak to `AETHER_HDR10_PROBE_TARGET` nit (600 by default), with the mapped metadata the stage declares |
+///
+/// `AETHER_HDR10_PROBE_META` sets the values (`maxcll=345,maxfall=123,peak=777,min=0.005`, the default).
+/// They are chosen to be unlike any real master, so a television's HDR info screen tells at a glance whose
+/// metadata it got. `Probes/HDR10PassThrough` plays the arms on an Apple TV. `chain+tonemap` is for timing the
+/// real tone-map kernel in playback (AE#957, 59.94 fps pacing); it maps only PQ frames whose peak is above the
+/// target, and passes the others through.
+///
+/// Only on the software path, never with an upscale plan or on the dual-layer decoder. Nothing here runs
+/// unless the variable is set.
+struct HDR10ProbeSettings: Equatable, Sendable {
+    enum Mode: String, CaseIterable, Sendable {
+        case log
+        case meta
+        case chain
+        case chainMeta = "chain+meta"
+        case pulse
+        case chainPulse = "chain+pulse"
+        case chainToneMap = "chain+tonemap"
+
+        var runsChain: Bool { self == .chain || self == .chainMeta || self == .chainPulse || self == .chainToneMap }
+        /// The tone map declares its own output metadata, so this mode sets none of the probe's.
+        var setsMetadata: Bool { self != .log && self != .chain && self != .chainToneMap }
+        /// The pixels stay as they are and only the metadata switches, so a television that uses it
+        /// brightens and dims the highlights in step: visible by eye, no camera needed.
+        var pulses: Bool { self == .pulse || self == .chainPulse }
+    }
+
+    var mode: Mode
+    var metadata: HDR10StaticMetadata
+    /// `chain+tonemap`'s target peak in nit.
+    var targetPeakNits: Double = Self.defaultTargetPeakNits
+    /// True when `AETHER_HDR10_PROBE_META` was set. `chain+tonemap` then maps a frame that carries no HDR10
+    /// metadata as if it carried these values, so a test clip without any can still time the kernel.
+    var metadataGiven = false
+
+    static let modeVariable = "AETHER_HDR10_PROBE"
+    static let metadataVariable = "AETHER_HDR10_PROBE_META"
+    static let targetVariable = "AETHER_HDR10_PROBE_TARGET"
+    /// About what an LG G4 reaches on a large bright area; a 1000 nit master needs mapping to it.
+    static let defaultTargetPeakNits = 600.0
+
+    /// Read with `getenv` at each call, not cached: a probe host switches modes between arms with `setenv`.
+    static func fromEnvironment(
+        _ read: (String) -> String? = { getenv($0).map { String(cString: $0) } }
+    ) -> HDR10ProbeSettings? {
+        guard let raw = read(modeVariable), !raw.isEmpty else { return nil }
+        switch parse(mode: raw, metadata: read(metadataVariable), target: read(targetVariable)) {
+        case let .success(settings):
+            return settings
+        case let .failure(error):
+            EngineLog.emit("[HDR10Probe] ignored: \(error.message)", category: .swPlayback)
+            return nil
+        }
+    }
+
+    struct ParseError: Error, Equatable {
+        let message: String
+    }
+
+    static func parse(mode raw: String, metadata: String?, target: String? = nil) -> Result<HDR10ProbeSettings, ParseError> {
+        let name = raw.trimmingCharacters(in: .whitespaces).lowercased()
+        guard let mode = Mode(rawValue: name) else {
+            let known = Mode.allCases.map(\.rawValue).joined(separator: ", ")
+            return .failure(ParseError(message: "\(modeVariable)=\(raw) is not one of \(known)"))
+        }
+        var targetPeakNits = defaultTargetPeakNits
+        if let target, !target.isEmpty {
+            guard let nits = Double(target.trimmingCharacters(in: .whitespaces)), nits >= 1, nits <= 10_000 else {
+                return .failure(ParseError(message: "\(targetVariable)=\(target) is not 1...10000 nit"))
+            }
+            targetPeakNits = nits
+        }
+        guard let metadata, !metadata.isEmpty else {
+            return .success(HDR10ProbeSettings(mode: mode, metadata: .probeDefault, targetPeakNits: targetPeakNits))
+        }
+        return HDR10StaticMetadata.parse(metadata).map {
+            HDR10ProbeSettings(mode: mode, metadata: $0, targetPeakNits: targetPeakNits, metadataGiven: true)
+        }
+    }
+}
+
+/// The probe's values for `HDR10StaticMetadata`: its defaults, the pulse's other set, and the parser.
+extension HDR10StaticMetadata {
+    /// Unlike any real master (those say 1000 or 4000 nit), so a television's info screen shows whose it is.
+    static let probeDefault = HDR10StaticMetadata(maxCLL: 345, maxFALL: 123, masteringPeakNits: 777,
+                                                  masteringMinNits: 0.005)
+
+    /// The other half of the pulse: a common real master (4000 nit), far from the probe's 345 / 777, so
+    /// a television that tone-maps by it maps the highlights very differently.
+    static let pulseAlternate = HDR10StaticMetadata(maxCLL: 4000, maxFALL: 1000, masteringPeakNits: 4000,
+                                                    masteringMinNits: 0.005)
+
+    /// `maxcll=345,maxfall=123,peak=777,min=0.005`; keys left out keep `probeDefault`'s value.
+    static func parse(_ text: String) -> Result<HDR10StaticMetadata, HDR10ProbeSettings.ParseError> {
+        var result = probeDefault
+        for item in text.split(separator: ",") {
+            let pair = item.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
+            guard pair.count == 2, let value = Double(pair[1]), value.isFinite else {
+                return .failure(.init(message: "\(HDR10ProbeSettings.metadataVariable): cannot read '\(item)'"))
+            }
+            // Int(_:) traps on a finite Double past Int's range (maxcll=1e30), so convert through exactly:.
+            let whole = Int(exactly: value.rounded(.towardZero))
+            switch pair[0].lowercased() {
+            case "maxcll", "maxfall":
+                guard let whole else {
+                    return .failure(.init(message: "maxcll and maxfall must be 1...65535 with maxfall <= maxcll"))
+                }
+                if pair[0].lowercased() == "maxcll" { result.maxCLL = whole } else { result.maxFALL = whole }
+            case "peak": result.masteringPeakNits = value
+            case "min": result.masteringMinNits = value
+            default:
+                return .failure(.init(message: "\(HDR10ProbeSettings.metadataVariable): unknown key '\(pair[0])'"))
+            }
+        }
+        guard (1...65535).contains(result.maxCLL), (1...65535).contains(result.maxFALL),
+              result.maxFALL <= result.maxCLL else {
+            return .failure(.init(message: "maxcll and maxfall must be 1...65535 with maxfall <= maxcll"))
+        }
+        guard result.masteringPeakNits >= 1, result.masteringPeakNits <= 10_000,
+              result.masteringMinNits >= 0, result.masteringMinNits < result.masteringPeakNits else {
+            return .failure(.init(message: "peak must be 1...10000 nit and min 0 up to below peak"))
+        }
+        return .success(result)
+    }
+}
+
+/// Runs one `HDR10ProbeSettings` on the software path's decoded frames. `process` returns the frame to
+/// deliver, nil to deliver the input unchanged. A chain that fails three frames in a row switches the
+/// stage off (frames then pass through) and says so once.
+final class HDR10ProbeStage: @unchecked Sendable {
+
+    let settings: HDR10ProbeSettings
+    static let timingWindow = 48
+    static let timingLines = 10
+    static let maxConsecutiveFailures = 3
+    /// Frames per pulse phase: 3 s at 23.976, 1.2 s at 59.94.
+    static let pulseFrames = 72
+    static let pulseSwitchLines = 4
+
+    private let lock = NSLock()
+    private var frames = 0
+    private var firstFrameLogged = false
+    private var windowGPUms: [Double] = []
+    private var timingLinesLogged = 0
+    private var consecutiveFailures = 0
+    private var disabled = false
+    private var lastNote: String?
+    private var pulseSwitchesLogged = 0
+    #if !targetEnvironment(simulator)
+    /// A `FrameChain`, typed loosely because the class needs OS 26.
+    private var chain: AnyObject?
+    private var chainSize: (Int, Int)?
+    /// The source metadata the tone-map chain was built for; a change rebuilds it.
+    private var chainSource: HDR10StaticMetadata?
+    private var device: MTLDevice?
+    private var queue: MTLCommandQueue?
+    #endif
+
+    init(settings: HDR10ProbeSettings) {
+        self.settings = settings
+        EngineLog.emit("[HDR10Probe] on: mode=\(settings.mode.rawValue)"
+                       + (settings.mode.setsMetadata ? " " + Self.describe(settings.metadata) : "")
+                       + (settings.mode.pulses ? " alternating every \(Self.pulseFrames) frames with "
+                          + Self.describe(.pulseAlternate) : "")
+                       + (settings.mode == .chainToneMap
+                          ? String(format: " target %g nit", settings.targetPeakNits) : ""),
+                       category: .swPlayback)
+    }
+
+    static func describe(_ m: HDR10StaticMetadata) -> String {
+        String(format: "maxCLL=%d maxFALL=%d mastering=%g/%.4f nit", m.maxCLL, m.maxFALL,
+               m.masteringPeakNits, m.masteringMinNits)
+    }
+
+    func process(_ input: CVPixelBuffer, pts: CMTime) -> CVPixelBuffer? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !disabled else { return nil }
+        var output = input
+        var gpuMs: Double?
+        if settings.mode.runsChain {
+            switch runChain(input) {
+            case let .success((buffer, ms)):
+                output = buffer
+                gpuMs = ms
+                consecutiveFailures = 0
+            case let .failure(skip):
+                notePassThrough(skip.message)
+                if skip.counts {
+                    consecutiveFailures += 1
+                    if consecutiveFailures >= Self.maxConsecutiveFailures {
+                        disabled = true
+                        EngineLog.emit("[HDR10Probe] off: \(consecutiveFailures) chain failures in a row, last: "
+                                       + skip.message, category: .swPlayback)
+                    }
+                }
+                return nil
+            }
+        }
+        if settings.mode.setsMetadata {
+            let metadata = metadata(forFrame: frames, pts: pts)
+            CVBufferSetAttachment(output, kCVImageBufferMasteringDisplayColorVolumeKey,
+                                  metadata.masteringDisplayColorVolume as CFData, .shouldPropagate)
+            CVBufferSetAttachment(output, kCVImageBufferContentLightLevelInfoKey,
+                                  metadata.contentLightLevel as CFData, .shouldPropagate)
+        }
+        frames += 1
+        if !firstFrameLogged {
+            firstFrameLogged = true
+            EngineLog.emit("[HDR10Probe] first frame: in " + Self.describe(input)
+                           + (output === input ? "" : "; out " + Self.describe(output))
+                           + "; format description " + Self.describeFormatDescription(of: output),
+                           category: .swPlayback)
+        }
+        if let gpuMs { noteTiming(gpuMs, pts: pts) }
+        // `meta` alone changed the input's own attachments, so delivering the input is right there too.
+        return output === input ? nil : output
+    }
+
+    /// The values for frame `index` (counted from 0): the settings' own, or in a pulse mode the
+    /// alternate set in every other phase of `pulseFrames`. Logs the first few switches.
+    func metadata(forFrame index: Int, pts: CMTime) -> HDR10StaticMetadata {
+        guard settings.mode.pulses else { return settings.metadata }
+        let phase = index / Self.pulseFrames
+        if index > 0, index % Self.pulseFrames == 0, pulseSwitchesLogged < Self.pulseSwitchLines {
+            pulseSwitchesLogged += 1
+            EngineLog.emit(String(format: "[HDR10Probe] pulse: frame %d, pts %.2f s, now %@", index,
+                                  CMTimeGetSeconds(pts), phase % 2 == 1 ? "the 4000 nit set" : "the probe's set"),
+                           category: .swPlayback)
+        }
+        return phase % 2 == 1 ? .pulseAlternate : settings.metadata
+    }
+
+    private struct Note: Error {
+        let message: String
+        /// False for a frame the chain cannot take by design (format, size), which is no failure.
+        let counts: Bool
+    }
+
+    private func runChain(_ input: CVPixelBuffer) -> Result<(CVPixelBuffer, Double), Note> {
+        #if targetEnvironment(simulator)
+        return .failure(Note(message: "the frame chain is not built for the simulator", counts: false))
+        #else
+        guard #available(tvOS 26, iOS 26, macOS 26, visionOS 26, *) else {
+            return .failure(Note(message: "the frame chain needs OS 26", counts: false))
+        }
+        let format = CVPixelBufferGetPixelFormatType(input)
+        guard FrameChain.supportedFormats.contains(format) else {
+            return .failure(Note(message: "pixel format \(format) is not 8 or 10-bit 4:2:0", counts: false))
+        }
+        let picture = FrameUpscaler.pictureRegion(of: input)
+        guard picture.width % 2 == 0, picture.height % 2 == 0 else {
+            return .failure(Note(message: "picture \(picture.width)x\(picture.height) is odd", counts: false))
+        }
+        var toneMap: (curve: BT2390ToneCurve, source: HDR10StaticMetadata, from: String)?
+        if settings.mode == .chainToneMap {
+            switch Self.toneMapCurve(for: input, targetPeakNits: settings.targetPeakNits,
+                                     standIn: settings.metadataGiven ? settings.metadata : nil) {
+            case let .success(found): toneMap = found
+            case let .failure(note): return .failure(note)
+            }
+        }
+        do {
+            let built: FrameChain
+            if let existing = chain as? FrameChain, chainSize.map({ $0 == (picture.width, picture.height) }) == true,
+               chainSource == toneMap?.source {
+                built = existing
+            } else {
+                if device == nil {
+                    device = MTLCreateSystemDefaultDevice()
+                    queue = device?.makeCommandQueue()
+                }
+                guard let device, let queue else {
+                    return .failure(Note(message: "no Metal device", counts: true))
+                }
+                let stage: any FrameChainStage = toneMap.map { ToneMapStage(curve: $0.curve, source: $0.source) }
+                    ?? PassThroughStage()
+                built = try FrameChain(device: device, queue: queue, sourceWidth: picture.width,
+                                       sourceHeight: picture.height, targetWidth: picture.width,
+                                       targetHeight: picture.height, stages: [stage])
+                chain = built
+                chainSize = (picture.width, picture.height)
+                chainSource = toneMap?.source
+                var line = "[HDR10Probe] chain built for \(picture.width)x\(picture.height)"
+                if let toneMap, case .hdr10(let out) = built.outputColorVolume {
+                    line += String(format: ", tone map %g nit (%@) to %g nit, knee at %.0f nit, out ",
+                                   toneMap.curve.sourcePeakNits, toneMap.from, toneMap.curve.targetPeakNits,
+                                   toneMap.curve.kneeNits)
+                        + Self.describe(out) + (built.isRoundTripOnly ? ", one kernel" : ", two passes")
+                }
+                EngineLog.emit(line, category: .swPlayback)
+            }
+            let (output, ms) = try built.process(input, picture: picture)
+            built.attach(from: input, to: output)
+            return .success((output, ms))
+        } catch {
+            return .failure(Note(message: "chain: \(error)", counts: true))
+        }
+        #endif
+    }
+
+    /// The curve for `chain+tonemap` from the frame's own HDR10 metadata, else from `standIn` (the probe's
+    /// values, when set); a frame it does not apply to is no failure (it passes through). `from` names the
+    /// value that set the peak, with "probe stand-in" when the frame had none.
+    private static func toneMapCurve(for input: CVPixelBuffer, targetPeakNits: Double, standIn: HDR10StaticMetadata?)
+        -> Result<(curve: BT2390ToneCurve, source: HDR10StaticMetadata, from: String), Note> {
+        let transfer = CVBufferCopyAttachment(input, kCVImageBufferTransferFunctionKey, nil) as? String
+        guard transfer == kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ as String else {
+            return .failure(Note(message: "tone map: the frame is not PQ", counts: false))
+        }
+        let own = HDR10StaticMetadata(
+            masteringDisplayColorVolume: CVBufferCopyAttachment(input, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
+            contentLightLevel: CVBufferCopyAttachment(input, kCVImageBufferContentLightLevelInfoKey, nil) as? Data)
+        guard let source = own ?? standIn, let peak = ToneMapSourcePeak.choose(masteringPeakNits: source.masteringPeakNits,
+                                                               maxCLL: source.maxCLL) else {
+            return .failure(Note(message: "tone map: the frame carries no HDR10 metadata", counts: false))
+        }
+        guard let curve = BT2390ToneCurve(sourcePeakNits: peak.nits, targetPeakNits: targetPeakNits) else {
+            return .failure(Note(message: String(format: "tone map: no curve from a %g nit source peak to %g nit "
+                                                 + "(the target must be lower, and not below a third of it in PQ)",
+                                                 peak.nits, targetPeakNits), counts: false))
+        }
+        return .success((curve, source, own == nil ? "probe stand-in, " + peak.from.rawValue : peak.from.rawValue))
+    }
+
+    private func notePassThrough(_ message: String) {
+        guard message != lastNote else { return }
+        lastNote = message
+        EngineLog.emit("[HDR10Probe] passing frames through: \(message)", category: .swPlayback)
+    }
+
+    private func noteTiming(_ ms: Double, pts: CMTime) {
+        windowGPUms.append(ms)
+        guard windowGPUms.count == Self.timingWindow else { return }
+        defer { windowGPUms.removeAll() }
+        guard timingLinesLogged < Self.timingLines else { return }
+        timingLinesLogged += 1
+        let mean = windowGPUms.reduce(0, +) / Double(windowGPUms.count)
+        EngineLog.emit(String(format: "[HDR10Probe] chain gpu %.2f ms mean, %.2f ms max over %d frames (frame %d, pts %.2f s)",
+                              mean, windowGPUms.max() ?? 0, windowGPUms.count, frames, pts.seconds),
+                       category: .swPlayback)
+    }
+
+    /// "x420 3840x2160 tf=SMPTE_ST_2084_PQ prim=ITU_R_2020 mtx=ITU_R_2020 mdcv=peak 1000 min 0.0050 cll=1000/400".
+    static func describe(_ buffer: CVPixelBuffer) -> String {
+        func tag(_ key: CFString) -> String { (CVBufferCopyAttachment(buffer, key, nil) as? String) ?? "-" }
+        func bytes(_ key: CFString) -> Data? { CVBufferCopyAttachment(buffer, key, nil) as? Data }
+        return "\(fourCC(CVPixelBufferGetPixelFormatType(buffer))) "
+            + "\(CVPixelBufferGetWidth(buffer))x\(CVPixelBufferGetHeight(buffer)) "
+            + "tf=\(tag(kCVImageBufferTransferFunctionKey)) prim=\(tag(kCVImageBufferColorPrimariesKey)) "
+            + "mtx=\(tag(kCVImageBufferYCbCrMatrixKey)) "
+            + "mdcv=\(HDR10StaticMetadata.describe(masteringDisplayColorVolume: bytes(kCVImageBufferMasteringDisplayColorVolumeKey)) ?? "-") "
+            + "cll=\(HDR10StaticMetadata.describe(contentLightLevel: bytes(kCVImageBufferContentLightLevelInfoKey)) ?? "-")"
+    }
+
+    /// What a format description made from the buffer carries, which is what the renderer hands the
+    /// display layer: the renderer builds its description the same way (`createSampleBuffer`).
+    static func describeFormatDescription(of buffer: CVPixelBuffer) -> String {
+        var description: CMVideoFormatDescription?
+        guard CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: buffer,
+                                                           formatDescriptionOut: &description) == noErr,
+              let description else { return "not created" }
+        func ext(_ key: CFString) -> Data? { CMFormatDescriptionGetExtension(description, extensionKey: key) as? Data }
+        let mdcv = HDR10StaticMetadata.describe(
+            masteringDisplayColorVolume: ext(kCMFormatDescriptionExtension_MasteringDisplayColorVolume)) ?? "-"
+        let cll = HDR10StaticMetadata.describe(
+            contentLightLevel: ext(kCMFormatDescriptionExtension_ContentLightLevelInfo)) ?? "-"
+        return "mdcv=\(mdcv) cll=\(cll)"
+    }
+
+    private static func fourCC(_ code: OSType) -> String {
+        let chars = [24, 16, 8, 0].map { Character(UnicodeScalar(UInt8((code >> UInt32($0)) & 0xFF))) }
+        return String(chars)
+    }
+}
