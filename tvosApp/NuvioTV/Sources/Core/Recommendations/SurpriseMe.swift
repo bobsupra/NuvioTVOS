@@ -276,19 +276,33 @@ struct SurpriseMeHistory {
     /// title when they share any id (Nuvio, IMDb, TMDB) or the same name and
     /// year, so a movie saved in Trakt under its IMDb id and in Simkl under its
     /// TMDB id counts once.
+    ///
+    /// Sameness carries over: if A has an IMDb id, B a TMDB id, and a later
+    /// entry has both, all three are one title and only A is kept.
     static func unique(_ metas: [NuvioMeta]) -> [NuvioMeta] {
-        var seen = Set<String>()
-        var result: [NuvioMeta] = []
-        for meta in metas {
-            let keys = Self.keys(for: meta)
-            guard seen.isDisjoint(with: keys) else {
-                seen.formUnion(keys)
-                continue
+        // Union-find over entries that share a key. Each group's root is its
+        // earliest entry, so the first occurrence is the one kept.
+        var parent = Array(metas.indices)
+        func root(_ index: Int) -> Int {
+            var index = index
+            while parent[index] != index {
+                parent[index] = parent[parent[index]]
+                index = parent[index]
             }
-            seen.formUnion(keys)
-            result.append(meta)
+            return index
         }
-        return result
+        var firstEntryForKey: [String: Int] = [:]
+        for (index, meta) in metas.enumerated() {
+            for key in Self.keys(for: meta) {
+                guard let other = firstEntryForKey[key] else {
+                    firstEntryForKey[key] = index
+                    continue
+                }
+                let a = root(other), b = root(index)
+                if a != b { parent[max(a, b)] = min(a, b) }
+            }
+        }
+        return metas.indices.filter { root($0) == $0 }.map { metas[$0] }
     }
 
     func contains(_ meta: NuvioMeta) -> Bool {
