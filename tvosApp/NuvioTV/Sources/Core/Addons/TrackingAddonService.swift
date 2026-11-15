@@ -345,6 +345,10 @@ final class TrackingAddonPlaybackReporter {
     private var lastAction: TrackingAddonService.PlayerAction?
     private var lastTime: TimeInterval = 0
     private var lastDuration: TimeInterval = 0
+    /// Events that happened before the duration was known (players often report
+    /// playing before it), in order, for `pendingItem`. Sent once it is known.
+    private var pending: [TrackingAddonService.PlayerAction] = []
+    private var pendingItem: Item?
 
     init(send: @escaping Send = { action, item, currentTime, duration in
         TrackingAddonService.sendPlayerEvent(
@@ -359,8 +363,16 @@ final class TrackingAddonPlaybackReporter {
     }
 
     /// Reports `start` or `pause`. Repeats of the current state are dropped.
+    /// Without a duration yet, the event waits (see `durationAvailable`).
     func report(_ action: TrackingAddonService.PlayerAction, item: Item, currentTime: TimeInterval, duration: TimeInterval) {
-        guard duration.isFinite, duration > 0, currentTime.isFinite else { return }
+        guard currentTime.isFinite else { return }
+        guard duration.isFinite, duration > 0 else {
+            hold(action, item: item)
+            return
+        }
+        // Only this item's timing may send what waited for it; another item's
+        // can't, and that item's duration was never known, so its events go.
+        releasePending(for: item, currentTime: currentTime, duration: duration)
         if let previous = self.item, previous != item {
             stop()
         }
@@ -381,25 +393,98 @@ final class TrackingAddonPlaybackReporter {
     }
 
     /// A seek re-sends the current state with the new position.
-    func seeked(to currentTime: TimeInterval, duration: TimeInterval) {
-        guard let item, let lastAction, lastAction != .stop,
+    /// `seekedItem` is the item the seek happened in. A seek in another item
+    /// (the next video, before its first status was reported) is not progress
+    /// for the reported one and is ignored.
+    func seeked(_ seekedItem: Item?, to currentTime: TimeInterval, duration: TimeInterval) {
+        guard let item, seekedItem == item, let lastAction, lastAction != .stop,
               currentTime.isFinite, duration.isFinite, duration > 0 else { return }
         remember(currentTime, duration)
         send(lastAction, item, currentTime, duration)
     }
 
-    /// Player closed, video changed or ended.
-    func stop(currentTime: TimeInterval? = nil, duration: TimeInterval? = nil) {
-        if let currentTime, currentTime.isFinite { lastTime = currentTime }
-        if let duration, duration.isFinite, duration > 0 { lastDuration = duration }
-        guard let item, let lastAction, lastAction != .stop else { return }
+    /// The player now knows the duration of `item` (the one playing): send
+    /// what waited for that item, in order. What waited for another item is
+    /// dropped, since its duration was never known. Called on every time
+    /// update, so it does nothing when nothing waits.
+    func durationAvailable(item: Item?, currentTime: TimeInterval, duration: TimeInterval) {
+        guard !pending.isEmpty, currentTime.isFinite, duration.isFinite, duration > 0 else { return }
+        guard let item else { dropPending(); return }
+        releasePending(for: item, currentTime: currentTime, duration: duration)
+    }
+
+    /// Player closed, video changed or ended: stops the item events were sent
+    /// for (`item`), if any.
+    ///
+    /// `currentTime` and `duration` belong to `timingItem`, the one playing;
+    /// nil means they belong to the reported item. They are applied only to an
+    /// item they belong to, so another item's position never reaches it.
+    func stop(timingFor timingItem: Item? = nil, currentTime: TimeInterval? = nil, duration: TimeInterval? = nil) {
+        let hasTiming = currentTime.map(\.isFinite) == true && duration.map { $0.isFinite && $0 > 0 } == true
+        func timingBelongs(to candidate: Item?) -> Bool {
+            guard let candidate else { return false }
+            return timingItem == nil || timingItem == candidate
+        }
+        if !pending.isEmpty {
+            if hasTiming, timingBelongs(to: pendingItem), let currentTime, let duration {
+                // Known by now: what waited goes out first, then the stop.
+                flushPending(currentTime: currentTime, duration: duration)
+            } else {
+                // Closed before its duration was known (or with another item's
+                // timing): nothing of it was sent, so nothing is stopped for it.
+                dropPending()
+            }
+        }
+        guard let reported = item, let lastAction, lastAction != .stop else { return }
+        if timingBelongs(to: reported) {
+            if let currentTime, currentTime.isFinite { lastTime = currentTime }
+            if let duration, duration.isFinite, duration > 0 { lastDuration = duration }
+        }
         self.lastAction = .stop
-        send(.stop, item, lastTime, lastDuration)
+        send(.stop, reported, lastTime, lastDuration)
     }
 
     private func remember(_ currentTime: TimeInterval, _ duration: TimeInterval) {
         lastTime = currentTime
         lastDuration = duration
+    }
+
+    private func hold(_ action: TrackingAddonService.PlayerAction, item: Item) {
+        if pendingItem != item {
+            // Another video before the first one's duration was known: nothing of
+            // it was sent, so it is dropped.
+            pending = []
+            pendingItem = item
+        }
+        if action == .stop {
+            // Ended before the duration was known.
+            pending = []
+            pendingItem = nil
+            return
+        }
+        if pending.last != action { pending.append(action) }
+    }
+
+    /// Sends what waited if it belongs to `item`; drops it if it belongs to another.
+    private func releasePending(for item: Item, currentTime: TimeInterval, duration: TimeInterval) {
+        guard !pending.isEmpty else { return }
+        guard pendingItem == item else { dropPending(); return }
+        flushPending(currentTime: currentTime, duration: duration)
+    }
+
+    private func dropPending() {
+        pending = []
+        pendingItem = nil
+    }
+
+    private func flushPending(currentTime: TimeInterval, duration: TimeInterval) {
+        guard let item = pendingItem else { pending = []; return }
+        let actions = pending
+        pending = []
+        pendingItem = nil
+        for action in actions {
+            report(action, item: item, currentTime: currentTime, duration: duration)
+        }
     }
 }
 

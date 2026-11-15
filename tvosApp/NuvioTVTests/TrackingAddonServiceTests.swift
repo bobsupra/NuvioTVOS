@@ -114,7 +114,7 @@ final class TrackingAddonServiceTests: XCTestCase {
         reporter.report(.start, item: item, currentTime: 0, duration: 100)
         reporter.report(.start, item: item, currentTime: 5, duration: 100)
         reporter.report(.pause, item: item, currentTime: 10, duration: 100)
-        reporter.seeked(to: 40, duration: 100)
+        reporter.seeked(item, to: 40, duration: 100)
         reporter.report(.start, item: item, currentTime: 40, duration: 100)
         reporter.stop(currentTime: 55, duration: 100)
         reporter.stop(currentTime: 55, duration: 100)
@@ -150,6 +150,199 @@ final class TrackingAddonServiceTests: XCTestCase {
         reporter.report(.start, item: .init(type: "movie", videoId: "tt1"), currentTime: 0, duration: 0)
         reporter.stop()
         XCTAssertEqual(events, [])
+    }
+
+    // MARK: Duration arriving after playing
+
+    @MainActor
+    private func recordingReporter() -> (TrackingAddonPlaybackReporter, () -> [String]) {
+        var events: [String] = []
+        let reporter = TrackingAddonPlaybackReporter { action, item, time, duration in
+            events.append("\(action.rawValue) \(item.videoId) \(Int(time))/\(Int(duration))")
+        }
+        return (reporter, { events })
+    }
+
+    private let film = TrackingAddonPlaybackReporter.Item(type: "movie", videoId: "tt1")
+
+    @MainActor
+    func testStartWaitsForTheDurationAndGoesOutWhenItArrives() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        XCTAssertEqual(events(), [])
+
+        reporter.durationAvailable(item: film, currentTime: 2, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 2/100"])
+        // Further time updates send nothing more.
+        reporter.durationAvailable(item: film, currentTime: 3, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 2/100"])
+    }
+
+    @MainActor
+    func testAPauseBeforeTheDurationGoesOutAfterTheStart() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.report(.pause, item: film, currentTime: 0, duration: 0)
+        reporter.durationAvailable(item: film, currentTime: 4, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 4/100", "pause tt1 4/100"])
+    }
+
+    @MainActor
+    func testAStatusChangeWithTheDurationSendsWhatWaitedFirst() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.report(.pause, item: film, currentTime: 6, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 6/100", "pause tt1 6/100"])
+    }
+
+    @MainActor
+    func testClosingBeforeTheDurationIsKnownSendsNothing() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.report(.pause, item: film, currentTime: 0, duration: 0)
+        reporter.stop(timingFor: film, currentTime: 0, duration: 0)
+        reporter.durationAvailable(item: film, currentTime: 1, duration: 100)
+        XCTAssertEqual(events(), [])
+    }
+
+    @MainActor
+    func testClosingOnceTheDurationIsKnownSendsStartThenStop() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        // Closed before a time update published it, but the duration is known by now.
+        reporter.stop(timingFor: film, currentTime: 9, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 9/100", "stop tt1 9/100"])
+    }
+
+    @MainActor
+    func testAnotherVideoBeforeTheDurationDropsTheFirstOnesEvents() {
+        let (reporter, events) = recordingReporter()
+        let episode = TrackingAddonPlaybackReporter.Item(type: "series", videoId: "tt2:1:1")
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.report(.start, item: episode, currentTime: 0, duration: 0)
+        reporter.durationAvailable(item: episode, currentTime: 1, duration: 1_500)
+        XCTAssertEqual(events(), ["start tt2:1:1 1/1500"])
+    }
+
+    @MainActor
+    func testASeekBeforeAnythingWasSentSendsNothing() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.seeked(film, to: 30, duration: 100)
+        XCTAssertEqual(events(), [])
+        reporter.durationAvailable(item: film, currentTime: 30, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 30/100"])
+    }
+
+    // MARK: Pending events and another item's timing
+
+    private let other = TrackingAddonPlaybackReporter.Item(type: "series", videoId: "tt9:1:2")
+
+    @MainActor
+    func testAnotherItemsStatusEventDropsThePendingEventsInsteadOfLendingThemItsTiming() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.report(.pause, item: film, currentTime: 0, duration: 0)
+        // B reports with its own known duration while A still waits.
+        reporter.report(.start, item: other, currentTime: 12, duration: 2_400)
+        XCTAssertEqual(events(), ["start tt9:1:2 12/2400"], "A must not go out with B's position and duration")
+        // A's duration arriving later can't bring A's events back.
+        reporter.durationAvailable(item: film, currentTime: 3, duration: 100)
+        XCTAssertEqual(events(), ["start tt9:1:2 12/2400"])
+    }
+
+    @MainActor
+    func testAnotherItemsTimeUpdateDropsThePendingEvents() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        // A time update for B (the player moved on) while A still waits.
+        reporter.durationAvailable(item: other, currentTime: 12, duration: 2_400)
+        XCTAssertEqual(events(), [])
+        reporter.durationAvailable(item: film, currentTime: 3, duration: 100)
+        XCTAssertEqual(events(), [])
+        // B's own events then go out normally.
+        reporter.report(.start, item: other, currentTime: 13, duration: 2_400)
+        XCTAssertEqual(events(), ["start tt9:1:2 13/2400"])
+    }
+
+    @MainActor
+    func testATimeUpdateWithNoTrackableItemDropsPendingEvents() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.durationAvailable(item: nil, currentTime: 5, duration: 100)
+        reporter.durationAvailable(item: film, currentTime: 6, duration: 100)
+        XCTAssertEqual(events(), [])
+    }
+
+    @MainActor
+    func testClosingWithAnotherItemsTimingSendsNothingForThePendingOne() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 0, duration: 0)
+        reporter.stop(timingFor: other, currentTime: 40, duration: 2_400)
+        XCTAssertEqual(events(), [])
+    }
+
+    // MARK: Stopping the reported item
+
+    @MainActor
+    func testChangingFromAStartedItemToAnotherStopsTheFirst() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 10, duration: 100)
+        reporter.report(.start, item: other, currentTime: 0, duration: 2_400)
+        XCTAssertEqual(events(), ["start tt1 10/100", "stop tt1 10/100", "start tt9:1:2 0/2400"])
+    }
+
+    @MainActor
+    func testStopWithoutArgumentsStopsTheReportedItemAtItsLastPosition() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 10, duration: 100)
+        reporter.report(.pause, item: film, currentTime: 25, duration: 100)
+        reporter.stop()
+        XCTAssertEqual(events(), ["start tt1 10/100", "pause tt1 25/100", "stop tt1 25/100"])
+        // Already stopped: nothing more.
+        reporter.stop()
+        XCTAssertEqual(events().count, 3)
+    }
+
+    @MainActor
+    func testClosingWithAnotherItemsTimingStopsTheReportedItemWithItsOwnTiming() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 30, duration: 100)
+        // The player's time already belongs to B, which was never reported.
+        reporter.stop(timingFor: other, currentTime: 40, duration: 2_400)
+        XCTAssertEqual(events(), ["start tt1 30/100", "stop tt1 30/100"], "A keeps its own timing, and B gets no stop")
+    }
+
+    @MainActor
+    func testClosingWithTheReportedItemsTimingUsesIt() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 30, duration: 100)
+        reporter.stop(timingFor: film, currentTime: 55, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 30/100", "stop tt1 55/100"])
+    }
+
+    // MARK: Seeks and item identity
+
+    @MainActor
+    func testASeekInTheReportedItemSendsItsState() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 10, duration: 100)
+        reporter.seeked(film, to: 60, duration: 100)
+        XCTAssertEqual(events(), ["start tt1 10/100", "start tt1 60/100"])
+    }
+
+    @MainActor
+    func testASeekInTheNextVideoIsNotSentAsProgressForThePreviousOne() {
+        let (reporter, events) = recordingReporter()
+        reporter.report(.start, item: film, currentTime: 90, duration: 100)
+        // The next episode loads and resumes at 20 min before its first status is reported.
+        reporter.seeked(other, to: 1_200, duration: 2_400)
+        reporter.seeked(nil, to: 1_200, duration: 2_400)
+        XCTAssertEqual(events(), ["start tt1 90/100"])
+
+        // Its first status then stops A at A's own position and starts B.
+        reporter.report(.start, item: other, currentTime: 1_200, duration: 2_400)
+        XCTAssertEqual(events(), ["start tt1 90/100", "stop tt1 90/100", "start tt9:1:2 1200/2400"])
     }
 
     private actor Recorder {
