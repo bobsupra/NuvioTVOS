@@ -6788,6 +6788,13 @@ struct TVHomeView: View {
             if !oldVal && active && !isFullScreenOverlayPresented {
                 checkAndTriggerAutoRefresh()
             }
+            if active, collectionHome == nil { AIHomeCatalogStore.shared.refreshIfNeeded() }
+        }
+        .onReceive(AIHomeCatalogStore.shared.$revision.dropFirst()) { _ in
+            applyAIHomeSections()
+        }
+        .task {
+            if isActive, collectionHome == nil { AIHomeCatalogStore.shared.refreshIfNeeded() }
         }
         .onChange(of: scenePhase) { _, phase in
             handleScenePhaseChange(phase)
@@ -6874,6 +6881,7 @@ struct TVHomeView: View {
     private func handleScenePhaseChange(_ phase: ScenePhase) {
         guard phase == .active else { return }
         checkAndTriggerAutoRefresh()
+        if isActive, collectionHome == nil { AIHomeCatalogStore.shared.refreshIfNeeded() }
         if isActive && !isFullScreenOverlayPresented {
             if usesRemoteProgress {
                 scheduleContinueWatchingRefresh()
@@ -9500,6 +9508,20 @@ struct TVHomeView: View {
         return pinnedCollections + TVHomeCatalogOrder.apply(to: remainder)
     }
 
+    /// Puts the current For You rows at the top of the rows already on Home,
+    /// without reloading the catalogs.
+    @MainActor
+    private func applyAIHomeSections() {
+        guard collectionHome == nil, !store.sections.isEmpty else { return }
+        let ai = AIHomeCatalogStore.shared.sections()
+        let rest = store.sections.filter { !AIHomeCatalogs.isSectionID($0.id) }
+        let updated = ai + rest
+        let unchanged = updated.count == store.sections.count && zip(updated, store.sections).allSatisfy { new, old in
+            new.id == old.id && new.items.map(\.id) == old.items.map(\.id)
+        }
+        if !unchanged { store.sections = updated }
+    }
+
     @MainActor
     private func publishHomeSections(
         catalogSections: [TVHomeSection],
@@ -9509,7 +9531,9 @@ struct TVHomeView: View {
         TVHomeDebugTrace.measure("home.publishHomeSections catalog=\(catalogSections.count) col=\(collectionSections.count)") {
             let pinned = collectionSections.filter(\.isPinnedCollection)
             let unpinned = collectionSections.filter { !$0.isPinnedCollection }
-            let composed = homeOrderedSections(pinned + catalogSections + unpinned)
+            // Settings > Integrations > Surprise Me > For You rows go first.
+            let aiSections = collectionHome == nil ? AIHomeCatalogStore.shared.sections() : []
+            let composed = aiSections + homeOrderedSections(pinned + catalogSections + unpinned)
 
             // Rows this load still owes, drawn as skeletons in their saved position.
             let published = Set(composed.map(\.id))

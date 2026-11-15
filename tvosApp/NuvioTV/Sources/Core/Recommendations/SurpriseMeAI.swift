@@ -3,10 +3,11 @@ import Security
 
 /// Optional AI help for Surprise Me, with the viewer's own API key.
 ///
-/// The AI never invents titles: it gets a numbered list of real candidates
-/// (already filtered to movies the viewer hasn't watched) and answers with
-/// the numbers it picks and a short reason. Anything else in the answer is
-/// ignored. Without a key, or when a request fails, Surprise Me picks on its own.
+/// The AI picks from a numbered list of real candidates (already filtered to
+/// titles the viewer hasn't watched) and suggests its own movies or series,
+/// each with a short reason. Its own suggestions are only kept once TMDB
+/// confirms them. Without a key, or when a request fails, Surprise Me picks on
+/// its own.
 enum SurpriseMeAIProvider: String, CaseIterable, Identifiable {
     case off = "Off"
     case gemini = "Gemini"
@@ -19,8 +20,31 @@ enum SurpriseMeAIProvider: String, CaseIterable, Identifiable {
         switch self {
         case .off: return ""
         case .gemini: return "gemini-3.6-flash"
-        case .deepSeek: return "deepseek-chat"
-        case .openRouter: return "google/gemini-2.5-flash"
+        // DeepSeek-V4.1-Flash. The older names are being retired.
+        case .deepSeek: return "deepseek-flash"
+        // OpenRouter is for models Nuvio doesn't call directly (Gemini and
+        // DeepSeek have their own options), so its default is a different family.
+        case .openRouter: return "qwen/qwen3.7-flash"
+        }
+    }
+
+    /// The models offered in Settings: (API model id, name shown). Only these
+    /// can be chosen; the first is the default.
+    var suggestedModels: [(id: String, name: String)] {
+        switch self {
+        case .deepSeek: return [("deepseek-flash", "DeepSeek-V4.1-Flash")]
+        // All on Gemini's free tier. 3.6 Flash is the default because AI Subtitles
+        // already uses it; 3.8 Flash is newer, 3.5 Flash-Lite faster with more quota.
+        case .gemini: return [
+            ("gemini-3.6-flash", "Gemini 3.6 Flash"),
+            ("gemini-3.8-flash", "Gemini 3.8 Flash"),
+            ("gemini-3.5-flash-lite", "Gemini 3.5 Flash-Lite"),
+        ]
+        case .openRouter: return [
+            ("qwen/qwen3.7-flash", "Qwen 3.7 Flash"),
+            ("anthropic/claude-haiku-4.5", "Claude Haiku 4.5"),
+        ]
+        case .off: return []
         }
     }
 
@@ -104,13 +128,18 @@ struct SurpriseMeAIConfiguration: Equatable {
 
     static func current(defaults: UserDefaults = ProfileSettings.current) -> Self {
         let provider = SurpriseMeAIProvider(rawValue: defaults.string(forKey: SettingsKey.surpriseMeAIProvider) ?? "") ?? .off
-        let storedModel = (defaults.string(forKey: SettingsKey.surpriseMeAIModel) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
         return Self(
             provider: provider,
             apiKey: SurpriseMeAIKeyStore.apiKey(for: provider),
-            model: storedModel.isEmpty ? provider.defaultModel : storedModel
+            model: normalizedModel(defaults.string(forKey: SettingsKey.surpriseMeAIModel), for: provider)
         )
+    }
+
+    /// The stored model when it is one of the provider's models; otherwise,
+    /// including a model typed in an older version, the provider's default.
+    static func normalizedModel(_ stored: String?, for provider: SurpriseMeAIProvider) -> String {
+        let model = (stored ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return provider.suggestedModels.contains { $0.id == model } ? model : provider.defaultModel
     }
 }
 
@@ -125,6 +154,7 @@ struct SurpriseMeAISuggestion: Equatable {
     let title: String
     let year: Int?
     let reason: String?
+    var isSeries = false
 }
 
 /// What the AI learns from: the whole taste profile, compacted, and how the
@@ -132,10 +162,10 @@ struct SurpriseMeAISuggestion: Equatable {
 struct SurpriseMeAIContext {
     let profile: TasteProfile
     let history: SurpriseMeHistory
-    /// Suggestions the viewer opened in this session.
-    var opened: [NuvioMeta] = []
-    /// Suggestions the viewer skipped with Another one in this session.
-    var skipped: [NuvioMeta] = []
+    /// How the viewer reacted to earlier suggestions, across sessions.
+    var feedback = SurpriseMeFeedback()
+    /// Whether to suggest movies, series or both.
+    var content: SurpriseMeContent = .all
 }
 
 enum SurpriseMeAI {
@@ -143,13 +173,18 @@ enum SurpriseMeAI {
     static let maxWatchedTitles = 120
     static let maxSavedTitles = 60
     static let maxInProgressTitles = 20
-    static let maxSessionTitles = 15
-    static let maxOutsideSuggestions = 5
+    static let maxFeedbackTitles = 25
+    /// The AI's own suggestions come first; the list adds what it may not know
+    /// (recent releases) or what the viewer's add-ons surely have.
+    static let maxOutsideSuggestions = 10
+    static let maxListPicks = 3
+    /// Order of the queue: this many of the AI's own picks, then one from the list.
+    static let ownPicksPerListPick = 4
 
     /// The prompt: the viewer's genre shares, everything they watched, saved
     /// and are watching (most recent first, capped so the request stays small),
-    /// how they reacted to this session's suggestions, and the numbered
-    /// candidates. Titles and years only, nothing else about the viewer.
+    /// how they reacted to earlier suggestions, and the numbered candidates.
+    /// Titles and years only, nothing else about the viewer.
     static func prompt(context: SurpriseMeAIContext, candidates: [NuvioMeta], language: String) -> String {
         func titles(_ metas: [NuvioMeta], limit: Int) -> String {
             let list = SurpriseMeHistory.unique(metas).prefix(limit).map(title(of:))
@@ -162,28 +197,46 @@ enum SurpriseMeAI {
             .joined(separator: ", ")
         let list = candidates.prefix(maxCandidates).enumerated().map { index, meta in
             let genres = (meta.genres ?? []).prefix(3).joined(separator: ", ")
-            return "\(index + 1). \(title(of: meta))\(genres.isEmpty ? "" : " — \(genres)")"
+            let kind = SurpriseMeContent.kind(of: meta) == .series ? "series" : "movie"
+            return "\(index + 1). \(title(of: meta)) [\(kind)]\(genres.isEmpty ? "" : " — \(genres)")"
         }.joined(separator: "\n")
+        let what: String
+        let mix: String
+        switch context.content {
+        case .movies:
+            what = "movies"
+            mix = "Only movies, no series."
+        case .series:
+            what = "series"
+            mix = "Only TV series, no movies."
+        case .all:
+            what = "movies and series"
+            let share = Int((context.profile.seriesShare * 100).rounded())
+            mix = "Series are \(share)% of what they watch: mix movies and series in about that proportion."
+        }
         return """
-        You recommend movies to one viewer. Learn their taste from everything below: \
-        directors, actors, eras, tone and themes, not only genres.
+        You recommend \(what) to one viewer. Learn their taste from everything below: \
+        directors, creators, actors, eras, tone and themes, not only genres.
 
         Genre shares of what they watch: \(genres.isEmpty ? "unknown yet" : genres).
         Watched (most recent first): \(titles(context.history.watched, limit: maxWatchedTitles)).
         Saved to watch later: \(titles(context.history.library, limit: maxSavedTitles)).
         Watching now: \(titles(context.history.continueWatching, limit: maxInProgressTitles)).
-        In this session they opened: \(titles(context.opened, limit: maxSessionTitles)).
-        In this session they skipped (avoid similar ones): \(titles(context.skipped, limit: maxSessionTitles)).
+        Earlier suggestions they then watched (loved): \(titles(context.feedback.watched(in: context.history), limit: maxFeedbackTitles)).
+        Earlier suggestions they opened (liked): \(titles(context.feedback.liked, limit: maxFeedbackTitles)).
+        Earlier suggestions they skipped (avoid similar ones): \(titles(context.feedback.skipped, limit: maxFeedbackTitles)).
 
-        1. Choose the 5 movies from this numbered list they are most likely to enjoy, best first. \
-        Only use numbers from the list.
+        1. Suggest the \(maxOutsideSuggestions) real titles they are most likely to love, best first, \
+        from everything you know. \(mix) Never anything already watched or listed above. \
+        Give the exact original title, the release year (first air year for a series) and \
+        "type": "movie" or "series".
+
+        2. Then choose up to \(maxListPicks) titles from this numbered list of recent or available \
+        titles that also fit them. Only use numbers from the list.
         \(list)
 
-        2. Then suggest up to \(maxOutsideSuggestions) other real movies, not in the list and not \
-        already watched, that fit them even better. Give the exact original title and release year.
-
         Answer with JSON only: \
-        {"picks":[{"number":1,"reason":"..."}],"others":[{"title":"...","year":2016,"reason":"..."}]}. \
+        {"picks":[{"number":1,"reason":"..."}],"others":[{"title":"...","year":2016,"type":"movie","reason":"..."}]}. \
         Each reason is one short sentence in \(language) that mentions what they watched when it helps.
         """
     }
@@ -200,6 +253,7 @@ enum SurpriseMeAI {
         struct Other: Decodable {
             let title: String
             let year: Int?
+            let type: String?
             let reason: String?
         }
         let picks: [Pick]?
@@ -229,13 +283,19 @@ enum SurpriseMeAI {
     }
 
     /// The AI's own suggestions outside the list, still to be confirmed on TMDB.
-    static func parseOthers(_ text: String) -> [SurpriseMeAISuggestion] {
+    /// Without a type they count as movies, unless only series are wanted.
+    /// Kinds that aren't wanted are dropped.
+    static func parseOthers(_ text: String, content: SurpriseMeContent = .all) -> [SurpriseMeAISuggestion] {
         guard let others = answer(from: text)?.others else { return [] }
         var seen = Set<String>()
         return others.prefix(maxOutsideSuggestions).compactMap { other in
             let title = other.title.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !title.isEmpty, seen.insert(title.lowercased()).inserted else { return nil }
-            return SurpriseMeAISuggestion(title: title, year: other.year, reason: cleaned(other.reason))
+            let type = other.type?.lowercased() ?? ""
+            let isSeries = type.isEmpty ? content == .series : NuvioMeta.isSeriesType(type)
+            guard !title.isEmpty,
+                  isSeries ? content.includesSeries : content.includesMovies,
+                  seen.insert("\(isSeries ? "s" : "m"):\(title.lowercased())").inserted else { return nil }
+            return SurpriseMeAISuggestion(title: title, year: other.year, reason: cleaned(other.reason), isSeries: isSeries)
         }
     }
 
@@ -249,21 +309,36 @@ enum SurpriseMeAI {
         isWatched: @escaping (NuvioMeta) -> Bool,
         session: URLSession = .shared
     ) async -> [SurpriseMeAIPick] {
-        guard configuration.isUsable, !candidates.isEmpty else { return [] }
+        // The AI suggests first, so an empty candidate list is fine.
+        guard configuration.isUsable else { return [] }
         let shortlist = Array(candidates.prefix(maxCandidates))
         let text = prompt(context: context, candidates: shortlist, language: language)
         guard let request = request(for: text, configuration: configuration),
               let (data, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let answer = responseText(from: data, provider: configuration.provider) else { return [] }
-        var picks = parse(answer, candidates: shortlist)
-        let confirmed = await confirm(parseOthers(answer))
-        var seen = Set(picks.flatMap { SurpriseMeHistory.keys(for: $0.meta) })
-        for pick in confirmed where !isWatched(pick.meta) && seen.isDisjoint(with: SurpriseMeHistory.keys(for: pick.meta)) {
-            seen.formUnion(SurpriseMeHistory.keys(for: pick.meta))
-            picks.append(pick)
+        let listPicks = Array(parse(answer, candidates: shortlist).prefix(maxListPicks))
+        let own = await confirm(parseOthers(answer, content: context.content)).filter { !isWatched($0.meta) }
+        return merge(own: own, list: listPicks)
+    }
+
+    /// The AI's own picks first, with one list pick after every few, each title once.
+    static func merge(own: [SurpriseMeAIPick], list: [SurpriseMeAIPick]) -> [SurpriseMeAIPick] {
+        var result: [SurpriseMeAIPick] = []
+        var seen = Set<String>()
+        func add(_ pick: SurpriseMeAIPick) {
+            let keys = SurpriseMeHistory.keys(for: pick.meta)
+            guard seen.isDisjoint(with: keys) else { return }
+            seen.formUnion(keys)
+            result.append(pick)
         }
-        return picks
+        var listQueue = list[...]
+        for (index, pick) in own.enumerated() {
+            add(pick)
+            if (index + 1) % ownPicksPerListPick == 0, let next = listQueue.popFirst() { add(next) }
+        }
+        listQueue.forEach(add)
+        return result
     }
 
     /// Looks each suggestion up on TMDB; ones it can't find are dropped.
@@ -272,7 +347,9 @@ enum SurpriseMeAI {
         return await withTaskGroup(of: (Int, SurpriseMeAIPick?).self) { group in
             for (index, suggestion) in suggestions.enumerated() {
                 group.addTask {
-                    let meta = await TmdbDetailsService.surpriseMeFindMovie(title: suggestion.title, year: suggestion.year)
+                    let meta = suggestion.isSeries
+                        ? await TmdbDetailsService.surpriseMeFindSeries(title: suggestion.title, year: suggestion.year)
+                        : await TmdbDetailsService.surpriseMeFindMovie(title: suggestion.title, year: suggestion.year)
                     return (index, meta.map { SurpriseMeAIPick(meta: $0, reason: suggestion.reason) })
                 }
             }

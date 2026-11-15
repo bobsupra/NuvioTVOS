@@ -1,11 +1,12 @@
 import SwiftUI
 
-/// The Surprise Me tab: one movie chosen for the viewer's tastes, with a
-/// button to roll again. Configured in Settings > Integrations > Surprise Me.
+/// The Surprise Me tab: one movie or series chosen for the viewer's tastes,
+/// with a button to roll again. Configured in Settings > Integrations > Surprise Me.
 ///
 /// Candidates come from the catalogs on Home and, when TMDB is on, from TMDB's
-/// recommendations for the viewer's favourite movies and its well-rated movies
-/// in their favourite genres. Anything already watched, in Nuvio or a connected
+/// recommendations for the viewer's favourite titles and its well-rated movies
+/// and series in their favourite genres. Settings decide whether it suggests
+/// movies, series or both. Anything already watched, in Nuvio or a connected
 /// tracker, is left out. With an AI key, the AI chooses among those candidates
 /// and says why.
 struct SurpriseMeView: View {
@@ -17,22 +18,25 @@ struct SurpriseMeView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.surpriseMeUseTMDB) private var useTMDB = true
     @AppStorage(SettingsKey.surpriseMeUseTrackers) private var useTrackers = true
+    @AppStorage(SettingsKey.surpriseMeContent) private var contentRaw = SurpriseMeContent.all.rawValue
 
     @State private var profile = TasteProfile.empty
     @State private var history = SurpriseMeHistory.empty
     /// TMDB candidates and queued AI picks, kept only for the profile, TMDB
-    /// setting and history they were gathered for.
+    /// setting, history and kind of titles they were gathered for.
     @State private var pool = SurpriseMeCandidatePool()
     @State private var pick: NuvioMeta?
     @State private var pickReason: String?
     @State private var offered: Set<String> = []
-    /// This session's reactions, so the AI learns what landed and what didn't.
-    @State private var opened: [NuvioMeta] = []
-    @State private var skipped: [NuvioMeta] = []
+    /// What the viewer did with earlier suggestions, kept across launches, so
+    /// both the AI and the taste profile learn what lands and what doesn't.
+    @State private var feedback = SurpriseMeFeedback()
     @State private var didLoad = false
     @State private var isThinking = false
     @State private var noMovieFound = false
     @State private var historySources: [String] = []
+
+    private var content: SurpriseMeContent { SurpriseMeContent(rawValue: contentRaw) ?? .all }
 
     private enum FocusTarget: Hashable { case surprise, open, another }
     @FocusState private var focus: FocusTarget?
@@ -60,28 +64,37 @@ struct SurpriseMeView: View {
             }
             syncPool()
             if pool.needsOnlineCandidates, let requested = pool.ticket {
-                let fetched = await SurpriseMeOnline.candidates(history: history, profile: profile)
-                // Ignored if the tab closed, TMDB was turned off or the profile
-                // or history changed while TMDB answered.
+                let fetched = await SurpriseMeOnline.candidates(history: history, profile: profile, content: content)
+                // Ignored if the tab closed, TMDB was turned off, or the profile,
+                // history or kind of titles changed while TMDB answered.
                 guard !Task.isCancelled else { return }
                 pool.accept(online: fetched, for: requested)
             }
         }
         .onChange(of: useTMDB) { _, _ in syncPool() }
+        .onChange(of: contentRaw) { _, _ in syncPool() }
     }
 
     private var poolKey: SurpriseMeCandidatePool.Key {
-        .init(profileScope: ProfileSettings.activeProfileScope, useTMDB: useTMDB, historySignature: history.signature)
+        .init(
+            profileScope: ProfileSettings.activeProfileScope,
+            useTMDB: useTMDB,
+            historySignature: history.signature,
+            variant: content.rawValue
+        )
     }
 
     /// Drops candidates and queued picks gathered for another profile, TMDB
-    /// setting or history; on another profile, also what was shown and offered.
+    /// setting, history or kind of titles; on another profile, also what was
+    /// shown and offered.
     private func syncPool() {
-        guard pool.prepare(for: poolKey) == .profileChanged else { return }
+        let change = pool.prepare(for: poolKey)
+        guard change != .unchanged else { return }
+        noMovieFound = false
+        guard change == .profileChanged else { return }
         pick = nil
         pickReason = nil
         offered = []
-        noMovieFound = false
     }
 
     /// The tab opens on a button, like the profile tab: nothing is suggested
@@ -110,7 +123,7 @@ struct SurpriseMeView: View {
             .disabled(isThinking)
             .focused($focus, equals: .surprise)
             if didLoad, noMovieFound {
-                Text(L10n.string("surprise_me_empty", fallback: "No unwatched movies found yet. Add movie catalogs or turn on TMDB."))
+                Text(L10n.string("surprise_me_empty", fallback: "Nothing unwatched found yet. Add catalogs or turn on TMDB."))
                     .font(.system(size: 22))
                     .foregroundColor(.white.opacity(0.65))
             }
@@ -190,7 +203,7 @@ struct SurpriseMeView: View {
 
             HStack(spacing: 24) {
                 Button {
-                    if !opened.contains(where: { $0.id == meta.id }) { opened.insert(meta, at: 0) }
+                    remember(meta, .liked)
                     onOpenDetails(meta)
                 } label: {
                     Label(L10n.string("surprise_me_open", fallback: "View"), systemImage: "play.fill")
@@ -198,7 +211,8 @@ struct SurpriseMeView: View {
                 .focused($focus, equals: .open)
 
                 Button {
-                    if !opened.contains(where: { $0.id == meta.id }) { skipped.insert(meta, at: 0) }
+                    // Skipping counts only if they didn't open it first.
+                    if feedback.verdict(for: meta) != .liked { remember(meta, .skipped) }
                     Task { await roll() }
                 } label: {
                     Label(
@@ -246,10 +260,12 @@ struct SurpriseMeView: View {
             library: SurpriseMeLibraries.allItems(),
             continueWatching: ContinueWatchingStore.items().map(\.meta)
         )
+        feedback = SurpriseMeFeedback.load()
         profile = TasteProfile.build(
             watched: history.watched,
             library: history.library,
-            continueWatching: history.continueWatching
+            continueWatching: history.continueWatching,
+            feedback: feedback
         )
         historySources = useTrackers ? SurpriseMeTrackers.sourceLabels(of: watched) : []
     }
@@ -264,7 +280,7 @@ struct SurpriseMeView: View {
         syncPool()
         // AI picks wait in a queue, so "Another one" doesn't ask again each time.
         while let next = pool.nextQueuedPick() {
-            guard !offered.contains(next.meta.id), !isWatched(next.meta) else { continue }
+            guard !offered.contains(next.meta.id), !isWatched(next.meta), content.allows(next.meta) else { continue }
             show(next.meta, reason: next.reason.map { "✨ \($0)" })
             return
         }
@@ -273,21 +289,23 @@ struct SurpriseMeView: View {
         if configuration.isUsable {
             let shortlist = SurpriseMe.shortlist(
                 from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
-                limit: SurpriseMeAI.maxCandidates
+                content: content, limit: SurpriseMeAI.maxCandidates
             )
-            if !shortlist.isEmpty, let requested = pool.ticket {
+            if let requested = pool.ticket {
                 isThinking = true
-                let excluded = offered
+                // Never offer again what was offered this session or skipped before.
+                let excluded = offered.union(feedback.skipped.map(\.id))
                 let picks = await SurpriseMeAI.rank(
                     candidates: shortlist,
-                    context: SurpriseMeAIContext(profile: profile, history: history, opened: opened, skipped: skipped),
+                    context: SurpriseMeAIContext(profile: profile, history: history, feedback: feedback, content: content),
                     configuration: configuration,
                     language: Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier)
                         ?? "English",
                     isWatched: { meta in isWatched(meta) || excluded.contains(meta.id) }
                 )
                 isThinking = false
-                // The profile, TMDB setting or history changed while the AI answered.
+                // The profile, TMDB setting, history or kind of titles changed
+                // while the AI answered.
                 syncPool()
                 guard pool.stillCurrent(requested) else { return }
                 if let first = picks.first {
@@ -302,12 +320,18 @@ struct SurpriseMeView: View {
             from: candidates,
             profile: profile,
             isWatched: isWatched,
-            excluding: offered
+            excluding: offered,
+            content: content
         ) else {
             noMovieFound = true
             return
         }
         show(next, reason: nil)
+    }
+
+    private func remember(_ meta: NuvioMeta, _ verdict: SurpriseMeFeedbackEntry.Verdict) {
+        feedback.record(meta, verdict)
+        feedback.save()
     }
 
     private func show(_ meta: NuvioMeta, reason: String?) {
