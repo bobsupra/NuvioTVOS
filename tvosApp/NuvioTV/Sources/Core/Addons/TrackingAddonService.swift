@@ -210,8 +210,9 @@ enum TrackingAddonService {
               let manifest = await manifest(manifestURL),
               manifest.supports(resource, type: type, id: id) else { return }
         for url in urls(manifestURL) {
-            // Turned off while an earlier request to it was still running.
-            guard isApproved(manifestURL, in: defaults) else { return }
+            // Turned off, disabled or uninstalled while its manifest was
+            // loading or an earlier request to it was still running.
+            guard mayReceiveEvents(manifestURL, in: defaults) else { return }
             var request = URLRequest(url: url)
             request.timeoutInterval = 10
             await send(request)

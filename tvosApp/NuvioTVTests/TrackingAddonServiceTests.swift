@@ -249,4 +249,53 @@ final class TrackingAddonServiceTests: XCTestCase {
         let sent = await recorder.events
         XCTAssertEqual(sent.count, 1)
     }
+
+    private func deliverStart(
+        defaults: UserDefaults,
+        recorder: Recorder,
+        whileManifestLoads change: @escaping @Sendable () -> Void
+    ) async {
+        await TrackingAddonService.deliver(
+            to: manifestURL, resource: "player", type: "movie", id: "tt1",
+            defaults: defaults,
+            urls: { [$0] },
+            send: { request in await recorder.add(request.url?.absoluteString ?? "") },
+            manifest: { _ in
+                change()
+                return TrackingAddonManifest(resources: [.init(name: "player")])
+            }
+        )
+    }
+
+    func testNothingIsSentWhenTheAddonIsTurnedOffWhileItsManifestLoads() async {
+        let defaults = profileDefaults("TrackingManifestTurnedOff", approved: true)
+        let recorder = Recorder()
+        let url = manifestURL
+        await deliverStart(defaults: defaults, recorder: recorder) {
+            TrackingAddonService.setApproved(false, manifestURL: url, in: defaults)
+        }
+        let sent = await recorder.events
+        XCTAssertEqual(sent, [])
+    }
+
+    func testNothingIsSentWhenTheAddonIsDisabledWhileItsManifestLoads() async {
+        let defaults = profileDefaults("TrackingManifestDisabled", approved: true)
+        let recorder = Recorder()
+        let url = manifestURL
+        await deliverStart(defaults: defaults, recorder: recorder) {
+            defaults.set(#"[{"url":"\#(url.absoluteString)","enabled":false}]"#, forKey: SettingsKey.streamAddonManifestStates)
+        }
+        let sent = await recorder.events
+        XCTAssertEqual(sent, [])
+    }
+
+    func testNothingIsSentWhenTheAddonIsUninstalledWhileItsManifestLoads() async {
+        let defaults = profileDefaults("TrackingManifestUninstalled", approved: true)
+        let recorder = Recorder()
+        await deliverStart(defaults: defaults, recorder: recorder) {
+            defaults.set("[]", forKey: SettingsKey.streamAddonManifestStates)
+        }
+        let sent = await recorder.events
+        XCTAssertEqual(sent, [])
+    }
 }
