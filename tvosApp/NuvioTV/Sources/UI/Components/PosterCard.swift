@@ -3668,11 +3668,12 @@ struct TitleActionsMenuContent: View {
             return
         }
 
-        guard SelectedLibraryService.isSelectedAndAuthenticated else { return }
+        guard SelectedLibraryService.isSelectedAndAuthenticated,
+              let owner = TrackingAddonLibraryChanges.Owner.current() else { return }
 
         let desiredMembership = !currentlyInLibrary
         let meta = meta
-        TrackingAddonLibraryChanges.perform(desiredMembership, meta: meta) {
+        TrackingAddonLibraryChanges.perform(desiredMembership, meta: meta, owner: owner) {
             await SelectedLibraryService.setWatchlist(meta, isInWatchlist: desiredMembership)
         }
     }

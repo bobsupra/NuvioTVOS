@@ -128,20 +128,24 @@ enum TrackingAddonService {
         }
     }
 
+    /// `profileID` is the profile the event belongs to: the active one unless
+    /// the change was started on another and confirmed later.
     static func sendLibraryEvent(
         _ action: LibraryAction,
         type: String,
         id: String,
-        videoIds: [String] = []
+        videoIds: [String] = [],
+        profileID: String?? = nil
     ) {
-        dispatch(resource: "library", type: type, id: id) { manifestURL in
+        dispatch(resource: "library", type: type, id: id, profileID: profileID) { manifestURL in
             TrackingAddonService.libraryURLs(manifestURL: manifestURL, type: type, id: id, action: action, videoIds: videoIds)
         }
     }
 
     /// A user added or removed a title from their library or watchlist.
-    static func sendLibraryMembership(_ isInLibrary: Bool, meta: NuvioMeta) {
-        sendLibraryEvent(isInLibrary ? .libraryAdd : .libraryRemove, type: meta.type, id: meta.id)
+    /// `profileID` as in `sendLibraryEvent`.
+    static func sendLibraryMembership(_ isInLibrary: Bool, meta: NuvioMeta, profileID: String?? = nil) {
+        sendLibraryEvent(isInLibrary ? .libraryAdd : .libraryRemove, type: meta.type, id: meta.id, profileID: profileID)
     }
 
     /// A user marked a whole title watched or unwatched.
@@ -162,18 +166,17 @@ enum TrackingAddonService {
     /// that produced the event: turning an add-on off withdraws consent, so
     /// what is still waiting for it is dropped. Switching profiles doesn't
     /// drop anything; those events belong to the profile that approved them.
+    ///
+    /// `profileID` (when given) is the profile the event belongs to; its
+    /// consent and add-ons decide where it goes, even if another is active now.
     private static func dispatch(
         resource: String,
         type: String,
         id: String,
+        profileID requestedProfileID: String?? = nil,
         urls: @escaping @Sendable (URL) -> [URL]
     ) {
-        let defaults = ProfileSettings.current
-        let profileID = ProfileSettings.activeProfileID
-        let approved = approvedManifestURLs(in: defaults)
-        guard !approved.isEmpty else { return }
-        let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs(in: defaults)
-            .filter { approved.contains($0.absoluteString) }
+        let (profileID, manifestURLs) = eventTargets(profileID: requestedProfileID)
         guard !manifestURLs.isEmpty else { return }
         for manifestURL in manifestURLs {
             eventQueue.enqueue(key: manifestURL.absoluteString) {
@@ -186,6 +189,19 @@ enum TrackingAddonService {
                 )
             }
         }
+    }
+
+    /// The profile an event belongs to and the add-ons it may go to: the ones
+    /// that profile approved and has installed and enabled. `profileID` nil
+    /// means the active profile.
+    static func eventTargets(profileID requestedProfileID: String?? = nil) -> (profileID: String?, manifestURLs: [URL]) {
+        let profileID = requestedProfileID ?? ProfileSettings.activeProfileID
+        let defaults = requestedProfileID == nil ? ProfileSettings.current : ProfileSettings.store(for: profileID)
+        let approved = approvedManifestURLs(in: defaults)
+        guard !approved.isEmpty else { return (profileID, []) }
+        let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs(in: defaults)
+            .filter { approved.contains($0.absoluteString) }
+        return (profileID, manifestURLs)
     }
 
     /// Whether `manifestURL` may still receive events for the profile whose

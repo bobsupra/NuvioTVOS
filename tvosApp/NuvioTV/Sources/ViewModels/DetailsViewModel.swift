@@ -1280,13 +1280,15 @@ class DetailsViewModel: ObservableObject {
         // Runs after earlier changes to this title; tracking add-ons hear of it
         // only once the library service confirms it.
         let mutation = remoteWatchlistMutation
+        let owner = TrackingAddonLibraryChanges.Owner(
+            profileID: ProfileSettings.activeProfileID,
+            isCurrent: { context.isCurrent }
+        )
         watchlistMutationTask = TrackingAddonLibraryChanges.perform(
             desiredMembership,
             meta: meta,
-            mutation: {
-                guard context.isCurrent else { return false }
-                return await mutation(meta, desiredMembership)
-            },
+            owner: owner,
+            mutation: { await mutation(meta, desiredMembership) },
             completion: { [weak self] succeeded in
                 guard let self, !Task.isCancelled, context.isCurrent,
                       self.watchlistMutationGeneration == mutationGeneration,

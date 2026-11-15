@@ -14096,10 +14096,12 @@ private struct TVGridHeroSlideshowView: View {
     private func toggleLibraryAction(for item: NuvioMeta) {
         let currentlyInLibrary = SelectedLibraryService.isInLibrary(meta: item)
         if TraktSettingsStore.librarySourceMode != .local && SelectedLibraryService.isSelectedAndAuthenticated {
+            guard let owner = TrackingAddonLibraryChanges.Owner.current() else { return }
             let desiredMembership = !currentlyInLibrary
             TrackingAddonLibraryChanges.perform(
                 desiredMembership,
                 meta: item,
+                owner: owner,
                 mutation: { await SelectedLibraryService.setWatchlist(item, isInWatchlist: desiredMembership) },
                 completion: { _ in updateLibraryStatus() }
             )
