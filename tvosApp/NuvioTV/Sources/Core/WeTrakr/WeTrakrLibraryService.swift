@@ -32,11 +32,19 @@ enum WeTrakrLibraryService {
         repository: CatalogRepository? = nil,
         store: UserDefaults = ProfileSettings.current,
         updateCachedLibraryItems: Bool = true,
-        requireSuccessfulResponses: Bool = false
+        requireSuccessfulResponses: Bool = false,
+        tokenStorage: WeTrakrTokenStorage = WeTrakrKeychainTokenStorage(),
+        profileScope: String? = nil,
+        client: WeTrakrAPIClient = WeTrakrLibraryService.client
     ) async -> [LibraryStoreItem]? {
-        guard let token = WeTrakrRuntimeSession.authenticatedState(store: store)?.accessToken,
+        guard let token = WeTrakrRuntimeSession.authenticatedState(
+            store: store, tokenStorage: tokenStorage, profileScope: profileScope
+        )?.accessToken,
               !token.isEmpty else { return nil }
         let clientID = WeTrakrConfig.clientID(in: store)
+        // Whose list this is: the profile and the account linked when the token
+        // was read. Checked again once the answers arrive (below).
+        let owner = cacheOwner(for: store)
 
         let extendedQuery = [
             URLQueryItem(name: "extended", value: "show_level_1,movie_level_1"),
@@ -58,6 +66,10 @@ enum WeTrakrLibraryService {
 
         let movies = try? await moviesRequest.valueOrThrow()
         let shows = try? await showsRequest.valueOrThrow()
+        // The profile was relinked to another account while these were out: this is
+        // the previous account's list, so it is neither cached nor returned as the
+        // current one's. A late answer can't replace the new account's cache either.
+        guard cacheOwner(for: store) == owner else { return nil }
         guard !requireSuccessfulResponses || (movies != nil && shows != nil) else { return nil }
 
         var items: [LibraryStoreItem] = []
@@ -83,7 +95,7 @@ enum WeTrakrLibraryService {
         }
 
         if updateCachedLibraryItems {
-            replaceCachedItems(items, for: store)
+            cachedLibrary = (owner, items)
         }
         return items
     }

@@ -399,6 +399,11 @@ private final class HeldResponseURLProtocol: URLProtocol {
     private static var _requests = 0
     private static var gate = DispatchSemaphore(value: 0)
     static var started: (() -> Void)?
+    /// When set, only requests whose Authorization header contains it are held;
+    /// the others are answered at once.
+    static var holdOnlyAuthorization: String?
+    /// The body to answer a request with (default "{}").
+    static var body: ((URLRequest) -> Data)?
 
     static var requests: Int { lock.withLock { _requests } }
 
@@ -406,6 +411,8 @@ private final class HeldResponseURLProtocol: URLProtocol {
         lock.withLock { _requests = 0 }
         gate = DispatchSemaphore(value: 0)
         started = nil
+        holdOnlyAuthorization = nil
+        body = nil
     }
 
     static func answer() { gate.signal() }
@@ -415,15 +422,20 @@ private final class HeldResponseURLProtocol: URLProtocol {
 
     override func startLoading() {
         Self.lock.withLock { Self._requests += 1 }
-        let started = Self.started
-        DispatchQueue.main.async { started?() }
+        let authorization = request.value(forHTTPHeaderField: "Authorization") ?? ""
+        let held = Self.holdOnlyAuthorization.map { authorization.contains($0) } ?? true
+        let data = Self.body?(request) ?? Data("{}".utf8)
+        if held {
+            let started = Self.started
+            DispatchQueue.main.async { started?() }
+        }
         let gate = Self.gate
         DispatchQueue.global().async { [self] in
-            gate.wait()
+            if held { gate.wait() }
             let response = HTTPURLResponse(url: request.url!, statusCode: 200, httpVersion: nil,
                                            headerFields: ["Content-Type": "application/json"])!
             client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
-            client?.urlProtocol(self, didLoad: Data("{}".utf8))
+            client?.urlProtocol(self, didLoad: data)
             client?.urlProtocolDidFinishLoading(self)
         }
     }
@@ -595,6 +607,85 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
         XCTAssertNotNil(WeTrakrLibraryService.cachedItems(for: store))
         fixture.seed(.weTrakr, suffix: "relinked")
         XCTAssertNil(WeTrakrLibraryService.cachedItems(for: store), "Account A's list must not show for account B")
+    }
+
+    // MARK: WeTrakr library fetch
+
+    private func fetch(_ fixture: QueueOwnershipFixture, store: UserDefaults, session: URLSession) async -> [LibraryStoreItem]? {
+        await WeTrakrLibraryService.fetchLibrary(
+            store: store, tokenStorage: fixture.tokens, profileScope: fixture.profile,
+            client: WeTrakrAPIClient(session: session)
+        )
+    }
+
+    func testAFetchAnsweredAfterARelinkIsNeitherCachedNorReturnedForTheNewAccount() async {
+        HeldResponseURLProtocol.reset()
+        let fixture = QueueOwnershipFixture(.weTrakr)
+        defer { fixture.restore() }
+        let store = fixture.store
+        let inFlight = expectation(description: "A's movies and shows requests in flight")
+        inFlight.expectedFulfillmentCount = 2
+        HeldResponseURLProtocol.started = { inFlight.fulfill() }
+        let session = HeldResponseURLProtocol.session()
+
+        let fetchA = Task { await self.fetch(fixture, store: store, session: session) }
+        await fulfillment(of: [inFlight], timeout: 3)
+        fixture.seed(.weTrakr, suffix: "relinked")   // same profile, account B
+        HeldResponseURLProtocol.answer()
+        HeldResponseURLProtocol.answer()
+
+        let result = await fetchA.value
+        XCTAssertNil(result, "A's list must not be returned as account B's")
+        XCTAssertNil(WeTrakrLibraryService.cachedItems(for: store), "nor cached under B's binding")
+    }
+
+    func testALateFetchForThePreviousAccountCannotReplaceTheNewAccountsCache() async {
+        HeldResponseURLProtocol.reset()
+        let fixture = QueueOwnershipFixture(.weTrakr)
+        defer { fixture.restore() }
+        let store = fixture.store
+        // Only account A's requests ("access-a") are held; account B's answer at once,
+        // with one movie in B's list.
+        HeldResponseURLProtocol.holdOnlyAuthorization = "access-a"
+        HeldResponseURLProtocol.body = { request in
+            let isB = request.value(forHTTPHeaderField: "Authorization")?.contains("access-relinked") == true
+            let isMovies = request.url?.path.hasSuffix("/movies") == true
+            return Data((isB && isMovies ? #"[{"id":42,"type":"movie","title":"B Film","year":2020}]"# : "[]").utf8)
+        }
+        let inFlight = expectation(description: "A's requests in flight")
+        inFlight.expectedFulfillmentCount = 2
+        HeldResponseURLProtocol.started = { inFlight.fulfill() }
+        let session = HeldResponseURLProtocol.session()
+
+        let fetchA = Task { await self.fetch(fixture, store: store, session: session) }
+        await fulfillment(of: [inFlight], timeout: 3)
+        fixture.seed(.weTrakr, suffix: "relinked")
+        let fetchB = await fetch(fixture, store: store, session: session)
+        XCTAssertEqual(fetchB?.map(\.meta.name), ["B Film"])
+        XCTAssertEqual(WeTrakrLibraryService.cachedItems(for: store)?.map(\.meta.name), ["B Film"])
+
+        // A's answers arrive last.
+        HeldResponseURLProtocol.answer()
+        HeldResponseURLProtocol.answer()
+        let resultA = await fetchA.value
+        XCTAssertNil(resultA)
+        XCTAssertEqual(WeTrakrLibraryService.cachedItems(for: store)?.map(\.meta.name), ["B Film"],
+                       "A's late answer must not replace B's cache")
+    }
+
+    func testAFetchWithoutARelinkIsCachedAndReturned() async {
+        HeldResponseURLProtocol.reset()
+        let fixture = QueueOwnershipFixture(.weTrakr)
+        defer { fixture.restore() }
+        let store = fixture.store
+        HeldResponseURLProtocol.holdOnlyAuthorization = "never-held"
+        HeldResponseURLProtocol.body = { request in
+            Data((request.url?.path.hasSuffix("/movies") == true
+                  ? #"[{"id":7,"type":"movie","title":"A Film","year":2019}]"# : "[]").utf8)
+        }
+        let result = await fetch(fixture, store: store, session: HeldResponseURLProtocol.session())
+        XCTAssertEqual(result?.map(\.meta.name), ["A Film"])
+        XCTAssertEqual(WeTrakrLibraryService.cachedItems(for: store)?.map(\.meta.name), ["A Film"])
     }
 }
 
