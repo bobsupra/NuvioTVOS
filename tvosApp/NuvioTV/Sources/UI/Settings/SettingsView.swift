@@ -8591,7 +8591,7 @@ private struct SurpriseMeOptionsSheet: View {
                         title: L10n.string("surprise_me_group_ai", fallback: "AI (optional)"),
                         subtitle: L10n.string(
                             "surprise_me_group_ai_subtitle",
-                            fallback: "With your own key, an AI chooses among the movies found and says why. It can only pick from that list, so it never suggests something that doesn't exist."
+                            fallback: "With your own key, an AI learns your taste from your whole history, chooses among the movies found and suggests others, and says why. Its own suggestions are checked on TMDB, so it never shows something that doesn't exist or that you've already watched."
                         )
                     ) {
                         SettingsOptionRow(
@@ -8637,7 +8637,7 @@ private struct SurpriseMeOptionsSheet: View {
                             )
                             Text(L10n.string(
                                 "surprise_me_ai_privacy",
-                                fallback: "When you press Surprise Me, the titles you watched or saved recently, your favourite genres and the list of candidate movies are sent to the provider you chose, with your key. Your key stays in this Apple TV's Keychain and never syncs."
+                                fallback: "When you press Surprise Me, the provider you chose receives, with your key: the titles and years of up to 120 movies and shows you watched, 60 you saved and 20 you're watching, your genre shares, which suggestions you opened or skipped this session, and the candidate movies. The AI learns your taste from all of it, picks from the candidates and can suggest other movies, which are shown only if TMDB confirms they exist and you haven't watched them. Your key stays in this Apple TV's Keychain and never syncs."
                             ))
                             .font(.system(size: 17, weight: .medium))
                             .foregroundColor(.white.opacity(0.56))
@@ -8679,7 +8679,7 @@ private struct SurpriseMeOptionsSheet: View {
         } message: {
             Text(L10n.string(
                 "surprise_me_ai_consent_message",
-                fallback: "Each time you press Surprise Me, the titles you watched or saved recently, your favourite genres and a list of candidate movies are sent to the AI provider with your API key. Requests use your provider's quota."
+                fallback: "Each time Surprise Me asks the AI, the titles of what you watched, saved and are watching (up to 200), your genre shares, how you reacted to this session's suggestions and a list of candidate movies are sent to the AI provider with your API key. Requests use your provider's quota."
             ))
         }
     }

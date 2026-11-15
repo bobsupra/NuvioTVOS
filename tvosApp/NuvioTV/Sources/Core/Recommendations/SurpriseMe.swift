@@ -12,6 +12,10 @@ struct TasteProfile: Equatable {
     let weights: [String: Double]
     /// Display names of the genres, heaviest first.
     let topGenres: [String]
+    /// Display name for each normalized genre key.
+    var displayNames: [String: String] = [:]
+
+    func displayName(for key: String) -> String { displayNames[key] ?? key }
 
     static let empty = TasteProfile(weights: [:], topGenres: [])
 
@@ -38,8 +42,7 @@ struct TasteProfile: Equatable {
         var names: [String: String] = [:]
         func add(_ metas: [NuvioMeta], weight: Double) {
             // The same title can come from two trackers under different ids.
-            var seen = Set<String>()
-            for meta in metas where seen.insert(meta.imdbId ?? meta.id).inserted {
+            for meta in SurpriseMeHistory.unique(metas) {
                 for genre in meta.genres ?? [] {
                     let key = normalized(genre)
                     guard !key.isEmpty else { continue }
@@ -57,7 +60,8 @@ struct TasteProfile: Equatable {
         let ordered = totals.sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
         return TasteProfile(
             weights: totals.mapValues { $0 / sum },
-            topGenres: ordered.prefix(3).compactMap { names[$0.key] }
+            topGenres: ordered.prefix(3).compactMap { names[$0.key] },
+            displayNames: names
         )
     }
 
@@ -189,19 +193,50 @@ struct SurpriseMeHistory {
 
     /// Distinct titles across the three lists.
     var titleCount: Int {
-        Set((watched + library + continueWatching).map(Self.titleKey)).count
+        Self.unique(watched + library + continueWatching).count
     }
 
     /// Most recent first as stored; movies and shows, for the AI prompt.
     var recentTitles: [NuvioMeta] {
-        var seen = Set<String>()
-        return (watched + continueWatching + library).filter { seen.insert(Self.titleKey($0)).inserted }
+        Self.unique(watched + continueWatching + library)
     }
 
     /// Movies from the history to ask TMDB for recommendations about.
     var seedMovies: [NuvioMeta] {
-        var seen = Set<String>()
-        return (watched + library).filter { SurpriseMe.isMovie($0) && seen.insert(Self.titleKey($0)).inserted }
+        Self.unique(watched + library).filter(SurpriseMe.isMovie)
+    }
+
+    /// One entry per title, first occurrence kept. Two entries are the same
+    /// title when they share any id (Nuvio, IMDb, TMDB) or the same name and
+    /// year, so a movie saved in Trakt under its IMDb id and in Simkl under its
+    /// TMDB id counts once.
+    ///
+    /// Sameness carries over: if A has an IMDb id, B a TMDB id, and a later
+    /// entry has both, all three are one title and only A is kept.
+    static func unique(_ metas: [NuvioMeta]) -> [NuvioMeta] {
+        // Union-find over entries that share a key. Each group's root is its
+        // earliest entry, so the first occurrence is the one kept.
+        var parent = Array(metas.indices)
+        func root(_ index: Int) -> Int {
+            var index = index
+            while parent[index] != index {
+                parent[index] = parent[parent[index]]
+                index = parent[index]
+            }
+            return index
+        }
+        var firstEntryForKey: [String: Int] = [:]
+        for (index, meta) in metas.enumerated() {
+            for key in Self.keys(for: meta) {
+                guard let other = firstEntryForKey[key] else {
+                    firstEntryForKey[key] = index
+                    continue
+                }
+                let a = root(other), b = root(index)
+                if a != b { parent[max(a, b)] = min(a, b) }
+            }
+        }
+        return metas.indices.filter { root($0) == $0 }.map { metas[$0] }
     }
 
     func contains(_ meta: NuvioMeta) -> Bool {
@@ -222,6 +257,27 @@ struct SurpriseMeHistory {
         let name = meta.name.lowercased().filter { $0.isLetter || $0.isNumber }
         if !name.isEmpty, let year = meta.year { result.append("name:\(name):\(year)") }
         return result
+    }
+}
+
+/// Every library the viewer has: Nuvio's own and the watchlists of Trakt,
+/// Simkl, MDBList and WeTrakr, whichever one Settings shows as the library.
+///
+/// Read only, from the copies this Apple TV already keeps of each account's
+/// list (per profile and account), so nothing is requested, changed or synced
+/// back, and one account's list never shows under another's.
+enum SurpriseMeLibraries {
+    static func allItems() -> [NuvioMeta] {
+        let profileID = WatchedStore.activeProfileId
+        var metas = LibraryStore.items().map(\.meta)
+        for source in TraktLibrarySourceMode.allCases where source != .local {
+            let binding = RemoteLibraryStore.accountBindingID(for: source, profileId: profileID)
+            guard let items = RemoteLibraryStore.load(
+                source: source, profileId: profileID, accountBindingId: binding
+            ) else { continue }
+            metas += items.map(\.meta)
+        }
+        return SurpriseMeHistory.unique(metas)
     }
 }
 

@@ -25,6 +25,9 @@ struct SurpriseMeView: View {
     @State private var pick: NuvioMeta?
     @State private var pickReason: String?
     @State private var offered: Set<String> = []
+    /// This session's reactions, so the AI learns what landed and what didn't.
+    @State private var opened: [NuvioMeta] = []
+    @State private var skipped: [NuvioMeta] = []
     @State private var didLoad = false
     @State private var isThinking = false
     @State private var noMovieFound = false
@@ -166,6 +169,7 @@ struct SurpriseMeView: View {
 
             HStack(spacing: 24) {
                 Button {
+                    if !opened.contains(where: { $0.id == meta.id }) { opened.insert(meta, at: 0) }
                     onOpenDetails(meta)
                 } label: {
                     Label(L10n.string("surprise_me_open", fallback: "View"), systemImage: "play.fill")
@@ -173,6 +177,7 @@ struct SurpriseMeView: View {
                 .focused($focus, equals: .open)
 
                 Button {
+                    if !opened.contains(where: { $0.id == meta.id }) { skipped.insert(meta, at: 0) }
                     Task { await roll() }
                 } label: {
                     Label(
@@ -217,7 +222,7 @@ struct SurpriseMeView: View {
         let watched = WatchedStore.items()
         history = SurpriseMeHistory(
             watched: watched.map(\.meta),
-            library: LibraryStore.items().map(\.meta),
+            library: SurpriseMeLibraries.allItems(),
             continueWatching: ContinueWatchingStore.items().map(\.meta)
         )
         profile = TasteProfile.build(
@@ -239,7 +244,7 @@ struct SurpriseMeView: View {
         while let next = aiQueue.first {
             aiQueue.removeFirst()
             guard !offered.contains(next.meta.id), !isWatched(next.meta) else { continue }
-            show(next.meta, reason: next.reason)
+            show(next.meta, reason: next.reason.map { "✨ \($0)" })
             return
         }
 
@@ -251,13 +256,14 @@ struct SurpriseMeView: View {
             )
             if !shortlist.isEmpty {
                 isThinking = true
+                let excluded = offered
                 let picks = await SurpriseMeAI.rank(
                     candidates: shortlist,
-                    profile: profile,
-                    recentTitles: history.recentTitles,
+                    context: SurpriseMeAIContext(profile: profile, history: history, opened: opened, skipped: skipped),
                     configuration: configuration,
                     language: Locale(identifier: "en").localizedString(forIdentifier: AppLocaleManager.shared.locale.identifier)
-                        ?? "English"
+                        ?? "English",
+                    isWatched: { meta in isWatched(meta) || excluded.contains(meta.id) }
                 )
                 isThinking = false
                 if let first = picks.first {

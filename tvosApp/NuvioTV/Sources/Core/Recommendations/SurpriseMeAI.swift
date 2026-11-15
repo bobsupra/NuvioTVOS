@@ -119,27 +119,71 @@ struct SurpriseMeAIPick: Equatable {
     let reason: String?
 }
 
+/// A title the AI suggested outside the candidate list. It is only shown after
+/// TMDB confirms it exists and it isn't something the viewer already watched.
+struct SurpriseMeAISuggestion: Equatable {
+    let title: String
+    let year: Int?
+    let reason: String?
+}
+
+/// What the AI learns from: the whole taste profile, compacted, and how the
+/// viewer reacted to this session's suggestions.
+struct SurpriseMeAIContext {
+    let profile: TasteProfile
+    let history: SurpriseMeHistory
+    /// Suggestions the viewer opened in this session.
+    var opened: [NuvioMeta] = []
+    /// Suggestions the viewer skipped with Another one in this session.
+    var skipped: [NuvioMeta] = []
+}
+
 enum SurpriseMeAI {
     static let maxCandidates = 40
-    static let maxHistoryTitles = 30
+    static let maxWatchedTitles = 120
+    static let maxSavedTitles = 60
+    static let maxInProgressTitles = 20
+    static let maxSessionTitles = 15
+    static let maxOutsideSuggestions = 5
 
-    /// The prompt: the viewer's favourite genres and recent titles, then the
-    /// numbered candidates. Titles and years only, nothing else about the viewer.
-    static func prompt(profile: TasteProfile, recentTitles: [NuvioMeta], candidates: [NuvioMeta], language: String) -> String {
-        let history = recentTitles.prefix(maxHistoryTitles).map { title(of: $0) }.joined(separator: "; ")
+    /// The prompt: the viewer's genre shares, everything they watched, saved
+    /// and are watching (most recent first, capped so the request stays small),
+    /// how they reacted to this session's suggestions, and the numbered
+    /// candidates. Titles and years only, nothing else about the viewer.
+    static func prompt(context: SurpriseMeAIContext, candidates: [NuvioMeta], language: String) -> String {
+        func titles(_ metas: [NuvioMeta], limit: Int) -> String {
+            let list = SurpriseMeHistory.unique(metas).prefix(limit).map(title(of:))
+            return list.isEmpty ? "none" : list.joined(separator: "; ")
+        }
+        let genres = context.profile.weights
+            .sorted { $0.value > $1.value }
+            .prefix(8)
+            .map { "\(context.profile.displayName(for: $0.key)) \(Int(($0.value * 100).rounded()))%" }
+            .joined(separator: ", ")
         let list = candidates.prefix(maxCandidates).enumerated().map { index, meta in
             let genres = (meta.genres ?? []).prefix(3).joined(separator: ", ")
             return "\(index + 1). \(title(of: meta))\(genres.isEmpty ? "" : " — \(genres)")"
         }.joined(separator: "\n")
         return """
-        You recommend movies. The viewer's favourite genres: \(profile.topGenres.joined(separator: ", ")).
-        Titles they watched or saved recently: \(history.isEmpty ? "none yet" : history).
+        You recommend movies to one viewer. Learn their taste from everything below: \
+        directors, actors, eras, tone and themes, not only genres.
 
-        Choose the 5 movies from this numbered list they are most likely to enjoy, best first. \
+        Genre shares of what they watch: \(genres.isEmpty ? "unknown yet" : genres).
+        Watched (most recent first): \(titles(context.history.watched, limit: maxWatchedTitles)).
+        Saved to watch later: \(titles(context.history.library, limit: maxSavedTitles)).
+        Watching now: \(titles(context.history.continueWatching, limit: maxInProgressTitles)).
+        In this session they opened: \(titles(context.opened, limit: maxSessionTitles)).
+        In this session they skipped (avoid similar ones): \(titles(context.skipped, limit: maxSessionTitles)).
+
+        1. Choose the 5 movies from this numbered list they are most likely to enjoy, best first. \
         Only use numbers from the list.
         \(list)
 
-        Answer with JSON only: {"picks":[{"number":1,"reason":"..."}]}. \
+        2. Then suggest up to \(maxOutsideSuggestions) other real movies, not in the list and not \
+        already watched, that fit them even better. Give the exact original title and release year.
+
+        Answer with JSON only: \
+        {"picks":[{"number":1,"reason":"..."}],"others":[{"title":"...","year":2016,"reason":"..."}]}. \
         Each reason is one short sentence in \(language) that mentions what they watched when it helps.
         """
     }
@@ -148,42 +192,96 @@ enum SurpriseMeAI {
         meta.year.map { "\(meta.name) (\($0))" } ?? meta.name
     }
 
-    /// Reads the AI's answer back into candidates. Numbers outside the list and
-    /// repeats are dropped, so only real, checked titles come out.
-    static func parse(_ text: String, candidates: [NuvioMeta]) -> [SurpriseMeAIPick] {
-        struct Answer: Decodable {
-            struct Pick: Decodable {
-                let number: Int
-                let reason: String?
-            }
-            let picks: [Pick]
+    private struct Answer: Decodable {
+        struct Pick: Decodable {
+            let number: Int
+            let reason: String?
         }
-        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start < end,
-              let answer = try? JSONDecoder().decode(Answer.self, from: Data(text[start...end].utf8)) else { return [] }
+        struct Other: Decodable {
+            let title: String
+            let year: Int?
+            let reason: String?
+        }
+        let picks: [Pick]?
+        let others: [Other]?
+    }
+
+    private static func answer(from text: String) -> Answer? {
+        guard let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start < end else { return nil }
+        return try? JSONDecoder().decode(Answer.self, from: Data(text[start...end].utf8))
+    }
+
+    private static func cleaned(_ reason: String?) -> String? {
+        let trimmed = reason?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed?.isEmpty == false ? trimmed : nil
+    }
+
+    /// Reads the AI's choices from the list back into candidates. Numbers
+    /// outside the list and repeats are dropped, so only real, checked titles come out.
+    static func parse(_ text: String, candidates: [NuvioMeta]) -> [SurpriseMeAIPick] {
+        guard let picks = answer(from: text)?.picks else { return [] }
         var used = Set<Int>()
-        return answer.picks.compactMap { pick in
+        return picks.compactMap { pick in
             let index = pick.number - 1
             guard candidates.indices.contains(index), index < maxCandidates, used.insert(index).inserted else { return nil }
-            let reason = pick.reason?.trimmingCharacters(in: .whitespacesAndNewlines)
-            return SurpriseMeAIPick(meta: candidates[index], reason: reason?.isEmpty == false ? reason : nil)
+            return SurpriseMeAIPick(meta: candidates[index], reason: cleaned(pick.reason))
         }
     }
 
+    /// The AI's own suggestions outside the list, still to be confirmed on TMDB.
+    static func parseOthers(_ text: String) -> [SurpriseMeAISuggestion] {
+        guard let others = answer(from: text)?.others else { return [] }
+        var seen = Set<String>()
+        return others.prefix(maxOutsideSuggestions).compactMap { other in
+            let title = other.title.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty, seen.insert(title.lowercased()).inserted else { return nil }
+            return SurpriseMeAISuggestion(title: title, year: other.year, reason: cleaned(other.reason))
+        }
+    }
+
+    /// Asks the AI and returns its picks: first the ones from the list, then
+    /// its own suggestions that TMDB confirms and the viewer hasn't watched.
     static func rank(
         candidates: [NuvioMeta],
-        profile: TasteProfile,
-        recentTitles: [NuvioMeta],
+        context: SurpriseMeAIContext,
         configuration: SurpriseMeAIConfiguration,
         language: String,
+        isWatched: @escaping (NuvioMeta) -> Bool,
         session: URLSession = .shared
     ) async -> [SurpriseMeAIPick] {
         guard configuration.isUsable, !candidates.isEmpty else { return [] }
-        let text = prompt(profile: profile, recentTitles: recentTitles, candidates: candidates, language: language)
+        let shortlist = Array(candidates.prefix(maxCandidates))
+        let text = prompt(context: context, candidates: shortlist, language: language)
         guard let request = request(for: text, configuration: configuration),
               let (data, response) = try? await session.data(for: request),
               let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
               let answer = responseText(from: data, provider: configuration.provider) else { return [] }
-        return parse(answer, candidates: Array(candidates.prefix(maxCandidates)))
+        var picks = parse(answer, candidates: shortlist)
+        let confirmed = await confirm(parseOthers(answer))
+        var seen = Set(picks.flatMap { SurpriseMeHistory.keys(for: $0.meta) })
+        for pick in confirmed where !isWatched(pick.meta) && seen.isDisjoint(with: SurpriseMeHistory.keys(for: pick.meta)) {
+            seen.formUnion(SurpriseMeHistory.keys(for: pick.meta))
+            picks.append(pick)
+        }
+        return picks
+    }
+
+    /// Looks each suggestion up on TMDB; ones it can't find are dropped.
+    static func confirm(_ suggestions: [SurpriseMeAISuggestion]) async -> [SurpriseMeAIPick] {
+        guard !suggestions.isEmpty, TmdbDetailsService.isAvailableForSurpriseMe else { return [] }
+        return await withTaskGroup(of: (Int, SurpriseMeAIPick?).self) { group in
+            for (index, suggestion) in suggestions.enumerated() {
+                group.addTask {
+                    let meta = await TmdbDetailsService.surpriseMeFindMovie(title: suggestion.title, year: suggestion.year)
+                    return (index, meta.map { SurpriseMeAIPick(meta: $0, reason: suggestion.reason) })
+                }
+            }
+            var results: [(Int, SurpriseMeAIPick)] = []
+            for await (index, pick) in group {
+                if let pick { results.append((index, pick)) }
+            }
+            return results.sorted { $0.0 < $1.0 }.map(\.1)
+        }
     }
 
     static func request(for prompt: String, configuration: SurpriseMeAIConfiguration) -> URLRequest? {

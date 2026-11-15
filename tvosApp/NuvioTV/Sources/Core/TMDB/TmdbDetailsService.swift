@@ -1934,6 +1934,28 @@ extension TmdbDetailsService {
         return await surpriseMeMovies(path: "movie/\(resolved.id)/recommendations", query: [:], apiKey: apiKey)
     }
 
+    /// The movie TMDB finds for a title the AI suggested, or nil when there is
+    /// no match. With a year, the release year must be within one year of it.
+    static func surpriseMeFindMovie(title: String, year: Int?) async -> NuvioMeta? {
+        guard isEnabled, let apiKey else { return nil }
+        var query = ["query": title, "include_adult": "false"]
+        if let year { query["year"] = String(year) }
+        var results = await surpriseMeMovies(path: "search/movie", query: query, apiKey: apiKey)
+        if results.isEmpty, year != nil {
+            // Release years differ between countries; try again without it.
+            query["year"] = nil
+            results = await surpriseMeMovies(path: "search/movie", query: query, apiKey: apiKey)
+        }
+        let wanted = title.lowercased().filter { $0.isLetter || $0.isNumber }
+        return results.first { meta in
+            let yearMatches = year == nil || meta.year.map { abs($0 - year!) <= 1 } == true
+            let name = meta.name.lowercased().filter { $0.isLetter || $0.isNumber }
+            return yearMatches && (name == wanted || results.count == 1)
+        } ?? results.first { meta in
+            year != nil && meta.year.map { abs($0 - year!) <= 1 } == true
+        }
+    }
+
     /// Well-rated movies in any of `genres`, most popular first.
     static func surpriseMeDiscover(genres: [String], page: Int = 1) async -> [NuvioMeta] {
         guard isEnabled, let apiKey else { return [] }
