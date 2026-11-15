@@ -1,4 +1,5 @@
 import XCTest
+import Security
 @testable import NuvioTV
 
 /// IPTV sources (with their credentials) are kept per profile id, and profile ids are reused.
@@ -12,18 +13,39 @@ final class IPTVProfileCleanupTests: XCTestCase {
         func remove(profileID: String) throws { data.removeValue(forKey: profileID) }
     }
 
+    /// Keychain refusing deletions until `failsRemoval` is cleared.
+    private final class FailingRemovalStorage: IPTVSourceStorage {
+        var data: [String: Data] = [:]
+        var failsRemoval = true
+        var removalAttempts = 0
+        func read(profileID: String) throws -> Data? { data[profileID] }
+        func write(_ value: Data, profileID: String) throws { data[profileID] = value }
+        func remove(profileID: String) throws {
+            removalAttempts += 1
+            if failsRemoval { throw IPTVSourceStoreError.keychain(errSecInteractionNotAllowed) }
+            data.removeValue(forKey: profileID)
+        }
+    }
+
     private var savedStorage: (any IPTVSourceStorage)!
     private var backend = MemoryStorage()
     private var removed = ""
     private var kept = ""
     private var directory: URL!
     private var previousActive: String?
+    private var savedPendingRemovals: IPTVPendingSourceRemovals!
+    private var pendingDefaultsName = ""
+    private var pendingDefaults: UserDefaults!
 
     override func setUpWithError() throws {
         try super.setUpWithError()
         savedStorage = IPTVSourceStore.defaultStorage
         backend = MemoryStorage()
         IPTVSourceStore.defaultStorage = backend
+        savedPendingRemovals = IPTVSourceStore.pendingRemovals
+        pendingDefaultsName = "iptv-pending-\(UUID().uuidString)"
+        pendingDefaults = UserDefaults(suiteName: pendingDefaultsName)
+        IPTVSourceStore.pendingRemovals = IPTVPendingSourceRemovals(defaults: pendingDefaults)
         removed = "iptv-removed-\(UUID().uuidString)"
         kept = "iptv-kept-\(UUID().uuidString)"
         previousActive = UserDefaults.standard.string(forKey: "nuvio.active_profile_id")
@@ -37,6 +59,8 @@ final class IPTVProfileCleanupTests: XCTestCase {
 
     override func tearDown() {
         IPTVSourceStore.defaultStorage = savedStorage
+        IPTVSourceStore.pendingRemovals = savedPendingRemovals
+        pendingDefaults.removePersistentDomain(forName: pendingDefaultsName)
         try? FileManager.default.removeItem(at: directory)
         UserDefaults.standard.set(previousActive, forKey: "nuvio.active_profile_id")
         for id in [removed, kept] {
@@ -133,5 +157,69 @@ final class IPTVProfileCleanupTests: XCTestCase {
         let added = source("added")
         XCTAssertTrue(try store.save([keptSource, added], profileID: kept, ifGeneration: keptGeneration))
         XCTAssertEqual(try store.load(profileID: kept), [keptSource, added])
+    }
+
+    func testAFailedDeletionKeepsTheSourcesUnreadableUntilARetrySucceeds() throws {
+        let failing = FailingRemovalStorage()
+        IPTVSourceStore.defaultStorage = failing
+        let store = IPTVSourceStore()
+        let old = source("old")
+        try store.save([old], profileID: removed)
+
+        IPTVSourceStore.removeProfile(removed)
+
+        // Keychain kept them, but a profile reusing the id doesn't see them.
+        XCTAssertNotNil(failing.data[removed])
+        XCTAssertEqual(try store.load(profileID: removed), [])
+        XCTAssertEqual(failing.removalAttempts, 2, "the load retried the deletion")
+
+        // After a restart: the mark was kept in preferences, so it still holds.
+        IPTVSourceStore.pendingRemovals = IPTVPendingSourceRemovals(defaults: pendingDefaults)
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.contains(removed))
+        XCTAssertEqual(try IPTVSourceStore().load(profileID: removed), [])
+        XCTAssertNotNil(failing.data[removed])
+
+        // Keychain works again: the retry at launch deletes them and clears the mark.
+        failing.failsRemoval = false
+        IPTVSourceStore.retryPendingRemovals()
+        XCTAssertNil(failing.data[removed])
+        XCTAssertFalse(IPTVSourceStore.pendingRemovals.contains(removed))
+        XCTAssertNil(pendingDefaults.stringArray(forKey: IPTVPendingSourceRemovals.key))
+
+        // A new profile with the id then saves and reads its own sources normally.
+        let new = source("new")
+        try store.save([new], profileID: removed)
+        XCTAssertEqual(try store.load(profileID: removed), [new])
+    }
+
+    func testANewProfileSavingOverAPendingDeletionReplacesTheOldSources() throws {
+        let failing = FailingRemovalStorage()
+        IPTVSourceStore.defaultStorage = failing
+        let store = IPTVSourceStore()
+        try store.save([source("old")], profileID: removed)
+        IPTVSourceStore.removeProfile(removed)
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.contains(removed))
+
+        // Deletion still failing: the write replaces the whole item, so the old
+        // sources are gone and the mark can go too.
+        let new = source("new")
+        XCTAssertTrue(try store.save([new], profileID: removed, ifGeneration: IPTVSourceStore.generation(for: removed)))
+        XCTAssertFalse(IPTVSourceStore.pendingRemovals.contains(removed))
+        XCTAssertEqual(try store.load(profileID: removed), [new])
+
+        // A failed write leaves the mark, so the old sources stay unreadable.
+        try store.save([source("old")], profileID: kept)
+        IPTVSourceStore.removeProfile(kept)
+        final class FailingWrites: IPTVSourceStorage {
+            let inner: FailingRemovalStorage
+            init(_ inner: FailingRemovalStorage) { self.inner = inner }
+            func read(profileID: String) throws -> Data? { try inner.read(profileID: profileID) }
+            func write(_ value: Data, profileID: String) throws { throw IPTVSourceStoreError.keychain(errSecIO) }
+            func remove(profileID: String) throws { try inner.remove(profileID: profileID) }
+        }
+        let broken = IPTVSourceStore(storage: FailingWrites(failing))
+        XCTAssertThrowsError(try broken.save([source("other")], profileID: kept))
+        XCTAssertTrue(IPTVSourceStore.pendingRemovals.contains(kept))
+        XCTAssertEqual(try store.load(profileID: kept), [])
     }
 }
