@@ -6999,6 +6999,30 @@ enum LargePayloadStore {
         removeAll(key: key, directory: directory, except: nil)
     }
 
+    /// Every key stored in `directory`, on either tier.
+    static func keys(directory: String) -> Set<String> {
+        var keys = Set<String>()
+        for base in [applicationSupportBase, cachesBase] {
+            guard let url = base?.appendingPathComponent(directory, isDirectory: true),
+                  let names = try? FileManager.default.contentsOfDirectory(atPath: url.path) else { continue }
+            for name in names {
+                if let key = key(forFileName: name) { keys.insert(key) }
+            }
+        }
+        return keys
+    }
+
+    /// Reverses `fileName(forKey:)`.
+    private static func key(forFileName name: String) -> String? {
+        guard name.hasSuffix(".json") else { return nil }
+        var encoded = String(name.dropLast(5))
+            .replacingOccurrences(of: "_", with: "/")
+            .replacingOccurrences(of: "-", with: "+")
+        while encoded.count % 4 != 0 { encoded += "=" }
+        guard let data = Data(base64Encoded: encoded) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
     static func removeDirectory(_ directory: String) {
         for base in [applicationSupportBase, cachesBase] {
             guard let url = base?.appendingPathComponent(directory, isDirectory: true) else { continue }

@@ -57,6 +57,10 @@ private struct JellyfinSyncCheckpoint: Codable {
     var identity: Identity
     var runID: String
     var leaseID: String
+    /// How page files are named. Missing in checkpoints written before pages
+    /// carried their profile and server in the name; those are started over.
+    var pageFormat: Int? = JellyfinSyncCheckpoint.currentPageFormat
+    static let currentPageFormat = 2
     var pageOffsets: [String: [Int]] = [:]
     var pageCounts: [String: [Int: Int]] = [:]
     var nextStartIndices: [String: Int] = [:]
@@ -71,6 +75,11 @@ private struct JellyfinSyncCheckpoint: Codable {
 /// Writes each page separately and then advances a small manifest. If the
 /// process stops between those writes, the same offset is fetched again and
 /// safely overwrites its unreferenced page file.
+///
+/// Every page's name starts with its profile and server's prefix, so pages
+/// that no checkpoint lists (the process stopped before the manifest was
+/// saved, the manifest is unreadable, or a reset stopped halfway) can still be
+/// found and removed for that profile and server alone.
 private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
     struct PageProgress {
         var found: Int
@@ -100,19 +109,21 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
         key = Self.checkpointKey(profileID: identity.profileID, serverID: identity.serverID)
         Self.lock.lock()
         defer { Self.lock.unlock() }
+        Self.removeLegacyPages()
         if let data = LargePayloadStore.read(key: key, directory: Self.directory),
            let saved = try? JSONDecoder().decode(JellyfinSyncCheckpoint.self, from: data),
-           saved.identity == identity {
+           saved.identity == identity,
+           saved.pageFormat == JellyfinSyncCheckpoint.currentPageFormat {
             checkpoint = saved
             checkpoint.leaseID = UUID().uuidString
             try persist(checkpoint)
+            // Pages this run wrote but never listed, and any from older runs.
+            Self.removePages(forKey: key, keeping: Self.listedPageKeys(saved, key: key))
             return
         }
 
-        if let data = LargePayloadStore.read(key: key, directory: Self.directory),
-           let previous = try? JSONDecoder().decode(JellyfinSyncCheckpoint.self, from: data) {
-            Self.removePages(previous, key: key)
-        }
+        // A new run: nothing written for this profile and server is needed.
+        Self.removePages(forKey: key, keeping: [])
         checkpoint = JellyfinSyncCheckpoint(identity: identity, runID: UUID().uuidString, leaseID: UUID().uuidString)
         try persist(checkpoint)
     }
@@ -226,7 +237,7 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
         Self.lock.lock()
         defer { Self.lock.unlock() }
         guard (try? ensureCurrentLease()) != nil else { return }
-        Self.removePages(checkpoint, key: key)
+        Self.removePages(forKey: key, keeping: [])
         LargePayloadStore.remove(key: key, directory: Self.directory)
     }
 
@@ -249,15 +260,16 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
 
     /// Drops a server's checkpoint and its pages for one profile, whatever run left them.
     /// The pages hold the server's library listing, so they must not outlive the server.
+    /// Pages are found by their profile and server prefix, so this works even when
+    /// the checkpoint is unreadable or never listed a page, and never touches
+    /// another profile's or server's pages.
     static func remove(profileID: String, serverID: String) {
         lock.lock()
         defer { lock.unlock() }
         let key = checkpointKey(profileID: profileID, serverID: serverID)
-        if let data = LargePayloadStore.read(key: key, directory: directory),
-           let saved = try? JSONDecoder().decode(JellyfinSyncCheckpoint.self, from: data) {
-            removePages(saved, key: key)
-        }
+        removePages(forKey: key, keeping: [])
         LargePayloadStore.remove(key: key, directory: directory)
+        removeLegacyPages()
     }
 
     /// Sign-out: every profile's checkpoints and pages.
@@ -267,26 +279,50 @@ private final class JellyfinSyncCheckpointStore: @unchecked Sendable {
         LargePayloadStore.removeDirectory(directory)
     }
 
-    private static func checkpointKey(profileID: String, serverID: String) -> String {
+    static func checkpointKey(profileID: String, serverID: String) -> String {
         "jellyfinSyncCheckpoint.v1.\(shortHash("\(profileID)|\(serverID)"))"
     }
 
-    private static func pageKey(key: String, runID: String, entity: String, startIndex: Int) -> String {
-        "jellyfinSyncPage.\(shortHash("\(key)|\(runID)|\(entity)|\(startIndex)"))"
+    /// Start of every page name for one profile and server: derived from the
+    /// checkpoint key, so it is unique to that pair.
+    static func pagePrefix(forKey key: String) -> String {
+        "jellyfinSyncPage.v2.\(shortHash(key))."
+    }
+
+    static func pageKey(key: String, runID: String, entity: String, startIndex: Int) -> String {
+        pagePrefix(forKey: key) + shortHash("\(runID)|\(entity)|\(startIndex)")
+    }
+
+    /// Pages named before they carried a profile and server prefix
+    /// (`jellyfinSyncPage.<hash>`). Checkpoints that used them are started over
+    /// when loaded, so nothing reads them any more.
+    static func isLegacyPageKey(_ key: String) -> Bool {
+        key.range(of: #"^jellyfinSyncPage\.[0-9a-f]{64}$"#, options: .regularExpression) != nil
     }
 
     private static func shortHash(_ value: String) -> String {
         SHA256.hash(data: Data(value.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    private static func removePages(_ checkpoint: JellyfinSyncCheckpoint, key: String) {
-        for (entity, offsets) in checkpoint.pageOffsets {
-            for startIndex in offsets {
-                LargePayloadStore.remove(
-                    key: pageKey(key: key, runID: checkpoint.runID, entity: entity, startIndex: startIndex),
-                    directory: directory
-                )
-            }
+    private static func listedPageKeys(_ checkpoint: JellyfinSyncCheckpoint, key: String) -> Set<String> {
+        Set(checkpoint.pageOffsets.flatMap { entity, offsets in
+            offsets.map { pageKey(key: key, runID: checkpoint.runID, entity: entity, startIndex: $0) }
+        })
+    }
+
+    /// Every page of this profile and server except `keeping`. Called with the
+    /// lock held, so no page is between being written and being listed.
+    private static func removePages(forKey key: String, keeping: Set<String>) {
+        let prefix = pagePrefix(forKey: key)
+        for pageKey in LargePayloadStore.keys(directory: directory)
+        where pageKey.hasPrefix(prefix) && !keeping.contains(pageKey) {
+            LargePayloadStore.remove(key: pageKey, directory: directory)
+        }
+    }
+
+    private static func removeLegacyPages() {
+        for pageKey in LargePayloadStore.keys(directory: directory) where isLegacyPageKey(pageKey) {
+            LargePayloadStore.remove(key: pageKey, directory: directory)
         }
     }
 }
@@ -299,6 +335,18 @@ enum JellyfinSyncCheckpoints {
 
     static func eraseAll() {
         JellyfinSyncCheckpointStore.eraseAll()
+    }
+
+    // For tests: how checkpoint and page files are named.
+    static func checkpointKey(profileID: String, serverID: String) -> String {
+        JellyfinSyncCheckpointStore.checkpointKey(profileID: profileID, serverID: serverID)
+    }
+
+    static func pageKey(profileID: String, serverID: String, runID: String, entity: String, startIndex: Int) -> String {
+        JellyfinSyncCheckpointStore.pageKey(
+            key: checkpointKey(profileID: profileID, serverID: serverID),
+            runID: runID, entity: entity, startIndex: startIndex
+        )
     }
 }
 
