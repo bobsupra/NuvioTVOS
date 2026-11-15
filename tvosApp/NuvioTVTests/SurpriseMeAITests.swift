@@ -107,6 +107,16 @@ final class SurpriseMeAITests: XCTestCase {
         XCTAssertEqual(history.titleCount, 2)
     }
 
+    func testAnEntryWithBothIdsJoinsTwoEarlierEntries() {
+        // Different names (a localized title), so only the ids link them.
+        let fromTrakt = NuvioMeta(id: "tt1375666", name: "Inception", imdbId: "tt1375666", type: "movie", year: 2010)
+        let fromSimkl = NuvioMeta(id: "tmdb:27205", name: "El origen", tmdbId: 27205, type: "movie", year: 2010)
+        let both = NuvioMeta(id: "x", name: "Origen", imdbId: "tt1375666", tmdbId: 27205, type: "movie")
+        let other = NuvioMeta(id: "tt0816692", name: "Interstellar", type: "movie", year: 2014)
+        XCTAssertEqual(SurpriseMeHistory.unique([fromTrakt, fromSimkl, other, both]).map(\.id), ["tt1375666", "tt0816692"])
+        XCTAssertEqual(SurpriseMeHistory(watched: [fromTrakt, fromSimkl, other, both], library: [], continueWatching: []).titleCount, 2)
+    }
+
     func testScienceFictionAndSciFiAreTheSameGenre() {
         XCTAssertEqual(TasteProfile.normalized("Science Fiction"), TasteProfile.normalized("Sci-Fi"))
         XCTAssertEqual(TmdbDetailsService.surpriseMeGenreID(for: "Science Fiction"), 878)
