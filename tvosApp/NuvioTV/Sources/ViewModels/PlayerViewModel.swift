@@ -5237,7 +5237,11 @@ class PlayerViewModel: ObservableObject {
         }
         let targetTime = postCredits?.startTime ?? interval.endTime
         let wasPlaying = status == .playing
-        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)), exact: true)
+        // Stay half a second inside the file: a segment can end on the last
+        // frame (Plex's credits do) or a hair past it, and a seek beyond the
+        // end restarts some engines from the beginning.
+        let lastSafePosition = time.duration > 1 ? time.duration - 0.5 : Double.infinity
+        seek(to: min(targetTime + 0.25, lastSafePosition), exact: true)
         if wasPlaying {
             play()
         }
