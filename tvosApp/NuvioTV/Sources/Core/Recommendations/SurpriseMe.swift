@@ -195,6 +195,25 @@ struct SurpriseMeHistory {
         keys = Set((watched + continueWatching).flatMap(Self.keys(for:)))
     }
 
+    /// Changes whenever a title is added to, removed from or moved within any
+    /// of the three lists (most recent first), even if the count stays the
+    /// same, and whenever a title's genres change (the taste profile, and so
+    /// TMDB's genre candidates and the AI's genre shares, come from them).
+    /// In-memory only: not stable across launches.
+    var signature: Int {
+        var hasher = Hasher()
+        for (index, list) in [watched, library, continueWatching].enumerated() {
+            hasher.combine(index)
+            for meta in list {
+                hasher.combine(Self.titleKey(meta))
+                // Normalized and sorted: only which genres, not their order or spelling.
+                let genres = Set((meta.genres ?? []).map(TasteProfile.normalized).filter { !$0.isEmpty })
+                hasher.combine(genres.sorted())
+            }
+        }
+        return hasher.finalize()
+    }
+
     /// Distinct titles across the three lists.
     var titleCount: Int {
         Self.unique(watched + library + continueWatching).count
