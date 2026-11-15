@@ -2982,6 +2982,8 @@ enum ContinueWatchingStore {
         // reading progress during this switch sees the new profile's rows.
         WatchProgressLedger.setActiveProfile(profileId)
         ContinueWatchingDismissStore.setActiveProfile(profileId)
+        // Plex cards Home merged belong to the previous profile.
+        PlexContinueWatchingMerge.reset()
         migrateLegacyHistoryIfNeeded()
         // Carry a pre-ledger install's history across, so upgrading users keep
         // their row and it becomes syncable.
@@ -3897,6 +3899,14 @@ enum ContinueWatchingStore {
     }
 
     private static func writeTopShelfFeedLocked(from selectedItems: [ContinueWatchingItem]) {
+        // Plex's titles in progress join the shelf as they join Home's row,
+        // and take the place Home's sort gives them.
+        var selectedItems = selectedItems
+        let withPlex = PlexContinueWatchingMerge.mergedWithLatest(into: selectedItems)
+        if !withPlex.elementsEqual(selectedItems, by: { $0.isContentEqual(to: $1) }) {
+            let preference = ProfileSettings.current.string(forKey: SettingsKey.continueWatchingSort) ?? "Default"
+            selectedItems = ContinueWatchingSortPolicy.sorted(withPlex, preference: preference)
+        }
         // Each entry keeps its place on Home's row, so the shelf can show both
         // sections as one row in that order.
         let allItems = Array(selectedItems.enumerated())

@@ -1409,6 +1409,15 @@ struct ContentView: View {
         Task(priority: .utility) { await PluginStore.shared.appBecameActive() }
     }
 
+    /// The card a Top Shelf Continue Watching entry resumes: the stored one,
+    /// or the Plex card that Home shows in its place.
+    @MainActor
+    private static func continueWatchingItem(forShelfID id: String) -> ContinueWatchingItem? {
+        let stored = ContinueWatchingStore.item(for: id)
+        return PlexContinueWatchingMerge.mergedNow(into: stored.map { [$0] } ?? [])
+            .first { $0.meta.id == id } ?? stored
+    }
+
     /// Handles Top Shelf, `nuvio://` / `nuvio-tv://` title open, and
     /// `stremio://` add-on install deep links. Deferred while login/profile gate
     /// is up so Top Shelf cold-launch still works.
@@ -1471,7 +1480,7 @@ struct ContentView: View {
             ?? "movie"
 
         if host == "continue-watching" || pathParts.first == "continue-watching",
-           let item = ContinueWatchingStore.item(for: id) {
+           let item = Self.continueWatchingItem(forShelfID: id) {
             resumePlayback(item)
             return
         }
@@ -6406,6 +6415,7 @@ struct TVHomeView: View {
             // retires Continue Watching cards.
             guard collectionHome == nil, isActive, !isFullScreenOverlayPresented else { return }
             setContinueWatching(rawContinueWatchingItems)
+            writeDisplayedContinueWatchingToTopShelf()
         }
         .modifier(CalendarTodayHomeFeed(
             enabled: homeCalendarToday && collectionHome == nil,
@@ -6463,6 +6473,9 @@ struct TVHomeView: View {
             let remaining = all.filter { !ContinueWatchingDismissStore.isDismissed($0) }
             if remaining.count != all.count {
                 setContinueWatching(remaining)
+                // A dismissed Plex card leaves no stored change behind to
+                // rewrite the shelf.
+                writeDisplayedContinueWatchingToTopShelf()
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: CollectionPlaybackOriginStore.changedNotification)
@@ -10302,6 +10315,11 @@ struct TVHomeView: View {
     }
 
     /// Publish Continue Watching and derived lookups together, outside body.
+    /// The Top Shelf's Continue Watching in the order Home shows it.
+    private func writeDisplayedContinueWatchingToTopShelf() {
+        ContinueWatchingStore.writeTopShelfFeed(from: continueWatching + upcomingItems)
+    }
+
     private func setContinueWatching(_ sourceItems: [ContinueWatchingItem]) {
         // Titles in progress on Plex join the row; see PlexContinueWatchingMerge.
         let rawItems = PlexContinueWatchingMerge.merged(into: sourceItems, displayable: shouldDisplayContinueWatchingItem)
