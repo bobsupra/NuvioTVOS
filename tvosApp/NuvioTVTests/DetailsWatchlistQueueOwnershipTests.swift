@@ -477,9 +477,12 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
         }
     }
 
-    /// Runs A's write, optionally switching to another profile while it's in flight.
-    /// Returns the result, the UI notifications posted, and the other profile's id.
-    private func run(_ mode: QueueOwnershipMode, _ fixture: QueueOwnershipFixture, switchDuringRequest: Bool,
+    private enum Interruption { case none, profileSwitch, accountRelink }
+
+    /// Runs A's write and, while it's in flight, optionally switches to another profile or
+    /// relinks the same profile to another account. Returns the result, the UI
+    /// notifications posted, and the other profile's id.
+    private func run(_ mode: QueueOwnershipMode, _ fixture: QueueOwnershipFixture, during interruption: Interruption,
                      beforeAnswer: ((String?) -> Void)? = nil) async -> (Bool, Int, String?) {
         let inFlight = expectation(description: "A's request in flight: \(mode)")
         HeldResponseURLProtocol.started = { inFlight.fulfill() }
@@ -488,11 +491,17 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
         let task = Task { await self.write(mode, fixture, session: session) }
         await fulfillment(of: [inFlight], timeout: 3)
         var other: String?
-        if switchDuringRequest {
+        switch interruption {
+        case .none:
+            break
+        case .profileSwitch:
             let id = "details-other-\(UUID().uuidString)"
             ProfileSettings.setActiveProfile(id, isPrimary: false)
             LibraryStore.setActiveProfile(id)
             other = id
+        case .accountRelink:
+            // A new grant (or a different API key) on the same profile: account B.
+            fixture.seed(mode, suffix: "relinked")
         }
         beforeAnswer?(other)
         // Counted from here on: only what the server's answer causes, not the switch itself.
@@ -516,7 +525,7 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
             HeldResponseURLProtocol.reset()
             let fixture = QueueOwnershipFixture(mode)
             defer { fixture.restore() }
-            let (result, posted, other) = await run(mode, fixture, switchDuringRequest: true)
+            let (result, posted, other) = await run(mode, fixture, during: .profileSwitch)
             defer { cleanUp(other) }
             XCTAssertEqual(HeldResponseURLProtocol.requests, 1, "\(mode)")
             XCTAssertTrue(result, "The server applied A's change, so it must be reported for A: \(mode)")
@@ -529,7 +538,7 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
             HeldResponseURLProtocol.reset()
             let fixture = QueueOwnershipFixture(mode)
             defer { fixture.restore() }
-            let (result, posted, _) = await run(mode, fixture, switchDuringRequest: false)
+            let (result, posted, _) = await run(mode, fixture, during: .none)
             XCTAssertTrue(result, "\(mode)")
             XCTAssertGreaterThan(posted, 0, "\(mode)")
         }
@@ -540,7 +549,7 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
         defer { fixture.restore() }
         let ownerStore = fixture.store
         let bTitle = NuvioMeta(id: "tt-b", name: "B's title", type: "movie")
-        let (result, _, other) = await run(.weTrakr, fixture, switchDuringRequest: true) { otherID in
+        let (result, _, other) = await run(.weTrakr, fixture, during: .profileSwitch) { otherID in
             // B's library was loaded after the switch, while A's request was still out.
             WeTrakrLibraryService.replaceCachedItems(
                 [LibraryStoreItem(meta: bTitle, addedAt: Date())], for: ProfileSettings.store(for: otherID)
@@ -551,6 +560,41 @@ final class LibraryServiceInFlightSwitchTests: XCTestCase {
         let bCache = WeTrakrLibraryService.cachedItems(for: ProfileSettings.store(for: other))
         XCTAssertEqual(bCache?.map(\.meta.id), ["tt-b"], "A's add must not appear in B's cache")
         XCTAssertNil(WeTrakrLibraryService.cachedItems(for: ownerStore), "B's cache is never handed to A either")
+    }
+
+    func testASuccessConfirmedAfterASameProfileRelinkLeavesTheNewAccountsUIAlone() async {
+        for mode in [QueueOwnershipMode.simklV1, .simklV2, .mdbOAuth, .mdbAPIKey, .weTrakr] {
+            HeldResponseURLProtocol.reset()
+            let fixture = QueueOwnershipFixture(mode)
+            defer { fixture.restore() }
+            let (result, posted, _) = await run(mode, fixture, during: .accountRelink)
+            XCTAssertTrue(result, "Account A applied the change, so it's reported for A: \(mode)")
+            XCTAssertEqual(posted, 0, "Account B's library UI must not get A's change: \(mode)")
+        }
+    }
+
+    func testWeTrakrNeverPutsAChangeIntoTheRelinkedAccountsCache() async {
+        let fixture = QueueOwnershipFixture(.weTrakr)
+        defer { fixture.restore() }
+        let store = fixture.store
+        let bTitle = NuvioMeta(id: "tt-account-b", name: "Account B's title", type: "movie")
+        let (result, _, _) = await run(.weTrakr, fixture, during: .accountRelink) { _ in
+            // Account B's library was loaded after the relink, while A's request was still out.
+            WeTrakrLibraryService.replaceCachedItems([LibraryStoreItem(meta: bTitle, addedAt: Date())], for: store)
+        }
+        XCTAssertTrue(result)
+        XCTAssertEqual(WeTrakrLibraryService.cachedItems(for: store)?.map(\.meta.id), ["tt-account-b"],
+                       "A's add must not appear in account B's cache")
+    }
+
+    func testWeTrakrsCacheBelongsToTheAccountItWasLoadedFor() {
+        let fixture = QueueOwnershipFixture(.weTrakr)
+        defer { fixture.restore() }
+        let store = fixture.store
+        WeTrakrLibraryService.replaceCachedItems([LibraryStoreItem(meta: meta, addedAt: Date())], for: store)
+        XCTAssertNotNil(WeTrakrLibraryService.cachedItems(for: store))
+        fixture.seed(.weTrakr, suffix: "relinked")
+        XCTAssertNil(WeTrakrLibraryService.cachedItems(for: store), "Account A's list must not show for account B")
     }
 }
 

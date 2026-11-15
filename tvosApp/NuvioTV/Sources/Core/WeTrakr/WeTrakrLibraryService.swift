@@ -9,11 +9,12 @@ enum WeTrakrLibraryService {
     /// under another.
     private static var cachedLibrary: (owner: String, items: [LibraryStoreItem])?
 
-    /// The profile a settings store belongs to.
+    /// The profile a settings store belongs to and its linked WeTrakr account:
+    /// a relink on the same profile is another owner.
     static func cacheOwner(for store: UserDefaults) -> String {
         let id = store.string(forKey: "nuvio.tv.profile.settings.profileID")?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return id.isEmpty ? "default" : id
+        return "\(id.isEmpty ? "default" : id)|\(WeTrakrAuthStore.accountBindingID(in: store))"
     }
 
     /// Replaces the cache with `store`'s profile's items.
@@ -102,6 +103,12 @@ enum WeTrakrLibraryService {
         let clientID = WeTrakrConfig.clientID(in: store)
         let ids = WeTrakrProgressService.wetrakrIDs(for: meta)
         guard ids.hasUsableIdentifier else { return false }
+        // Who this write is for: the profile and the account linked now. Once the
+        // answer arrives, its cache and UI are only touched if both still hold.
+        let owner = cacheOwner(for: store)
+        func ownerIsCurrent() -> Bool {
+            ProfileSettings.isActiveStore(store) && cacheOwner(for: store) == owner
+        }
 
         let mediaPayload = WeTrakrMediaPayload(title: meta.name, year: meta.year, ids: ids, status: "planning")
 
@@ -119,11 +126,11 @@ enum WeTrakrLibraryService {
                 )
                 _ = try result.valueOrThrow()
 
-                // Only this profile's cache, never another profile's.
-                if var current = cachedItems(for: store),
+                // Only this profile's and account's cache, never another's.
+                if ownerIsCurrent(), var current = cachedItems(for: store),
                    !current.contains(where: { $0.meta.id == meta.id || WatchedStore.sameContent($0.meta, meta) }) {
                     current.insert(LibraryStoreItem(meta: meta, addedAt: Date()), at: 0)
-                    cachedLibrary = (cacheOwner(for: store), current)
+                    cachedLibrary = (owner, current)
                 }
             } else {
                 let payload = WeTrakrTrackingRemovePayload(
@@ -138,15 +145,15 @@ enum WeTrakrLibraryService {
                 )
                 _ = try result.valueOrThrow()
 
-                if var current = cachedItems(for: store) {
+                if ownerIsCurrent(), var current = cachedItems(for: store) {
                     current.removeAll(where: { $0.meta.id == meta.id || WatchedStore.sameContent($0.meta, meta) })
-                    cachedLibrary = (cacheOwner(for: store), current)
+                    cachedLibrary = (owner, current)
                 }
             }
 
             // WeTrakr applied it: that's the result. The visible library is only
-            // told while this profile is still the active one.
-            if ProfileSettings.isActiveStore(store) {
+            // told while this profile and this account are still the current ones.
+            if ownerIsCurrent() {
                 NotificationCenter.default.post(
                     name: TraktLibraryService.mutationNotification,
                     object: TraktLibraryMutation(meta: meta, isInWatchlist: isInWatchlist)
