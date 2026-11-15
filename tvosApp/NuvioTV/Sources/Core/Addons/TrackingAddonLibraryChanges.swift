@@ -20,11 +20,14 @@ enum TrackingAddonLibraryChanges {
         /// or relink since).
         let isCurrent: @MainActor () -> Bool
 
-        /// The active profile and its selected remote library, or nil when
-        /// there is none (local library, or not signed in).
-        static func current() -> Owner? {
-            guard let context = SelectedLibraryMutationContext() else { return nil }
-            return Owner(profileID: ProfileSettings.activeProfileID, isCurrent: { context.isCurrent })
+        init(profileID: String?, isCurrent: @escaping @MainActor () -> Bool) {
+            self.profileID = profileID
+            self.isCurrent = isCurrent
+        }
+
+        /// The owner `context` captured: its profile and library account.
+        init(context: SelectedLibraryMutationContext) {
+            self.init(profileID: ProfileSettings.activeProfileID, isCurrent: { context.isCurrent })
         }
     }
 

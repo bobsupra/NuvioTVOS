@@ -14096,13 +14096,14 @@ private struct TVGridHeroSlideshowView: View {
     private func toggleLibraryAction(for item: NuvioMeta) {
         let currentlyInLibrary = SelectedLibraryService.isInLibrary(meta: item)
         if TraktSettingsStore.librarySourceMode != .local && SelectedLibraryService.isSelectedAndAuthenticated {
-            guard let owner = TrackingAddonLibraryChanges.Owner.current() else { return }
+            // Captured now: the write and its report belong to this profile and account.
+            guard let context = SelectedLibraryMutationContext() else { return }
             let desiredMembership = !currentlyInLibrary
             TrackingAddonLibraryChanges.perform(
                 desiredMembership,
                 meta: item,
-                owner: owner,
-                mutation: { await SelectedLibraryService.setWatchlist(item, isInWatchlist: desiredMembership) },
+                owner: .init(context: context),
+                mutation: { await SelectedLibraryService.setWatchlist(item, isInWatchlist: desiredMembership, context: context) },
                 completion: { _ in updateLibraryStatus() }
             )
         } else {

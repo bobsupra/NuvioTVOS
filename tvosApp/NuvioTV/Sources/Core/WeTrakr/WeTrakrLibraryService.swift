@@ -69,9 +69,10 @@ enum WeTrakrLibraryService {
     static func setWatchlist(
         _ meta: NuvioMeta,
         isInWatchlist: Bool,
-        store: UserDefaults = ProfileSettings.current
+        store: UserDefaults = ProfileSettings.current,
+        profileScope: String? = nil
     ) async -> Bool {
-        guard let token = WeTrakrRuntimeSession.authenticatedState(store: store)?.accessToken,
+        guard let token = WeTrakrRuntimeSession.authenticatedState(store: store, profileScope: profileScope)?.accessToken,
               !token.isEmpty else { return false }
         let clientID = WeTrakrConfig.clientID(in: store)
         let ids = WeTrakrProgressService.wetrakrIDs(for: meta)

@@ -3668,13 +3668,14 @@ struct TitleActionsMenuContent: View {
             return
         }
 
+        // Captured now: the write and its report belong to this profile and account.
         guard SelectedLibraryService.isSelectedAndAuthenticated,
-              let owner = TrackingAddonLibraryChanges.Owner.current() else { return }
+              let context = SelectedLibraryMutationContext() else { return }
 
         let desiredMembership = !currentlyInLibrary
         let meta = meta
-        TrackingAddonLibraryChanges.perform(desiredMembership, meta: meta, owner: owner) {
-            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: desiredMembership)
+        TrackingAddonLibraryChanges.perform(desiredMembership, meta: meta, owner: .init(context: context)) {
+            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: desiredMembership, context: context)
         }
     }
 

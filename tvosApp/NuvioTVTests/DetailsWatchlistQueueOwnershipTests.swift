@@ -299,9 +299,96 @@ final class DetailsWatchlistQueueOwnershipTests: XCTestCase {
         let vm = DetailsViewModel(
             repository: repository, streamDiscoveryMode: .repository,
             deferredPreparationDelay: { throw CancellationError() }, enrichmentStarter: { _, _ in },
-            watchlistContext: { fixture.context() }, remoteWatchlistMutation: writer
+            watchlistContext: { fixture.context() }, remoteWatchlistMutation: { meta, membership, _ in await writer(meta, membership) }
         )
         await vm.loadDetails(id: repository.meta.id, type: repository.meta.type).value
         return vm
     }
 }
+
+/// SelectedLibraryService.setWatchlist(_:isInWatchlist:context:) waits for the AniList id
+/// mapping before writing. Whatever changes during that wait, the write goes only to the
+/// profile and account that started it, and is reported only for them.
+@MainActor
+final class SelectedLibraryWriteOwnershipTests: XCTestCase {
+    private let meta = NuvioMeta(id: "tt0111161", name: "Film", imdbId: "tt0111161", type: "movie")
+
+    private func switchProfile(away fixture: QueueOwnershipFixture) -> String {
+        let other = "details-other-\(UUID().uuidString)"
+        ProfileSettings.setActiveProfile(other, isPrimary: false)
+        LibraryStore.setActiveProfile(other)
+        return other
+    }
+
+    private func cleanUp(_ id: String) {
+        UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(id)")
+    }
+
+    func testAProfileSwitchDuringTheMappingWritesNothingForEveryAuthMode() async {
+        for mode in QueueOwnershipMode.allCases {
+            let fixture = QueueOwnershipFixture(mode)
+            defer { fixture.restore() }
+            guard let context = fixture.context() else { return XCTFail("no context: \(mode)") }
+            var other: String?
+            var writes = 0
+            let result = await SelectedLibraryService.setWatchlist(
+                meta, isInWatchlist: true, context: context,
+                resolve: { meta in other = self.switchProfile(away: fixture); return meta },
+                write: { _, _, _ in writes += 1; return true }
+            )
+            XCTAssertFalse(result, "\(mode)")
+            XCTAssertEqual(writes, 0, "Must not write to the next profile's library: \(mode)")
+            other.map(cleanUp)
+        }
+    }
+
+    func testAnAccountRelinkDuringTheMappingWritesNothingForEveryAuthMode() async {
+        for mode in QueueOwnershipMode.allCases {
+            let fixture = QueueOwnershipFixture(mode)
+            defer { fixture.restore() }
+            guard let context = fixture.context() else { return XCTFail("no context: \(mode)") }
+            var writes = 0
+            let result = await SelectedLibraryService.setWatchlist(
+                meta, isInWatchlist: true, context: context,
+                resolve: { meta in fixture.seed(mode, suffix: "relinked"); return meta },
+                write: { _, _, _ in writes += 1; return true }
+            )
+            XCTAssertFalse(result, "\(mode)")
+            XCTAssertEqual(writes, 0, "Must not write to the newly linked account: \(mode)")
+        }
+    }
+
+    func testAWriteCompletedOnTheOwnerIsReportedForItEvenAfterASwitchForEveryAuthMode() async {
+        let savedReport = TrackingAddonLibraryChanges.report
+        defer { TrackingAddonLibraryChanges.report = savedReport }
+        for mode in QueueOwnershipMode.allCases {
+            let fixture = QueueOwnershipFixture(mode)
+            defer { fixture.restore() }
+            guard let context = fixture.context() else { return XCTFail("no context: \(mode)") }
+            let ownerStore = fixture.store
+            var reportedFor: [String?] = []
+            TrackingAddonLibraryChanges.report = { _, _, profileID in reportedFor.append(profileID) }
+            var writtenTo: LibraryWriteTarget?
+            var other: String?
+
+            await TrackingAddonLibraryChanges.perform(true, meta: meta, owner: .init(context: context)) {
+                await SelectedLibraryService.setWatchlist(
+                    self.meta, isInWatchlist: true, context: context,
+                    resolve: { $0 },
+                    write: { _, _, target in
+                        writtenTo = target
+                        // The request is in flight when the user switches profiles.
+                        other = self.switchProfile(away: fixture)
+                        return true
+                    }
+                )
+            }.value
+
+            XCTAssertTrue(writtenTo?.store === ownerStore, "Written to the owner's store: \(mode)")
+            XCTAssertEqual(writtenTo?.source, mode.source, "\(mode)")
+            XCTAssertEqual(reportedFor, [fixture.profile], "Reported for the owner, not the next profile: \(mode)")
+            other.map(cleanUp)
+        }
+    }
+}
+

@@ -10,6 +10,15 @@ struct SelectedLibraryMutationContext {
     private let settingsProfileID: String?
     private let source: TraktLibrarySourceMode
     private let accountIsCurrent: @MainActor () -> Bool
+    /// The service's profile scope captured with the account (Simkl, WeTrakr, MDBList).
+    private var serviceProfileScope: String?
+    private var traktContext: TraktLibraryMutationContext?
+
+    /// Where a write for this owner goes: its settings store, service, scope and
+    /// account, as captured, never whichever profile is active when it runs.
+    var target: LibraryWriteTarget {
+        LibraryWriteTarget(source: source, store: store, profileScope: serviceProfileScope, trakt: traktContext)
+    }
 
     init?(
         simklTokens: SimklTokenStorage = SimklKeychainTokenStorage(),
@@ -26,9 +35,11 @@ struct SelectedLibraryMutationContext {
             return nil
         case .trakt:
             guard let context = TraktLibraryMutationContext() else { return nil }
+            traktContext = context
             accountIsCurrent = { context.isCurrent }
         case .simkl:
             let scope = SimklRuntimeSession.profileScope()
+            serviceProfileScope = scope
             guard let state = SimklRuntimeSession.authenticatedState(
                 store: store, tokenStorage: simklTokens, profileScope: scope
             ) else { return nil }
@@ -44,6 +55,7 @@ struct SelectedLibraryMutationContext {
             }
         case .wetrakr:
             let scope = WeTrakrRuntimeSession.profileScope()
+            serviceProfileScope = scope
             guard WeTrakrRuntimeSession.isAuthenticated(
                 in: store, tokenStorage: weTrakrTokens, profileScope: scope
             ) else { return nil }
@@ -58,6 +70,7 @@ struct SelectedLibraryMutationContext {
             }
         case .mdblist:
             let scope = MdbListRuntimeSession.profileScope()
+            serviceProfileScope = scope
             if mdbListTokens.tokens(for: scope) != nil {
                 let binding = MdbListAuthStore.accountBindingID(in: store)
                 accountIsCurrent = {
@@ -85,3 +98,12 @@ struct SelectedLibraryMutationContext {
             && accountIsCurrent()
     }
 }
+
+/// The captured destination of a library write.
+struct LibraryWriteTarget {
+    let source: TraktLibrarySourceMode
+    let store: UserDefaults
+    let profileScope: String?
+    let trakt: TraktLibraryMutationContext?
+}
+

@@ -470,7 +470,7 @@ class DetailsViewModel: ObservableObject {
     private let deferredPreparationDelay: AsyncDelay
     private let injectedEnrichmentStarter: EnrichmentStarter?
     private let watchlistContext: @MainActor () -> SelectedLibraryMutationContext?
-    private let remoteWatchlistMutation: @MainActor (NuvioMeta, Bool) async -> Bool
+    private let remoteWatchlistMutation: @MainActor (NuvioMeta, Bool, SelectedLibraryMutationContext) async -> Bool
 
     init(
         repository: CatalogRepository,
@@ -482,8 +482,8 @@ class DetailsViewModel: ObservableObject {
         watchlistContext: @escaping @MainActor () -> SelectedLibraryMutationContext? = {
             SelectedLibraryMutationContext()
         },
-        remoteWatchlistMutation: @escaping @MainActor (NuvioMeta, Bool) async -> Bool = { meta, membership in
-            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: membership)
+        remoteWatchlistMutation: @escaping @MainActor (NuvioMeta, Bool, SelectedLibraryMutationContext) async -> Bool = { meta, membership, context in
+            await SelectedLibraryService.setWatchlist(meta, isInWatchlist: membership, context: context)
         }
     ) {
         self.repository = repository
@@ -1288,7 +1288,7 @@ class DetailsViewModel: ObservableObject {
             desiredMembership,
             meta: meta,
             owner: owner,
-            mutation: { await mutation(meta, desiredMembership) },
+            mutation: { await mutation(meta, desiredMembership, context) },
             completion: { [weak self] succeeded in
                 guard let self, !Task.isCancelled, context.isCurrent,
                       self.watchlistMutationGeneration == mutationGeneration,
