@@ -11274,8 +11274,9 @@ private struct TvStreamPickerOverlay: View {
         let picks = pickerSortOption == .recommended
             ? StreamPickerListBuilder.recommendedByResolution(from: activeDisplayedStreams)
             : []
-        // The top recommended sources get a short speed check; a slow top pick
-        // gives way to the best checked one that keeps up with its resolution.
+        // The top recommended sources get a speed verdict from what they report
+        // (never by opening them); a slow top pick gives way to the best one
+        // that keeps up with its resolution.
         let speedCandidates = pickerSortOption == .recommended
             ? Array(activeDisplayedStreams.lazy.filter {
                 !$0.isNotPlayable && $0.unavailabilityReason == nil && StreamPickerListBuilder.resolution(for: $0) > 0
@@ -11498,27 +11499,19 @@ private struct TvStreamPickerOverlay: View {
                 .stroke(Color.white.opacity(0.10), lineWidth: 1)
         )
         .task(id: speedCandidates.map(\.id).joined(separator: "|")) {
-            await checkSpeed(of: speedCandidates)
+            checkSpeed(of: speedCandidates)
         }
     }
 
     static let speedCheckCandidateCount = 3
 
-    /// Checks the candidates that have no result yet, all at once, while the
-    /// user looks at the list.
-    private func checkSpeed(of candidates: [NuvioStream]) async {
-        let pending = candidates.filter { speedVerdicts[$0.id] == nil }
-        guard !pending.isEmpty else { return }
-        await withTaskGroup(of: (String, StreamSpeedVerdict?).self) { group in
-            for stream in pending {
-                let resolution = StreamPickerListBuilder.resolution(for: stream)
-                group.addTask {
-                    (stream.id, await StreamSpeedProbe.shared.verdict(for: stream, resolution: resolution))
-                }
-            }
-            for await (id, verdict) in group {
-                guard !Task.isCancelled else { return }
-                if let verdict { speedVerdicts[id] = verdict }
+    /// Judges the candidates that have no result yet. Nothing is downloaded:
+    /// see StreamSpeedProbe.
+    private func checkSpeed(of candidates: [NuvioStream]) {
+        for stream in candidates where speedVerdicts[stream.id] == nil {
+            let resolution = StreamPickerListBuilder.resolution(for: stream)
+            if let verdict = StreamSpeedProbe.verdict(for: stream, resolution: resolution) {
+                speedVerdicts[stream.id] = verdict
             }
         }
     }
