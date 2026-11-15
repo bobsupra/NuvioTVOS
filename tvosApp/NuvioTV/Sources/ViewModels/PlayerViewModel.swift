@@ -3908,6 +3908,11 @@ class PlayerViewModel: ObservableObject {
             // even when paused or when the settings HUD is open.
             if clock.position != latestTime.current { clock.position = latestTime.current }
             if clock.duration != latestTime.duration { clock.duration = latestTime.duration }
+            // Tracking add-on events from before the duration was known (status
+            // turns .playing as soon as the engine starts) go out now, in order.
+            trackingAddonReporter.durationAvailable(
+                item: trackingAddonItem, currentTime: latestTime.current, duration: latestTime.duration
+            )
             let engineBufferedSeconds = Double(c.bufferedMs) / 1000.0
             let effectiveBuffered = max(engineBufferedSeconds, diskCachedBufferedPosition)
             if clock.buffered != effectiveBuffered { clock.buffered = effectiveBuffered }
@@ -4867,7 +4872,7 @@ class PlayerViewModel: ObservableObject {
             cancelPauseOverlaySchedule()
             return
         }
-        trackingAddonReporter.stop(currentTime: time.current, duration: time.duration)
+        trackingAddonReporter.stop(timingFor: trackingAddonItem, currentTime: time.current, duration: time.duration)
         PlexPlaybackSync.shared.report(.stopped, url: activeStreamURL, currentTime: time.current, duration: time.duration)
         rememberManualSourceIfReady(refreshTimestamp: true)
         detachWatchPartyPlayerBridge()
@@ -5153,7 +5158,7 @@ class PlayerViewModel: ObservableObject {
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
         let prevCurrent = time.current
-        trackingAddonReporter.seeked(to: target, duration: duration)
+        trackingAddonReporter.seeked(trackingAddonItem, to: target, duration: duration)
         PlexPlaybackSync.shared.seeked(url: activeStreamURL, to: target, duration: duration)
         seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s, exact: \(exact))")
         screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds), exact: \(exact)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
