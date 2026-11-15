@@ -50,7 +50,14 @@ enum IPTVSourceStoreError: Error, Equatable {
 struct IPTVSourceStore {
     let storage: any IPTVSourceStorage
 
-    init(storage: any IPTVSourceStorage = IPTVKeychainStorage()) {
+    /// Where sources are kept unless a store is given another storage (tests swap it).
+    static var defaultStorage: any IPTVSourceStorage = IPTVKeychainStorage()
+
+    /// Moved on whenever a profile's sources are removed with the profile, so an
+    /// earlier pending save for that profile can't bring them back.
+    static let profileGenerations = AccountLoginGenerations()
+
+    init(storage: any IPTVSourceStorage = IPTVSourceStore.defaultStorage) {
         self.storage = storage
     }
 
@@ -58,6 +65,36 @@ struct IPTVSourceStore {
         guard !profileID.isEmpty else { throw IPTVSourceStoreError.invalidProfile }
         guard let data = try storage.read(profileID: profileID) else { return [] }
         return try JSONDecoder().decode([IPTVSource].self, from: data)
+    }
+
+    /// The generation to capture before work that saves later (see `save(_:profileID:ifGeneration:)`).
+    static func generation(for profileID: String) -> UInt64 {
+        profileGenerations.current(for: profileID)
+    }
+
+    /// Saves only if the profile's sources weren't removed since `generation`
+    /// was captured. Returns false, saving nothing, when they were.
+    @discardableResult
+    func save(_ sources: [IPTVSource], profileID: String, ifGeneration generation: UInt64) throws -> Bool {
+        var failure: Error?
+        let saved = Self.profileGenerations.commit(generation, for: profileID) {
+            do { try save(sources, profileID: profileID) } catch { failure = error }
+        }
+        if let failure { throw failure }
+        return saved
+    }
+
+    /// A profile was deleted, here or on another device. Profile ids can be
+    /// reused, so its sources (with their credentials), favourites and last
+    /// channel must not pass to a new profile; a pending save for it is stopped.
+    /// Other profiles' sources are untouched.
+    static func removeProfile(_ profileID: String, defaults: UserDefaults? = nil) {
+        guard !profileID.isEmpty else { return }
+        let storage = defaultStorage
+        profileGenerations.invalidate(profileID) { try? storage.remove(profileID: profileID) }
+        let settings = defaults ?? ProfileSettings.store(for: profileID)
+        IPTVFavoritesStore(defaults: settings).save([])
+        IPTVRecentChannelStore.remove(from: settings)
     }
 
     func save(_ sources: [IPTVSource], profileID: String) throws {

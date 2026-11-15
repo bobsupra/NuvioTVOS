@@ -23,6 +23,12 @@ final class AccountLoginGenerations: @unchecked Sendable {
         }
     }
 
+    /// The profile's current generation, without starting anything. Work that
+    /// captures it can only save while nothing removed the profile's data since.
+    func current(for profileScope: String) -> UInt64 {
+        lock.withLock { generations[profileScope] ?? 0 }
+    }
+
     /// Removes a profile's login: moves the generation on and runs `remove`
     /// under the lock, so a login still waiting can't bring it back.
     func invalidate(_ profileScope: String, _ remove: () -> Void = {}) {
