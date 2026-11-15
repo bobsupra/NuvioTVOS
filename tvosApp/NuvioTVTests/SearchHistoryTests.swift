@@ -247,6 +247,7 @@ private protocol SearchLifecycleModel: AnyObject {
     var error: String? { get }
     var recentSearches: [String] { get }
     func performSearch(query: String)
+    func reloadRecent()
 }
 
 extension SearchViewModel: SearchLifecycleModel {}
@@ -1902,6 +1903,67 @@ final class SearchProfileSwitchTests: XCTestCase {
     @MainActor
     func testNetflixSearchLateResultStaysOutOfTheNextProfile() async throws {
         try await assertLateSearchDoesNotLeakIntoTheNextProfile { NetflixSearchViewModel(repository: $0) }
+    }
+
+    /// B becomes active, a search view appears and calls reloadRecent() before the
+    /// queued notification is handled, and only then does A's search finish.
+    @MainActor
+    private func assertReloadBeforeTheNotificationDoesNotLetASearchIn(
+        _ makeViewModel: (CatalogRepository) -> any SearchLifecycleModel
+    ) async throws {
+        let (profileA, profileB) = (profiles[0], profiles[1])
+        ProfileSettings.setActiveProfile(profileA, isPrimary: false)
+        SearchHistoryStore.save(["alpha query"], defaults: ProfileSettings.store(for: profileA))
+
+        let repo = ControllableLifecycleRepository()
+        let slowStarted = expectation(description: "slow search started")
+        let slowCanFinish = expectation(description: "slow search may finish")
+        let slowReturned = expectation(description: "slow search returned")
+        repo.searchHandler = { query in
+            if query == "Dune" {
+                slowStarted.fulfill()
+                await self.fulfillment(of: [slowCanFinish], timeout: 5)
+                slowReturned.fulfill()
+            }
+            return [NuvioMeta(id: "meta_\(query)", name: "Result for \(query)", type: "movie")]
+        }
+        let viewModel = makeViewModel(repo)
+        viewModel.reloadRecent()
+        XCTAssertEqual(viewModel.recentSearches, ["alpha query"])
+
+        viewModel.searchText = "Dune"
+        await fulfillment(of: [slowStarted], timeout: 2)
+
+        // All in one main-actor turn, so the notification is still queued.
+        ProfileSettings.setActiveProfile(profileB, isPrimary: false)
+        SearchHistoryStore.save(["beta query"], defaults: ProfileSettings.store(for: profileB))
+        viewModel.reloadRecent()
+        XCTAssertEqual(viewModel.recentSearches, ["beta query"])
+
+        // A's search finishes now, before or after the notification turn.
+        slowCanFinish.fulfill()
+        await fulfillment(of: [slowReturned], timeout: 2)
+        try await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(history(profileB), ["beta query"], "A's query must not reach B")
+        XCTAssertTrue(viewModel.results.isEmpty)
+
+        // The queued notification doesn't reset B again: what's typed on B stays and saves to B.
+        viewModel.searchText = "Interstellar"
+        try await Task.sleep(nanoseconds: 450_000_000)
+        try await waitForSearch(viewModel)
+        XCTAssertEqual(viewModel.searchText, "Interstellar")
+        XCTAssertEqual(history(profileB), ["Interstellar", "beta query"])
+        XCTAssertEqual(history(profileA), ["alpha query"])
+    }
+
+    @MainActor
+    func testSearchReloadBeforeTheNotificationDoesNotLetASearchIn() async throws {
+        try await assertReloadBeforeTheNotificationDoesNotLetASearchIn { SearchViewModel(repository: $0) }
+    }
+
+    @MainActor
+    func testNetflixSearchReloadBeforeTheNotificationDoesNotLetASearchIn() async throws {
+        try await assertReloadBeforeTheNotificationDoesNotLetASearchIn { NetflixSearchViewModel(repository: $0) }
     }
 
     @MainActor

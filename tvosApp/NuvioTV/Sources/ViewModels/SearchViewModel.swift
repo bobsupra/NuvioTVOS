@@ -101,8 +101,16 @@ class SearchViewModel: ObservableObject {
 
         NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] _ in self?.activeProfileDidChange() }
+            .sink { [weak self] _ in self?.resetIfProfileChanged() }
             .store(in: &cancellables)
+    }
+
+    /// Runs the reset below once per profile change, whichever notices it
+    /// first: the notification, or `reloadRecent()` when a search view appears
+    /// before the queued notification is handled.
+    func resetIfProfileChanged() {
+        guard ProfileSettings.activeProfileScope != historyProfileScope else { return }
+        activeProfileDidChange()
     }
 
     /// Another profile is active: drop everything from the previous one. A
@@ -125,7 +133,7 @@ class SearchViewModel: ObservableObject {
         emptyStateReason = nil
         isLoading = false
         searchText = ""
-        reloadRecent()
+        loadHistoryFromActiveProfile()
     }
 
     var hasQuery: Bool {
@@ -177,6 +185,8 @@ class SearchViewModel: ObservableObject {
         let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         searchGeneration &+= 1
         let generation = searchGeneration
+        // The profile this search belongs to, whatever the history shows when it ends.
+        let originProfileScope = ProfileSettings.activeProfileScope
         searchTimeoutTask?.cancel()
         searchTask?.cancel()
         enrichmentTask?.cancel()
@@ -199,7 +209,7 @@ class SearchViewModel: ObservableObject {
             error = nil
             emptyStateReason = cached.results.isEmpty ? cached.reason : nil
             isLoading = false
-            if !cached.results.isEmpty { commitRecentSearch(trimmed) }
+            if !cached.results.isEmpty { commitRecentSearch(trimmed, from: originProfileScope) }
             if SearchResultEnrichment.hasIncompleteLeadingResults(cached.results) {
                 enrich(cached.results, cacheKey: cacheKey, generation: generation, cacheable: true)
             }
@@ -229,7 +239,7 @@ class SearchViewModel: ObservableObject {
                     self.cache(outcome, for: cacheKey)
                 }
                 self.applyFilter()
-                if !found.isEmpty { self.commitRecentSearch(trimmed) }
+                if !found.isEmpty { self.commitRecentSearch(trimmed, from: originProfileScope) }
                 self.emptyStateReason = outcome.isComplete
                     ? (found.isEmpty ? outcome.reason : nil)
                     : .requestFailed
@@ -330,6 +340,16 @@ class SearchViewModel: ObservableObject {
     /// the same key, so whichever search style isn't on screen goes stale until
     /// its view reappears.
     func reloadRecent() {
+        // A search view can appear before the profile-change notification is
+        // handled: reset here so no work from the previous profile survives.
+        if ProfileSettings.activeProfileScope != historyProfileScope {
+            activeProfileDidChange()
+        } else {
+            loadHistoryFromActiveProfile()
+        }
+    }
+
+    private func loadHistoryFromActiveProfile() {
         historyProfileScope = ProfileSettings.activeProfileScope
         recentSearches = SearchHistoryStore.load()
     }
@@ -342,15 +362,17 @@ class SearchViewModel: ObservableObject {
 
     func commitCurrentSearch() {
         guard hasQuery else { return }
-        commitRecentSearch(searchText)
+        commitRecentSearch(searchText, from: ProfileSettings.activeProfileScope)
     }
 
-    private func commitRecentSearch(_ term: String) {
-        // The profile changed and its notification hasn't been handled yet:
-        // never merge the previous profile's list into this one.
-        guard historyProfileScope == ProfileSettings.activeProfileScope else {
-            sessionCommittedQuery = nil
-            reloadRecent()
+    /// Saves `term` only to the profile the search started on, and only while
+    /// that profile is active and is the one the visible history came from.
+    private func commitRecentSearch(_ term: String, from originProfileScope: String) {
+        let active = ProfileSettings.activeProfileScope
+        guard originProfileScope == active, historyProfileScope == active else {
+            // A search from another profile, or a switch not handled yet: never
+            // save it here, and never merge another profile's list into this one.
+            resetIfProfileChanged()
             return
         }
         let (updated, newSession) = SearchHistoryStore.commit(
