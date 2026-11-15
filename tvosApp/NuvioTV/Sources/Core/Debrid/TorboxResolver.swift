@@ -40,7 +40,7 @@ struct TorboxResolver: DebridProvider {
                 query: [.init(name: "id", value: String(torrentId)), .init(name: "bypass_cache", value: "true")]
             ), let file = DebridFileSelection.select(
                 from: info.data?.files ?? [], request: request,
-                name: { $0.displayName }, size: { $0.size }, fileId: { $0.id }
+                name: { $0.selectionPath }, size: { $0.size }, fileId: { $0.id }
             ), let fileId = file.id else { return .stale }
 
             // 3. Request a direct link for that file.
@@ -131,7 +131,13 @@ private struct TorrentData: Decodable {
         let id: Int?
         let name: String?
         let shortName: String?
+        let absolutePath: String?
         let size: Int64?
+
+        var selectionPath: String {
+            [name, absolutePath, shortName].compactMap { $0 }
+                .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty } ?? ""
+        }
 
         var displayName: String {
             if let shortName, !shortName.isEmpty { return shortName }
@@ -142,6 +148,7 @@ private struct TorrentData: Decodable {
         enum CodingKeys: String, CodingKey {
             case id, name, size
             case shortName = "short_name"
+            case absolutePath = "absolute_path"
         }
     }
 }

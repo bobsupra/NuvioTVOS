@@ -131,29 +131,44 @@ enum DebridVideo {
         return extensions.contains(ext)
     }
 
-    /// A release's sample clip (`Show.S01E05.1080p-GRP-sample.mkv`, `Sample/show.s01e05.mkv`):
-    /// `sample` as a whole word anywhere in the path.
+    /// A release's sample clip (`Show.S01E05.1080p-GRP-sample.mkv`, `Sample/show.s01e05.mkv`).
+    /// For episode names, treat text before the episode marker as a possible title.
     static func isSample(_ path: String) -> Bool {
-        path.range(of: "(?<![a-z0-9])sample(?![a-z0-9])", options: [.regularExpression, .caseInsensitive]) != nil
+        let components = path.replacingOccurrences(of: "\\", with: "/").split(separator: "/").map(String.init)
+        guard let filename = components.last else { return false }
+        let samplePattern = "(?<![a-z0-9])sample(?![a-z0-9])"
+        let episodePattern = #"(?i)(?:^|[^a-z0-9])(?:s\d+e\d+|\d+x\d+)(?![0-9])"#
+        if let episode = filename.range(of: episodePattern, options: .regularExpression) {
+            if components.dropLast().contains(where: { $0.caseInsensitiveCompare("sample") == .orderedSame }) {
+                return true
+            }
+            return filename[episode.upperBound...].range(
+                of: samplePattern, options: [.regularExpression, .caseInsensitive]
+            ) != nil
+        }
+        return path.range(of: samplePattern, options: [.regularExpression, .caseInsensitive]) != nil
     }
 
-    /// Matches complete episode tokens such as S01E05, S1E5 or 1x05. The
-    /// trailing digit boundary is essential: S1E2 must not select S1E20.
+    /// Matches complete episode tokens such as S01E05, S01E05E06 or 1x05.
+    /// The trailing digit boundary prevents S1E2 from matching S1E20.
     static func matchesEpisode(_ path: String, season: Int?, episode: Int?) -> Bool {
         guard let season, let episode, season >= 0, episode > 0 else { return false }
-        let pattern = "(?:^|[^a-z0-9])(?:s0*\(season)e0*\(episode)|0*\(season)x0*\(episode))(?![0-9])"
+        let pattern = "(?:^|[^a-z0-9])(?:s0*\(season)e(?:[0-9]+e)*0*\(episode)|0*\(season)x0*\(episode))(?![0-9])"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
             return false
         }
-        let range = NSRange(path.startIndex..., in: path)
-        return regex.firstMatch(in: path, range: range) != nil
+        // Parent folders can contain a different episode number than the file.
+        let filename = path.replacingOccurrences(of: "\\", with: "/")
+            .split(separator: "/").last.map(String.init) ?? ""
+        let range = NSRange(filename.startIndex..., in: filename)
+        return regex.firstMatch(in: filename, range: range) != nil
     }
 }
 
 /// The file-picking heuristic shared by every provider (Real-Debrid, Premiumize,
 /// Torbox): prefer a filename matching the wanted episode, then the add-on's
-/// `fileIdx`, then the largest video file. Generic over each provider's file DTO
-/// via accessor closures. Mirrors the Android `*FileSelector` classes.
+/// `fileIdx`, then the largest video file. A unique add-on filename can pick a
+/// specific release first. Generic over provider DTOs via accessor closures.
 enum DebridFileSelection {
     static func select<File>(
         from files: [File],
@@ -164,10 +179,52 @@ enum DebridFileSelection {
     ) -> File? {
         let playable = files.filter { DebridVideo.isPlayable(name($0)) }
         guard !playable.isEmpty else { return nil }
-        // A release's sample clip also carries the episode token; it is picked only when the
-        // torrent holds nothing else.
+        // Exclude likely samples from automatic name/episode/size selection when
+        // alternatives exist. An explicit file index may still select one below.
         let features = playable.filter { !DebridVideo.isSample(name($0)) }
         let candidates = features.isEmpty ? playable : features
+
+        // Prefer an unambiguous file name supplied by the add-on. Keep the
+        // sample protection, and do not override an explicit episode with a
+        // conflicting or unidentifiable file name.
+        if let requested = request.filename?.trimmingCharacters(in: .whitespacesAndNewlines), !requested.isEmpty {
+            func normalized(_ value: String) -> String {
+                value.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .replacingOccurrences(of: "\\", with: "/")
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+            }
+            let target = normalized(requested)
+            let targetBasename = target.split(separator: "/").last.map(String.init) ?? target
+            func basename(_ file: File) -> String {
+                normalized(name(file)).split(separator: "/").last.map(String.init) ?? ""
+            }
+            let matchingGroups = [
+                candidates.filter { normalized(name($0)) == target },
+                candidates.filter { normalized(name($0)).caseInsensitiveCompare(target) == .orderedSame },
+                candidates.filter { target.contains("/") && normalized(name($0)).hasSuffix("/" + target) },
+                candidates.filter {
+                    target.contains("/") && normalized(name($0)).lowercased().hasSuffix("/" + target.lowercased())
+                },
+                candidates.filter { basename($0) == targetBasename },
+                candidates.filter { basename($0).caseInsensitiveCompare(targetBasename) == .orderedSame }
+            ]
+            let matchIndex = matchingGroups.firstIndex { !$0.isEmpty }
+            let matches = matchIndex.map { matchingGroups[$0] } ?? []
+            let pathParts = target.split(separator: "/").map(String.init)
+            let filenameHasEpisode = targetBasename.range(
+                of: #"(?i)(?:^|[^a-z0-9])(?:s\d+e\d+|\d+x\d+)(?![0-9])"#,
+                options: .regularExpression
+            ) != nil
+            let folderMatchesEpisode = pathParts.count > 1 && !filenameHasEpisode &&
+                DebridVideo.matchesEpisode(pathParts[pathParts.count - 2], season: request.season, episode: request.episode)
+            let exactPathMatchesEpisode = (matchIndex == 0 || matchIndex == 1) && folderMatchesEpisode
+            if matches.count == 1, let match = matches.first,
+               (request.season == nil || request.episode == nil ||
+                DebridVideo.matchesEpisode(name(match), season: request.season, episode: request.episode) ||
+                exactPathMatchesEpisode) {
+                return match
+            }
+        }
 
         // Series: a filename that matches the season/episode wins; the largest one if several do.
         if request.season != nil,
