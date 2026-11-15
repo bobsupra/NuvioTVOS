@@ -5630,6 +5630,7 @@ private struct IntegrationSettingsView: View {
     @State private var showingMdbListOptions = false
     @State private var showingAISubtitleOptions = false
     @State private var showingSurpriseMeOptions = false
+    @State private var showingTrackingAddons = false
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @State private var showingP2PConsent = false
     @State private var showingAddonsSettings = false
@@ -5963,6 +5964,26 @@ private struct IntegrationSettingsView: View {
             }
 
             SettingsGroup(
+                title: L10n.string("tvos_settings_tracking_addons", fallback: "Tracking Add-ons"),
+                subtitle: L10n.string(
+                    "tvos_settings_tracking_addons_integration_subtitle",
+                    fallback: "Stremio add-ons that follow what you watch for a tracking service"
+                )
+            ) {
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_manage_tracking_addons", fallback: "Manage Tracking Add-ons"),
+                    subtitle: L10n.string(
+                        "tvos_settings_manage_tracking_addons_subtitle",
+                        fallback: "Choose which add-ons receive your watch activity, and see why an add-on isn't listed"
+                    ),
+                    value: L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingTrackingAddons = true
+                }
+            }
+
+            SettingsGroup(
                 title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
                 subtitle: L10n.string(
                     "surprise_me_integration_subtitle",
@@ -6278,6 +6299,10 @@ private struct IntegrationSettingsView: View {
         }
         .sheet(isPresented: $showingAISubtitleOptions) {
             AISubtitleOptionsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $showingTrackingAddons) {
+            TrackingAddonsManageSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(isPresented: $showingSurpriseMeOptions) {
@@ -15787,6 +15812,39 @@ private struct JellyfinLibrarySelectionSheet: View {
 /// Installed add-ons that declare Stremio's `player` or `library` resource.
 /// They receive the user's watch activity, so each one stays off until the
 /// user turns it on here. Hidden when none is installed.
+/// Settings > Integrations > Manage Tracking Add-ons.
+private struct TrackingAddonsManageSheet: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.streamAddonManifestURL) private var streamAddonManifestURL = ""
+    @AppStorage(SettingsKey.streamAddonManifestURLs) private var streamAddonManifestURLs = ""
+    @AppStorage(SettingsKey.streamAddonManifestStates) private var streamAddonManifestStates = ""
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(L10n.string("tvos_settings_manage_tracking_addons", fallback: "Manage Tracking Add-ons"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+                    TrackingAddonsSettingsGroup(
+                        accentColor: accentColor,
+                        addonsSignature: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates,
+                        showsAllAddons: true
+                    )
+                }
+                .frame(width: 1_000, alignment: .leading)
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+    }
+}
+
 private struct TrackingAddonsSettingsGroup: View {
     struct Entry: Identifiable, Equatable {
         let manifestURL: URL
@@ -15796,35 +15854,113 @@ private struct TrackingAddonsSettingsGroup: View {
         var id: String { manifestURL.absoluteString }
     }
 
+    /// An installed add-on that doesn't track, with what its manifest declares.
+    struct OtherAddon: Identifiable, Equatable {
+        let id: String
+        let name: String
+        let resources: String
+    }
+
     let accentColor: Color
     let addonsSignature: String
+    /// Manage Tracking Add-ons: show the group even when none is installed, and
+    /// list the other add-ons with what they declare, so it's clear why one
+    /// doesn't appear.
+    var showsAllAddons = false
 
     @State private var entries: [Entry] = []
+    @State private var others: [OtherAddon] = []
+    /// Add-ons whose manifest couldn't be read: whether they track is unknown,
+    /// so they are neither offered for tracking nor listed as not tracking.
+    @State private var unreadable: [OtherAddon] = []
+    @State private var didLoad = false
     @State private var approved: Set<String> = TrackingAddonService.approvedManifestURLs()
 
     var body: some View {
         Group {
-            if !entries.isEmpty {
-                SettingsGroup(
-                    title: L10n.string("tvos_settings_tracking_addons", fallback: "Tracking Add-ons"),
-                    subtitle: L10n.string(
-                        "tvos_settings_tracking_addons_subtitle",
-                        fallback: "These add-ons can follow what you watch for a tracking service. Turning one on shares your playback and library activity (what you watch, when and how far) with it."
-                    )
-                ) {
-                    ForEach(entries) { entry in
-                        SettingsToggleRow(
-                            title: entry.name,
-                            subtitle: subtitle(for: entry),
-                            isOn: binding(for: entry),
-                            accentColor: accentColor
-                        )
+            if showsAllAddons {
+                VStack(alignment: .leading, spacing: 28) {
+                    trackingGroup
+                    if !others.isEmpty {
+                        SettingsGroup(
+                            title: L10n.string("tvos_settings_tracking_addons_others", fallback: "Other add-ons"),
+                            subtitle: L10n.string(
+                                "tvos_settings_tracking_addons_others_subtitle",
+                                fallback: "These don't support tracking. Shown with the resources their manifest declares."
+                            )
+                        ) {
+                            // Focusable rows, so a long list can be scrolled with the remote.
+                            ForEach(others) { other in
+                                SettingsActionRow(
+                                    title: other.name,
+                                    subtitle: other.resources,
+                                    value: "",
+                                    accentColor: accentColor
+                                ) {}
+                            }
+                        }
+                    }
+                    if !unreadable.isEmpty {
+                        SettingsGroup(
+                            title: L10n.string("tvos_settings_tracking_addons_unknown", fallback: "Couldn't check"),
+                            subtitle: L10n.string(
+                                "tvos_settings_tracking_addons_unknown_subtitle",
+                                fallback: "Their manifest couldn't be read, so it isn't known whether they support tracking. Select one to check again."
+                            )
+                        ) {
+                            ForEach(unreadable) { addon in
+                                SettingsActionRow(
+                                    title: addon.name,
+                                    subtitle: addon.resources,
+                                    value: "",
+                                    accentColor: accentColor
+                                ) {
+                                    Task { await loadEntries() }
+                                }
+                            }
+                        }
                     }
                 }
+            } else if !entries.isEmpty {
+                trackingGroup
             }
         }
         .task(id: addonsSignature) {
             await loadEntries()
+        }
+    }
+
+    private var trackingGroup: some View {
+        SettingsGroup(
+            title: L10n.string("tvos_settings_tracking_addons", fallback: "Tracking Add-ons"),
+            subtitle: L10n.string(
+                "tvos_settings_tracking_addons_subtitle",
+                fallback: "These add-ons can follow what you watch for a tracking service. Turning one on shares your playback and library activity (what you watch, when and how far) with it."
+            )
+        ) {
+            if entries.isEmpty {
+                SettingsActionRow(
+                    title: didLoad
+                        ? L10n.string("tvos_settings_tracking_addons_none", fallback: "No tracking add-ons")
+                        : L10n.string("tvos_settings_tracking_addons_loading", fallback: "Checking your add-ons…"),
+                    subtitle: didLoad
+                        ? L10n.string(
+                            "tvos_settings_tracking_addons_none_detail",
+                            fallback: "An add-on supports tracking when its manifest declares Stremio's player or library resource."
+                        )
+                        : "",
+                    value: "",
+                    accentColor: accentColor
+                ) {}
+            }
+            ForEach(entries) { entry in
+                SettingsToggleRow(
+                    title: entry.name,
+                    subtitle: subtitle(for: entry),
+                    isOn: binding(for: entry),
+                    accentColor: accentColor
+                )
+            }
         }
     }
 
@@ -15852,20 +15988,42 @@ private struct TrackingAddonsSettingsGroup: View {
     private func loadEntries() async {
         let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
         var loaded: [Entry] = []
+        var otherAddons: [OtherAddon] = []
+        var unreadableAddons: [OtherAddon] = []
         for manifestURL in manifestURLs {
-            guard let manifest = await TrackingAddonService.manifest(for: manifestURL),
-                  manifest.isTrackingAddon else { continue }
-            let name = manifest.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let manifest = await TrackingAddonService.manifest(for: manifestURL)
+            let trimmed = manifest?.name?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = (trimmed?.isEmpty == false ? trimmed : nil)
+                ?? CinemetaCatalogRepository.streamAddonName(for: manifestURL)
+            guard let manifest else {
+                unreadableAddons.append(OtherAddon(
+                    id: manifestURL.absoluteString,
+                    name: name,
+                    resources: L10n.string("tvos_settings_tracking_addons_unreadable", fallback: "Manifest couldn't be read")
+                ))
+                continue
+            }
+            guard manifest.isTrackingAddon else {
+                let resources = manifest.resources.map(\.name).filter { !$0.isEmpty }
+                otherAddons.append(OtherAddon(
+                    id: manifestURL.absoluteString,
+                    name: name,
+                    resources: resources.isEmpty ? "—" : resources.joined(separator: ", ")
+                ))
+                continue
+            }
             loaded.append(Entry(
                 manifestURL: manifestURL,
-                name: (name?.isEmpty == false ? name : nil)
-                    ?? CinemetaCatalogRepository.streamAddonName(for: manifestURL),
+                name: name,
                 tracksPlayback: manifest.tracksPlayback,
                 tracksLibrary: manifest.tracksLibrary
             ))
         }
         guard !Task.isCancelled else { return }
         entries = loaded
+        others = otherAddons
+        unreadable = unreadableAddons
+        didLoad = true
         approved = TrackingAddonService.approvedManifestURLs()
     }
 }
