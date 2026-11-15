@@ -579,8 +579,20 @@ struct JellyfinClient {
         /// What the server asked for, in seconds, when it said.
         let retryAfter: TimeInterval?
 
+        /// Longer waits than this (a day) get the generic message: a huge
+        /// minute count wouldn't help, and converting an oversized header
+        /// value to Int would trap.
+        static let longestWaitShown: TimeInterval = 24 * 60 * 60
+
+        /// Whole minutes to show, or nil for the generic "try again later".
+        var minutesToShow: Int? {
+            guard let retryAfter, retryAfter.isFinite, retryAfter > 0,
+                  retryAfter <= Self.longestWaitShown else { return nil }
+            return max(1, Int((retryAfter / 60).rounded(.up)))
+        }
+
         var errorDescription: String? {
-            guard let retryAfter, retryAfter > 0 else {
+            guard let minutes = minutesToShow else {
                 return L10n.string(
                     "jellyfin_error_rate_limited",
                     fallback: "The Jellyfin server is limiting requests. Try again later."
@@ -589,7 +601,7 @@ struct JellyfinClient {
             return L10n.format(
                 "jellyfin_error_rate_limited_minutes",
                 fallback: "The Jellyfin server is limiting requests. Try again in about %d min.",
-                max(1, Int((retryAfter / 60).rounded(.up)))
+                minutes
             )
         }
     }

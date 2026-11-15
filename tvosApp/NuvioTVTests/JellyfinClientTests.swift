@@ -106,6 +106,40 @@ final class JellyfinClientTests: XCTestCase {
         XCTAssertEqual(requests, 1)
     }
 
+    func testAnOversizedRetryAfterFallsBackToTryAgainLater() async {
+        // Finite but far too large to convert to whole minutes.
+        let tryAgainLater = JellyfinClient.RateLimitedError(retryAfter: nil).errorDescription
+        for header in ["1e308", "99999999999999999999999999", "86401"] {
+            XCTAssertEqual(
+                JellyfinClient.retryDecision(retryAfter: header, attempt: 0),
+                .giveUp(serverWait: JellyfinClient.retryAfterSeconds(header)!),
+                header
+            )
+            let error = JellyfinClient.RateLimitedError(retryAfter: JellyfinClient.retryAfterSeconds(header))
+            XCTAssertNil(error.minutesToShow, header)
+            XCTAssertEqual(error.errorDescription, tryAgainLater, header)
+        }
+        XCTAssertEqual(JellyfinClient.RateLimitedError(retryAfter: 86_400).minutesToShow, 1_440)
+        XCTAssertEqual(JellyfinClient.RateLimitedError(retryAfter: 61).minutesToShow, 2)
+        XCTAssertNil(JellyfinClient.RateLimitedError(retryAfter: .infinity).minutesToShow)
+        XCTAssertNil(JellyfinClient.RateLimitedError(retryAfter: nil).minutesToShow)
+
+        // End to end: the request fails cleanly instead of crashing.
+        JellyfinMockURLProtocol.requestHandler = { request in
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 429, httpVersion: nil, headerFields: ["Retry-After": "1e308"]
+            )!
+            return (response, Data())
+        }
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "token", session: session)
+        do {
+            try await client.ping()
+            XCTFail("Expected a rate-limited error")
+        } catch {
+            XCTAssertEqual(error.localizedDescription, tryAgainLater)
+        }
+    }
+
     func testAShortServerWaitIsRetried() async throws {
         var requests = 0
         JellyfinMockURLProtocol.requestHandler = { request in
