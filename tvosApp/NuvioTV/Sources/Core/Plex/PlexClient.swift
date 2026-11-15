@@ -44,6 +44,22 @@ struct PlexFile: Codable, Equatable {
     let sizeBytes: Int64?
     /// What sets this file apart, for the stream list: "4K · 18.2 Mbps", "Part 2 of 2".
     let label: String?
+    /// What Plex knows about the file's video and audio, for the stream list.
+    var details: PlexFileDetails? = nil
+}
+
+/// A file's format as Plex's library listing reports it.
+struct PlexFileDetails: Codable, Equatable {
+    /// `"1080"`, `"4k"`, `"sd"`.
+    var videoResolution: String? = nil
+    var videoCodec: String? = nil
+    var audioCodec: String? = nil
+    var audioChannels: Int? = nil
+    var bitrateKbps: Int? = nil
+    /// The file's name on the server, without its folders.
+    var fileName: String? = nil
+    /// Set on parts of a split file: "Part 2 of 2".
+    var part: String? = nil
 }
 
 /// One movie, show, or episode from a section listing. Plex returns all three
@@ -524,27 +540,85 @@ struct PlexClient {
         let title: String
     }
 
-    func externalSubtitles(ratingKey: String) async throws -> [ExternalSubtitle] {
-        let data = try await get("library/metadata/\(ratingKey)")
+    /// The video, audio and subtitle tracks of one file, named as Plex names them.
+    struct PartTracks: Equatable {
+        /// "Main 10", from the video track's profile.
+        var videoProfile: String? = nil
+        /// "Dolby Vision", "HDR10" or "HLG"; nil for SDR.
+        var dynamicRange: String? = nil
+        /// "English (EAC3 5.1)", one per audio track.
+        var audio: [String] = []
+        /// "English", "English SDH", one per subtitle track, without repeats.
+        var subtitles: [String] = []
+    }
+
+    /// An item's tracks by file (`/library/parts/...` key), and the subtitle
+    /// files Plex keeps beside the video.
+    struct ItemTracks: Equatable {
+        var parts: [String: PartTracks] = [:]
+        var externalSubtitles: [ExternalSubtitle] = []
+    }
+
+    func tracks(ratingKey: String) async throws -> ItemTracks {
+        try Self.decodeTracks(try await get("library/metadata/\(ratingKey)"))
+    }
+
+    static func decodeTracks(_ data: Data) throws -> ItemTracks {
         struct Payload: Decodable {
             struct Container: Decodable { let Metadata: [Item]? }
             struct Item: Decodable { let Media: [MediaDTO]? }
             struct MediaDTO: Decodable { let Part: [PartDTO]? }
-            struct PartDTO: Decodable { let Stream: [StreamDTO]? }
+            struct PartDTO: Decodable {
+                let key: String?
+                let Stream: [StreamDTO]?
+            }
             struct StreamDTO: Decodable {
                 let streamType: Int?
                 let key: String?
                 let languageCode: String?
                 let displayTitle: String?
+                let profile: String?
+                let colorTrc: String?
+                let DOVIPresent: Bool?
             }
             let MediaContainer: Container
         }
-        let streams = try JSONDecoder().decode(Payload.self, from: data)
-            .MediaContainer.Metadata?.first?.Media?.flatMap { $0.Part ?? [] }.flatMap { $0.Stream ?? [] } ?? []
-        return streams.compactMap { stream in
-            guard stream.streamType == 3, let key = stream.key, !key.isEmpty else { return nil }
-            return ExternalSubtitle(key: key, languageCode: stream.languageCode ?? "und", title: stream.displayTitle ?? "Plex")
+        let parts = try JSONDecoder().decode(Payload.self, from: data)
+            .MediaContainer.Metadata?.first?.Media?.flatMap { $0.Part ?? [] } ?? []
+        var result = ItemTracks()
+        for part in parts {
+            var tracks = PartTracks()
+            for stream in part.Stream ?? [] {
+                switch stream.streamType {
+                case 1 where tracks.videoProfile == nil && tracks.dynamicRange == nil:
+                    tracks.videoProfile = stream.profile.map { $0.capitalized }
+                    if stream.DOVIPresent == true {
+                        tracks.dynamicRange = "Dolby Vision"
+                    } else if stream.colorTrc == "smpte2084" {
+                        tracks.dynamicRange = "HDR10"
+                    } else if stream.colorTrc == "arib-std-b67" {
+                        tracks.dynamicRange = "HLG"
+                    }
+                case 2:
+                    if let title = stream.displayTitle, !title.isEmpty { tracks.audio.append(title) }
+                case 3:
+                    if let title = stream.displayTitle, !title.isEmpty, !tracks.subtitles.contains(title) {
+                        tracks.subtitles.append(title)
+                    }
+                    if let key = stream.key, !key.isEmpty {
+                        result.externalSubtitles.append(ExternalSubtitle(
+                            key: key,
+                            languageCode: stream.languageCode ?? "und",
+                            title: stream.displayTitle ?? "Plex"
+                        ))
+                    }
+                default:
+                    break
+                }
+            }
+            if let key = part.key { result.parts[key] = tracks }
         }
+        return result
     }
 
     /// Ends a conversion started through `transcodeURL`, freeing the server.
@@ -639,10 +713,14 @@ struct PlexClient {
             let key: String?
             let size: Int64?
             let container: String?
+            let file: String?
         }
         struct MediaDTO: Decodable {
             let container: String?
             let videoResolution: String?
+            let videoCodec: String?
+            let audioCodec: String?
+            let audioChannels: Int?
             let bitrate: Int?
             let Part: [PartDTO]?
         }
@@ -698,7 +776,16 @@ struct PlexClient {
                     partKey: filePart.key ?? "",
                     container: filePart.container ?? version.container,
                     sizeBytes: filePart.size,
-                    label: labels.isEmpty ? nil : labels.joined(separator: " · ")
+                    label: labels.isEmpty ? nil : labels.joined(separator: " · "),
+                    details: PlexFileDetails(
+                        videoResolution: version.videoResolution,
+                        videoCodec: version.videoCodec,
+                        audioCodec: version.audioCodec,
+                        audioChannels: version.audioChannels,
+                        bitrateKbps: version.bitrate,
+                        fileName: filePart.file.map { ($0 as NSString).lastPathComponent },
+                        part: parts.count > 1 ? "Part \(index + 1) of \(parts.count)" : nil
+                    )
                 ))
             }
         }

@@ -141,7 +141,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Sidecar subtitle files for the items about to be offered, read from the
     /// server with a short limit so a slow server never holds up the list.
-    private func plexSubtitles(videoId: String) async -> [String: [NuvioSubtitle]] {
+    private func plexTracks(videoId: String) async -> [String: PlexOfferedTracks] {
         let contentId = Self.baseContentId(from: videoId)
         let episode = Self.seasonEpisode(fromVideoId: videoId)
         var requests: [(ratingKey: String, client: PlexClient, baseURL: URL, token: String)] = []
@@ -152,32 +152,33 @@ final class StreamsRepository: ObservableObject {
             }
         }
         guard !requests.isEmpty else { return [:] }
-        return await withTaskGroup(of: (String, [NuvioSubtitle]).self) { group in
+        return await withTaskGroup(of: (String, PlexOfferedTracks).self) { group in
             for request in requests {
                 group.addTask {
-                    let found = (try? await request.client.externalSubtitles(ratingKey: request.ratingKey)) ?? []
-                    return (request.ratingKey, found.compactMap { subtitle in
+                    let found = (try? await request.client.tracks(ratingKey: request.ratingKey)) ?? PlexClient.ItemTracks()
+                    let subtitles = found.externalSubtitles.compactMap { subtitle in
                         PlexClient.subtitleURL(baseURL: request.baseURL, key: subtitle.key, token: request.token).map {
                             NuvioSubtitle(url: $0.absoluteString, language: subtitle.languageCode, label: subtitle.title)
                         }
-                    })
+                    }
+                    return (request.ratingKey, PlexOfferedTracks(subtitles: subtitles, parts: found.parts))
                 }
             }
             group.addTask {
                 try? await Task.sleep(nanoseconds: 1_500_000_000)
-                return ("", [])
+                return ("", PlexOfferedTracks())
             }
-            var result: [String: [NuvioSubtitle]] = [:]
-            for await (ratingKey, subtitles) in group {
+            var result: [String: PlexOfferedTracks] = [:]
+            for await (ratingKey, tracks) in group {
                 if ratingKey.isEmpty { group.cancelAll(); break }
-                result[ratingKey] = subtitles
+                result[ratingKey] = tracks
                 if result.count == requests.count { group.cancelAll(); break }
             }
             return result
         }
     }
 
-    private func plexStreamGroup(videoId: String, subtitles: [String: [NuvioSubtitle]] = [:]) -> AddonStreamGroup? {
+    private func plexStreamGroup(videoId: String, tracks: [String: PlexOfferedTracks] = [:]) -> AddonStreamGroup? {
         let contentId = Self.baseContentId(from: videoId)
         let episode = Self.seasonEpisode(fromVideoId: videoId)
         let matchingTitles = PlexLibraryIndex.shared.titles(matching: contentId)
@@ -192,16 +193,21 @@ final class StreamsRepository: ObservableObject {
                 PlexPlaybackSync.shared.streamOffered(
                     PlexPlaybackSync.Item(serverID: server.id, ratingKey: item.ratingKey, durationMs: item.durationMs)
                 )
-                let itemSubtitles = subtitles[item.ratingKey] ?? []
+                let itemTracks = tracks[item.ratingKey]
+                let itemSubtitles = itemTracks?.subtitles ?? []
                 // One stream per file: other versions and parts of a split file.
                 for file in item.files {
                     guard let url = PlexClient.streamURL(baseURL: baseURL, partKey: file.partKey) else { continue }
-                    let size = file.sizeBytes.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) }
+                    let label = PlexStreamLabel.label(
+                        for: file,
+                        tracks: itemTracks?.parts[file.partKey],
+                        serverName: server.displayName
+                    )
                     streams.append(
                         NuvioStream(
                             url: url.absoluteString,
-                            name: server.displayName,
-                            description: [file.label, size].compactMap { $0 }.joined(separator: " · "),
+                            name: label.name,
+                            description: label.description,
                             addonName: "Plex",
                             subtitles: itemSubtitles,
                             videoSize: file.sizeBytes,
@@ -214,8 +220,11 @@ final class StreamsRepository: ObservableObject {
                     streams.append(
                         NuvioStream(
                             url: url.absoluteString,
-                            name: server.displayName,
-                            description: L10n.string("plex_stream_convert", fallback: "Convert on server (1080p) · use if the file won't play"),
+                            name: PlexStreamLabel.convertName,
+                            description: PlexStreamLabel.convertDescription(
+                                L10n.string("plex_stream_convert", fallback: "Convert on server (1080p) · use if the file won't play"),
+                                serverName: server.displayName
+                            ),
                             addonName: "Plex",
                             subtitles: itemSubtitles,
                             httpHeaders: [PlexClient.tokenHeader: token]
@@ -394,9 +403,9 @@ final class StreamsRepository: ObservableObject {
     private func runDiscovery(requestKey: String, type: String, videoId: String,
                               addonManifestURLs: [URL]) async {
         guard !Task.isCancelled else { return }
-        let plexSubtitles = await plexSubtitles(videoId: videoId)
+        let plexTracks = await plexTracks(videoId: videoId)
         guard !Task.isCancelled else { return }
-        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, subtitles: plexSubtitles)]
+        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, tracks: plexTracks)]
             .compactMap { $0 }
         state = StreamsDiscoveryState(
             requestKey: requestKey,
@@ -1824,4 +1833,10 @@ private struct LossyPrimitiveString: Decodable {
             value = nil
         }
     }
+}
+
+/// The subtitle files and per-file tracks of one Plex item being offered.
+struct PlexOfferedTracks {
+    var subtitles: [NuvioSubtitle] = []
+    var parts: [String: PlexClient.PartTracks] = [:]
 }

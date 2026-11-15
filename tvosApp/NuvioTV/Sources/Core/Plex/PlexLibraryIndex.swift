@@ -18,10 +18,13 @@ struct PlexIndexedItem: Codable, Equatable {
     var label: String? = nil
     /// Other versions and parts of the same movie or episode.
     var alternates: [PlexFile]? = nil
+    /// The main file's format. Absent on items synced before it was kept.
+    var details: PlexFileDetails? = nil
 
     /// Every file, the main one first.
     var files: [PlexFile] {
-        [PlexFile(partKey: partKey, container: container, sizeBytes: size, label: label)] + (alternates ?? [])
+        [PlexFile(partKey: partKey, container: container, sizeBytes: size, label: label, details: details)]
+            + (alternates ?? [])
     }
 }
 
@@ -119,7 +122,8 @@ enum PlexLibraryResolver {
                     size: movie.sizeBytes,
                     durationMs: movie.durationMs,
                     label: movie.files.count > 1 ? movie.files.first?.label : nil,
-                    alternates: movie.files.count > 1 ? Array(movie.files.dropFirst()) : nil
+                    alternates: movie.files.count > 1 ? Array(movie.files.dropFirst()) : nil,
+                    details: movie.files.first?.details
                 )
             ])
         }
@@ -140,7 +144,8 @@ enum PlexLibraryResolver {
                     episodePremiereDate: episode.originallyAvailableAt,
                     episodeThumb: episode.thumb,
                     label: episode.files.count > 1 ? episode.files.first?.label : nil,
-                    alternates: episode.files.count > 1 ? Array(episode.files.dropFirst()) : nil
+                    alternates: episode.files.count > 1 ? Array(episode.files.dropFirst()) : nil,
+                    details: episode.files.first?.details
                 )
             }
             guard !files.isEmpty else { continue }

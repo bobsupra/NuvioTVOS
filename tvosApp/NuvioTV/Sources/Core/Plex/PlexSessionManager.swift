@@ -331,8 +331,10 @@ final class PlexSessionManager: ObservableObject {
                 for library in selected {
                     try Task.checkCancellation()
                     markers[library.id] = library.changeMarker
-                    if !force, let marker = library.changeMarker, previousMarkers[library.id] == marker {
-                        let kept = previousTitles.filter { $0.libraryID == library.id }
+                    let kept = previousTitles.filter { $0.libraryID == library.id }
+                    // Titles synced before file formats were kept are listed once more.
+                    let hasFileDetails = kept.isEmpty || kept.contains { $0.items.contains { $0.details != nil } }
+                    if !force, hasFileDetails, let marker = library.changeMarker, previousMarkers[library.id] == marker {
                         titles += kept
                         found += kept.reduce(0) { $0 + $1.items.count }
                         listedEverything = false
