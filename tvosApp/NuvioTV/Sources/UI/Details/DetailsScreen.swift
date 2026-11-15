@@ -10737,10 +10737,16 @@ private struct TvStreamPickerOverlay: View {
                     guard let index = activeSourceRowFocusIDs.firstIndex(of: focusID) else { return nil }
                     return activeSourceRows[index]
                 }
+                // Never for links an add-on resolves on request, and only with
+                // Background pre-fetch on: see FocusedStreamWarmPolicy.
                 if let stream = focusedStream,
                    let raw = stream.directURL,
                    let url = URL(string: raw),
-                   ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                   FocusedStreamWarmPolicy.mayWarm(
+                       url: url,
+                       backgroundPreFetchEnabled: backgroundStreamPreFetch,
+                       addonManifestURLs: CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+                   ) {
                     let token = UUID()
                     focusedStreamWarmToken = token
                     let profileID = pickerProfileID ?? ProfileSettings.activeProfileID ?? ""
