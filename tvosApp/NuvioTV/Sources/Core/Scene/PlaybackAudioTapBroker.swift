@@ -13,8 +13,9 @@ final class PlaybackAudioTapBroker {
     private var consumerTask: Task<Void, Never>?
     /// Identifies the current consumer task. `installAudioTap()` finishes the previous tap's
     /// stream, so a replaced consumer still reaches its end handler; it must not tear down
-    /// or reinstall the tap that replaced it.
-    private var consumerGeneration: UInt64 = 0
+    /// or reinstall the tap that replaced it. Nor may its buffers reach subscribers: one can
+    /// already be on its way to the main actor when the tap is replaced (see `broadcast`).
+    private(set) var consumerGeneration: UInt64 = 0
     private var isReconnecting = false
     
     init(engine: AetherEngine?) {
@@ -101,7 +102,7 @@ final class PlaybackAudioTapBroker {
                     print("[AudioTapBroker] Yielded buffer #\(bufferCount): pts=\(String(format: "%.2f", buffer.sourceTime))s, frames=\(buffer.buffer.frameLength), discontinuity=\(buffer.discontinuity)")
                 }
                 #endif
-                await self?.broadcast(buffer: buffer)
+                await self?.broadcast(buffer: buffer, generation: generation)
             }
             print("[AudioTapBroker] Engine tap stream ended after \(bufferCount) buffer(s)")
             await self?.handleEngineStreamEnded(generation: generation)
@@ -116,7 +117,12 @@ final class PlaybackAudioTapBroker {
         engine?.removeAudioTap()
     }
     
-    private func broadcast(buffer: AudioTapBuffer) {
+    /// The consumer hops to the main actor for each buffer. If `updateEngine` (or a teardown)
+    /// replaces the tap while a buffer is waiting to hop, cancelling the consumer doesn't stop
+    /// that call, so without this check the previous session's audio, with its source time,
+    /// would reach the current subscribers.
+    func broadcast(buffer: AudioTapBuffer, generation: UInt64) {
+        guard generation == consumerGeneration else { return }
         for continuation in subscribers.values {
             continuation.yield(buffer)
         }
