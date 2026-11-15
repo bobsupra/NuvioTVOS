@@ -4227,6 +4227,9 @@ struct TvDetailsContent: View {
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
+    /// Details' scroll view and where each lower section starts in it, for moving to the section
+    /// focus goes to (tvOS doesn't scroll Details).
+    @State private var detailsSectionTops = TVScrollTops()
     @State private var isChoosingWatchPartyEpisode = false
     /// Settings → Integrations → AniList: which AniList entry and episode the play target is.
     @State private var aniListTarget: AniListScrobbler.Target?
@@ -5002,11 +5005,22 @@ struct TvDetailsContent: View {
                                         productionCompanies: productionCompanies,
                                         scrollProxy: scrollProxy
                                     )
+                                    .modifier(TVScrollTopReader(
+                                        key: String(describing: section),
+                                        tops: detailsSectionTops,
+                                        space: "tv-details-scroll"
+                                    ))
                                 }
                             }
                             }
-                            // The hero and each section are where the scroll can settle.
-                            .scrollTargetLayout()
+                            .background {
+                                TVScrollViewFinder(box: detailsSectionTops.scrollBox)
+                                    .frame(width: 1, height: 1)
+                                    .allowsHitTesting(false)
+                                TVScrollLock(locked: true)
+                                    .frame(width: 1, height: 1)
+                                    .allowsHitTesting(false)
+                            }
                             .task {
                                 guard builtLowerSectionCount == 0 else { return }
                                 TvDetailsFocusActivity.start()
@@ -5029,6 +5043,7 @@ struct TvDetailsContent: View {
                                 buildLowerSections(upTo: .max)
                             }
                             .onChange(of: focusedDetailsSection) { _, section in
+                                moveDetails(to: section)
                                 buildSectionBelow(section)
                             }
                             // Inset and layout metrics matching Android TV.
@@ -5038,10 +5053,6 @@ struct TvDetailsContent: View {
                             .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .topLeading)
                         }
                         .scrollClipDisabledIfAvailable()
-                        // Details' up and down is left to the scroll view: tvOS scrolls to what
-                        // focus goes to, and the scroll settles with a section's top at the top of
-                        // the screen (instead of Details scrolling there with its own animation).
-                        .scrollTargetBehavior(.viewAligned)
                         .coordinateSpace(name: "tv-details-scroll")
                         .onAppear {
                             if let initialRelatedFocusID {
@@ -5463,6 +5474,30 @@ struct TvDetailsContent: View {
         withTransaction(transaction) { builtLowerSectionCount = count }
     }
 
+    /// Moves Details to the top of the section focus went to (to the very top for the actions),
+    /// by Core Animation: tvOS doesn't scroll Details (`TVScrollLock`), whose scroll for focus
+    /// went frame by frame on the main thread and stuttered while the main thread built what
+    /// focus brought. tvOS still moves focus to a section off screen. Just after Details opened,
+    /// or a section was built, the section may not be laid out yet: tried again a few times
+    /// while focus stays there.
+    private func moveDetails(to section: TvDetailsFocusSection, attempt: Int = 0) {
+        let key: String
+        if section == .actions {
+            key = "actions"
+        } else if let below = Self.lowerSection(for: section) {
+            key = String(describing: below)
+        } else {
+            return
+        }
+        guard !detailsSectionTops.move(to: key, margin: 0, toTop: section == .actions),
+              attempt < 6 else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(30))
+            guard focusedDetailsSection == section else { return }
+            moveDetails(to: section, attempt: attempt + 1)
+        }
+    }
+
     /// The section below the one focus moved into, built now if it isn't yet.
     private func buildSectionBelow(_ section: TvDetailsFocusSection) {
         guard builtLowerSectionCount != .max else { return }
@@ -5668,17 +5703,9 @@ struct TvDetailsContent: View {
             },
             onBack: handleDetailsBack,
             onFocus: {
+                // Details moves to the section as it becomes the focused one (`moveDetails`).
                 if focusedDetailsSection != .related {
                     focusedDetailsSection = .related
-                    withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                        scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
-                    }
-                } else {
-                    var transaction = Transaction(animation: nil)
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) {
-                        scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
-                    }
                 }
             }
         )
@@ -7035,7 +7062,6 @@ private struct TvDetailsSectionButton: View {
 
 private enum TvDetailsHorizontalStrip {
     static let verticalPadding: CGFloat = 28
-    static let scrollSpring = Animation.spring(response: 0.3, dampingFraction: 1.0)
 }
 
 private struct TvDetailsRelatedRow: View {
@@ -7078,48 +7104,45 @@ private struct TvDetailsRelatedRow: View {
                 .font(.system(size: 34, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
 
-            HStack(alignment: .bottom, spacing: spacing) {
-                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
-                    let buildsLater = index >= builtCount
-                    PosterCard(
-                        meta: item.asMeta,
-                        customPosterScreen: .details,
-                        onFocus: { _ in
-                            if scrollIndex != index { scrollIndex = index }
-                            if builtCount < items.count { builtCount = items.count }
-                            onFocus()
-                            onItemFocus?(item)
-                        },
-                        externalFocus: externalFocus,
-                        externalFocusValue: item.id,
-                        layoutMode: homeLayout,
-                        showPosterLabels: posterLabels,
-                        smoothFocusAnimations: smoothFocus,
-                        focusHighlighterEnabled: focusHighlighter,
-                        buildsLater: buildsLater
-                    ) {
-                        onSelect(item)
+            TVCAStrip(index: scrollIndex, step: step, animated: smoothFocus) {
+                HStack(alignment: .bottom, spacing: spacing) {
+                    ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                        let buildsLater = index >= builtCount
+                        PosterCard(
+                            meta: item.asMeta,
+                            customPosterScreen: .details,
+                            onFocus: { _ in
+                                if scrollIndex != index { scrollIndex = index }
+                                if builtCount < items.count { builtCount = items.count }
+                                onFocus()
+                                onItemFocus?(item)
+                            },
+                            externalFocus: externalFocus,
+                            externalFocusValue: item.id,
+                            layoutMode: homeLayout,
+                            showPosterLabels: posterLabels,
+                            smoothFocusAnimations: smoothFocus,
+                            focusHighlighterEnabled: focusHighlighter,
+                            buildsLater: buildsLater
+                        ) {
+                            onSelect(item)
+                        }
+                        .detailsSnapshot(TvDetailsCardSnapshotKey(
+                            item: item,
+                            index: index,
+                            style: "\(homeLayout)|\(posterLabels)|\(smoothFocus)|\(focusHighlighter)|\(buildsLater)"
+                        ))
+                        .disabled(
+                            focusRequestID.map { $0 != item.id }
+                                ?? (entryLocked && index != scrollIndex)
+                        )
                     }
-                    .detailsSnapshot(TvDetailsCardSnapshotKey(
-                        item: item,
-                        index: index,
-                        style: "\(homeLayout)|\(posterLabels)|\(smoothFocus)|\(focusHighlighter)|\(buildsLater)"
-                    ))
-                    .disabled(
-                        focusRequestID.map { $0 != item.id }
-                            ?? (entryLocked && index != scrollIndex)
-                    )
                 }
+                .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
             }
-            .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
-            .offset(x: -CGFloat(scrollIndex) * step)
             // Deliberately do not clip this strip to the text column. Like the
             // Home rows, posters keep drawing all the way to the screen edge.
             .frame(height: stripHeight, alignment: .leading)
-            .animation(
-                smoothFocus ? TvDetailsHorizontalStrip.scrollSpring : nil,
-                value: scrollIndex
-            )
         }
         .focusSection()
         .onExitCommand {
@@ -7193,28 +7216,25 @@ private struct TvDetailsProductionRow: View {
                 .font(.system(size: 34, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
 
-            HStack(alignment: .top, spacing: spacing) {
-                ForEach(Array(companies.enumerated()), id: \.element.id) { index, company in
-                    TvDetailsCompanyCard(
-                        company: company,
-                        onSelect: { onSelect(company) },
-                        onFocus: {
-                            if scrollIndex != index { scrollIndex = index }
-                            onFocus()
-                        },
-                        onBack: onBack
-                    )
-                    .detailsSnapshot(TvDetailsCardSnapshotKey(item: company, index: index))
-                    .disabled(entryLocked && index != entryCompanyIndex)
+            TVCAStrip(index: scrollIndex, step: step, animated: smoothFocus) {
+                HStack(alignment: .top, spacing: spacing) {
+                    ForEach(Array(companies.enumerated()), id: \.element.id) { index, company in
+                        TvDetailsCompanyCard(
+                            company: company,
+                            onSelect: { onSelect(company) },
+                            onFocus: {
+                                if scrollIndex != index { scrollIndex = index }
+                                onFocus()
+                            },
+                            onBack: onBack
+                        )
+                        .detailsSnapshot(TvDetailsCardSnapshotKey(item: company, index: index))
+                        .disabled(entryLocked && index != entryCompanyIndex)
+                    }
                 }
+                .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
             }
-            .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
-            .offset(x: -CGFloat(scrollIndex) * step)
             .frame(height: stripHeight, alignment: .leading)
-            .animation(
-                smoothFocus ? TvDetailsHorizontalStrip.scrollSpring : nil,
-                value: scrollIndex
-            )
         }
         .focusSection()
         .onExitCommand {
@@ -7337,30 +7357,27 @@ private struct TvDetailsCommentsRow: View {
                 .font(.system(size: 34, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
 
-            HStack(spacing: 22) {
-                ForEach(Array(comments.enumerated()), id: \.element.id) { index, comment in
-                    TvDetailsCommentCard(
-                        comment: comment,
-                        onSelect: { onSelect(comment) },
-                        onFocus: {
-                            if scrollIndex != index { scrollIndex = index }
-                            onFocus()
-                        },
-                        onBack: onBack
-                    )
-                    .detailsSnapshot(TvDetailsCardSnapshotKey(item: comment, index: index))
-                    .disabled(entryLocked && index != scrollIndex)
+            TVCAStrip(index: scrollIndex, step: cardWidth + spacing, animated: smoothFocus) {
+                HStack(spacing: 22) {
+                    ForEach(Array(comments.enumerated()), id: \.element.id) { index, comment in
+                        TvDetailsCommentCard(
+                            comment: comment,
+                            onSelect: { onSelect(comment) },
+                            onFocus: {
+                                if scrollIndex != index { scrollIndex = index }
+                                onFocus()
+                            },
+                            onBack: onBack
+                        )
+                        .detailsSnapshot(TvDetailsCardSnapshotKey(item: comment, index: index))
+                        .disabled(entryLocked && index != scrollIndex)
+                    }
                 }
+                .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
             }
-            .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
-            .offset(x: -CGFloat(scrollIndex) * (cardWidth + spacing))
             // Keep comment cards edge-to-edge as well; the parent vertical
             // scroll view owns the viewport instead of this row clipping it.
             .frame(height: stripHeight, alignment: .leading)
-            .animation(
-                smoothFocus ? TvDetailsHorizontalStrip.scrollSpring : nil,
-                value: scrollIndex
-            )
         }
         .focusSection()
         .onExitCommand {

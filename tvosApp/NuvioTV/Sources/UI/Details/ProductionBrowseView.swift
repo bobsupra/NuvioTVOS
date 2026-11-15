@@ -85,6 +85,8 @@ private struct CompanyBrowseContent: View {
 
     @FocusState private var placeholderFocused: Bool
     @State private var scrollOffset: CGFloat = 0
+    /// tvOS doesn't scroll the page: Core Animation moves it to the rail focus is in.
+    @State private var railTops = TVScrollTops()
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
@@ -154,12 +156,28 @@ private struct CompanyBrowseContent: View {
                             .frame(maxWidth: .infinity, minHeight: 260)
                     } else {
                         ForEach(rails) { rail in
-                            NetworkBrowseRail(rail: rail, onSelect: onSelect)
-                                .equatable()
+                            NetworkBrowseRail(
+                                rail: rail,
+                                movesByCA: true,
+                                onFocusRail: {
+                                    railTops.move(to: rail.id, margin: TVBrowsePageMove.margin, toTop: rail.id == rails.first?.id)
+                                },
+                                onSelect: onSelect
+                            )
+                            .equatable()
+                            .modifier(TVScrollTopReader(key: rail.id, tops: railTops, space: "company-browse-scroll"))
                         }
                     }
                 }
                 .padding(.bottom, 70)
+                .background {
+                    TVScrollViewFinder(box: railTops.scrollBox)
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                    TVScrollLock(locked: true)
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                }
             }
             .focusSection()
             .coordinateSpace(name: "company-browse-scroll")
@@ -284,6 +302,12 @@ private struct CompanyBrowseContent: View {
     }
 }
 
+/// How far below the top of the screen a browse page's rail starts once the page moved to it
+/// (the first rail: the page at its top, with its heading).
+private enum TVBrowsePageMove {
+    static let margin: CGFloat = 60
+}
+
 private struct CompanyBrowseScrollOffsetKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
 
@@ -349,12 +373,21 @@ private struct CompanyBrowseScrollTransitionShadow: View {
 struct NetworkBrowseRail: View, Equatable {
     let rail: TmdbNetworkBrowseRail
     var externalFocus: FocusState<String?>.Binding? = nil
+    /// tvOS doesn't scroll the rail: Core Animation moves the focused card under the title.
+    var movesByCA = false
+    /// Focus came to one of the rail's cards.
+    var onFocusRail: (() -> Void)? = nil
     let onSelect: (RelatedTitle) -> Void
+
+    @State private var focusedIndex = 0
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
 
     /// What the rail shows; `onSelect` is left out (closures can't be compared), so the page
     /// redrawing (loading, its scroll shadow) no longer rebuilds every card of every rail.
     static func == (lhs: NetworkBrowseRail, rhs: NetworkBrowseRail) -> Bool {
-        lhs.rail == rhs.rail && (lhs.externalFocus == nil) == (rhs.externalFocus == nil)
+        lhs.rail == rhs.rail
+            && (lhs.externalFocus == nil) == (rhs.externalFocus == nil)
+            && lhs.movesByCA == rhs.movesByCA
     }
 
     var body: some View {
@@ -364,24 +397,51 @@ struct NetworkBrowseRail: View, Equatable {
                 .foregroundColor(.white.opacity(0.92))
                 .padding(.horizontal, 80)
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                // Lazy: an actor's rail can hold well over a hundred titles, and all their cards
-                // were built at once as the page opened (more than a second on an Apple TV 4K).
-                LazyHStack(alignment: .top, spacing: TmdbBrowseGridMetrics.posterGap) {
-                    ForEach(rail.items) { title in
-                        ProductionBrowseCard(
-                            title: title,
-                            externalFocus: externalFocus,
-                            onSelect: {
-                                onSelect(title)
-                            }
-                        )
+            if movesByCA {
+                TVCAStrip(
+                    index: focusedIndex,
+                    step: TmdbBrowseGridMetrics.posterWidth + TmdbBrowseGridMetrics.posterGap,
+                    animated: smoothFocus
+                ) {
+                    // Lazy, as below.
+                    LazyHStack(alignment: .top, spacing: TmdbBrowseGridMetrics.posterGap) {
+                        ForEach(Array(rail.items.enumerated()), id: \.element.id) { index, title in
+                            ProductionBrowseCard(
+                                title: title,
+                                externalFocus: externalFocus,
+                                onFocus: {
+                                    if focusedIndex != index { focusedIndex = index }
+                                    onFocusRail?()
+                                },
+                                onSelect: {
+                                    onSelect(title)
+                                }
+                            )
+                        }
                     }
+                    .padding(.horizontal, 80)
+                    .padding(.vertical, 12)
                 }
-                .padding(.horizontal, 80)
-                .padding(.vertical, 12)
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    // Lazy: an actor's rail can hold well over a hundred titles, and all their cards
+                    // were built at once as the page opened (more than a second on an Apple TV 4K).
+                    LazyHStack(alignment: .top, spacing: TmdbBrowseGridMetrics.posterGap) {
+                        ForEach(rail.items) { title in
+                            ProductionBrowseCard(
+                                title: title,
+                                externalFocus: externalFocus,
+                                onSelect: {
+                                    onSelect(title)
+                                }
+                            )
+                        }
+                    }
+                    .padding(.horizontal, 80)
+                    .padding(.vertical, 12)
+                }
+                .scrollClipDisabledIfAvailable()
             }
-            .scrollClipDisabledIfAvailable()
         }
     }
 }
@@ -398,6 +458,8 @@ struct PersonBrowseView: View {
     @State private var rails: [TmdbNetworkBrowseRail] = []
     @State private var isLoading = true
     @State private var scrollOffset: CGFloat = 0
+    /// tvOS doesn't scroll the page: Core Animation moves it to the rail focus is in.
+    @State private var railTops = TVScrollTops()
     @FocusState private var focusedCardID: String?
     @FocusState private var placeholderFocused: Bool
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -472,12 +534,29 @@ struct PersonBrowseView: View {
                             .frame(maxWidth: .infinity, minHeight: 260)
                     } else {
                         ForEach(rails) { rail in
-                            NetworkBrowseRail(rail: rail, externalFocus: $focusedCardID, onSelect: onSelect)
-                                .equatable()
+                            NetworkBrowseRail(
+                                rail: rail,
+                                externalFocus: $focusedCardID,
+                                movesByCA: true,
+                                onFocusRail: {
+                                    railTops.move(to: rail.id, margin: TVBrowsePageMove.margin, toTop: rail.id == rails.first?.id)
+                                },
+                                onSelect: onSelect
+                            )
+                            .equatable()
+                            .modifier(TVScrollTopReader(key: rail.id, tops: railTops, space: "person-browse-scroll"))
                         }
                     }
                 }
                 .padding(.bottom, 70)
+                .background {
+                    TVScrollViewFinder(box: railTops.scrollBox)
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                    TVScrollLock(locked: true)
+                        .frame(width: 1, height: 1)
+                        .allowsHitTesting(false)
+                }
             }
             .focusSection()
             .coordinateSpace(name: "person-browse-scroll")
@@ -684,6 +763,7 @@ struct ProductionBrowseCard: View {
     let title: RelatedTitle
     let alwaysShowLabels: Bool
     var externalFocus: FocusState<String?>.Binding?
+    var onFocus: (() -> Void)?
     let onSelect: () -> Void
 
     @FocusState private var isFocused: Bool
@@ -705,11 +785,13 @@ struct ProductionBrowseCard: View {
         title: RelatedTitle,
         alwaysShowLabels: Bool = false,
         externalFocus: FocusState<String?>.Binding? = nil,
+        onFocus: (() -> Void)? = nil,
         onSelect: @escaping () -> Void
     ) {
         self.title = title
         self.alwaysShowLabels = alwaysShowLabels
         self.externalFocus = externalFocus
+        self.onFocus = onFocus
         self.onSelect = onSelect
     }
 
@@ -788,6 +870,9 @@ struct ProductionBrowseCard: View {
         .scaleEffect(isFocused ? 1.06 : 1)
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: isFocused)
         .zIndex(isFocused ? 1 : 0)
+        .onChange(of: isFocused) { _, focused in
+            if focused { onFocus?() }
+        }
     }
 
     private var subtitle: String {

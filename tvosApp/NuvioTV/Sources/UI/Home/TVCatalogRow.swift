@@ -85,9 +85,10 @@ enum TVHomeVerticalScroll {
 }
 
 /// Moves a scroll view the app scrolls itself (its scrolling for focus off): by Core Animation
-/// when animated, which goes on outside the main thread once started, as tvOS's own scroll does.
-/// A SwiftUI scroll animation is worked out on the main thread frame by frame, and stalled with
-/// whatever else a move costs there (the focused card, the hero, rows being built).
+/// when animated, which goes on in the render server, outside the main thread, once started.
+/// tvOS's own scroll for focus and a SwiftUI scroll animation both move the scroll view frame by
+/// frame on the main thread, and stall with whatever else a move costs there (the focused card,
+/// the hero, rows being built).
 enum TVScrollMove {
     static let duration: TimeInterval = 0.36
 
