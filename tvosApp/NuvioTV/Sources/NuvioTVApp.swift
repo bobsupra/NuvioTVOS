@@ -556,10 +556,15 @@ struct DetailsNavigationContextTransition {
 }
 
 struct ContentView: View {
+    private enum DetailsBackDestination {
+        case details(DetailsNavigationEntry)
+        case personBrowse(TmdbPersonMetadata)
+    }
+
     private struct PartyDetailsDestination {
         let screen: TVScreen
         let tab: TVTab
-        let backStack: [DetailsNavigationEntry]
+        let backStack: [DetailsBackDestination]
         let returnDestination: DetailsReturnDestination
         let collectionContext: CollectionPlaybackContext?
         let libraryWatchedContext: LibraryWatchedContext?
@@ -657,12 +662,9 @@ struct ContentView: View {
     @State private var pendingDeepLinkURL: URL?
     /// Details title to restore when leaving a production company browse.
     @State private var productionBrowseReturn: DetailsNavigationEntry?
-    /// Details title to restore when leaving a person browse.
-    @State private var personBrowseReturn: DetailsNavigationEntry?
-    /// Titles to walk back through when Details opened Details ("More like
-    /// this"). Empty means the current Details is the root of its chain and back
-    /// belongs to its recorded return destination.
-    @State private var detailsBackStack: [DetailsNavigationEntry] = []
+    /// Screens visited within a Details flow. An empty stack returns to the
+    /// destination recorded when the flow started.
+    @State private var detailsBackStack: [DetailsBackDestination] = []
     /// One-shot recommendation focus request carried from a pushed title back
     /// to the parent Details route.
     @State private var pendingDetailsFocusRequest: DetailsNavigationEntry?
@@ -1287,17 +1289,7 @@ struct ContentView: View {
                 productionBrowseReturn = nil
             }
         case .personBrowse:
-            withAnimation(.easeInOut(duration: 0.24)) {
-                if let ret = personBrowseReturn {
-                    pendingDetailsFocusRequest = ret
-                    activeScreen = .details(id: ret.id, type: ret.type)
-                    detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
-                } else {
-                    activeScreen = .main
-                    detailsLibraryWatchedContext = nil
-                }
-                personBrowseReturn = nil
-            }
+            leaveDetails()
         default:
             break
         }
@@ -1305,15 +1297,15 @@ struct ContentView: View {
 
     private func ignorePlayerDismissalHandoffExit() {}
 
-    /// Backs out of Details to the title it was opened from (a "More like this"
-    /// chain), or to the screen that opened the root Details.
+    /// Backs up one screen within the Details flow, or leaves the flow at its root.
     private func leaveDetails() {
         pendingDetailsPlaybackRequestID = nil
         TVHomeDebugTrace.log(
             "details.leave backStackRemaining=\(detailsBackStack.count) returnDest=\(detailsReturnDestination)"
         )
         withAnimation(.easeInOut(duration: 0.24)) {
-            if let previous = detailsBackStack.popLast() {
+            switch detailsBackStack.popLast() {
+            case let .details(previous):
                 activeScreen = .details(id: previous.id, type: previous.type)
                 detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(previous)
                 if previous.focusTarget != nil,
@@ -1323,7 +1315,11 @@ struct ContentView: View {
                 } else {
                     pendingDetailsFocusRequest = nil
                 }
-            } else {
+            case let .personBrowse(person):
+                pendingDetailsFocusRequest = nil
+                detailsLibraryWatchedContext = nil
+                activeScreen = .personBrowse(person)
+            case nil:
                 pendingDetailsFocusRequest = nil
                 switch detailsReturnDestination {
                 case .main:
@@ -2959,7 +2955,7 @@ struct ContentView: View {
                                 // same navigation chain. Otherwise backing out
                                 // of the selected title falls all the way home.
                                 let transition = DetailsNavigationContextTransition.openingRelatedTitle(from: ret)
-                                detailsBackStack.append(transition.backStackEntry)
+                                detailsBackStack.append(.details(transition.backStackEntry))
                                 detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
                                 activeScreen = .details(id: title.id, type: title.type)
                             } else {
@@ -2995,33 +2991,11 @@ struct ContentView: View {
                     onSelect: { title in
                         CinemetaCatalogRepository.cacheCatalogMetadata(title.asMeta)
                         withAnimation(.easeInOut(duration: 0.28)) {
-                            if let ret = personBrowseReturn {
-                                // Keep the originating Details screen in the
-                                // same navigation chain. Otherwise backing out
-                                // of the selected title falls all the way home.
-                                let transition = DetailsNavigationContextTransition.openingRelatedTitle(from: ret)
-                                detailsBackStack.append(transition.backStackEntry)
-                                detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
-                                activeScreen = .details(id: title.id, type: title.type)
-                            } else {
-                                openDetailsRoot(id: title.id, type: title.type)
-                            }
-                            personBrowseReturn = nil
+                            detailsBackStack.append(.personBrowse(person))
+                            activeScreen = .details(id: title.id, type: title.type)
                         }
                     },
-                    onBack: {
-                        withAnimation(.easeInOut(duration: 0.24)) {
-                            if let ret = personBrowseReturn {
-                                pendingDetailsFocusRequest = ret
-                                activeScreen = .details(id: ret.id, type: ret.type)
-                                detailsLibraryWatchedContext = DetailsNavigationContextTransition.restoring(ret)
-                            } else {
-                                activeScreen = .main
-                                detailsLibraryWatchedContext = nil
-                            }
-                            personBrowseReturn = nil
-                        }
-                    }
+                    onBack: { leaveDetails() }
                 )
                 .transition(.leavingScreen)
                 .onDisappear {
@@ -3408,7 +3382,7 @@ struct ContentView: View {
                     focusTarget: relatedSnapshot == nil ? nil : focusTarget,
                     relatedItemsSnapshot: relatedSnapshot
                 )
-                detailsBackStack.append(transition.backStackEntry)
+                detailsBackStack.append(.details(transition.backStackEntry))
                 detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .details(id: nextId, type: nextType)
@@ -3454,7 +3428,7 @@ struct ContentView: View {
                         simklRatings: displayedSimklRatings
                     )
                 }
-                personBrowseReturn = DetailsNavigationEntry(
+                let transition = DetailsNavigationContextTransition.pushingCurrentDetails(
                     id: contentId,
                     type: contentType,
                     libraryWatchedContext: detailsLibraryWatchedContext,
@@ -3462,6 +3436,8 @@ struct ContentView: View {
                     relatedItemsSnapshot: relatedSnapshot
                 )
                 withAnimation(.easeInOut(duration: 0.28)) {
+                    detailsBackStack.append(.details(transition.backStackEntry))
+                    detailsLibraryWatchedContext = transition.activeLibraryWatchedContext
                     activeScreen = .personBrowse(person)
                 }
             }
