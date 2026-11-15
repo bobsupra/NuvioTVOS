@@ -17,11 +17,40 @@ struct MetaCompany: Identifiable, Equatable, Hashable {
 }
 
 struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
+    /// What kind of credit this person has. Separate from `role`, which for
+    /// cast is the character's name and so can be any text, "Creator" included.
+    enum Credit: Hashable {
+        case creator
+        case director
+        case cast
+    }
+
+    /// The role shown for a series' creators (TMDB's "created by").
+    static let creatorRole = "Creator"
+
     var id: String { tmdbId.map(String.init) ?? name }
     let name: String
+    /// Shown under the name: "Creator", "Director", or a cast member's character.
     let role: String?
     let profileURL: String?
     let tmdbId: Int?
+    /// Nil when the source doesn't say (AniList, fallbacks).
+    var credit: Credit? = nil
+
+    /// The role to show under the name: "Creator" and "Director" in the app's
+    /// language, decided by the credit type; a cast member's character name,
+    /// or any role from a source without a credit type, exactly as given.
+    var displayRole: String? {
+        switch credit {
+        case .creator:
+            return L10n.string("details_person_creator", fallback: "Creator")
+        case .director:
+            return L10n.string("details_director", fallback: "Director")
+        case .cast, nil:
+            let trimmed = role?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false ? trimmed : nil
+        }
+    }
 }
 
 struct TmdbCreditMetadata {
@@ -457,7 +486,8 @@ enum TmdbDetailsService {
                     name: name,
                     role: "Director",
                     profileURL: imageURL(person.profilePath, size: "w500"),
-                    tmdbId: person.id
+                    tmdbId: person.id,
+                    credit: .director
                 )
             }
         let castPeople = (decoded.cast ?? [])
@@ -468,7 +498,8 @@ enum TmdbDetailsService {
                     name: name,
                     role: nonEmpty(person.character),
                     profileURL: imageURL(person.profilePath, size: "w500"),
-                    tmdbId: person.id
+                    tmdbId: person.id,
+                    credit: .cast
                 )
             }
 
@@ -496,9 +527,10 @@ enum TmdbDetailsService {
             guard let name = nonEmpty(creator.name) else { return nil }
             return TmdbPersonMetadata(
                 name: name,
-                role: "Creator",
+                role: TmdbPersonMetadata.creatorRole,
                 profileURL: imageURL(creator.profilePath, size: "w500"),
-                tmdbId: creator.id
+                tmdbId: creator.id,
+                credit: .creator
             )
         }
     }

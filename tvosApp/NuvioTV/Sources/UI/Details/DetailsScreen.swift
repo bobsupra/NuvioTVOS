@@ -5320,6 +5320,7 @@ struct TvDetailsContent: View {
                                     if detailsActionsBelowInfo {
                                         TvDetailsSummary(
                                             meta: meta,
+                                            creators: DetailsCreditLine.creators(in: uiState.people),
                                             simkl: uiState.simklRatings,
                                             isBackgroundTrailerPlaying: isTrailerPlaying && isTrailerRenderReady,
                                             isSynopsisFocused: false
@@ -5331,6 +5332,7 @@ struct TvDetailsContent: View {
 
                                         TvDetailsSummary(
                                             meta: meta,
+                                            creators: DetailsCreditLine.creators(in: uiState.people),
                                             simkl: uiState.simklRatings,
                                             isBackgroundTrailerPlaying: isTrailerPlaying && isTrailerRenderReady,
                                             isSynopsisFocused: false
@@ -7081,6 +7083,8 @@ private struct OptionalAccessibilityHint: ViewModifier {
 
 private struct TvDetailsSummary: View {
     let meta: NuvioMeta
+    /// The series' creators, from TMDB's "created by"; empty when unknown.
+    var creators: [String] = []
     var simkl: SimklTitleRatings? = nil
     var isBackgroundTrailerPlaying: Bool = false
     var isSynopsisFocused: Bool = false
@@ -7171,26 +7175,7 @@ private struct TvDetailsSummary: View {
     }
 
     private var creatorLine: String? {
-        if meta.isSeries {
-            if let writers = meta.writer, !writers.isEmpty {
-                let list = writers.prefix(2).joined(separator: ", ")
-                return "Creator: \(list)"
-            }
-            if let directors = meta.director, !directors.isEmpty {
-                let list = directors.prefix(2).joined(separator: ", ")
-                return "Creator: \(list)"
-            }
-        } else {
-            if let directors = meta.director, !directors.isEmpty {
-                let list = directors.prefix(2).joined(separator: ", ")
-                return directors.count > 1 ? "Directors: \(list)" : "Director: \(list)"
-            }
-            if let writers = meta.writer, !writers.isEmpty {
-                let list = writers.prefix(2).joined(separator: ", ")
-                return writers.count > 1 ? "Writers: \(list)" : "Writer: \(list)"
-            }
-        }
-        return nil
+        DetailsCreditLine.text(for: meta, creators: creators)
     }
 
     private var certificationLabel: String? {
@@ -8811,8 +8796,7 @@ private struct TvDetailsPersonCard: View {
                             color: isFocused ? .white : .white.opacity(0.74), isActive: isFocused, alignment: .center)
                     .frame(width: 210)
 
-                if let role = person.role,
-                   !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let role = person.displayRole {
                     Text(role)
                         .font(.system(size: 20, weight: .regular))
                         .foregroundColor(.white.opacity(isFocused ? 0.82 : 0.55))
@@ -12745,5 +12729,62 @@ struct ErrorView: View {
             }
         }
         .padding(32)
+    }
+}
+
+/// The credit line above a title's synopsis, labelled with the role the
+/// metadata actually gives.
+///
+/// A series' creator is only known from TMDB's "created by". Its writer and
+/// director lists (from TMDB's crew or the add-on) are people who wrote or
+/// directed episodes, so without a known creator they are shown as writers or
+/// directors, never as the creator.
+enum DetailsCreditLine {
+    static let maxNames = 2
+
+    /// Creator names from the TMDB people list: those credited as creator,
+    /// never a cast member whose character happens to be called "Creator".
+    static func creators(in people: [TmdbPersonMetadata]) -> [String] {
+        people.filter { $0.credit == .creator }.map(\.name)
+    }
+
+    static func text(for meta: NuvioMeta, creators: [String]) -> String? {
+        let creators = names(creators)
+        let directors = names(meta.director)
+        let writers = names(meta.writer)
+        if meta.isSeries {
+            if !creators.isEmpty { return line(.creator, creators) }
+            if !writers.isEmpty { return line(.writer, writers) }
+            if !directors.isEmpty { return line(.director, directors) }
+        } else {
+            if !directors.isEmpty { return line(.director, directors) }
+            if !writers.isEmpty { return line(.writer, writers) }
+        }
+        return nil
+    }
+
+    enum Role { case creator, director, writer }
+
+    private static func names(_ list: [String]?) -> [String] {
+        (list ?? []).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.filter { !$0.isEmpty }
+    }
+
+    private static func line(_ role: Role, _ names: [String]) -> String {
+        let list = names.prefix(maxNames).joined(separator: ", ")
+        let plural = names.count > 1
+        switch (role, plural) {
+        case (.creator, false):
+            return L10n.format("details_credit_creator", fallback: "Creator: %@", list)
+        case (.creator, true):
+            return L10n.format("details_credit_creators", fallback: "Creators: %@", list)
+        case (.director, false):
+            return L10n.format("details_credit_director", fallback: "Director: %@", list)
+        case (.director, true):
+            return L10n.format("details_credit_directors", fallback: "Directors: %@", list)
+        case (.writer, false):
+            return L10n.format("details_credit_writer", fallback: "Writer: %@", list)
+        case (.writer, true):
+            return L10n.format("details_credit_writers", fallback: "Writers: %@", list)
+        }
     }
 }
