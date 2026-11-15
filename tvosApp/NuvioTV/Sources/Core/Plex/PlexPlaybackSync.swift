@@ -93,6 +93,19 @@ final class PlexPlaybackSync {
         return (current, merged)
     }
 
+    /// The link to hand an external player (Infuse, VLC, ...). Those apps take
+    /// a URL and nothing else, so a Plex link carries its token in the query
+    /// for them. The link is never stored; other streams pass through unchanged.
+    func urlForExternalPlayer(_ url: URL) -> URL {
+        let (current, headers) = resolve(url: url, headers: [:])
+        guard let token = headers[PlexClient.tokenHeader], !token.isEmpty,
+              var components = URLComponents(url: current, resolvingAgainstBaseURL: false) else { return current }
+        var items = (components.queryItems ?? []).filter { $0.name != PlexClient.tokenHeader }
+        items.append(URLQueryItem(name: PlexClient.tokenHeader, value: token))
+        components.queryItems = items
+        return components.url ?? url
+    }
+
     /// Headers safe to store with a link: a Plex link is stored without its token.
     func headersForStorage(url: String, headers: [String: String]) -> [String: String] {
         guard item(forString: url) != nil else { return headers }

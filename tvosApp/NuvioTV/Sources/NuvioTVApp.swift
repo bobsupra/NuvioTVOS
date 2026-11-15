@@ -2192,7 +2192,7 @@ struct ContentView: View {
         if !isStandalonePlaybackSession,
            url.scheme?.lowercased() != "smb",
            let launchURL = player.launchURL(
-               for: url,
+               for: PlexPlaybackSync.shared.urlForExternalPlayer(url),
                filename: mediaFilename,
                subtitleURLs: subtitleURLs,
                position: resumeFrom,

@@ -41,6 +41,20 @@ final class PlexPlaybackSyncTests: XCTestCase {
         XCTAssertNil(sync.headersForStorage(url: resolved.url.absoluteString, headers: resolved.headers)[PlexClient.tokenHeader])
     }
 
+    func testExternalPlayersGetTheTokenInTheLink() {
+        let external = sync.urlForExternalPlayer(URL(string: storedLink)!)
+        let components = URLComponents(url: external, resolvingAgainstBaseURL: false)
+        XCTAssertEqual(components?.path, partPath)
+        XCTAssertEqual(components?.host, "192.168.1.10")
+        // The token stored for the server, or none when there isn't one.
+        let token = PlexCredentialStore.token(forServerID: serverID)
+        let sentToken = components?.queryItems?.first { $0.name == PlexClient.tokenHeader }?.value
+        XCTAssertEqual(sentToken, token.isEmpty ? nil : token)
+        XCTAssertFalse(external.absoluteString.contains("Token=old"))
+        let other = URL(string: "https://example.com/video.mkv?t=1")!
+        XCTAssertEqual(sync.urlForExternalPlayer(other), other)
+    }
+
     func testOtherStreamsPassThroughUnchanged() {
         let url = URL(string: "https://example.com/video.mkv?t=1")!
         let resolved = sync.resolve(url: url, headers: ["A": "b"])
