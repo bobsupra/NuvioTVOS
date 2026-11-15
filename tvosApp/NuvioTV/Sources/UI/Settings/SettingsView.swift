@@ -15779,6 +15779,7 @@ private struct PlexSettingsSection: View {
     @State private var isChoosingHomeUser = false
     @State private var syncingServer: PlexServerConfig?
     @State private var refreshError: String?
+    @AppStorage(SettingsKey.plexLocalRowEnabled) private var showsOnHome = true
 
     var body: some View {
         SettingsGroup(
@@ -15822,6 +15823,16 @@ private struct PlexSettingsSection: View {
                         }
                     }
                 }
+
+                SettingsToggleRow(
+                    title: L10n.string("plex_show_on_home", fallback: "Show on Home"),
+                    subtitle: L10n.string(
+                        "plex_show_on_home_subtitle",
+                        fallback: "Show your Plex libraries as rows on Home. Plex streams and Continue Watching keep working when this is off."
+                    ),
+                    isOn: $showsOnHome,
+                    accentColor: accentColor
+                )
 
                 ForEach(serverStore.servers) { server in
                     PlexServerRow(
