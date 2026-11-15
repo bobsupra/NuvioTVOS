@@ -23,7 +23,11 @@ enum MALAccount {
 
         var errorDescription: String? {
             switch self {
-            case .superseded: return "This login was replaced: you logged out or started another login meanwhile."
+            case .superseded:
+                return L10n.string(
+                    "account_login_superseded",
+                    fallback: "This login was replaced: you logged out or started another login meanwhile."
+                )
             case .noClientID: return "Fill in your MAL API client's Client ID first."
             case .refused(let reason): return "MyAnimeList refused the login: \(reason)"
             case .noAnswer: return "MyAnimeList didn't answer. Try again."

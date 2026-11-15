@@ -50,3 +50,14 @@ final class AccountLoginGenerations: @unchecked Sendable {
         }
     }
 }
+
+/// The anime-tracker logins kept per profile (AniList, MAL). Removing them also
+/// stops a login still waiting for that profile, so it can't save afterwards.
+enum ProfileAccountLogins {
+    /// A profile was deleted, here or on another device. Profile ids can be
+    /// reused, so a new profile must not inherit the old one's logins.
+    static func remove(for profileID: String) {
+        AniListAccount.removeLogin(for: profileID)
+        MALKeychain.remove(for: profileID)
+    }
+}

@@ -27,7 +27,11 @@ enum AniListAccount {
 
         var errorDescription: String? {
             switch self {
-            case .superseded: return "This login was replaced: you logged out or started another login meanwhile."
+            case .superseded:
+                return L10n.string(
+                    "account_login_superseded",
+                    fallback: "This login was replaced: you logged out or started another login meanwhile."
+                )
             case .emptyToken: return "Paste the token AniList shows after you allow access."
             case .notAccepted(let reason): return "AniList didn't accept the token (\(reason))."
             case .badToken(let problem): return problem.message

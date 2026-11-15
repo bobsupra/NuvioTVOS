@@ -103,4 +103,80 @@ final class AccountLoginGenerationsTests: XCTestCase {
         XCTAssertNil(MALAccount.storeRenewed(renewed, replacing: login, for: profile))
         XCTAssertNil(MALKeychain.login(for: profile))
     }
+
+    // MARK: Profile deletion
+
+    /// A ProfileManager on a temporary folder holding `profile` and `otherProfile`.
+    private func profileManager() throws -> (ProfileManager, cleanUp: () -> Void) {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("logins-\(UUID().uuidString)")
+        let activeKey = "nuvio.active_profile_id"
+        let previousActive = UserDefaults.standard.string(forKey: activeKey)
+        // Written first, so the manager doesn't migrate any profiles stored in
+        // UserDefaults: only these two exist, and nothing else is touched.
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let profiles = [Profile(id: profile, name: "A"), Profile(id: otherProfile, name: "B")]
+        try JSONEncoder().encode(profiles.map(StoredProfile.init(from:)))
+            .write(to: directory.appendingPathComponent("nuvio-profiles.json"))
+        let manager = try ProfileManager(baseDir: directory.path)
+        XCTAssertEqual(try manager.getProfiles().map(\.id), [profile, otherProfile])
+        return (manager, {
+            try? FileManager.default.removeItem(at: directory)
+            UserDefaults.standard.set(previousActive, forKey: activeKey)
+        })
+    }
+
+    private func logInOtherProfile() {
+        AniListAccount.save(aniList("other"), ifCurrent: AniListAccount.beginLogin(for: otherProfile), for: otherProfile)
+        MALKeychain.save(mal("other"), ifCurrent: MALKeychain.beginLogin(for: otherProfile), for: otherProfile)
+    }
+
+    private func assertOtherProfileStillLoggedIn(file: StaticString = #filePath, line: UInt = #line) {
+        XCTAssertEqual(AniListAccount.storage.login(for: otherProfile)?.viewerName, "other", file: file, line: line)
+        XCTAssertEqual(MALKeychain.login(for: otherProfile)?.userName, "other", file: file, line: line)
+    }
+
+    func testAProfileRemovedBySyncStopsItsPendingLoginsAndDropsItsLogins() throws {
+        let (manager, cleanUp) = try profileManager()
+        defer { cleanUp() }
+        logInOtherProfile()
+        AniListAccount.save(aniList("old"), ifCurrent: AniListAccount.beginLogin(for: profile), for: profile)
+        let aniListPending = AniListAccount.beginLogin(for: profile)
+        let malPending = MALKeychain.beginLogin(for: profile)
+
+        // Deleted on another device: the next sync replaces the profile list without it.
+        try manager.replaceProfiles([Profile(id: otherProfile, name: "B")])
+
+        XCTAssertNil(AniListAccount.storage.login(for: profile), "a reused profile id must not inherit it")
+        XCTAssertFalse(AniListAccount.save(aniList("late"), ifCurrent: aniListPending, for: profile))
+        XCTAssertFalse(MALKeychain.save(mal("late"), ifCurrent: malPending, for: profile))
+        XCTAssertNil(AniListAccount.storage.login(for: profile))
+        XCTAssertNil(MALKeychain.login(for: profile))
+        assertOtherProfileStillLoggedIn()
+    }
+
+    func testDeletingAProfileStopsItsPendingLoginsAndDropsItsLogins() throws {
+        let (manager, cleanUp) = try profileManager()
+        defer { cleanUp() }
+        logInOtherProfile()
+        MALKeychain.save(mal("old"), ifCurrent: MALKeychain.beginLogin(for: profile), for: profile)
+        let aniListPending = AniListAccount.beginLogin(for: profile)
+        let malPending = MALKeychain.beginLogin(for: profile)
+
+        try manager.deleteProfile(id: profile)
+
+        XCTAssertNil(MALKeychain.login(for: profile))
+        XCTAssertFalse(AniListAccount.save(aniList("late"), ifCurrent: aniListPending, for: profile))
+        XCTAssertFalse(MALKeychain.save(mal("late"), ifCurrent: malPending, for: profile))
+        XCTAssertNil(AniListAccount.storage.login(for: profile))
+        assertOtherProfileStillLoggedIn()
+    }
+
+    func testTheSupersededMessageIsLocalized() {
+        let expected = L10n.string(
+            "account_login_superseded",
+            fallback: "This login was replaced: you logged out or started another login meanwhile."
+        )
+        XCTAssertEqual(AniListAccount.AccountError.superseded.localizedDescription, expected)
+        XCTAssertEqual(MALAccount.Failure.superseded.localizedDescription, expected)
+    }
 }
