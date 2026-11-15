@@ -25,13 +25,34 @@ enum IPTVGuideRefreshPolicy {
     }
 
     /// When to fetch again after a successful load at `loadedAt`.
+    ///
+    /// Channels' listings can run out at different times, so the channel that
+    /// runs out first decides, not the one with the longest schedule. Only
+    /// channels with listings from `loadedAt` on count: one with none, or only
+    /// past ones, may legitimately have no guide and can't keep the rest
+    /// refreshing. `minInterval` bounds it either way.
     static func nextRefresh(after programmes: [IPTVProgramme], loadedAt: Date) -> Date {
         let windowEnd = loadedAt.addingTimeInterval(lookAhead)
-        let lastEnd = min(programmes.map(\.end).max() ?? loadedAt, windowEnd)
+        var lastEndByChannel: [String: Date] = [:]
+        for programme in programmes {
+            lastEndByChannel[programme.channelID] = max(lastEndByChannel[programme.channelID] ?? .distantPast, programme.end)
+        }
+        let covered = lastEndByChannel.values.filter { $0 > loadedAt }
+        let lastEnd = min(covered.min() ?? loadedAt, windowEnd)
         let beforeRunningOut = lastEnd.addingTimeInterval(-lead)
         let latest = loadedAt.addingTimeInterval(maxAge)
         let earliest = loadedAt.addingTimeInterval(minInterval)
         return max(earliest, min(beforeRunningOut, latest))
+    }
+
+    /// Whether to fetch the guide now, for every trigger (the minute clock and
+    /// returning to the view): never while a load runs; at once if this source's
+    /// guide was never tried; otherwise only once its scheduled time comes, so a
+    /// failed load's backoff holds even if the guide is empty.
+    static func shouldLoad(isLoading: Bool, nextRefresh: Date?, now: Date) -> Bool {
+        guard !isLoading else { return false }
+        guard let nextRefresh else { return true }
+        return now >= nextRefresh
     }
 
     /// When to try again after `failures` consecutive failed loads (1 = the first).

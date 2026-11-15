@@ -205,14 +205,9 @@ struct IPTVLiveView: View {
                let sourceID = recent.sourceID(), let source = sources.first(where: { $0.id == sourceID }) {
                 load(source)
             }
-            if let id = selectedID, let url = selectedGuideURL {
-                // Back on the view: load a missing guide, or refresh one that is due.
-                if guideByChannel.isEmpty, guideTask == nil {
-                    loadGuide(url: url, for: id, channels: channels, sameOrigin: selectedGuideNeedsSameOrigin)
-                } else {
-                    refreshGuideIfDue(now: Date())
-                }
-            }
+            // Back on the view: the first load, or a refresh or retry that is due.
+            // An empty guide after a failure waits for its retry like any other.
+            refreshGuideIfDue(now: Date())
         }
         catch { sourcesLoaded = false; errorMessage = L10n.string("iptv_storage_read_error", fallback: "Could not read IPTV sources.") }
     }
@@ -401,10 +396,11 @@ struct IPTVLiveView: View {
         return guideByChannel[id]?.first { $0.start <= guideNow && guideNow < $0.end }
     }
 
-    /// Fetches the guide again when it is due and nothing is loading it now.
+    /// Fetches the guide when IPTVGuideRefreshPolicy.shouldLoad says so.
     private func refreshGuideIfDue(now: Date) {
-        guard guideTask == nil, let sourceID = selectedID, let url = selectedGuideURL,
-              let due = guideNextRefresh, now >= due else { return }
+        guard let sourceID = selectedID, let url = selectedGuideURL,
+              IPTVGuideRefreshPolicy.shouldLoad(isLoading: guideTask != nil, nextRefresh: guideNextRefresh, now: now)
+        else { return }
         loadGuide(url: url, for: sourceID, channels: channels, sameOrigin: selectedGuideNeedsSameOrigin)
     }
 
