@@ -2344,8 +2344,22 @@ class PlayerViewModel: ObservableObject {
     }
 
     var isShufflingEpisodes: Bool {
+        _ = shuffleRevision
         guard let meta = activeMeta, meta.isSeries else { return false }
         return EpisodeShuffle.shared.isActive(seriesID: meta.id)
+    }
+
+    /// Bumped when shuffle is turned off from the player, so the controls and
+    /// the Episodes panel redraw.
+    @Published private(set) var shuffleRevision = 0
+
+    /// Episodes panel > Turn Off Shuffle: back to playing in order, with the
+    /// following episode as Up Next again.
+    func turnOffShuffle() {
+        guard let meta = activeMeta, meta.isSeries else { return }
+        EpisodeShuffle.shared.stop(seriesID: meta.id)
+        nextEpisode = Self.nextEpisode(after: currentEpisodeVideo, in: seriesEpisodes)
+        shuffleRevision &+= 1
     }
 
     private static func nextEpisode(after current: NuvioVideo?, in episodes: [NuvioVideo]) -> NuvioVideo? {

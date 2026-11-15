@@ -155,7 +155,9 @@ struct PlayerEpisodesPanel: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
-                        if episodes.isEmpty {
+                        if viewModel.isShufflingEpisodes {
+                            shuffleOnContent
+                        } else if episodes.isEmpty {
                             Button {} label: {
                                 PlayerPanelRow(
                                     title: "Episodes unavailable",
@@ -193,6 +195,14 @@ struct PlayerEpisodesPanel: View {
                 }
                 .focusSection()
                 .onAppear {
+                    if viewModel.isShufflingEpisodes {
+                        DispatchQueue.main.async { focusedID = Self.shuffleOffID }
+                    } else {
+                        scrollToTarget(proxy: proxy)
+                    }
+                }
+                .onChange(of: viewModel.shuffleRevision) { _, _ in
+                    // Shuffle just turned off: show the episodes in order.
                     scrollToTarget(proxy: proxy)
                 }
             }
@@ -215,6 +225,58 @@ struct PlayerEpisodesPanel: View {
         .onReceive(NotificationCenter.default.publisher(for: AniListAccount.changedNotification).receive(on: RunLoop.main)) { _ in
             refreshSpoilerEvidence()
         }
+    }
+
+    private static let shuffleOffID = "shuffle_off"
+
+    /// While the series plays in shuffle, the panel says so instead of listing
+    /// the episodes in order, and offers to go back to playing in order.
+    @ViewBuilder
+    private var shuffleOnContent: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Label(
+                L10n.string("player_shuffle_on", fallback: "Shuffle On"),
+                systemImage: "shuffle"
+            )
+            .font(.system(size: 26, weight: .bold))
+            .foregroundColor(.white)
+            Text(L10n.string(
+                "player_shuffle_on_subtitle",
+                fallback: "Episodes play in random order. None repeats until every episode has played."
+            ))
+            .font(.system(size: 20))
+            .foregroundColor(.white.opacity(0.7))
+            if let next = viewModel.nextEpisode {
+                Text(L10n.format(
+                    "player_shuffle_up_next",
+                    fallback: "Up next: S%1$d E%2$d",
+                    next.season,
+                    next.episode
+                ))
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundColor(.white.opacity(0.85))
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 8)
+        .padding(.bottom, 6)
+
+        Button {
+            viewModel.turnOffShuffle()
+        } label: {
+            PlayerPanelRow(
+                title: L10n.string("player_shuffle_turn_off", fallback: "Turn Off Shuffle"),
+                subtitle: L10n.string(
+                    "player_shuffle_turn_off_subtitle",
+                    fallback: "Play the following episodes in order and show the episode list"
+                ),
+                isFocused: focusedID == Self.shuffleOffID
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .focused($focusedID, equals: Self.shuffleOffID)
+        .id(Self.shuffleOffID)
     }
 
     private func refreshSpoilerEvidence(refreshCompletedLedgerEvidence: Bool = false) {
