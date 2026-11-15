@@ -56,7 +56,7 @@ struct SurpriseMeView: View {
                 refreshProfile()
             }
             syncPool()
-            if pool.needsOnlineCandidates, let requested = pool.key {
+            if pool.needsOnlineCandidates, let requested = pool.ticket {
                 let fetched = await SurpriseMeOnline.candidates(history: history, profile: profile)
                 // Ignored if the tab closed, TMDB was turned off or the profile
                 // or history changed while TMDB answered.
@@ -68,7 +68,7 @@ struct SurpriseMeView: View {
     }
 
     private var poolKey: SurpriseMeCandidatePool.Key {
-        .init(profileScope: ProfileSettings.activeProfileScope, useTMDB: useTMDB, historyCount: history.titleCount)
+        .init(profileScope: ProfileSettings.activeProfileScope, useTMDB: useTMDB, historySignature: history.signature)
     }
 
     /// Drops candidates and queued picks gathered for another profile, TMDB
@@ -270,7 +270,7 @@ struct SurpriseMeView: View {
                 from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
                 limit: SurpriseMeAI.maxCandidates
             )
-            if !shortlist.isEmpty, let requested = pool.key {
+            if !shortlist.isEmpty, let requested = pool.ticket {
                 isThinking = true
                 let picks = await SurpriseMeAI.rank(
                     candidates: shortlist,
@@ -283,7 +283,7 @@ struct SurpriseMeView: View {
                 isThinking = false
                 // The profile, TMDB setting or history changed while the AI answered.
                 syncPool()
-                guard pool.key == requested else { return }
+                guard pool.stillCurrent(requested) else { return }
                 if let first = picks.first {
                     pool.accept(aiQueue: Array(picks.dropFirst()), for: requested)
                     show(first.meta, reason: first.reason.map { "✨ \($0)" })
