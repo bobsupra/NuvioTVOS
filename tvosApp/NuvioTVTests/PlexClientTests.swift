@@ -28,7 +28,7 @@ private final class PlexMockURLProtocol: URLProtocol {
 
 final class PlexClientTests: XCTestCase {
     private var session: URLSession!
-    private let baseURL = URL(string: "http://192.168.8.13:32400")!
+    private let baseURL = URL(string: "http://192.168.1.10:32400")!
 
     override func setUp() {
         super.setUp()
@@ -63,12 +63,12 @@ final class PlexClientTests: XCTestCase {
             connections: [
                 .init(uri: "https://1-2-3-4.x.plex.direct:5000", address: "1.2.3.4", port: 5000, protocolName: "https", isLocal: false, isRelay: true),
                 .init(uri: "https://79-1-1-1.x.plex.direct:32400", address: "79.1.1.1", port: 32400, protocolName: "https", isLocal: false, isRelay: false),
-                .init(uri: "https://192-168-8-13.x.plex.direct:32400", address: "192.168.8.13", port: 32400, protocolName: "https", isLocal: true, isRelay: false)
+                .init(uri: "https://192-168-1-10.x.plex.direct:32400", address: "192.168.1.10", port: 32400, protocolName: "https", isLocal: true, isRelay: false)
             ]
         )
         XCTAssertEqual(PlexClient.candidateBaseURLs(for: resource).map(\.absoluteString), [
-            "https://192-168-8-13.x.plex.direct:32400",
-            "http://192.168.8.13:32400",
+            "https://192-168-1-10.x.plex.direct:32400",
+            "http://192.168.1.10:32400",
             "https://79-1-1-1.x.plex.direct:32400",
             "https://1-2-3-4.x.plex.direct:5000"
         ])
@@ -134,7 +134,7 @@ final class PlexClientTests: XCTestCase {
 
     func testStreamURLKeepsThePartPathAndCarriesNoToken() {
         let url = PlexClient.streamURL(baseURL: baseURL, partKey: "/library/parts/9/1/file.mkv")
-        XCTAssertEqual(url?.absoluteString, "http://192.168.8.13:32400/library/parts/9/1/file.mkv")
+        XCTAssertEqual(url?.absoluteString, "http://192.168.1.10:32400/library/parts/9/1/file.mkv")
     }
 
     func testViewedSinceUsesPlexFilterAndReadsWatchState() async throws {

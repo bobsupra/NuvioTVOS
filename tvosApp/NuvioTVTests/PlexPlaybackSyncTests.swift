@@ -13,7 +13,7 @@ final class PlexPlaybackSyncTests: XCTestCase {
     private var storedLink: String { "http://10.0.0.5:32400\(partPath)?X-Plex-Token=old" }
 
     override func setUp() async throws {
-        PlexServerStore.shared.upsert(PlexServerConfig(id: serverID, displayName: "Test", baseURLString: "http://192.168.8.13:32400"))
+        PlexServerStore.shared.upsert(PlexServerConfig(id: serverID, displayName: "Test", baseURLString: "http://192.168.1.10:32400"))
         let item = PlexIndexedItem(ratingKey: "101", partKey: partPath, container: "mkv", size: 1, durationMs: 600_000, season: 1, episode: 1)
         let title = PlexIndexedTitle(
             contentId: "plex-\(serverID)-50", serverID: serverID, libraryID: "4", libraryName: "TV", ratingKey: "50",
@@ -35,7 +35,7 @@ final class PlexPlaybackSyncTests: XCTestCase {
 
     func testStoredLinkIsRecognisedAndPointedAtTheCurrentAddressWithoutAToken() {
         let resolved = sync.resolve(url: URL(string: storedLink)!, headers: ["User-Agent": "x"])
-        XCTAssertEqual(resolved.url.absoluteString, "http://192.168.8.13:32400\(partPath)")
+        XCTAssertEqual(resolved.url.absoluteString, "http://192.168.1.10:32400\(partPath)")
         XCTAssertEqual(resolved.headers["User-Agent"], "x")
         XCTAssertNotNil(resolved.headers[PlexClient.tokenHeader])
         XCTAssertNil(sync.headersForStorage(url: resolved.url.absoluteString, headers: resolved.headers)[PlexClient.tokenHeader])
