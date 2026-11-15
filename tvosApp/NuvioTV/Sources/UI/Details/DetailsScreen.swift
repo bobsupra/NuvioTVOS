@@ -5303,6 +5303,10 @@ struct TvDetailsContent: View {
     /// (the season was switched, say) so the strip can't stay unfocusable.
     private func beginRelatedFocusRestoration(_ targetID: String, using scrollProxy: ScrollViewProxy) {
         guard initialRelatedFocusID == targetID else { return }
+        // Focus goes back to More Like This, so every section is built at once (as for an
+        // episode opened from the calendar): built a step at a time, More Like This came a
+        // second or more later, and the remote did nothing until then.
+        buildLowerSections(upTo: .max)
         if relatedFocusRestoreTargetID != targetID {
             if relatedFocusRestoreTargetID != nil {
                 cancelRelatedFocusRestoration()
