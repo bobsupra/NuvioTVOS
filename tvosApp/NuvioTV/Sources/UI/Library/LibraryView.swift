@@ -15,6 +15,8 @@ enum LibraryGridMetrics {
 enum LibrarySourceMode: String, CaseIterable, Identifiable {
     case saved
     case cloud
+    /// Titles synced from the user's own servers: Plex, Jellyfin and SMB.
+    case servers
 
     var id: String { rawValue }
 
@@ -24,6 +26,8 @@ enum LibrarySourceMode: String, CaseIterable, Identifiable {
             return L10n.string("library_source_saved", fallback: "Saved")
         case .cloud:
             return L10n.string("library_source_cloud", fallback: "Cloud")
+        case .servers:
+            return L10n.string("library_source_servers", fallback: "Servers")
         }
     }
 }
@@ -252,6 +256,7 @@ struct LibraryWatchedContext {
 public struct LibraryView: View {
     @StateObject private var viewModel: LibraryViewModel
     @StateObject private var cloudViewModel: CloudLibraryViewModel
+    @StateObject private var serverViewModel = ServerLibraryViewModel()
     let onContentClick: (String, String) -> Void
     var onLibraryContentClick: ((String, String, LibraryWatchedContext) -> Void)? = nil
     var onLongPress: ((NuvioMeta) -> Void)? = nil
@@ -311,6 +316,21 @@ public struct LibraryView: View {
     private var cloudLibraryAvailable: Bool {
         cloudViewModel.isAvailable
     }
+
+    /// The Servers tab shows once a Plex, Jellyfin or SMB library has synced.
+    private var serverLibraryAvailable: Bool {
+        !serverViewModel.groups.isEmpty || serverViewModel.isAvailable
+    }
+
+    private var availableSourceModes: [LibrarySourceMode] {
+        LibrarySourceMode.allCases.filter { mode in
+            switch mode {
+            case .saved: return true
+            case .cloud: return cloudLibraryAvailable
+            case .servers: return serverLibraryAvailable
+            }
+        }
+    }
     
     public var body: some View {
         ZStack(alignment: .top) {
@@ -321,10 +341,10 @@ public struct LibraryView: View {
                     .font(.system(size: 46, weight: .bold))
                     .foregroundColor(.white)
 
-                // Source switch: Saved | Cloud
-                if cloudLibraryAvailable {
+                // Source switch: Saved | Cloud | Servers
+                if availableSourceModes.count > 1 {
                     HStack(spacing: 16) {
-                        ForEach(LibrarySourceMode.allCases) { mode in
+                        ForEach(availableSourceModes) { mode in
                             SourceModeChip(
                                 title: mode.localizedTitle,
                                 isSelected: sourceMode == mode
@@ -335,6 +355,8 @@ public struct LibraryView: View {
                                     }
                                     if mode == .cloud {
                                         Task { await cloudViewModel.load() }
+                                    } else if mode == .servers {
+                                        Task { await serverViewModel.load() }
                                     }
                                 }
                             }
@@ -426,6 +448,8 @@ public struct LibraryView: View {
                                 }
                             }
                         }
+                    } else if sourceMode == .servers {
+                        serverFilters
                     } else {
                         // Cloud filters: Select provider & Select type
                         FilterMenu(
@@ -478,10 +502,10 @@ public struct LibraryView: View {
                 .disabled(overlayRestoreItemID != nil || overlayRestoreCloudItemID != nil)
                 .zIndex(1)
 
-                if sourceMode == .saved {
-                    savedContent
-                } else {
-                    cloudContent
+                switch sourceMode {
+                case .saved: savedContent
+                case .cloud: cloudContent
+                case .servers: serversContent
                 }
             }
             .padding(.horizontal, LibraryGridMetrics.pageInset)
@@ -537,6 +561,141 @@ public struct LibraryView: View {
                 sourceMode = .saved
             }
         }
+        .task { await serverViewModel.load() }
+        .onChange(of: serverLibraryAvailable) { _, available in
+            if !available && sourceMode == .servers {
+                sourceMode = .saved
+            }
+        }
+    }
+
+    // MARK: - Servers tab
+
+    @ViewBuilder
+    private var serverFilters: some View {
+        if serverViewModel.availableSources.count > 1 {
+            FilterMenu(
+                label: "\(L10n.string("server_library_source", fallback: "Source")): \(serverViewModel.sourceFilter?.title ?? L10n.string("library_type_all", fallback: "All"))"
+            ) {
+                Button { serverViewModel.sourceFilter = nil } label: {
+                    menuItem(L10n.string("library_type_all", fallback: "All"), selected: serverViewModel.sourceFilter == nil)
+                }
+                ForEach(serverViewModel.availableSources) { source in
+                    Button { serverViewModel.sourceFilter = source } label: {
+                        menuItem(source.title, selected: serverViewModel.sourceFilter == source)
+                    }
+                }
+            }
+        }
+
+        FilterMenu(
+            label: "\(L10n.string("library_filter_sort", fallback: "Sort")): \(serverViewModel.sortOption.localizedTitle)"
+        ) {
+            ForEach(ServerLibraryViewModel.SortOption.allCases) { option in
+                Button { serverViewModel.sortOption = option } label: {
+                    menuItem(option.localizedTitle, selected: serverViewModel.sortOption == option)
+                }
+            }
+        }
+
+        FilterMenu(
+            label: "\(L10n.string("tvos_library_content", fallback: "Content")): \(serverContentTypeLabel)"
+        ) {
+            Button { serverViewModel.contentTypeFilter = nil } label: {
+                menuItem(L10n.string("library_type_all", fallback: "All"), selected: serverViewModel.contentTypeFilter == nil)
+            }
+            Button { serverViewModel.contentTypeFilter = "movie" } label: {
+                menuItem(L10n.string("type_movie", fallback: "Movies"), selected: serverViewModel.contentTypeFilter == "movie")
+            }
+            Button { serverViewModel.contentTypeFilter = "series" } label: {
+                menuItem(L10n.string("type_series", fallback: "Series"), selected: serverViewModel.contentTypeFilter == "series")
+            }
+        }
+    }
+
+    private var serverContentTypeLabel: String {
+        switch serverViewModel.contentTypeFilter {
+        case "movie": return L10n.string("type_movie", fallback: "Movies")
+        case "series": return L10n.string("type_series", fallback: "Series")
+        default: return L10n.string("library_type_all", fallback: "All")
+        }
+    }
+
+    @ViewBuilder
+    private var serversContent: some View {
+        let groups = serverViewModel.visibleGroups
+        if serverViewModel.isLoading && groups.isEmpty {
+            centeredMessage {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.6)
+            }
+        } else if groups.isEmpty {
+            centeredMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.system(size: 56))
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(L10n.string("library_filter_empty_title", fallback: "No matching titles"))
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(.white)
+                    Text(L10n.string("library_filter_empty_message", fallback: "Try changing or clearing your filters."))
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 600)
+                }
+            }
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    ForEach(groups) { group in
+                        Text(serverGroupTitle(group, among: groups))
+                            .font(.system(size: 28, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.85))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+
+                        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: LibraryGridMetrics.posterGap) {
+                            ForEach(group.items, id: \.id) { meta in
+                                LibraryItemButton(
+                                    item: LibraryStoreItem(meta: meta, addedAt: .distantPast).stremioMeta,
+                                    externalFocus: $focusedItemID,
+                                    retainFocusAppearance: overlayRestoreItemID == meta.id,
+                                    onFocus: {
+                                        if overlayRestoreItemID == meta.id {
+                                            overlayRestoreItemID = nil
+                                        }
+                                    },
+                                    onLongPress: onLongPress.map { cb in { cb(meta) } }
+                                ) {
+                                    overlayRestoreItemID = meta.id
+                                    lastFocusedItemID = meta.id
+                                    onContentClick(meta.id, meta.type)
+                                }
+                                .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != meta.id)
+                            }
+                        }
+                    }
+                }
+                .padding(.top, 16)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 90)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(TVTopBarScrollAnchor())
+            }
+            .focusSection()
+            .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
+        }
+    }
+
+    /// A library's name, with its source when more than one source is shown
+    /// ("TV Shows · Plex").
+    private func serverGroupTitle(
+        _ group: ServerLibraryViewModel.Group,
+        among groups: [ServerLibraryViewModel.Group]
+    ) -> String {
+        Set(groups.map(\.source)).count > 1 ? "\(group.title) · \(group.source.title)" : group.title
     }
 
     private var cloudSelectedProviderLabel: String {
