@@ -57,6 +57,9 @@ class SearchViewModel: ObservableObject {
     private var cacheOrder: [String] = []
     private var cachedSourceSignature = CinemetaCatalogRepository.searchSourceSignature
     private var sessionCommittedQuery: String?
+    /// The profile `recentSearches` was read from. The view model outlives
+    /// profile switches, so history is only ever saved back to this profile.
+    private var historyProfileScope = ProfileSettings.activeProfileScope
 
     init(
         repository: CatalogRepository = CinemetaCatalogRepository(),
@@ -64,6 +67,7 @@ class SearchViewModel: ObservableObject {
     ) {
         self.repository = repository
         self.searchTimeout = searchTimeout
+        historyProfileScope = ProfileSettings.activeProfileScope
         recentSearches = SearchHistoryStore.load()
 
         $searchText
@@ -94,6 +98,34 @@ class SearchViewModel: ObservableObject {
                 .sink { [weak self] _ in self?.searchSourcesDidChange() }
                 .store(in: &cancellables)
         }
+
+        NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.activeProfileDidChange() }
+            .store(in: &cancellables)
+    }
+
+    /// Another profile is active: drop everything from the previous one. A
+    /// search still running can't commit (its generation is stale), cached
+    /// results came from that profile's add-ons and state, and the visible
+    /// history is re-read from the new profile instead of carried over.
+    func activeProfileDidChange() {
+        searchGeneration &+= 1
+        searchTimeoutTask?.cancel()
+        searchTask?.cancel()
+        enrichmentTask?.cancel()
+        cachedResults = [:]
+        cacheOrder = []
+        cachedSourceSignature = CinemetaCatalogRepository.searchSourceSignature
+        sessionCommittedQuery = nil
+        lastFocusedResultID = nil
+        allResults = []
+        results = []
+        error = nil
+        emptyStateReason = nil
+        isLoading = false
+        searchText = ""
+        reloadRecent()
     }
 
     var hasQuery: Bool {
@@ -298,6 +330,7 @@ class SearchViewModel: ObservableObject {
     /// the same key, so whichever search style isn't on screen goes stale until
     /// its view reappears.
     func reloadRecent() {
+        historyProfileScope = ProfileSettings.activeProfileScope
         recentSearches = SearchHistoryStore.load()
     }
 
@@ -313,6 +346,13 @@ class SearchViewModel: ObservableObject {
     }
 
     private func commitRecentSearch(_ term: String) {
+        // The profile changed and its notification hasn't been handled yet:
+        // never merge the previous profile's list into this one.
+        guard historyProfileScope == ProfileSettings.activeProfileScope else {
+            sessionCommittedQuery = nil
+            reloadRecent()
+            return
+        }
         let (updated, newSession) = SearchHistoryStore.commit(
             term,
             current: recentSearches,
