@@ -36,6 +36,21 @@ struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
     let tmdbId: Int?
     /// Nil when the source doesn't say (AniList, fallbacks).
     var credit: Credit? = nil
+
+    /// The role to show under the name: "Creator" and "Director" in the app's
+    /// language, decided by the credit type; a cast member's character name,
+    /// or any role from a source without a credit type, exactly as given.
+    var displayRole: String? {
+        switch credit {
+        case .creator:
+            return L10n.string("details_person_creator", fallback: "Creator")
+        case .director:
+            return L10n.string("details_director", fallback: "Director")
+        case .cast, nil:
+            let trimmed = role?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed?.isEmpty == false ? trimmed : nil
+        }
+    }
 }
 
 struct TmdbCreditMetadata {

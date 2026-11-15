@@ -84,4 +84,25 @@ final class DetailsCreditLineTests: XCTestCase {
             label("details_credit_writer", "Writer: %@", "W")
         )
     }
+
+    // MARK: Person cards
+
+    func testPersonCardsLocalizeCreatorAndDirectorButKeepCharacterNames() {
+        let creator = TmdbPersonMetadata(name: "A", role: "Creator", profileURL: nil, tmdbId: 1, credit: .creator)
+        let director = TmdbPersonMetadata(name: "B", role: "Director", profileURL: nil, tmdbId: 2, credit: .director)
+        XCTAssertEqual(creator.displayRole, L10n.string("details_person_creator", fallback: "Creator"))
+        XCTAssertEqual(director.displayRole, L10n.string("details_director", fallback: "Director"))
+
+        // A character's name is shown exactly as TMDB gives it, even "Creator" or "Director".
+        let playingCreator = TmdbPersonMetadata(name: "C", role: "Creator", profileURL: nil, tmdbId: 3, credit: .cast)
+        let playingDirector = TmdbPersonMetadata(name: "D", role: " Director ", profileURL: nil, tmdbId: 4, credit: .cast)
+        let character = TmdbPersonMetadata(name: "E", role: "Walter White", profileURL: nil, tmdbId: 5, credit: .cast)
+        XCTAssertEqual(playingCreator.displayRole, "Creator")
+        XCTAssertEqual(playingDirector.displayRole, "Director")
+        XCTAssertEqual(character.displayRole, "Walter White")
+
+        // Sources without a credit type keep their role as given; blank roles show nothing.
+        XCTAssertEqual(TmdbPersonMetadata(name: "F", role: "Main", profileURL: nil, tmdbId: nil).displayRole, "Main")
+        XCTAssertNil(TmdbPersonMetadata(name: "G", role: "  ", profileURL: nil, tmdbId: nil, credit: .cast).displayRole)
+    }
 }

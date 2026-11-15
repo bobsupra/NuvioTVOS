@@ -8757,8 +8757,7 @@ private struct TvDetailsPersonCard: View {
                             color: isFocused ? .white : .white.opacity(0.74), isActive: isFocused, alignment: .center)
                     .frame(width: 210)
 
-                if let role = person.role,
-                   !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                if let role = person.displayRole {
                     Text(role)
                         .font(.system(size: 20, weight: .regular))
                         .foregroundColor(.white.opacity(isFocused ? 0.82 : 0.55))

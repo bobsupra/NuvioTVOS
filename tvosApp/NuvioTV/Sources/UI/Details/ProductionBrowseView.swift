@@ -640,10 +640,7 @@ struct PersonBrowseView: View {
     }
 
     private var categoryLabel: String {
-        if let role = person.role, !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return role
-        }
-        return "Cast & Crew"
+        person.displayRole ?? L10n.string("details_cast_and_crew", fallback: "Cast & Crew")
     }
 
     private var personFallback: some View {
