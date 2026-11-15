@@ -244,8 +244,10 @@ class PlayerViewModel: ObservableObject {
         case .ended: action = .stop
         default: return
         }
-        guard let item = trackingAddonItem else { return }
         let duration = time.duration > 0 ? time.duration : clock.duration
+        let plexState: PlexPlaybackSync.PlayerState = action == .start ? .playing : (action == .pause ? .paused : .stopped)
+        PlexPlaybackSync.shared.report(plexState, url: activeStreamURL, currentTime: time.current, duration: duration)
+        guard let item = trackingAddonItem else { return }
         trackingAddonReporter.report(action, item: item, currentTime: time.current, duration: duration)
     }
     private var scenePauseAlreadyNotified = false
@@ -1261,7 +1263,7 @@ class PlayerViewModel: ObservableObject {
             subtitle: subtitle,
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
-            resumeFrom: resumeFrom,
+            resumeFrom: PlexPlaybackSync.shared.resumePosition(for: url, fallback: resumeFrom),
             currentEpisode: currentEpisode,
             beginsNewPlaybackCompletionSession: !hasLoaded
         )
@@ -4813,6 +4815,7 @@ class PlayerViewModel: ObservableObject {
             return
         }
         trackingAddonReporter.stop(currentTime: time.current, duration: time.duration)
+        PlexPlaybackSync.shared.report(.stopped, url: activeStreamURL, currentTime: time.current, duration: time.duration)
         rememberManualSourceIfReady(refreshTimestamp: true)
         detachWatchPartyPlayerBridge()
         cancelPendingAdvanceResolution()
@@ -5098,6 +5101,7 @@ class PlayerViewModel: ObservableObject {
             : max(seconds, 0)
         let prevCurrent = time.current
         trackingAddonReporter.seeked(to: target, duration: duration)
+        PlexPlaybackSync.shared.seeked(url: activeStreamURL, to: target, duration: duration)
         seekWatchdogLog("[SeekWatchdog][PlayerVM] 👆 User seek to \(String(format: "%.3f", seconds))s (target: \(String(format: "%.3f", target))s, current: \(String(format: "%.3f", time.current))s, duration: \(String(format: "%.3f", duration))s, exact: \(exact))")
         screensaverDebugLog("[ScreensaverDebug][PlayerVM] seek(to: \(seconds), exact: \(exact)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
         engine.seekToMs(Int64(target * 1000), exact: exact)
@@ -8488,6 +8492,9 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveProgressIfNeeded() {
+        if status == .playing {
+            PlexPlaybackSync.shared.report(.playing, url: activeStreamURL, currentTime: time.current, duration: time.duration)
+        }
         guard isTrackablePlayback else { return }
         guard status == .playing else { return }
         didRefreshManualSourceTimestamp = false

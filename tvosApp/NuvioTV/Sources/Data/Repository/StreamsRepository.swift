@@ -139,6 +139,47 @@ final class StreamsRepository: ObservableObject {
         )
     }
 
+    private func plexStreamGroup(videoId: String) -> AddonStreamGroup? {
+        let contentId = Self.baseContentId(from: videoId)
+        let episode = Self.seasonEpisode(fromVideoId: videoId)
+        let matchingTitles = PlexLibraryIndex.shared.titles(matching: contentId)
+        guard !matchingTitles.isEmpty else { return nil }
+
+        var streams: [NuvioStream] = []
+        for title in matchingTitles {
+            guard let server = PlexServerStore.shared.server(id: title.serverID),
+                  let baseURL = server.baseURL else { continue }
+            let token = PlexCredentialStore.token(forServerID: server.id)
+            for item in title.items where item.season == episode.season && item.episode == episode.episode {
+                guard let url = PlexClient.streamURL(baseURL: baseURL, partKey: item.partKey, token: token) else { continue }
+                PlexPlaybackSync.shared.register(
+                    url: url.absoluteString,
+                    serverID: server.id,
+                    ratingKey: item.ratingKey,
+                    durationMs: item.durationMs
+                )
+                streams.append(
+                    NuvioStream(
+                        url: url.absoluteString,
+                        name: server.displayName,
+                        description: item.size.map {
+                            ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+                        },
+                        addonName: "Plex",
+                        videoSize: item.size
+                    )
+                )
+            }
+        }
+        guard !streams.isEmpty else { return nil }
+        return AddonStreamGroup(
+            addonId: "local.plex",
+            displayName: "Plex",
+            streams: streams,
+            isLoading: false
+        )
+    }
+
     // MARK: - Public API
 
     func load(
@@ -300,7 +341,7 @@ final class StreamsRepository: ObservableObject {
     private func runDiscovery(requestKey: String, type: String, videoId: String,
                               addonManifestURLs: [URL]) async {
         guard !Task.isCancelled else { return }
-        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId)]
+        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId)]
             .compactMap { $0 }
         state = StreamsDiscoveryState(
             requestKey: requestKey,
