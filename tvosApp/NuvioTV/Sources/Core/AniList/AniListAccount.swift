@@ -22,9 +22,16 @@ enum AniListAccount {
         case notAccepted(String)
         /// Something is wrong with the pasted text itself, so AniList isn't asked.
         case badToken(TokenProblem)
+        /// Logged out, or a newer login started, while AniList was answering.
+        case superseded
 
         var errorDescription: String? {
             switch self {
+            case .superseded:
+                return L10n.string(
+                    "account_login_superseded",
+                    fallback: "This login was replaced: you logged out or started another login meanwhile."
+                )
             case .emptyToken: return "Paste the token AniList shows after you allow access."
             case .notAccepted(let reason): return "AniList didn't accept the token (\(reason))."
             case .badToken(let problem): return problem.message
@@ -150,6 +157,25 @@ enum AniListAccount {
 
     static var login: Login? { storage.login(for: ProfileSettings.activeProfileScope) }
 
+    /// See AccountLoginGenerations: a late answer can't restore a removed login
+    /// or replace a newer one.
+    static let loginGenerations = AccountLoginGenerations()
+
+    static func beginLogin(for profileScope: String) -> UInt64 {
+        loginGenerations.begin(for: profileScope)
+    }
+
+    /// Saves `login` only if no logout or newer login happened since `generation` began.
+    @discardableResult
+    static func save(_ login: Login, ifCurrent generation: UInt64, for profileScope: String) -> Bool {
+        loginGenerations.commit(generation, for: profileScope) { storage.save(login, for: profileScope) }
+    }
+
+    /// Removes a profile's login and stops any login still waiting for it.
+    static func removeLogin(for profileScope: String) {
+        loginGenerations.invalidate(profileScope) { storage.remove(for: profileScope) }
+    }
+
     static var isLoggedIn: Bool { AniListSettings.isEnabled && login != nil }
 
     // MARK: Logging in
@@ -197,6 +223,7 @@ enum AniListAccount {
         guard !token.isEmpty else { throw AccountError.emptyToken }
         // The profile that started the login, not whichever is active once AniList answers.
         let profileScope = ProfileSettings.activeProfileScope
+        let generation = beginLogin(for: profileScope)
         let (facts, problem) = inspect(token, now: now)
         if let problem {
             AniListDiagnostics.note(.account, "Log in stopped: \(problem.message) · \(facts.summary)")
@@ -215,7 +242,10 @@ enum AniListAccount {
             throw AccountError.notAccepted("no account in its answer")
         }
         let login = Login(token: token, viewerID: viewer.id, viewerName: viewer.name, avatar: viewer.avatar?.large, savedAt: Date())
-        storage.save(login, for: profileScope)
+        guard save(login, ifCurrent: generation, for: profileScope) else {
+            AniListDiagnostics.note(.account, "Log in dropped: logged out or a newer login started meanwhile")
+            throw AccountError.superseded
+        }
         clearStates()
         AniListDiagnostics.note(.account, "Logged in as \(viewer.name)")
         changed(homeToo: true)
@@ -223,7 +253,7 @@ enum AniListAccount {
     }
 
     static func logOut() {
-        storage.remove(for: ProfileSettings.activeProfileScope)
+        removeLogin(for: ProfileSettings.activeProfileScope)
         clearStates()
         AniListDiagnostics.note(.account, "Logged out")
         changed(homeToo: true)

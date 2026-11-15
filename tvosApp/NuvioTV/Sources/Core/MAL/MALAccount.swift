@@ -18,9 +18,16 @@ enum MALAccount {
         case noClientID
         case refused(String)
         case noAnswer
+        /// Logged out, or a newer login started, while MAL was answering.
+        case superseded
 
         var errorDescription: String? {
             switch self {
+            case .superseded:
+                return L10n.string(
+                    "account_login_superseded",
+                    fallback: "This login was replaced: you logged out or started another login meanwhile."
+                )
             case .noClientID: return "Fill in your MAL API client's Client ID first."
             case .refused(let reason): return "MyAnimeList refused the login: \(reason)"
             case .noAnswer: return "MyAnimeList didn't answer. Try again."
@@ -66,6 +73,7 @@ enum MALAccount {
         guard !clientID.isEmpty else { throw Failure.noClientID }
         // The profile that started the login, not whichever is active once MAL answers.
         let profileScope = ProfileSettings.activeProfileScope
+        let generation = MALKeychain.beginLogin(for: profileScope)
         let token = try await tokens([
             "client_id": clientID,
             "grant_type": "authorization_code",
@@ -75,7 +83,9 @@ enum MALAccount {
         ], now: now)
         let name = await userName(token: token.accessToken) ?? "your account"
         let login = Login(accessToken: token.accessToken, refreshToken: token.refreshToken, expiresAt: token.expiresAt, userName: name, clientID: clientID)
-        MALKeychain.save(login, for: profileScope)
+        guard MALKeychain.save(login, ifCurrent: generation, for: profileScope) else {
+            throw Failure.superseded
+        }
         await lists.forget()
         AniListSettings.notifyHomeChanged()
         return name
@@ -156,15 +166,18 @@ enum MALAccount {
     /// Keeps a renewed login for the profile that asked for it. Logged out meanwhile: nothing is
     /// saved. Logged in again or renewed by another call meanwhile: that newer login stays.
     @discardableResult
+    /// The read and the save happen with no logout or login in between.
     static func storeRenewed(_ renewed: Tokens, replacing login: Login, for profileScope: String) -> String? {
-        guard let current = MALKeychain.login(for: profileScope) else { return nil }
-        guard current.refreshToken == login.refreshToken else { return current.accessToken }
-        var updated = current
-        updated.accessToken = renewed.accessToken
-        updated.refreshToken = renewed.refreshToken
-        updated.expiresAt = renewed.expiresAt
-        MALKeychain.save(updated, for: profileScope)
-        return renewed.accessToken
+        MALKeychain.loginGenerations.exclusive {
+            guard let current = MALKeychain.login(for: profileScope) else { return nil }
+            guard current.refreshToken == login.refreshToken else { return current.accessToken }
+            var updated = current
+            updated.accessToken = renewed.accessToken
+            updated.refreshToken = renewed.refreshToken
+            updated.expiresAt = renewed.expiresAt
+            MALKeychain.save(updated, for: profileScope)
+            return renewed.accessToken
+        }
     }
 
     // MARK: Calls
@@ -383,7 +396,25 @@ enum MALKeychain {
 
     static func login(for profileScope: String) -> MALAccount.Login? { storage.login(for: profileScope) }
     static func save(_ login: MALAccount.Login, for profileScope: String) { storage.save(login, for: profileScope) }
-    static func remove(for profileScope: String) { storage.remove(for: profileScope) }
+
+    /// See AccountLoginGenerations: a late answer can't restore a removed login
+    /// or replace a newer one.
+    static let loginGenerations = AccountLoginGenerations()
+
+    static func beginLogin(for profileScope: String) -> UInt64 {
+        loginGenerations.begin(for: profileScope)
+    }
+
+    /// Saves a new login only if no logout or newer login happened since `generation` began.
+    @discardableResult
+    static func save(_ login: MALAccount.Login, ifCurrent generation: UInt64, for profileScope: String) -> Bool {
+        loginGenerations.commit(generation, for: profileScope) { storage.save(login, for: profileScope) }
+    }
+
+    /// Removes a profile's login and stops any login still waiting for it.
+    static func remove(for profileScope: String) {
+        loginGenerations.invalidate(profileScope) { storage.remove(for: profileScope) }
+    }
 }
 
 /// The MAL login in the Keychain, one per profile, never synced.
