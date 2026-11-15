@@ -187,4 +187,66 @@ final class TrackingAddonServiceTests: XCTestCase {
         XCTAssertEqual(afterFast, ["fast"])
         await slow.value
     }
+
+    /// A profile's settings with the tracker installed and, optionally, approved.
+    private func profileDefaults(_ name: String, approved: Bool) -> UserDefaults {
+        let defaults = UserDefaults(suiteName: name)!
+        defaults.removePersistentDomain(forName: name)
+        defaults.set(#"[{"url":"\#(manifestURL.absoluteString)","enabled":true}]"#, forKey: SettingsKey.streamAddonManifestStates)
+        TrackingAddonService.setApproved(approved, manifestURL: manifestURL, in: defaults)
+        return defaults
+    }
+
+    private func deliverStart(defaults: UserDefaults, recorder: Recorder) async {
+        await TrackingAddonService.deliver(
+            to: manifestURL, resource: "player", type: "movie", id: "tt1",
+            defaults: defaults,
+            urls: { [$0] },
+            send: { request in await recorder.add(request.url?.absoluteString ?? "") },
+            manifest: { _ in TrackingAddonManifest(resources: [.init(name: "player")]) }
+        )
+    }
+
+    func testAQueuedEventIsDroppedWhenTheAddonIsTurnedOffWhileItWaits() async {
+        let defaults = profileDefaults("TrackingQueueTurnedOff", approved: true)
+        XCTAssertTrue(TrackingAddonService.mayReceiveEvents(manifestURL, in: defaults))
+        let queue = TrackingEventQueue()
+        let recorder = Recorder()
+        queue.enqueue(key: manifestURL.absoluteString) {
+            try? await Task.sleep(nanoseconds: 200_000_000)   // a slow earlier request
+        }
+        let waiting = queue.enqueue(key: manifestURL.absoluteString) {
+            await self.deliverStart(defaults: defaults, recorder: recorder)
+        }
+        TrackingAddonService.setApproved(false, manifestURL: manifestURL, in: defaults)
+        await waiting.value
+        let sent = await recorder.events
+        XCTAssertEqual(sent, [])
+    }
+
+    func testAQueuedEventIsSentWhenTheAddonStaysOn() async {
+        let defaults = profileDefaults("TrackingQueueStaysOn", approved: true)
+        let queue = TrackingEventQueue()
+        let recorder = Recorder()
+        queue.enqueue(key: manifestURL.absoluteString) {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        await queue.enqueue(key: manifestURL.absoluteString) {
+            await self.deliverStart(defaults: defaults, recorder: recorder)
+        }.value
+        let sent = await recorder.events
+        XCTAssertEqual(sent, [manifestURL.absoluteString])
+    }
+
+    func testEventsUseTheApprovalOfTheProfileThatProducedThem() async {
+        // Switching profiles doesn't drop them: each event carries its own
+        // profile's settings, not whichever profile is active when it runs.
+        let approving = profileDefaults("TrackingProfileApproving", approved: true)
+        let other = profileDefaults("TrackingProfileOther", approved: false)
+        let recorder = Recorder()
+        await deliverStart(defaults: approving, recorder: recorder)
+        await deliverStart(defaults: other, recorder: recorder)
+        let sent = await recorder.events
+        XCTAssertEqual(sent.count, 1)
+    }
 }

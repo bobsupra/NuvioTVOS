@@ -156,6 +156,12 @@ enum TrackingAddonService {
     /// declares `resource` for this type and id. Fire and forget, but in
     /// order per add-on: a quick start, pause and stop must not reach it as
     /// stop before start.
+    ///
+    /// An event can wait in its add-on's queue behind a slow request. When it
+    /// runs, the add-on must still be approved and installed for the profile
+    /// that produced the event: turning an add-on off withdraws consent, so
+    /// what is still waiting for it is dropped. Switching profiles doesn't
+    /// drop anything; those events belong to the profile that approved them.
     private static func dispatch(
         resource: String,
         type: String,
@@ -163,6 +169,7 @@ enum TrackingAddonService {
         urls: @escaping @Sendable (URL) -> [URL]
     ) {
         let defaults = ProfileSettings.current
+        let profileID = ProfileSettings.activeProfileID
         let approved = approvedManifestURLs(in: defaults)
         guard !approved.isEmpty else { return }
         let manifestURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs(in: defaults)
@@ -170,14 +177,44 @@ enum TrackingAddonService {
         guard !manifestURLs.isEmpty else { return }
         for manifestURL in manifestURLs {
             eventQueue.enqueue(key: manifestURL.absoluteString) {
-                guard let manifest = await TrackingAddonService.manifest(for: manifestURL),
-                      manifest.supports(resource, type: type, id: id) else { return }
-                for url in urls(manifestURL) {
-                    var request = URLRequest(url: url)
-                    request.timeoutInterval = 10
-                    _ = try? await TrackingAddonService.session.data(for: request)
-                }
+                await deliver(
+                    to: manifestURL,
+                    resource: resource, type: type, id: id,
+                    defaults: ProfileSettings.store(for: profileID),
+                    urls: urls,
+                    send: { request in _ = try? await TrackingAddonService.session.data(for: request) }
+                )
             }
+        }
+    }
+
+    /// Whether `manifestURL` may still receive events for the profile whose
+    /// settings are `defaults`: approved, and installed and enabled.
+    static func mayReceiveEvents(_ manifestURL: URL, in defaults: UserDefaults) -> Bool {
+        isApproved(manifestURL, in: defaults)
+            && CinemetaCatalogRepository.configuredStreamAddonManifestURLs(in: defaults).contains(manifestURL)
+    }
+
+    /// One queued event for one add-on, checked again when it runs.
+    static func deliver(
+        to manifestURL: URL,
+        resource: String,
+        type: String,
+        id: String,
+        defaults: UserDefaults,
+        urls: @Sendable (URL) -> [URL],
+        send: @Sendable (URLRequest) async -> Void,
+        manifest: @Sendable (URL) async -> TrackingAddonManifest? = { await TrackingAddonService.manifest(for: $0) }
+    ) async {
+        guard mayReceiveEvents(manifestURL, in: defaults),
+              let manifest = await manifest(manifestURL),
+              manifest.supports(resource, type: type, id: id) else { return }
+        for url in urls(manifestURL) {
+            // Turned off while an earlier request to it was still running.
+            guard isApproved(manifestURL, in: defaults) else { return }
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 10
+            await send(request)
         }
     }
 
