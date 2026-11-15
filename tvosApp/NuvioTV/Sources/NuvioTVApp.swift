@@ -5090,27 +5090,25 @@ private struct TVMainTabView: View {
                 }
             }
             Tab(value: TVTab.settings) { settingsTabContent } label: { settingsTabLabel }
-            if !directCollectionDestinations.isEmpty {
-                TabSection {
-                    ForEach(directCollectionDestinations) { destination in
-                        Tab(value: TVTab.collection(destination.id)) {
-                            collectionTabContent(destination)
-                        } label: {
-                            collectionTabLabel(destination)
+            // A tab builder takes at most 10 direct children.
+            Group {
+                if !directCollectionDestinations.isEmpty {
+                    TabSection {
+                        ForEach(directCollectionDestinations) { destination in
+                            Tab(value: TVTab.collection(destination.id)) {
+                                collectionTabContent(destination)
+                            } label: {
+                                collectionTabLabel(destination)
+                            }
                         }
+                    } header: {
+                        Text(L10n.string("tmdb_collections_title", fallback: "Collections"))
                     }
-                } header: {
-                    Text(L10n.string("tmdb_collections_title", fallback: "Collections"))
                 }
-            }
-            if !genreCollectionDestinations.isEmpty {
-                if #available(tvOS 27.0, *) {
-                    // tvOS supports the automatic policy, but not an explicit
-                    // collapsed default. Keep the system's native behavior;
-                    // header interaction still needs verification on Apple TV.
-                    genreTabSection.defaultSectionExpansion(.automatic)
-                } else {
-                    // Earlier systems retain a usable, expanded native section.
+                if !genreCollectionDestinations.isEmpty {
+                    // The system's native expansion behavior. (An `if #available`
+                    // here can't compile: TabContentBuilder has no
+                    // buildLimitedAvailability, and `.automatic` is the default.)
                     genreTabSection
                 }
             }
