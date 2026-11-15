@@ -4356,7 +4356,7 @@ private struct LayoutDiscoverySettingsView: View {
                     title: L10n.string("layout_ambient_mode", fallback: "Ambient Mode"),
                     subtitle: L10n.string(
                         "layout_ambient_mode_sub",
-                        fallback: "After two idle minutes on Home, show a slideshow of backdrops from your catalogs. The Apple TV screensaver still starts at its usual time."
+                        fallback: "After a minute without using the remote on Home, show a slideshow of backdrops from your catalogs. The Apple TV screensaver still starts at its usual time."
                     ),
                     isOn: $ambientMode,
                     accentColor: accentColor

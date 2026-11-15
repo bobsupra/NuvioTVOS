@@ -23,3 +23,31 @@ final class AmbientModeTests: XCTestCase {
         XCTAssertEqual(slides.count, 40)
     }
 }
+
+@MainActor
+final class AmbientModeInputTests: XCTestCase {
+    func testTheClickAfterTheDismissingTouchIsSwallowed() {
+        let monitor = UserActivityMonitor.shared
+        var dismissals = 0
+        let start = Date()
+        monitor.interceptNextInput = { dismissals += 1 }
+
+        // Touch on the clickpad: dismisses Ambient Mode.
+        XCTAssertTrue(monitor.consumesInput(at: start))
+        // The click of the same press, a moment later: swallowed, not opened.
+        XCTAssertTrue(monitor.consumesInput(at: start.addingTimeInterval(0.3)))
+        // Later input works normally again.
+        XCTAssertFalse(monitor.consumesInput(at: start.addingTimeInterval(2)))
+        XCTAssertEqual(dismissals, 1)
+    }
+
+    func testInputPassesThroughWhenAmbientModeIsNotShowing() {
+        let monitor = UserActivityMonitor.shared
+        monitor.interceptNextInput = nil
+        XCTAssertFalse(monitor.consumesInput(at: Date().addingTimeInterval(10)))
+    }
+
+    func testAmbientModeStartsBeforeTheShortestScreensaverSetting() {
+        XCTAssertLessThan(AmbientModeOverlay.idleDelay, 120)
+    }
+}
