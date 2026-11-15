@@ -11747,7 +11747,8 @@ private final class UpHoldPressHostView: UIView, UIGestureRecognizerDelegate {
             target: self,
             action: #selector(handleUpHold(_:))
         )
-        upHold.allowedPressTypes = [NSNumber(value: UIPress.PressType.upArrow.rawValue)]
+        // Use playPause instead of upArrow to enable this functionality with older Siri remote
+        upHold.allowedPressTypes = [NSNumber(value: UIPress.PressType.playPause.rawValue)]
         upHold.minimumPressDuration = 0.5
         upHold.cancelsTouchesInView = false
         upHold.delegate = self
