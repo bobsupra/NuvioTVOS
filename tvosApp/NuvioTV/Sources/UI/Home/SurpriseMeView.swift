@@ -20,8 +20,9 @@ struct SurpriseMeView: View {
 
     @State private var profile = TasteProfile.empty
     @State private var history = SurpriseMeHistory.empty
-    @State private var onlineCandidates: [NuvioMeta] = []
-    @State private var aiQueue: [SurpriseMeAIPick] = []
+    /// TMDB candidates and queued AI picks, kept only for the profile, TMDB
+    /// setting and history they were gathered for.
+    @State private var pool = SurpriseMeCandidatePool()
     @State private var pick: NuvioMeta?
     @State private var pickReason: String?
     @State private var offered: Set<String> = []
@@ -54,10 +55,30 @@ struct SurpriseMeView: View {
                 guard !Task.isCancelled else { return }
                 refreshProfile()
             }
-            if useTMDB, onlineCandidates.isEmpty {
-                onlineCandidates = await SurpriseMeOnline.candidates(history: history, profile: profile)
+            syncPool()
+            if pool.needsOnlineCandidates, let requested = pool.key {
+                let fetched = await SurpriseMeOnline.candidates(history: history, profile: profile)
+                // Ignored if the tab closed, TMDB was turned off or the profile
+                // or history changed while TMDB answered.
+                guard !Task.isCancelled else { return }
+                pool.accept(online: fetched, for: requested)
             }
         }
+        .onChange(of: useTMDB) { _, _ in syncPool() }
+    }
+
+    private var poolKey: SurpriseMeCandidatePool.Key {
+        .init(profileScope: ProfileSettings.activeProfileScope, useTMDB: useTMDB, historyCount: history.titleCount)
+    }
+
+    /// Drops candidates and queued picks gathered for another profile, TMDB
+    /// setting or history; on another profile, also what was shown and offered.
+    private func syncPool() {
+        guard pool.prepare(for: poolKey) == .profileChanged else { return }
+        pick = nil
+        pickReason = nil
+        offered = []
+        noMovieFound = false
     }
 
     /// The tab opens on a button, like the profile tab: nothing is suggested
@@ -229,15 +250,15 @@ struct SurpriseMeView: View {
     }
 
     private var candidates: [NuvioMeta] {
-        homeStore.sections.flatMap(\.items) + onlineCandidates
+        pool.candidates(home: homeStore.sections.flatMap(\.items))
     }
 
     private func roll() async {
         let isWatched: (NuvioMeta) -> Bool = { history.contains($0) || WatchedStore.contains(meta: $0) }
 
+        syncPool()
         // AI picks wait in a queue, so "Another one" doesn't ask again each time.
-        while let next = aiQueue.first {
-            aiQueue.removeFirst()
+        while let next = pool.nextQueuedPick() {
             guard !offered.contains(next.meta.id), !isWatched(next.meta) else { continue }
             show(next.meta, reason: next.reason)
             return
@@ -249,7 +270,7 @@ struct SurpriseMeView: View {
                 from: candidates, profile: profile, isWatched: isWatched, excluding: offered,
                 limit: SurpriseMeAI.maxCandidates
             )
-            if !shortlist.isEmpty {
+            if !shortlist.isEmpty, let requested = pool.key {
                 isThinking = true
                 let picks = await SurpriseMeAI.rank(
                     candidates: shortlist,
@@ -260,8 +281,11 @@ struct SurpriseMeView: View {
                         ?? "English"
                 )
                 isThinking = false
+                // The profile, TMDB setting or history changed while the AI answered.
+                syncPool()
+                guard pool.key == requested else { return }
                 if let first = picks.first {
-                    aiQueue = Array(picks.dropFirst())
+                    pool.accept(aiQueue: Array(picks.dropFirst()), for: requested)
                     show(first.meta, reason: first.reason.map { "✨ \($0)" })
                     return
                 }
