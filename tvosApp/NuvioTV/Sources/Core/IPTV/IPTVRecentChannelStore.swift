@@ -7,6 +7,9 @@ struct IPTVRecentChannelStore {
 
     func load() -> String? { defaults.string(forKey: Self.key) }
 
+    /// Forgets the last channel, for a deleted profile.
+    static func remove(from defaults: UserDefaults) { defaults.removeObject(forKey: key) }
+
     /// The source UUID is public local identity; the rest of the key is an
     /// opaque channel digest. Reject old or malformed values safely.
     func sourceID() -> UUID? {

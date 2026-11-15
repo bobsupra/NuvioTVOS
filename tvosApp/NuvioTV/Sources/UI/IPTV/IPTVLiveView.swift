@@ -227,6 +227,8 @@ struct IPTVLiveView: View {
         loadTask?.cancel()
         let token = UUID()
         requestID = token
+        // Captured before loading: if the profile is deleted meanwhile, the save below does nothing.
+        let sourcesGeneration = IPTVSourceStore.generation(for: profileID)
         loading = true
         errorMessage = nil
         loadTask = Task { @MainActor in
@@ -261,7 +263,11 @@ struct IPTVLiveView: View {
                     } else {
                         updated.append(source)
                     }
-                    try store.save(updated, profileID: profileID)
+                    guard try store.save(updated, profileID: profileID, ifGeneration: sourcesGeneration) else {
+                        loading = false
+                        loadTask = nil
+                        return
+                    }
                     sources = updated
                     clearEditor()
                 }

@@ -180,3 +180,23 @@ final class AccountLoginGenerationsTests: XCTestCase {
         XCTAssertEqual(MALAccount.Failure.superseded.localizedDescription, expected)
     }
 }
+
+final class AccountLoginGenerationsSemanticsTests: XCTestCase {
+    func testAProfileWithNoHistoryIsAtGenerationZeroAndCanCommitIt() {
+        let generations = AccountLoginGenerations()
+        XCTAssertEqual(generations.current(for: "new"), 0)
+        var saved = false
+        XCTAssertTrue(generations.commit(0, for: "new") { saved = true })
+        XCTAssertTrue(saved)
+    }
+
+    func testRemovalAndNewLoginsMoveTheGenerationOn() {
+        let generations = AccountLoginGenerations()
+        let initial = generations.current(for: "p")
+        generations.invalidate("p")
+        XCTAssertFalse(generations.commit(initial, for: "p") {})
+        let started = generations.begin(for: "p")
+        XCTAssertEqual(generations.current(for: "p"), started)
+        XCTAssertTrue(generations.commit(started, for: "p") {})
+    }
+}

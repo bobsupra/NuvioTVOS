@@ -23,6 +23,12 @@ final class AccountLoginGenerations: @unchecked Sendable {
         }
     }
 
+    /// The profile's current generation, without starting anything. Work that
+    /// captures it can only save while nothing removed the profile's data since.
+    func current(for profileScope: String) -> UInt64 {
+        lock.withLock { generations[profileScope] ?? 0 }
+    }
+
     /// Removes a profile's login: moves the generation on and runs `remove`
     /// under the lock, so a login still waiting can't bring it back.
     func invalidate(_ profileScope: String, _ remove: () -> Void = {}) {
@@ -32,10 +38,20 @@ final class AccountLoginGenerations: @unchecked Sendable {
         }
     }
 
+    /// Invalidates a group atomically, for operations such as signing out.
+    func invalidate(_ profileScopes: Set<String>, _ remove: () -> Void) {
+        lock.withLock {
+            for scope in profileScopes {
+                generations[scope] = (generations[scope] ?? 0) &+ 1
+            }
+            remove()
+        }
+    }
+
     /// Runs `body` with no login saved or removed meanwhile, for a
     /// read-then-write such as keeping a renewed token.
-    func exclusive<T>(_ body: () -> T) -> T {
-        lock.withLock(body)
+    func exclusive<T>(_ body: () throws -> T) rethrows -> T {
+        try lock.withLock(body)
     }
 
     /// Runs `save` only if `generation` is still the profile's current one. The
@@ -44,7 +60,9 @@ final class AccountLoginGenerations: @unchecked Sendable {
     @discardableResult
     func commit(_ generation: UInt64, for profileScope: String, _ save: () -> Void) -> Bool {
         lock.withLock {
-            guard generations[profileScope] == generation else { return false }
+            // A profile nothing was started or removed for is at generation 0,
+            // the same value `current(for:)` reports for it.
+            guard (generations[profileScope] ?? 0) == generation else { return false }
             save()
             return true
         }
