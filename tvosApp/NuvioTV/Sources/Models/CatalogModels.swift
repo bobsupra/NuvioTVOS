@@ -12613,6 +12613,14 @@ enum ProfileSettings {
     private static let trailerSoundMigrationKey = "nuvio.tv.profile.settings.trailerSound.v2"
     private static let trailerSoundLegacyFallbackKey = "nuvio.tv.profile.settings.trailerSound.legacyFallback"
     static let settingsChangedNotification = Notification.Name("nuvio.tv.profile.settings.changed")
+    /// Posted on the main thread after the active profile changes to another one
+    /// (or to none), so state kept across profiles can be reset.
+    static let activeProfileChangedNotification = Notification.Name("nuvio.tv.profile.active.changed")
+
+    private static func postActiveProfileChanged() {
+        let post = { NotificationCenter.default.post(name: activeProfileChangedNotification, object: nil) }
+        if Thread.isMainThread { post() } else { DispatchQueue.main.async(execute: post) }
+    }
 
     /// Values identifying connected external tracking/metadata accounts on the device.
     /// They are deliberately not copied when a new profile is created: a profile
@@ -12694,8 +12702,10 @@ enum ProfileSettings {
         // Profile selection remains active when disk migration fails. In that
         // case, skip preference mutations so an oversized legacy domain is not
         // sent back through cfprefsd.
+        let changed = activeProfileID != id
         current = suite
         activeProfileID = id
+        if changed { postActiveProfileChanged() }
         guard canMutatePreferences else { return }
 
         suite.set(primary, forKey: primaryProfileKey)
@@ -12714,8 +12724,10 @@ enum ProfileSettings {
     }
 
     static func clearActiveProfile() {
+        let changed = activeProfileID != nil
         current = .standard
         activeProfileID = nil
+        if changed { postActiveProfileChanged() }
     }
 
     /// The old sound preference now belongs only to card previews. Copy its
