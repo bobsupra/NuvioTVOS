@@ -126,4 +126,19 @@ final class SurpriseMeCandidatePoolTests: XCTestCase {
         XCTAssertNotEqual(before.signature, SurpriseMeHistory(watched: [a], library: [b], continueWatching: []).signature)
         XCTAssertEqual(before.signature, SurpriseMeHistory(watched: [a, b], library: [], continueWatching: []).signature)
     }
+
+    func testTheHistorySignatureChangesWhenATitlesGenresChange() {
+        func meta(_ genres: [String]?) -> NuvioMeta { NuvioMeta(id: "tt1", name: "Film", type: "movie", genres: genres) }
+        let drama = SurpriseMeHistory(watched: [meta(["Drama"])], library: [], continueWatching: [])
+        let sciFi = SurpriseMeHistory(watched: [meta(["Drama", "Sci-Fi"])], library: [], continueWatching: [])
+        XCTAssertNotEqual(drama.signature, sciFi.signature)
+        XCTAssertNotEqual(drama.signature, SurpriseMeHistory(watched: [meta(nil)], library: [], continueWatching: []).signature)
+
+        // The same genres in another order or spelling are the same taste.
+        let reordered = SurpriseMeHistory(watched: [meta(["Sci-Fi", "Drama"])], library: [], continueWatching: [])
+        let respelled = SurpriseMeHistory(watched: [meta(["drama", "Science Fiction"])], library: [], continueWatching: [])
+        XCTAssertEqual(sciFi.signature, reordered.signature)
+        XCTAssertEqual(sciFi.signature, respelled.signature)
+    }
 }
+
