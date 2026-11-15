@@ -112,7 +112,12 @@ final class PlexSessionManager: ObservableObject {
     }
 
     func handleForegroundSession() async {
+        let alreadyConnected = PlexServerStore.shared.servers.map(\.id).filter { connectionState(for: $0).isConnected }
         await connectAll(autoSync: false)
+        // Newly connected servers read their watch state while connecting.
+        for serverID in alreadyConnected {
+            await refreshWatchStates(forServerID: serverID)
+        }
         if NSClassFromString("XCTestCase") == nil {
             autoSyncConnectedServers(minimumInterval: Self.foregroundAutoSyncInterval)
         }
@@ -179,6 +184,7 @@ final class PlexSessionManager: ObservableObject {
             }
             clients[server.id] = client
             connectionStates[server.id] = .connected(libraries: libraries)
+            await refreshWatchStates(forServerID: server.id)
         } catch {
             guard isCurrent() else { return }
             connectionStates[server.id] = .failed(error.localizedDescription)
@@ -193,6 +199,36 @@ final class PlexSessionManager: ObservableObject {
         connectionProfileIDs[server.id] = nil
         connectionStates[server.id] = .disconnected
         syncStates[server.id] = .idle
+    }
+
+    // MARK: - Watch state
+
+    /// Reads what was played on the server since the last read: one small
+    /// request per selected library and type. Runs on every connect, so a
+    /// position saved by another Plex app is known before anything plays here.
+    func refreshWatchStates(forServerID serverID: String) async {
+        guard let server = PlexServerStore.shared.server(id: serverID),
+              let since = server.watchStateReadAt,
+              let client = client(forServerID: serverID),
+              case .connected(let libraries) = connectionState(for: serverID) else { return }
+        let readAt = Int64(Date().timeIntervalSince1970)
+        var states: [String: PlexWatchState] = [:]
+        do {
+            for library in libraries where server.selectedLibraryIDs.contains(library.id) {
+                let type: PlexClient.ItemType = library.type == "movie" ? .movie : .episode
+                // A minute of overlap covers clock differences with the server.
+                for item in try await client.items(libraryID: library.id, type: type, viewedSince: since - 60) {
+                    states[item.ratingKey] = PlexWatchState(item)
+                }
+            }
+        } catch {
+            return
+        }
+        PlexLibraryIndex.shared.setWatchStates(states, forServerID: serverID, merging: true)
+        if var updated = PlexServerStore.shared.server(id: serverID) {
+            updated.watchStateReadAt = readAt
+            PlexServerStore.shared.upsert(updated)
+        }
     }
 
     // MARK: - Sync
@@ -210,6 +246,8 @@ final class PlexSessionManager: ObservableObject {
             guard let self else { return }
             do {
                 var titles: [PlexIndexedTitle] = []
+                var states: [String: PlexWatchState] = [:]
+                let readAt = Int64(Date().timeIntervalSince1970)
                 var found = 0
                 for library in selected {
                     try Task.checkCancellation()
@@ -225,21 +263,25 @@ final class PlexSessionManager: ObservableObject {
                     if library.type == "movie" {
                         let movies = try await client.items(libraryID: library.id, type: .movie, onPageFetched: progress)
                         found += movies.count
+                        for movie in movies { states[movie.ratingKey] = PlexWatchState(movie) }
                         titles += PlexLibraryResolver.resolve(movies: movies, shows: [], episodes: [], serverID: server.id, library: library)
                     } else {
                         let shows = try await client.items(libraryID: library.id, type: .show, onPageFetched: progress)
                         found += shows.count
                         let episodes = try await client.items(libraryID: library.id, type: .episode, onPageFetched: progress)
                         found += episodes.count
+                        for episode in episodes { states[episode.ratingKey] = PlexWatchState(episode) }
                         titles += PlexLibraryResolver.resolve(movies: [], shows: shows, episodes: episodes, serverID: server.id, library: library)
                     }
                 }
                 try Task.checkCancellation()
                 guard self.activeProfileID == profileID else { return }
                 try PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
+                PlexLibraryIndex.shared.setWatchStates(states, forServerID: server.id, merging: false)
                 if var updated = PlexServerStore.shared.server(id: server.id) {
                     updated.lastSyncDate = Date()
                     updated.lastSyncTitleCount = titles.count
+                    updated.watchStateReadAt = readAt
                     PlexServerStore.shared.upsert(updated)
                 }
                 self.syncStates[server.id] = .done(PlexSyncReport(

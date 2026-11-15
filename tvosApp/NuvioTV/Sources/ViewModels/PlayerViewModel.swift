@@ -1200,6 +1200,9 @@ class PlayerViewModel: ObservableObject {
         currentEpisode: NuvioVideo? = nil,
         isActionPlaybackSession: Bool = false
     ) {
+        // A Plex link is pointed at the server's current address, with its
+        // token as a header; any other stream is unchanged.
+        let (url, httpHeaders) = PlexPlaybackSync.shared.resolve(url: url, headers: httpHeaders)
         PlaybackTimelineRecorder.record(.playbackLoadRequested)
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         self.isActionPlaybackSession = isActionPlaybackSession
@@ -8628,7 +8631,7 @@ class PlayerViewModel: ObservableObject {
             LastPlaybackStreamStore.save(
                 metaId: activeMeta.id,
                 url: activeStreamURL,
-                httpHeaders: activeHTTPHeaders,
+                httpHeaders: PlexPlaybackSync.shared.headersForStorage(url: activeStreamURL, headers: activeHTTPHeaders),
                 season: season,
                 episode: episode,
                 meta: activeMeta,

@@ -44,6 +44,27 @@ struct PlexIndexedTitle: Codable, Equatable {
     var items: [PlexIndexedItem]
 }
 
+/// The account's watch state for one movie or episode, as Plex reports it.
+struct PlexWatchState: Codable, Equatable {
+    var viewOffsetMs: Int64
+    var viewCount: Int
+    /// Unix seconds; 0 when never played.
+    var lastViewedAt: Int64
+
+    var isWatched: Bool { viewCount > 0 }
+    var resumeSeconds: Double { Double(viewOffsetMs) / 1000 }
+
+    init(viewOffsetMs: Int64 = 0, viewCount: Int = 0, lastViewedAt: Int64 = 0) {
+        self.viewOffsetMs = viewOffsetMs
+        self.viewCount = viewCount
+        self.lastViewedAt = lastViewedAt
+    }
+
+    init(_ item: PlexMediaItem) {
+        self.init(viewOffsetMs: item.viewOffsetMs ?? 0, viewCount: item.viewCount ?? 0, lastViewedAt: item.lastViewedAt ?? 0)
+    }
+}
+
 enum PlexLibraryResolver {
     /// Groups one section's movies, shows, and episodes into titles locally.
     static func resolve(
@@ -130,6 +151,9 @@ final class PlexLibraryIndex: ObservableObject {
     }
 
     @Published private(set) var titlesByServerID: [String: [PlexIndexedTitle]] = [:]
+    /// Watch state per server, keyed by the movie's or episode's rating key.
+    /// A server has an entry here once its state has been read at least once.
+    @Published private(set) var watchStatesByServerID: [String: [String: PlexWatchState]] = [:]
 
     enum IndexError: LocalizedError {
         case persistenceFailed
@@ -138,10 +162,53 @@ final class PlexLibraryIndex: ObservableObject {
 
     private init() {
         titlesByServerID = Self.load()
+        watchStatesByServerID = Self.loadWatchStates()
     }
 
     func reload() {
         titlesByServerID = Self.load()
+        watchStatesByServerID = Self.loadWatchStates()
+    }
+
+    // MARK: - Watch state
+
+    /// `nil` until the server's watch state has been read; afterwards an item
+    /// Plex never mentioned is simply unwatched.
+    func watchState(serverID: String, ratingKey: String) -> PlexWatchState? {
+        guard let states = watchStatesByServerID[serverID] else { return nil }
+        return states[ratingKey] ?? PlexWatchState()
+    }
+
+    /// Replaces a server's states (after a full sync) or merges newer ones in.
+    func setWatchStates(_ states: [String: PlexWatchState], forServerID serverID: String, merging: Bool) {
+        var updated = watchStatesByServerID
+        if merging {
+            updated[serverID, default: [:]].merge(states) { _, new in new }
+        } else {
+            updated[serverID] = states
+        }
+        guard updated != watchStatesByServerID else { return }
+        watchStatesByServerID = updated
+        if let data = try? JSONEncoder().encode(updated) {
+            _ = LargePayloadStore.write(data, key: Self.watchStateKey, directory: Self.storageDirectoryName)
+        }
+        NotificationCenter.default.post(name: Self.watchStateChangedNotification, object: nil)
+    }
+
+    static let watchStateChangedNotification = Notification.Name("nuvio.tv.plex.watchState.changed")
+
+    /// The server, title, and file a `/library/parts/...` path belongs to.
+    func locate(partPath: String, preferredHost: String? = nil) -> (server: PlexServerConfig, title: PlexIndexedTitle, item: PlexIndexedItem)? {
+        let servers = PlexServerStore.shared.servers
+        let preferred = servers.filter { preferredHost != nil && $0.baseURL?.host == preferredHost }
+        for server in preferred + servers.filter({ candidate in !preferred.contains(where: { $0.id == candidate.id }) }) {
+            for title in titlesByServerID[server.id] ?? [] {
+                if let item = title.items.first(where: { $0.partKey == partPath }) {
+                    return (server, title, item)
+                }
+            }
+        }
+        return nil
     }
 
     func titles() -> [PlexIndexedTitle] {
@@ -243,6 +310,14 @@ final class PlexLibraryIndex: ObservableObject {
     }
 
     func removeAll(forServerID serverID: String) {
+        if watchStatesByServerID[serverID] != nil {
+            var states = watchStatesByServerID
+            states.removeValue(forKey: serverID)
+            watchStatesByServerID = states
+            if let data = try? JSONEncoder().encode(states) {
+                _ = LargePayloadStore.write(data, key: Self.watchStateKey, directory: Self.storageDirectoryName)
+            }
+        }
         var updated = titlesByServerID
         guard updated.removeValue(forKey: serverID) != nil else { return }
         guard persist(updated) else { return }
@@ -253,6 +328,16 @@ final class PlexLibraryIndex: ObservableObject {
     private static let storageDirectoryName = "plexLibraryIndex"
     private static var storageKey: String {
         "plexLibraryIndex.\(ProfileSettings.activeProfileID ?? "default")"
+    }
+
+    private static var watchStateKey: String {
+        "plexWatchStates.\(ProfileSettings.activeProfileID ?? "default")"
+    }
+
+    private static func loadWatchStates() -> [String: [String: PlexWatchState]] {
+        guard let data = LargePayloadStore.read(key: watchStateKey, directory: storageDirectoryName),
+              let decoded = try? JSONDecoder().decode([String: [String: PlexWatchState]].self, from: data) else { return [:] }
+        return decoded
     }
 
     private func persist(_ titles: [String: [PlexIndexedTitle]]) -> Bool {

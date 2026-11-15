@@ -60,6 +60,11 @@ struct PlexMediaItem: Codable, Equatable {
     let partKey: String?
     let container: String?
     let sizeBytes: Int64?
+    /// The account's watch state: resume position, play count, and when it was
+    /// last played (Unix seconds). Absent fields mean unwatched.
+    var viewOffsetMs: Int64? = nil
+    var viewCount: Int? = nil
+    var lastViewedAt: Int64? = nil
 }
 
 /// Thin client for plex.tv (sign-in, server discovery) and for one Plex Media
@@ -333,9 +338,12 @@ struct PlexClient {
 
     /// Every item of one type in a section. A single request per page covers a
     /// whole library (episodes included), so syncs need no per-show requests.
+    /// - Parameter viewedSince: only items played at or after this time (Unix
+    ///   seconds), for refreshing watch state without listing the library.
     func items(
         libraryID: String,
         type: ItemType,
+        viewedSince: Int64? = nil,
         onPageFetched: ((Int, Int?) -> Void)? = nil
     ) async throws -> [PlexMediaItem] {
         var all: [PlexMediaItem] = []
@@ -343,15 +351,18 @@ struct PlexClient {
         let pageSize = 500
         for _ in 0..<1_000 {
             try Task.checkCancellation()
-            let data = try await get(
-                "library/sections/\(libraryID)/all",
-                query: [
-                    "type": String(type.rawValue),
-                    "includeGuids": "1",
-                    "X-Plex-Container-Start": String(start),
-                    "X-Plex-Container-Size": String(pageSize)
-                ]
-            )
+            var query = [
+                "type": String(type.rawValue),
+                "includeGuids": "1",
+                "X-Plex-Container-Start": String(start),
+                "X-Plex-Container-Size": String(pageSize)
+            ]
+            if let viewedSince {
+                // Plex filter syntax: `lastViewedAt>=N` is the key `lastViewedAt>`
+                // with value `N`.
+                query["lastViewedAt>"] = String(viewedSince)
+            }
+            let data = try await get("library/sections/\(libraryID)/all", query: query)
             let page = try JSONDecoder().decode(ItemsPayload.self, from: data).MediaContainer
             let metadata = page.Metadata ?? []
             all.append(contentsOf: metadata.map(Self.mapItem))
@@ -393,12 +404,24 @@ struct PlexClient {
         )
     }
 
+    /// Marks an item (a movie, an episode, or a whole show) watched or unwatched.
+    func setWatched(_ watched: Bool, ratingKey: String) async throws {
+        _ = try await get(watched ? ":/scrobble" : ":/unscrobble", query: [
+            "key": ratingKey,
+            "identifier": "com.plexapp.plugins.library"
+        ])
+    }
+
     // MARK: - Media URLs
 
+    static let tokenHeader = "X-Plex-Token"
+
     /// A direct-play URL for one file. Plex serves the original bytes over
-    /// HTTP range requests, so the player seeks without any transcoding.
-    static func streamURL(baseURL: URL, partKey: String, token: String) -> URL? {
-        url(baseURL: baseURL, path: partKey, query: ["X-Plex-Token": token])
+    /// HTTP range requests, so the player seeks without any transcoding. The
+    /// token is not part of the URL: requests carry it in `tokenHeader`, so a
+    /// stored or logged link never contains a credential.
+    static func streamURL(baseURL: URL, partKey: String) -> URL? {
+        url(baseURL: baseURL, path: partKey, query: [:])
     }
 
     /// Artwork resized by the server, so Home doesn't download full-size art.
@@ -418,6 +441,7 @@ struct PlexClient {
         let base = baseURL.absoluteString.hasSuffix("/") ? String(baseURL.absoluteString.dropLast()) : baseURL.absoluteString
         let normalizedPath = path.hasPrefix("/") ? path : "/\(path)"
         guard var components = URLComponents(string: base + normalizedPath) else { return nil }
+        guard !query.isEmpty else { return components.url }
         components.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
         return components.url
     }
@@ -458,6 +482,7 @@ struct PlexClient {
             let index: Int?
             let viewOffset: Int64?
             let viewCount: Int?
+            let lastViewedAt: Int64?
             let Genre: [TagDTO]?
             let Role: [TagDTO]?
             let Director: [TagDTO]?
@@ -495,7 +520,10 @@ struct PlexClient {
             episodeNumber: item.index,
             partKey: part?.key,
             container: part?.container ?? media?.container,
-            sizeBytes: part?.size
+            sizeBytes: part?.size,
+            viewOffsetMs: item.viewOffset,
+            viewCount: item.viewCount,
+            lastViewedAt: item.lastViewedAt
         )
     }
 

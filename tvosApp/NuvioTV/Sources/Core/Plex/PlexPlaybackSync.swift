@@ -2,64 +2,105 @@ import Foundation
 
 /// Keeps Plex's resume position in step with Nuvio playback of Plex files.
 ///
-/// Stream lists register each Plex URL they offer, and read the item's current
-/// position from the server in the background. When one of those URLs plays,
-/// Plex's position is the resume point (so a show started in another Plex app
-/// continues where it stopped there), and play, pause, seek, stop, and a
-/// periodic heartbeat are reported back so other Plex apps resume here too.
+/// A Plex stream is recognised by its `/library/parts/...` path, looked up in
+/// the synced library. That works the same for a stream picked from a stream
+/// list and for a stored link replayed from Continue Watching, and it survives
+/// the server changing address.
+///
+/// - Before playback, `resolve` points the link at the server's current
+///   address and adds the token as a request header.
+/// - Plex's saved position is the resume point, so a title started in another
+///   Plex app continues where it stopped there.
+/// - Play, pause, seek, stop, and a periodic heartbeat are reported back, so
+///   other Plex apps resume where Nuvio stopped.
 @MainActor
 final class PlexPlaybackSync {
     static let shared = PlexPlaybackSync()
 
-    struct Entry {
+    struct Item: Hashable {
         let serverID: String
         let ratingKey: String
         let durationMs: Int64?
-        /// Seconds; `nil` until the server answered. 0 means no saved position.
-        var serverPositionSeconds: Double?
+    }
+
+    /// What is known about one item's playback in this app run.
+    private struct Session {
+        var lastState: PlexClient.TimelineState?
+        var lastReportAt: Date?
         var resumeConsumed = false
     }
 
-    private var entries: [String: Entry] = [:]
-    private var lastState: [String: PlexClient.TimelineState] = [:]
-    private var lastReportAt: [String: Date] = [:]
-
-    nonisolated static let heartbeatInterval: TimeInterval = 10
-
-    private init() {}
-
-    // MARK: - Stream registration
-
-    func register(url: String, serverID: String, ratingKey: String, durationMs: Int64?) {
-        if entries[url] == nil {
-            entries[url] = Entry(serverID: serverID, ratingKey: ratingKey, durationMs: durationMs)
-        } else {
-            entries[url]?.resumeConsumed = false
-        }
-        guard let client = PlexSessionManager.shared.client(forServerID: serverID) else { return }
-        Task { [weak self] in
-            guard let state = try? await client.playbackState(ratingKey: ratingKey) else { return }
-            await MainActor.run {
-                self?.entries[url]?.serverPositionSeconds = Double(state.viewOffsetMs ?? 0) / 1000
+    private var sessions: [Item: Session] = [:]
+    /// Where reports go; replaced in tests.
+    var sendTimeline: (Item, PlexClient.TimelineState, _ timeMs: Int64, _ durationMs: Int64) -> Void = { item, state, timeMs, durationMs in
+        guard let client = PlexSessionManager.shared.client(forServerID: item.serverID) else { return }
+        Task.detached(priority: .utility) {
+            do {
+                try await client.reportTimeline(ratingKey: item.ratingKey, state: state, timeMs: timeMs, durationMs: durationMs)
+            } catch {
+                print("[Plex] timeline report failed: \(error.localizedDescription)")
             }
         }
     }
+    var now: () -> Date = Date.init
 
-    func isPlexStream(_ url: String?) -> Bool {
-        guard let url else { return false }
-        return entries[url] != nil
+    nonisolated static let heartbeatInterval: TimeInterval = 10
+
+    init() {}
+
+    // MARK: - Recognising Plex streams
+
+    /// The Plex item a stream URL plays, or `nil` for any other stream.
+    func item(for url: URL) -> Item? {
+        guard url.path.hasPrefix("/library/parts/"),
+              let found = PlexLibraryIndex.shared.locate(partPath: url.path, preferredHost: url.host) else { return nil }
+        return Item(serverID: found.server.id, ratingKey: found.item.ratingKey, durationMs: found.item.durationMs)
     }
 
-    /// The position playback of `url` should start from. Plex's answer wins
-    /// for the first load of a Plex stream; reloads mid-session (source
-    /// failover, engine handoff) keep the caller's own position.
+    private func item(forString url: String?) -> Item? {
+        url.flatMap(URL.init(string:)).flatMap(item(for:))
+    }
+
+    /// The URL and headers to actually request: the server's current address
+    /// with the token in a header. A stored link keeps working after the
+    /// server moves, and never needs a token inside it. Other streams pass
+    /// through unchanged.
+    func resolve(url: URL, headers: [String: String]) -> (url: URL, headers: [String: String]) {
+        guard let item = item(for: url),
+              let server = PlexServerStore.shared.server(id: item.serverID),
+              let baseURL = server.baseURL,
+              let current = PlexClient.streamURL(baseURL: baseURL, partKey: url.path) else { return (url, headers) }
+        var merged = headers
+        merged[PlexClient.tokenHeader] = PlexCredentialStore.token(forServerID: server.id)
+        return (current, merged)
+    }
+
+    /// Headers safe to store with a link: a Plex link is stored without its token.
+    func headersForStorage(url: String, headers: [String: String]) -> [String: String] {
+        guard item(forString: url) != nil else { return headers }
+        return headers.filter { $0.key != PlexClient.tokenHeader }
+    }
+
+    // MARK: - Resume
+
+    /// A stream list offers this item again: its next play resumes from Plex.
+    func streamOffered(_ item: Item) {
+        sessions[item, default: Session()].resumeConsumed = false
+    }
+
+    /// The position playback of `url` should start from. Plex's saved position
+    /// wins for the first load of a play; reloads within it (source failover,
+    /// engine handoff) keep the caller's own position.
     func resumePosition(for url: URL, fallback: Double?) -> Double? {
-        let key = url.absoluteString
-        guard var entry = entries[key], !entry.resumeConsumed,
-              let serverPosition = entry.serverPositionSeconds else { return fallback }
-        entry.resumeConsumed = true
-        entries[key] = entry
-        return serverPosition > 5 ? serverPosition : nil
+        guard let item = item(for: url) else { return fallback }
+        var session = sessions[item] ?? Session()
+        guard !session.resumeConsumed,
+              let state = PlexLibraryIndex.shared.watchState(serverID: item.serverID, ratingKey: item.ratingKey) else {
+            return fallback
+        }
+        session.resumeConsumed = true
+        sessions[item] = session
+        return state.resumeSeconds > 5 ? state.resumeSeconds : nil
     }
 
     // MARK: - Reporting
@@ -71,8 +112,8 @@ final class PlexPlaybackSync {
     /// Reports a state change right away and repeats `playing` at most every
     /// `heartbeatInterval` seconds. Not a Plex stream: nothing happens.
     func report(_ state: PlayerState, url: String?, currentTime: TimeInterval, duration: TimeInterval) {
-        guard let url, var entry = entry(for: url),
-              currentTime.isFinite, currentTime >= 0 else { return }
+        guard let item = item(forString: url), currentTime.isFinite, currentTime >= 0 else { return }
+        var session = sessions[item] ?? Session()
         let timelineState: PlexClient.TimelineState
         switch state {
         case .playing: timelineState = .playing
@@ -84,65 +125,53 @@ final class PlexPlaybackSync {
         // app sees. Wait for a real position; a stop before any report was
         // sent leaves the saved point alone too.
         if currentTime < 1 {
-            let sessionReported = lastState[url] == .playing || lastState[url] == .paused
-            if timelineState != .stopped || !sessionReported { return }
+            let reported = session.lastState == .playing || session.lastState == .paused
+            if timelineState != .stopped || !reported { return }
         }
-        let now = Date()
-        if lastState[url] == timelineState, timelineState != .stopped,
-           let last = lastReportAt[url], now.timeIntervalSince(last) < Self.heartbeatInterval {
+        let date = now()
+        if session.lastState == timelineState, timelineState != .stopped,
+           let last = session.lastReportAt, date.timeIntervalSince(last) < Self.heartbeatInterval {
             return
         }
-        if lastState[url] == .stopped, timelineState == .stopped { return }
-        lastState[url] = timelineState
-        lastReportAt[url] = now
-        entry.serverPositionSeconds = currentTime
-        entries[url] = entry
+        if session.lastState == .stopped, timelineState == .stopped { return }
+        session.lastState = timelineState
+        session.lastReportAt = date
+        if timelineState == .stopped {
+            // The next play is a new one and reads Plex's position again.
+            session.resumeConsumed = false
+        }
+        sessions[item] = session
 
-        guard let client = PlexSessionManager.shared.client(forServerID: entry.serverID) else { return }
-        let durationMs = duration.isFinite && duration > 0 ? Int64(duration * 1000) : (entry.durationMs ?? 0)
-        let ratingKey = entry.ratingKey
+        let durationMs = duration.isFinite && duration > 0 ? Int64(duration * 1000) : (item.durationMs ?? 0)
         let timeMs = Int64(currentTime * 1000)
-        Task.detached(priority: .utility) {
-            do {
-                try await client.reportTimeline(ratingKey: ratingKey, state: timelineState, timeMs: timeMs, durationMs: durationMs)
-            } catch {
-                print("[Plex] timeline report failed: \(error.localizedDescription)")
-            }
-        }
-    }
-
-    /// The registered entry for `url`, or one recovered from the synced library.
-    /// Continue Watching and other shortcuts replay a stored stream URL without
-    /// building a stream list, so the URL was never registered in this launch;
-    /// its `/library/parts/...` path still identifies the item.
-    private func entry(for url: String) -> Entry? {
-        if let existing = entries[url] { return existing }
-        guard let recovered = Self.entryFromLibrary(url) else { return nil }
-        entries[url] = recovered
-        return recovered
-    }
-
-    private static func entryFromLibrary(_ urlString: String) -> Entry? {
-        guard let url = URL(string: urlString), url.path.hasPrefix("/library/parts/") else { return nil }
-        let servers = PlexServerStore.shared.servers
-        // Prefer the server this URL points at; a stored link can predate an
-        // address change, so fall back to any added server.
-        let sameAddress = servers.filter { $0.baseURL?.host == url.host && $0.baseURL?.port == url.port }
-        for server in sameAddress.isEmpty ? servers : sameAddress {
-            for title in PlexLibraryIndex.shared.titlesByServerID[server.id] ?? [] {
-                if let item = title.items.first(where: { $0.partKey == url.path }) {
-                    return Entry(serverID: server.id, ratingKey: item.ratingKey, durationMs: item.durationMs)
-                }
-            }
-        }
-        return nil
+        rememberPosition(item, timeMs: timeMs, durationMs: durationMs)
+        sendTimeline(item, timelineState, timeMs, durationMs)
     }
 
     /// A seek: report the new position now, whatever the heartbeat timing.
     func seeked(url: String?, to currentTime: TimeInterval, duration: TimeInterval) {
-        guard let url, let state = lastState[url], state != .stopped else { return }
-        lastReportAt[url] = nil
-        lastState[url] = nil
+        guard let item = item(forString: url), var session = sessions[item],
+              let state = session.lastState, state != .stopped else { return }
+        session.lastReportAt = nil
+        session.lastState = nil
+        sessions[item] = session
         report(state == .paused ? .paused : .playing, url: url, currentTime: currentTime, duration: duration)
+    }
+
+    /// Mirrors what the server will save, so a replay before the next read of
+    /// the server's state resumes from here. Past Plex's 90% threshold the
+    /// server marks the item watched and clears its position.
+    private func rememberPosition(_ item: Item, timeMs: Int64, durationMs: Int64) {
+        // Only once the server's state has been read; a lone entry would make
+        // every other item look unwatched rather than unknown.
+        guard var state = PlexLibraryIndex.shared.watchState(serverID: item.serverID, ratingKey: item.ratingKey) else { return }
+        if durationMs > 0, Double(timeMs) >= Double(durationMs) * 0.9 {
+            state.viewOffsetMs = 0
+            state.viewCount = max(state.viewCount, 1)
+        } else {
+            state.viewOffsetMs = timeMs
+        }
+        state.lastViewedAt = Int64(now().timeIntervalSince1970)
+        PlexLibraryIndex.shared.setWatchStates([item.ratingKey: state], forServerID: item.serverID, merging: true)
     }
 }

@@ -132,9 +132,35 @@ final class PlexClientTests: XCTestCase {
         try await client.reportTimeline(ratingKey: "101", state: .paused, timeMs: 61_500, durationMs: 3_600_000)
     }
 
-    func testStreamURLKeepsThePartPathAndAddsTheToken() {
-        let url = PlexClient.streamURL(baseURL: baseURL, partKey: "/library/parts/9/1/file.mkv", token: "abc")
-        XCTAssertEqual(url?.absoluteString, "http://192.168.8.13:32400/library/parts/9/1/file.mkv?X-Plex-Token=abc")
+    func testStreamURLKeepsThePartPathAndCarriesNoToken() {
+        let url = PlexClient.streamURL(baseURL: baseURL, partKey: "/library/parts/9/1/file.mkv")
+        XCTAssertEqual(url?.absoluteString, "http://192.168.8.13:32400/library/parts/9/1/file.mkv")
+    }
+
+    func testViewedSinceUsesPlexFilterAndReadsWatchState() async throws {
+        PlexMockURLProtocol.requestHandler = { request in
+            XCTAssertEqual(self.query(request)["lastViewedAt>"], "1700000000")
+            return self.respond(request, json: """
+            {"MediaContainer":{"totalSize":1,"Metadata":[{"ratingKey":"7","type":"episode","title":"x",
+              "viewOffset":150068,"viewCount":2,"lastViewedAt":1700000500}]}}
+            """)
+        }
+        let client = PlexClient(baseURL: baseURL, token: "token", session: session)
+        let items = try await client.items(libraryID: "4", type: .episode, viewedSince: 1_700_000_000)
+        XCTAssertEqual(PlexWatchState(items[0]), PlexWatchState(viewOffsetMs: 150_068, viewCount: 2, lastViewedAt: 1_700_000_500))
+    }
+
+    func testSetWatchedScrobblesAndUnscrobbles() async throws {
+        var paths: [String] = []
+        PlexMockURLProtocol.requestHandler = { request in
+            paths.append(request.url!.path)
+            XCTAssertEqual(self.query(request)["key"], "7")
+            return self.respond(request, json: "{}")
+        }
+        let client = PlexClient(baseURL: baseURL, token: "token", session: session)
+        try await client.setWatched(true, ratingKey: "7")
+        try await client.setWatched(false, ratingKey: "7")
+        XCTAssertEqual(paths, ["/:/scrobble", "/:/unscrobble"])
     }
 
     // MARK: - Grouping

@@ -151,12 +151,9 @@ final class StreamsRepository: ObservableObject {
                   let baseURL = server.baseURL else { continue }
             let token = PlexCredentialStore.token(forServerID: server.id)
             for item in title.items where item.season == episode.season && item.episode == episode.episode {
-                guard let url = PlexClient.streamURL(baseURL: baseURL, partKey: item.partKey, token: token) else { continue }
-                PlexPlaybackSync.shared.register(
-                    url: url.absoluteString,
-                    serverID: server.id,
-                    ratingKey: item.ratingKey,
-                    durationMs: item.durationMs
+                guard let url = PlexClient.streamURL(baseURL: baseURL, partKey: item.partKey) else { continue }
+                PlexPlaybackSync.shared.streamOffered(
+                    PlexPlaybackSync.Item(serverID: server.id, ratingKey: item.ratingKey, durationMs: item.durationMs)
                 )
                 streams.append(
                     NuvioStream(
@@ -166,7 +163,8 @@ final class StreamsRepository: ObservableObject {
                             ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
                         },
                         addonName: "Plex",
-                        videoSize: item.size
+                        videoSize: item.size,
+                        httpHeaders: [PlexClient.tokenHeader: token]
                     )
                 )
             }

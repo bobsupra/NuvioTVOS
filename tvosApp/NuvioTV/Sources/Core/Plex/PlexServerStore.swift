@@ -16,6 +16,8 @@ struct PlexServerConfig: Codable, Identifiable, Equatable {
     var lastSyncDate: Date?
     var lastSyncTitleCount: Int?
     var syncAutomatically: Bool
+    /// When watch state was last read from the server (Unix seconds).
+    var watchStateReadAt: Int64?
 
     init(
         id: String,
