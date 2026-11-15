@@ -999,7 +999,8 @@ struct DetailsScreen: View {
                 sortOption: sortOption,
                 includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
                 cachedOnly: cachedOnly,
-                preserveAddonStreams: preserveAddonOrder
+                preserveAddonStreams: preserveAddonOrder,
+                filterPromotional: true
             )
             let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
             let pool: [NuvioStream]
@@ -1242,7 +1243,8 @@ struct DetailsScreen: View {
                         sortOption: sortOption,
                         includeDebrid: debridIsEnabled || torrentIsEnabled,
                         cachedOnly: cachedOnly,
-                        preserveAddonStreams: preserveAddonOrder
+                        preserveAddonStreams: preserveAddonOrder,
+                        filterPromotional: true
                     )
                     let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
                     let pool: [NuvioStream]
@@ -3660,7 +3662,8 @@ enum SmartPlaybackSelector {
         cachedOnly: Bool = false,
         preserveAddonStreams: Bool = false,
         includeUnavailable: Bool = false,
-        includeUnknownCacheStatus: Bool = false
+        includeUnknownCacheStatus: Bool = false,
+        filterPromotional: Bool = true
     ) -> [NuvioStream] {
         let playable = streams.filter { stream in
             if stream.unavailabilityReason != nil { return includeUnavailable }
@@ -3671,14 +3674,16 @@ enum SmartPlaybackSelector {
             return includeDebrid && stream.isDebridResolvable
         }
         let compatible = playable.filter { $0.unavailabilityReason != nil || $0.isNotPlayable || isPlatformPlaybackCompatible($0) }
-        let available = compatible.filter { $0.unavailabilityReason == nil }
-        let nonPromotional = available.filter { $0.isNotPlayable || !isPromotionalStream($0) }
-        let selectedAvailable = nonPromotional.isEmpty ? available : nonPromotional
-        let selectedAvailableIDs = Set(selectedAvailable.map(\.id))
-        // Keep notice cards in place without letting them count as promotional
-        // fallback evidence or changing the selected available candidates.
-        var result = compatible.filter {
-            $0.unavailabilityReason != nil || selectedAvailableIDs.contains($0.id)
+        var result = compatible
+        if filterPromotional {
+            let available = compatible.filter { $0.unavailabilityReason == nil }
+            let nonPromotional = available.filter { $0.isNotPlayable || !isPromotionalStream($0) }
+            let selectedAvailable = nonPromotional.isEmpty ? available : nonPromotional
+            let selectedAvailableIDs = Set(selectedAvailable.map(\.id))
+            // Notices do not count as promotional fallback evidence.
+            result = compatible.filter {
+                $0.unavailabilityReason != nil || selectedAvailableIDs.contains($0.id)
+            }
         }
         if cachedOnly {
             result = result.filter {
@@ -4053,7 +4058,8 @@ enum StreamPickerListBuilder {
         includeDebrid: Bool,
         cachedOnly: Bool = false,
         preserveAddonStreams: Bool = false,
-        includeUnknownCacheStatus: Bool = false
+        includeUnknownCacheStatus: Bool = false,
+        filterPromotional: Bool = false
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
         return SmartPlaybackSelector.playableStreams(
@@ -4062,7 +4068,8 @@ enum StreamPickerListBuilder {
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonStreams,
             includeUnavailable: true,
-            includeUnknownCacheStatus: includeUnknownCacheStatus
+            includeUnknownCacheStatus: includeUnknownCacheStatus,
+            filterPromotional: filterPromotional
         )
     }
 
@@ -4075,7 +4082,8 @@ enum StreamPickerListBuilder {
         includeDebrid: Bool,
         cachedOnly: Bool = false,
         preserveAddonStreams: Bool = false,
-        includeUnknownCacheStatus: Bool = false
+        includeUnknownCacheStatus: Bool = false,
+        filterPromotional: Bool = false
     ) -> [NuvioStream] {
         let playable = playableStreams(
             streams: streams,
@@ -4084,7 +4092,8 @@ enum StreamPickerListBuilder {
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonStreams || sortOption == .recommended,
-            includeUnknownCacheStatus: includeUnknownCacheStatus
+            includeUnknownCacheStatus: includeUnknownCacheStatus,
+            filterPromotional: filterPromotional
         )
         return sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonStreams)
     }

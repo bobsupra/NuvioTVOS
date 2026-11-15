@@ -13,6 +13,134 @@ private enum TestStreamError: Error { case failed }
 
 final class StreamsDiscoveryTests: XCTestCase {
 
+    func testManualPickerPreservesNamesContainingPromotionalWordsAcrossAddonFilters() {
+        let trailer = NuvioStream(
+            url: "https://example.com/episode-a.mkv",
+            name: "Debridio 1080p",
+            description: "Trailer.Park.Boys.The.Animated.Series.S01E01.1080p.mkv",
+            addonName: "Debridio"
+        )
+        let other = NuvioStream(
+            url: "https://example.com/episode-b.mkv",
+            name: "1080p",
+            description: "ARK.The.Animated.Series.S01E01.1080p.mkv",
+            addonName: "Another Addon"
+        )
+        let groups = [
+            AddonStreamGroup(addonId: "debridio", displayName: "Debridio", streams: [trailer], isLoading: false),
+            AddonStreamGroup(addonId: "other", displayName: "Another Addon", streams: [other], isLoading: false)
+        ]
+
+        for preserve in [false, true] {
+            let all = StreamPickerListBuilder.displayedStreams(
+                streams: [trailer, other], groups: groups, selectedAddonId: nil,
+                sortOption: .default, includeDebrid: false, preserveAddonStreams: preserve
+            )
+            let addon = StreamPickerListBuilder.displayedStreams(
+                streams: [trailer, other], groups: groups, selectedAddonId: "debridio",
+                sortOption: .default, includeDebrid: false, preserveAddonStreams: preserve
+            )
+            XCTAssertEqual(Set(all.map(\.id)), Set([trailer.id, other.id]))
+            XCTAssertEqual(addon.map(\.id), [trailer.id])
+        }
+    }
+
+    func testManualPickerDoesNotTreatAddonNameOrURLAsPromotionalEvidence() {
+        let first = NuvioStream(
+            url: "https://example.com/preview/episode.mkv", name: "1080p",
+            description: "Episode 1080p", addonName: "Preview Addon"
+        )
+        let second = NuvioStream(
+            url: "https://example.com/other.mkv", name: "1080p",
+            description: "Episode 1080p", addonName: "Other"
+        )
+        let result = StreamPickerListBuilder.displayedStreams(
+            streams: [first, second], groups: [], selectedAddonId: nil,
+            sortOption: .default, includeDebrid: false, preserveAddonStreams: true
+        )
+        XCTAssertEqual(Set(result.map(\.id)), Set([first.id, second.id]))
+    }
+
+    func testAutomaticSelectionStillExcludesPromotionalStreamsWhenAlternativesExist() {
+        let trailer = NuvioStream(
+            url: "https://example.com/trailer.mkv", name: "Official trailer 1080p",
+            description: nil, addonName: "Addon"
+        )
+        let movie = NuvioStream(
+            url: "https://example.com/movie.mkv", name: "Movie 1080p",
+            description: nil, addonName: "Addon"
+        )
+        let candidates = SmartPlaybackSelector.playableStreams(
+            from: [trailer, movie], preserveAddonStreams: true
+        )
+        XCTAssertEqual(candidates.map(\.id), [movie.id])
+        let automaticList = StreamPickerListBuilder.displayedStreams(
+            streams: [trailer, movie], groups: [], selectedAddonId: nil,
+            sortOption: .default, includeDebrid: false, preserveAddonStreams: true,
+            filterPromotional: true
+        )
+        XCTAssertEqual(automaticList.map(\.id), [movie.id])
+    }
+
+    func testManualPickerStillHonorsCachedOnly() {
+        let cached = NuvioStream(
+            url: "https://example.com/cached.mkv", name: "1080p cached",
+            description: "Trailer.Park.Boys.S01E01.1080p", addonName: "Debridio", isCached: true
+        )
+        let unknown = NuvioStream(
+            url: "https://example.com/other.mkv", name: "1080p",
+            description: "Other.1080p", addonName: "Debridio"
+        )
+        let result = StreamPickerListBuilder.displayedStreams(
+            streams: [cached, unknown], groups: [], selectedAddonId: nil,
+            sortOption: .default, includeDebrid: false, cachedOnly: true, preserveAddonStreams: true
+        )
+        XCTAssertEqual(result.map(\.id), [cached.id])
+    }
+
+    func testManualPickerDoesNotFilterNamesForCachedOrUncachedDirectStreams() {
+        let cached = NuvioStream(
+            url: "https://example.com/a.mkv", name: "1080p",
+            description: "Trailer.Park.Boys.S01E01.1080p", addonName: "Debridio", isCached: true
+        )
+        let uncached = NuvioStream(
+            url: "https://example.com/b.mkv", name: "1080p",
+            description: "Trailer.Park.Boys.S01E01.1080p", addonName: "Debridio", isCached: false
+        )
+        for preserve in [false, true] {
+            let allCacheStates = StreamPickerListBuilder.displayedStreams(
+                streams: [cached, uncached], groups: [], selectedAddonId: nil,
+                sortOption: .default, includeDebrid: false, cachedOnly: false, preserveAddonStreams: preserve
+            )
+            XCTAssertEqual(Set(allCacheStates.map(\.id)), Set([cached.id, uncached.id]))
+
+            let cachedOnly = StreamPickerListBuilder.displayedStreams(
+                streams: [cached, uncached], groups: [], selectedAddonId: nil,
+                sortOption: .default, includeDebrid: false, cachedOnly: true, preserveAddonStreams: preserve
+            )
+            XCTAssertEqual(cachedOnly.map(\.id), [cached.id])
+        }
+    }
+
+    func testManualPickerKeepsUnknownTorrentCacheStatusWhenRequested() {
+        let unknown = NuvioStream(
+            url: nil, name: "1080p",
+            description: "Trailer.Park.Boys.S01E01.1080p", addonName: "Torrentio",
+            infoHash: "0123456789abcdef0123456789abcdef01234567",
+            debridCacheStatusUnavailable: true
+        )
+        let other = NuvioStream(
+            url: "https://example.com/other.mkv", name: "1080p",
+            description: "Other.1080p", addonName: "Torrentio", isCached: true
+        )
+        let result = StreamPickerListBuilder.displayedStreams(
+            streams: [unknown, other], groups: [], selectedAddonId: nil,
+            sortOption: .default, includeDebrid: true, cachedOnly: true,
+            preserveAddonStreams: true, includeUnknownCacheStatus: true
+        )
+        XCTAssertEqual(Set(result.map(\.id)), Set([unknown.id, other.id]))
+    }
+
     func testStreamRequestRetryPolicyRetriesTransientErrorsOnly() {
         XCTAssertFalse(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.timedOut)))
         XCTAssertTrue(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.networkConnectionLost)))
