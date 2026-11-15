@@ -38,13 +38,127 @@ final class JellyfinClientTests: XCTestCase {
         session = URLSession(configuration: config)
     }
 
-    func testRateLimitRetryDelayUsesRetryAfterThenBacksOff() {
-        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: "3", attempt: 0), 3)
-        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: " 120 ", attempt: 0), 30)
-        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: nil, attempt: 0), 1)
-        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: nil, attempt: 3), 8)
-        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: "Wed, 21 Oct 2026 07:28:00 GMT", attempt: 1), 2)
-        XCTAssertEqual(JellyfinClient.retryDelay(retryAfter: nil, attempt: 10), 30)
+    func testRetryAfterReadsSecondsAndHTTPDates() {
+        let now = Date(timeIntervalSince1970: 1_793_000_000)
+        XCTAssertEqual(JellyfinClient.retryAfterSeconds("3", now: now), 3)
+        XCTAssertEqual(JellyfinClient.retryAfterSeconds(" 120 ", now: now), 120)
+        let in90 = now.addingTimeInterval(90)
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        for format in ["EEE, dd MMM yyyy HH:mm:ss 'GMT'", "EEEE, dd-MMM-yy HH:mm:ss 'GMT'", "EEE MMM d HH:mm:ss yyyy"] {
+            formatter.dateFormat = format
+            let header = formatter.string(from: in90)
+            XCTAssertEqual(JellyfinClient.retryAfterSeconds(header, now: now) ?? -1, 90, accuracy: 1, header)
+        }
+        // A date already past means "now"; garbage and negatives are ignored.
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        XCTAssertEqual(JellyfinClient.retryAfterSeconds(formatter.string(from: now.addingTimeInterval(-60)), now: now), 0)
+        XCTAssertNil(JellyfinClient.retryAfterSeconds("soon", now: now))
+        XCTAssertNil(JellyfinClient.retryAfterSeconds("-5", now: now))
+        XCTAssertNil(JellyfinClient.retryAfterSeconds(nil, now: now))
+    }
+
+    func testRetryHonorsTheServerOrGivesUpWhenItAsksTooMuch() {
+        let now = Date(timeIntervalSince1970: 1_793_000_000)
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: "3", attempt: 0, now: now), .retry(after: 3))
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: "30", attempt: 0, now: now), .retry(after: 30))
+        // Retrying after 30 s when the server said 120 would only hit its limit again.
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: "120", attempt: 0, now: now), .giveUp(serverWait: 120))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "GMT")
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss 'GMT'"
+        XCTAssertEqual(
+            JellyfinClient.retryDecision(retryAfter: formatter.string(from: now.addingTimeInterval(120)), attempt: 0, now: now),
+            .giveUp(serverWait: 120)
+        )
+        XCTAssertEqual(
+            JellyfinClient.retryDecision(retryAfter: formatter.string(from: now.addingTimeInterval(10)), attempt: 0, now: now),
+            .retry(after: 10)
+        )
+        // No header: back off 1, 2, 4, 8 ... capped at 30 s.
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: nil, attempt: 0, now: now), .retry(after: 1))
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: nil, attempt: 3, now: now), .retry(after: 8))
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: "soon", attempt: 1, now: now), .retry(after: 2))
+        XCTAssertEqual(JellyfinClient.retryDecision(retryAfter: nil, attempt: 10, now: now), .retry(after: 30))
+    }
+
+    func testALongServerWaitFailsAtOnceWithTryAgainLater() async {
+        var requests = 0
+        JellyfinMockURLProtocol.requestHandler = { request in
+            requests += 1
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 429, httpVersion: nil, headerFields: ["Retry-After": "120"]
+            )!
+            return (response, Data())
+        }
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "token", session: session)
+        do {
+            try await client.ping()
+            XCTFail("Expected a rate-limited error")
+        } catch let error as JellyfinClient.RateLimitedError {
+            XCTAssertEqual(error.retryAfter, 120)
+            XCTAssertTrue(error.localizedDescription.contains("2"))
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(requests, 1)
+    }
+
+    func testAShortServerWaitIsRetried() async throws {
+        var requests = 0
+        JellyfinMockURLProtocol.requestHandler = { request in
+            requests += 1
+            let status = requests == 1 ? 429 : 200
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: status, httpVersion: nil, headerFields: ["Retry-After": "0"]
+            )!
+            return (response, Data("{}".utf8))
+        }
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "token", session: session)
+        try await client.ping()
+        XCTAssertEqual(requests, 2)
+    }
+
+    func testRunningOutOfRetriesSaysToTryAgain() async {
+        var requests = 0
+        JellyfinMockURLProtocol.requestHandler = { request in
+            requests += 1
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 503, httpVersion: nil, headerFields: ["Retry-After": "0"]
+            )!
+            return (response, Data())
+        }
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "token", session: session)
+        do {
+            try await client.ping()
+            XCTFail("Expected a rate-limited error")
+        } catch {
+            XCTAssertTrue(error is JellyfinClient.RateLimitedError, "\(error)")
+        }
+        XCTAssertEqual(requests, JellyfinClient.rateLimitRetryLimit + 1)
+    }
+
+    func testCancellingDuringTheWaitStopsAtOnce() async {
+        var requests = 0
+        JellyfinMockURLProtocol.requestHandler = { request in
+            requests += 1
+            let response = HTTPURLResponse(
+                url: request.url!, statusCode: 429, httpVersion: nil, headerFields: ["Retry-After": "20"]
+            )!
+            return (response, Data())
+        }
+        let client = JellyfinClient(baseURL: baseURL, accessToken: "token", session: session)
+        let started = Date()
+        let task = Task { try await client.ping() }
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        task.cancel()
+        let result = await task.result
+        if case .success = result { XCTFail("Expected cancellation") }
+        if case .failure(let error) = result { XCTAssertTrue(error is CancellationError, "\(error)") }
+        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertEqual(requests, 1)
     }
 
     override func tearDown() {
