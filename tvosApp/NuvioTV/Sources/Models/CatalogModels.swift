@@ -12772,7 +12772,7 @@ enum ProfileSettings {
             AISubtitleKeyStore.remove(profileScope: id)
             Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: id) }
             StreamBadgeSettingsStore.removeRules(for: id)
-            AniListAccount.storage.remove(for: id)
+            AniListAccount.removeLogin(for: id)
             MALKeychain.remove(for: id)
             UserDefaults.standard.removePersistentDomain(forName: "\(suitePrefix).\(id)")
         }
@@ -12783,7 +12783,7 @@ enum ProfileSettings {
         // "guest", "1" and "default", so the previous user's sessions would be
         // restored without these.
         TraktKeychainStorage.shared.clearAll()
-        AniListAccount.storage.remove(for: "default")
+        AniListAccount.removeLogin(for: "default")
         AniListAccount.clearStates()
         MALKeychain.remove(for: "default")
         Task { await MALAccount.lists.forget() }
