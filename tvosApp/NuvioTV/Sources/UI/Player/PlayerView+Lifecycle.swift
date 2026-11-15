@@ -149,6 +149,21 @@ extension PlayerView {
             }
     }
 
+    /// Leaves the player once playback has ended, unless post-play holds it
+    /// or a next episode can still be played from here.
+    func finishIfPlaybackEnded() {
+        guard viewModel.status == .ended,
+              !didHandleFinished,
+              !viewModel.isAdvancingEpisode,
+              !viewModel.hasPlayableNextEpisode,
+              !viewModel.postPlayState.blocksNaturalCompletion,
+              let onFinished else {
+            return
+        }
+        didHandleFinished = true
+        onFinished()
+    }
+
     /// Playback-state observers: picture-in-picture, status, source switching,
     /// stream reloads, and scene phase.
     var layersObservingPlayback: some View {
@@ -178,14 +193,14 @@ extension PlayerView {
                     }
                     onPlaybackStarted?()
                 }
-                guard status == .ended,
-                      !didHandleFinished,
-                      !viewModel.postPlayState.blocksNaturalCompletion,
-                      let onFinished else {
-                    return
-                }
-                didHandleFinished = true
-                onFinished()
+                finishIfPlaybackEnded()
+            }
+            // Post-play can hold the player at the end while its
+            // recommendations load. When it lets go with nothing to show
+            // (none found, or the lookup failed), the status is already
+            // `.ended` and won't change again, so finish from here.
+            .onChange(of: viewModel.postPlayState.blocksNaturalCompletion) { _, blocks in
+                if !blocks { finishIfPlaybackEnded() }
             }
             .onChange(of: viewModel.hasRenderedFirstFrame) { _, ready in
                 if ready,
