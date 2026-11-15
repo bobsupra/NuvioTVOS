@@ -67,6 +67,13 @@ extension PlayerView {
             .animation(.easeInOut(duration: 0.2), value: isPlayerBottomFadeVisible)
     }
 
+    /// The post-play mini player has played the video to its end.
+    var isPostPlayMiniPlayerFinished: Bool {
+        viewModel.postPlayState.isVisible
+            && !viewModel.postPlayState.isTrailerPlaying
+            && viewModel.status == .ended
+    }
+
     @ViewBuilder
     var videoSurfaceLayer: some View {
         // Keep MPV mounted through trailer/EOF states; hiding this layer must not
@@ -140,7 +147,8 @@ extension PlayerView {
                 .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
             }
 
-            if viewModel.postPlayState.isVisible && viewModel.postPlayState.canReturnToPlayer {
+            if viewModel.postPlayState.isVisible && viewModel.postPlayState.canReturnToPlayer,
+               !isPostPlayMiniPlayerFinished {
                 miniPlayerReturnButton
             }
         }
@@ -165,6 +173,10 @@ extension PlayerView {
             }
         }
         .shadow(color: Color.black.opacity(viewModel.postPlayState.isVisible ? 0.6 : 0), radius: 16)
+        // Once the video has ended there is nothing to return to: the
+        // recommendation keeps the screen without a frozen mini player.
+        .opacity(isPostPlayMiniPlayerFinished ? 0 : 1)
+        .animation(.easeOut(duration: 0.3), value: isPostPlayMiniPlayerFinished)
         .frame(
             maxWidth: .infinity,
             maxHeight: .infinity,

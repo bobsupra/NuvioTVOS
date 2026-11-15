@@ -629,6 +629,10 @@ final class PostPlayRecommendationTests: XCTestCase {
         XCTAssertFalse(state.isVisible)
         XCTAssertTrue(state.hasReturnedToPlayer)
         XCTAssertNil(state.countdownSeconds)
+        // Back in the video: the end of the file closes the player.
+        XCTAssertFalse(state.blocksNaturalCompletion)
+        XCTAssertFalse(PostPlayRecommendationUiState(hasReturnedToPlayer: true).blocksNaturalCompletion)
+        XCTAssertTrue(PostPlayRecommendationUiState(isLoadingRecommendation: true).blocksNaturalCompletion)
 
         // Paging to index 1 of 3
         var pagedState = PostPlayRecommendationUiState(

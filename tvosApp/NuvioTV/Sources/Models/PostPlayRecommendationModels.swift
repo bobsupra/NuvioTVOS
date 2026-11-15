@@ -187,8 +187,11 @@ struct PostPlayRecommendationUiState: Equatable {
         isVisible && !isTrailerPlaying && !hasReturnedToPlayer
     }
 
+    /// Holds the player open at the end while a recommendation is showing or
+    /// about to show. Once the viewer has gone back to the video, the end of
+    /// the file closes the player as usual.
     var blocksNaturalCompletion: Bool {
-        recommendation != nil || isVisible || hasReturnedToPlayer || isLoadingRecommendation
+        isVisible || (!hasReturnedToPlayer && (recommendation != nil || isLoadingRecommendation))
     }
 
     func returnToPlayer() -> PostPlayRecommendationUiState {

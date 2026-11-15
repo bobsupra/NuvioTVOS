@@ -4105,7 +4105,11 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.24)) {
                     activeScreen = .details(id: meta.id, type: meta.type)
                 }
-            } : nil),
+            // A movie or episode that ends with nothing to play next leaves
+            // the player, as Back would, and doesn't stay on the last frame.
+            } : (party == nil ? {
+                dismissPlayer(meta: meta, subtitle: subtitle)
+            } : nil)),
             onPlaybackStarted: {
                 playbackDidStart = true
                 if !isStandalonePlaybackSession, let provenance,

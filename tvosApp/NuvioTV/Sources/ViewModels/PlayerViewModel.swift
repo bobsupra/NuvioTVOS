@@ -470,6 +470,11 @@ class PlayerViewModel: ObservableObject {
     @Published var postPlayState = PostPlayRecommendationUiState()
     let postPlayController = PostPlayRecommendationController()
 
+    /// Whether another episode can play after this one: it exists and has aired.
+    var hasPlayableNextEpisode: Bool {
+        nextEpisode.map { EpisodeReleasePolicy.hasAired($0.released) } ?? false
+    }
+
     var isNextEpisodeMetadataResolved: Bool {
         guard let meta = activeMeta, meta.isSeries, !isStandalonePlaybackSession else { return true }
         return !seriesEpisodes.isEmpty
