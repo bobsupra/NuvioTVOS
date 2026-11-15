@@ -88,4 +88,50 @@ final class ReplacementStreamDetectionTests: XCTestCase {
         )
         XCTAssertEqual(PlayerViewModel.expectedDuration(for: meta, progressItem: watchedEntry), 2_400)
     }
+
+    @MainActor
+    func testExpectedDurationComesOnlyFromTheSameEpisode() {
+        let meta = NuvioMeta(
+            id: "tt-replacement-other-episode",
+            name: "Series",
+            type: "series",
+            runtime: "22 min"
+        )
+        // Episode 110 was watched from a source that serves three episodes in one file.
+        let longFileEntry = ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "test://three-episodes-in-one-file",
+            position: 600,
+            duration: 4_250,
+            lastWatchedAt: Date(),
+            season: 1,
+            episode: 110
+        )
+
+        XCTAssertEqual(
+            PlayerViewModel.expectedDuration(for: meta, progressItem: longFileEntry, episode: (season: 1, episode: 110)),
+            4_250
+        )
+        // Episode 112 is another file: the title's runtime applies.
+        let expected = PlayerViewModel.expectedDuration(
+            for: meta, progressItem: longFileEntry, episode: (season: 1, episode: 112)
+        )
+        XCTAssertEqual(expected, 1_320)
+        // A single-episode file of 22 minutes is then not taken for an expired-link slate.
+        XCTAssertFalse(PlayerViewModel.streamLooksLikeReplacement(
+            loadedDuration: 1_344,
+            pendingResumeSeconds: nil,
+            expectedDurationSeconds: expected,
+            isStandalonePlaybackSession: false,
+            isLiveStream: false
+        ))
+        // With the other episode's length it was.
+        XCTAssertTrue(PlayerViewModel.streamLooksLikeReplacement(
+            loadedDuration: 1_344,
+            pendingResumeSeconds: nil,
+            expectedDurationSeconds: 4_250,
+            isStandalonePlaybackSession: false,
+            isLiveStream: false
+        ))
+    }
 }
