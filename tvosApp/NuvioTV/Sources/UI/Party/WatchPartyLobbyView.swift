@@ -36,6 +36,7 @@ struct WatchPartyLobbyView: View {
     @FocusState private var accountGateFocused: Bool
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
 
     var body: some View {
         ScrollView(.vertical) {
@@ -72,10 +73,12 @@ struct WatchPartyLobbyView: View {
             }
         }
         .onAppear {
-            if canUseAccount {
-                focusedAction = preferredRoomFocus
-            } else {
-                accountGateFocused = true
+            if !useTopNavigation {
+                if canUseAccount {
+                    focusedAction = preferredRoomFocus
+                } else {
+                    accountGateFocused = true
+                }
             }
         }
         .onChange(of: code) { _, newValue in
@@ -93,7 +96,9 @@ struct WatchPartyLobbyView: View {
         }
         .onChange(of: service.session?.party?.code) { oldCode, newCode in
             guard oldCode == nil, newCode != nil, canUseAccount else { return }
-            focusedAction = preferredRoomFocus
+            if !useTopNavigation || focusedAction != nil {
+                focusedAction = preferredRoomFocus
+            }
         }
         .sheet(isPresented: $showingInvitation) {
             if let party = service.session?.party, WatchPartyCode.isValid(party.code) {
@@ -121,23 +126,34 @@ struct WatchPartyLobbyView: View {
             }
             pendingJoinMediaKey = nil
             pendingJoinCode = nil
-            if canUseAccount { focusedAction = preferredRoomFocus }
+            if canUseAccount, (!useTopNavigation || focusedAction != nil) {
+                focusedAction = preferredRoomFocus
+            }
         }
         .onChange(of: service.session?.party?.media.key) { oldKey, newKey in
             guard WatchPartyMediaReviewPolicy.changed(from: oldKey, to: newKey),
                   let party = service.session?.party, let newKey else { return }
             reviewRoomID = party.id
             reviewMediaKey = newKey
-            focusedAction = preferredRoomFocus
+            if !useTopNavigation || focusedAction != nil {
+                focusedAction = preferredRoomFocus
+            }
         }
         .onChange(of: service.session?.connection) { _, _ in
-            if canUseAccount { focusedAction = preferredRoomFocus }
+            if canUseAccount, (!useTopNavigation || focusedAction != nil) {
+                focusedAction = preferredRoomFocus
+            }
         }
         .onChange(of: service.session?.membershipExit) { _, _ in
-            if canUseAccount { focusedAction = preferredRoomFocus }
+            if canUseAccount, (!useTopNavigation || focusedAction != nil) {
+                focusedAction = preferredRoomFocus
+            }
         }
         .onChange(of: canUseAccount) { _, allowed in
-            accountGateFocused = !allowed
+            if !useTopNavigation || focusedAction != nil || accountGateFocused {
+                accountGateFocused = !allowed
+                focusedAction = allowed ? preferredRoomFocus : nil
+            }
             if !allowed {
                 invalidateInvitationPreview()
                 reviewRoomID = nil
@@ -145,7 +161,6 @@ struct WatchPartyLobbyView: View {
                 pendingJoinMediaKey = nil
                 pendingJoinCode = nil
             }
-            focusedAction = allowed ? preferredRoomFocus : nil
         }
         .onReceive(service.contextDidInvalidate) { _ in
             // An invitation preview belongs to one authenticated environment.
@@ -161,11 +176,15 @@ struct WatchPartyLobbyView: View {
         }
         .onChange(of: service.busy) { _, busy in
             if !busy && canUseAccount && focusedAction == nil && operation == nil {
-                focusedAction = preferredRoomFocus
+                if !useTopNavigation {
+                    focusedAction = preferredRoomFocus
+                }
             }
         }
         .onChange(of: owner.presentation?.id) { _, _ in
-            if canUseAccount { focusedAction = preferredRoomFocus }
+            if canUseAccount, (!useTopNavigation || focusedAction != nil) {
+                focusedAction = preferredRoomFocus
+            }
         }
         .confirmationDialog(L10n.string("party_end_room_everyone_desc", fallback: "End this room for everyone?"), isPresented: $endingRoom) {
             Button(L10n.string("party_end_room_confirm_title", fallback: "End room"), role: .destructive) {
@@ -1425,7 +1444,9 @@ struct WatchPartyLobbyView: View {
                 operation = nil
                 // The service can become idle before this local operation releases.
                 if canUseAccount && focusedAction == nil {
-                    focusedAction = preferredRoomFocus
+                    if !useTopNavigation {
+                        focusedAction = preferredRoomFocus
+                    }
                 }
             }
             do { try await action() }

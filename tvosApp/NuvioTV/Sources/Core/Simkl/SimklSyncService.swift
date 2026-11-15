@@ -2496,7 +2496,6 @@ enum SelectedLibraryService {
         return RemoteLibraryStore.contains(metaId: metaId, type: type, source: source, profileId: profileId, accountBindingId: bindingId)
     }
 
-    @MainActor
     /// Writes for the owner `context` captured. The AniList id mapping can
     /// take a while; once it's done, the write happens only if that profile
     /// and account are still current, and always to the store, scope and

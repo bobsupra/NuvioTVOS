@@ -570,7 +570,6 @@ struct JellyfinClient {
         formatter.locale = Locale(identifier: "en_US_POSIX")
         formatter.timeZone = TimeZone(identifier: "GMT")
         formatter.dateFormat = format
-        formatter.isLenient = true
         return formatter
     }
 

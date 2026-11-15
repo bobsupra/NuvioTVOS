@@ -1004,6 +1004,16 @@ struct NativeSearchView: View {
                             onContentClick(item.id, item.type)
                         }
                         .accessibilityIdentifier("native-search-result-\(item.id)")
+                        // Kept as it was while it shows the same: every move along the results
+                        // redraws this screen, which rebuilt every card on it. The lock for
+                        // putting focus back stays outside it.
+                        .cardSnapshot(GridCardSnapshotKey(
+                            meta: item,
+                            index: index,
+                            columns: colCount,
+                            mode: isGridMode ? 1 : 0,
+                            retainsFocusAppearance: overlayRestoreResultID == item.id
+                        ))
                         .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)
                     }
                 }

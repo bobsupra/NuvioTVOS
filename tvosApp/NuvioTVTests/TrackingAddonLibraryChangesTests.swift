@@ -106,8 +106,10 @@ final class TrackingAddonLibraryChangesTests: XCTestCase {
 
     func testAChangeQueuedBeforeAProfileSwitchNeverRuns() async {
         let meta = title("tt5")
+        let started = expectation(description: "first change started")
         let gate = expectation(description: "first change may finish")
         let first = TrackingAddonLibraryChanges.perform(true, meta: meta, owner: owner("a"), mutation: {
+            started.fulfill()
             await self.fulfillment(of: [gate], timeout: 2)
             return true
         })
@@ -118,6 +120,7 @@ final class TrackingAddonLibraryChangesTests: XCTestCase {
             return true
         }, completion: { result = $0 })
 
+        await fulfillment(of: [started], timeout: 2)
         // The user switches to B (or logs out, or relinks) while it waits its turn.
         activeOwner = "b"
         gate.fulfill()

@@ -2,6 +2,11 @@ import XCTest
 @testable import NuvioTV
 
 final class PlexStreamLabelTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        L10n.reload(languageTag: "en")
+    }
+
     private func file(_ details: PlexFileDetails?, container: String = "mkv", size: Int64? = nil, label: String? = nil) -> PlexFile {
         PlexFile(partKey: "/library/parts/9/1/file.\(container)", container: container, sizeBytes: size, label: label, details: details)
     }

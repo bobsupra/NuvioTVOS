@@ -1674,11 +1674,11 @@ final class HomeLayoutSettingsTests: XCTestCase {
         // while horizontal strip scrolling uses 0.86 with momentum preservation.
         XCTAssertEqual(
             TVHomeLayout.verticalScrollAnimation,
-            Animation.interactiveSpring(response: 0.28, dampingFraction: 1.0, blendDuration: 0.20)
+            Animation.interactiveSpring(response: 0.34, dampingFraction: 0.96, blendDuration: 0.24)
         )
         XCTAssertEqual(
             TVHomeLayout.fastVerticalScrollAnimation,
-            Animation.interactiveSpring(response: 0.18, dampingFraction: 1.0, blendDuration: 0.12)
+            Animation.interactiveSpring(response: 0.28, dampingFraction: 0.96, blendDuration: 0.22)
         )
         XCTAssertEqual(
             TVHomeLayout.scrollAnimation,
@@ -2697,6 +2697,12 @@ final class HomeLayoutSettingsTests: XCTestCase {
         // The screen's hero backdrop still uses the clean background fanart.
         let heroBackdrop = TVHomeView.preferredBackdropURL(for: meta)
         XCTAssertEqual(heroBackdrop, "https://example.com/clean-backdrop.jpg")
+    }
+
+    func testTVTabOrderHasHomeFirstAndProfileNotSelectableTab() {
+        let cases = TVTab.allCases
+        XCTAssertEqual(cases.first, .home, "Home must be the first tab")
+        XCTAssertFalse(cases.contains(.profile), "Profile must not be a selectable tab in TVTab.allCases")
     }
 }
 

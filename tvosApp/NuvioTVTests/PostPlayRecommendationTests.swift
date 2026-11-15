@@ -175,6 +175,15 @@ private struct PlayerSurfacePresentationTestHost: View {
 }
 
 final class PostPlayRecommendationTests: XCTestCase {
+    override func setUp() {
+        super.setUp()
+        L10n.reload(languageTag: "en")
+    }
+
+    override func tearDown() {
+        L10n.reload(languageTag: nil)
+        super.tearDown()
+    }
 
     @MainActor
     @available(tvOS 18.0, *)

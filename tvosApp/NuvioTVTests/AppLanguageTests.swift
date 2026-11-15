@@ -189,4 +189,35 @@ final class AppLanguageTests: XCTestCase {
         // Reset to system
         L10n.reload(languageTag: nil)
     }
+
+    func testCroatianAndSerbianCreditTranslations() {
+        L10n.reload(languageTag: "hr")
+        XCTAssertEqual(L10n.string("details_creator_and_cast", fallback: ""), "Autor serije i glumci")
+        XCTAssertEqual(L10n.string("details_director", fallback: ""), "Redatelj")
+        XCTAssertEqual(L10n.string("details_writer", fallback: ""), "Scenarist")
+
+        L10n.reload(languageTag: "sr-Latn")
+        XCTAssertEqual(L10n.string("details_creator_and_cast", fallback: ""), "Autor serije i glumci")
+        XCTAssertEqual(L10n.string("details_director", fallback: ""), "Reditelj")
+        XCTAssertEqual(L10n.string("details_writer", fallback: ""), "Scenarista")
+
+        // Reset to system
+        L10n.reload(languageTag: nil)
+    }
+
+    func testNewFeatureTranslations() {
+        L10n.reload(languageTag: "en")
+        XCTAssertEqual(L10n.string("details_shuffle_on", fallback: ""), "Shuffle On")
+        XCTAssertEqual(L10n.string("nav_surprise_me", fallback: ""), "Surprise Me")
+        XCTAssertEqual(L10n.string("stream_speed_fast", fallback: ""), "⚡ Fast")
+        XCTAssertEqual(L10n.string("tvos_settings_manage_tracking_addons", fallback: ""), "Manage Tracking Add-ons")
+
+        L10n.reload(languageTag: "fr")
+        XCTAssertFalse(L10n.string("details_shuffle_on", fallback: "").isEmpty)
+        XCTAssertFalse(L10n.string("nav_surprise_me", fallback: "").isEmpty)
+        XCTAssertFalse(L10n.string("tvos_settings_manage_tracking_addons", fallback: "").isEmpty)
+
+        // Reset to system
+        L10n.reload(languageTag: nil)
+    }
 }

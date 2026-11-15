@@ -566,6 +566,7 @@ struct CalendarView: View {
     @AppStorage(SettingsKey.calendarTvmazeTimes) private var tvmazeTimes = CalendarOptions.defaultTvmazeTimes
     @AppStorage(SettingsKey.calendarAniList) private var aniListCalendar = CalendarOptions.defaultAniList
     @AppStorage(SettingsKey.calendarAniListPlanning) private var aniListPlanning = CalendarOptions.defaultAniListPlanning
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
 
     private var accent: Color { SettingsAccent.color(for: theme) }
     private var filter: CalendarFilter { CalendarFilter(stored: filterRaw) }
@@ -725,7 +726,7 @@ struct CalendarView: View {
         .padding(.horizontal, 49)
         .padding(.top, 56)
         .padding(.bottom, 30)
-        .defaultFocusIfAvailable($focus, didFocusToday ? nil : .day(today))
+        .defaultFocusIfAvailable($focus, (useTopNavigation || didFocusToday) ? nil : .day(today))
         .onAppear(perform: focusTodayOnFirstOpen)
         // Back from the event panel returns to the day of the focused
         // event, which may differ from selectedDay after scrolling the list.
@@ -754,7 +755,9 @@ struct CalendarView: View {
         displayedMonth = today.firstOfMonth
         selectedDay = today
         // After the focus engine's own first pass, as Details does for Play.
-        DispatchQueue.main.async { focus = .day(today) }
+        if !useTopNavigation {
+            DispatchQueue.main.async { focus = .day(today) }
+        }
     }
 
     // MARK: Header

@@ -1702,6 +1702,7 @@ struct SettingsView: View {
     let onVerifyProfilePin: ((String, String) async -> Bool)?
     let onSignIn: (() -> Void)?
     let onSignOut: (() -> Void)?
+    let onSwitchProfile: (() -> Void)?
 
     init(
         selectedCategory: Binding<SettingsCategory>,
@@ -1715,7 +1716,8 @@ struct SettingsView: View {
         onChangeProfilePin: ((String, String?, String?) async -> Bool)? = nil,
         onVerifyProfilePin: ((String, String) async -> Bool)? = nil,
         onSignIn: (() -> Void)? = nil,
-        onSignOut: (() -> Void)? = nil
+        onSignOut: (() -> Void)? = nil,
+        onSwitchProfile: (() -> Void)? = nil
     ) {
         self._selectedCategory = selectedCategory
         self.activeProfile = activeProfile
@@ -1729,6 +1731,7 @@ struct SettingsView: View {
         self.onVerifyProfilePin = onVerifyProfilePin
         self.onSignIn = onSignIn
         self.onSignOut = onSignOut
+        self.onSwitchProfile = onSwitchProfile
     }
 
     @State private var presentedLanguagePicker: LanguagePickerKind?
@@ -2067,6 +2070,7 @@ struct SettingsView: View {
                 onVerifyProfilePin: onVerifyProfilePin,
                 onSignIn: onSignIn,
                 onSignOut: onSignOut,
+                onSwitchProfile: onSwitchProfile,
                 onPresentPin: { mode in
                     presentedProfilePinMode = mode
                 }
@@ -2196,6 +2200,7 @@ private struct AccountSettingsView: View {
     let onVerifyProfilePin: ((String, String) async -> Bool)?
     let onSignIn: (() -> Void)?
     let onSignOut: (() -> Void)?
+    let onSwitchProfile: (() -> Void)?
     let onPresentPin: (ProfilePinSheetMode) -> Void
 
     @AppStorage(SettingsKey.profileName) private var profileName = "Nuvio User"
@@ -2262,6 +2267,21 @@ private struct AccountSettingsView: View {
                 }
                 .padding(.bottom, 6)
 
+                SettingsActionRow(
+                    title: L10n.string("profile_change", fallback: "Switch Profile"),
+                    subtitle: L10n.string(
+                        "profile_change_subtitle",
+                        fallback: "Switch to another profile on this account"
+                    ),
+                    value: L10n.string("profile_switch_label", fallback: "Switch"),
+                    accentColor: accentColor
+                ) {
+                    onSwitchProfile?()
+                }
+                .settingsEntryAnchor(activeProfile != nil && onSwitchProfile != nil)
+                .opacity(activeProfile != nil && onSwitchProfile != nil ? 1 : 0.46)
+                .disabled(activeProfile == nil || onSwitchProfile == nil)
+
                 // First focusable row in the pane carries the entry anchor —
                 // without one the entry lock leaves the pane unenterable.
                 SettingsTextFieldRow(
@@ -2276,7 +2296,7 @@ private struct AccountSettingsView: View {
                     centerDisplayText: true,
                     onCommit: saveProfileName
                 )
-                .settingsEntryAnchor(activeProfile != nil && onChangeProfileName != nil)
+                .settingsEntryAnchor(activeProfile != nil && onSwitchProfile == nil && onChangeProfileName != nil)
                 .disabled(activeProfile == nil || onChangeProfileName == nil)
 
                 SettingsActionRow(
