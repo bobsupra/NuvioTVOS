@@ -26,8 +26,9 @@ permissions:
 
 env:
   NODEJS_MOBILE_TAG: v24.20.0-0
-  # node-tvos-v24.20.0-0: the first build; -icu: with ICU's break iterators (Intl.Segmenter).
-  NODE_TVOS_RELEASE: node-tvos-v24.20.0-0-icu
+  # node-tvos-v24.20.0-0: the first build. -r2: ICU's break iterators (Intl.Segmenter) and
+  # V8's snapshot for the ARMv8.0 baseline (Apple TV HD, Apple TV 4K 1st generation).
+  NODE_TVOS_RELEASE: node-tvos-v24.20.0-0-r2
   TVOS_DEPLOYMENT_TARGET: "18.0"
 
 jobs:
@@ -192,7 +193,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="$NODE_TVOS_RELEASE"
-          notes="nodejs-mobile $NODEJS_MOBILE_TAG for tvOS $TVOS_DEPLOYMENT_TARGET+ (device arm64, simulator arm64), for AIOStreams in Nuvio. Small ICU (English) with ICU's break iterators, for Intl.Segmenter.
+          notes="nodejs-mobile $NODEJS_MOBILE_TAG for tvOS $TVOS_DEPLOYMENT_TARGET+ (device arm64, simulator arm64), for AIOStreams in Nuvio. Small ICU (English) with ICU's break iterators (Intl.Segmenter); V8's snapshot for the ARMv8.0 baseline (Apple TV HD, Apple TV 4K 1st generation).
 
           Vendor/NodeMobile/Package.swift:
           url: https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/NodeMobile.xcframework.zip
@@ -201,7 +202,7 @@ jobs:
             gh release upload "$tag" out/NodeMobile.xcframework.zip --clobber -R "$GITHUB_REPOSITORY"
             gh release edit "$tag" --notes "$notes" -R "$GITHUB_REPOSITORY"
           else
-            gh release create "$tag" out/NodeMobile.xcframework.zip --title "Node.js for tvOS ($NODEJS_MOBILE_TAG, break iterators)" \
+            gh release create "$tag" out/NodeMobile.xcframework.zip --title "Node.js for tvOS ($NODEJS_MOBILE_TAG, r2)" \
               --notes "$notes" --target "$GITHUB_SHA" --latest=false -R "$GITHUB_REPOSITORY"
           fi
           echo "::notice::https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/NodeMobile.xcframework.zip · $CHECKSUM"

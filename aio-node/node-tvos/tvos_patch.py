@@ -11,7 +11,8 @@ they are. What differs:
   process.execve() needs the same guard,
 - the framework project (device family 3, tvOS deployment target),
 - ICU's break-iterator data, which small-icu leaves out and Intl.Segmenter
-  needs.
+  needs,
+- V8's snapshot, which must not use CPU features the oldest Apple TVs lack.
 
 Usage: tvos_patch.py <nodejs-mobile source tree> [tvOS deployment target]
 """
@@ -171,4 +172,28 @@ def icu_small(text):
 
 
 edit("tools/icu/icu_small.json", icu_small)
+
+
+# 6. V8: the snapshot's builtins (all the machine code a jitless V8 runs) are
+# generated on the build machine, and V8 adds the CPU features its compiler has
+# there (an Apple M chip: LSE atomics, DOTPROD, PMULL). tvOS 18 also runs on
+# Apple TV HD (A8) and Apple TV 4K 1st generation (A10X), which are ARMv8.0
+# and have none of them: the 4K 1st generation crashed with SIGILL at the
+# first JavaScript. The snapshot gets the ARMv8.0 baseline; at run time V8
+# still finds what the chip has, for the code it makes then.
+def v8_arm64_features(text):
+    return replace_once(
+        """  if (cross_compile) {
+    supported_ |= CpuFeaturesFromCompiler();
+    supported_ |= CpuFeaturesFromTargetOS();
+    return;
+  }""",
+        """  if (cross_compile) {
+    // tvOS: the ARMv8.0 baseline, for Apple TV HD and Apple TV 4K 1st generation.
+    return;
+  }""",
+    )(text)
+
+
+edit("deps/v8/src/codegen/arm64/assembler-arm64.cc", v8_arm64_features)
 print(f"tvOS patches applied (deployment target {target}).")
