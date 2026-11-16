@@ -603,8 +603,11 @@ final class AIOStreamsHost: ObservableObject {
         Self.note("arguments: " + arguments.dropFirst().map { $0.count > 200 ? "<script>" : $0 }.joined(separator: " "))
 
         let thread = Thread {
-            NuvioInstallAlternateSignalStack()
-            Self.note("Node.js thread: stack \(Thread.current.stackSize / 1_048_576) MB · calling node_start")
+            let alternate = NuvioInstallAlternateSignalStack() == 1
+            Self.note(
+                "Node.js thread: stack \(Thread.current.stackSize / 1_048_576) MB, "
+                    + "\(alternate ? "a" : "no") stack for crash notes · calling node_start"
+            )
             let status = Self.run(nodeStart, arguments: arguments)
             Self.note("Node.js exited with code \(status)")
             Task { @MainActor in
@@ -1379,7 +1382,7 @@ final class AIOStreamsHost: ObservableObject {
         _ = aioPreviousActions
         // The handler runs on an alternate stack, so a thread that used up its own stack
         // still leaves a note (each thread needs its own: Node.js' thread sets one too).
-        NuvioInstallAlternateSignalStack()
+        _ = NuvioInstallAlternateSignalStack()
         for number in crashSignals {
             let name = String(cString: strsignal(number))
             aioSignalNotes[Int(number)] = strdup("\n[nuvio] CRASH: signal \(number) (\(name))\n")

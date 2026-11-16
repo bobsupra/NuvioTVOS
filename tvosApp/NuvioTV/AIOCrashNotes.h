@@ -10,6 +10,7 @@
 #ifndef AIOCrashNotes_h
 #define AIOCrashNotes_h
 
+#include <dlfcn.h>
 #include <execinfo.h>
 #include <pthread.h>
 #include <signal.h>
@@ -34,21 +35,30 @@ static inline void nuvio_crash_write_hex(int fd, uintptr_t value) {
     (void)write(fd, buffer, sizeof buffer);
 }
 
+typedef int (*nuvio_sigaltstack_function)(const stack_t *, stack_t *);
+
 /// An alternate stack for signal handlers on the calling thread (kept for as long as the thread
-/// lives); nothing when it has one already.
-static inline void NuvioInstallAlternateSignalStack(void) {
+/// lives); nothing when it has one already. The tvOS SDK marks sigaltstack unavailable, while the
+/// system has it: looked up at run time, and left out when it isn't there. 1: the thread has one.
+static inline int NuvioInstallAlternateSignalStack(void) {
+    nuvio_sigaltstack_function sigaltstack_call = (nuvio_sigaltstack_function)dlsym(RTLD_DEFAULT, "sigaltstack");
+    if (sigaltstack_call == NULL) return 0;
     stack_t current;
-    if (sigaltstack(NULL, &current) == 0 && !(current.ss_flags & SS_DISABLE) && current.ss_sp != NULL) {
-        return;
+    if (sigaltstack_call(NULL, &current) == 0 && !(current.ss_flags & SS_DISABLE) && current.ss_sp != NULL) {
+        return 1;
     }
     size_t size = 256 * 1024;
     void *memory = malloc(size);
-    if (memory == NULL) return;
+    if (memory == NULL) return 0;
     stack_t alternate;
     alternate.ss_sp = memory;
     alternate.ss_size = size;
     alternate.ss_flags = 0;
-    if (sigaltstack(&alternate, NULL) != 0) free(memory);
+    if (sigaltstack_call(&alternate, NULL) != 0) {
+        free(memory);
+        return 0;
+    }
+    return 1;
 }
 
 /// From the signal handler: a line with the fault address and the thread, then the crashed
