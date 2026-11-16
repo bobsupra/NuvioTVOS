@@ -1294,6 +1294,9 @@ struct TVHomeCatalogBrowseView: View {
     @State private var hasMore: Bool
     @State private var isLoadingMore = false
     @State private var collectionPageFailed = false
+    /// The last add-on page failed (a timeout, a server error). Loading stops
+    /// there, with a Retry card, instead of giving up on the catalog for good.
+    @State private var catalogPageFailed = false
     @State private var collectionPageTask: Task<Void, Never>?
     @State private var collectionPageGeneration: UInt = 0
     @FocusState private var focusedItemID: String?
@@ -1369,10 +1372,14 @@ struct TVHomeCatalogBrowseView: View {
                             }
                         }
 
-                        if collectionPageFailed {
+                        if collectionPageFailed || catalogPageFailed {
                             Button {
-                                guard let collectionSource, let collectionProfileID else { return }
-                                loadMoreCollection(source: collectionSource, profileID: collectionProfileID)
+                                if let collectionSource, let collectionProfileID {
+                                    loadMoreCollection(source: collectionSource, profileID: collectionProfileID)
+                                } else if catalogPageFailed {
+                                    catalogPageFailed = false
+                                    if let last = items.last { loadMoreIfNeeded(currentItem: last) }
+                                }
                             } label: {
                                 Label(L10n.string("action_retry", fallback: "Retry"), systemImage: "arrow.clockwise")
                             }
@@ -1413,6 +1420,7 @@ struct TVHomeCatalogBrowseView: View {
     private func loadMoreIfNeeded(currentItem: NuvioMeta) {
         guard hasMore,
               !isLoadingMore,
+              !catalogPageFailed,
               let index = items.firstIndex(where: { $0.id == currentItem.id }),
               index >= max(items.count - TVHomeRowPrefetchThreshold, 0) else { return }
 
@@ -1452,6 +1460,7 @@ struct TVHomeCatalogBrowseView: View {
             do {
                 let page = try await repository.browseCatalog(
                     addonId: section.addonId,
+                    manifestURL: section.manifestURL,
                     contentType: contentType,
                     catalogId: catalogId,
                     skip: requestedSkip,
@@ -1463,7 +1472,7 @@ struct TVHomeCatalogBrowseView: View {
                 nextSkip = page.nextSkip ?? (requestedSkip + page.items.count)
                 hasMore = page.hasMore && !newItems.isEmpty
             } catch {
-                hasMore = false
+                catalogPageFailed = true
             }
         }
     }

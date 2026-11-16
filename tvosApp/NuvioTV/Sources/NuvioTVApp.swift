@@ -10337,6 +10337,7 @@ struct TVHomeView: View {
             do {
                 let page = try await repository.browseCatalog(
                     addonId: section.addonId,
+                    manifestURL: section.manifestURL,
                     contentType: contentType,
                     catalogId: catalogId,
                     skip: requestedSkip,
@@ -10447,6 +10448,7 @@ struct TVHomeView: View {
             do {
                 let page = try await repository.browseCatalog(
                     addonId: section.addonId,
+                    manifestURL: section.manifestURL,
                     contentType: contentType,
                     catalogId: catalogId,
                     skip: 0,
