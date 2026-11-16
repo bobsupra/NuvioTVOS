@@ -132,6 +132,53 @@ final class DetailsPrimaryMetadataReadinessTests: XCTestCase {
 
         viewModel.cancelAllTasks()
     }
+
+    func testMoreLikeThisPrefetchRejectsNonCanonicalIdAndPrefetchesResolvedCanonicalId() {
+        let nonCanonicalMeta = NuvioMeta(id: "tmdb:12345", name: "TMDB Movie", type: "movie")
+        let repository = PrimaryPlaybackCatalogRepository(metadata: nonCanonicalMeta)
+        let viewModel = DetailsViewModel(
+            repository: repository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: { throw CancellationError() },
+            enrichmentStarter: { _, _ in }
+        )
+
+        viewModel.triggerStreamPreFetch(for: nonCanonicalMeta)
+        XCTAssertNil(viewModel.prefetchedStreamId, "Non-canonical stream ID must not trigger stream prefetch")
+
+        let canonicalMeta = NuvioMeta(id: "tt1234567", name: "TMDB Movie", imdbId: "tt1234567", tmdbId: 12345, type: "movie")
+        viewModel.triggerStreamPreFetch(for: canonicalMeta)
+        XCTAssertEqual(viewModel.prefetchedStreamId, "tt1234567", "Canonical stream ID should successfully prefetch")
+
+        viewModel.cancelAllTasks()
+    }
+
+    func testLoadDetailsUpdatesStreamRequestWhenCanonicalIdResolves() async {
+        let canonicalMeta = NuvioMeta(id: "tt9999999", name: "Resolved Movie", imdbId: "tt9999999", tmdbId: 12345, type: "movie")
+        let repository = PrimaryPlaybackCatalogRepository(metadata: canonicalMeta)
+        let viewModel = DetailsViewModel(
+            repository: repository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: { throw CancellationError() },
+            enrichmentStarter: { _, _ in }
+        )
+
+        viewModel.prepareStreams(forId: "tmdb:12345", type: "movie")
+        XCTAssertEqual(viewModel.requestedStreamId, "tmdb:12345")
+
+        await viewModel.loadDetails(id: "tmdb:12345", type: "movie").value
+
+        XCTAssertEqual(viewModel.requestedStreamId, "tt9999999", "Stream request must be upgraded to canonical stream ID")
+        viewModel.cancelAllTasks()
+    }
+
+    func testPreservingEnrichmentMatchesNonCanonicalAndCanonicalIDs() {
+        let existing = NuvioMeta(id: "tmdb:55555", name: "Action Movie", tmdbId: 55555, type: "movie", genres: ["Action", "Sci-Fi"])
+        let incoming = NuvioMeta(id: "tt5555555", name: "Action Movie", imdbId: "tt5555555", tmdbId: 55555, type: "movie", genres: nil)
+
+        let enriched = incoming.preservingEnrichment(from: existing)
+        XCTAssertEqual(enriched.genres, ["Action", "Sci-Fi"], "Enrichment must be preserved across non-canonical to canonical ID transition")
+    }
 }
 
 final class DetailsPrimaryPlayTargetTests: XCTestCase {

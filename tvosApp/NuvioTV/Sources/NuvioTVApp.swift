@@ -302,11 +302,16 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         var tabs: [Self] = [.home]
         if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
-        if ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
+        if isIPTVEnabled && ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
         if isCalendarEnabled { tabs.append(.calendar) }
         if ProfileSettings.current.bool(forKey: SettingsKey.showSurpriseMeTab) { tabs.append(.surprise) }
         tabs.append(.settings)
         return tabs
+    }
+
+    /// Native IPTV (disabled for now until ready).
+    static var isIPTVEnabled: Bool {
+        false
     }
 
     /// Settings → Appearance → Sidebar → Calendar (on unless turned off).
@@ -4723,7 +4728,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
-    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = true
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
@@ -5048,7 +5053,7 @@ private struct TVMainTabView: View {
             }
             .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
             .tag(TVTab.library)
-            if nativeIPTVEnabled {
+            if TVTab.isIPTVEnabled && nativeIPTVEnabled {
                 Group {
                     if selectedTab == .liveTV {
                         liveTVTabContent
@@ -5174,7 +5179,7 @@ private struct TVMainTabView: View {
     private var groupedCollectionTabs: some View {
         TabView(selection: activeTabBinding) {
             coreTabs
-            if nativeIPTVEnabled {
+            if TVTab.isIPTVEnabled && nativeIPTVEnabled {
                 Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
                     if selectedTab == .liveTV {
                         liveTVTabContent

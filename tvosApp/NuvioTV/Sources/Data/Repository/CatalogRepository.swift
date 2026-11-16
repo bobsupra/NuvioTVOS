@@ -637,11 +637,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
         "Talk-Show", "Game-Show"
     ]
 
-    func cachedMetadata(for id: String) -> NuvioMeta? {
-        let context = Self.metadataCacheContext
-        return Self.metadataCacheQueue.sync {
-            Self.cachedMetadataContext == context ? Self.cachedMetaById[id] : nil
+    static func cachedMetadata(for id: String) -> NuvioMeta? {
+        let context = metadataCacheContext
+        return metadataCacheQueue.sync {
+            cachedMetadataContext == context ? cachedMetaById[id] : nil
         }
+    }
+
+    func cachedMetadata(for id: String) -> NuvioMeta? {
+        Self.cachedMetadata(for: id)
     }
 
     static func clearMetadataCache() {
@@ -1352,8 +1356,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
            let tmdbNum = Int(id.dropFirst(5)) {
             if let cachedImdb = cachedMetadata(for: id)?.imdbId, cachedImdb.hasPrefix("tt") {
                 resolvedId = cachedImdb
+            } else if let cachedImdb = Self.cachedImdb(forTmdbId: tmdbNum, type: metaType) {
+                resolvedId = cachedImdb
             } else if let imdb = await Self.resolveImdbFromTmdb(tmdbId: tmdbNum, type: metaType) {
                 resolvedId = imdb
+            } else if let cachedTitle = cachedMetadata(for: id)?.name, !cachedTitle.isEmpty {
+                if let searchImdb = await Self.resolveImdbFromCinemetaSearch(title: cachedTitle, year: cachedMetadata(for: id)?.year, type: metaType) {
+                    resolvedId = searchImdb
+                    Self.cacheImdb(searchImdb, forTmdbId: tmdbNum, type: metaType)
+                }
             }
         }
 
@@ -1488,8 +1499,18 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     }
 
                     let meta = await TmdbDetailsService.localizedMetadata(for: rawMeta)
-                    cacheMetadata(meta, requestedID: id, context: metadataContext)
-                    return meta
+                    var resolvedResult = meta
+                    if resolvedResult.imdbId == nil {
+                        resolvedResult = resolvedResult.withImdbId(resolvedCanonicalImdbID)
+                    }
+                    if resolvedResult.tmdbId == nil, id.hasPrefix("tmdb:"), let tmdbNum = Int(id.dropFirst(5)) {
+                        resolvedResult = resolvedResult.withTmdbId(tmdbNum)
+                    }
+                    if let imdb = resolvedResult.imdbId, imdb.hasPrefix("tt"), id.hasPrefix("tmdb:"), let tmdbNum = Int(id.dropFirst(5)) {
+                        Self.cacheImdb(imdb, forTmdbId: tmdbNum, type: metaType)
+                    }
+                    cacheMetadata(resolvedResult, requestedID: id, context: metadataContext)
+                    return resolvedResult
                 } catch {
                     lastError = error
                 }
@@ -1498,7 +1519,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         // If no /meta endpoint returned a response, check if the item was already cached from a catalog
         if let cached = cachedMetadata(for: id) ?? cachedMetadata(for: resolvedId) {
-            let localized = await TmdbDetailsService.localizedMetadata(for: cached)
+            var localized = await TmdbDetailsService.localizedMetadata(for: cached)
+            if localized.imdbId == nil, let resolvedCanonicalImdbID {
+                localized = localized.withImdbId(resolvedCanonicalImdbID)
+            }
+            if localized.tmdbId == nil, id.hasPrefix("tmdb:"), let tmdbNum = Int(id.dropFirst(5)) {
+                localized = localized.withTmdbId(tmdbNum)
+            }
+            if let imdb = localized.imdbId, imdb.hasPrefix("tt"), id.hasPrefix("tmdb:"), let tmdbNum = Int(id.dropFirst(5)) {
+                Self.cacheImdb(imdb, forTmdbId: tmdbNum, type: metaType)
+            }
             cacheMetadata(localized, requestedID: id, context: metadataContext)
             return localized
         }
@@ -1558,13 +1588,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
     private static var tmdbToImdbCache: [String: String] = [:]
     private static let tmdbToImdbLock = NSLock()
 
-    private static func cachedImdb(forTmdbId tmdbId: Int, type: String) -> String? {
+    static func cachedImdb(forTmdbId tmdbId: Int, type: String) -> String? {
         tmdbToImdbLock.lock()
         defer { tmdbToImdbLock.unlock() }
         return tmdbToImdbCache["\(tmdbId):\(type)"]
     }
 
-    private static func cacheImdb(_ imdbId: String, forTmdbId tmdbId: Int, type: String) {
+    static func cacheImdb(_ imdbId: String, forTmdbId tmdbId: Int, type: String) {
         tmdbToImdbLock.lock()
         defer { tmdbToImdbLock.unlock() }
         tmdbToImdbCache["\(tmdbId):\(type)"] = imdbId
@@ -1577,8 +1607,20 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if let cached = cachedImdb(forTmdbId: tmdbId, type: primaryMedia) {
             return cached
         }
-        let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let apiKey: String = {
+            if let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+                return key
+            }
+            if let key = UserDefaults.standard.string(forKey: SettingsKey.tmdbApiKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+                return key
+            }
+            if let key = TmdbDetailsService.currentApiKey?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
+                return key
+            }
+            return ""
+        }()
         // A TMDB-backed collection is an explicit source choice, independent
         // of whether optional Details enrichment is enabled.
         if !apiKey.isEmpty {
@@ -1604,6 +1646,44 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return imdb
         }
         return nil
+    }
+
+    static func resolveImdbFromCinemetaSearch(title: String, year: Int?, type: String) async -> String? {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        guard let url = try? StremioCatalogURLBuilder.url(
+            baseURL: URL(string: "https://v3-cinemeta.strem.io")!,
+            type: type,
+            catalogId: "top",
+            skip: nil,
+            search: trimmed,
+            genre: nil
+        ) else { return nil }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 6
+        request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+        guard let (data, response) = try? await networkSession.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+              let catalog = try? JSONDecoder().decode(CinemetaCatalogResponse.self, from: data) else {
+            return nil
+        }
+        let cleanTitle = trimmed.lowercased()
+        let metas = catalog.metas.map { $0.toMeta(fallbackType: type) }
+        for item in metas {
+            let itemImdb = item.imdbId ?? (item.id.hasPrefix("tt") ? item.id : nil)
+            guard let canonicalImdb = itemImdb.flatMap(NuvioMeta.canonicalImdbID(from:)) else { continue }
+            let itemTitle = item.name.lowercased()
+            if itemTitle == cleanTitle {
+                if let year, let itemYear = item.year {
+                    if abs(itemYear - year) <= 1 {
+                        return canonicalImdb
+                    }
+                } else {
+                    return canonicalImdb
+                }
+            }
+        }
+        return metas.compactMap { $0.imdbId.flatMap(NuvioMeta.canonicalImdbID(from:)) ?? NuvioMeta.canonicalImdbID(from: $0.id) }.first
     }
 
     private static func isSeriesType(_ type: String) -> Bool {

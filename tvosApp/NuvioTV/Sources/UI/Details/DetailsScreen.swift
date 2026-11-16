@@ -518,7 +518,7 @@ struct DetailsScreen: View {
         }
         .onChange(of: backgroundStreamPreFetch) { _, isEnabled in
             if isEnabled {
-                if let meta = viewModel.uiState.meta, meta.id == id {
+                if let meta = viewModel.uiState.meta, meta.matches(id: id) {
                     viewModel.triggerStreamPreFetch(for: meta)
                 }
                 performBackgroundAutoSelectionAndPreResolution()
@@ -529,14 +529,14 @@ struct DetailsScreen: View {
         }
         .onChange(of: viewModel.uiState.isLoading) { _, isLoading in
             if !isLoading {
-                if let meta = viewModel.uiState.meta, meta.id == id, !meta.isSeries {
+                if let meta = viewModel.uiState.meta, meta.matches(id: id), !meta.isSeries {
                     onWatchPartyMovieReady?(meta)
                 }
                 presentInitialStreamPickerIfNeeded()
             }
         }
         .onChange(of: viewModel.uiState.meta?.id) { _, newID in
-            guard let newID, newID == id, let meta = viewModel.uiState.meta, meta.id == newID, !meta.isSeries else { return }
+            guard newID != nil, let meta = viewModel.uiState.meta, meta.matches(id: id), !meta.isSeries else { return }
             onWatchPartyMovieReady?(meta)
         }
         .onChange(of: initialPlaybackRequestID) { oldRequestID, newRequestID in
@@ -568,7 +568,7 @@ struct DetailsScreen: View {
             TVHomeDebugTrace.log("details.appear id=\(id) type=\(type)")
             if let initialPlaybackRequestID {
                 beginInitialPlaybackPreparation(requestID: initialPlaybackRequestID)
-            } else if viewModel.uiState.meta == nil || viewModel.uiState.meta?.id != id {
+            } else if viewModel.uiState.meta == nil || !(viewModel.uiState.meta?.matches(id: id) ?? false) {
                 viewModel.loadDetails(
                     id: id,
                     type: type,
@@ -681,7 +681,7 @@ struct DetailsScreen: View {
             guard viewModel.didLoadMetadataSuccessfully else { return }
             guard viewModel.uiState.error == nil,
                   !viewModel.uiState.isLoading,
-                  viewModel.uiState.meta?.id == id else { return }
+                  viewModel.uiState.meta?.matches(id: id) == true else { return }
             readyInitialPlaybackRequestID = requestID
         }
     }
@@ -843,6 +843,7 @@ struct DetailsScreen: View {
     private func startStreamFlow(streamId: String, type: String, reload: Bool, forceManualPicker: Bool = false) {
         guard let meta = viewModel.uiState.meta else { return }
         streamPickerAvailabilityMessage = nil
+        let targetStreamId = (DetailsViewModel.isNonCanonicalStreamId(streamId) && !DetailsViewModel.isNonCanonicalStreamId(meta.streamId)) ? meta.streamId : streamId
 
         let activeProfileId = ProfileSettings.activeProfileID
 
@@ -887,7 +888,7 @@ struct DetailsScreen: View {
             isResolvingDebrid = false
             isPreparingPlayback = false
             if reload {
-                viewModel.prepareStreams(forId: streamId, type: type)
+                viewModel.prepareStreams(forId: targetStreamId, type: type)
             }
             if !viewModel.uiState.streams.isEmpty {
                 let saved = streamDiscoveryDuration ?? (viewModel.prefetchStartTime.map { Date().timeIntervalSince($0) } ?? 0)
@@ -901,7 +902,7 @@ struct DetailsScreen: View {
         if !forceManualPicker,
            let preStream = preResolvedStream,
            let preURL = preResolvedURL,
-           preResolvedStreamId == streamId {
+           preResolvedStreamId == targetStreamId {
             let discoverySaved = streamDiscoveryDuration ?? 0
             let debridSaved = preResolvedDuration ?? 0
             let totalSaved = discoverySaved + debridSaved
@@ -962,7 +963,7 @@ struct DetailsScreen: View {
         isStreamPickerPresented = false
 
         if reload {
-            viewModel.prepareStreams(forId: streamId, type: type, forceRefresh: true)
+            viewModel.prepareStreams(forId: targetStreamId, type: type, forceRefresh: true)
         }
         finishSmartPlaybackIfPossible(meta: meta)
     }
@@ -6101,11 +6102,27 @@ struct TvDetailsContent: View {
             } : nil,
             onSelect: { item in
                 stopBackgroundTrailer(manual: false)
-                CinemetaCatalogRepository.cacheCatalogMetadata(item.asMeta)
+                let resolvedCardId: String = {
+                    if item.id.hasPrefix("tt") { return item.id }
+                    if let cachedImdb = CinemetaCatalogRepository.cachedMetadata(for: item.id)?.imdbId, cachedImdb.hasPrefix("tt") {
+                        return cachedImdb
+                    }
+                    if item.id.hasPrefix("tmdb:"),
+                       let tmdbNum = Int(item.id.dropFirst(5)),
+                       let cachedImdb = CinemetaCatalogRepository.cachedImdb(forTmdbId: tmdbNum, type: item.type) {
+                        return cachedImdb
+                    }
+                    return item.id
+                }()
+                var metaToCache = item.asMeta
+                if resolvedCardId.hasPrefix("tt") {
+                    metaToCache = metaToCache.withImdbId(resolvedCardId)
+                }
+                CinemetaCatalogRepository.cacheCatalogMetadata(metaToCache)
                 if restoresMoreLikeThisFocus {
                     cancelFocusRestoration()
                     onOpenTitle?(
-                        item.id,
+                        resolvedCardId,
                         item.type,
                         DetailsFocusTarget(kind: .moreLikeThis, itemID: item.id),
                         items,
@@ -6114,7 +6131,7 @@ struct TvDetailsContent: View {
                         uiState.simklRatings
                     )
                 } else {
-                    onOpenTitle?(item.id, item.type, nil, nil, uiState.people, uiState.companies, uiState.simklRatings)
+                    onOpenTitle?(resolvedCardId, item.type, nil, nil, uiState.people, uiState.companies, uiState.simklRatings)
                 }
             },
             onBack: handleDetailsBack,

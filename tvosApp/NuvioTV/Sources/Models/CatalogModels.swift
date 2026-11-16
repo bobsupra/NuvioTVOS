@@ -287,6 +287,25 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
         return Self.canonicalImdbID(from: id) ?? imdbId ?? id
     }
 
+    /// True when this metadata matches candidateId (direct id, imdbId, streamId, or tmdbId prefix).
+    func matches(id candidateId: String) -> Bool {
+        if id.caseInsensitiveCompare(candidateId) == .orderedSame {
+            return true
+        }
+        if let imdbId, imdbId.caseInsensitiveCompare(candidateId) == .orderedSame {
+            return true
+        }
+        if streamId.caseInsensitiveCompare(candidateId) == .orderedSame {
+            return true
+        }
+        if candidateId.hasPrefix("tmdb:"),
+           let tmdbNum = Int(candidateId.dropFirst(5)),
+           tmdbId == tmdbNum {
+            return true
+        }
+        return false
+    }
+
     /// Compact copy for watched / library-style persistence.
     /// Drops the full episode guide (can be huge) and non-finite ratings so a
     /// single bad `Double.nan` cannot make `JSONEncoder` silently drop the
@@ -468,7 +487,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     /// cast/director/writer credits) from a previously resolved `NuvioMeta` instance
     /// when merging with a newly fetched full `/meta` record that does not provide them.
     func preservingEnrichment(from existing: NuvioMeta?) -> NuvioMeta {
-        guard let existing, existing.id == id else { return self }
+        guard let existing, matches(id: existing.id) || existing.matches(id: id) else { return self }
         var resolved = self
         if resolved.externalRatings == nil, let existingRatings = existing.externalRatings {
             resolved = resolved.withExternalRatings(existingRatings)
@@ -477,8 +496,9 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
         let directorToUse = (resolved.director == nil || resolved.director?.isEmpty == true) ? existing.director : resolved.director
         let writerToUse = (resolved.writer == nil || resolved.writer?.isEmpty == true) ? existing.writer : resolved.writer
         let certToUse = (resolved.certification == nil || resolved.certification?.isEmpty == true) ? existing.certification : resolved.certification
+        let genresToUse = (resolved.genres == nil || resolved.genres?.isEmpty == true) ? existing.genres : resolved.genres
 
-        if castToUse != resolved.cast || directorToUse != resolved.director || writerToUse != resolved.writer || certToUse != resolved.certification {
+        if castToUse != resolved.cast || directorToUse != resolved.director || writerToUse != resolved.writer || certToUse != resolved.certification || genresToUse != resolved.genres {
             resolved = NuvioMeta(
                 id: resolved.id,
                 name: resolved.name,
@@ -490,7 +510,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
                 tmdbId: resolved.tmdbId,
                 type: resolved.type,
                 year: resolved.year,
-                genres: resolved.genres,
+                genres: genresToUse,
                 rating: resolved.rating,
                 releaseInfo: resolved.releaseInfo,
                 runtime: resolved.runtime,
@@ -511,6 +531,74 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             )
         }
         return resolved
+    }
+
+    func withImdbId(_ newImdbId: String?) -> NuvioMeta {
+        guard imdbId != newImdbId else { return self }
+        return NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: posterUrl,
+            backgroundUrl: backgroundUrl,
+            logoUrl: logoUrl,
+            imdbId: newImdbId,
+            tmdbId: tmdbId,
+            type: type,
+            year: year,
+            genres: genres,
+            rating: rating,
+            releaseInfo: releaseInfo,
+            runtime: runtime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            language: language,
+            released: released,
+            status: status,
+            videos: videos,
+            trailerYtIds: trailerYtIds,
+            externalRatings: externalRatings,
+            posterShape: posterShape,
+            isFromAddon: isFromAddon,
+            landscapePosterUrl: landscapePosterUrl
+        )
+    }
+
+    func withTmdbId(_ newTmdbId: Int?) -> NuvioMeta {
+        guard tmdbId != newTmdbId else { return self }
+        return NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: posterUrl,
+            backgroundUrl: backgroundUrl,
+            logoUrl: logoUrl,
+            imdbId: imdbId,
+            tmdbId: newTmdbId,
+            type: type,
+            year: year,
+            genres: genres,
+            rating: rating,
+            releaseInfo: releaseInfo,
+            runtime: runtime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            language: language,
+            released: released,
+            status: status,
+            videos: videos,
+            trailerYtIds: trailerYtIds,
+            externalRatings: externalRatings,
+            posterShape: posterShape,
+            isFromAddon: isFromAddon,
+            landscapePosterUrl: landscapePosterUrl
+        )
     }
 
     func withCertification(_ newCertification: String?) -> NuvioMeta {

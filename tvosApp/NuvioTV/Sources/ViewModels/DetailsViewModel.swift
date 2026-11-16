@@ -514,7 +514,14 @@ class DetailsViewModel: ObservableObject {
         prefetchedStreamId = nil
         prefetchedEpisode = nil
         prefetchStartTime = nil
-        requestedStreamId = nil
+        if let requested = requestedStreamId {
+            let isSameTarget = requested == id
+                || (requested.hasPrefix("tmdb:") && id.hasPrefix("tmdb:"))
+                || (requested.hasPrefix("tt") && id.hasPrefix("tt"))
+            if !isSameTarget {
+                requestedStreamId = nil
+            }
+        }
         detailsRequestGeneration &+= 1
         let requestGeneration = detailsRequestGeneration
         let hasRelatedItemsSnapshot = relatedItemsSnapshot != nil
@@ -584,6 +591,13 @@ class DetailsViewModel: ObservableObject {
                 primaryState.isLoading = false
                 primaryState.error = nil
                 self.uiState = primaryState
+
+                // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
+                // reload them immediately with the resolved canonical stream id.
+                if let requested = self.requestedStreamId,
+                   Self.isNonCanonicalStreamId(requested) || (requested != resolvedMeta.streamId && !Self.isNonCanonicalStreamId(resolvedMeta.streamId)) {
+                    self.prepareStreams(forId: resolvedMeta.streamId, type: resolvedMeta.type, forceRefresh: true)
+                }
 
                 // Present primary metadata immediately for instant smooth transition.
                 // Defer streams & heavy secondary enrichment until the screen transition
@@ -684,14 +698,20 @@ class DetailsViewModel: ObservableObject {
         }
     }
 
+    static func isNonCanonicalStreamId(_ id: String) -> Bool {
+        id.hasPrefix("tmdb:") || id.hasPrefix("simkl:") || id.hasPrefix("trakt:") || id.hasPrefix("wetrakr:")
+    }
+
     func triggerStreamPreFetch(for meta: NuvioMeta) {
         let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
         guard prefetchEnabled else { return }
-        guard prefetchedStreamId == nil else { return }
 
         guard let (targetStreamId, targetEpisode) = resolveDefaultPlayTarget(for: meta) else {
             return
         }
+        guard !Self.isNonCanonicalStreamId(targetStreamId) else { return }
+        guard prefetchedStreamId != targetStreamId else { return }
+
         prefetchedStreamId = targetStreamId
         prefetchedEpisode = targetEpisode
         prefetchStartTime = Date()
@@ -1130,13 +1150,29 @@ class DetailsViewModel: ObservableObject {
     ///
     /// `forceRefresh` restarts discovery for the same key (explicit refresh).
     func prepareStreams(forId streamId: String, type: String, forceRefresh: Bool = false) {
-        requestedStreamId = streamId
         streamObserveTask?.cancel()
 
+        let targetId: String = {
+            if !Self.isNonCanonicalStreamId(streamId) { return streamId }
+            if let currentMeta = uiState.meta, currentMeta.matches(id: streamId), !Self.isNonCanonicalStreamId(currentMeta.streamId) {
+                return currentMeta.streamId
+            }
+            if let cachedStreamId = repository.cachedMetadata(for: streamId)?.streamId, !Self.isNonCanonicalStreamId(cachedStreamId) {
+                return cachedStreamId
+            }
+            if streamId.hasPrefix("tmdb:"),
+               let tmdbNum = Int(streamId.dropFirst(5)),
+               let cachedImdb = CinemetaCatalogRepository.cachedImdb(forTmdbId: tmdbNum, type: type) {
+                return cachedImdb
+            }
+            return streamId
+        }()
+        requestedStreamId = targetId
+
         if streamDiscoveryMode == .shared {
-            prepareSharedStreams(forId: streamId, type: type, forceRefresh: forceRefresh)
+            prepareSharedStreams(forId: targetId, type: type, forceRefresh: forceRefresh)
         } else {
-            prepareRepositoryStreams(forId: streamId, type: type)
+            prepareRepositoryStreams(forId: targetId, type: type)
         }
     }
 

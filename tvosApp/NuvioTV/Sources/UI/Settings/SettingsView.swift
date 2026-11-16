@@ -6081,11 +6081,14 @@ private struct IntegrationSettingsView: View {
                 }
             }
 
-            SettingsGroup(title: L10n.string("iptv_settings_title", fallback: "Live TV"),
-                          subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")) {
-                SettingsToggleRow(title: L10n.string("iptv_enable_title", fallback: "Native IPTV"),
-                                  subtitle: L10n.string("iptv_enable_subtitle", fallback: "Show Live TV in navigation"),
-                                  isOn: $nativeIPTVEnabled, accentColor: accentColor)
+            // Hidden for now until IPTV is ready
+            if false {
+                SettingsGroup(title: L10n.string("iptv_settings_title", fallback: "Live TV"),
+                              subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")) {
+                    SettingsToggleRow(title: L10n.string("iptv_enable_title", fallback: "Native IPTV"),
+                                      subtitle: L10n.string("iptv_enable_subtitle", fallback: "Show Live TV in navigation"),
+                                      isOn: $nativeIPTVEnabled, accentColor: accentColor)
+                }
             }
 
             SettingsGroup(
