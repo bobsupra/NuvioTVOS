@@ -192,6 +192,17 @@ protocol CatalogRepository {
         genre: String?
     ) async throws -> CatalogPage
 
+    /// Browse a later page of a Home catalog from the add-on install its
+    /// first page came from (`manifestURL`), when it's known.
+    func browseCatalog(
+        addonId: String?,
+        manifestURL: String?,
+        contentType: String,
+        catalogId: String,
+        skip: Int,
+        genre: String?
+    ) async throws -> CatalogPage
+
     /// Get available genres for content type
     func getGenres(contentType: String) async throws -> [String]
 
@@ -274,6 +285,23 @@ extension CatalogRepository {
         genre: String?
     ) async throws -> CatalogPage {
         try await browseCatalog(
+            contentType: contentType,
+            catalogId: catalogId,
+            skip: skip,
+            genre: genre
+        )
+    }
+
+    func browseCatalog(
+        addonId: String?,
+        manifestURL: String?,
+        contentType: String,
+        catalogId: String,
+        skip: Int,
+        genre: String?
+    ) async throws -> CatalogPage {
+        try await browseCatalog(
+            addonId: addonId,
             contentType: contentType,
             catalogId: catalogId,
             skip: skip,
@@ -2544,6 +2572,24 @@ final class CinemetaCatalogRepository: CatalogRepository {
         skip: Int,
         genre: String?
     ) async throws -> CatalogPage {
+        try await browseCatalog(
+            addonId: addonId,
+            manifestURL: nil,
+            contentType: contentType,
+            catalogId: catalogId,
+            skip: skip,
+            genre: genre
+        )
+    }
+
+    func browseCatalog(
+        addonId: String?,
+        manifestURL: String?,
+        contentType: String,
+        catalogId: String,
+        skip: Int,
+        genre: String?
+    ) async throws -> CatalogPage {
         let metadataContext = Self.metadataCacheContext
         if addonId == AniListService.addonID {
             let page = await AniListService.browse(catalogId: catalogId, skip: skip, genre: genre)
@@ -2566,7 +2612,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         let sourceBaseURL: URL
-        if let addonId, !addonId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        if let installed = Self.installedManifestURL(manifestURL) {
+            // The install the first page came from, as the first page used it.
+            sourceBaseURL = installed.deletingLastPathComponent()
+        } else if let addonId, !addonId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             guard let resolved = await baseURL(
                 forAddonId: addonId,
                 contentType: contentType,
@@ -2945,6 +2994,32 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return items
     }
 
+    /// `manifestURL` when it's still one of the enabled add-ons, so a row
+    /// kept from before an add-on was removed, disabled or reconfigured isn't
+    /// sent to an install the viewer no longer uses.
+    private static func installedManifestURL(_ manifestURL: String?) -> URL? {
+        guard let raw = manifestURL?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              let url = URL(string: raw),
+              url.lastPathComponent.lowercased() == "manifest.json" else { return nil }
+        let enabled = Set(configuredStreamAddonManifestURLs.map(\.absoluteString))
+        return enabled.contains(url.absoluteString) ? url : nil
+    }
+
+    /// Whether `manifest` lists the catalog (id, or the part before a comma,
+    /// and an equivalent type when one is given).
+    private static func manifest(_ manifest: AddonManifest, hasCatalog catalogId: String, contentType: String?) -> Bool {
+        guard let catalogs = manifest.catalogs else { return false }
+        let baseCatalogId = catalogId.components(separatedBy: ",").first ?? catalogId
+        return catalogs.contains { cat in
+            let idMatches = cat.id.caseInsensitiveCompare(catalogId) == .orderedSame ||
+                            cat.id.caseInsensitiveCompare(baseCatalogId) == .orderedSame
+            let typeMatches = contentType.map {
+                cat.type.caseInsensitiveCompare($0) == .orderedSame || AddonTransportUrls.isTypeEquivalent(cat.type, $0)
+            } ?? true
+            return idMatches && typeMatches
+        }
+    }
+
     private func baseURL(
         forAddonId addonId: String?,
         contentType: String? = nil,
@@ -2988,7 +3063,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
             candidateManifestURLs.append(u)
         }
 
-        // 4. Match by manifest.id or manifest URL
+        // 4. Match by manifest.id or manifest URL. The same add-on can be
+        // installed more than once with different configurations (lists,
+        // tokens), and every copy reports the same manifest.id. Prefer the
+        // copy that has this catalog: asking another copy for a later page
+        // fails, and the row or grid stops loading after its first page.
+        var firstIdMatch: URL?
         for manifestURL in candidateManifestURLs {
             if manifestURL.absoluteString == raw ||
                manifestURL.deletingLastPathComponent().absoluteString == raw {
@@ -2999,10 +3079,17 @@ final class CinemetaCatalogRepository: CatalogRepository {
                    (manifest.id == raw ||
                     manifest.id.caseInsensitiveCompare(raw) == .orderedSame ||
                     (extractedManifestId != nil && manifest.id.caseInsensitiveCompare(extractedManifestId!) == .orderedSame)) {
-                    return manifestURL.deletingLastPathComponent()
+                    guard let catalogId, !catalogId.isEmpty else {
+                        return manifestURL.deletingLastPathComponent()
+                    }
+                    if Self.manifest(manifest, hasCatalog: catalogId, contentType: contentType) {
+                        return manifestURL.deletingLastPathComponent()
+                    }
+                    if firstIdMatch == nil { firstIdMatch = manifestURL.deletingLastPathComponent() }
                 }
             }
         }
+        if let firstIdMatch { return firstIdMatch }
 
         // 5. Cinemeta shortcuts (only if no configured add-on claimed the id above)
         if Self.isCinemetaEnabled,
@@ -3014,23 +3101,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         // 6. Match by catalogId and contentType in manifest.catalogs (Fallback for custom/recs/synced catalogs)
         if let catalogId, !catalogId.isEmpty {
-            let baseCatalogId = catalogId.components(separatedBy: ",").first ?? catalogId
             for manifestURL in candidateManifestURLs {
                 if let manifest = await manifest(for: manifestURL),
-                   let catalogs = manifest.catalogs {
-                    let hasMatchingCatalog = catalogs.contains { cat in
-                        let idMatches = cat.id == catalogId ||
-                                        cat.id == baseCatalogId ||
-                                        cat.id.caseInsensitiveCompare(catalogId) == .orderedSame ||
-                                        cat.id.caseInsensitiveCompare(baseCatalogId) == .orderedSame
-                        let typeMatches = (contentType == nil ||
-                                           cat.type.caseInsensitiveCompare(contentType!) == .orderedSame ||
-                                           AddonTransportUrls.isTypeEquivalent(cat.type, contentType!))
-                        return idMatches && typeMatches
-                    }
-                    if hasMatchingCatalog {
-                        return manifestURL.deletingLastPathComponent()
-                    }
+                   Self.manifest(manifest, hasCatalog: catalogId, contentType: contentType) {
+                    return manifestURL.deletingLastPathComponent()
                 }
             }
         }
