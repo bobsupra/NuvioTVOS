@@ -5422,6 +5422,7 @@ private struct TVHomeFocusedCardObserver: View {
 private final class TVHomeFocusWork {
     struct VisibleSectionsSignature: Equatable {
         let cwVisible: Bool
+        let cwPlaceholder: Bool
         let cwCount: Int
         let cwFirstId: String?
         let upCount: Int
@@ -6077,6 +6078,9 @@ struct TVHomeView: View {
     /// Add-on/catalog settings the last completed load actually read.
     @State private var lastLoadedInputSignature: String?
     @State private var rawContinueWatchingItems: [ContinueWatchingItem] = []
+    /// False until the selected remote progress source has answered once. Until
+    /// then, with nothing to show, the row holds its place with loading cards.
+    @State private var didRemoteContinueWatchingAnswer = false
     @State private var appliedContinueWatchingSort: String?
     @State private var continueWatching: [ContinueWatchingItem] = []
     @State private var upcomingItems: [ContinueWatchingItem] = []
@@ -6735,6 +6739,14 @@ struct TVHomeView: View {
             guard collectionHome == nil else { return }
             refreshContinueWatchingOrigins(rawContinueWatchingItems)
         }
+        .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification)
+            .merge(with: NotificationCenter.default.publisher(for: SimklAuthStore.changedNotification))
+            .merge(with: NotificationCenter.default.publisher(for: MdbListAuthStore.changedNotification))
+            .merge(with: NotificationCenter.default.publisher(for: WeTrakrAuthStore.changedNotification))
+            .receive(on: RunLoop.main)) { _ in
+            // A saved row belongs to the account that was signed in.
+            RemoteContinueWatchingRowCache.removeAll()
+        }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
             guard isActive && !isFullScreenOverlayPresented else { return }
             scheduleContinueWatchingRefresh()
@@ -6827,6 +6839,7 @@ struct TVHomeView: View {
                 pendingContinueWatchingDebounceTask?.cancel()
                 pendingContinueWatchingDebounceTask = nil
                 continueWatchingRefreshGeneration &+= 1
+                didRemoteContinueWatchingAnswer = true
             }
         }
     }
@@ -7010,6 +7023,7 @@ struct TVHomeView: View {
             traktWatchedHistorySyncTask = nil
             finishSimklHomeLoadingDiagnostic()
             continueWatchingRefreshGeneration &+= 1
+            didRemoteContinueWatchingAnswer = true
         }
     }
 
@@ -8159,6 +8173,16 @@ struct TVHomeView: View {
             return .gridHero
         }
         for (index, section) in visibleSections.enumerated() {
+            // Continue Watching takes first focus even while it loads from a
+            // remote source: its loading cards hold focus until the titles
+            // arrive, instead of the row below taking it.
+            if section.id == TVHomeSection.continueWatchingId, section.isLoadingPlaceholder {
+                return .card(
+                    key: TVHomeCardIdentity.placeholderKey(rowID: section.id, index: 0),
+                    sectionID: section.id,
+                    sectionIndex: index
+                )
+            }
             guard section.hasContent, !section.isLoadingPlaceholder else { continue }
             if let folder = section.collectionFolders.first {
                 return .card(
@@ -8546,6 +8570,14 @@ struct TVHomeView: View {
         }
         if let saved = store.lastFocusedCardID {
             return saved
+        }
+        // Continue Watching is still loading from a remote source. It is the
+        // row that takes first focus, so wait for it rather than settle on the
+        // row below and leave the user there when it arrives.
+        if visibleSections.contains(where: {
+            $0.id == TVHomeSection.continueWatchingId && $0.isLoadingPlaceholder
+        }) {
+            return nil
         }
         guard let section = visibleSections.first(where: {
             $0.hasContent && !$0.isLoadingPlaceholder
@@ -9249,8 +9281,14 @@ struct TVHomeView: View {
     }
 
     private var visibleSections: [TVHomeSection] {
+        let showsResumePlaceholder = continueWatchingVisible
+            && collectionHome == nil
+            && usesRemoteProgress
+            && !didRemoteContinueWatchingAnswer
+            && continueWatching.isEmpty
         let signature = TVHomeFocusWork.VisibleSectionsSignature(
             cwVisible: continueWatchingVisible,
+            cwPlaceholder: showsResumePlaceholder,
             cwCount: continueWatchingVisible ? continueWatchingMetas.count : 0,
             cwFirstId: continueWatchingVisible ? continueWatchingMetas.first?.id : nil,
             upCount: continueWatchingVisible ? upcomingMetas.count : 0,
@@ -9273,7 +9311,8 @@ struct TVHomeView: View {
             id: TVHomeSection.continueWatchingId,
             title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
             items: continueWatchingMetas,
-            posterShape: continueWatchingLandscape ? "landscape" : "poster"
+            posterShape: continueWatchingLandscape ? "landscape" : "poster",
+            isLoadingPlaceholder: showsResumePlaceholder
         )
         let upcomingSection = TVHomeSection(
             id: TVHomeSection.upcomingId,
@@ -9287,7 +9326,8 @@ struct TVHomeView: View {
             items: calendarToday.metas,
             posterShape: continueWatchingLandscape ? "landscape" : "poster"
         )
-        let pinnedSections = ((continueWatching.isEmpty || !continueWatchingVisible) ? [] : [resumeSection])
+        let showsResumeSection = continueWatchingVisible && (!continueWatching.isEmpty || showsResumePlaceholder)
+        let pinnedSections = (showsResumeSection ? [resumeSection] : [])
             + ((upcomingMetas.isEmpty || !continueWatchingVisible) ? [] : [upcomingSection])
             + ((calendarToday.isEmpty || !homeCalendarToday) ? [] : [calendarTodaySection])
             + [localTitlesSection].compactMap { $0 }
@@ -10780,9 +10820,11 @@ struct TVHomeView: View {
                 if let displayed = displayedProgressSource, displayed != selectedProgressSource {
                     setContinueWatching([])
                     displayedProgressSource = selectedProgressSource
+                    didRemoteContinueWatchingAnswer = false
                 } else if displayedProgressSource == nil {
                     displayedProgressSource = selectedProgressSource
                 }
+                showSavedRemoteContinueWatchingIfEmpty()
                 #if DEBUG
                 logRowWindow("remote progress source (\(selectedProgressSource.rawValue))")
                 #endif
@@ -10942,6 +10984,12 @@ struct TVHomeView: View {
         }
 
         print("[ContinueWatching][Home] refreshContinueWatchingFromSelectedSource: fetching from remote provider \(source.rawValue)")
+        // Whatever the provider says, it has answered: the loading cards go.
+        defer {
+            if generation == continueWatchingRefreshGeneration {
+                didRemoteContinueWatchingAnswer = true
+            }
+        }
         let items = await TraktProgressService.fetchContinueWatching(
             repository: repository,
             source: source,
@@ -10980,8 +11028,15 @@ struct TVHomeView: View {
                 && seenMetaIds.insert($0.meta.id).inserted
         }
         print("[ContinueWatching][Home] refreshContinueWatchingFromSelectedSource: remote returned \(items.count) items -> visible \(visibleItems.count)")
+        let focusWasOnPlaceholder = !didRemoteContinueWatchingAnswer
+            && continueWatching.isEmpty
+            && focusedSectionId == TVHomeSection.continueWatchingId
         setContinueWatching(visibleItems)
+        if focusWasOnPlaceholder {
+            moveFocusFromPlaceholderToFirstContinueWatchingCard()
+        }
         displayedProgressSource = source
+        RemoteContinueWatchingRowCache.save(visibleItems, profileId: profileID, source: source.rawValue)
         ContinueWatchingStore.writeTopShelfFeed(from: visibleItems)
 
         // Continue Watching is visible now. Other providers own their own
@@ -11007,6 +11062,31 @@ struct TVHomeView: View {
 
     private var selectedProgressSource: TraktWatchProgressSource {
         TraktSettingsStore.watchProgressSource
+    }
+
+    /// Until the provider answers, shows the row it returned last time, so
+    /// Continue Watching is there when Home opens and can take focus.
+    private func showSavedRemoteContinueWatchingIfEmpty() {
+        guard rawContinueWatchingItems.isEmpty else { return }
+        let saved = RemoteContinueWatchingRowCache.load(
+            profileId: ContinueWatchingStore.activeProfileId,
+            source: selectedProgressSource.rawValue
+        ).filter(shouldDisplayContinueWatchingItem)
+        guard !saved.isEmpty else { return }
+        print("[ContinueWatching][Home] showing saved \(selectedProgressSource.rawValue) row (\(saved.count)) until the fetch returns")
+        setContinueWatching(saved)
+    }
+
+    /// The loading cards had focus when the row arrived: the first title takes it,
+    /// so focus stays in the row instead of going wherever the focus engine picks.
+    private func moveFocusFromPlaceholderToFirstContinueWatchingCard() {
+        DispatchQueue.main.async {
+            guard focusedSectionId == TVHomeSection.continueWatchingId,
+                  let first = continueWatchingMetas.first else { return }
+            let cardKey = TVHomeCardIdentity.key(rowID: TVHomeSection.continueWatchingId, item: first)
+            store.lastFocusedCardID = cardKey
+            setFocusedCardID(cardKey)
+        }
     }
 
     private var usesRemoteProgress: Bool {
