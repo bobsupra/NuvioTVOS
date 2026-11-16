@@ -5518,11 +5518,12 @@ struct TvDetailsContent: View {
 
     /// Play asked for again while focus is nowhere as Details opens: the first ask can find Play
     /// not focusable yet, and nothing had focus until tvOS put it on Trailer by itself most of a
-    /// second later. Every 100 ms for up to two seconds, while focus stays out of the sections.
+    /// second later. Every 100 ms for up to four seconds (a title opened for the first time took
+    /// 1.8 s), while focus stays out of the sections.
     private func keepAskingForPlay(attempt: Int = 0) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             guard openingPlayFocusPending else { return }
-            guard focusedDetailsSection == .actions, attempt < 20 else {
+            guard focusedDetailsSection == .actions, attempt < 40 else {
                 openingPlayFocusPending = false
                 return
             }
