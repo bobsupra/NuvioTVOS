@@ -50,23 +50,23 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.5.1** is the latest tvOS release.
+**Beta 3.5.2** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.1/NuvioTV-3.5.1-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.1) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.2/NuvioTV-3.5.2-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.2) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.5.1
+### New in Beta 3.5.2
 
-- **AniList & MyAnimeList Integrations:** Full anime tracking sync with AniList and MyAnimeList. Syncs watched episodes, scores, and status with client credentials kept securely on the Apple TV.
-- **Native Top Tab Navigation:** Optional layout in **Settings → Appearance** to switch from sidebar to native Apple TV top tab bar.
-- **Custom Subtitle Fonts & Style Presets:** Load custom `.ttf`/`.otf` fonts transferred locally or via URL, plus manage and reorder subtitle style presets.
-- **Stream List Customization & Live Preview:** Customize stream source formatting with an interactive live preview, plus locally cached provider badge artwork.
-- **Continue Watching Labels & Title Scrolling:** Control Continue Watching card labels (Focused Only, Always, Hidden) and marquee scroll long titles on focus.
-- **Player Speed Controls & Spoiler Masking:** Granular playback speed adjustment and episode thumbnail/description spoiler protection.
-- **Multi-Source External Hero Ratings:** Ratings from IMDb, Rotten Tomatoes, AniList, MyAnimeList, and TMDB with configurable order and provider switches.
-- **Hardening & Stability:** Decoupled next-episode pre-buffering (no interruptions to playing torrent or Usenet streams), stabilized Details back-navigation, loading backdrop alignment fix, and Trakt Keychain persistence.
+- **Plex Media Server Integration:** Connect your Plex Media Server directly to Apple TV with multi-user Plex Home support, intro/credits skip markers, Plex stream labels, and Top Shelf/Continue Watching sync.
+- **Unified Library "Servers" Tab:** Dedicated Servers tab inside Library aggregating Plex, Jellyfin, and SMB shares into one unified browsing interface.
+- **AI "Surprise Me" & "For You" Catalogs:** AI-curated discovery across Trakt, Simkl, AniList, and MAL watch history with customizable AI engines (Gemini Flash, OpenRouter, DeepSeek, Qwen).
+- **Episode Shuffle Play:** Shuffle TV show episodes effortlessly from the series Details view or in-player Episodes shelf.
+- **AIOStreams & JS Plugins:** Direct integration for AIOStreams scraper configurations and local execution of JavaScript add-on plugins.
+- **Ambient Mode Screen Saver:** Full-bleed cinematic backdrop screensaver with metadata highlights when idle.
+- **Estimated Finish Time & Stream Recommendations:** Real-time clock completion time in HUD, best stream badges, and stream name keyword filtering.
+- **Navigation, Stream Resolution & Stability Polish:** Canonical IMDb stream ID resolution from TMDB, source picker focus retention, Jellyfin rate-limit recovery, and Keychain isolation.
 
 ### Built-in Player
 
