@@ -3,7 +3,9 @@ name: Node.js for tvOS
 # Builds nodejs-mobile (Node.js 24) for tvOS as NodeMobile.xcframework, the
 # runtime the original AIOStreams runs in inside Nuvio (AIOStreamsHost; the
 # tvOS changes: aio-node/node-tvos/tvos_patch.py), and publishes it as
-# NodeMobile.xcframework.zip in the release node-tvos-<nodejs-mobile tag>.
+# NodeMobile.xcframework.zip in the release NODE_TVOS_RELEASE (a new name for
+# each build that changes what is in it: a release Package.swift points at
+# must keep its zip, or its checksum no longer matches).
 # Vendor/NodeMobile/Package.swift points at that release: after a new build,
 # update its URL and the checksum this workflow prints.
 on:
@@ -24,6 +26,8 @@ permissions:
 
 env:
   NODEJS_MOBILE_TAG: v24.20.0-0
+  # node-tvos-v24.20.0-0: the first build; -icu: with ICU's break iterators (Intl.Segmenter).
+  NODE_TVOS_RELEASE: node-tvos-v24.20.0-0-icu
   TVOS_DEPLOYMENT_TARGET: "18.0"
 
 jobs:
@@ -180,15 +184,15 @@ jobs:
         with:
           name: NodeMobile.xcframework
           path: out/NodeMobile.xcframework.zip
-      - name: Release node-tvos-${{ env.NODEJS_MOBILE_TAG }}
+      - name: Release ${{ env.NODE_TVOS_RELEASE }}
         if: inputs.publish
         env:
           GH_TOKEN: ${{ github.token }}
           CHECKSUM: ${{ steps.zip.outputs.checksum }}
         run: |
           set -euo pipefail
-          tag="node-tvos-$NODEJS_MOBILE_TAG"
-          notes="nodejs-mobile $NODEJS_MOBILE_TAG for tvOS $TVOS_DEPLOYMENT_TARGET+ (device arm64, simulator arm64), for AIOStreams in Nuvio.
+          tag="$NODE_TVOS_RELEASE"
+          notes="nodejs-mobile $NODEJS_MOBILE_TAG for tvOS $TVOS_DEPLOYMENT_TARGET+ (device arm64, simulator arm64), for AIOStreams in Nuvio. Small ICU (English) with ICU's break iterators, for Intl.Segmenter.
 
           Vendor/NodeMobile/Package.swift:
           url: https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/NodeMobile.xcframework.zip
@@ -197,7 +201,7 @@ jobs:
             gh release upload "$tag" out/NodeMobile.xcframework.zip --clobber -R "$GITHUB_REPOSITORY"
             gh release edit "$tag" --notes "$notes" -R "$GITHUB_REPOSITORY"
           else
-            gh release create "$tag" out/NodeMobile.xcframework.zip --title "Node.js for tvOS ($NODEJS_MOBILE_TAG)" \
+            gh release create "$tag" out/NodeMobile.xcframework.zip --title "Node.js for tvOS ($NODEJS_MOBILE_TAG, break iterators)" \
               --notes "$notes" --target "$GITHUB_SHA" --latest=false -R "$GITHUB_REPOSITORY"
           fi
           echo "::notice::https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/NodeMobile.xcframework.zip · $CHECKSUM"

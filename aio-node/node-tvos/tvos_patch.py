@@ -9,7 +9,9 @@ they are. What differs:
 - APIs that tvOS forbids outright (fork / exec*), which iOS only fails at run
   time: libuv already returns ENOSYS from uv_spawn on tvOS, Node's
   process.execve() needs the same guard,
-- the framework project (device family 3, tvOS deployment target).
+- the framework project (device family 3, tvOS deployment target),
+- ICU's break-iterator data, which small-icu leaves out and Intl.Segmenter
+  needs.
 
 Usage: tvos_patch.py <nodejs-mobile source tree> [tvOS deployment target]
 """
@@ -148,4 +150,25 @@ def prepare_script(text):
 
 
 edit("tools/ios_framework_prepare.sh", prepare_script)
+
+
+# 5. ICU: small-icu (English only) drops all break-iterator data, so
+# Intl.Segmenter can't make its ICU break iterator. V8 doesn't check for that
+# in a release build: segment() then dereferences null and the whole app
+# crashes (AIOStreams' formatter cuts text to N characters with it, as in
+# "{stream.title::truncate(25)}"). Keep the break iterators: the rules for
+# root and English, every rule file and the dictionaries (Chinese, Japanese,
+# Thai, Lao, Burmese, Khmer words), a few MB.
+def icu_small(text):
+    for old, new in [
+        ('"brkitr": "none",', '"brkitr": "locales",'),
+        ('"brkfiles": "none",', '"brkfiles": "leavealone",'),
+        ('"brkdict": "none",', '"brkdict": "leavealone",'),
+        ('    "brkitr/root.res",\n', ''),
+    ]:
+        text = replace_once(old, new)(text)
+    return text
+
+
+edit("tools/icu/icu_small.json", icu_small)
 print(f"tvOS patches applied (deployment target {target}).")
