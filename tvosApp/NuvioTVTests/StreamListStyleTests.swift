@@ -205,4 +205,25 @@ final class StreamListStyleTests: XCTestCase {
         let bracketOutput = StreamListStyle.displayText(bracketInput, hidingAddonName: "Torrentio")
         XCTAssertEqual(bracketOutput, "[RD+]\n1080p")
     }
+
+    @MainActor
+    func testLastPlayedDisplayStartsAtZeroMinutesAndOmitsSeconds() {
+        let base = Date(timeIntervalSince1970: 1_700_000_000)
+
+        // Seconds < 60 must start with 0 min (never seconds or "just now")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base), "0 min")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(15)), "0 min")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(59)), "0 min")
+
+        // Increments on the minute boundary without seconds
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(60)), "1 min")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(119)), "1 min")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(120)), "2 min")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(3599)), "59 min")
+
+        // Multi-hour and clock skew
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(3600)), "1 hr")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(3660)), "1 hr, 1 min")
+        XCTAssertEqual(NuvioLastPlayedDisplay.formatted(from: base, relativeTo: base.addingTimeInterval(-10)), "0 min")
+    }
 }

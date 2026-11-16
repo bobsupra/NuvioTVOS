@@ -12314,7 +12314,9 @@ private struct TvStreamCard: View {
                     if let lastPlayedAt {
                         HStack(spacing: 6) {
                             Text(L10n.string("details_last_played", fallback: "Last played"))
-                            Text(lastPlayedAt, style: .relative)
+                            TimelineView(.periodic(from: lastPlayedAt, by: 60)) { context in
+                                Text(NuvioLastPlayedDisplay.formatted(from: lastPlayedAt, relativeTo: context.date))
+                            }
                         }
                         .font(.system(size: style.detailFont(22), weight: .medium))
                         .foregroundColor(.white.opacity(0.58))

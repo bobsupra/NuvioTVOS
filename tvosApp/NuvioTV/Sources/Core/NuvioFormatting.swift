@@ -114,3 +114,22 @@ enum NuvioRuntimeDisplay {
         return Int(value[range])
     }
 }
+
+/// Formats the last-played relative timestamp on source cards into minutes (and hours/days),
+/// omitting seconds and starting at "0 min".
+@MainActor
+enum NuvioLastPlayedDisplay {
+    private static let formatter: DateComponentsFormatter = {
+        let f = DateComponentsFormatter()
+        f.allowedUnits = [.day, .hour, .minute]
+        f.unitsStyle = .short
+        f.maximumUnitCount = 2
+        return f
+    }()
+
+    static func formatted(from date: Date, relativeTo now: Date = Date()) -> String {
+        let elapsed = max(0, now.timeIntervalSince(date))
+        return formatter.string(from: elapsed) ?? "0 min"
+    }
+}
+
