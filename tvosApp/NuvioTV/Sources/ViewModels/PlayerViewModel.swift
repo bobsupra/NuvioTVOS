@@ -313,6 +313,8 @@ class PlayerViewModel: ObservableObject {
     @Published var isTimelineFocused: Bool = false
     /// Infuse-style scrub mode (touchpad drag / D-pad jump / wheel fine-tune).
     @Published private(set) var isScrubbing = false
+    /// Cooldown timestamp to prevent duplicate / cascading exit commands from multiple views in the same gesture.
+    var lastRemoteBackHandledAt: CFTimeInterval = 0
     /// Cache-backed Aether still for the current scrub target. Nil means the
     /// time-only HUD remains visible while a still is unavailable.
     @Published private(set) var scrubThumbnail: CGImage?
@@ -5991,6 +5993,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func cancelScrub() {
+        suppressMoveBriefly(0.35)
         resetScrubSession()
         showControls = true
         if status == .paused,

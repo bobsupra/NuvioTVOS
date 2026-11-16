@@ -11682,7 +11682,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
     @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
     @AppStorage(SettingsKey.dualLayerRoute) private var dualLayerRoute = "softwareHost"
-    @AppStorage(SettingsKey.foldsDolbyVisionFEL) private var foldsDolbyVisionFEL = true
+    @AppStorage(SettingsKey.foldsDolbyVisionFEL) private var foldsDolbyVisionFEL = false
     @AppStorage(SettingsKey.lowResUpscaling) private var lowResUpscaling = true
     @AppStorage(SettingsKey.upscaleScaler) private var upscaleScaler = "smart"
     @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false

@@ -902,7 +902,8 @@ extension PlayerView {
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
-                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
+                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) },
+                onRemoteBackAction: { handleRemoteBack() }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(shouldShowControls ? 1 : 0)

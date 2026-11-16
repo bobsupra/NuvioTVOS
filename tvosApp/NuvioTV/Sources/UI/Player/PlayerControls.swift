@@ -35,6 +35,7 @@ struct PlayerControls: View {
     @Binding var requestedFocus: PlayerControlFocus?
     var onFocusSkipSegment: () -> Void = {}
     var onFocusNextEpisode: () -> Void = {}
+    var onRemoteBackAction: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
     @State private var isAuxiliaryCardFocusActive = false
@@ -59,7 +60,6 @@ struct PlayerControls: View {
                     bottomControls
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .onExitCommand(perform: handleExit)
             }
             .disabled(isNamingSubtitlePreset)
 
@@ -352,19 +352,7 @@ struct PlayerControls: View {
             return
         }
         PlaybackTimelineRecorder.record(.controlsExitReceived, engine: viewModel.activeEngineKind)
-        if viewModel.isScrubbing {
-            viewModel.cancelScrub()
-        } else if focusedControl == nil,
-                  viewModel.showControls,
-                  viewModel.controlsAutoHideSuspended,
-                  !isAuxiliaryCardFocusActive,
-                  !isSkipSegmentFocused,
-                  !isNextEpisodeFocused {
-            // Native Menu owns focus until Back dismisses it.
-            return
-        } else {
-            viewModel.hideControls()
-        }
+        onRemoteBackAction()
     }
 
     private var isPlaybackStarted: Bool {

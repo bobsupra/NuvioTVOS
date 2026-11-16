@@ -22,6 +22,10 @@ extension PlayerView {
 
     /// Back / Menu during playback (also from the remote-gesture layer, which takes the remote).
     func handleRemoteBack() {
+        let now = CACurrentMediaTime()
+        guard now - viewModel.lastRemoteBackHandledAt > 0.35 else { return }
+        viewModel.lastRemoteBackHandledAt = now
+
         PlaybackTimelineRecorder.record(.backPressed, engine: viewModel.activeEngineKind)
         if viewModel.isSceneDetailVisible {
             withAnimation(.easeInOut(duration: 0.2)) {
@@ -50,6 +54,14 @@ extension PlayerView {
         }
         if viewModel.isScrubbing {
             viewModel.cancelScrub()
+            return
+        }
+        if viewModel.isHoldingSeek {
+            viewModel.stopRepeatingSkip()
+            return
+        }
+        if viewModel.pendingSeekDelta != 0 {
+            viewModel.pendingSeekDelta = 0
             return
         }
         if viewModel.showPauseOverlay {

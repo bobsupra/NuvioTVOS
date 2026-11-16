@@ -2615,6 +2615,36 @@ extension PlayerControlsSettingsTests {
     }
 
     @MainActor
+    func testCancelScrubbingKeepsControlsOpenAndSuppressesMove() {
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.time = PlayerTime(current: 120, duration: 3600)
+        model.pause()
+        XCTAssertEqual(model.status, .paused)
+        XCTAssertTrue(model.showControls)
+
+        // Engage scrubbing via touchpad
+        model.remoteTouchBegan()
+        model.remoteTouchMoved(dx: 60, dy: 0)
+        XCTAssertTrue(model.isScrubbing)
+        model.remoteTouchEnded(dx: 60, dy: 0)
+
+        // Cancel scrub (Back button tapped while preview / scrub is active)
+        model.cancelScrub()
+        XCTAssertFalse(model.isScrubbing, "Cancelling scrub must end scrubbing mode")
+        XCTAssertTrue(model.showControls, "Cancelling scrub must leave controls visible and not dismiss player")
+        XCTAssertTrue(model.moveSuppressed, "Cancelling scrub must briefly suppress move commands")
+
+        // Exit command debounce simulation
+        let now = CACurrentMediaTime()
+        model.lastRemoteBackHandledAt = now
+        XCTAssertFalse(CACurrentMediaTime() - model.lastRemoteBackHandledAt > 0.35, "Immediate duplicate exit command within cooldown must be suppressed")
+    }
+
+    @MainActor
     func testPauseClickJitterDoesNotTriggerScrubbing() {
         let provider = ControlledScrubThumbnailProvider()
         let model = PlayerViewModel(

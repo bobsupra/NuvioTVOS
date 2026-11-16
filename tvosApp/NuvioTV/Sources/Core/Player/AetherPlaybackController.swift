@@ -5249,7 +5249,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
         let dualLayerRouteRaw = ProfileSettings.current.string(forKey: SettingsKey.dualLayerRoute) ?? "softwareHost"
         let dualLayerRoute: DualLayerRoute = dualLayerRouteRaw == "avPlayerOutput" ? .avPlayerOutput : .softwareHost
-        let foldsDolbyVisionFEL = ProfileSettings.current.object(forKey: SettingsKey.foldsDolbyVisionFEL) as? Bool ?? true
+        let foldsDolbyVisionFEL = ProfileSettings.current.object(forKey: SettingsKey.foldsDolbyVisionFEL) as? Bool ?? false
         let sourceSupportsHDR10PlusPreflight = ["file", "http", "https"].contains(
             request.videoURL.scheme?.lowercased() ?? "")
         let prefersHDR10PlusForThisLoad = !panelPresentsDV
