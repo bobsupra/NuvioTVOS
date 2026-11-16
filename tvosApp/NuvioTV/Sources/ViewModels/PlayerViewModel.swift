@@ -1757,7 +1757,9 @@ class PlayerViewModel: ObservableObject {
         self.explicitSeekProgressCheckpoint = nil
         self.didStartTraktScrobble = false
         self.lastTraktProgressReport = .distantPast
-        self.expectedDurationSeconds = isStandalonePlaybackSession ? nil : Self.expectedDuration(for: meta)
+        self.expectedDurationSeconds = isStandalonePlaybackSession
+            ? nil
+            : Self.expectedDuration(for: meta, episode: resolvedEpisodeNumbers)
         self.didDetectReplacementStream = false
         self.replacementStreamHits = 0
         self.hasRenderedFirstFrame = false
@@ -9252,16 +9254,39 @@ class PlayerViewModel: ObservableObject {
         return true
     }
 
-    private static func expectedDuration(for meta: NuvioMeta) -> Double? {
+    private static func expectedDuration(for meta: NuvioMeta, episode: (season: Int, episode: Int)?) -> Double? {
         let progressItem = ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
-        return expectedDuration(for: meta, progressItem: progressItem)
+        return expectedDuration(for: meta, progressItem: progressItem, episode: episode)
     }
 
-    static func expectedDuration(for meta: NuvioMeta, progressItem: ContinueWatchingItem?) -> Double? {
-        if let progressItem, !progressItem.isUpNextEntry, progressItem.duration >= 60 {
+    /// The length the file about to play should have: the one recorded for
+    /// this same episode, else the title's runtime.
+    ///
+    /// A series has one Continue Watching entry, for the episode last played.
+    /// Its length says nothing about another episode: sources differ, and one
+    /// may serve three episodes in a single 70-minute file where another
+    /// serves each on its own. Using it for a different episode made a
+    /// normal file look like an expired-link slate.
+    static func expectedDuration(
+        for meta: NuvioMeta,
+        progressItem: ContinueWatchingItem?,
+        episode: (season: Int, episode: Int)? = nil
+    ) -> Double? {
+        if let progressItem, !progressItem.isUpNextEntry, progressItem.duration >= 60,
+           progressItemIsForEpisode(progressItem, episode: episode) {
             return progressItem.duration
         }
         return runtimeSeconds(from: meta.runtime)
+    }
+
+    /// With no episode on either side (a movie, or an entry saved without
+    /// numbers) the entry is taken as it was before.
+    private static func progressItemIsForEpisode(
+        _ item: ContinueWatchingItem,
+        episode: (season: Int, episode: Int)?
+    ) -> Bool {
+        guard let episode, let season = item.season, let number = item.episode else { return true }
+        return season == episode.season && number == episode.episode
     }
 
     /// Parses a Stremio/Cinemeta runtime string ("115 min", "1h 55min", "120")
