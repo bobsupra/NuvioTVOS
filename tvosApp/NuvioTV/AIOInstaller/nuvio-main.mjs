@@ -853,7 +853,7 @@ startControl();
 log(`starting AIOStreams from ${aioRoot} (node ${process.version}, ${process.arch}, jitless: ${process.execArgv.includes('--jitless') || process.versions.mobile ? 'yes' : 'no'})`);
 // Intl.Segmenter (AIOStreams' formatter cuts text with it, "::truncate(N)") needs ICU's break
 // iterators: without them segment() crashes the app. Node.js for tvOS keeps them since
-// node-tvos-v24.20.0-0-icu; asking which locales it supports doesn't make one.
+// node-tvos-v24.20.0-0-r2; asking which locales it supports doesn't make one.
 log(`Intl.Segmenter: ${Intl.Segmenter.supportedLocalesOf(['en']).length > 0 ? 'ICU break iterators present' : 'no ICU break iterators: segment() would crash Nuvio'}`);
 try {
   installFfprobeBridge(process.env.NUVIO_FFPROBE_URL, log);
