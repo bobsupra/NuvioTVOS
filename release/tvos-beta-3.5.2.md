@@ -6,8 +6,6 @@
 
 > **Join the community:** [NuvioTVOS Discord](https://discord.gg/2YnNr2xmnJ) — chat, get help, report bugs, and share ideas.
 
-> 🎉 **Thank you for 300+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping reach 300+ stars on GitHub! Your feedback, issue reports, and testing make this possible.
-
 ### Plex Media Server Integration
 
 - **Native Plex Integration:** Connect your Plex Media Server directly to Apple TV with multi-user Plex Home support and watch status synchronization.
