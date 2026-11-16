@@ -118,6 +118,14 @@ final class AIOStreamsHostTests: XCTestCase {
         note("AIO-TEST log:\n" + aio.logLines.suffix(60).joined(separator: "\n"))
     }
 
+    /// Node.js' heap limit: set in the sheet, or half of what tvOS allows Nuvio more.
+    func testNodeHeapLimit() {
+        XCTAssertEqual(AIOStreamsHost.nodeHeapLimitMB(setting: 0, availableMB: 1028), 512)
+        XCTAssertEqual(AIOStreamsHost.nodeHeapLimitMB(setting: 0, availableMB: 3000), 1024)
+        XCTAssertEqual(AIOStreamsHost.nodeHeapLimitMB(setting: 0, availableMB: 500), 384)
+        XCTAssertEqual(AIOStreamsHost.nodeHeapLimitMB(setting: 768, availableMB: 500), 768)
+    }
+
     /// An AniList title: the ids the AIOStreams addon is asked by, per setting.
     func testAnimeSearchRequestIDs() {
         let all: (String) -> Bool = { _ in true }

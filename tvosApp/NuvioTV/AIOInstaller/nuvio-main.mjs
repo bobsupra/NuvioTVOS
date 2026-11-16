@@ -42,6 +42,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import v8 from 'node:v8';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { installFfprobeBridge } from './ffprobe-bridge.mjs';
@@ -879,3 +880,23 @@ log(ready ? `AIOStreams is ready in ${seconds} s, ${memory} MB` : `AIOStreams di
 setInterval(() => {
   writeState({ rssMB: Math.round(process.memoryUsage().rss / 1048576), heapMB: Math.round(process.memoryUsage().heapUsed / 1048576) });
 }, 60000).unref();
+logHeap();
+
+// Node.js' heap in the log next to Nuvio's own memory lines: its limit once, then a line
+// when the heap changed by 25 MB or more (checked every second while the event loop is
+// free), at least once a minute.
+function logHeap() {
+  const mb = (bytes) => Math.round(bytes / 1048576);
+  log(`memory (Node.js) · heap limit ${mb(v8.getHeapStatistics().heap_size_limit)} MB`);
+  let loggedHeap = 0;
+  let loggedAt = 0;
+  setInterval(() => {
+    const usage = process.memoryUsage();
+    const heap = mb(usage.heapUsed);
+    const now = Date.now();
+    if (Math.abs(heap - loggedHeap) < 25 && now - loggedAt < 60000) return;
+    loggedHeap = heap;
+    loggedAt = now;
+    log(`memory (Node.js) · heap ${heap} of ${mb(usage.heapTotal)} MB, rss ${mb(usage.rss)} MB, outside the heap ${mb(usage.external)} MB`);
+  }, 1000).unref();
+}

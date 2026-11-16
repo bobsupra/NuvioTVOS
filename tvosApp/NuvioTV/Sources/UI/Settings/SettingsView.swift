@@ -24087,6 +24087,16 @@ private struct AIOStreamsHostSheet: View {
                     aio.cycleAnimeRequest()
                 }
 
+                SettingsActionRow(
+                    title: "Node.js memory limit",
+                    subtitle: "How far AIOStreams' memory may grow before Node.js frees it, from the next start. tvOS closes Nuvio when Nuvio and AIOStreams together pass its own limit. By Apple TV: half of what tvOS allows Nuvio more when AIOStreams starts (384–1024 MB)."
+                        + (aio.appliedNodeMemoryLimit.map { "\nNow: \($0) MB" } ?? ""),
+                    value: aio.nodeMemoryLimit == 0 ? "By Apple TV" : "\(aio.nodeMemoryLimit) MB",
+                    accentColor: accentColor
+                ) {
+                    aio.cycleNodeMemoryLimit()
+                }
+
                 if let previous = aio.previousRun, aio.phase == .stopped || previous.unexpected {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("Last run" + (previous.date.map { " · " + $0.formatted(date: .abbreviated, time: .shortened) } ?? ""))
