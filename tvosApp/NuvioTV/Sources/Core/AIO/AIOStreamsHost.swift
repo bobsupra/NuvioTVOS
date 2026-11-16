@@ -1434,9 +1434,9 @@ final class AIOStreamsHost: ObservableObject {
     }
 
     /// Nuvio's memory (Node.js runs inside it) in the log while AIOStreams
-    /// runs, checked five times a second: a line when it changed by 25 MB or
-    /// more, each time while tvOS allows less than 200 MB more, and at least
-    /// once a minute. Written at once, so the last lines before tvOS closes Nuvio
+    /// runs, checked every second: a line when it changed by 25 MB or more,
+    /// every second while tvOS allows less than 200 MB more, and at least once
+    /// a minute. Written at once, so the last lines before tvOS closes Nuvio
     /// are in the next run's Last run.
     private func startMemoryLog() {
         guard memoryTimer == nil else { return }
@@ -1446,7 +1446,7 @@ final class AIOStreamsHost: ObservableObject {
     private nonisolated static func makeMemoryTimer() -> DispatchSourceTimer {
         let log = AIOMemoryLog()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "nuvio.aio.memory", qos: .utility))
-        timer.schedule(deadline: .now() + 0.2, repeating: 0.2)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
         timer.setEventHandler { log.check() }
         timer.resume()
         return timer
@@ -1496,6 +1496,13 @@ final class AIOStreamsHost: ObservableObject {
     await step('WebAssembly', () => typeof WebAssembly);
     await step('crypto', async () => (await import('node:crypto')).createHash('sha256').update('nuvio').digest('hex').slice(0, 16));
     await step('zlib', async () => { const zlib = await import('node:zlib'); return zlib.gunzipSync(zlib.gzipSync('nuvio')).toString(); });
+    await step('Intl.Segmenter', () => {
+      // Without ICU's break iterators segment() would crash the app: only asked when they are there.
+      if (Intl.Segmenter.supportedLocalesOf(['en']).length === 0) throw new Error('no ICU break iterators');
+      const graphemes = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('a👍🏽e\u0301🇨🇿')].length;
+      const words = [...new Intl.Segmenter('en', { granularity: 'word' }).segment('Ahoj, světe')].filter((part) => part.isWordLike).length;
+      return `${graphemes} graphemes, ${words} words`;
+    });
     await step('files', async () => { const fs = await import('node:fs'); const file = (process.env.TMPDIR || '/tmp') + '/nuvio-node-test.txt'; fs.writeFileSync(file, 'ok'); return fs.readFileSync(file, 'utf8'); });
     await step('sqlite', async () => { const { DatabaseSync } = await import('node:sqlite'); const db = new DatabaseSync(':memory:'); return db.prepare('select sqlite_version() as version').get().version; });
     await step('http server', async () => {

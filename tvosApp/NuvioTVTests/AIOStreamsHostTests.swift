@@ -118,6 +118,24 @@ final class AIOStreamsHostTests: XCTestCase {
         note("AIO-TEST log:\n" + aio.logLines.suffix(60).joined(separator: "\n"))
     }
 
+    /// Node.js for tvOS has ICU's break iterators: Intl.Segmenter works (without them its
+    /// segment() crashed the app). Runs the Node.js self-test and reads its Intl.Segmenter line.
+    func testNodeHasICUBreakIterators() async throws {
+        try XCTSkipIf(ProcessInfo.processInfo.environment["AIO_TESTS"] == "1",
+                      "AIOStreams runs in this test process, and Node.js starts once per process")
+        let host = AIOStreamsHost.shared
+        host.testNodeOnly()
+        let deadline = Date().addingTimeInterval(120)
+        var line: String?
+        while line == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 500_000_000)
+            host.refreshLog()
+            line = host.logLines.first { $0.contains("[node-test] Intl.Segmenter") }
+        }
+        let found = try XCTUnwrap(line, "No Intl.Segmenter line from the Node.js self-test:\n" + host.logLines.suffix(30).joined(separator: "\n"))
+        XCTAssertTrue(found.contains("4 graphemes, 2 words"), found)
+    }
+
     /// Node.js' heap limit: set in the sheet, or half of what tvOS allows Nuvio more.
     func testNodeHeapLimit() {
         XCTAssertEqual(AIOStreamsHost.nodeHeapLimitMB(setting: 0, availableMB: 1028), 512)
