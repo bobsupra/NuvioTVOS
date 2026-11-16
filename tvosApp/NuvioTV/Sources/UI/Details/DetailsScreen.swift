@@ -10555,6 +10555,13 @@ private struct TvStreamPickerOverlay: View {
     /// on the All chip; this drives the hand-off once results exist, once.
     @State private var didSeedStreamFocus = false
     @State private var restoredSourceFocusID: String?
+    /// The source row that last held focus. Add-ons answer one after another,
+    /// and each answer re-sorts the list; focus goes back to this row and not
+    /// to whichever source is first now.
+    @State private var lastFocusedSourceRowID: String?
+    /// Bumped to scroll the restored row back into view when its id has not
+    /// changed since the last restore.
+    @State private var sourceFocusScrollRequest = 0
     @State private var pickerProfileID: String?
     @State private var lastPlayedSourceMatch: LastManualSourceStore.Match?
     @State private var lastPlayedSourceStream: NuvioStream?
@@ -10763,6 +10770,9 @@ private struct TvStreamPickerOverlay: View {
                 if let newValue, newValue != filterAllKey, !didSeedStreamFocus {
                     didSeedStreamFocus = true
                 }
+                if let newValue, activePickerRowFocusIDs.contains(newValue) {
+                    lastFocusedSourceRowID = newValue
+                }
                 // Focusing a source must not request its URL: even a small
                 // range probe can cause an add-on to add or download a release.
                 guard newValue == nil else { return }
@@ -10953,7 +10963,11 @@ private struct TvStreamPickerOverlay: View {
             at: lastPlayedSourceIndex,
             in: displayedStreamRowFocusIDs
         )
-        let focusedIndex = focusedItem.flatMap { id in activeSourceRowFocusIDs.firstIndex(of: id) }
+        // Keep the row the viewer is on inside the rendered page. While focus
+        // is in flight after a rebuild, that is the row that last held it.
+        let rowIDs = activeSourceRowFocusIDs
+        let focusedIndex = focusedItem.flatMap { id in rowIDs.firstIndex(of: id) }
+            ?? lastFocusedSourceRowID.flatMap { id in rowIDs.firstIndex(of: id) }
         visibleStreamLimit = max(StreamPickerListBuilder.defaultPageSize, (focusedIndex ?? -1) + 1)
     }
 
@@ -11462,6 +11476,9 @@ private struct TvStreamPickerOverlay: View {
                     .onChange(of: restoredSourceFocusID) { _, id in
                         if let id { proxy.scrollTo(id, anchor: .center) }
                     }
+                    .onChange(of: sourceFocusScrollRequest) { _, _ in
+                        if let id = restoredSourceFocusID { proxy.scrollTo(id, anchor: .center) }
+                    }
                 }
             }
 
@@ -11646,6 +11663,22 @@ private struct TvStreamPickerOverlay: View {
             refreshDisplayedStreamsIfNeeded()
             guard focusedItem == nil || focusedItem == filterAllKey else { return }
             if didSeedStreamFocus {
+                // The focused row can lose focus when more sources arrive and
+                // the list is rebuilt around it. Seeding the first row then
+                // would put another source under the viewer's Select.
+                if let last = lastFocusedSourceRowID,
+                   let index = activeSourceRowFocusIDs.firstIndex(of: last) {
+                    visibleStreamLimit = max(visibleStreamLimit, index + 1)
+                    restoredSourceFocusID = last
+                    sourceFocusScrollRequest &+= 1
+                    // The row may be far down a lazy list now. Scroll to it
+                    // first, and ask for focus once it has had time to render.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        guard focusedItem == nil || focusedItem == filterAllKey else { return }
+                        grabFocus(last, attempt: 0)
+                    }
+                    return
+                }
                 let restored = restoredSourceFocusID.flatMap { id in
                     id == lastPlayedSourceRowFocusID || activeSourceRowFocusIDs.contains(id) ? id : nil
                 }
