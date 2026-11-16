@@ -603,6 +603,7 @@ final class AIOStreamsHost: ObservableObject {
         Self.note("arguments: " + arguments.dropFirst().map { $0.count > 200 ? "<script>" : $0 }.joined(separator: " "))
 
         let thread = Thread {
+            NuvioInstallAlternateSignalStack()
             Self.note("Node.js thread: stack \(Thread.current.stackSize / 1_048_576) MB · calling node_start")
             let status = Self.run(nodeStart, arguments: arguments)
             Self.note("Node.js exited with code \(status)")
@@ -682,6 +683,7 @@ final class AIOStreamsHost: ObservableObject {
             markedReady = true
             Self.saveRunRecord(kind: .aio, ready: true)
             Self.note("ready · \(Self.memoryDescription())")
+            Self.rearmCrashNotes()
             // Settled once the first warm-up is through, or a minute on.
             DispatchQueue.main.asyncAfter(deadline: .now() + 60) { Self.updateRunRecord(["settled": true]) }
         }
@@ -1111,6 +1113,7 @@ final class AIOStreamsHost: ObservableObject {
     /// search came since then (nuvio-main.mjs notes when).
     func warmUp(unlessSearchSince since: Date? = nil) async {
         guard phase == .running, addonEnabled, configurationVerified, !warmingUp, manifestURL != nil else { return }
+        Self.rearmCrashNotes()
         warmingUp = true
         defer { warmingUp = false }
         if let since {
@@ -1311,6 +1314,9 @@ final class AIOStreamsHost: ObservableObject {
         var unexpected = true
         if let crash = lines.last(where: { $0.hasPrefix("[nuvio] CRASH:") }) {
             summary = "Crashed — " + String(crash.dropFirst("[nuvio] CRASH: ".count))
+            if let detail = lines.last(where: { $0.hasPrefix("[nuvio] crash: ") }) {
+                summary += " · " + String(detail.dropFirst("[nuvio] crash: ".count))
+            }
         } else if lines.contains(where: { $0.hasPrefix("[nuvio] exit() was called") }) {
             summary = "Node.js closed the app (exit)"
         } else if let exited = lines.last(where: { $0.hasPrefix("[nuvio] Node.js exited") }) {
@@ -1363,22 +1369,51 @@ final class AIOStreamsHost: ObservableObject {
 
     // MARK: - Crash notes
 
+    private nonisolated static let crashSignals = [SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGTRAP, SIGFPE, SIGSYS]
+
     private nonisolated static func installCrashNotes() {
         guard !aioCrashNotesInstalled else { return }
         aioCrashNotesInstalled = true
         // Touch the buffers now: never for the first time inside a signal handler.
         _ = aioFrames
         _ = aioPreviousActions
-        for number in [SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGTRAP, SIGFPE, SIGSYS] {
+        // The handler runs on an alternate stack, so a thread that used up its own stack
+        // still leaves a note (each thread needs its own: Node.js' thread sets one too).
+        NuvioInstallAlternateSignalStack()
+        for number in crashSignals {
             let name = String(cString: strsignal(number))
-            aioSignalNotes[Int(number)] = strdup("\n[nuvio] CRASH: signal \(number) (\(name))\n[nuvio] native stack:\n")
+            aioSignalNotes[Int(number)] = strdup("\n[nuvio] CRASH: signal \(number) (\(name))\n")
             var action = sigaction()
             action.__sigaction_u.__sa_sigaction = aioNoteSignal
             action.sa_flags = SA_SIGINFO | SA_ONSTACK
             sigemptyset(&action.sa_mask)
             sigaction(number, &action, aioPreviousActions + Int(number))
         }
+        var installed = sigaction()
+        if sigaction(SIGSEGV, nil, &installed) == 0 {
+            aioHandlerBits = unsafeBitCast(installed.__sigaction_u.__sa_sigaction, to: Int.self)
+        }
         atexit(aioNoteExit)
+    }
+
+    /// Node.js may set handlers of its own as it starts: the notes' handler back in front of
+    /// them (it hands each signal on to the handler it replaced).
+    nonisolated static func rearmCrashNotes() {
+        guard aioCrashNotesInstalled, aioHandlerBits != 0 else { return }
+        var taken: [String] = []
+        for number in crashSignals {
+            var current = sigaction()
+            guard sigaction(number, nil, &current) == 0 else { continue }
+            if unsafeBitCast(current.__sigaction_u.__sa_sigaction, to: Int.self) == aioHandlerBits { continue }
+            aioPreviousActions[Int(number)] = current
+            var action = sigaction()
+            action.__sigaction_u.__sa_sigaction = aioNoteSignal
+            action.sa_flags = SA_SIGINFO | SA_ONSTACK
+            sigemptyset(&action.sa_mask)
+            sigaction(number, &action, nil)
+            taken.append(String(cString: strsignal(number)))
+        }
+        if !taken.isEmpty { note("crash notes: back in front of Node.js' handlers for \(taken.joined(separator: ", "))") }
     }
 
     private nonisolated static func deviceDescription() -> String {
@@ -1396,9 +1431,9 @@ final class AIOStreamsHost: ObservableObject {
     }
 
     /// Nuvio's memory (Node.js runs inside it) in the log while AIOStreams
-    /// runs, checked every second: a line when it changed by 25 MB or more,
-    /// every second while tvOS allows less than 200 MB more, and at least once
-    /// a minute. Written at once, so the last lines before tvOS closes Nuvio
+    /// runs, checked five times a second: a line when it changed by 25 MB or
+    /// more, each time while tvOS allows less than 200 MB more, and at least
+    /// once a minute. Written at once, so the last lines before tvOS closes Nuvio
     /// are in the next run's Last run.
     private func startMemoryLog() {
         guard memoryTimer == nil else { return }
@@ -1408,7 +1443,7 @@ final class AIOStreamsHost: ObservableObject {
     private nonisolated static func makeMemoryTimer() -> DispatchSourceTimer {
         let log = AIOMemoryLog()
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "nuvio.aio.memory", qos: .utility))
-        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.schedule(deadline: .now() + 0.2, repeating: 0.2)
         timer.setEventHandler { log.check() }
         timer.resume()
         return timer
@@ -1542,6 +1577,9 @@ private final class AIOMemoryLog: @unchecked Sendable {
 /// The log file, once opened (stdout and stderr point to it as well).
 private nonisolated(unsafe) var aioLogDescriptor: Int32 = -1
 private nonisolated(unsafe) var aioCrashNotesInstalled = false
+/// The notes' handler, to tell it from handlers set later (`rearmCrashNotes`).
+private nonisolated(unsafe) var aioHandlerBits = 0
+private nonisolated(unsafe) var aioCrashNoted = false
 
 private nonisolated(unsafe) let aioFrames: UnsafeMutablePointer<UnsafeMutableRawPointer?> = {
     let frames = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 128)
@@ -1566,11 +1604,18 @@ private nonisolated(unsafe) let aioSignalNotes: UnsafeMutablePointer<UnsafeMutab
 /// the signal again, and the app crashes as it would have).
 private func aioNoteSignal(_ number: Int32, _ info: UnsafeMutablePointer<siginfo_t>?, _ context: UnsafeMutableRawPointer?) {
     guard number > 0, number < 32 else { return }
+    // Once: a handler handed the signal on calling this one again lets the crash happen.
+    if aioCrashNoted {
+        var fallback = sigaction() // zeroed: SIG_DFL
+        sigaction(number, &fallback, nil)
+        return
+    }
+    aioCrashNoted = true
     let descriptor = aioLogDescriptor
     if descriptor >= 0, let note = aioSignalNotes[Int(number)] {
         _ = write(descriptor, note, strlen(note))
-        let count = backtrace(aioFrames, 128)
-        backtrace_symbols_fd(aioFrames, count, descriptor)
+        // The crashed thread's own stack (from the signal's context), not this handler's.
+        NuvioNoteCrash(descriptor, info, context)
     }
     sigaction(number, aioPreviousActions + Int(number), nil)
 }
