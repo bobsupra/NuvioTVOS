@@ -106,7 +106,7 @@ Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's
   - **`process.exit()`** would close Nuvio. With `NUVIO_EMBEDDED=1`, `nuvio-main.mjs` turns it into a "stopped" state instead.
   - An uncaught exception would end Node and Nuvio with it. Both bootstrap and main catch and log.
 - *Test Node.js only* in the sheet runs a short self-test instead of AIOStreams: memory, WebAssembly, crypto, zlib, `Intl.Segmenter`, files, `node:sqlite`, HTTP server, `fetch` over HTTPS and a CPU loop.
-- **Memory.** tvOS closes an app at 2 GB (on the Apple TV 4K 3rd and 4th generation alike; no entitlement raises it on tvOS), and Node.js runs inside Nuvio, so both share it. Node.js lets its heap grow toward its limit before it collects much, so the limit (`--max-old-space-size`) is set at each start: by the Apple TV (default: half of what tvOS allows Nuvio more at that moment, in steps of 64 MB, 384–1024 MB) or 1024 / 768 / 512 / 384 MB in the sheet. The value tvOS reports changes with the app's state: right at launch it can be about half of what it is once Nuvio is on screen, so a start with Nuvio gets the lower, safer limit.
+- **Memory.** tvOS closes an app at 2 GB (on the Apple TV 4K 3rd and 4th generation alike; no entitlement raises it on tvOS), and Node.js runs inside Nuvio, so both share it. Node.js lets its heap grow toward its limit before it collects much, so the limit (`--max-old-space-size`) is set at each start: by the Apple TV (default: half of what tvOS allows Nuvio more at that moment, in steps of 64 MB, 384–1024 MB) or 1024 / 768 / 512 MB in the sheet. The value tvOS reports changes with the app's state: right at launch it can be about half of what it is once Nuvio is on screen, so a start with Nuvio gets the lower, safer limit.
 
 ---
 
@@ -369,7 +369,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 | Use the AIOStreams Addon | The addon on or off (on this Apple TV only) |
 | Save to Nuvio Account | These settings and the configuration, with its password, in this profile of the Nuvio account (section 7) |
 | Anime searches | AniList ID / Converted ID / Both (section 8) |
-| Node.js memory limit | By Apple TV / 1024 / 768 / 512 / 384 MB (section 4), from the next start |
+| Node.js memory limit | By Apple TV / 1024 / 768 / 512 MB (section 4), from the next start |
 | Last run, Log | How the previous run ended; the live log |
 
 ---

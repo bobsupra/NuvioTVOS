@@ -55,7 +55,7 @@ final class AIOStreamsHost: ObservableObject {
     nonisolated static let animeRequestKey = "aio.experiment.animeRequest"
     /// Node.js' heap limit in MB; 0: set by the Apple TV at each start (`nodeHeapLimitMB`).
     nonisolated static let nodeMemoryLimitKey = "aio.experiment.nodeMemoryLimit"
-    nonisolated static let nodeMemoryLimitChoices = [0, 1024, 768, 512, 384]
+    nonisolated static let nodeMemoryLimitChoices = [0, 1024, 768, 512]
     /// AIOStreams' official image.
     nonisolated static let defaultSource = "ghcr.io/viren070/aiostreams"
     /// Nuvio's own port in nuvio-main.mjs (versions), 127.0.0.1 only.
