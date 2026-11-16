@@ -146,6 +146,42 @@ struct AuthService {
         return first
     }
 
+    /// POST /rest/v1/rpc/start_device_login_session, the sign-in with a short
+    /// code the Android app uses. Nil on a server without it, which then signs
+    /// in through `startTvLoginSession`. Custom servers always use that one.
+    func startDeviceLoginSession(
+        accessToken: String,
+        deviceNonce: String,
+        deviceName: String?
+    ) async throws -> DeviceLoginStartResult? {
+        guard !isCustom else { return nil }
+        var body: [String: Any] = [
+            "p_device_nonce": deviceNonce,
+            "p_redirect_base_url": AuthConfig.officialDeviceLoginWebBaseURL,
+            "p_device_type": "tv"
+        ]
+        if let deviceName, !deviceName.isEmpty { body["p_device_name"] = deviceName }
+        do {
+            let rows: [DeviceLoginStartResult] = try await request(
+                path: "/rest/v1/rpc/start_device_login_session",
+                method: "POST",
+                bearer: accessToken,
+                json: body
+            )
+            guard let first = rows.first else {
+                throw AuthError(message: "Empty response from start_device_login_session")
+            }
+            return first.isComplete ? first : nil
+        } catch {
+            let message = friendlyMessage(error).lowercased()
+            if message.contains("could not find the function"),
+               message.contains("start_device_login_session") {
+                return nil
+            }
+            throw error
+        }
+    }
+
     /// POST /rest/v1/rpc/poll_tv_login_session
     func pollTvLoginSession(accessToken: String, code: String, deviceNonce: String) async throws -> TvLoginPollResult {
         let rows: [TvLoginPollResult] = try await request(

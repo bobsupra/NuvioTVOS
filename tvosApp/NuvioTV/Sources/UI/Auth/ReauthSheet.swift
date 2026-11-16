@@ -177,7 +177,13 @@ struct ReauthSheet: View {
                 }
             }
 
-            if let code = auth.qrCode, !code.isEmpty {
+            if let link = auth.qrManualEntryLink {
+                Text(L10n.format("auth_qr_manual_instruction", fallback: "Or go to %@ and enter", link))
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.7))
+            }
+
+            if let code = auth.qrDisplayCode {
                 Text(L10n.format("auth_qr_code", fallback: "Code: %@", code))
                     .font(.system(size: 24, weight: .bold))
                     .foregroundColor(.white)

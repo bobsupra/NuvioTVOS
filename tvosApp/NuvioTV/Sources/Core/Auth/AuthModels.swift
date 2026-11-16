@@ -102,6 +102,57 @@ struct TvLoginStartResult: Decodable {
     }
 }
 
+/// One row from the `start_device_login_session` RPC: a short code the user
+/// can type at `verification_uri`, and the device code the TV polls with.
+struct DeviceLoginStartResult: Decodable {
+    let deviceCode: String
+    let userCode: String
+    let verificationURI: String
+    let verificationURIComplete: String
+    let expiresAt: String
+    let pollIntervalSeconds: Int
+
+    enum CodingKeys: String, CodingKey {
+        case deviceCode = "device_code"
+        case userCode = "user_code"
+        case verificationURI = "verification_uri"
+        case verificationURIComplete = "verification_uri_complete"
+        case expiresAt = "expires_at"
+        case pollIntervalSeconds = "poll_interval_seconds"
+    }
+
+    init(
+        deviceCode: String,
+        userCode: String,
+        verificationURI: String,
+        verificationURIComplete: String,
+        expiresAt: String,
+        pollIntervalSeconds: Int = 3
+    ) {
+        self.deviceCode = deviceCode
+        self.userCode = userCode
+        self.verificationURI = verificationURI
+        self.verificationURIComplete = verificationURIComplete
+        self.expiresAt = expiresAt
+        self.pollIntervalSeconds = pollIntervalSeconds
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        deviceCode = try c.decode(String.self, forKey: .deviceCode)
+        userCode = try c.decode(String.self, forKey: .userCode)
+        verificationURI = try c.decode(String.self, forKey: .verificationURI)
+        verificationURIComplete = try c.decode(String.self, forKey: .verificationURIComplete)
+        expiresAt = try c.decode(String.self, forKey: .expiresAt)
+        pollIntervalSeconds = (try? c.decode(Int.self, forKey: .pollIntervalSeconds)) ?? 3
+    }
+
+    /// Every field the sign-in screen needs is there.
+    var isComplete: Bool {
+        !deviceCode.isEmpty && !userCode.isEmpty && !verificationURIComplete.isEmpty
+    }
+}
+
 /// One row from the `poll_tv_login_session` RPC.
 struct TvLoginPollResult: Decodable {
     let status: String
