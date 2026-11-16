@@ -79,6 +79,10 @@ Nuvio's free built-in **AetherEngine** is the default in Auto mode. **MPVKit** i
 
 For supported 48 kHz TrueHD Atmos and DTS:X VOD, **Settings → Playback → Player → Atmos & DTS:X Spatial Audio (Beta)** opts into a fixed 9.1.6 render on tvOS 26+. It is off by default. The engine delivers 24-bit PCM to the system for HDMI and AirPods Spatial Audio, or lossy APAC for AirPlay; this is not TrueHD or DTS-HD bitstream passthrough. See [the spatial audio notes](docs/truehd-spatial-audio.md) for supported sources and fallback behavior.
 
+### Supported Media Servers & Sources
+
+[Plex](https://plex.tv) · [Jellyfin](https://jellyfin.org) · SMB (NAS / Network Shares) · [Usenet (NNTP)](https://en.wikipedia.org/wiki/Usenet) · [AIOStreams](https://github.com/Viren070/AIOStreams) · [Stremio Add-ons](https://stremio.com)
+
 ### Supported Tracking Services
 
 [Trakt](https://trakt.tv) · [Simkl](https://simkl.com) · [AniList](https://anilist.co) · [MyAnimeList](https://myanimelist.net) · [WeTrakr](https://wetrakr.com) · [MDBList](https://mdblist.com)
@@ -96,7 +100,7 @@ The shared mobile code remains in [composeApp](./composeApp), alongside the iOS 
 
 ## Current tvOS App
 
-Native SwiftUI Apple TV app with configurable catalogs; profile-scoped Nuvio libraries, Jellyfin libraries, and SMB shares; Calendar and follows; and Watch Party. Top Shelf supports configurable content in carousel, landscape, and poster layouts. Optional Seekr seek previews show frames near the playhead. Playback uses AetherEngine, with MPVKit for demanding cases; the app also supports native Usenet/NNTP playback and opt-in P2P torrent streaming. See the [tvOS source](./tvosApp/NuvioTV) and [Tuist project](./tvosApp/Project.swift).
+Native SwiftUI Apple TV app with configurable catalogs; profile-scoped Nuvio libraries, Plex servers, Jellyfin libraries, and SMB shares; Calendar and follows; and Watch Party. Top Shelf supports configurable content in carousel, landscape, and poster layouts. Optional Seekr seek previews show frames near the playhead. Playback uses AetherEngine, with MPVKit for demanding cases; the app also supports native Usenet/NNTP playback. See the [tvOS source](./tvosApp/NuvioTV) and [Tuist project](./tvosApp/Project.swift).
 
 ## Contributing
 
