@@ -295,6 +295,8 @@ final class AuthManager: ObservableObject {
         currentSession = nil
         store.clear()
         store.didSkipLogin = false
+        // Saved Continue Watching rows belong to the account that signed out.
+        RemoteContinueWatchingRowCache.removeAll()
         clearQrState()
         sessionNeedsReauthentication = false
         authState = .signedOut
