@@ -2218,6 +2218,7 @@ private struct AccountSettingsView: View {
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
     @State private var showingBackgroundPicker = false
+    @State private var confirmingSignOut = false
 
     private var accountStatusText: String {
         guard isAuthenticated else {
@@ -2468,7 +2469,7 @@ private struct AccountSettingsView: View {
                         value: L10n.string("action_disconnect", fallback: "Disconnect"),
                         accentColor: Color(red: 1.0, green: 0.43, blue: 0.43)
                     ) {
-                        onSignOut?()
+                        confirmingSignOut = true
                     }
                     .opacity(onSignOut != nil ? 1 : 0.46)
                     .disabled(onSignOut == nil)
@@ -2491,6 +2492,22 @@ private struct AccountSettingsView: View {
         }
         .onAppear { refreshEditableName() }
         .onChange(of: activeProfile) { _, _ in refreshEditableName() }
+        // Signing out removes the account and its local data from this Apple
+        // TV, so it is confirmed first, as on Android.
+        .alert(
+            L10n.string("account_sign_out_confirm_title", fallback: "Sign out?"),
+            isPresented: $confirmingSignOut
+        ) {
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+            Button(L10n.string("tvos_account_sign_out", fallback: "Sign Out"), role: .destructive) {
+                onSignOut?()
+            }
+        } message: {
+            Text(L10n.string(
+                "account_sign_out_confirm_subtitle",
+                fallback: "You will need to sign in again to sync library, watch progress, addons, and plugins on this device."
+            ))
+        }
         .sheet(isPresented: $showingAvatarPicker) {
             if let profile = activeProfile {
                 ProfileAvatarPickerSheet(
