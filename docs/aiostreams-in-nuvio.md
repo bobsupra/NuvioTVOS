@@ -79,11 +79,13 @@ This document explains how the original AIOStreams runs inside Nuvio on Apple TV
 | The configuration backup (uuid, password, config) | **Keychain** (service `nuvio.aio.experiment`) | tvOS may clear Caches. User defaults are used only in unsigned simulator tests. |
 | Log | `Caches/AIOStreams-logs/run.log` | stdout and stderr go straight there |
 
-Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's LAN address on port 8767), `DATABASE_URI` (sqlite), `DISK_CACHE_DIR`, `SECRET_KEY` (random once, kept), `LOG_LEVEL` (`warn`, or `info` with *Detailed AIOStreams log*), `ANIME_DB_LEVEL_OF_DETAIL=required`, `TMDB_API_KEY` (Nuvio's own key, for AIOStreams' title and year matching), `NODE_COMPILE_CACHE`, `UV_THREADPOOL_SIZE=4`, `NUVIO_EMBEDDED=1`, `NUVIO_T0_MS`, `NUVIO_STATE_FILE`, `NUVIO_BACKUP_FILE`, `NUVIO_WAKE_FILE`, `NUVIO_AIO_HOME`, `NUVIO_AIO_SOURCE`, `NUVIO_AIO_USE_PREVIOUS`, `NUVIO_AIO_LAST_START_FAILED`, `NUVIO_CONTROL_PORT`, `NUVIO_CONTROL_TOKEN`, `DISABLE_RATE_LIMITS=true`, `REGEX_FILTER_ACCESS=all` and `SEL_SYNC_ACCESS=all`. For the plugins (section 12) also `NUVIO_PLUGINS_URL`. Later (ffprobe) `NUVIO_FFPROBE_URL`.
+Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's LAN address on port 8767), `DATABASE_URI` (sqlite), `DISK_CACHE_DIR`, `SECRET_KEY` (random once, kept), `LOG_LEVEL` (`warn`, or `info` with *Detailed AIOStreams log*), `ANIME_DB_LEVEL_OF_DETAIL=required`, `TMDB_API_KEY` (Nuvio's own key, for AIOStreams' title and year matching), `NODE_COMPILE_CACHE`, `UV_THREADPOOL_SIZE=4`, `NUVIO_EMBEDDED=1`, `NUVIO_T0_MS`, `NUVIO_STATE_FILE`, `NUVIO_BACKUP_FILE`, `NUVIO_WAKE_FILE`, `NUVIO_AIO_HOME`, `NUVIO_AIO_SOURCE`, `NUVIO_AIO_USE_PREVIOUS`, `NUVIO_AIO_LAST_START_FAILED`, `NUVIO_CONTROL_PORT`, `NUVIO_CONTROL_TOKEN`, `DISABLE_RATE_LIMITS=true`, `REGEX_FILTER_ACCESS=all`, `SEL_SYNC_ACCESS=all` and `MAX_ADDONS=1000`. For the plugins (section 12) also `NUVIO_PLUGINS_URL`. Later (ffprobe) `NUVIO_FFPROBE_URL`.
 
 `DISABLE_RATE_LIMITS=true` switches off all of AIOStreams' rate limits (from the next start). Everything Nuvio asks comes from 127.0.0.1, so AIOStreams counts the whole of Nuvio as one address: 15 metadata requests or 30 catalogs in 5 s, 10 stream requests in 15 s. A busy search ("Frieren") answered `rate limit exceeded` on one of its results. AIOStreams' limit on wrong passwords stays.
 
 `REGEX_FILTER_ACCESS=all` and `SEL_SYNC_ACCESS=all` allow regex filters and filters synced from a link (release-group regexes, stream expressions). By default AIOStreams keeps them for an instance's trusted users, so a configuration from a community template that syncs its filters, such as Tamtaro's (Save & Install → Import Template → `https://git.tamtaro.de/complete.json`), could not be saved: `Forbidden URL(s) in regex configuration`. AIOStreams in Nuvio has one user, the TV's owner.
+
+`MAX_ADDONS=1000` lifts AIOStreams' limit of 15 addons per configuration, meant to spare a shared instance. AIOStreams counts each addon once per service it uses, and the "Nuvio plugins" card (section 12) makes one addon per plugin, so a plugin repository sent through AIOStreams went over 15 and the configuration could not be saved: `Your current configuration requires N addons, but the maximum allowed is 15`.
 
 ---
 
@@ -350,6 +352,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 | The addon on other devices | Never synced: `127.0.0.1` exists only on this Apple TV. With *Save to Nuvio Account* the configuration is synced, and each Apple TV makes its own addon from it (section 7) |
 | AIOStreams' rate limits | Off (`DISABLE_RATE_LIMITS=true`): everything comes from 127.0.0.1 (section 3) |
 | Regex filters and filters synced from a link | Allowed (`REGEX_FILTER_ACCESS=all`, `SEL_SYNC_ACCESS=all`): one user, so templates such as Tamtaro's can be imported (section 3) |
+| Addons per configuration | Practically unlimited (`MAX_ADDONS=1000`) instead of 15, so every plugin can go through AIOStreams (section 3) |
 
 ---
 

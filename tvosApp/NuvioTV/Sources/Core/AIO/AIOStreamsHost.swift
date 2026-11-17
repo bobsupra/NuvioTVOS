@@ -529,6 +529,10 @@ final class AIOStreamsHost: ObservableObject {
             // AIOStreams' default keeps them for an instance's trusted users only.
             "REGEX_FILTER_ACCESS": "all",
             "SEL_SYNC_ACCESS": "all",
+            // AIOStreams allows a configuration 15 addons (each addon once per service it uses),
+            // to spare a shared instance. The "Nuvio plugins" card makes one addon per plugin,
+            // so a plugin repository alone could be more: no limit worth the name here.
+            "MAX_ADDONS": "1000",
             // Every request in the log costs work on the TV: warnings and errors unless asked.
             "LOG_LEVEL": detailedLog ? "info" : "warn",
             // process.exit() would close Nuvio: nuvio-main.mjs turns it into a stop.
