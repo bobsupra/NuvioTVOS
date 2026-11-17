@@ -59,6 +59,72 @@ struct AetherPlayerSurface: UIViewControllerRepresentable {
     }
 }
 
+/// Reports full-screen playback to tvOS while the player is in a window, so the
+/// system can give the app the whole screen when Apple TV is set to a wide
+/// aspect ratio (Settings > Video and Audio > Aspect Ratio).
+///
+/// `AVSupportsExtendedAspectRatiosForContentPlayback` in Info.plist only lets an
+/// app past the centred 16:9 area while its scene is in full-screen playback.
+/// AVPlayerViewController sets that state through UIKit's playback-controls
+/// state manager on the window scene. Nuvio draws video in its own views, so
+/// this makes the same calls. They are private UIKit API, called by selector
+/// and checked at runtime, so they do nothing where the API is missing.
+struct FullscreenPlaybackSceneMarker: UIViewRepresentable {
+    func makeUIView(context: Context) -> FullscreenPlaybackSceneMarkerView {
+        FullscreenPlaybackSceneMarkerView()
+    }
+
+    func updateUIView(_ uiView: FullscreenPlaybackSceneMarkerView, context: Context) {}
+
+    static func dismantleUIView(_ uiView: FullscreenPlaybackSceneMarkerView, coordinator: ()) {
+        uiView.endSession()
+    }
+}
+
+final class FullscreenPlaybackSceneMarkerView: UIView {
+    private var sessionAssertion: NSObject?
+    private weak var sessionScene: UIWindowScene?
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        let scene = window?.windowScene
+        // Re-parenting inside the same scene must not end and restart the
+        // session, or tvOS would resize the app back to 16:9 and out again.
+        if scene === sessionScene, sessionAssertion != nil { return }
+        endSession()
+        guard let scene else { return }
+        sessionAssertion = Self.beginFullscreenPlaybackSession(on: scene)
+        sessionScene = scene
+    }
+
+    func endSession() {
+        sessionScene = nil
+        guard let assertion = sessionAssertion else { return }
+        sessionAssertion = nil
+        let invalidate = NSSelectorFromString("invalidate")
+        if assertion.responds(to: invalidate) {
+            assertion.perform(invalidate)
+        }
+    }
+
+    private static func beginFullscreenPlaybackSession(on scene: UIWindowScene) -> NSObject? {
+        #if os(tvOS)
+        let managerSelector = NSSelectorFromString("_playbackControlsStateManager")
+        let beginSelector = NSSelectorFromString("_beginFullscreenPlaybackSession")
+        guard scene.responds(to: managerSelector),
+              let manager = scene.perform(managerSelector)?.takeUnretainedValue() as? NSObject,
+              manager.responds(to: beginSelector),
+              let assertion = manager.perform(beginSelector)?.takeUnretainedValue() as? NSObject
+        else {
+            return nil
+        }
+        return assertion
+        #else
+        return nil
+        #endif
+    }
+}
+
 
 struct RemoteSeekPressCatcher: UIViewRepresentable {
     let isActive: Bool
