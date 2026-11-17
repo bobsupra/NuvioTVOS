@@ -263,6 +263,20 @@ function addNuvioPluginsPreset(core) {
     static getParser() {
       const Base = super.getParser();
       return class NuvioPluginParser extends Base {
+        // A Usenet stream (`nzbUrl`, played by Nuvio Usenet with its own servers)
+        // as AIOStreams' own Usenet add-ons give it: Stremio NNTP, cached. Without
+        // a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and
+        // drops every such stream.
+        getService(stream, current) {
+          if (stream && stream.nzbUrl && !stream.url) return { id: 'stremio_nntp', cached: true };
+          return super.getService(stream, current);
+        }
+
+        getStreamType(stream, service, current) {
+          if (stream && stream.nzbUrl && !stream.url) return 'stremio-usenet';
+          return super.getStreamType(stream, service, current);
+        }
+
         parse(stream) {
           const parsed = super.parse(stream);
           if (!this.nuvioCount) {

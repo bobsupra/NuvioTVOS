@@ -323,6 +323,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 - **In AIOStreams:** add the **"Nuvio plugins"** card on the configuration page once. It is a preset that `nuvio-main.mjs` adds to AIOStreams' `PresetManager` at start-up (`fromId` and `getPresetList` wrapped), so AIOStreams' files stay unchanged and the card survives updates.
   - The card fetches `plugins.json` from Nuvio's plugin server (cached for 5 s) and makes **one addon per plugin**, with the plugin's name.
   - It has the usual add-on options (timeout, default 20 s; resources; media types; pin; library; passthrough), the same for each plugin.
+  - A plugin's Usenet stream (`nzbUrl`, no `url`) is typed as AIOStreams' own Usenet add-ons type it: `stremio-usenet` with the Stremio NNTP service, cached. Without a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and dropped every such stream (Usenet Direct: 20 streams taken, 0 shown). Nuvio Usenet plays it with its own servers, as before.
 - **Nuvio's side** (`PluginAIOBridge.swift`) is served on the plugin server, `http://127.0.0.1:8766/<token>/stremio/`:
   - `plugins.json`: the plugins set *Through AIOStreams* (key, name, resources);
   - `p/<key>/manifest.json`: a Stremio manifest with streams and subtitles (for `tt`/`tmdb:` ids or the plugin's own prefixes), plus its catalogs and metadata;
