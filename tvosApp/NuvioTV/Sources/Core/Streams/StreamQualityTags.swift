@@ -1579,19 +1579,21 @@ enum StreamBadgeSizing {
             .first(where: { Double($0) != nil }) ?? "0"
         let number = Double(numberText.replacingOccurrences(of: ",", with: ".")) ?? 0
         let upper = token.uppercased()
-        let multiplier: Double = upper.contains("TB") ? 1_099_511_627_776 :
-            upper.contains("GB") ? 1_073_741_824 :
-            upper.contains("MB") ? 1_048_576 : 1_024
+        // Add-ons and Plex write decimal units (1 GB = 10^9 bytes).
+        let multiplier: Double = upper.contains("TB") ? 1_000_000_000_000 :
+            upper.contains("GB") ? 1_000_000_000 :
+            upper.contains("MB") ? 1_000_000 : 1_000
         let bytes = Int64(number * multiplier)
         return bytes > 0 ? bytes : nil
     }
 
     static func fileSizeLabel(for stream: NuvioStream) -> String? {
         guard let bytes = fileSizeBytes(for: stream) else { return nil }
-        let gib = Double(bytes) / 1_073_741_824
-        if gib >= 1 {
-            return String(format: "Size %.1f GB", gib)
+        // Decimal units, so the badge matches the size the source shows.
+        let gigabytes = Double(bytes) / 1_000_000_000
+        if gigabytes >= 1 {
+            return String(format: "Size %.1f GB", gigabytes)
         }
-        return "Size \(Int((Double(bytes) / 1_048_576).rounded())) MB"
+        return "Size \(Int((Double(bytes) / 1_000_000).rounded())) MB"
     }
 }
