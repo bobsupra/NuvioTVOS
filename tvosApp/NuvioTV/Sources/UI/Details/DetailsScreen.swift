@@ -10524,6 +10524,7 @@ private struct TvStreamPickerOverlay: View {
     /// Nuvio Recommended speed checks, by stream id.
     @State private var speedVerdicts: [String: StreamSpeedVerdict] = [:]
     @State private var showSortOptions = false
+    @State private var filterRowEdges = FilterRowEdges(leading: false, trailing: false)
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     @AppStorage(SettingsKey.preserveAddonStreamOrder) private var preserveAddonOrder = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
@@ -10599,7 +10600,8 @@ private struct TvStreamPickerOverlay: View {
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
-    private let cachedKey = "filter::cached"
+    private let refreshKey = "filter::refresh"
+
     private func filterKey(_ addonId: String) -> String { "filter::\(addonId)" }
 
     private var effectiveCachedOnly: Bool {
@@ -11229,10 +11231,33 @@ private struct TvStreamPickerOverlay: View {
         return AddonRatingsService.sortRatings(items, by: { $0.source })
     }
 
+    private static let filterEdgeFade: CGFloat = 56
+
+    /// Sort or the cached-only filter differs from the default, so the
+    /// options button shows a dot.
+    private var filterOptionsActive: Bool {
+        pickerSortOption != .quality || (showsCachedOnlyFilter && cachedOnly)
+    }
+
     private var filterRow: some View {
         HStack(spacing: 18) {
-            // Only add-on filters scroll. Vertical/edge padding gives the 1.06x
-            // focused scale room to draw without the ScrollView clipping it.
+            // Reload the sources, as the refresh button at the start of the
+            // Android TV row does. Holding Up still works too.
+            if onRefresh != nil {
+                TvStreamIconButton(
+                    systemImage: "arrow.clockwise",
+                    accessibilityLabel: L10n.string("details_refresh_sources", fallback: "Refresh sources"),
+                    showsDot: false,
+                    isSpinning: isRefreshing,
+                    focusBinding: $focusedItem,
+                    focusValue: refreshKey,
+                    action: { performRefresh() }
+                )
+            }
+
+            // The add-on pills scroll across the row. Vertical/edge padding gives
+            // the 1.06x focused scale room to draw without the ScrollView
+            // clipping it.
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 18) {
                     TvStreamFilterButton(
@@ -11258,43 +11283,76 @@ private struct TvStreamPickerOverlay: View {
                 .padding(.vertical, 12)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-
-            if showsCachedOnlyFilter {
-                TvStreamFilterButton(
-                    title: cachedOnly
-                        ? L10n.string("details_cached_only", fallback: "Cached only")
-                        : L10n.string("details_all_cache", fallback: "All cache"),
-                    isSelected: cachedOnly,
-                    focusBinding: $focusedItem,
-                    focusValue: cachedKey,
-                    action: { cachedOnly.toggle() }
+            // Fade an end only while pills are hidden past it, so a pill
+            // scrolling away disappears gradually instead of being cut, and the
+            // row has no fade at rest when everything fits.
+            .onScrollGeometryChange(for: FilterRowEdges.self) { geometry in
+                FilterRowEdges(
+                    leading: geometry.contentOffset.x > 1,
+                    trailing: geometry.contentOffset.x + geometry.containerSize.width < geometry.contentSize.width - 1
                 )
-                .fixedSize(horizontal: true, vertical: false)
+            } action: { _, edges in
+                filterRowEdges = edges
             }
+            .mask(
+                HStack(spacing: 0) {
+                    LinearGradient(
+                        colors: [filterRowEdges.leading ? .clear : .black, .black],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: Self.filterEdgeFade)
+                    Color.black
+                    LinearGradient(
+                        colors: [.black, filterRowEdges.trailing ? .clear : .black],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: Self.filterEdgeFade)
+                }
+                .animation(.easeOut(duration: 0.2), value: filterRowEdges)
+            )
 
-            // Sort remains pinned to the trailing edge instead of moving with
-            // the add-on scroller.
-            TvStreamFilterButton(
-                title: L10n.format("details_sort_format", fallback: "Sort: %@", pickerSortOption == .recommended ? L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended") : L10n.optionLabel(sortOption.rawValue)),
-                isSelected: pickerSortOption != .quality,
+            // Sort and the cached-only filter share one round button pinned
+            // to the trailing edge, like the refresh button on Android TV, so
+            // the add-on pills keep the rest of the row.
+            TvStreamIconButton(
+                systemImage: "line.3.horizontal.decrease",
+                accessibilityLabel: L10n.string("details_sort_streams_by", fallback: "Sort streams by"),
+                showsDot: filterOptionsActive,
                 focusBinding: $focusedItem,
                 focusValue: sortKey,
                 action: { showSortOptions = true }
             )
-            .fixedSize(horizontal: true, vertical: false)
             .confirmationDialog(
                 L10n.string("details_sort_streams_by", fallback: "Sort streams by"),
                 isPresented: $showSortOptions,
                 titleVisibility: .visible
             ) {
                 ForEach(StreamSortOption.allCases.filter { $0 != .recommended }) { option in
-                    Button(L10n.optionLabel(option.rawValue)) { recommendedSort = false; sortOption = option }
+                    Button(sortMenuTitle(L10n.optionLabel(option.rawValue), selected: pickerSortOption == option)) {
+                        recommendedSort = false
+                        sortOption = option
+                    }
                 }
-                Button(L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended")) { recommendedSort = true }
+                Button(sortMenuTitle(
+                    L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended"),
+                    selected: pickerSortOption == .recommended
+                )) { recommendedSort = true }
+                if showsCachedOnlyFilter {
+                    Button(cachedOnly
+                        ? L10n.string("details_all_cache", fallback: "All cache")
+                        : L10n.string("details_cached_only", fallback: "Cached only")
+                    ) { cachedOnly.toggle() }
+                }
             }
         }
         .padding(.vertical, 4)
         .focusSection()
+    }
+
+    private func sortMenuTitle(_ title: String, selected: Bool) -> String {
+        selected ? "\(title) ✓" : title
     }
 
     private var streamPanel: some View {
@@ -11915,6 +11973,57 @@ private struct TvStreamRecommendationCard: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+    }
+}
+
+/// Which ends of the stream picker's add-on pill row have pills scrolled out of view.
+private struct FilterRowEdges: Equatable {
+    var leading: Bool
+    var trailing: Bool
+}
+
+/// Round icon button for the stream picker's filter row, the size of a filter
+/// pill. A dot marks a non-default setting behind it.
+private struct TvStreamIconButton: View {
+    let systemImage: String
+    let accessibilityLabel: String
+    let showsDot: Bool
+    var isSpinning = false
+    let focusBinding: FocusState<String?>.Binding
+    let focusValue: String
+    let action: () -> Void
+
+    private var isFocused: Bool { focusBinding.wrappedValue == focusValue }
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: systemImage)
+                .font(.system(size: 26, weight: .semibold))
+                .foregroundColor(isFocused ? .black : .white.opacity(0.85))
+                .rotationEffect(.degrees(isSpinning ? 360 : 0))
+                .animation(
+                    isSpinning ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default,
+                    value: isSpinning
+                )
+                .frame(width: 58, height: 58)
+                .modifier(TvDetailsGlassBackground(filled: isFocused, shape: Circle()))
+                .overlay(alignment: .topTrailing) {
+                    if showsDot {
+                        // Blue stays visible on both the dark and the white
+                        // (focused) button.
+                        Circle()
+                            .fill(Color(red: 0.22, green: 0.54, blue: 0.87))
+                            .frame(width: 14, height: 14)
+                            .offset(x: -2, y: 2)
+                    }
+                }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused(focusBinding, equals: focusValue)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+        .accessibilityLabel(accessibilityLabel)
     }
 }
 
