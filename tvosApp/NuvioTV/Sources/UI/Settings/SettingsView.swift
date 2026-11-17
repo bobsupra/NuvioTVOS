@@ -361,6 +361,7 @@ enum SettingsKey {
     static let streamListHideFileSize = "nuvio.tv.settings.playback.streamListHideFileSize"
     static let streamListHideAddonName = "nuvio.tv.settings.playback.streamListHideAddonName"
     static let streamListHideDescription = "nuvio.tv.settings.playback.streamListHideDescription"
+    static let streamListSymbolIcons = "nuvio.tv.settings.playback.streamListSymbolIcons"
     static let streamListDetailSize = "nuvio.tv.settings.playback.streamListDetailSize"
     static let streamListBadgeSize = "nuvio.tv.settings.playback.streamListBadgeSize"
     static let streamListLogoSize = "nuvio.tv.settings.playback.streamListLogoSize"
@@ -500,7 +501,7 @@ enum SettingsKey {
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
-        streamListHideAddonName, streamListHideDescription,
+        streamListHideAddonName, streamListHideDescription, streamListSymbolIcons,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
@@ -3890,6 +3891,7 @@ private struct StreamListStyleEditor: View {
     @AppStorage(SettingsKey.streamListHideFileSize) private var hideFileSize = false
     @AppStorage(SettingsKey.streamListHideAddonName) private var hideAddonName = false
     @AppStorage(SettingsKey.streamListHideDescription) private var hideDescription = false
+    @AppStorage(SettingsKey.streamListSymbolIcons) private var symbolIcons = false
 
     @State private var streamBadgeURL = ""
     @State private var streamBadgeImportError: String?
@@ -3904,6 +3906,7 @@ private struct StreamListStyleEditor: View {
             hideFileSize: hideFileSize,
             hideAddonName: hideAddonName,
             hideDescription: hideDescription,
+            symbolIcons: symbolIcons,
             detailSize: detailSize, badgeSize: badgeSize, logoSize: logoSize,
             spacing: spacing, height: height)
     }
@@ -3940,7 +3943,7 @@ private struct StreamListStyleEditor: View {
                             .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.white.opacity(0.55))
                         StreamListPreview(style: style, showAddonLogo: showAddonLogo, width: previewWidth)
-                            .id("\(streamBadgeSettingsRevision)_\(showAddonLogo)_\(hideAddonName)_\(hideDescription)_\(hideFileSize)")
+                            .id("\(streamBadgeSettingsRevision)_\(showAddonLogo)_\(hideAddonName)_\(hideDescription)_\(hideFileSize)_\(symbolIcons)")
                     }
                     .padding(.top, 110)
                 }
@@ -4069,6 +4072,13 @@ private struct StreamListStyleEditor: View {
         )
 
         SettingsToggleRow(
+            title: L10n.string("tvos_settings_stream_list_symbol_icons", fallback: "Symbols Instead of Emoji"),
+            subtitle: L10n.string("tvos_settings_stream_list_symbol_icons_subtitle", fallback: "Show system symbols in place of the emoji add-ons put in stream details"),
+            isOn: $symbolIcons,
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
             title: L10n.string("tvos_settings_stream_list_expand_focused", fallback: "Expand Focused Card (Experimental)"),
             subtitle: L10n.string("tvos_settings_stream_list_expand_focused_subtitle", fallback: "The selected stream shows its whole name and description"),
             isOn: $expandFocused,
@@ -4185,6 +4195,7 @@ private struct StreamListStyleEditor: View {
         hideFileSize = false
         hideAddonName = false
         hideDescription = false
+        symbolIcons = false
     }
 
     private func importStreamBadgePack() {
