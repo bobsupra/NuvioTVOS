@@ -34,6 +34,12 @@ extension PlayerView {
         ZStack {
             Color.black.ignoresSafeArea()
 
+            // Lets tvOS widen the app past 16:9 while the player is up.
+            FullscreenPlaybackSceneMarker()
+                .frame(width: 0, height: 0)
+                .allowsHitTesting(false)
+                .accessibilityHidden(true)
+
             videoSurfaceLayer
             playerBottomFadeLayer
             postPlayRecommendationLayer
