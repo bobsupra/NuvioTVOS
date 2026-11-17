@@ -53,6 +53,9 @@ final class AIOStreamsHost: ObservableObject {
     private nonisolated static let usePreviousKey = "aio.experiment.usePrevious"
     private nonisolated static let versionKey = "aio.experiment.version"
     nonisolated static let animeRequestKey = "aio.experiment.animeRequest"
+    /// Node.js' heap limit in MB; 0: set by the Apple TV at each start (`nodeHeapLimitMB`).
+    nonisolated static let nodeMemoryLimitKey = "aio.experiment.nodeMemoryLimit"
+    nonisolated static let nodeMemoryLimitChoices = [0, 1024, 768, 512]
     /// AIOStreams' official image.
     nonisolated static let defaultSource = "ghcr.io/viren070/aiostreams"
     /// Nuvio's own port in nuvio-main.mjs (versions), 127.0.0.1 only.
@@ -141,6 +144,10 @@ final class AIOStreamsHost: ObservableObject {
     @Published private(set) var animeRequest: AnimeRequest
     /// The last search by both ids: how long each took, how many streams.
     @Published private(set) var lastAnimeSearch: String?
+    /// Node.js' heap limit setting (MB; 0: by the Apple TV), from the next start.
+    @Published private(set) var nodeMemoryLimit: Int
+    /// The heap limit the running Node.js got.
+    @Published private(set) var appliedNodeMemoryLimit: Int?
 
     private var stateTimer: Timer?
     /// From Nuvio opening to Node.js being started.
@@ -154,6 +161,10 @@ final class AIOStreamsHost: ObservableObject {
     private var startDate: Date?
     private var markedReady = false
     private var lastStartUnfinished = false
+    /// tvOS closed Nuvio on screen before the last start settled (its first
+    /// warm-up, or a minute): not started automatically, so it doesn't happen
+    /// at every launch.
+    private var lastRunClosedEarly = false
     /// The remembered configuration exists in AIOStreams (checked after each start).
     private var configurationVerified = false
     private var checkingConfiguration = false
@@ -161,6 +172,8 @@ final class AIOStreamsHost: ObservableObject {
     private var backgroundSince: Date?
     /// The addon address last seen in the state file (the page's doing).
     private var lastStateManifest: String?
+    /// Nuvio's memory in the log while AIOStreams runs (`MemoryLog`).
+    private var memoryTimer: DispatchSourceTimer?
 
     private init() {
         autoStart = UserDefaults.standard.bool(forKey: Self.autoStartKey)
@@ -171,6 +184,8 @@ final class AIOStreamsHost: ObservableObject {
         packageVersion = UserDefaults.standard.string(forKey: Self.versionKey) ?? ""
         usePreviousAtNextStart = UserDefaults.standard.bool(forKey: Self.usePreviousKey)
         animeRequest = Self.animeRequestSetting
+        let limit = UserDefaults.standard.integer(forKey: Self.nodeMemoryLimitKey)
+        nodeMemoryLimit = Self.nodeMemoryLimitChoices.contains(limit) ? limit : 0
         hasBackup = Self.loadBackup() != nil
         syncToAccount = AIOSettingsSync.syncChoice() ?? false
         loadPreviousRun()
@@ -183,6 +198,14 @@ final class AIOStreamsHost: ObservableObject {
         }
         _ = center.addObserver(forName: Notification.Name("UIApplicationWillEnterForegroundNotification"), object: nil, queue: nil) { _ in
             Task { @MainActor in AIOStreamsHost.shared.enteredForeground() }
+        }
+        // On screen or not, in the run record: tvOS closing Nuvio while it is on screen
+        // leaves no note of its own (it is most likely out of memory).
+        _ = center.addObserver(forName: Notification.Name("UIApplicationDidBecomeActiveNotification"), object: nil, queue: nil) { _ in
+            Task { @MainActor in AIOStreamsHost.shared.noteOnScreen(true) }
+        }
+        _ = center.addObserver(forName: Notification.Name("UIApplicationWillResignActiveNotification"), object: nil, queue: nil) { _ in
+            Task { @MainActor in AIOStreamsHost.shared.noteOnScreen(false) }
         }
     }
 
@@ -376,6 +399,25 @@ final class AIOStreamsHost: ObservableObject {
         UserDefaults.standard.set(enabled, forKey: Self.detailedLogKey)
     }
 
+    /// The next heap limit for Node.js, for the row in the sheet; from the next start.
+    func cycleNodeMemoryLimit() {
+        let choices = Self.nodeMemoryLimitChoices
+        let next = choices[((choices.firstIndex(of: nodeMemoryLimit) ?? 0) + 1) % choices.count]
+        nodeMemoryLimit = next
+        UserDefaults.standard.set(next, forKey: Self.nodeMemoryLimitKey)
+    }
+
+    /// Node.js' heap limit for a start. Node.js lets its heap grow toward the
+    /// limit before it collects much, while tvOS closes Nuvio (Node.js runs
+    /// inside it) at a memory limit of its own: about 1.2–1.5 GB in all on an
+    /// Apple TV 4K, and Nuvio itself takes a few hundred MB of it. By the Apple
+    /// TV (`setting` 0): half of what tvOS allows Nuvio more when Node.js
+    /// starts, in steps of 64 MB, from 384 to 1024 MB.
+    nonisolated static func nodeHeapLimitMB(setting: Int, availableMB: Int) -> Int {
+        guard setting <= 0 else { return setting }
+        return min(1024, max(384, availableMB / 2 / 64 * 64))
+    }
+
     /// AIOStreams' settings here and its configuration (with the password) in
     /// this profile of the Nuvio account; off removes them from the account.
     func setSyncToAccount(_ enabled: Bool) {
@@ -411,6 +453,10 @@ final class AIOStreamsHost: ObservableObject {
         // A start that crashed must not crash every launch.
         if lastStartUnfinished {
             notice = "Not started automatically: the last start did not finish (see Last run). Start it here when you want to try again."
+            return
+        }
+        if lastRunClosedEarly {
+            notice = "Not started automatically: tvOS closed Nuvio soon after AIOStreams started, most likely for memory (see Last run). Lower the Node.js memory limit or turn off add-ons, then start it here."
             return
         }
         start()
@@ -483,6 +529,10 @@ final class AIOStreamsHost: ObservableObject {
             // AIOStreams' default keeps them for an instance's trusted users only.
             "REGEX_FILTER_ACCESS": "all",
             "SEL_SYNC_ACCESS": "all",
+            // AIOStreams allows a configuration 15 addons (each addon once per service it uses),
+            // to spare a shared instance. The "Nuvio plugins" card makes one addon per plugin,
+            // so a plugin repository alone could be more: no limit worth the name here.
+            "MAX_ADDONS": "1000",
             // Every request in the log costs work on the TV: warnings and errors unless asked.
             "LOG_LEVEL": detailedLog ? "info" : "warn",
             // process.exit() would close Nuvio: nuvio-main.mjs turns it into a stop.
@@ -510,14 +560,21 @@ final class AIOStreamsHost: ObservableObject {
             setenv("TMDB_API_KEY", tmdbKey, 1)
         }
 
+        let availableMB = Int(os_proc_available_memory() / 1_048_576)
+        let heapLimit = Self.nodeHeapLimitMB(setting: nodeMemoryLimit, availableMB: availableMB)
+        appliedNodeMemoryLimit = heapLimit
         launch(
             .aio,
             nodeStart: nodeStart,
-            arguments: ["node", "--max-old-space-size=1024", bootstrap.path],
+            arguments: ["node", "--max-old-space-size=\(heapLimit)", bootstrap.path],
             stateFile: stateFile,
             backupFile: backupFile
         )
         Self.note("data: \(dataDirectory.path)")
+        Self.note(
+            "Node.js memory limit \(heapLimit) MB"
+                + (nodeMemoryLimit == 0 ? " (by the Apple TV: tvOS allowed \(availableMB) MB more)" : " (set in the sheet)")
+        )
     }
 
     /// Only Node.js with a short self-test, no AIOStreams: tells a crash of
@@ -550,7 +607,11 @@ final class AIOStreamsHost: ObservableObject {
         Self.note("arguments: " + arguments.dropFirst().map { $0.count > 200 ? "<script>" : $0 }.joined(separator: " "))
 
         let thread = Thread {
-            Self.note("Node.js thread: stack \(Thread.current.stackSize / 1_048_576) MB · calling node_start")
+            let alternate = NuvioInstallAlternateSignalStack() == 1
+            Self.note(
+                "Node.js thread: stack \(Thread.current.stackSize / 1_048_576) MB, "
+                    + "\(alternate ? "a" : "no") stack for crash notes · calling node_start"
+            )
             let status = Self.run(nodeStart, arguments: arguments)
             Self.note("Node.js exited with code \(status)")
             Task { @MainActor in
@@ -564,6 +625,7 @@ final class AIOStreamsHost: ObservableObject {
         thread.stackSize = 16 << 20
         thread.qualityOfService = .userInitiated
         thread.start()
+        if kind == .aio { startMemoryLog() }
 
         scheduleStateTimer(every: 0.25, stateFile: stateFile, backupFile: backupFile)
         if logVisible { startLogTimer() }
@@ -628,6 +690,9 @@ final class AIOStreamsHost: ObservableObject {
             markedReady = true
             Self.saveRunRecord(kind: .aio, ready: true)
             Self.note("ready · \(Self.memoryDescription())")
+            Self.rearmCrashNotes()
+            // Settled once the first warm-up is through, or a minute on.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 60) { Self.updateRunRecord(["settled": true]) }
         }
         if wasStarting, phase != .starting {
             scheduleStateTimer(every: 5, stateFile: file, backupFile: backupFile)
@@ -643,7 +708,28 @@ final class AIOStreamsHost: ObservableObject {
     }
 
     private nonisolated static func saveRunRecord(kind: RunKind, ready: Bool) {
-        UserDefaults.standard.set(["kind": kind.rawValue, "ready": ready, "date": Date()], forKey: runRecordKey)
+        UserDefaults.standard.set(
+            ["kind": kind.rawValue, "ready": ready, "date": Date(), "onScreen": isOnScreen, "settled": false],
+            forKey: runRecordKey
+        )
+    }
+
+    /// Changes in this run's record.
+    private nonisolated static func updateRunRecord(_ changes: [String: Any]) {
+        guard var record = UserDefaults.standard.dictionary(forKey: runRecordKey) else { return }
+        record.merge(changes) { _, new in new }
+        UserDefaults.standard.set(record, forKey: runRecordKey)
+    }
+
+    /// Main thread only.
+    private nonisolated(unsafe) static var isOnScreen = false
+
+    /// Nuvio on screen (active) or not, for the run record: written once this
+    /// run started Node.js (before, the record is the previous run's).
+    private func noteOnScreen(_ onScreen: Bool) {
+        Self.isOnScreen = onScreen
+        guard started else { return }
+        Self.updateRunRecord(["onScreen": onScreen])
     }
 
     /// "Start, seconds after Nuvio opened: …" from the times Node.js reports
@@ -1034,6 +1120,7 @@ final class AIOStreamsHost: ObservableObject {
     /// search came since then (nuvio-main.mjs notes when).
     func warmUp(unlessSearchSince since: Date? = nil) async {
         guard phase == .running, addonEnabled, configurationVerified, !warmingUp, manifestURL != nil else { return }
+        Self.rearmCrashNotes()
         warmingUp = true
         defer { warmingUp = false }
         if let since {
@@ -1064,6 +1151,7 @@ final class AIOStreamsHost: ObservableObject {
         }
         lastWarmUp = result
         Self.note("warm-up: \(result)")
+        Self.updateRunRecord(["settled": true])
     }
 
     /// Back from the Home screen. tvOS takes a suspended app's ports away,
@@ -1224,22 +1312,33 @@ final class AIOStreamsHost: ObservableObject {
         let record = UserDefaults.standard.dictionary(forKey: Self.runRecordKey)
         let kind = RunKind(rawValue: record?["kind"] as? String ?? "") ?? .aio
         let ready = record?["ready"] as? Bool ?? true
+        let onScreen = record?["onScreen"] as? Bool ?? false
+        let settled = record?["settled"] as? Bool ?? true
         let lines = text.split(separator: "\n").map(String.init)
+        let lastMemory = lines.last(where: { $0.hasPrefix("[nuvio] memory · ") })
+            .map { String($0.dropFirst("[nuvio] memory · ".count)) }
         var summary = "Ended when Nuvio was closed"
         var unexpected = true
         if let crash = lines.last(where: { $0.hasPrefix("[nuvio] CRASH:") }) {
             summary = "Crashed — " + String(crash.dropFirst("[nuvio] CRASH: ".count))
+            if let detail = lines.last(where: { $0.hasPrefix("[nuvio] crash: ") }) {
+                summary += " · " + String(detail.dropFirst("[nuvio] crash: ".count))
+            }
         } else if lines.contains(where: { $0.hasPrefix("[nuvio] exit() was called") }) {
             summary = "Node.js closed the app (exit)"
         } else if let exited = lines.last(where: { $0.hasPrefix("[nuvio] Node.js exited") }) {
             summary = String(exited.dropFirst("[nuvio] ".count))
             unexpected = !exited.hasSuffix("code 0")
+        } else if kind == .aio && onScreen {
+            summary = (ready ? "Closed by tvOS while Nuvio was on screen" : "Closed by tvOS during the start, Nuvio on screen")
+                + ", most likely out of memory" + (lastMemory.map { " — last: \($0)" } ?? "")
         } else if kind == .aio && !ready {
             summary = "Ended during the start without a message — tvOS probably closed Nuvio (memory?)"
         } else {
             unexpected = false
         }
         lastStartUnfinished = kind == .aio && !ready
+        lastRunClosedEarly = kind == .aio && ready && onScreen && !settled && unexpected
         let date = record?["date"] as? Date
         previousRun = PreviousRun(
             summary: (kind == .nodeTest ? "Node.js test: " : "") + summary,
@@ -1277,22 +1376,51 @@ final class AIOStreamsHost: ObservableObject {
 
     // MARK: - Crash notes
 
+    private nonisolated static let crashSignals = [SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGTRAP, SIGFPE, SIGSYS]
+
     private nonisolated static func installCrashNotes() {
         guard !aioCrashNotesInstalled else { return }
         aioCrashNotesInstalled = true
         // Touch the buffers now: never for the first time inside a signal handler.
         _ = aioFrames
         _ = aioPreviousActions
-        for number in [SIGSEGV, SIGBUS, SIGILL, SIGABRT, SIGTRAP, SIGFPE, SIGSYS] {
+        // The handler runs on an alternate stack, so a thread that used up its own stack
+        // still leaves a note (each thread needs its own: Node.js' thread sets one too).
+        _ = NuvioInstallAlternateSignalStack()
+        for number in crashSignals {
             let name = String(cString: strsignal(number))
-            aioSignalNotes[Int(number)] = strdup("\n[nuvio] CRASH: signal \(number) (\(name))\n[nuvio] native stack:\n")
+            aioSignalNotes[Int(number)] = strdup("\n[nuvio] CRASH: signal \(number) (\(name))\n")
             var action = sigaction()
             action.__sigaction_u.__sa_sigaction = aioNoteSignal
             action.sa_flags = SA_SIGINFO | SA_ONSTACK
             sigemptyset(&action.sa_mask)
             sigaction(number, &action, aioPreviousActions + Int(number))
         }
+        var installed = sigaction()
+        if sigaction(SIGSEGV, nil, &installed) == 0 {
+            aioHandlerBits = unsafeBitCast(installed.__sigaction_u.__sa_sigaction, to: Int.self)
+        }
         atexit(aioNoteExit)
+    }
+
+    /// Node.js may set handlers of its own as it starts: the notes' handler back in front of
+    /// them (it hands each signal on to the handler it replaced).
+    nonisolated static func rearmCrashNotes() {
+        guard aioCrashNotesInstalled, aioHandlerBits != 0 else { return }
+        var taken: [String] = []
+        for number in crashSignals {
+            var current = sigaction()
+            guard sigaction(number, nil, &current) == 0 else { continue }
+            if unsafeBitCast(current.__sigaction_u.__sa_sigaction, to: Int.self) == aioHandlerBits { continue }
+            aioPreviousActions[Int(number)] = current
+            var action = sigaction()
+            action.__sigaction_u.__sa_sigaction = aioNoteSignal
+            action.sa_flags = SA_SIGINFO | SA_ONSTACK
+            sigemptyset(&action.sa_mask)
+            sigaction(number, &action, nil)
+            taken.append(String(cString: strsignal(number)))
+        }
+        if !taken.isEmpty { note("crash notes: back in front of Node.js' handlers for \(taken.joined(separator: ", "))") }
     }
 
     private nonisolated static func deviceDescription() -> String {
@@ -1307,6 +1435,25 @@ final class AIOStreamsHost: ObservableObject {
     nonisolated static func memoryDescription() -> String {
         let available = os_proc_available_memory() / 1_048_576
         return "Nuvio \(appFootprintMB() ?? -1) MB, tvOS allows \(available) MB more"
+    }
+
+    /// Nuvio's memory (Node.js runs inside it) in the log while AIOStreams
+    /// runs, checked every second: a line when it changed by 25 MB or more,
+    /// every second while tvOS allows less than 200 MB more, and at least once
+    /// a minute. Written at once, so the last lines before tvOS closes Nuvio
+    /// are in the next run's Last run.
+    private func startMemoryLog() {
+        guard memoryTimer == nil else { return }
+        memoryTimer = Self.makeMemoryTimer()
+    }
+
+    private nonisolated static func makeMemoryTimer() -> DispatchSourceTimer {
+        let log = AIOMemoryLog()
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "nuvio.aio.memory", qos: .utility))
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { log.check() }
+        timer.resume()
+        return timer
     }
 
     // MARK: - Node
@@ -1353,6 +1500,13 @@ final class AIOStreamsHost: ObservableObject {
     await step('WebAssembly', () => typeof WebAssembly);
     await step('crypto', async () => (await import('node:crypto')).createHash('sha256').update('nuvio').digest('hex').slice(0, 16));
     await step('zlib', async () => { const zlib = await import('node:zlib'); return zlib.gunzipSync(zlib.gzipSync('nuvio')).toString(); });
+    await step('Intl.Segmenter', () => {
+      // Without ICU's break iterators segment() would crash the app: only asked when they are there.
+      if (Intl.Segmenter.supportedLocalesOf(['en']).length === 0) throw new Error('no ICU break iterators');
+      const graphemes = [...new Intl.Segmenter('en', { granularity: 'grapheme' }).segment('a👍🏽e\u0301🇨🇿')].length;
+      const words = [...new Intl.Segmenter('en', { granularity: 'word' }).segment('Ahoj, světe')].filter((part) => part.isWordLike).length;
+      return `${graphemes} graphemes, ${words} words`;
+    });
     await step('files', async () => { const fs = await import('node:fs'); const file = (process.env.TMPDIR || '/tmp') + '/nuvio-node-test.txt'; fs.writeFileSync(file, 'ok'); return fs.readFileSync(file, 'utf8'); });
     await step('sqlite', async () => { const { DatabaseSync } = await import('node:sqlite'); const db = new DatabaseSync(':memory:'); return db.prepare('select sqlite_version() as version').get().version; });
     await step('http server', async () => {
@@ -1399,7 +1553,7 @@ final class AIOStreamsHost: ObservableObject {
         return secret
     }
 
-    private nonisolated static func appFootprintMB() -> Int? {
+    nonisolated static func appFootprintMB() -> Int? {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
         let result = withUnsafeMutablePointer(to: &info) { pointer in
@@ -1412,11 +1566,34 @@ final class AIOStreamsHost: ObservableObject {
     }
 }
 
+// MARK: - Memory log
+
+/// The memory log's state (`AIOStreamsHost.startMemoryLog`), only on its queue.
+private final class AIOMemoryLog: @unchecked Sendable {
+    private var loggedMB = 0
+    private var loggedAt = Date.distantPast
+    private var peakMB = 0
+
+    func check() {
+        guard let footprint = AIOStreamsHost.appFootprintMB() else { return }
+        let available = Int(os_proc_available_memory() / 1_048_576)
+        peakMB = max(peakMB, footprint)
+        let now = Date()
+        guard abs(footprint - loggedMB) >= 25 || available < 200 || now.timeIntervalSince(loggedAt) >= 60 else { return }
+        loggedMB = footprint
+        loggedAt = now
+        AIOStreamsHost.note("memory · Nuvio \(footprint) MB (peak \(peakMB)), tvOS allows \(available) MB more")
+    }
+}
+
 // MARK: - Crash notes (plain C-style state: used from signal handlers)
 
 /// The log file, once opened (stdout and stderr point to it as well).
 private nonisolated(unsafe) var aioLogDescriptor: Int32 = -1
 private nonisolated(unsafe) var aioCrashNotesInstalled = false
+/// The notes' handler, to tell it from handlers set later (`rearmCrashNotes`).
+private nonisolated(unsafe) var aioHandlerBits = 0
+private nonisolated(unsafe) var aioCrashNoted = false
 
 private nonisolated(unsafe) let aioFrames: UnsafeMutablePointer<UnsafeMutableRawPointer?> = {
     let frames = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 128)
@@ -1441,11 +1618,18 @@ private nonisolated(unsafe) let aioSignalNotes: UnsafeMutablePointer<UnsafeMutab
 /// the signal again, and the app crashes as it would have).
 private func aioNoteSignal(_ number: Int32, _ info: UnsafeMutablePointer<siginfo_t>?, _ context: UnsafeMutableRawPointer?) {
     guard number > 0, number < 32 else { return }
+    // Once: a handler handed the signal on calling this one again lets the crash happen.
+    if aioCrashNoted {
+        var fallback = sigaction() // zeroed: SIG_DFL
+        sigaction(number, &fallback, nil)
+        return
+    }
+    aioCrashNoted = true
     let descriptor = aioLogDescriptor
     if descriptor >= 0, let note = aioSignalNotes[Int(number)] {
         _ = write(descriptor, note, strlen(note))
-        let count = backtrace(aioFrames, 128)
-        backtrace_symbols_fd(aioFrames, count, descriptor)
+        // The crashed thread's own stack (from the signal's context), not this handler's.
+        NuvioNoteCrash(descriptor, info, context)
     }
     sigaction(number, aioPreviousActions + Int(number), nil)
 }

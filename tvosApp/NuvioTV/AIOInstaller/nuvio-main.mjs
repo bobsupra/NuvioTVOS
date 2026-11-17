@@ -42,6 +42,7 @@ import net from 'node:net';
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
+import v8 from 'node:v8';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { installFfprobeBridge } from './ffprobe-bridge.mjs';
@@ -262,6 +263,20 @@ function addNuvioPluginsPreset(core) {
     static getParser() {
       const Base = super.getParser();
       return class NuvioPluginParser extends Base {
+        // A Usenet stream (`nzbUrl`, played by Nuvio Usenet with its own servers)
+        // as AIOStreams' own Usenet add-ons give it: Stremio NNTP, cached. Without
+        // a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and
+        // drops every such stream.
+        getService(stream, current) {
+          if (stream && stream.nzbUrl && !stream.url) return { id: 'stremio_nntp', cached: true };
+          return super.getService(stream, current);
+        }
+
+        getStreamType(stream, service, current) {
+          if (stream && stream.nzbUrl && !stream.url) return 'stremio-usenet';
+          return super.getStreamType(stream, service, current);
+        }
+
         parse(stream) {
           const parsed = super.parse(stream);
           if (!this.nuvioCount) {
@@ -850,6 +865,10 @@ process.chdir(aioRoot);
 startProxy();
 startControl();
 log(`starting AIOStreams from ${aioRoot} (node ${process.version}, ${process.arch}, jitless: ${process.execArgv.includes('--jitless') || process.versions.mobile ? 'yes' : 'no'})`);
+// Intl.Segmenter (AIOStreams' formatter cuts text with it, "::truncate(N)") needs ICU's break
+// iterators: without them segment() crashes the app. Node.js for tvOS keeps them since
+// node-tvos-v24.20.0-0-r2; asking which locales it supports doesn't make one.
+log(`Intl.Segmenter: ${Intl.Segmenter.supportedLocalesOf(['en']).length > 0 ? 'ICU break iterators present' : 'no ICU break iterators: segment() would crash Nuvio'}`);
 try {
   installFfprobeBridge(process.env.NUVIO_FFPROBE_URL, log);
 } catch (error) {
@@ -879,3 +898,23 @@ log(ready ? `AIOStreams is ready in ${seconds} s, ${memory} MB` : `AIOStreams di
 setInterval(() => {
   writeState({ rssMB: Math.round(process.memoryUsage().rss / 1048576), heapMB: Math.round(process.memoryUsage().heapUsed / 1048576) });
 }, 60000).unref();
+logHeap();
+
+// Node.js' heap in the log next to Nuvio's own memory lines: its limit once, then a line
+// when the heap changed by 25 MB or more (checked every second while the event loop is
+// free), at least once a minute.
+function logHeap() {
+  const mb = (bytes) => Math.round(bytes / 1048576);
+  log(`memory (Node.js) · heap limit ${mb(v8.getHeapStatistics().heap_size_limit)} MB`);
+  let loggedHeap = 0;
+  let loggedAt = 0;
+  setInterval(() => {
+    const usage = process.memoryUsage();
+    const heap = mb(usage.heapUsed);
+    const now = Date.now();
+    if (Math.abs(heap - loggedHeap) < 25 && now - loggedAt < 60000) return;
+    loggedHeap = heap;
+    loggedAt = now;
+    log(`memory (Node.js) · heap ${heap} of ${mb(usage.heapTotal)} MB, rss ${mb(usage.rss)} MB, outside the heap ${mb(usage.external)} MB`);
+  }, 1000).unref();
+}

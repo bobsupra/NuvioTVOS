@@ -79,11 +79,13 @@ This document explains how the original AIOStreams runs inside Nuvio on Apple TV
 | The configuration backup (uuid, password, config) | **Keychain** (service `nuvio.aio.experiment`) | tvOS may clear Caches. User defaults are used only in unsigned simulator tests. |
 | Log | `Caches/AIOStreams-logs/run.log` | stdout and stderr go straight there |
 
-Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's LAN address on port 8767), `DATABASE_URI` (sqlite), `DISK_CACHE_DIR`, `SECRET_KEY` (random once, kept), `LOG_LEVEL` (`warn`, or `info` with *Detailed AIOStreams log*), `ANIME_DB_LEVEL_OF_DETAIL=required`, `TMDB_API_KEY` (Nuvio's own key, for AIOStreams' title and year matching), `NODE_COMPILE_CACHE`, `UV_THREADPOOL_SIZE=4`, `NUVIO_EMBEDDED=1`, `NUVIO_T0_MS`, `NUVIO_STATE_FILE`, `NUVIO_BACKUP_FILE`, `NUVIO_WAKE_FILE`, `NUVIO_AIO_HOME`, `NUVIO_AIO_SOURCE`, `NUVIO_AIO_USE_PREVIOUS`, `NUVIO_AIO_LAST_START_FAILED`, `NUVIO_CONTROL_PORT`, `NUVIO_CONTROL_TOKEN`, `DISABLE_RATE_LIMITS=true`, `REGEX_FILTER_ACCESS=all` and `SEL_SYNC_ACCESS=all`. For the plugins (section 12) also `NUVIO_PLUGINS_URL`. Later (ffprobe) `NUVIO_FFPROBE_URL`.
+Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's LAN address on port 8767), `DATABASE_URI` (sqlite), `DISK_CACHE_DIR`, `SECRET_KEY` (random once, kept), `LOG_LEVEL` (`warn`, or `info` with *Detailed AIOStreams log*), `ANIME_DB_LEVEL_OF_DETAIL=required`, `TMDB_API_KEY` (Nuvio's own key, for AIOStreams' title and year matching), `NODE_COMPILE_CACHE`, `UV_THREADPOOL_SIZE=4`, `NUVIO_EMBEDDED=1`, `NUVIO_T0_MS`, `NUVIO_STATE_FILE`, `NUVIO_BACKUP_FILE`, `NUVIO_WAKE_FILE`, `NUVIO_AIO_HOME`, `NUVIO_AIO_SOURCE`, `NUVIO_AIO_USE_PREVIOUS`, `NUVIO_AIO_LAST_START_FAILED`, `NUVIO_CONTROL_PORT`, `NUVIO_CONTROL_TOKEN`, `DISABLE_RATE_LIMITS=true`, `REGEX_FILTER_ACCESS=all`, `SEL_SYNC_ACCESS=all` and `MAX_ADDONS=1000`. For the plugins (section 12) also `NUVIO_PLUGINS_URL`. Later (ffprobe) `NUVIO_FFPROBE_URL`.
 
 `DISABLE_RATE_LIMITS=true` switches off all of AIOStreams' rate limits (from the next start). Everything Nuvio asks comes from 127.0.0.1, so AIOStreams counts the whole of Nuvio as one address: 15 metadata requests or 30 catalogs in 5 s, 10 stream requests in 15 s. A busy search ("Frieren") answered `rate limit exceeded` on one of its results. AIOStreams' limit on wrong passwords stays.
 
 `REGEX_FILTER_ACCESS=all` and `SEL_SYNC_ACCESS=all` allow regex filters and filters synced from a link (release-group regexes, stream expressions). By default AIOStreams keeps them for an instance's trusted users, so a configuration from a community template that syncs its filters, such as Tamtaro's (Save & Install → Import Template → `https://git.tamtaro.de/complete.json`), could not be saved: `Forbidden URL(s) in regex configuration`. AIOStreams in Nuvio has one user, the TV's owner.
+
+`MAX_ADDONS=1000` lifts AIOStreams' limit of 15 addons per configuration, meant to spare a shared instance. AIOStreams counts each addon once per service it uses, and the "Nuvio plugins" card (section 12) makes one addon per plugin, so a plugin repository sent through AIOStreams went over 15 and the configuration could not be saved: `Your current configuration requires N addons, but the maximum allowed is 15`.
 
 ---
 
@@ -92,7 +94,9 @@ Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's
 - **nodejs-mobile `v24.20.0-0`**, patched by `tvos_patch.py`. tvOS belongs to the iOS family, so most of nodejs-mobile's iOS patches apply as they are. The patch changes:
   - the SDKs (`appletvos` / `appletvsimulator`) and the minimum-version flags (tvOS 18.0);
   - Node's `process.execve()`, which gets a guard: tvOS forbids `fork`/`exec*` outright, and libuv already returns `ENOSYS` from `uv_spawn`;
-  - the framework project (device family 3, tvOS deployment target).
+  - the framework project (device family 3, tvOS deployment target);
+  - ICU: Node.js is built with small-icu (English), whose filter drops every break-iterator file. `Intl.Segmenter` then can't make its ICU break iterator, and V8 doesn't check that in a release build: `segment()` dereferences null and the whole app crashes (`SIGSEGV` in `JSSegments::Create`). AIOStreams' formatter cuts text with it (`{stream.title::truncate(25)}`), so a formatter using `truncate` closed Nuvio at the first search. The patch keeps the break iterators: the rules for root and English, every rule file and the dictionaries, a few MB.   - V8's snapshot: its builtins (all the machine code a jitless V8 runs) are generated on the build machine, and V8 added the CPU features of that machine's compiler (an Apple M chip: LSE atomics, DOTPROD, PMULL). Apple TV HD (A8) and Apple TV 4K 1st generation (A10X) are ARMv8.0 and have none of them: the 4K 1st generation crashed with `SIGILL` at the first JavaScript, right after `node_start`. The patch gives the snapshot the ARMv8.0 baseline; at run time V8 still probes the chip for code it makes then.
+- Release `node-tvos-v24.20.0-0-r2` (both of the above). Each build that changes what is in it gets a new release name, so the release `Package.swift` points at keeps its zip and checksum.
 - The CI workflow `build-node-tvos.yml` builds both slices with ccache, which takes hours. The IPA workflow takes `NodeMobile.xcframework` from the latest successful run of that workflow.
 - Nuvio starts Node with `node_start(argc, argv)` on its own thread with a 16 MB stack. **Node can be started once per app process.** There is no "restart AIOStreams"; restarting Nuvio does it.
 - **What Apple TV does not allow, and how it is handled:**
@@ -103,7 +107,8 @@ Environment Nuvio passes to Node: `PORT`, `NUVIO_LAN_PORT`, `BASE_URL` (the TV's
   - **No symlinks** in the app container. The installer lays `node_modules` out without them.
   - **`process.exit()`** would close Nuvio. With `NUVIO_EMBEDDED=1`, `nuvio-main.mjs` turns it into a "stopped" state instead.
   - An uncaught exception would end Node and Nuvio with it. Both bootstrap and main catch and log.
-- *Test Node.js only* in the sheet runs a short self-test instead of AIOStreams: memory, WebAssembly, crypto, zlib, files, `node:sqlite`, HTTP server, `fetch` over HTTPS and a CPU loop.
+- *Test Node.js only* in the sheet runs a short self-test instead of AIOStreams: memory, WebAssembly, crypto, zlib, `Intl.Segmenter`, files, `node:sqlite`, HTTP server, `fetch` over HTTPS and a CPU loop.
+- **Memory.** tvOS closes an app at 2 GB (on the Apple TV 4K 3rd and 4th generation alike; no entitlement raises it on tvOS), and Node.js runs inside Nuvio, so both share it. Node.js lets its heap grow toward its limit before it collects much, so the limit (`--max-old-space-size`) is set at each start: by the Apple TV (default: half of what tvOS allows Nuvio more at that moment, in steps of 64 MB, 384–1024 MB) or 1024 / 768 / 512 MB in the sheet. The value tvOS reports changes with the app's state: right at launch it can be about half of what it is once Nuvio is on screen, so a start with Nuvio gets the lower, safer limit.
 
 ---
 
@@ -286,7 +291,9 @@ Asking twice costs nothing the user notices: nothing is playing at that moment.
 ## 10. Log and diagnostics
 
 - Everything Node prints goes **straight to a file** (`dup2` of stdout and stderr), so what was written survives a crash.
-- A crash leaves a note with the native stack (signal handlers plus `atexit`). The next run shows **Last run**: how the previous one ended. On an Apple TV there is no other way to see a crash without a Mac.
+- A crash leaves a note (signal handlers plus `atexit`): the signal, the fault address, the thread, whether the fault is at the end of the thread's stack (a stack overflow), and the crashed thread's own stack from the signal's context (`AIOCrashNotes.h`, written with `write()` only). The handler runs on an alternate signal stack (set on the main thread and on Node.js' thread; `sigaltstack` is looked up at run time, as the tvOS SDK marks it unavailable), so a thread that used up its stack still leaves a note. Node.js may set handlers of its own as it starts: after it is ready, and before each warm-up, the handler is put back in front of them and hands each signal on to the one it replaced, once. The next run shows **Last run**: how the previous one ended. On an Apple TV there is no other way to see a crash without a Mac.
+- tvOS closing Nuvio (out of memory) leaves no note. The run record keeps whether Nuvio was on screen: closed while on screen shows in Last run with the last memory line, and when that came before the start settled (its first warm-up, or a minute), AIOStreams is not started automatically at the next launch, so it can't happen at every launch.
+- **Memory in the log:** Nuvio's memory (Node.js included), checked every second from Swift, a line when it changed by 25 MB or more, every second while tvOS allows less than 200 MB more, at least once a minute; and Node.js' heap (`memory (Node.js) · heap … of … MB`) from `nuvio-main.mjs`, with its limit at the start.
 - `[nuvio]` lines come from `nuvio-main.mjs`, `bootstrap.mjs` and Swift: the start, its times, versions, configuration, warm-up, wake-ups, restore and update.
 - *Detailed AIOStreams log* sets AIOStreams' `LOG_LEVEL=info` (every request) instead of `warn`. Every log line costs work on the TV.
 - The sheet shows memory and memory warnings. In CI (Linux, jitless), AIOStreams used about 200 MB right after the start, ~290 MB after the first searches and ~400 MB while it downloaded its anime databases. The Apple TV adds its own overhead.
@@ -316,6 +323,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 - **In AIOStreams:** add the **"Nuvio plugins"** card on the configuration page once. It is a preset that `nuvio-main.mjs` adds to AIOStreams' `PresetManager` at start-up (`fromId` and `getPresetList` wrapped), so AIOStreams' files stay unchanged and the card survives updates.
   - The card fetches `plugins.json` from Nuvio's plugin server (cached for 5 s) and makes **one addon per plugin**, with the plugin's name.
   - It has the usual add-on options (timeout, default 20 s; resources; media types; pin; library; passthrough), the same for each plugin.
+  - A plugin's Usenet stream (`nzbUrl`, no `url`) is typed as AIOStreams' own Usenet add-ons type it: `stremio-usenet` with the Stremio NNTP service, cached. Without a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and dropped every such stream (Usenet Direct: 20 streams taken, 0 shown). Nuvio Usenet plays it with its own servers, as before.
 - **Nuvio's side** (`PluginAIOBridge.swift`) is served on the plugin server, `http://127.0.0.1:8766/<token>/stremio/`:
   - `plugins.json`: the plugins set *Through AIOStreams* (key, name, resources);
   - `p/<key>/manifest.json`: a Stremio manifest with streams and subtitles (for `tt`/`tmdb:` ids or the plugin's own prefixes), plus its catalogs and metadata;
@@ -345,6 +353,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 | The addon on other devices | Never synced: `127.0.0.1` exists only on this Apple TV. With *Save to Nuvio Account* the configuration is synced, and each Apple TV makes its own addon from it (section 7) |
 | AIOStreams' rate limits | Off (`DISABLE_RATE_LIMITS=true`): everything comes from 127.0.0.1 (section 3) |
 | Regex filters and filters synced from a link | Allowed (`REGEX_FILTER_ACCESS=all`, `SEL_SYNC_ACCESS=all`): one user, so templates such as Tamtaro's can be imported (section 3) |
+| Addons per configuration | Practically unlimited (`MAX_ADDONS=1000`) instead of 15, so every plugin can go through AIOStreams (section 3) |
 
 ---
 
@@ -364,6 +373,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 | Use the AIOStreams Addon | The addon on or off (on this Apple TV only) |
 | Save to Nuvio Account | These settings and the configuration, with its password, in this profile of the Nuvio account (section 7) |
 | Anime searches | AniList ID / Converted ID / Both (section 8) |
+| Node.js memory limit | By Apple TV / 1024 / 768 / 512 MB (section 4), from the next start |
 | Last run, Log | How the previous run ended; the live log |
 
 ---
@@ -373,6 +383,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 | | |
 |---|---|
 | `AIOStreamsHostTests` | On the tvOS simulator, inside the app: installs AIOStreams from the official image, starts it, checks the versions and updates, saves a configuration as the page does and asks the addon for streams; then the backup, the warm-up and a configuration restored after AIOStreams lost it. Only with `AIO_TESTS=1` (`TEST_RUNNER_AIO_TESTS=1` for xcodebuild): it downloads the image and leaves AIOStreams running for the rest of the test run |
+| `AIOStreamsHostTests` (always) | Node.js for tvOS has ICU's break iterators: the Node.js self-test in the simulator segments a sample with `Intl.Segmenter` (graphemes and words); Node.js' memory limit by the Apple TV |
 | `AIOSettingsSyncTests` | *Save to Nuvio Account*: the choice, export, import, the newer backup wins, the same password |
 | `PluginRuntimeTests`, `PluginPlatformTests`, `PluginAIOBridgeTests` | The plugins, and plugins through AIOStreams |
 | Linux, outside this repository | `smoke.sh` from the official image with the same installer, Node 24 `--jitless` and WebAssembly through polywasm: install, configuration page, saving a configuration, streams, the versions port, a second start with the held refreshes, the "Nuvio plugins" card with a stand-in plugin (http and `nzbUrl` streams), the ports taken away and back after the wake file is written, no rate limits, a configuration with Tamtaro's and Vidhin's filters synced from a link (saved, and streams with them); a pinned and the newest version. And the ffprobe bridge against AIOStreams' real ffprobe code |
