@@ -12557,7 +12557,9 @@ private struct TvStreamCard: View {
             .font(.system(size: (size * 0.65).rounded(), weight: .semibold))
             .foregroundColor(.white.opacity(0.9))
 
-        if let logo = stream.addonLogoURL, let url = URL(string: logo) {
+        if let integration = IntegrationLogo(streamLogoReference: stream.addonLogoURL) {
+            IntegrationLogoView(logo: integration, size: size)
+        } else if let logo = stream.addonLogoURL, let url = URL(string: logo) {
             AsyncImage(url: url) { phase in
                 switch phase {
                 case .success(let image):

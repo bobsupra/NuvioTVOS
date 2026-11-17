@@ -9357,29 +9357,7 @@ private struct TraktConnectionSettingsCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 18) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(Color(red: 0.94, green: 0.10, blue: 0.17))
-                    Text("trakt")
-                        .font(.system(size: 24, weight: .black))
-                        .foregroundColor(.white)
-                }
-                .frame(width: 92, height: 62)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(statusTitle)
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundColor(.white)
-
-                    Text(statusSubtitle)
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundColor(.white.opacity(0.62))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 16)
-            }
+            IntegrationStatusRow(logo: .trakt, title: statusTitle, subtitle: statusSubtitle)
 
             switch viewModel.mode {
             case .disconnected, .awaitingApproval:
@@ -9988,29 +9966,7 @@ private struct SimklConnectionSettingsCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 18) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(Color(red: 0.08, green: 0.55, blue: 0.82))
-                    Text("SIMKL")
-                        .font(.system(size: 21, weight: .black))
-                        .foregroundColor(.white)
-                }
-                .frame(width: 92, height: 62)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(statusTitle)
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundColor(.white)
-
-                    Text(statusSubtitle)
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundColor(.white.opacity(0.62))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 16)
-            }
+            IntegrationStatusRow(logo: .simkl, title: statusTitle, subtitle: statusSubtitle)
 
             switch viewModel.mode {
             case .disconnected, .awaitingApproval:
@@ -10098,38 +10054,7 @@ private struct MdbListConnectionSettingsCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 18) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.10, green: 0.34, blue: 0.24),
-                                    Color(red: 0.12, green: 0.23, blue: 0.18)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                    Text("MDBList")
-                        .font(.system(size: 19, weight: .black))
-                        .foregroundColor(.white)
-                }
-                .frame(width: 112, height: 62)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(statusTitle)
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundColor(.white)
-
-                    Text(statusSubtitle)
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundColor(.white.opacity(0.62))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 16)
-            }
+            IntegrationStatusRow(logo: .mdblist, title: statusTitle, subtitle: statusSubtitle)
 
             switch viewModel.mode {
             case .disconnected, .awaitingApproval:
@@ -11206,38 +11131,7 @@ private struct WeTrakrConnectionSettingsCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .top, spacing: 18) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 18, style: .continuous)
-                        .fill(
-                            LinearGradient(
-                                colors: [
-                                    Color(red: 0.50, green: 0.18, blue: 0.76),
-                                    Color(red: 0.32, green: 0.08, blue: 0.54)
-                                ],
-                                startPoint: .topLeading,
-                                endPoint: .bottomTrailing
-                            )
-                        )
-                    Text("WeTrakr")
-                        .font(.system(size: 19, weight: .black))
-                        .foregroundColor(.white)
-                }
-                .frame(width: 112, height: 62)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text(statusTitle)
-                        .font(.system(size: 24, weight: .bold))
-                        .foregroundColor(.white)
-
-                    Text(statusSubtitle)
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundColor(.white.opacity(0.62))
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-
-                Spacer(minLength: 16)
-            }
+            IntegrationStatusRow(logo: .wetrakr, title: statusTitle, subtitle: statusSubtitle)
 
             switch viewModel.mode {
             case .disconnected, .awaitingApproval:
@@ -14821,11 +14715,30 @@ private struct SMBSettingsSection: View {
     @State private var isAddingServer = false
     @State private var scanningServer: SMBServerConfig?
 
+    private var connectedServers: [SMBServerConfig] {
+        serverStore.servers.filter { sessionManager.connectionState(for: $0.id).isConnected }
+    }
+
+    private var statusTitle: String {
+        IntegrationServerStatus.title(connectedNames: connectedServers.map(\.displayName))
+    }
+
+    private var statusSubtitle: String {
+        if !connectedServers.isEmpty {
+            return L10n.string("smb_status_connected_subtitle", fallback: "This profile can play files from these shares.")
+        }
+        return serverStore.servers.isEmpty
+            ? L10n.string("smb_status_no_servers_subtitle", fallback: "Add a server below to play files from its shares.")
+            : L10n.string("smb_status_disconnected_subtitle", fallback: "Connect a server below to play files from its shares.")
+    }
+
     var body: some View {
         SettingsGroup(
             title: L10n.string("smb_group_title", fallback: "SMB"),
             subtitle: L10n.string("smb_group_subtitle", fallback: "Play files from a NAS or PC on your local network")
         ) {
+            IntegrationStatusRow(logo: .smb, title: statusTitle, subtitle: statusSubtitle)
+
             SettingsActionRow(
                 title: L10n.string("smb_add_server", fallback: "Add Server"),
                 subtitle: L10n.string("smb_add_server_subtitle", fallback: "Connect a share by host or IP address"),
@@ -15407,11 +15320,30 @@ private struct JellyfinSettingsSection: View {
     @State private var isAddingServer = false
     @State private var syncingServer: JellyfinServerConfig?
 
+    private var connectedServers: [JellyfinServerConfig] {
+        serverStore.servers.filter { sessionManager.connectionState(for: $0.id).isConnected }
+    }
+
+    private var statusTitle: String {
+        IntegrationServerStatus.title(connectedNames: connectedServers.map(\.displayName))
+    }
+
+    private var statusSubtitle: String {
+        if !connectedServers.isEmpty {
+            return L10n.string("jellyfin_status_connected_subtitle", fallback: "This profile can browse and play the server's library.")
+        }
+        return serverStore.servers.isEmpty
+            ? L10n.string("jellyfin_status_no_servers_subtitle", fallback: "Add a server below to browse and play its library.")
+            : L10n.string("jellyfin_status_disconnected_subtitle", fallback: "Connect a server below to browse and play its library.")
+    }
+
     var body: some View {
         SettingsGroup(
             title: L10n.string("jellyfin_group_title", fallback: "Jellyfin"),
             subtitle: L10n.string("jellyfin_group_subtitle", fallback: "Browse and play a self-hosted Jellyfin server's library")
         ) {
+            IntegrationStatusRow(logo: .jellyfin, title: statusTitle, subtitle: statusSubtitle)
+
             SettingsActionRow(
                 title: L10n.string("jellyfin_add_server", fallback: "Add Server"),
                 subtitle: L10n.string("jellyfin_add_server_subtitle", fallback: "Connect a server by URL"),
@@ -15974,13 +15906,33 @@ private struct PlexSettingsSection: View {
     @State private var refreshError: String?
     @AppStorage(SettingsKey.plexLocalRowEnabled) private var showsOnHome = true
 
+    private var statusTitle: String {
+        guard serverStore.isSignedIn else {
+            return L10n.string("integration_status_not_connected", fallback: "Not Connected")
+        }
+        if sessionManager.needsSignIn {
+            return L10n.string("plex_status_sign_in_expired", fallback: "Sign-in Expired")
+        }
+        return L10n.format("integration_status_connected_as", fallback: "Connected as %@", serverStore.accountName ?? "Plex")
+    }
+
+    private var statusSubtitle: String {
+        guard serverStore.isSignedIn else {
+            return L10n.string("plex_status_signed_out_subtitle", fallback: "Sign in with your Plex account to add your servers.")
+        }
+        if sessionManager.needsSignIn {
+            return L10n.string("plex_status_sign_in_expired_subtitle", fallback: "Sign in again to keep using your Plex servers.")
+        }
+        return L10n.string("plex_status_connected_subtitle", fallback: "This profile can use your Plex servers, libraries, and resume positions.")
+    }
+
     var body: some View {
         SettingsGroup(
             title: L10n.string("plex_group_title", fallback: "Plex"),
-            subtitle: serverStore.isSignedIn
-                ? L10n.format("plex_signed_in_as", fallback: "Signed in as %@", serverStore.accountName ?? "Plex")
-                : L10n.string("plex_group_subtitle", fallback: "Browse and play your Plex Media Server libraries, with resume position kept in sync with other Plex apps")
+            subtitle: L10n.string("plex_group_subtitle", fallback: "Browse and play your Plex Media Server libraries, with resume position kept in sync with other Plex apps")
         ) {
+            IntegrationStatusRow(logo: .plex, title: statusTitle, subtitle: statusSubtitle)
+
             if serverStore.isSignedIn {
                 if sessionManager.needsSignIn {
                     SettingsActionRow(

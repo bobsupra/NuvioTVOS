@@ -87,6 +87,7 @@ final class StreamsRepository: ObservableObject {
                 name: server.displayName,
                 description: ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
                 addonName: "Local (SMB)",
+                addonLogoURL: IntegrationLogo.smb.streamLogoReference,
                 filename: file.filename,
                 videoSize: file.size
             )
@@ -125,6 +126,7 @@ final class StreamsRepository: ObservableObject {
                             ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
                         },
                         addonName: "Jellyfin",
+                        addonLogoURL: IntegrationLogo.jellyfin.streamLogoReference,
                         videoSize: item.size
                     )
                 )
@@ -210,6 +212,7 @@ final class StreamsRepository: ObservableObject {
                             description: label.description,
                             addonName: "Plex",
                             subtitles: itemSubtitles,
+                            addonLogoURL: IntegrationLogo.plex.streamLogoReference,
                             videoSize: file.sizeBytes,
                             httpHeaders: [PlexClient.tokenHeader: token]
                         )
@@ -227,6 +230,7 @@ final class StreamsRepository: ObservableObject {
                             ),
                             addonName: "Plex",
                             subtitles: itemSubtitles,
+                            addonLogoURL: IntegrationLogo.plex.streamLogoReference,
                             httpHeaders: [PlexClient.tokenHeader: token]
                         )
                     )
