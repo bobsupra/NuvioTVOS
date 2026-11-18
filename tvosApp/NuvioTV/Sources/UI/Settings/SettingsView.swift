@@ -14288,7 +14288,7 @@ private struct AboutSettingsView: View {
                 if let release = releaseUpdateService.latestRelease {
                     SettingsActionRow(
                         title: L10n.string("release_update_details", fallback: "Release Details"),
-                        subtitle: L10n.string("release_update_details_subtitle", fallback: "View version \(release.displayVersion) release notes and QR code"),
+                        subtitle: L10n.format("release_update_details_subtitle", fallback: "View version %@ release notes and QR code", release.displayVersion),
                         value: L10n.string("tvos_settings_view", fallback: "View"),
                         accentColor: accentColor
                     ) {
