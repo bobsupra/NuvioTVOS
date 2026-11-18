@@ -350,6 +350,7 @@ enum SettingsKey {
     static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
     static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
     static let showAddonLogo = "nuvio.tv.settings.playback.showAddonLogo"
+    static let streamNuvioBadges = "nuvio.tv.settings.playback.streamNuvioBadges"
     static let streamBadgePlacement = "nuvio.tv.settings.playback.streamBadgePlacement"
     static let streamListTextScale = "nuvio.tv.settings.playback.streamListTextScale"
     static let streamListCardSize = "nuvio.tv.settings.playback.streamListCardSize"
@@ -498,7 +499,7 @@ enum SettingsKey {
         plexServers, plexAccountName, plexLocalRowEnabled,
         playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, foldsDolbyVisionFEL, preferHDR10Plus, lowResUpscaling, upscaleScaler, losslessAudioBridge, preserveSubwooferBassInStereo, loudnessNormalizer, loudnessTargetPreset, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
-        cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
+        cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamNuvioBadges, streamBadgePlacement,
         streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
         streamListHideAddonName, streamListHideDescription,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
@@ -3878,6 +3879,7 @@ private struct StreamListStyleEditor: View {
     @AppStorage(SettingsKey.streamListBadgeSize) private var badgeSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListLogoSize) private var logoSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
+    @AppStorage(SettingsKey.streamNuvioBadges) private var nuvioBadges = false
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
     @AppStorage(SettingsKey.streamListCardSize) private var cardSize = StreamListStyle.CardSize.standard.rawValue
     @AppStorage(SettingsKey.streamListSpacing) private var spacing = StreamListStyle.Spacing.standard.rawValue
@@ -3940,7 +3942,7 @@ private struct StreamListStyleEditor: View {
                             .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.white.opacity(0.55))
                         StreamListPreview(style: style, showAddonLogo: showAddonLogo, width: previewWidth)
-                            .id("\(streamBadgeSettingsRevision)_\(showAddonLogo)_\(hideAddonName)_\(hideDescription)_\(hideFileSize)")
+                            .id("\(streamBadgeSettingsRevision)_\(showAddonLogo)_\(hideAddonName)_\(hideDescription)_\(hideFileSize)_\(nuvioBadges)")
                     }
                     .padding(.top, 110)
                 }
@@ -4084,6 +4086,19 @@ private struct StreamListStyleEditor: View {
         )
 
         SettingsToggleRow(
+            title: L10n.string("tvos_settings_nuvio_badges", fallback: "Nuvio Badges"),
+            subtitle: L10n.string("tvos_settings_nuvio_badges_subtitle", fallback: "Draw quality badges with the official Dolby, DTS and HDR10+ marks instead of the badge pack's images"),
+            isOn: Binding(
+                get: { nuvioBadges },
+                set: { newValue in
+                    nuvioBadges = newValue
+                    StreamBadgeSettingsStore.setUseNuvioBadges(newValue)
+                }
+            ),
+            accentColor: accentColor
+        )
+
+        SettingsToggleRow(
             title: L10n.string("tvos_settings_addon_logo", fallback: "Add-on Logo"),
             subtitle: L10n.string("tvos_settings_addon_logo_subtitle", fallback: "Show the source add-on logo beside each stream"),
             isOn: Binding(
@@ -4172,6 +4187,8 @@ private struct StreamListStyleEditor: View {
         logoSize = StreamListStyle.Step.standard.rawValue
         showAddonLogo = false
         StreamBadgeSettingsStore.setShowAddonLogo(false)
+        nuvioBadges = false
+        StreamBadgeSettingsStore.setUseNuvioBadges(false)
         streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
         StreamBadgeSettingsStore.setPlacement(.bottom)
         cardSize = StreamListStyle.CardSize.standard.rawValue

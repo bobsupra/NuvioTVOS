@@ -12109,7 +12109,8 @@ struct StreamListPreview: View {
         let settings = StreamBadgeSettingsStore.snapshot
         let badges = StreamBadgeSettingsSnapshot(
             rules: settings.rules, showFileSizeBadges: settings.showFileSizeBadges,
-            showAddonLogo: showAddonLogo, badgePlacement: settings.badgePlacement)
+            showAddonLogo: showAddonLogo, badgePlacement: settings.badgePlacement,
+            useNuvioBadges: settings.useNuvioBadges)
         let panelTop = (Self.canvas.height - layout.stackHeight) / 2
         let panelLeft = Self.canvas.width - 64 - layout.panelWidth
         let panelShape = RoundedRectangle(cornerRadius: 32, style: .continuous)
@@ -12264,11 +12265,24 @@ private struct TvStreamCardPresentationCacheKey: Equatable {
 
 private struct TvStreamCardPresentation {
     let importedBadges: [StreamBadgeFilter]
+    /// App-drawn badges; set instead of `importedBadges` when Nuvio Badges is on.
+    let nuvioBadges: [NuvioStreamBadge]
     let fileSizeLabel: String?
     let badgePlacement: StreamBadgePlacement
     let showAddonLogo: Bool
 
     init(stream: NuvioStream, badgeSettings: StreamBadgeSettingsSnapshot) {
+        fileSizeLabel = badgeSettings.showFileSizeBadges
+            ? StreamBadgeSizing.fileSizeLabel(for: stream)
+            : nil
+        badgePlacement = badgeSettings.badgePlacement
+        showAddonLogo = badgeSettings.showAddonLogo
+        if badgeSettings.useNuvioBadges {
+            nuvioBadges = NuvioStreamBadge.badges(for: stream)
+            importedBadges = []
+            return
+        }
+        nuvioBadges = []
         let matched = StreamBadgeMatcher.matchedBadges(
             for: stream,
             rules: badgeSettings.rules
@@ -12291,15 +12305,11 @@ private struct TvStreamCardPresentation {
         } else {
             importedBadges = matched
         }
-        fileSizeLabel = badgeSettings.showFileSizeBadges
-            ? StreamBadgeSizing.fileSizeLabel(for: stream)
-            : nil
-        badgePlacement = badgeSettings.badgePlacement
-        showAddonLogo = badgeSettings.showAddonLogo
     }
 
     init(pending badgeSettings: StreamBadgeSettingsSnapshot) {
         importedBadges = []
+        nuvioBadges = []
         fileSizeLabel = nil
         badgePlacement = badgeSettings.badgePlacement
         showAddonLogo = badgeSettings.showAddonLogo
@@ -12332,6 +12342,7 @@ private struct TvStreamCard: View {
     private let focusID: String
     private let lastPlayedAt: Date?
     private let importedBadges: [StreamBadgeFilter]
+    private let nuvioBadges: [NuvioStreamBadge]
     private let fileSizeLabel: String?
     private let badgePlacement: StreamBadgePlacement
     private let showAddonLogo: Bool
@@ -12369,6 +12380,7 @@ private struct TvStreamCard: View {
         self.style = style
         self.previewFocused = previewFocused
         self.importedBadges = presentation.importedBadges
+        self.nuvioBadges = presentation.nuvioBadges
         self.fileSizeLabel = style.hideFileSize ? nil : presentation.fileSizeLabel
         self.badgePlacement = presentation.badgePlacement
         self.showAddonLogo = presentation.showAddonLogo
@@ -12393,7 +12405,7 @@ private struct TvStreamCard: View {
     }
 
     var body: some View {
-        let showImportedBadges = !importedBadges.isEmpty || fileSizeLabel != nil
+        let showImportedBadges = !importedBadges.isEmpty || !nuvioBadges.isEmpty || fileSizeLabel != nil
         let metrics = style.metrics
         let badgeScale = style.badgeScale
         let looksFocused = isFocused || previewFocused
@@ -12408,6 +12420,7 @@ private struct TvStreamCard: View {
                     if showImportedBadges && badgePlacement == .top {
                         TvStreamImportedBadgeRow(
                             badges: importedBadges,
+                            nuvioBadges: nuvioBadges,
                             fileSizeLabel: fileSizeLabel,
                             isScrolling: looksFocused,
                             scale: badgeScale
@@ -12464,6 +12477,7 @@ private struct TvStreamCard: View {
                     if showImportedBadges && badgePlacement == .bottom {
                         TvStreamImportedBadgeRow(
                             badges: importedBadges,
+                            nuvioBadges: nuvioBadges,
                             fileSizeLabel: fileSizeLabel,
                             isScrolling: looksFocused,
                             scale: badgeScale
@@ -12587,6 +12601,7 @@ private struct TvStreamBadgeRowWidthKey: PreferenceKey {
 
 private struct TvStreamImportedBadgeRow: View {
     let badges: [StreamBadgeFilter]
+    var nuvioBadges: [NuvioStreamBadge] = []
     let fileSizeLabel: String?
     let isScrolling: Bool
     /// The stream list's text size (Settings → Playback → Stream List).
@@ -12652,6 +12667,10 @@ private struct TvStreamImportedBadgeRow: View {
 
     private var badgeContent: some View {
         HStack(spacing: 10) {
+            ForEach(nuvioBadges, id: \.self) { badge in
+                NuvioStreamBadgeView(badge: badge, scale: scale)
+            }
+
             ForEach(Array(badges.enumerated()), id: \.offset) { _, badge in
                 TvStreamImportedBadge(badge: badge, scale: scale)
             }
@@ -12661,7 +12680,7 @@ private struct TvStreamImportedBadgeRow: View {
                     .font(.system(size: (18 * scale).rounded(), weight: .bold))
                     .foregroundColor(.white.opacity(0.9))
                     .padding(.horizontal, 12 * scale)
-                    .padding(.vertical, 7 * scale)
+                    .frame(height: (36 * scale).rounded())
                     .background(
                         Capsule().fill(Color.white.opacity(0.12))
                     )
