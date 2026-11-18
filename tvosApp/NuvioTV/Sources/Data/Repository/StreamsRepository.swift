@@ -407,6 +407,8 @@ final class StreamsRepository: ObservableObject {
     private func runDiscovery(requestKey: String, type: String, videoId: String,
                               addonManifestURLs: [URL]) async {
         guard !Task.isCancelled else { return }
+        await PlexSessionManager.shared.syncDueServersBeforeStreamList()
+        guard !Task.isCancelled else { return }
         let plexTracks = await plexTracks(videoId: videoId)
         guard !Task.isCancelled else { return }
         let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, tracks: plexTracks)]
