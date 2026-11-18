@@ -12404,10 +12404,19 @@ private struct TvStreamCard: View {
         }
     }
 
+    private var badgeRow: some View {
+        TvStreamImportedBadgeRow(
+            badges: importedBadges,
+            nuvioBadges: nuvioBadges,
+            fileSizeLabel: fileSizeLabel,
+            isScrolling: isFocused || previewFocused,
+            scale: style.badgeScale
+        )
+    }
+
     var body: some View {
         let showImportedBadges = !importedBadges.isEmpty || !nuvioBadges.isEmpty || fileSizeLabel != nil
         let metrics = style.metrics
-        let badgeScale = style.badgeScale
         let looksFocused = isFocused || previewFocused
         // The focused card can show everything (Expand Focused Card).
         let expanded = style.expandFocused && looksFocused
@@ -12415,93 +12424,85 @@ private struct TvStreamCard: View {
         let descriptionLines = expanded ? nil : style.descriptionLines
 
         Button(action: action) {
-            HStack(alignment: .center, spacing: 34) {
-                VStack(alignment: .leading, spacing: metrics.lineSpacing) {
-                    if showImportedBadges && badgePlacement == .top {
-                        TvStreamImportedBadgeRow(
-                            badges: importedBadges,
-                            nuvioBadges: nuvioBadges,
-                            fileSizeLabel: fileSizeLabel,
-                            isScrolling: looksFocused,
-                            scale: badgeScale
-                        )
-                    }
+            // The badge row spans the whole card, under the add-on logo too.
+            VStack(alignment: .leading, spacing: metrics.lineSpacing) {
+                if showImportedBadges && badgePlacement == .top {
+                    badgeRow
+                }
 
-                    Text(primaryName)
-                        .font(.system(size: style.font(34), weight: .bold))
-                        .foregroundColor(.white)
-                        .lineLimit(nameLines)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    if let secondaryName {
-                        Text(secondaryName)
-                            .font(.system(size: style.font(38), weight: .medium))
+                HStack(alignment: .center, spacing: 34) {
+                    VStack(alignment: .leading, spacing: metrics.lineSpacing) {
+                        Text(primaryName)
+                            .font(.system(size: style.font(34), weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(nameLines)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
 
-                    if let description = descriptionText, !description.isEmpty {
-                        Text(description)
-                            .font(.system(size: style.detailFont(26), weight: .regular))
-                            .foregroundColor(.white.opacity(0.62))
-                            .lineSpacing(style.detailLineSpacing)
-                            .lineLimit(descriptionLines)
+                        if let secondaryName {
+                            Text(secondaryName)
+                                .font(.system(size: style.font(38), weight: .medium))
+                                .foregroundColor(.white)
+                                .lineLimit(nameLines)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if let description = descriptionText, !description.isEmpty {
+                            Text(description)
+                                .font(.system(size: style.detailFont(26), weight: .regular))
+                                .foregroundColor(.white.opacity(0.62))
+                                .lineSpacing(style.detailLineSpacing)
+                                .lineLimit(descriptionLines)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if let lastPlayedAt {
+                            HStack(spacing: 6) {
+                                Text(L10n.string("details_last_played", fallback: "Last played"))
+                                TimelineView(.periodic(from: lastPlayedAt, by: 60)) { context in
+                                    Text(NuvioLastPlayedDisplay.formatted(from: lastPlayedAt, relativeTo: context.date))
+                                }
+                            }
+                            .font(.system(size: style.detailFont(22), weight: .medium))
+                            .foregroundColor(.white.opacity(0.58))
+                            .lineLimit(1)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
+                        }
 
-                    if let lastPlayedAt {
-                        HStack(spacing: 6) {
-                            Text(L10n.string("details_last_played", fallback: "Last played"))
-                            TimelineView(.periodic(from: lastPlayedAt, by: 60)) { context in
-                                Text(NuvioLastPlayedDisplay.formatted(from: lastPlayedAt, relativeTo: context.date))
+                        if stream.debridCacheStatusUnavailable == true {
+                            Text(L10n.string(
+                                "debrid_cache_status_unavailable",
+                                fallback: "Cache status unavailable"
+                            ))
+                            .font(.system(size: style.detailFont(22), weight: .medium))
+                            .foregroundColor(.white.opacity(0.52))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if showAddonLogo {
+                        Spacer(minLength: 28)
+
+                        VStack(spacing: 18) {
+                            addonLogo
+
+                            if !style.hideAddonName, let addonName = stream.addonName {
+                                Text(addonName)
+                                    .font(.system(size: style.font(22), weight: .medium))
+                                    .foregroundColor(.white.opacity(0.42))
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                                    .frame(width: 220)
                             }
                         }
-                        .font(.system(size: style.detailFont(22), weight: .medium))
-                        .foregroundColor(.white.opacity(0.58))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if stream.debridCacheStatusUnavailable == true {
-                        Text(L10n.string(
-                            "debrid_cache_status_unavailable",
-                            fallback: "Cache status unavailable"
-                        ))
-                        .font(.system(size: style.detailFont(22), weight: .medium))
-                        .foregroundColor(.white.opacity(0.52))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if showImportedBadges && badgePlacement == .bottom {
-                        TvStreamImportedBadgeRow(
-                            badges: importedBadges,
-                            nuvioBadges: nuvioBadges,
-                            fileSizeLabel: fileSizeLabel,
-                            isScrolling: looksFocused,
-                            scale: badgeScale
-                        )
-                            .padding(.top, 4)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-                if showAddonLogo {
-                    Spacer(minLength: 28)
-
-                    VStack(spacing: 18) {
-                        addonLogo
-
-                        if !style.hideAddonName, let addonName = stream.addonName {
-                            Text(addonName)
-                                .font(.system(size: style.font(22), weight: .medium))
-                                .foregroundColor(.white.opacity(0.42))
-                                .lineLimit(2)
-                                .multilineTextAlignment(.center)
-                                .frame(width: 220)
-                        }
-                    }
+                if showImportedBadges && badgePlacement == .bottom {
+                    badgeRow
+                        .padding(.top, 4)
                 }
             }
             .padding(.horizontal, metrics.horizontalPadding)
