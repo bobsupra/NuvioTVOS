@@ -14596,6 +14596,12 @@ private struct LicensesAttributionsSheet: View {
             title: "TVmaze",
             body: "Broadcast times of series episodes in the calendar, when Exact air times is on. Data from tvmaze.com.",
             license: "CC BY-SA 4.0"
+        ),
+        LicenseEntry(
+            id: "stream-badge-marks",
+            title: "Stream badge marks",
+            body: "The Dolby, DTS and HDR10+ marks on Nuvio Badges, from Wikimedia Commons. The DTS:X mark is by CinemaLover24680, changed to a single color. All marks are trademarks of their owners and only name the format a stream has.",
+            license: "CC BY-SA 4.0 (DTS:X), public domain (others)"
         )
     ]
 
