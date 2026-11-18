@@ -12109,7 +12109,8 @@ struct StreamListPreview: View {
         let settings = StreamBadgeSettingsStore.snapshot
         let badges = StreamBadgeSettingsSnapshot(
             rules: settings.rules, showFileSizeBadges: settings.showFileSizeBadges,
-            showAddonLogo: showAddonLogo, badgePlacement: settings.badgePlacement)
+            showAddonLogo: showAddonLogo, badgePlacement: settings.badgePlacement,
+            useNuvioBadges: settings.useNuvioBadges)
         let panelTop = (Self.canvas.height - layout.stackHeight) / 2
         let panelLeft = Self.canvas.width - 64 - layout.panelWidth
         let panelShape = RoundedRectangle(cornerRadius: 32, style: .continuous)
@@ -12264,11 +12265,24 @@ private struct TvStreamCardPresentationCacheKey: Equatable {
 
 private struct TvStreamCardPresentation {
     let importedBadges: [StreamBadgeFilter]
+    /// App-drawn badges; set instead of `importedBadges` when Nuvio Badges is on.
+    let nuvioBadges: [NuvioStreamBadge]
     let fileSizeLabel: String?
     let badgePlacement: StreamBadgePlacement
     let showAddonLogo: Bool
 
     init(stream: NuvioStream, badgeSettings: StreamBadgeSettingsSnapshot) {
+        fileSizeLabel = badgeSettings.showFileSizeBadges
+            ? StreamBadgeSizing.fileSizeLabel(for: stream)
+            : nil
+        badgePlacement = badgeSettings.badgePlacement
+        showAddonLogo = badgeSettings.showAddonLogo
+        if badgeSettings.useNuvioBadges {
+            nuvioBadges = NuvioStreamBadge.badges(for: stream)
+            importedBadges = []
+            return
+        }
+        nuvioBadges = []
         let matched = StreamBadgeMatcher.matchedBadges(
             for: stream,
             rules: badgeSettings.rules
@@ -12291,15 +12305,11 @@ private struct TvStreamCardPresentation {
         } else {
             importedBadges = matched
         }
-        fileSizeLabel = badgeSettings.showFileSizeBadges
-            ? StreamBadgeSizing.fileSizeLabel(for: stream)
-            : nil
-        badgePlacement = badgeSettings.badgePlacement
-        showAddonLogo = badgeSettings.showAddonLogo
     }
 
     init(pending badgeSettings: StreamBadgeSettingsSnapshot) {
         importedBadges = []
+        nuvioBadges = []
         fileSizeLabel = nil
         badgePlacement = badgeSettings.badgePlacement
         showAddonLogo = badgeSettings.showAddonLogo
@@ -12332,6 +12342,7 @@ private struct TvStreamCard: View {
     private let focusID: String
     private let lastPlayedAt: Date?
     private let importedBadges: [StreamBadgeFilter]
+    private let nuvioBadges: [NuvioStreamBadge]
     private let fileSizeLabel: String?
     private let badgePlacement: StreamBadgePlacement
     private let showAddonLogo: Bool
@@ -12369,6 +12380,7 @@ private struct TvStreamCard: View {
         self.style = style
         self.previewFocused = previewFocused
         self.importedBadges = presentation.importedBadges
+        self.nuvioBadges = presentation.nuvioBadges
         self.fileSizeLabel = style.hideFileSize ? nil : presentation.fileSizeLabel
         self.badgePlacement = presentation.badgePlacement
         self.showAddonLogo = presentation.showAddonLogo
@@ -12392,10 +12404,19 @@ private struct TvStreamCard: View {
         }
     }
 
+    private var badgeRow: some View {
+        TvStreamImportedBadgeRow(
+            badges: importedBadges,
+            nuvioBadges: nuvioBadges,
+            fileSizeLabel: fileSizeLabel,
+            isScrolling: isFocused || previewFocused,
+            scale: style.badgeScale
+        )
+    }
+
     var body: some View {
-        let showImportedBadges = !importedBadges.isEmpty || fileSizeLabel != nil
+        let showImportedBadges = !importedBadges.isEmpty || !nuvioBadges.isEmpty || fileSizeLabel != nil
         let metrics = style.metrics
-        let badgeScale = style.badgeScale
         let looksFocused = isFocused || previewFocused
         // The focused card can show everything (Expand Focused Card).
         let expanded = style.expandFocused && looksFocused
@@ -12403,91 +12424,85 @@ private struct TvStreamCard: View {
         let descriptionLines = expanded ? nil : style.descriptionLines
 
         Button(action: action) {
-            HStack(alignment: .center, spacing: 34) {
-                VStack(alignment: .leading, spacing: metrics.lineSpacing) {
-                    if showImportedBadges && badgePlacement == .top {
-                        TvStreamImportedBadgeRow(
-                            badges: importedBadges,
-                            fileSizeLabel: fileSizeLabel,
-                            isScrolling: looksFocused,
-                            scale: badgeScale
-                        )
-                    }
+            // The badge row spans the whole card, under the add-on logo too.
+            VStack(alignment: .leading, spacing: metrics.lineSpacing) {
+                if showImportedBadges && badgePlacement == .top {
+                    badgeRow
+                }
 
-                    Text(primaryName)
-                        .font(.system(size: style.font(34), weight: .bold))
-                        .foregroundColor(.white)
-                        .lineLimit(nameLines)
-                        .fixedSize(horizontal: false, vertical: true)
-
-                    if let secondaryName {
-                        Text(secondaryName)
-                            .font(.system(size: style.font(38), weight: .medium))
+                HStack(alignment: .center, spacing: 34) {
+                    VStack(alignment: .leading, spacing: metrics.lineSpacing) {
+                        Text(primaryName)
+                            .font(.system(size: style.font(34), weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(nameLines)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
 
-                    if let description = descriptionText, !description.isEmpty {
-                        Text(description)
-                            .font(.system(size: style.detailFont(26), weight: .regular))
-                            .foregroundColor(.white.opacity(0.62))
-                            .lineSpacing(style.detailLineSpacing)
-                            .lineLimit(descriptionLines)
+                        if let secondaryName {
+                            Text(secondaryName)
+                                .font(.system(size: style.font(38), weight: .medium))
+                                .foregroundColor(.white)
+                                .lineLimit(nameLines)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if let description = descriptionText, !description.isEmpty {
+                            Text(description)
+                                .font(.system(size: style.detailFont(26), weight: .regular))
+                                .foregroundColor(.white.opacity(0.62))
+                                .lineSpacing(style.detailLineSpacing)
+                                .lineLimit(descriptionLines)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if let lastPlayedAt {
+                            HStack(spacing: 6) {
+                                Text(L10n.string("details_last_played", fallback: "Last played"))
+                                TimelineView(.periodic(from: lastPlayedAt, by: 60)) { context in
+                                    Text(NuvioLastPlayedDisplay.formatted(from: lastPlayedAt, relativeTo: context.date))
+                                }
+                            }
+                            .font(.system(size: style.detailFont(22), weight: .medium))
+                            .foregroundColor(.white.opacity(0.58))
+                            .lineLimit(1)
                             .fixedSize(horizontal: false, vertical: true)
-                    }
+                        }
 
-                    if let lastPlayedAt {
-                        HStack(spacing: 6) {
-                            Text(L10n.string("details_last_played", fallback: "Last played"))
-                            TimelineView(.periodic(from: lastPlayedAt, by: 60)) { context in
-                                Text(NuvioLastPlayedDisplay.formatted(from: lastPlayedAt, relativeTo: context.date))
+                        if stream.debridCacheStatusUnavailable == true {
+                            Text(L10n.string(
+                                "debrid_cache_status_unavailable",
+                                fallback: "Cache status unavailable"
+                            ))
+                            .font(.system(size: style.detailFont(22), weight: .medium))
+                            .foregroundColor(.white.opacity(0.52))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                    if showAddonLogo {
+                        Spacer(minLength: 28)
+
+                        VStack(spacing: 18) {
+                            addonLogo
+
+                            if !style.hideAddonName, let addonName = stream.addonName {
+                                Text(addonName)
+                                    .font(.system(size: style.font(22), weight: .medium))
+                                    .foregroundColor(.white.opacity(0.42))
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                                    .frame(width: 220)
                             }
                         }
-                        .font(.system(size: style.detailFont(22), weight: .medium))
-                        .foregroundColor(.white.opacity(0.58))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if stream.debridCacheStatusUnavailable == true {
-                        Text(L10n.string(
-                            "debrid_cache_status_unavailable",
-                            fallback: "Cache status unavailable"
-                        ))
-                        .font(.system(size: style.detailFont(22), weight: .medium))
-                        .foregroundColor(.white.opacity(0.52))
-                        .lineLimit(1)
-                        .fixedSize(horizontal: false, vertical: true)
-                    }
-
-                    if showImportedBadges && badgePlacement == .bottom {
-                        TvStreamImportedBadgeRow(
-                            badges: importedBadges,
-                            fileSizeLabel: fileSizeLabel,
-                            isScrolling: looksFocused,
-                            scale: badgeScale
-                        )
-                            .padding(.top, 4)
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
 
-                if showAddonLogo {
-                    Spacer(minLength: 28)
-
-                    VStack(spacing: 18) {
-                        addonLogo
-
-                        if !style.hideAddonName, let addonName = stream.addonName {
-                            Text(addonName)
-                                .font(.system(size: style.font(22), weight: .medium))
-                                .foregroundColor(.white.opacity(0.42))
-                                .lineLimit(2)
-                                .multilineTextAlignment(.center)
-                                .frame(width: 220)
-                        }
-                    }
+                if showImportedBadges && badgePlacement == .bottom {
+                    badgeRow
+                        .padding(.top, 4)
                 }
             }
             .padding(.horizontal, metrics.horizontalPadding)
@@ -12587,6 +12602,7 @@ private struct TvStreamBadgeRowWidthKey: PreferenceKey {
 
 private struct TvStreamImportedBadgeRow: View {
     let badges: [StreamBadgeFilter]
+    var nuvioBadges: [NuvioStreamBadge] = []
     let fileSizeLabel: String?
     let isScrolling: Bool
     /// The stream list's text size (Settings → Playback → Stream List).
@@ -12652,6 +12668,10 @@ private struct TvStreamImportedBadgeRow: View {
 
     private var badgeContent: some View {
         HStack(spacing: 10) {
+            ForEach(nuvioBadges, id: \.self) { badge in
+                NuvioStreamBadgeView(badge: badge, scale: scale)
+            }
+
             ForEach(Array(badges.enumerated()), id: \.offset) { _, badge in
                 TvStreamImportedBadge(badge: badge, scale: scale)
             }
@@ -12661,7 +12681,7 @@ private struct TvStreamImportedBadgeRow: View {
                     .font(.system(size: (18 * scale).rounded(), weight: .bold))
                     .foregroundColor(.white.opacity(0.9))
                     .padding(.horizontal, 12 * scale)
-                    .padding(.vertical, 7 * scale)
+                    .frame(height: (36 * scale).rounded())
                     .background(
                         Capsule().fill(Color.white.opacity(0.12))
                     )
