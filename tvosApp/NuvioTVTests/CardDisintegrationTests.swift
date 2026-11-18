@@ -90,10 +90,10 @@ final class CardDisintegrationTests: XCTestCase {
         XCTAssertTrue(center.runs.isEmpty)
     }
 
-    func testWithoutAFocusedCardTheRemovalRunsAtOnce() {
-        // Unit tests have no focused card on screen, so the effect cannot run.
+    func testWithoutAKnownCardFrameTheRemovalRunsAtOnce() {
+        // No row reported a frame for this card, so there is nothing to capture.
         var removed = 0
-        CardDisintegration.shared.dissolveFocusedCard(contentId: "tt0000001") { removed += 1 }
+        CardDisintegration.shared.dissolveCard(contentId: "tt0000001") { removed += 1 }
         XCTAssertEqual(removed, 1)
         XCTAssertFalse(CardDisintegration.shared.hiddenContentIds.contains("tt0000001"))
     }

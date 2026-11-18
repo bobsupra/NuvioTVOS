@@ -42,12 +42,23 @@ final class CardDisintegration: ObservableObject {
     @Published private(set) var runs: [Run] = []
     /// Content IDs whose card is hidden while its dust is shown.
     @Published private(set) var hiddenContentIds: Set<String> = []
+    /// Where each removable card is on screen, in window coordinates, as the
+    /// rows report it. Not published: it changes on every scroll and nothing
+    /// draws from it.
+    private var cardFrames: [String: CGRect] = [:]
 
-    /// Dissolves the focused card of `contentId`, then calls `removal`.
-    func dissolveFocusedCard(contentId: String, removal: @escaping () -> Void) {
+    /// Records where the card for `contentId` is, or forgets it with `nil`.
+    func setFrame(_ frame: CGRect?, for contentId: String) {
+        cardFrames[contentId] = frame
+    }
+
+    /// Dissolves the card of `contentId`, then calls `removal`. The card is
+    /// found by the frame its row reported: when a context menu asks for the
+    /// removal, focus is still in the closing menu, not on the card.
+    func dissolveCard(contentId: String, removal: @escaping () -> Void) {
         dissolve(
             contentId: contentId,
-            capture: UIAccessibility.isReduceMotionEnabled ? nil : Self.captureFocusedItem(),
+            capture: UIAccessibility.isReduceMotionEnabled ? nil : cardFrames[contentId].flatMap(Self.capture(frame:)),
             removal: removal
         )
     }
@@ -89,16 +100,17 @@ final class CardDisintegration: ObservableObject {
         let scale: CGFloat
     }
 
-    private static func captureFocusedItem() -> Capture? {
+    private static func capture(frame cardFrame: CGRect) -> Capture? {
         guard let window = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .flatMap(\.windows)
-            .first(where: \.isKeyWindow),
-            let view = UIFocusSystem.focusSystem(for: window)?.focusedItem as? UIView else { return nil }
+            .first(where: \.isKeyWindow) else { return nil }
 
-        let frame = view.convert(view.bounds, to: window).intersection(window.bounds)
-        // Only a card-sized item: never the whole screen or a sliver.
-        guard frame.width >= 80, frame.height >= 60,
+        let frame = cardFrame.intersection(window.bounds)
+        // Only a card-sized area that is mostly on screen.
+        guard !frame.isNull,
+              frame.width >= 80, frame.height >= 60,
+              frame.width * frame.height >= cardFrame.width * cardFrame.height * 0.5,
               frame.width <= window.bounds.width * 0.6,
               frame.height <= window.bounds.height * 0.6 else { return nil }
 

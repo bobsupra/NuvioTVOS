@@ -854,7 +854,7 @@ struct TVCatalogRow: View {
             } : nil,
             onRemoveFromContinueWatching: ((id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId) && progressItem != nil) ? {
                 guard let p = progressItem else { return }
-                cardDisintegration.dissolveFocusedCard(contentId: dissolveKey(item)) {
+                cardDisintegration.dissolveCard(contentId: dissolveKey(item)) {
                     onRemoveFromContinueWatching?(p)
                 }
             } : nil,
@@ -895,6 +895,10 @@ struct TVCatalogRow: View {
             LazyHStack(alignment: .top, spacing: rowCardSpacing) {
                 ForEach(cards) { card in
                     catalogCard(card, mountedCount: cards.count)
+                        .modifier(DissolveFrameReporter(
+                            isEnabled: id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId,
+                            key: dissolveKey(card.item)
+                        ))
                         .opacity(isDissolving(card.item) ? 0 : 1)
                         // A dissolving card can't take focus: Select or a second
                         // Remove on it would act on a title being removed.
@@ -2304,5 +2308,26 @@ extension TVCollectionFolderCard: Equatable {
         lhs.retainFocusAppearance == rhs.retainFocusAppearance &&
         lhs.allowsFocus == rhs.allowsFocus &&
         lhs.focusCallbackContext == rhs.focusCallbackContext
+    }
+}
+
+/// Tells `CardDisintegration` where a removable card is, so the dissolve can
+/// capture it. Only Continue Watching and Upcoming cards report.
+private struct DissolveFrameReporter: ViewModifier {
+    let isEnabled: Bool
+    let key: String
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .onGeometryChange(for: CGRect.self) { proxy in
+                    proxy.frame(in: .global)
+                } action: { frame in
+                    CardDisintegration.shared.setFrame(frame, for: key)
+                }
+                .onDisappear { CardDisintegration.shared.setFrame(nil, for: key) }
+        } else {
+            content
+        }
     }
 }
