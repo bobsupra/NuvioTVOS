@@ -138,6 +138,8 @@ struct StreamListStyle: Equatable {
     var hideAddonName = false
     /// Remove file names and description details from stream cards.
     var hideDescription = false
+    /// Draw SF Symbols in place of the emoji add-ons use as line markers.
+    var symbolIcons = false
 
     init() {}
 
@@ -152,6 +154,7 @@ struct StreamListStyle: Equatable {
         hideFileSize: Bool = false,
         hideAddonName: Bool = false,
         hideDescription: Bool = false,
+        symbolIcons: Bool = false,
         detailSize: String = Step.standard.rawValue,
         badgeSize: String = Step.standard.rawValue,
         logoSize: String = Step.standard.rawValue,
@@ -168,6 +171,7 @@ struct StreamListStyle: Equatable {
         self.hideFileSize = hideFileSize
         self.hideAddonName = hideAddonName
         self.hideDescription = hideDescription
+        self.symbolIcons = symbolIcons
         self.detailSize = Step(rawValue: detailSize) ?? .standard
         self.badgeSize = Step(rawValue: badgeSize) ?? .standard
         self.logoSize = Step(rawValue: logoSize) ?? .standard
@@ -196,6 +200,7 @@ struct StreamListStyle: Equatable {
             hideFileSize: bool(SettingsKey.streamListHideFileSize, false),
             hideAddonName: bool(SettingsKey.streamListHideAddonName, false),
             hideDescription: bool(SettingsKey.streamListHideDescription, false),
+            symbolIcons: bool(SettingsKey.streamListSymbolIcons, false),
             detailSize: string(SettingsKey.streamListDetailSize),
             badgeSize: string(SettingsKey.streamListBadgeSize),
             logoSize: string(SettingsKey.streamListLogoSize),

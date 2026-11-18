@@ -10544,6 +10544,7 @@ private struct TvStreamPickerOverlay: View {
     @AppStorage(SettingsKey.streamListHideFileSize) private var streamListHideFileSize = false
     @AppStorage(SettingsKey.streamListHideAddonName) private var streamListHideAddonName = false
     @AppStorage(SettingsKey.streamListHideDescription) private var streamListHideDescription = false
+    @AppStorage(SettingsKey.streamListSymbolIcons) private var streamListSymbolIcons = false
     @AppStorage(SettingsKey.streamListDetailSize) private var streamListDetailSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListBadgeSize) private var streamListBadgeSize = StreamListStyle.Step.standard.rawValue
     @AppStorage(SettingsKey.streamListLogoSize) private var streamListLogoSize = StreamListStyle.Step.standard.rawValue
@@ -10636,6 +10637,7 @@ private struct TvStreamPickerOverlay: View {
             hideFileSize: streamListHideFileSize,
             hideAddonName: streamListHideAddonName,
             hideDescription: streamListHideDescription,
+            symbolIcons: streamListSymbolIcons,
             detailSize: streamListDetailSize,
             badgeSize: streamListBadgeSize,
             logoSize: streamListLogoSize,
@@ -12145,7 +12147,7 @@ struct StreamListPreview: View {
                             externalFocus: $focus,
                             action: {}
                         )
-                        .id("\(stream.id)-\(badges.rules.activeImport?.sourceUrl ?? "none")-\(badges.badgePlacement.rawValue)-\(badges.showFileSizeBadges)-\(showAddonLogo)-\(badgeRevision)-\(style.hideFileSize)-\(style.hideAddonName)-\(style.hideDescription)")
+                        .id("\(stream.id)-\(badges.rules.activeImport?.sourceUrl ?? "none")-\(badges.badgePlacement.rawValue)-\(badges.showFileSizeBadges)-\(showAddonLogo)-\(badgeRevision)-\(style.hideFileSize)-\(style.hideAddonName)-\(style.hideDescription)-\(style.symbolIcons)")
                     }
                 }
                 .fixedSize(horizontal: false, vertical: true)
@@ -12432,14 +12434,14 @@ private struct TvStreamCard: View {
 
                 HStack(alignment: .center, spacing: 34) {
                     VStack(alignment: .leading, spacing: metrics.lineSpacing) {
-                        Text(primaryName)
+                        StreamSymbolText.text(primaryName, symbols: style.symbolIcons)
                             .font(.system(size: style.font(34), weight: .bold))
                             .foregroundColor(.white)
                             .lineLimit(nameLines)
                             .fixedSize(horizontal: false, vertical: true)
 
                         if let secondaryName {
-                            Text(secondaryName)
+                            StreamSymbolText.text(secondaryName, symbols: style.symbolIcons)
                                 .font(.system(size: style.font(38), weight: .medium))
                                 .foregroundColor(.white)
                                 .lineLimit(nameLines)
@@ -12447,7 +12449,7 @@ private struct TvStreamCard: View {
                         }
 
                         if let description = descriptionText, !description.isEmpty {
-                            Text(description)
+                            StreamSymbolText.text(description, symbols: style.symbolIcons)
                                 .font(.system(size: style.detailFont(26), weight: .regular))
                                 .foregroundColor(.white.opacity(0.62))
                                 .lineSpacing(style.detailLineSpacing)
@@ -12465,6 +12467,8 @@ private struct TvStreamCard: View {
                             .font(.system(size: style.detailFont(22), weight: .medium))
                             .foregroundColor(.white.opacity(0.58))
                             .lineLimit(1)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
                             .fixedSize(horizontal: false, vertical: true)
                         }
 
