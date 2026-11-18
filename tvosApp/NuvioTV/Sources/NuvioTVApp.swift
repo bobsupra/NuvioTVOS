@@ -5178,6 +5178,10 @@ private struct TVMainTabView: View {
     @available(tvOS 18.0, *)
     private var groupedCollectionTabs: some View {
         TabView(selection: activeTabBinding) {
+            // tvOS 27 opens the profile picker from the sidebar header instead.
+            if #unavailable(tvOS 27.0) {
+                Tab(value: TVTab.profile) { Color.clear } label: { profileTabLabel }
+            }
             coreTabs
             if TVTab.isIPTVEnabled && nativeIPTVEnabled {
                 Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
@@ -5257,7 +5261,12 @@ private struct TVMainTabView: View {
         } else if #available(tvOS 27.0, *) {
             groupedCollectionTabs
                 .tabViewSidebarHeader {
-                    TVSidebarProfileHeader(profile: displayedProfile)
+                    TVSidebarProfileHeader(profile: displayedProfile) {
+                        guard !isProfileFocusPending else { return }
+                        if selectedTab == .settings { syncManager.flushPendingPushes() }
+                        onSwitchProfile()
+                    }
+                    .disabled(isProfileFocusPending)
                 }
         } else if #available(tvOS 18.0, *) {
             groupedCollectionTabs
@@ -5337,16 +5346,26 @@ private struct TVMainTabView: View {
 @available(tvOS 27.0, *)
 private struct TVSidebarProfileHeader: View {
     let profile: Profile?
+    /// Opens the profile picker.
+    let action: () -> Void
 
+    @FocusState private var isFocused: Bool
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
 
     var body: some View {
-        headerContent
+        Button(action: action) {
+            headerContent
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .scaleEffect(isFocused ? 1.05 : 1.0, anchor: .leading)
+        .animation(.spring(response: 0.28, dampingFraction: 0.78), value: isFocused)
+        .focused($isFocused)
+        .focusEffectDisabled()
     }
 
     private var headerContent: some View {
         HStack(spacing: 12) {
-            TVSidebarAvatar(profile: profile, isFocused: false)
+            TVSidebarAvatar(profile: profile, isFocused: isFocused)
 
             VStack(alignment: .leading, spacing: 2) {
                 Text(displayName)
@@ -5354,6 +5373,14 @@ private struct TVSidebarProfileHeader: View {
                     .foregroundColor(.white)
                     .lineLimit(1)
                     .minimumScaleFactor(0.85)
+
+                if isFocused {
+                    Text(L10n.string("profile_change", fallback: "Change Profile"))
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.white.opacity(0.72))
+                        .lineLimit(1)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
             }
 
             Spacer(minLength: 8)
@@ -5362,6 +5389,9 @@ private struct TVSidebarProfileHeader: View {
                 .font(.system(size: 20, weight: .medium))
                 .foregroundColor(.white.opacity(0.68))
                 .fixedSize(horizontal: true, vertical: false)
+                .opacity(isFocused ? 0 : 1)
+                .animation(isFocused ? .easeOut(duration: 0.12) : .easeInOut(duration: 0.25), value: isFocused)
+                .accessibilityHidden(isFocused)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 12)
