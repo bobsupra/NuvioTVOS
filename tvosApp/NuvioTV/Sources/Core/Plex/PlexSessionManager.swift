@@ -24,6 +24,18 @@ enum PlexSyncState: Equatable {
     case failed(String)
 }
 
+/// Resumes a wait once, whichever of the sync or the time limit ends first.
+@MainActor
+private final class PlexSyncWaitGate {
+    private var resumed = false
+
+    func resume(_ continuation: CheckedContinuation<Void, Never>) {
+        guard !resumed else { return }
+        resumed = true
+        continuation.resume()
+    }
+}
+
 /// Owns the live connection for each added Plex server and drives Connect /
 /// Sync, mirroring `JellyfinSessionManager`. Plex returns a whole section per
 /// item type in a few large pages, so a sync is three paged listings per
@@ -32,7 +44,14 @@ enum PlexSyncState: Equatable {
 final class PlexSessionManager: ObservableObject {
     static let shared = PlexSessionManager()
 
-    nonisolated static let foregroundAutoSyncInterval: TimeInterval = 6 * 3600
+    /// A library that hasn't changed costs one small request to check, so a
+    /// return to the app looks for new titles often.
+    nonisolated static let foregroundAutoSyncInterval: TimeInterval = 15 * 60
+    /// Opening a stream list syncs first when the last sync is older than this,
+    /// so a title added since then offers its Plex copy on the first open.
+    nonisolated static let streamListAutoSyncInterval: TimeInterval = 5 * 60
+    /// How long a stream list waits for that sync before it shows what it has.
+    nonisolated static let streamListSyncWait: TimeInterval = 2
     nonisolated static let launchAutoSyncCooldown: TimeInterval = 60
 
     @Published private(set) var connectionStates: [String: PlexConnectionState] = [:]
@@ -197,8 +216,40 @@ final class PlexSessionManager: ObservableObject {
                   !server.selectedLibraryIDs.isEmpty,
                   connectionState(for: server.id).isConnected else { continue }
             if case .syncing = syncState(for: server.id) { continue }
-            if let last = server.lastSyncDate, Date().timeIntervalSince(last) < minimumInterval { continue }
+            guard Self.isSyncDue(lastSyncDate: server.lastSyncDate, minimumInterval: minimumInterval) else { continue }
             sync(server)
+        }
+    }
+
+    nonisolated static func isSyncDue(lastSyncDate: Date?, minimumInterval: TimeInterval, now: Date = Date()) -> Bool {
+        guard let lastSyncDate else { return true }
+        return now.timeIntervalSince(lastSyncDate) >= minimumInterval
+    }
+
+    /// Before a stream list reads the Plex titles: syncs the servers that are
+    /// due and waits for them, at most `timeout`. A slower sync carries on in
+    /// the background and its titles show the next time the list opens.
+    func syncDueServersBeforeStreamList(
+        minimumInterval: TimeInterval = PlexSessionManager.streamListAutoSyncInterval,
+        timeout: TimeInterval = PlexSessionManager.streamListSyncWait
+    ) async {
+        guard NSClassFromString("XCTestCase") == nil else { return }
+        autoSyncConnectedServers(minimumInterval: minimumInterval)
+        let running = PlexServerStore.shared.servers.compactMap { server -> Task<Void, Never>? in
+            guard case .syncing = syncState(for: server.id) else { return nil }
+            return syncTasks[server.id]
+        }
+        guard !running.isEmpty else { return }
+        let gate = PlexSyncWaitGate()
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            Task { @MainActor in
+                for task in running { await task.value }
+                gate.resume(continuation)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
+                gate.resume(continuation)
+            }
         }
     }
 
