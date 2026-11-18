@@ -6,8 +6,10 @@
 //
 
 import Combine
+import CoreText
 import Foundation
 import SwiftUI
+import UIKit
 
 /// Languages available for the app UI, matching Android TV `locale_config` /
 /// ThemeSettingsScreen (plus System default).
@@ -637,8 +639,7 @@ final class AppFontManager: ObservableObject {
     func font(size: CGFloat, weight: Font.Weight = .regular, design: Font.Design = .default) -> Font {
         switch currentFont {
         case .inter:
-            let fontName = Self.interFontName(for: weight)
-            return .custom(fontName, size: size)
+            return Self.inter(size: size, weight: weight)
         case .system:
             return .system(size: size, weight: weight, design: design == .default ? .default : design)
         case .rounded:
@@ -646,16 +647,43 @@ final class AppFontManager: ObservableObject {
         }
     }
 
-    private static func interFontName(for weight: Font.Weight) -> String {
+    /// Inter at `weight`. The bundled font is a single variable font whose only
+    /// PostScript name is "Inter-Regular"; its Medium, SemiBold and Bold styles
+    /// have no names of their own, so asking for "Inter-Bold" found nothing and
+    /// fell back to another font at regular weight. Set the weight axis instead.
+    private static func inter(size: CGFloat, weight: Font.Weight) -> Font {
+        let key = "\(size)|\(interWeight(for: weight))"
+        if let cached = interCache[key] { return cached }
+        let font = Font(interUIFont(size: size, weight: weight) as CTFont)
+        interCache[key] = font
+        return font
+    }
+
+    static func interUIFont(size: CGFloat, weight: Font.Weight) -> UIFont {
+        let descriptor = UIFontDescriptor(fontAttributes: [
+            .name: "Inter-Regular",
+            UIFontDescriptor.AttributeName(rawValue: kCTFontVariationAttribute as String): [wghtAxis: interWeight(for: weight)]
+        ])
+        return UIFont(descriptor: descriptor, size: size)
+    }
+
+    /// The weight axis of a variable font, 'wght'.
+    static let wghtAxis = 0x7767_6874
+
+    private static var interCache: [String: Font] = [:]
+
+    /// Inter's weight-axis value for a SwiftUI weight (100 Thin ... 900 Black).
+    static func interWeight(for weight: Font.Weight) -> CGFloat {
         switch weight {
-        case .bold, .heavy, .black:
-            return "Inter-Bold"
-        case .semibold:
-            return "Inter-SemiBold"
-        case .medium:
-            return "Inter-Medium"
-        default:
-            return "Inter-Regular"
+        case .ultraLight: return 200
+        case .thin: return 100
+        case .light: return 300
+        case .medium: return 500
+        case .semibold: return 600
+        case .bold: return 700
+        case .heavy: return 800
+        case .black: return 900
+        default: return 400
         }
     }
 }
