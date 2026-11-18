@@ -15,8 +15,11 @@ final class CardDisintegration: ObservableObject {
 
     /// Length of the dissolve, from the first particle leaving to the last one fading.
     static let duration: TimeInterval = 1.0
-    /// Side of one particle cell in points.
-    private static let cellSize: CGFloat = 5
+    /// Smallest side of one particle cell in points.
+    private static let minCellSize: CGFloat = 5
+    /// Most particles one card makes. Larger cards get larger cells, so a
+    /// dissolve costs about the same to draw whatever the card's size.
+    static let maxParticles = 1500
 
     struct Particle {
         let cell: CGRect
@@ -42,9 +45,20 @@ final class CardDisintegration: ObservableObject {
 
     /// Dissolves the focused card of `contentId`, then calls `removal`.
     func dissolveFocusedCard(contentId: String, removal: @escaping () -> Void) {
-        guard !UIAccessibility.isReduceMotionEnabled,
-              !hiddenContentIds.contains(contentId),
-              let capture = Self.captureFocusedItem() else {
+        dissolve(
+            contentId: contentId,
+            capture: UIAccessibility.isReduceMotionEnabled ? nil : Self.captureFocusedItem(),
+            removal: removal
+        )
+    }
+
+    /// Dissolves `capture`, then calls `removal`. Without a capture the removal
+    /// runs at once. While `contentId` is already dissolving, nothing happens:
+    /// its removal is on the way, and running it twice would repeat the
+    /// tracker updates.
+    func dissolve(contentId: String, capture: Capture?, removal: @escaping () -> Void) {
+        guard !hiddenContentIds.contains(contentId) else { return }
+        guard let capture else {
             removal()
             return
         }
@@ -69,7 +83,7 @@ final class CardDisintegration: ObservableObject {
 
     // MARK: Capture
 
-    private struct Capture {
+    struct Capture {
         let image: CGImage
         let frame: CGRect
         let scale: CGFloat
@@ -101,9 +115,11 @@ final class CardDisintegration: ObservableObject {
 
     /// One particle per cell, colored with the cell's average color. Cells that
     /// are transparent (the card's rounded corners) are skipped.
-    private static func particles(from image: CGImage, frame: CGRect) -> [Particle] {
-        let columns = max(1, Int((frame.width / cellSize).rounded()))
-        let rows = max(1, Int((frame.height / cellSize).rounded()))
+    static func particles(from image: CGImage, frame: CGRect) -> [Particle] {
+        let area = max(frame.width * frame.height, 1)
+        let cellSize = max(minCellSize, (area / CGFloat(maxParticles)).squareRoot())
+        let columns = max(1, Int(frame.width / cellSize))
+        let rows = max(1, Int(frame.height / cellSize))
         var pixels = [UInt8](repeating: 0, count: columns * rows * 4)
         let drawn = pixels.withUnsafeMutableBytes { buffer -> Bool in
             guard let context = CGContext(

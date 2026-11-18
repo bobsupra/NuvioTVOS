@@ -746,8 +746,13 @@ struct TVCatalogRow: View {
 
     /// True while a Continue Watching card is shown as dust instead of itself.
     private func isDissolving(_ item: NuvioMeta) -> Bool {
-        (id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId)
-            && cardDisintegration.hiddenContentIds.contains(item.id)
+        cardDisintegration.hiddenContentIds.contains(dissolveKey(item))
+    }
+
+    /// The row and the title: a title in both Continue Watching and Upcoming
+    /// only disappears from the row it was removed from.
+    private func dissolveKey(_ item: NuvioMeta) -> String {
+        "\(id)|\(item.id)"
     }
 
     /// One card of the row.
@@ -849,7 +854,7 @@ struct TVCatalogRow: View {
             } : nil,
             onRemoveFromContinueWatching: ((id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId) && progressItem != nil) ? {
                 guard let p = progressItem else { return }
-                cardDisintegration.dissolveFocusedCard(contentId: item.id) {
+                cardDisintegration.dissolveFocusedCard(contentId: dissolveKey(item)) {
                     onRemoveFromContinueWatching?(p)
                 }
             } : nil,
@@ -891,6 +896,9 @@ struct TVCatalogRow: View {
                 ForEach(cards) { card in
                     catalogCard(card, mountedCount: cards.count)
                         .opacity(isDissolving(card.item) ? 0 : 1)
+                        // A dissolving card can't take focus: Select or a second
+                        // Remove on it would act on a title being removed.
+                        .disabled(isDissolving(card.item))
                         .id(card.id)
                 }
             }
