@@ -101,10 +101,12 @@ final class CardDisintegration: ObservableObject {
     }
 
     private static func capture(frame cardFrame: CGRect) -> Capture? {
-        guard let window = UIApplication.shared.connectedScenes
-            .compactMap({ $0 as? UIWindowScene })
-            .flatMap(\.windows)
-            .first(where: \.isKeyWindow) else { return nil }
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let windows = scenes.flatMap(\.windows)
+        // The app's own window, not a menu's: right after a context menu closes,
+        // the key window can still be the menu's.
+        guard let window = windows.first(where: { !$0.isHidden && $0.windowLevel == .normal && $0.rootViewController != nil })
+            ?? windows.first(where: \.isKeyWindow) else { return nil }
 
         let frame = cardFrame.intersection(window.bounds)
         // Only a card-sized area that is mostly on screen.
