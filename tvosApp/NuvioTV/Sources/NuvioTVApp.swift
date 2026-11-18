@@ -65,6 +65,7 @@ struct NuvioTVApp: App {
         WindowGroup {
             ContentView()
                 .environmentObject(atvloadlyService)
+                .overlay { CardDisintegrationOverlay() }
         }
     }
 }

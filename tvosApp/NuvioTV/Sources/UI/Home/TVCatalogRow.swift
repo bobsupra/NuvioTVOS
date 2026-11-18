@@ -571,6 +571,7 @@ struct TVCatalogRow: View {
 
     @State private var scrollIndex: Int?
     @FocusState private var ownCardFocus: String?
+    @ObservedObject private var cardDisintegration = CardDisintegration.shared
     @State private var stagedCardCount = 0
     @State private var cardStaging = TVRowCardStaging()
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
@@ -743,6 +744,12 @@ struct TVCatalogRow: View {
         ownCardFocus = key
     }
 
+    /// True while a Continue Watching card is shown as dust instead of itself.
+    private func isDissolving(_ item: NuvioMeta) -> Bool {
+        (id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId)
+            && cardDisintegration.hiddenContentIds.contains(item.id)
+    }
+
     /// One card of the row.
     @ViewBuilder
     private func catalogCard(_ card: TVCatalogMaterializedCard, mountedCount: Int) -> some View {
@@ -841,7 +848,10 @@ struct TVCatalogRow: View {
                 if let p = progressItem { onStartContinueWatchingFromBeginning?(p) }
             } : nil,
             onRemoveFromContinueWatching: ((id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId) && progressItem != nil) ? {
-                if let p = progressItem { onRemoveFromContinueWatching?(p) }
+                guard let p = progressItem else { return }
+                cardDisintegration.dissolveFocusedCard(contentId: item.id) {
+                    onRemoveFromContinueWatching?(p)
+                }
             } : nil,
             onRefreshCatalog: onRefreshCatalog,
             cardIndex: itemIndex,
@@ -880,6 +890,7 @@ struct TVCatalogRow: View {
             LazyHStack(alignment: .top, spacing: rowCardSpacing) {
                 ForEach(cards) { card in
                     catalogCard(card, mountedCount: cards.count)
+                        .opacity(isDissolving(card.item) ? 0 : 1)
                         .id(card.id)
                 }
             }
