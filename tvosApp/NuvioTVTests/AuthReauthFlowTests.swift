@@ -154,6 +154,43 @@ final class AuthReauthFlowTests: XCTestCase {
         XCTAssertFalse(AuthConfig.tvLoginWebBaseURL.contains("api.nuvio.tv"))
     }
 
+    func testDeviceLoginStartResultDecodesTheShortCode() throws {
+        let json = """
+        [{
+            "device_code": "4f1c2a9e7b",
+            "user_code": "C46B62",
+            "verification_uri": "https://nuvio.tv/link",
+            "verification_uri_complete": "https://nuvio.tv/link?code=C46B62",
+            "expires_at": "2026-11-16T22:00:00Z",
+            "poll_interval_seconds": 5
+        }]
+        """.data(using: .utf8)!
+
+        let result = try XCTUnwrap(JSONDecoder().decode([DeviceLoginStartResult].self, from: json).first)
+        XCTAssertEqual(result.deviceCode, "4f1c2a9e7b")
+        XCTAssertEqual(result.userCode, "C46B62")
+        XCTAssertEqual(result.verificationURI, "https://nuvio.tv/link")
+        XCTAssertEqual(result.verificationURIComplete, "https://nuvio.tv/link?code=C46B62")
+        XCTAssertEqual(result.pollIntervalSeconds, 5)
+        XCTAssertTrue(result.isComplete)
+    }
+
+    func testDeviceLoginStartResultWithoutAUserCodeIsIncomplete() throws {
+        let json = """
+        {
+            "device_code": "4f1c2a9e7b",
+            "user_code": "",
+            "verification_uri": "https://nuvio.tv/link",
+            "verification_uri_complete": "https://nuvio.tv/link?code=",
+            "expires_at": "2026-11-16T22:00:00Z"
+        }
+        """.data(using: .utf8)!
+
+        let result = try JSONDecoder().decode(DeviceLoginStartResult.self, from: json)
+        XCTAssertEqual(result.pollIntervalSeconds, 3)
+        XCTAssertFalse(result.isComplete)
+    }
+
     func testTvLoginStartResultSanitizesAPINuvioURL() throws {
         // Issue #91: Backend returns web_url with api.nuvio.tv which fails when scanned by mobile camera
         let json = """

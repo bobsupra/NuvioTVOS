@@ -48,7 +48,30 @@ final class AuthManager: ObservableObject {
 
     // QR login UI state.
     @Published var qrImage: UIImage?
+    /// The code polled and exchanged: the device code, or the legacy TV code.
     @Published var qrCode: String?
+    /// The short code to type at `qrVerificationURI`; nil with the legacy sign-in.
+    @Published var qrUserCode: String?
+    @Published var qrVerificationURI: String?
+
+    /// The code shown under the QR: the short code as `XXX-XXX`, or the
+    /// legacy TV code when the server has no device sign-in.
+    var qrDisplayCode: String? {
+        if let short = qrUserCode, !short.isEmpty {
+            return short.count == 6 ? "\(short.prefix(3))-\(short.dropFirst(3))" : short
+        }
+        guard let code = qrCode, !code.isEmpty else { return nil }
+        return code
+    }
+
+    /// Where the short code is typed, without the scheme ("nuvio.tv/link").
+    /// Nil with the legacy sign-in, whose code is not meant to be typed.
+    var qrManualEntryLink: String? {
+        guard let short = qrUserCode, !short.isEmpty else { return nil }
+        let uri = qrVerificationURI.flatMap { $0.isEmpty ? nil : $0 } ?? AuthConfig.officialDeviceLoginWebBaseURL
+        return uri.replacingOccurrences(of: "https://", with: "").replacingOccurrences(of: "http://", with: "")
+    }
+
     @Published var qrStatusMessage: String?
     @Published var qrExpiresAt: Date?
 
@@ -454,19 +477,37 @@ final class AuthManager: ObservableObject {
                       self.isCurrent(operation),
                       self.isCurrent(qrOperation) else { return }
                 self.qrAnonAccessToken = anon.accessToken
-                let start = try await service.startTvLoginSession(
+                let pollInterval: Int
+                if let device = try await service.startDeviceLoginSession(
                     accessToken: anon.accessToken,
                     deviceNonce: nonce,
                     deviceName: Self.deviceName
-                )
-                guard self.isCurrent(operation), self.isCurrent(qrOperation) else { return }
-                self.qrCode = start.code
-                self.qrImage = QRCode.image(from: start.webUrl)
-                self.qrExpiresAt = Self.parseDate(start.expiresAt)
+                ) {
+                    guard self.isCurrent(operation), self.isCurrent(qrOperation) else { return }
+                    self.qrCode = device.deviceCode
+                    self.qrUserCode = device.userCode
+                    self.qrVerificationURI = device.verificationURI
+                    self.qrImage = QRCode.image(from: device.verificationURIComplete)
+                    self.qrExpiresAt = Self.parseDate(device.expiresAt)
+                    pollInterval = device.pollIntervalSeconds
+                } else {
+                    let start = try await service.startTvLoginSession(
+                        accessToken: anon.accessToken,
+                        deviceNonce: nonce,
+                        deviceName: Self.deviceName
+                    )
+                    guard self.isCurrent(operation), self.isCurrent(qrOperation) else { return }
+                    self.qrCode = start.code
+                    self.qrUserCode = nil
+                    self.qrVerificationURI = nil
+                    self.qrImage = QRCode.image(from: start.webUrl)
+                    self.qrExpiresAt = Self.parseDate(start.expiresAt)
+                    pollInterval = start.pollIntervalSeconds
+                }
                 self.qrStatusMessage = "Scan QR, approve in browser, then return here."
                 self.isBusy = false
                 self.startPolling(
-                    intervalSeconds: max(start.pollIntervalSeconds, 2),
+                    intervalSeconds: max(pollInterval, 2),
                     operation: operation,
                     qrOperation: qrOperation,
                     service: service
@@ -595,6 +636,8 @@ final class AuthManager: ObservableObject {
     private func clearQrState() {
         qrImage = nil
         qrCode = nil
+        qrUserCode = nil
+        qrVerificationURI = nil
         qrExpiresAt = nil
         qrNonce = nil
         qrAnonAccessToken = nil

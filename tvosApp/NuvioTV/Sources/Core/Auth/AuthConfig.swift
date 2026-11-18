@@ -12,6 +12,9 @@ enum AuthConfig {
     static let officialAPIBaseURL = "https://api.nuvio.tv"
     static let officialTvLoginWebBaseURL = "https://nuvio.tv/tv-login"
     static let legacyTvLoginWebBaseURL = "https://app.nuvio.tv/tv-login"
+    /// Where a short device code is typed in. Matches the Android
+    /// `DEVICE_LOGIN_WEB_BASE_URL` default.
+    static let officialDeviceLoginWebBaseURL = "https://nuvio.tv/link"
 
     /// Public publishable key from the Nuvio Public API docs.
     static let officialPublishableKey = "sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN"
