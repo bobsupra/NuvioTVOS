@@ -12469,8 +12469,6 @@ private struct TvStreamCard: View {
                             .lineLimit(1)
                             .fixedSize(horizontal: false, vertical: true)
                         }
-                            .fixedSize(horizontal: false, vertical: true)
-                        }
 
                         if stream.debridCacheStatusUnavailable == true {
                             Text(L10n.string(
