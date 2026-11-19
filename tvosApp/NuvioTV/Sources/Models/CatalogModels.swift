@@ -5315,6 +5315,19 @@ struct NuvioCollectionFolder: Decodable, Identifiable, Equatable {
     }
 }
 
+fileprivate extension KeyedDecodingContainer {
+    /// An integer id that some clients save as text ("8687275"). A value that is
+    /// neither a number nor a numeric string reads as nil instead of throwing, so
+    /// one odd id cannot make a whole collection fail to load.
+    func decodeLenientInteger<T: FixedWidthInteger & Decodable>(_ type: T.Type, forKey key: Key) -> T? {
+        if let number = try? decodeIfPresent(T.self, forKey: key) { return number }
+        if let text = try? decodeIfPresent(String.self, forKey: key) {
+            return T(text.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+}
+
 struct NuvioCollectionSource: Decodable, Hashable {
     var provider: String
     var addonId: String?
@@ -5390,12 +5403,12 @@ struct NuvioCollectionSource: Decodable, Hashable {
         tmdbSourceType = try c.decodeIfPresent(String.self, forKey: .tmdbSourceType)
             ?? c.decodeIfPresent(String.self, forKey: .tmdb_source_type)
         title = try c.decodeIfPresent(String.self, forKey: .title)
-        tmdbId = try c.decodeIfPresent(Int.self, forKey: .tmdbId)
-            ?? c.decodeIfPresent(Int.self, forKey: .tmdb_id)
-        traktListId = try c.decodeIfPresent(Int64.self, forKey: .traktListId)
-            ?? c.decodeIfPresent(Int64.self, forKey: .trakt_list_id)
-        mdblistId = try c.decodeIfPresent(Int.self, forKey: .mdblistId)
-            ?? c.decodeIfPresent(Int.self, forKey: .mdblist_id)
+        tmdbId = c.decodeLenientInteger(Int.self, forKey: .tmdbId)
+            ?? c.decodeLenientInteger(Int.self, forKey: .tmdb_id)
+        traktListId = c.decodeLenientInteger(Int64.self, forKey: .traktListId)
+            ?? c.decodeLenientInteger(Int64.self, forKey: .trakt_list_id)
+        mdblistId = c.decodeLenientInteger(Int.self, forKey: .mdblistId)
+            ?? c.decodeLenientInteger(Int.self, forKey: .mdblist_id)
         mdblistSlug = try c.decodeIfPresent(String.self, forKey: .mdblistSlug)
             ?? c.decodeIfPresent(String.self, forKey: .mdblist_slug)
         mdblistUrl = try c.decodeIfPresent(String.self, forKey: .mdblistUrl)
