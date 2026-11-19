@@ -57,7 +57,7 @@ struct AppNoticeBanner: View {
     private var title: String {
         switch notice {
         case .release(let release):
-            L10n.string("release_update_available_title", fallback: "NuvioTV \(release.displayVersion) is available")
+            L10n.format("release_update_available_title", fallback: "NuvioTV %@ is available", release.displayVersion)
         case .announcement(let announcement):
             announcement.title
         }
@@ -79,7 +79,7 @@ struct AppNoticeBanner: View {
     private var message: String {
         switch notice {
         case .release:
-            installAction?.message ?? L10n.string("release_update_available_subtitle", fallback: "You’re using version \(currentVersion). View the release or scan its QR code.")
+            installAction?.message ?? L10n.format("release_update_available_subtitle", fallback: "You’re using version %@. View the release or scan its QR code.", currentVersion)
         case .announcement(let announcement):
             announcement.message
         }
@@ -291,7 +291,7 @@ struct ReleaseQRCodeSheet: View {
 
     var body: some View {
         VStack(spacing: 28) {
-            Text(L10n.string("release_update_install_title", fallback: "Get NuvioTV \(release.displayVersion)"))
+            Text(L10n.format("release_update_install_title", fallback: "Get NuvioTV %@", release.displayVersion))
                 .font(.system(size: 42, weight: .regular))
                 .foregroundStyle(.white)
 
