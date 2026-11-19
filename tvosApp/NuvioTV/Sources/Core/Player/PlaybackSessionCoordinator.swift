@@ -444,7 +444,7 @@ final class PlaybackSessionCoordinator: ObservableObject {
             return
         }
         guard !didFallbackForCurrentURL else {
-            print("[PlaybackCoordinator] fallback already used for \(currentURLString ?? "?")")
+            print("[PlaybackCoordinator] fallback already used for \(currentURLString.flatMap(URL.init(string:)).map { AddonTransportUrls.diagnosticDescription(for: $0) } ?? "?")")
             return
         }
 

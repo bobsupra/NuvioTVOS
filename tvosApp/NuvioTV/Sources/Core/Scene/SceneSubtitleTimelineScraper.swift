@@ -80,7 +80,7 @@ actor SceneSubtitleTimelineScraper {
                     break
                 }
             } catch {
-                print("[SceneScraper] Subtitle fetch failed for \(sub.url): \(error.localizedDescription)")
+                print("[SceneScraper] Subtitle fetch failed for \(AddonTransportUrls.diagnosticDescription(for: url)): \(error.localizedDescription)")
             }
         }
         
