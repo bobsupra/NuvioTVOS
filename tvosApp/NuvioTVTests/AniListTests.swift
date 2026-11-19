@@ -172,7 +172,7 @@ final class AniListTests: XCTestCase {
         let secondSeasonFirst = try XCTUnwrap(meta.videos?.first { $0.season == 2 && $0.episode == 1 })
         XCTAssertEqual(meta.canonicalEpisodeStreamId(for: secondSeasonFirst), "anilist:102:1")
 
-        XCTAssertEqual(AniListMetaBuilder.tabTitles(tabs, language: .romaji), [1: "TV · 2020", 2: "2nd Season · 2021"])
+        XCTAssertEqual(AniListMetaBuilder.tabTitles(tabs, language: .romaji), [1: "Season 1 · 2020", 2: "Season 2 · 2021"])
     }
 
     func testAFilmIsAMovieWithoutAnEpisodeNumber() throws {
