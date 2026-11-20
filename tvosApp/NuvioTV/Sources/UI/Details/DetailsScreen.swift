@@ -6811,6 +6811,9 @@ private struct TvDetailsActionRow: View {
             )
             .disabled(entryLocked)
         }
+        // As wide as its buttons: in a film's narrower column, AniList's and MAL's wide buttons
+        // were squeezed to an icon and "A…". The row may reach past the column's edge instead.
+        .fixedSize(horizontal: true, vertical: false)
         .focusSection()
         .onExitCommand {
             onBack?()
@@ -7105,6 +7108,8 @@ private struct TvDetailsActionButton: View {
                     Text(title)
                         .font(.appFont(size: 32, weight: .medium))
                         .lineLimit(1)
+                        // Play, AniList and MAL keep their whole title ("Watching 5/12"), never "A…".
+                        .fixedSize(horizontal: isPrimary || isWide, vertical: false)
                         .accessibilityHidden(true)
                 }
             }
