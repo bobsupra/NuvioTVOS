@@ -31,3 +31,21 @@ struct GridCardSnapshotKey: Equatable {
     let retainsFocusAppearance: Bool
     var width: CGFloat = 0
 }
+
+/// Titles without the unreleased ones, worked out once per list: filtered in a computed
+/// property, every title's release date was checked several times on every redraw, which
+/// Search and Discover do on every focus move.
+final class ReleasedTitlesMemo {
+    private var revision = -1
+    private var hidesUnreleased = false
+    private(set) var titles: [NuvioMeta] = []
+    private(set) var ids: [String] = []
+
+    func update(_ source: [NuvioMeta], revision: Int, hideUnreleased: Bool) {
+        guard revision != self.revision || hideUnreleased != hidesUnreleased else { return }
+        self.revision = revision
+        hidesUnreleased = hideUnreleased
+        titles = hideUnreleased ? source.filter { !ContentReleasePolicy.isUnreleased($0) } : source
+        ids = titles.map(\.id)
+    }
+}

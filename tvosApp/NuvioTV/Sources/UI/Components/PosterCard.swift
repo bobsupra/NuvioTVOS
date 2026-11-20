@@ -8,6 +8,7 @@
 import CryptoKit
 import ImageIO
 import SwiftUI
+import Observation
 #if os(tvOS)
 import AVFoundation
 import AVKit
@@ -313,6 +314,8 @@ struct PosterCard: View {
     }
 
     #if os(tvOS)
+    /// The card's focus-only work (arming the landscape preload, the trailer's delay) is one
+    /// task, which returns at once for a card that isn't focused.
     private var focusableCard: some View {
         // Keep directional input in tvOS's focus engine. Per-card move
         // handlers bypass the clickpad dead zone and can turn a light touch
@@ -321,9 +324,7 @@ struct PosterCard: View {
             Button(action: onClick) {
                 posterContent
             }
-            .buttonStyle(PosterCardButtonStyle(onNativeFocusChange: { focused in
-                if focused { onFocus?(meta) } else { onBlur?(meta) }
-            }))
+            .buttonStyle(PosterCardButtonStyle(onNativeFocusChange: reportNativeFocus))
             .accessibilityIdentifier("poster-card-\(externalFocusValue ?? meta.id)")
             .disabled(!allowsFocus)
             .focused($isFocused)
@@ -441,6 +442,10 @@ struct PosterCard: View {
     }
     #endif
 
+    /// The landscape title, the progress bar, the badges and the watched mark are one overlay;
+    /// the border is drawn without the glass modifier (whose settle task every card started,
+    /// though a card whose artwork covers it never shows its glass) and, with the shadow, only on
+    /// the focused card.
     private var posterContent: some View {
         VStack(alignment: .leading, spacing: 9) {
             CachedPosterArtwork(
@@ -453,6 +458,7 @@ struct PosterCard: View {
                 maximumWidth: artworkDecodeWidth,
                 preloadMaximumWidth: landscapeArtworkDecodeWidth,
                 minimumSwapDelay: 0,
+                singleTask: true,
                 onPreloadFinished: { succeeded in
                     #if os(tvOS)
                     landscapeArtworkPrepared = succeeded
@@ -506,11 +512,19 @@ struct PosterCard: View {
                             #endif
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                     }
-                    continueProgressOverlay
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    if continueProgress != nil, !continueIsUpNext {
+                        continueProgressOverlay
+                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    }
                     continueShuffleBadge
-                    continueBadge
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: effectiveLandscape ? .topTrailing : .top)
+                    if continueBadgeDisplayText != nil {
+                        continueBadge
+                            .frame(
+                                maxWidth: .infinity,
+                                maxHeight: .infinity,
+                                alignment: effectiveLandscape ? .topTrailing : .top
+                            )
+                    }
                     if let origin = shownOrigin {
                         CollectionOriginBadge(origin: origin)
                             .padding(.trailing, 22)
@@ -691,7 +705,7 @@ struct PosterCard: View {
                             .modifier(
                                 LiquidGlassBadgeModifier(
                                     cornerRadius: badgeRadius,
-                                    isFocused: showsFocusedAppearance
+                                    isFocused: showsBadgeGlass
                                 )
                             )
                     } else {
@@ -1010,15 +1024,17 @@ struct PosterCard: View {
         effectiveHomeLayout == "Compact" ? 454 : 560
     }
 
-    private var focusedBorderColor: Color {
-        guard showsFocusedAppearance else { return .clear }
-        return AppFocusOutline.color
-    }
-
     private var focusedBorderWidth: CGFloat {
         showsFocusedAppearance ? (effectiveFocusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
     }
 
+    private func reportNativeFocus(_ focused: Bool) {
+        if focused { onFocus?(meta) } else { onBlur?(meta) }
+    }
+
+    // Only the focused card casts a shadow. A shadow is drawn in a pass of its own for each
+    // card, every frame a row moves, and the faint one under resting cards barely shows on
+    // the dark background.
     private var shadowOpacity: Double {
         showsFocusedAppearance ? 0.24 : 0
     }
@@ -1035,6 +1051,11 @@ struct PosterCard: View {
         isFocused || retainFocusAppearance
     }
 
+    /// The badge's glass comes in once focus rests on the card, as the card's own did.
+    private var showsBadgeGlass: Bool {
+        showsFocusedAppearance && landscapePreloadArmed
+    }
+
     private var showsPosterTitle: Bool {
         effectivePosterLabels
     }
@@ -1049,23 +1070,6 @@ struct PosterCard: View {
 
     private var isTrailerPreviewVisible: Bool {
         !isContinueOrUpcomingCard && isTrailerPreviewActive && isTrailerPreviewReady && !didFinishTrailerPreview
-    }
-
-    @MainActor
-    private func activateTrailerPreviewAfterDelay() async {
-        isTrailerPreviewActive = false
-        isTrailerPreviewReady = false
-        didFinishTrailerPreview = false
-        guard isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
-
-        let delay = min(15, max(0, trailerDelay))
-        do {
-            try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
-        } catch {
-            return
-        }
-        guard !Task.isCancelled, isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
-        isTrailerPreviewActive = true
     }
 
     private func cancelTrailerPreview() {
@@ -1123,16 +1127,16 @@ struct PosterCard: View {
         false
     }
 
-    private var focusedBorderColor: Color {
-        .clear
-    }
-
     private var focusedBorderWidth: CGFloat {
         0
     }
 
     private var shadowOpacity: Double {
         !AppleTVCapability.current.supportsLiquidGlass ? 0 : 0.2
+    }
+
+    private var showsBadgeGlass: Bool {
+        false
     }
 
     private var shadowRadius: CGFloat {
@@ -1612,13 +1616,14 @@ struct PosterGridCard: View {
 
     @FocusState private var focused: Bool
     @State private var didRequestInitialFocus = false
-    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
-    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
-    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
-    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
-    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
-    @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
-    @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @Environment(\.cardAppearance) private var cardAppearance
+    private var posterLabels: Bool { cardAppearance.posterLabels }
+    private var smoothFocus: Bool { cardAppearance.smoothFocus }
+    private var focusHighlighter: Bool { cardAppearance.focusHighlighter }
+    private var cardCornerRadiusSetting: String { cardAppearance.cardCornerRadius }
+    private var liquidGlassCards: Bool { cardAppearance.liquidGlassCards }
+    private var customPosterURLPattern: String { cardAppearance.customPosterURLPattern }
+    private var customPosterEnabledScreens: String { cardAppearance.customPosterEnabledScreens }
 
     private var customPosterArtworkURL: String? {
         let screens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -1663,7 +1668,8 @@ struct PosterGridCard: View {
                 LiquidGlassCardModifier(
                     cornerRadius: cardCornerRadius,
                     isFocused: showsFocusedAppearance,
-                    isEnabled: liquidGlassCards
+                    isEnabled: liquidGlassCards,
+                    coveredByArtwork: true
                 )
             )
             .overlay(alignment: .topTrailing) {
@@ -1684,6 +1690,7 @@ struct PosterGridCard: View {
                     lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
                 )
             )
+            // Only the focused card casts a shadow (see PosterCard).
             .shadow(
                 color: .black.opacity(showsFocusedAppearance ? 0.5 : 0),
                 radius: showsFocusedAppearance ? 16 : 0
@@ -1787,8 +1794,9 @@ struct LiquidGlassSurface: ViewModifier {
     let cornerRadius: CGFloat
     var prominent: Bool = false
 
-    @AppStorage(SettingsKey.amoled) private var amoled = false
-    @AppStorage(SettingsKey.amoledSurfaces) private var amoledSurfaces = false
+    @Environment(\.cardAppearance) private var cardAppearance
+    private var amoled: Bool { cardAppearance.amoled }
+    private var amoledSurfaces: Bool { cardAppearance.amoledSurfaces }
 
     private var shape: RoundedRectangle {
         RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
@@ -2173,6 +2181,8 @@ struct CachedPosterArtwork<Placeholder: View>: View {
     var maximumWidth: CGFloat? = nil
     var preloadMaximumWidth: CGFloat? = nil
     var minimumSwapDelay: TimeInterval = 0
+    /// The load and the preload in one task instead of two (poster cards).
+    var singleTask = false
     var onPreloadFinished: (Bool) -> Void = { _ in }
     var onArtworkLoaded: (String?) -> Void = { _ in }
     @ViewBuilder let placeholder: Placeholder
@@ -2187,6 +2197,7 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         maximumWidth: CGFloat? = nil,
         preloadMaximumWidth: CGFloat? = nil,
         minimumSwapDelay: TimeInterval = 0,
+        singleTask: Bool = false,
         onPreloadFinished: @escaping (Bool) -> Void = { _ in },
         onArtworkLoaded: @escaping (String?) -> Void = { _ in },
         @ViewBuilder placeholder: () -> Placeholder
@@ -2200,6 +2211,7 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         self.maximumWidth = maximumWidth
         self.preloadMaximumWidth = preloadMaximumWidth
         self.minimumSwapDelay = minimumSwapDelay
+        self.singleTask = singleTask
         self.onPreloadFinished = onPreloadFinished
         self.onArtworkLoaded = onArtworkLoaded
         self.placeholder = placeholder()
@@ -2241,6 +2253,24 @@ struct CachedPosterArtwork<Placeholder: View>: View {
     }
 
     var body: some View {
+        if singleTask {
+            artwork
+                .task(id: "\(cacheKey)\u{1}\(preloadCacheKey)") {
+                    await load()
+                    await preload()
+                }
+        } else {
+            artwork
+                .task(id: cacheKey) {
+                    await load()
+                }
+                .task(id: preloadCacheKey) {
+                    await preload()
+                }
+        }
+    }
+
+    private var artwork: some View {
         ZStack(alignment: .center) {
             if let image = displayedImage {
                 Image(uiImage: image)
@@ -2251,13 +2281,6 @@ struct CachedPosterArtwork<Placeholder: View>: View {
             } else {
                 placeholder
             }
-        }
-        .task(id: cacheKey) {
-            await load()
-        }
-        .task(id: preloadCacheKey) {
-            guard preloadCacheKey != nil else { return }
-            await preload()
         }
         .onDisappear {
             state.preloadedImage = nil
@@ -2273,11 +2296,21 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         if state.loadedKey == cacheKey { return state.image }
         if state.preloadedKey == cacheKey { return state.preloadedImage }
         if state.previousLoadedKey == cacheKey { return state.previousImage }
+        // Already decoded in memory (a card coming back on screen, Home rebuilt on returning
+        // to its tab): shown in the card's first frame. Asked for through the cache's actor, it
+        // came a few frames later, and the card showed its placeholder meanwhile (50-110 ms).
+        if let remembered = memoryCachedImage { return remembered }
 
         // While a brand-new variant is loading, keep real artwork on screen.
         // For landscape expansion this naturally starts with a zoomed poster;
         // for collapse the matching portrait is normally `previousImage`.
         return state.image ?? state.previousImage
+    }
+
+    /// The artwork this card asks for first, if it is already decoded in memory.
+    private var memoryCachedImage: UIImage? {
+        guard let rawURL = urlString ?? fallbackURLString, let url = URL(string: rawURL) else { return nil }
+        return PosterArtworkCache.shared.cachedImage(for: url, maxPixelSize: maxPixelSize)
     }
 
     @MainActor
@@ -2446,7 +2479,9 @@ actor PosterArtworkCache {
             }
             let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
             if gib > 3.5 {
-                return 140 * 1024 * 1024 // 140 MB (Apple TV 4K Gen 2/3)
+                // Full at 140 MB (about 1 MB a poster): moving down Home read and decoded
+                // the rows it came back to from disk again, and their cards waited 50-130 ms.
+                return 200 * 1024 * 1024 // 200 MB (Apple TV 4K Gen 2/3)
             } else if gib > 2.5 {
                 return 100 * 1024 * 1024 // 100 MB
             } else {
@@ -2459,8 +2494,19 @@ actor PosterArtworkCache {
         tracker.metrics()
     }
 
-    private let cache = NSCache<NSString, UIImage>()
+    /// NSCache is safe to read from any thread: the cards read it as they are drawn.
+    nonisolated(unsafe) private let cache = NSCache<NSString, UIImage>()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
+
+    private nonisolated static func memoryKey(for url: URL, maxPixelSize: Int) -> NSString {
+        let boundedPixelSize = min(max(maxPixelSize, 160), 1400)
+        return "\(url.absoluteString)#\(boundedPixelSize)" as NSString
+    }
+
+    /// The decoded poster when it is already in memory, at once: never loads.
+    nonisolated func cachedImage(for url: URL, maxPixelSize: Int) -> UIImage? {
+        cache.object(forKey: Self.memoryKey(for: url, maxPixelSize: maxPixelSize))
+    }
 
     init() {
         let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
@@ -2468,7 +2514,7 @@ actor PosterArtworkCache {
             cache.countLimit = 120
             cache.totalCostLimit = Self.tracker.maxCost
         } else if gib > 3.5 {
-            cache.countLimit = 220
+            cache.countLimit = 320
             cache.totalCostLimit = Self.tracker.maxCost
         } else if gib > 2.5 {
             cache.countLimit = 160
@@ -2511,7 +2557,7 @@ actor PosterArtworkCache {
 
     func image(for url: URL, maxPixelSize: Int) async -> UIImage? {
         let boundedPixelSize = min(max(maxPixelSize, 160), 1400)
-        let key = "\(url.absoluteString)#\(boundedPixelSize)" as NSString
+        let key = Self.memoryKey(for: url, maxPixelSize: maxPixelSize)
 
         if let cached = cache.object(forKey: key) {
             return cached
