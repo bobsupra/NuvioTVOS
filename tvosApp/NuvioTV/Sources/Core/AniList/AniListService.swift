@@ -373,6 +373,14 @@ enum AniListService {
     /// series under its first entry's id.
     static func metadata(id: String) async throws -> NuvioMeta? {
         guard AniListSettings.opensTitles, let startID = AniListMetaBuilder.aniListID(from: id) else { return nil }
+        // Built before in this session: Back to a title builds its details screen anew.
+        let signature = AniListSessionCache.signature
+        if let built = AniListSessionCache.title(id, signature: signature) {
+            for key in built.keys {
+                AniListTitleIndex.store(metaID: key, tabLabels: built.tabLabels, seasonByEntry: built.seasonByEntry, related: built.related)
+            }
+            return built.meta
+        }
         let merge = AniListSettings.seasonMode == .merged
         let language = AniListSettings.titleLanguage
 
@@ -440,6 +448,20 @@ enum AniListService {
         for key in Set([meta.id, id] + tabs.map { AniListMetaBuilder.metaID($0.id) }) {
             AniListTitleIndex.store(metaID: key, tabLabels: tabLabels, seasonByEntry: seasonByEntry, related: related)
         }
+
+        AniListSessionCache.store(
+            AniListSessionCache.Title(
+                meta: meta,
+                tabLabels: tabLabels,
+                seasonByEntry: seasonByEntry,
+                related: related,
+                keys: Array(Set([meta.id, id] + tabs.map { AniListMetaBuilder.metaID($0.id) }))
+            ),
+            finished: tabs.allSatisfy { $0.status == "FINISHED" || $0.status == "CANCELLED" },
+            // A picture that didn't load (a network failure) is asked again soon.
+            missingPictures: AniListSettings.usesEpisodeDetails && artwork.background == nil,
+            signature: signature
+        )
         return meta
     }
 
@@ -687,8 +709,12 @@ enum AniListService {
 
     /// Characters with their Japanese voice actors, and AniList's recommendations.
     static func extras(metaID: String) async -> (people: [TmdbPersonMetadata], recommendations: [RelatedTitle]) {
-        guard AniListSettings.opensTitles, let id = AniListMetaBuilder.aniListID(from: metaID),
-              let data = await extrasAnswer(id: id),
+        guard AniListSettings.opensTitles, let id = AniListMetaBuilder.aniListID(from: metaID) else { return ([], []) }
+        let signature = AniListSessionCache.signature
+        if let kept = AniListSessionCache.extras(metaID, signature: signature) {
+            return kept
+        }
+        guard let data = await extrasAnswer(id: id),
               let media = try? decoder.decode(AniListMediaResponse.self, from: data).data?.Media else {
             return ([], [])
         }
@@ -713,6 +739,12 @@ enum AniListService {
             .compactMap { $0.mediaRecommendation }
             .filter { $0.type == nil || $0.type == "ANIME" }
             .map { AniListMetaBuilder.relatedTitle($0, relation: nil, language: language) }
+        AniListSessionCache.storeExtras(
+            (people, recommendations),
+            for: metaID,
+            finished: media.status == "FINISHED" || media.status == "CANCELLED",
+            signature: signature
+        )
         return (people, recommendations)
     }
 
@@ -741,6 +773,7 @@ enum AniListService {
     }
 
     static func clearCache() async {
+        AniListSessionCache.removeAll()
         AniListPeople.removeAll()
         await AniListClient.shared.clearCache()
     }
@@ -836,6 +869,97 @@ enum AniListTitleIndex {
         lock.lock()
         defer { lock.unlock() }
         return entries[metaID.lowercased()]?.related ?? []
+    }
+}
+
+/// AniList titles built in this app session, with their extras (cast and recommendations), so
+/// Back to a title shows it at once: its details screen and repository are made anew and would
+/// build it again from the saved answers. Finished titles keep 6 hours, airing ones 30 minutes,
+/// one without its background 5 minutes (a picture that failed to load is asked again soon);
+/// a change of the settings that shape a title, another profile or Clear Cache drops them.
+enum AniListSessionCache {
+    struct Title {
+        let meta: NuvioMeta
+        let tabLabels: [Int: AniListMetaBuilder.TabLabel]
+        let seasonByEntry: [Int: Int]
+        let related: [RelatedTitle]
+        /// The ids it is kept under: the series', the one it was opened by and its entries'.
+        let keys: [String]
+    }
+
+    typealias Extras = (people: [TmdbPersonMetadata], recommendations: [RelatedTitle])
+
+    private struct Kept<Value> {
+        let value: Value
+        let signature: String
+        let expires: Date
+    }
+
+    static let finishedTTL: TimeInterval = 6 * 3600
+    static let airingTTL: TimeInterval = 30 * 60
+    static let missingPicturesTTL: TimeInterval = 5 * 60
+    /// Past this many ids, the expired ones go, then all of them.
+    static let limit = 300
+
+    private static let lock = NSLock()
+    private static var keptTitles: [String: Kept<Title>] = [:]
+    private static var keptExtras: [String: Kept<Extras>] = [:]
+
+    /// What a built title depends on besides AniList's answers.
+    static var signature: String {
+        [
+            ProfileSettings.activeProfileScope,
+            AniListSettings.seasonMode.rawValue,
+            AniListSettings.titleLanguage.rawValue,
+            AniListSettings.usesEpisodeDetails ? "details" : "nodetails",
+            TmdbDetailsService.useArtwork ? "tmdb-art" : "no-tmdb-art",
+        ].joined(separator: "|")
+    }
+
+    static func title(_ id: String, signature: String, now: Date = Date()) -> Title? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let kept = keptTitles[id.lowercased()], kept.signature == signature, kept.expires > now else { return nil }
+        return kept.value
+    }
+
+    static func store(_ title: Title, finished: Bool, missingPictures: Bool = false, signature: String, now: Date = Date()) {
+        let lifetime = missingPictures ? missingPicturesTTL : (finished ? finishedTTL : airingTTL)
+        let kept = Kept(value: title, signature: signature, expires: now.addingTimeInterval(lifetime))
+        lock.lock()
+        defer { lock.unlock() }
+        trim(&keptTitles, now: now)
+        for key in title.keys {
+            keptTitles[key.lowercased()] = kept
+        }
+    }
+
+    static func extras(_ metaID: String, signature: String, now: Date = Date()) -> Extras? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let kept = keptExtras[metaID.lowercased()], kept.signature == signature, kept.expires > now else { return nil }
+        return kept.value
+    }
+
+    static func storeExtras(_ value: Extras, for metaID: String, finished: Bool, signature: String, now: Date = Date()) {
+        let kept = Kept(value: value, signature: signature, expires: now.addingTimeInterval(finished ? finishedTTL : airingTTL))
+        lock.lock()
+        defer { lock.unlock() }
+        trim(&keptExtras, now: now)
+        keptExtras[metaID.lowercased()] = kept
+    }
+
+    static func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        keptTitles.removeAll()
+        keptExtras.removeAll()
+    }
+
+    private static func trim<Value>(_ store: inout [String: Kept<Value>], now: Date) {
+        guard store.count >= limit else { return }
+        store = store.filter { $0.value.expires > now }
+        if store.count >= limit { store.removeAll() }
     }
 }
 
