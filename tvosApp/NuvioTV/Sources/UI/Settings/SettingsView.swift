@@ -109,6 +109,48 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     }
 }
 
+/// The desktop app's Settings groups. Settings shows these instead of the
+/// flat category list while the Nuvio sidebar is on.
+enum SettingsPageGroup: String, CaseIterable, Identifiable {
+    case you, look, media, services, system
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .you: return L10n.string("tvos_settings_group_you", fallback: "You")
+        case .look: return L10n.string("tvos_settings_group_look", fallback: "Look")
+        case .media: return L10n.string("tvos_settings_group_media", fallback: "Media")
+        case .services: return L10n.string("tvos_settings_group_services", fallback: "Services")
+        case .system: return L10n.string("tvos_settings_group_system", fallback: "System")
+        }
+    }
+
+    var iconName: String {
+        switch self {
+        case .you: return "person.fill"
+        case .look: return "paintpalette.fill"
+        case .media: return "play.fill"
+        case .services: return "link"
+        case .system: return "gearshape.fill"
+        }
+    }
+
+    var categories: [SettingsCategory] {
+        switch self {
+        case .you: return [.account]
+        case .look: return [.appearance, .layout]
+        case .media: return [.playback, .subtitles]
+        case .services: return [.integrations]
+        case .system: return [.advanced, .about]
+        }
+    }
+
+    static func containing(_ category: SettingsCategory) -> SettingsPageGroup {
+        allCases.first { $0.categories.contains(category) } ?? .you
+    }
+}
+
 enum SettingsKey {
     static let partyChatToastsEnabled = "nuvio.tv.party.chatToastsEnabled"
     static let profileName = "nuvio.tv.settings.profile.name"
@@ -1662,7 +1704,7 @@ extension View {
     /// Marks the detail pane's first row so it stays focusable while the rest of
     /// the pane is entry-locked — i.e. the row a right-press should land on.
     func settingsEntryAnchor() -> some View {
-        environment(\.settingsEntryLocked, false)
+        modifier(ConditionalSettingsEntryAnchor(isActive: true))
     }
 
     /// Conditional variant: anchors only when `isActive`, otherwise leaves the
@@ -1691,8 +1733,29 @@ private struct EntryLockable: ViewModifier {
 private struct ConditionalSettingsEntryAnchor: ViewModifier {
     let isActive: Bool
     @Environment(\.settingsEntryLocked) private var locked
+    @Environment(\.settingsEntryFocus) private var entryFocus
+    @ViewBuilder
     func body(content: Content) -> some View {
-        content.environment(\.settingsEntryLocked, isActive ? false : locked)
+        if let entryFocus {
+            // Grouped Settings sends focus here when it opens the page.
+            content
+                .environment(\.settingsEntryLocked, isActive ? false : locked)
+                .focused(entryFocus, equals: isActive)
+        } else {
+            content.environment(\.settingsEntryLocked, isActive ? false : locked)
+        }
+    }
+}
+
+private struct SettingsEntryFocusKey: EnvironmentKey {
+    static let defaultValue: FocusState<Bool>.Binding? = nil
+}
+
+extension EnvironmentValues {
+    /// Set in grouped Settings: the binding a page's first row takes focus through.
+    var settingsEntryFocus: FocusState<Bool>.Binding? {
+        get { self[SettingsEntryFocusKey.self] }
+        set { self[SettingsEntryFocusKey.self] = newValue }
     }
 }
 
@@ -1764,6 +1827,21 @@ struct SettingsView: View {
     @State private var presentedProfilePinMode: ProfilePinSheetMode?
     @FocusState private var focusedCategory: SettingsCategory?
     @Environment(\.nuvioRailExitCount) private var nuvioRailExitCount
+    @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.useTopNavigation) private var usesTopNavigation = false
+    /// A page of the selected group is open in the detail pane. Closed, the
+    /// pane lists the group's pages.
+    @State private var groupPageOpen = false
+    @FocusState private var focusedGroupRow: SettingsCategory?
+    /// The first row of a group's open page. Focus is sent to it when the
+    /// page opens.
+    @FocusState private var pageEntryFocused: Bool
+    /// A page is opening or closing, and focus is on its way to a row.
+    @State private var pageOpening = false
+
+    /// Settings is grouped as on desktop while the Nuvio sidebar is in use.
+    private var usesGroups: Bool { useNuvioRail && !usesTopNavigation }
+    private var selectedGroup: SettingsPageGroup { .containing(selectedCategory) }
     @FocusState private var focusedLanguagePreference: LanguagePickerKind?
     /// Whether focus has entered the current category's detail pane at least once.
     /// The entry lock (land on the first row) only fires on the first entry; after
@@ -1810,6 +1888,9 @@ struct SettingsView: View {
                     // sends Right from it straight into the detail pane. Focus
                     // goes to the selected category instead.
                     .onChange(of: nuvioRailExitCount) { _, _ in
+                        // Not while a page is opening: that focus is on its
+                        // way to the page.
+                        guard !pageOpening else { return }
                         DispatchQueue.main.async { focusedCategory = selectedCategory }
                     }
                     .onChange(of: selectedCategory) { oldCat, newCat in
@@ -1819,7 +1900,9 @@ struct SettingsView: View {
                     }
 
                 Group {
-                    if selectedCategory == .subtitles {
+                    if usesGroups && !groupPageOpen {
+                        groupPageList
+                    } else if selectedCategory == .subtitles {
                         VStack(alignment: .leading, spacing: 28) {
                             selectedCategoryHeader
                             SubtitleStyleSettingsView(accentColor: accentColor)
@@ -1853,6 +1936,7 @@ struct SettingsView: View {
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .environment(\.settingsEntryFocus, usesGroups ? $pageEntryFocused : nil)
                 .focusSection()
                 // Lock every detail row except the first while focus is still in
                 // the sidebar and this category hasn't been entered yet, so the
@@ -1861,7 +1945,22 @@ struct SettingsView: View {
                 .environment(\.settingsEntryLocked, focusedCategory != nil && !detailVisited)
                 // Back from a setting returns focus to its selected category;
                 // Back from the category list remains handled by the TabView.
-                .onExitCommand { focusedCategory = selectedCategory }
+                .onExitCommand {
+                    guard usesGroups, groupPageOpen else {
+                        focusedCategory = selectedCategory
+                        return
+                    }
+                    // Back from a group's page returns to the group's list.
+                    groupPageOpen = false
+                    let page = selectedCategory
+                    pageOpening = true
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        focusedGroupRow = page
+                    }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                        pageOpening = false
+                    }
+                }
             }
             .disabled(presentedLanguagePicker != nil || presentedProfilePinMode != nil)
             .allowsHitTesting(presentedLanguagePicker == nil && presentedProfilePinMode == nil)
@@ -2042,6 +2141,25 @@ struct SettingsView: View {
                 .padding(.leading, 10)
 
             VStack(alignment: .leading, spacing: 14) {
+                if usesGroups {
+                    ForEach(SettingsPageGroup.allCases) { group in
+                        let isSelectedGroup = group == selectedGroup
+                        // A group's pill stands for its open page, or its first.
+                        let page = isSelectedGroup ? selectedCategory : group.categories[0]
+                        SettingsCategoryPill(
+                            title: group.title,
+                            iconName: group.iconName,
+                            isSelected: isSelectedGroup,
+                            isFocused: focusedCategory == page,
+                            accentColor: accentColor
+                        ) {
+                            if !isSelectedGroup { selectedCategory = group.categories[0] }
+                            groupPageOpen = false
+                        }
+                        .focused($focusedCategory, equals: page)
+                        .disabled(!(isSelectedGroup || focusedCategory != nil))
+                    }
+                } else {
                 ForEach(SettingsCategory.allCases) { category in
                     let isSelectedCategory = selectedCategory == category
                     let isFocusedCategory = focusedCategory == category
@@ -2058,7 +2176,8 @@ struct SettingsView: View {
                     let isFocusable = isSelectedCategory || focusedCategory != nil
 
                     SettingsCategoryPill(
-                        category: category,
+                        title: category.title,
+                        iconName: category.iconName,
                         isSelected: isSelectedCategory,
                         isFocused: isFocusedCategory,
                         accentColor: accentColor
@@ -2068,6 +2187,7 @@ struct SettingsView: View {
                     .focused($focusedCategory, equals: category)
                     .disabled(!isFocusable)
                 }
+                }
             }
         }
         .padding(.leading, 58)
@@ -2075,6 +2195,61 @@ struct SettingsView: View {
         .padding(.top, 58)
         .frame(width: 510)
         .frame(maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    /// The selected group's pages, as on desktop: one row per page.
+    private var groupPageList: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 28) {
+                Text(selectedGroup.title)
+                    .font(.appFont(size: 40, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(height: 70)
+
+                VStack(spacing: 14) {
+                    ForEach(selectedGroup.categories) { category in
+                        SettingsGroupPageRow(
+                            title: category.title,
+                            subtitle: category.subtitle,
+                            iconName: category.iconName,
+                            accentColor: accentColor
+                        ) {
+                            selectedCategory = category
+                            groupPageOpen = true
+                            // The focused row goes away with the list, and
+                            // tvOS would move the focus to the sidebar.
+                            pageOpening = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                                pageEntryFocused = true
+                            }
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.7) {
+                                pageOpening = false
+                            }
+                        }
+                        .focused($focusedGroupRow, equals: category)
+                        // From the group's pill, Right lands on the first page.
+                        .disabled(focusedCategory != nil && category != selectedGroup.categories[0])
+                    }
+                    if selectedGroup == .you, let onSwitchProfile {
+                        SettingsGroupPageRow(
+                            title: L10n.string("tvos_settings_switch_profile", fallback: "Switch Profile"),
+                            subtitle: L10n.string(
+                                "tvos_settings_switch_profile_subtitle",
+                                fallback: "Change to a different profile"
+                            ),
+                            iconName: "person.2.fill",
+                            accentColor: accentColor,
+                            action: onSwitchProfile
+                        )
+                        .disabled(focusedCategory != nil)
+                    }
+                }
+            }
+            .padding(.leading, 44)
+            .padding(.trailing, 72)
+            .padding(.vertical, 56)
+        }
+        .id(selectedGroup)
     }
 
     private var selectedCategoryHeader: some View {
@@ -2148,8 +2323,42 @@ struct SettingsView: View {
     }
 }
 
+/// A page of a Settings group: icon, title and what the page holds.
+private struct SettingsGroupPageRow: View {
+    let title: String
+    let subtitle: String
+    let iconName: String
+    let accentColor: Color
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                Image(systemName: iconName)
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundColor(accentColor)
+                    .frame(width: 44, height: 44)
+
+                SettingsRowText(title: title, subtitle: subtitle)
+
+                Spacer(minLength: 24)
+
+                Image(systemName: "chevron.right")
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundColor(accentColor)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+    }
+}
+
 private struct SettingsCategoryPill: View {
-    let category: SettingsCategory
+    let title: String
+    let iconName: String
     let isSelected: Bool
     let isFocused: Bool
     let accentColor: Color
@@ -2158,12 +2367,12 @@ private struct SettingsCategoryPill: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 22) {
-                Image(systemName: category.iconName)
+                Image(systemName: iconName)
                     .font(.system(size: 36, weight: .semibold))
                     .foregroundColor(iconColor)
                     .frame(width: 48, height: 48)
 
-                Text(category.title)
+                Text(title)
                     .font(.system(size: 30, weight: .bold))
                     .foregroundColor(textColor)
                     .lineLimit(1)

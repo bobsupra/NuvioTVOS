@@ -3249,6 +3249,23 @@ struct ContentView: View {
                     activeScreen = .profileSelection
                 }
             },
+            profiles: profileViewModel.profiles,
+            onPickProfile: { profile in
+                guard profile.id != profileViewModel.activeProfile?.id else { return }
+                homeStore.reset()
+                guard !profile.isPinProtected else {
+                    // PIN entry lives on the who's-watching screen.
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        profileViewModel.activeProfile = nil
+                        activeScreen = .profileSelection
+                    }
+                    return
+                }
+                profileViewModel.requestSwitch(to: profile)
+                guard profileViewModel.activeProfile?.id == profile.id else { return }
+                selectedTab = .home
+                beginProfileGate()
+            },
             onChangeProfileAvatar: { profileId, avatarId in
                 profileViewModel.updateProfileAvatar(id: profileId, avatarId: avatarId)
                 syncManager.syncProfilesAfterLocalEdit()
@@ -5264,6 +5281,10 @@ private struct TVMainTabView: View {
     let partyIsChoosing: Bool
     let onCancelPartySelection: () -> Void
     let onSwitchProfile: () -> Void
+    /// Every profile, for the Nuvio sidebar's inline list.
+    var profiles: [Profile] = []
+    /// Switches to a profile picked in the Nuvio sidebar.
+    var onPickProfile: (Profile) -> Void = { _ in }
     let onChangeProfileAvatar: (String, String) -> Void
     var onChangeProfileBackground: ((String, String?, String?) -> Void)? = nil
     let onChangeProfileName: (String, String) -> Void
@@ -5292,6 +5313,8 @@ private struct TVMainTabView: View {
     @State private var observedTabSettings: TVMainTabSettings?
     @State private var tabSettingsReadThrough = TVMainTabSettingsReadThrough()
     @FocusState private var railFocus: TVTab?
+    /// The profile focused in the Nuvio sidebar's inline list.
+    @FocusState private var railProfileFocus: String?
     /// Counts the times focus has left the Nuvio sidebar for the page.
     @State private var nuvioRailExitCount = 0
     @State private var selectedSettingsCategory: SettingsCategory = .account
@@ -5821,12 +5844,12 @@ private struct TVMainTabView: View {
             .focusSection()
             .padding(.leading, TVNuvioRail.collapsedWidth)
             .environment(\.nuvioRailExitCount, nuvioRailExitCount)
-            .onChange(of: railFocus) { previous, current in
-                guard previous != nil, current == nil else { return }
+            .onChange(of: nuvioRailHasFocus) { wasInside, isInside in
+                guard wasInside, !isInside else { return }
                 // Focus is briefly nowhere while the sidebar moves it to the
                 // current section. Only a lasting exit counts.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    if railFocus == nil { nuvioRailExitCount += 1 }
+                    if !nuvioRailHasFocus { nuvioRailExitCount += 1 }
                 }
             }
             .onExitCommand { railFocus = nuvioRailTabs.contains(selectedTab) ? selectedTab : .home }
@@ -5835,18 +5858,28 @@ private struct TVMainTabView: View {
                 tabs: nuvioRailTabs,
                 selection: selectedTab,
                 focus: $railFocus,
+                profileFocus: $railProfileFocus,
                 avatarId: displayedProfile?.avatarId ?? ProfileAvatarCatalog.defaultId,
                 profileName: profileTabTitle,
+                profiles: profiles,
+                activeProfileId: displayedProfile?.id,
                 needsAttention: sessionNeedsReauthentication,
                 onSelect: { selectedTab = $0 },
                 onProfile: {
                     guard !isProfileFocusPending else { return }
                     if selectedTab == .settings { syncManager.flushPendingPushes() }
                     onSwitchProfile()
+                },
+                onPickProfile: { profile in
+                    guard !isProfileFocusPending else { return }
+                    if selectedTab == .settings { syncManager.flushPendingPushes() }
+                    onPickProfile(profile)
                 }
             )
         }
     }
+
+    private var nuvioRailHasFocus: Bool { railFocus != nil || railProfileFocus != nil }
 
     @ViewBuilder
     private var nuvioRailSection: some View {
@@ -5981,20 +6014,29 @@ private struct TVMainTabView: View {
 /// Nuvio's sidebar: an icon rail on the leading edge with the profile at the
 /// top and one row per section. Like the desktop app's, which opens on hover,
 /// it opens while it has focus to show the profile name and section labels,
-/// and closes to icons when focus returns to the content.
+/// and closes to icons when focus returns to the content. In Settings it stays
+/// closed, as on desktop, because the Settings list sits right beside it.
 private struct TVNuvioRail: View {
     let tabs: [TVTab]
     let selection: TVTab
     var focus: FocusState<TVTab?>.Binding
+    var profileFocus: FocusState<String?>.Binding
     let avatarId: String
     let profileName: String
+    let profiles: [Profile]
+    let activeProfileId: String?
     let needsAttention: Bool
     let onSelect: (TVTab) -> Void
+    /// Opens the full who's-watching screen.
     let onProfile: () -> Void
+    let onPickProfile: (Profile) -> Void
 
     private var avatarFocused: Bool { focus.wrappedValue == .profile }
+    private var hasFocus: Bool { focus.wrappedValue != nil || profileFocus.wrappedValue != nil }
     /// Focus is outside the sidebar, so the next row it reaches is an entry.
     @State private var cameFromContent = true
+    /// The list of profiles under the profile row is open.
+    @State private var showsProfiles = false
     @FocusState private var entryStripFocused: Bool
 
     static let collapsedWidth: CGFloat = 128
@@ -6002,7 +6044,10 @@ private struct TVNuvioRail: View {
     /// The desktop sidebar's timing: 200 ms, fast out, slow in.
     static let motion = Animation.timingCurve(0.4, 0, 0.2, 1, duration: 0.2)
 
-    private var isExpanded: Bool { focus.wrappedValue != nil || entryStripFocused }
+    private var isExpanded: Bool {
+        guard hasFocus || entryStripFocused else { return false }
+        return selection != .settings || showsProfiles
+    }
 
     /// The row focus lands on when it enters the closed sidebar.
     private var landingTab: TVTab? { tabs.contains(selection) ? selection : tabs.first }
@@ -6016,7 +6061,10 @@ private struct TVNuvioRail: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: onProfile) {
+            Button {
+                // One profile has nothing to list, so it goes to the full screen.
+                if profiles.count > 1 { showsProfiles.toggle() } else { onProfile() }
+            } label: {
                 TVNuvioRailRow(isFocused: avatarFocused, isExpanded: isExpanded, label: profileName, labelIsProminent: true) {
                     ProfileAvatarView(avatarId: avatarId, size: 56, isFocused: false, showsFocusOutline: false)
                 }
@@ -6026,6 +6074,37 @@ private struct TVNuvioRail: View {
             .focusEffectDisabledIfAvailable()
             .accessibilityLabel(TVTab.profile.title)
             .padding(.top, 64)
+
+            if showsProfiles {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(profiles) { profile in
+                        let isActive = profile.id == activeProfileId
+                        Button {
+                            showsProfiles = false
+                            if !isActive { onPickProfile(profile) }
+                        } label: {
+                            TVNuvioRailRow(
+                                isFocused: profileFocus.wrappedValue == profile.id,
+                                isExpanded: isExpanded,
+                                label: ProfileDisplayName.resolve(profile: profile, settingsName: ""),
+                                labelIsProminent: isActive,
+                                iconSize: 44
+                            ) {
+                                ProfileAvatarView(avatarId: profile.avatarId, size: 40, isFocused: false, showsFocusOutline: false)
+                                    .opacity(isActive || profileFocus.wrappedValue == profile.id ? 1 : 0.7)
+                            }
+                        }
+                        .buttonStyle(TVNuvioRailButtonStyle())
+                        .focused(profileFocus, equals: profile.id)
+                        .focusEffectDisabledIfAvailable()
+                        .accessibilityLabel(profile.name)
+                        .accessibilityAddTraits(isActive ? .isSelected : [])
+                    }
+                }
+                .padding(.leading, 10)
+                .padding(.top, 8)
+                .transition(.opacity)
+            }
 
             Spacer(minLength: 0)
             VStack(alignment: .leading, spacing: 10) {
@@ -6058,7 +6137,7 @@ private struct TVNuvioRail: View {
             }
             Spacer(minLength: 0)
             // Balances the profile row so the sections sit at the screen's centre.
-            Color.clear.frame(height: 144)
+            Color.clear.frame(height: showsProfiles ? 0 : 144)
         }
         // tvOS only moves Left onto a row that is level with the focused
         // item, so from the top of a page it would not reach the sidebar. This
@@ -6069,7 +6148,7 @@ private struct TVNuvioRail: View {
                 .frame(width: 80)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
-                .focusable(focus.wrappedValue == nil)
+                .focusable(!hasFocus)
                 .focused($entryStripFocused)
                 .focusEffectDisabledIfAvailable()
                 .accessibilityHidden(true)
@@ -6086,12 +6165,22 @@ private struct TVNuvioRail: View {
         // through the labels.
         .background(Color.black)
         .animation(Self.motion, value: isExpanded)
+        .animation(Self.motion, value: showsProfiles)
         .focusSection()
         .defaultFocus(focus, landingTab, priority: .userInitiated)
         // tvOS moves focus to the row nearest the one it came from. Arriving
         // from the content, it goes to the current section instead.
+        .onChange(of: hasFocus) { _, isInside in
+            guard !isInside else { return }
+            // Focus is briefly nowhere while it moves between rows, so only a
+            // lasting exit closes the profile list and counts as leaving.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                guard !hasFocus else { return }
+                cameFromContent = true
+                showsProfiles = false
+            }
+        }
         .onChange(of: focus.wrappedValue) { previous, current in
-            if current == nil { cameFromContent = true }
             guard cameFromContent, let current else { return }
             cameFromContent = false
             guard previous == nil, let landingTab, current != landingTab else { return }
@@ -6109,30 +6198,37 @@ private struct TVNuvioRailRow<Icon: View>: View {
     let isExpanded: Bool
     let label: String
     let labelIsProminent: Bool
+    var iconSize: CGFloat = 64
     @ViewBuilder let icon: () -> Icon
 
-    private static var slot: CGFloat { 80 }
+    private var slot: CGFloat { iconSize + 16 }
 
     var body: some View {
         // The row's own frame is only the icon slot. tvOS looks for the next
         // item past the focused frame's edge, so a frame as wide as the open
         // sidebar would make Right skip everything the sidebar covers. The
         // platter and the label are drawn outside that frame.
-        icon().frame(width: 64, height: 64)
+        icon().frame(width: iconSize, height: iconSize)
             .padding(8)
             .background(alignment: .leading) {
+                // Closed, the platter is no wider than the icon, so a ring
+                // marks the focused row.
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .fill(Color.white.opacity(isFocused ? 0.14 : 0))
-                    .frame(width: isExpanded ? TVNuvioRail.expandedWidth - 48 : Self.slot)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                            .strokeBorder(Color.white.opacity(isFocused && !isExpanded ? 0.9 : 0), lineWidth: 3)
+                    )
+                    .frame(width: isExpanded ? TVNuvioRail.expandedWidth - 48 : slot)
             }
             .overlay(alignment: .leading) {
                 if isExpanded {
                     Text(label)
-                        .font(.system(size: 29, weight: .semibold))
+                        .font(.system(size: iconSize < 64 ? 25 : 29, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(isFocused || labelIsProminent ? 1 : 0.6))
                         .lineLimit(1)
                         .fixedSize()
-                        .padding(.leading, Self.slot + 10)
+                        .padding(.leading, slot + 10)
                         .transition(.opacity.combined(with: .move(edge: .leading)))
                 }
             }
