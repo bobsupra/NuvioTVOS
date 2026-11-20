@@ -305,6 +305,8 @@ func printUsage() {
                 OK if the clock advanced or FAIL if it stayed silent.
                 Smoke-tests the FFmpeg decode -> AVSampleBufferAudioRenderer
                 pipeline end-to-end on macOS without a display layer.
+                --gain DB sets LoadOptions.normalizationGainDB and prints
+                the engine's normalization report before stopping.
 
       live      Start a synthetic endless MPEG-TS source (LiveFixture,
                 loopback HTTP, no Content-Length, monotonic PTS / PCR
@@ -1119,6 +1121,9 @@ if first == "play" {
     // AE#956: LoadOptions.skipsContainerAttachments. Pair it with a throttled origin and an MKV that
     // carries fonts to see the open stop paying for them.
     let skipAttachments = takeFlag("--skip-attachments", from: &rest)
+    // AE#682: LoadOptions.serveIFramePlaylist on a full session, where the still ladder runs and
+    // fills the rendition ahead of AVKit (`[StillLadder] reading through the I-frame rendition`).
+    let playServesIFrames = takeFlag("--iframes", from: &rest)
     // #460: `--reload-applying <key>=<value>`, repeatable, with one shared delay. The delay is a
     // separate flag rather than teletext's `@ms` suffix because a header value can carry an `@`.
     // Default +20 s for the same reason the teletext switch uses it: the correction has to land on
@@ -1257,6 +1262,7 @@ if first == "play" {
                  assertDolbyVision: playAssertDV,
                  preserveASSMarkup: preserveASSMarkup,
                  skipAttachments: skipAttachments,
+                 serveIFrames: playServesIFrames,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
                  dualLayerRoute: playFelOutput ? .avPlayerOutput : .softwareHost,
@@ -1356,6 +1362,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let extractFlag = takeFlag("--extract", from: &rest)
     let secondsFlag = takeDoubleFlag("--seconds", in: 0...maxRunSeconds, from: &rest)
     let audioSeconds = secondsFlag ?? 10
+    let audioGain = takeDoubleFlag("--gain", from: &rest)   // Sodalite#242
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
     // AE#682: list an I-frame rendition in the master; serve only.
@@ -1413,7 +1420,7 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
             maxWidth: extractWidth
         ))
     case "audio":
-        exit(runAudio(url: url, seconds: audioSeconds))
+        exit(runAudio(url: url, seconds: audioSeconds, gainDB: audioGain))
     case "customio":
         if customLive {
             exit(runCustomLiveSpool(path: urlArg, seconds: secondsFlag ?? 720, rateKbps: customRateKbps,

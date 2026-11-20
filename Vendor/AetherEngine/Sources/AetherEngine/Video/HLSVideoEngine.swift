@@ -300,6 +300,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// has nothing in flight. Guarded by `restartLock`, like the reader and builder below.
     private var stillLadderEligible = false
     private var stillLadderSource: (keyframes: IFrameRendition, builder: PreviewKeyframeBuilder)?
+    /// The ladder also fills a served I-frame rendition ahead of AVKit, through the rendition's own
+    /// reader and cache, so a scrub does not wait on a read (and a tone map) per thumbnail. Guarded
+    /// by `restartLock`.
+    private var iFramePrefetchActive = false
     /// Rung bookkeeping, guarded by `stillLadderLock`. `stillLadderComplete` only gates the log line.
     private let stillLadderLock = NSLock()
     private var stillLadderCached: Set<Int> = []
@@ -766,7 +770,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// by AetherEngine to a thread-safe mirror and threaded onto every producer so the VOD backpressure
     /// wedge detector suspends while the consumer is paused (a paused player issues no forward fetch, so its
     /// frozen fetch target is not a wedge, issue #65 pause false-positive).
-    var playIntentProvider: (@Sendable () -> Bool)?
+    var playIntentProvider: (@Sendable () -> Bool)? {
+        didSet {
+            notifyPlayIntentChanged()
+        }
+    }
+
+    /// AE#472: snapshot the playback demuxer with the restart lock, then wake its reader after unlocking.
+    /// A restart can replace the demuxer concurrently; retain the selected instance without extending
+    /// the lock into the reader's condition variable.
+    func notifyPlayIntentChanged() {
+        restartLock.lock()
+        let currentDemuxer = demuxer
+        restartLock.unlock()
+        currentDemuxer?.notifyPlayIntentChanged()
+    }
 
     /// AE#520 round 2: how long the consumer can keep playing out of what it already holds, readable
     /// off the main actor. Wired by AetherEngine to a thread-safe mirror the telemetry sampler writes,
@@ -959,14 +977,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// #99: bounded revive for a VOD pump that died with muxerFailed (under `restartLock`).
     /// performRestart rebuilds muxer AND re-arms the audio bridge, so transient causes heal;
     /// a persistent cause exhausts the cap instead of restart-storming.
-    var muxerFailureReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+    var muxerFailureReviveGate = ReviveBudget(maxAttempts: 2)
 
     /// AE#169 round 2: bounded revive for a VOD pump that died on a MID-SESSION read error (under
     /// `restartLock`). #126 only surfaced the nothing-ever-produced case as fatal and assumed the
     /// scrub/wedge arms covered the rest; a tail request within the forward-wait window of the dead
     /// producer's front reached neither (rrgomes: seg719 miss x11 into -12889), so the exit gets
     /// its own event-driven arm. Same gate shape as #99.
-    var readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+    var readErrorReviveGate = ReviveBudget(maxAttempts: 2, reset: .onProgress)
     /// #377: a separate, larger budget for read errors caused by an origin REFUSING us rather than
     /// failing. Separate because the two must not spend each other: two attempts is right for a
     /// source that may be gone, and wrong for one that is merely refusing for a while, where each
@@ -978,7 +996,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var rateLimitReviveGate = RefusingSourceReviveBudget()
     /// AE#792 part 2: revives spent on a credential refusal the host has since renewed. Each one
     /// answers a renewal, so the bound only stops a host whose fresh credentials keep being refused.
-    var credentialReviveGate = MuxerFailureReviveGate(maxAttempts: 3)
+    var credentialReviveGate = ReviveBudget(maxAttempts: 3, reset: .onProgress)
 
     /// Consecutive automatic VOD provider re-anchors are a separate failure mode from read-error
     /// revives and origin throttling. Mutated only under restartLock; never reset by producer rebuilds.
@@ -1003,12 +1021,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AE#222 (under `restartLock`): bounded rebuild for a pump that deferred its first cut. One attempt is
     /// enough by construction (the prime is captured before the restart and reused for the session's whole
     /// life); the gate exists so a source that somehow defers again cannot restart-storm.
-    var audioSampleEntryPrimeGate = MuxerFailureReviveGate(maxAttempts: 1)
+    var audioSampleEntryPrimeGate = ReviveBudget(maxAttempts: 1)
 
     /// AE#169 round 3 (under `restartLock`): bounded re-anchor for a VOD pump whose restart
     /// scan-forward gate starved to EOF (no runtime keyframe at/after the targeted plan boundary,
     /// the unproducible tail segment). Same gate shape as #99.
-    var gateStarvationReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+    var gateStarvationReviveGate = ReviveBudget(maxAttempts: 2)
 
     /// #93 residual: a stalled AVPlayer sometimes never resumes REQUESTING after a wedge re-anchor
     /// (device: plain playback, one -15628 errorLog, then zero segment GETs while parked in
@@ -1690,10 +1708,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
             //    load, and each reposition refetches a segment, so prewarming would buy the same
             //    uniform-stride plan for the price of two segment downloads at every session start.
             if !Self.cuePrewarmMayRun(hasSegmentedReader: dem.timeSeekableReader != nil,
-                                      isSourceSeekable: dem.isSourceSeekable) {
+                                      isSourceSeekable: dem.isSourceSeekable,
+                                      isDASHSource: dem.isDASHSource) {
                 EngineLog.emit(
                     dem.timeSeekableReader != nil
                         ? "[HLSVideoEngine] cue prewarm: skipped for a segmented source (no index to load, every reposition refetches a segment)"
+                        : dem.isDASHSource
+                        ? "[HLSVideoEngine] cue prewarm: skipped for a DASH source (fragmented, no stss to load, AE#1075)"
                         : "[HLSVideoEngine] cue prewarm: skipped for a forward-only source (the seek would be a linear read, "
                           + "and the prefix it consumes is the producer's only pass)"
                 )
@@ -1734,7 +1755,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
             // boundaries no keyframe sits on (a 4 s grid over a 10 s GOP is producible on one boundary
             // in five; a restart at any other one opens its gate a GOP late and skews every index
             // mapping until AVPlayer starves).
-            let declaredSegmentStarts = dem.timeSeekableReader?.segmentStartTimesSeconds ?? []
+            //
+            // AE#1075: a DASH source declares them too, in its video sidx, while its fragmented virtual
+            // MP4 leaves the keyframe index empty (only the fragments read so far are indexed). The sidx
+            // times are presentation times and the anchor below is the first indexed keyframe on the
+            // decode axis; a constant composition offset cancels in the differences, and the boundary
+            // backoff absorbs what does not.
+            let dashStarts = dem.timeSeekableReader == nil
+                ? Self.coalescedRandomAccessStarts(
+                    dem.dashRandomAccessStartsSeconds,
+                    minimumSeconds: Self.dashMinimumSegmentSeconds(interleaveLeadSeconds: dem.dashInterleaveLeadSeconds))
+                : []
+            let declaredSegmentStarts = dem.timeSeekableReader?.segmentStartTimesSeconds ?? dashStarts
             let segmentedAnchorPts: Int64 = keyframes.sorted().first
                 ?? (videoStream.pointee.start_time != Int64.min
                     ? max(0, videoStream.pointee.start_time) : 0)
@@ -1750,7 +1782,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 self.firstKeyframeSeconds = Double(segmentedAnchorPts)
                     * Double(videoTimeBase.num) / Double(videoTimeBase.den)
                 EngineLog.emit(
-                    "[HLSVideoEngine] segment plan: source-declared boundaries, "
+                    "[HLSVideoEngine] segment plan: source-declared boundaries"
+                    + (dashStarts.isEmpty ? ", " : " (DASH sidx SAPs, AE#1075), ")
                     + "\(plan.count) segments [anchorPts=\(segmentedAnchorPts) "
                     + "shortestSegment=\(String(format: "%.3f", plan.map { $0.durationSeconds }.min() ?? 0))s]",
                     category: .session
@@ -2899,7 +2932,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
         if iFrameRenditionVerdict == .served,
            let rendition = makeIFrameRendition(plan: plan, cache: segmentCache,
                                                sourceIsHDR: videoRange != .sdr || dvVariant != .none) {
+            restartLock.lock()
             iFrameRendition = rendition
+            iFramePrefetchActive = generatesBackgroundScrubPreviews
+            restartLock.unlock()
             prov.setIFrameSource(rendition)
             EngineLog.emit("[HLSVideoEngine] i-frame rendition: served segments=\(plan.count) "
                            + "format=\(rendition.format.logName)", category: .session)
@@ -3694,7 +3730,10 @@ hasIFrameRendition: Bool = false,
         guard !busy, let started else { return }
 
         restartLock.lock()
-        let eligible = stillLadderEligible
+        let prefetching = iFramePrefetchActive
+        let eligible = stillLadderEligible || prefetching
+        let buildsJPEG: Bool
+        if prefetching, case .jpeg = iFrameRendition?.format { buildsJPEG = true } else { buildsJPEG = false }
         let plan = segmentPlan
         let segmentCache = cache
         restartLock.unlock()
@@ -3714,11 +3753,14 @@ hasIFrameRendition: Bool = false,
             secondsSinceLastRung: sinceLast)
         guard KeyframeStillLadder.linkIsIdle(link) else { return }
 
-        let resident = segmentCache?.residentIndexRanges() ?? []
+        // The rendition reads every I-frame off the source, resident or not, so nothing is skipped
+        // for it.
+        let resident = prefetching ? [] : segmentCache?.residentIndexRanges() ?? []
         let starts = plan.map(\.startSeconds)
+        let window = prefetching ? KeyframeStillLadder.iFrameWindowSegments : 0
         guard let index = KeyframeStillLadder.nextRung(
             segmentStarts: starts, totalSeconds: last.startSeconds + last.durationSeconds,
-            playheadSeconds: playhead, isCached: { skipped.contains($0) },
+            playheadSeconds: playhead, fineWindowSegments: window, isCached: { skipped.contains($0) },
             isResident: { idx in resident.contains { $0.contains(idx) } }) else {
             // Rungs inside the resident window were skipped, so a window that moves on can open
             // the ladder again: this only keeps the line to one per completion.
@@ -3733,6 +3775,9 @@ hasIFrameRendition: Bool = false,
             return
         }
         guard let source = makeStillLadderSource(plan: plan) else { return }
+        // The JPEG fragment cache holds 128, so only the window around the playhead is built ahead.
+        let center = KeyframeStillLadder.planIndex(atOrBefore: playhead, in: starts) ?? 0
+        let buildsFragment = buildsJPEG && abs(index - center) <= window
 
         stillLadderLock.lock()
         stillLadderReadInFlight = true
@@ -3741,7 +3786,7 @@ hasIFrameRendition: Bool = false,
         stillLadderLock.unlock()
         stillLadderQueue.async { [weak self] in
             let started = DispatchTime.now()
-            let payload = source.keyframes.keyframePayload(at: index)
+            let payload = source.keyframes.prefetch(at: index, buildsFragment: buildsFragment)
             guard let self else { return }
             let ms = Self.seconds(from: started, to: .now()) * 1000
             self.stillLadderLock.lock()
@@ -3771,7 +3816,8 @@ hasIFrameRendition: Bool = false,
         guard !cached.isEmpty else { return nil }
         restartLock.lock()
         let plan = segmentPlan
-        let source = stillLadderSource
+        // A rendition-only ladder has no preview builder that is right for this session.
+        let source = stillLadderEligible ? stillLadderSource : nil
         restartLock.unlock()
         guard let source,
               let index = KeyframeStillLadder.answeringRung(
@@ -3797,7 +3843,7 @@ hasIFrameRendition: Bool = false,
         restartLock.lock()
         defer { restartLock.unlock() }
         if let stillLadderSource { return stillLadderSource }
-        guard stillLadderEligible, let cfg = savedVideoConfig, !plan.isEmpty,
+        guard stillLadderEligible || iFramePrefetchActive, let cfg = savedVideoConfig, !plan.isEmpty,
               let directory = cache?.sessionDir.appendingPathComponent("still-ladder", isDirectory: true)
         else { return nil }
         let staging = directory.appendingPathComponent("staging", isDirectory: true)
@@ -3816,6 +3862,15 @@ hasIFrameRendition: Bool = false,
                                   durationSeconds: $0.durationSeconds)
         }
         let url = sourceURL
+        if iFramePrefetchActive, let rendition = iFrameRendition {
+            let made = (rendition, builder)
+            stillLadderSource = made
+            EngineLog.emit("[StillLadder] reading through the I-frame rendition (segments=\(plan.count), "
+                           + "window=\(KeyframeStillLadder.iFrameWindowSegments), format=\(rendition.format.logName))",
+                           category: .session)
+            return made
+        }
+        guard stillLadderEligible else { return nil }
         let keyframes = makeKeyframeRendition(
             config: cfg, entries: entries,
             cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true),
@@ -3953,6 +4008,7 @@ hasIFrameRendition: Bool = false,
         let ladder = stillLadderSource
         stillLadderSource = nil
         stillLadderEligible = false
+        iFramePrefetchActive = false
         closeUnusedCustomIFrameReader()
         savedVideoConfig = nil
         savedAudioConfig = nil
@@ -4073,7 +4129,11 @@ hasIFrameRendition: Bool = false,
         }
         return makeKeyframeRendition(
             config: cfg, entries: entries,
-            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true)),
+            // With the ladder prefetching into it, this cache holds the rungs too, and the ladder then
+            // keeps no cache of its own.
+            cache: IFramePayloadCache(directory: directory.appendingPathComponent("payloads", isDirectory: true),
+                                      byteLimit: generatesBackgroundScrubPreviews
+                                          ? KeyframeStillLadder.payloadByteLimit : 64 * 1024 * 1024),
             format: format, buildFragment: buildFragment, custom: custom)
     }
 
@@ -4139,6 +4199,19 @@ hasIFrameRendition: Bool = false,
     private func tearDownIFrameRendition() {
         provider?.setIFrameSource(nil)
         guard let rendition = iFrameRendition else { return }
+        // The ladder read into this rendition's cache, which the shutdown deletes; it starts over on
+        // a reader of its own.
+        restartLock.lock()
+        iFramePrefetchActive = false
+        let ladderShared = stillLadderSource?.keyframes === rendition
+        if ladderShared { stillLadderSource = nil }
+        restartLock.unlock()
+        if ladderShared {
+            stillLadderLock.lock()
+            stillLadderCached.removeAll()
+            stillLadderFailures.removeAll()
+            stillLadderLock.unlock()
+        }
         DispatchQueue.global(qos: .utility).async { rendition.shutdown() }
     }
 
@@ -4206,7 +4279,7 @@ hasIFrameRendition: Bool = false,
         }
 
         let producerEpoch = nextProducerEpoch()
-        let prod = try HLSSegmentProducer(
+        let prod = HLSSegmentProducer(
             demuxer: dem,
             videoStreamIndex: videoStreamIndex,
             video: cfg,

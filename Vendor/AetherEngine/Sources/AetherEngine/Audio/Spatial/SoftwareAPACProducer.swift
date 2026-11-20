@@ -24,17 +24,10 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
     /// loopback route does. Behind the bridge's activity lock, never its feed lock.
     var objectAudioActivity: ObjectAudioActivity? { bridge.objectAudioActivity }
     private let sampleRate = Double(SpatialAudioBridge.sampleRate)
-    private let stream: UnsafeMutablePointer<AVStream>
     /// PCM for the audio tap, which wants the 7.1 channel presentation the renderer is not given.
-    /// Opened on the first tap, since most sessions never tap, and under the lock because the tap
-    /// runs on the demux thread while `close` can come from the main actor.
-    private var tapDecoder: AudioDecoder?
-    private var tapOpenFailed = false
-    private var closed = false
+    private let tap: LazyTapDecoder
     private let lock = NSLock()
     private var loggedFeedError = false
-    private var runtimeFailureMessage: String?
-    private var stoppedAfterFailure = false
     /// Serializes a feed with `flush()`, so the epoch check and the bridge feed are one step: a packet
     /// read before a seek can no longer reach the bridge after the seek's `startSegment` and become
     /// the new run's `originFrame`, which would stamp the whole post-seek run at the old position.
@@ -44,7 +37,7 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
 
     init(bridge: SpatialAudioBridge, stream: UnsafeMutablePointer<AVStream>) {
         self.bridge = bridge
-        self.stream = stream
+        self.tap = LazyTapDecoder(stream: stream)
     }
 
     var feedEpoch: UInt64 { feedLock.withLock { _feedEpoch } }
@@ -66,17 +59,18 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
 
     /// Caller holds `feedLock`.
     private func feed(_ packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
-        guard !closed, !stoppedAfterFailure else { return [] }
         let packets: [UnsafeMutablePointer<AVPacket>]
         do {
             packets = try bridge.feed(packet: packet)
         } catch {
-            recordRuntimeFailure("Object audio bridge refused a packet: \(error)")
-            return []
-        }
-        if let failure = bridge.runtimeFailureDescription {
-            free(packets)
-            recordRuntimeFailure(failure)
+            lock.lock()
+            let first = !loggedFeedError
+            loggedFeedError = true
+            lock.unlock()
+            if first {
+                EngineLog.emit("[SWHost] ERROR: object-audio bridge refused a packet (\(error)); later ones are not logged",
+                               category: .swPlayback)
+            }
             return []
         }
         return buffers(from: packets)
@@ -84,26 +78,7 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
 
     /// The encoder's last packets once the source has ended, so the tail of the track plays.
     func endOfStream() -> [CMSampleBuffer] {
-        feedLock.withLock { endOfStreamLocked() }
-    }
-
-    func endOfStream(epoch: UInt64) -> [CMSampleBuffer] {
-        feedLock.withLock {
-            guard epoch == _feedEpoch else { return [] }
-            return endOfStreamLocked()
-        }
-    }
-
-    /// Caller holds `feedLock`, including the producer-epoch check.
-    private func endOfStreamLocked() -> [CMSampleBuffer] {
-        guard !closed, !stoppedAfterFailure else { return [] }
-        let packets = bridge.flush()
-        if let failure = bridge.runtimeFailureDescription {
-            free(packets)
-            recordRuntimeFailure(failure)
-            return []
-        }
-        return buffers(from: packets)
+        buffers(from: bridge.flush())
     }
 
     /// Stamps the bridge's packets and frees them. The bridge stamps packet k of an encoder run at the
@@ -115,51 +90,21 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
     /// `AVSampleBufferAudioRenderer` does not remove the priming itself, and the `- leading` below is
     /// right. Not measured on tvOS.
     private func buffers(from packets: [UnsafeMutablePointer<AVPacket>]) -> [CMSampleBuffer] {
-        defer { free(packets) }
         let leading = Int64(bridge.encoderLeadingFrames)
         var buffers: [CMSampleBuffer] = []
         for encoded in packets {
-            guard let data = encoded.pointee.data, encoded.pointee.size > 0,
-                  encoded.pointee.pts != Int64.min,
-                  let sample = Self.sampleBuffer(
-                    bytes: UnsafeRawBufferPointer(start: data, count: Int(encoded.pointee.size)),
-                    seconds: Double(encoded.pointee.pts - leading) / sampleRate,
-                    formatDescription: bridge.packetFormatDescription,
-                    pcmFrames: bridge.format == .lpcm ? Int(encoded.pointee.duration) : nil
-                  ) else {
-                recordRuntimeFailure("Object audio sample-buffer creation failed")
-                return []
+            if let data = encoded.pointee.data, encoded.pointee.size > 0,
+               let sample = Self.sampleBuffer(
+                bytes: UnsafeRawBufferPointer(start: data, count: Int(encoded.pointee.size)),
+                seconds: Double(encoded.pointee.pts - leading) / sampleRate,
+                formatDescription: bridge.packetFormatDescription,
+                pcmFrames: bridge.format == .lpcm ? Int(encoded.pointee.duration) : nil) {
+                buffers.append(sample)
             }
-            buffers.append(sample)
-        }
-        return buffers
-    }
-
-    private func free(_ packets: [UnsafeMutablePointer<AVPacket>]) {
-        for packet in packets {
-            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            var owned: UnsafeMutablePointer<AVPacket>? = encoded
             trackedPacketFree(&owned)
         }
-    }
-
-    /// Caller holds `feedLock`; this prevents later packets mixing into a failed renderer format.
-    private func recordRuntimeFailure(_ message: String) {
-        stoppedAfterFailure = true
-        if runtimeFailureMessage == nil { runtimeFailureMessage = message }
-        guard !loggedFeedError else { return }
-        loggedFeedError = true
-        EngineLog.emit("[SWHost] ERROR: object audio producer failed (\(message)); falling back to PCM", category: .swPlayback)
-    }
-
-    func takeRuntimeFailure() -> String? {
-        feedLock.withLock {
-            defer { runtimeFailureMessage = nil }
-            return runtimeFailureMessage
-        }
-    }
-
-    func stopAfterFailure(_ message: String) {
-        feedLock.withLock { recordRuntimeFailure(message) }
+        return buffers
     }
 
     /// One APAC packet as a one-sample buffer, or with `pcmFrames` one PCM packet as a buffer of that
@@ -171,71 +116,25 @@ final class SoftwareAPACProducer: SoftwareAudioProducing, @unchecked Sendable {
         guard let pcmFrames else {
             return SoftwareEAC3Passthrough.sampleBuffer(bytes: bytes, seconds: seconds, formatDescription: formatDescription)
         }
-        var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes.count,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
-            dataLength: bytes.count, flags: 0, blockBufferOut: &block) == noErr, let block,
-              CMBlockBufferReplaceDataBytes(
-                with: bytes.baseAddress!, blockBuffer: block, offsetIntoDestination: 0,
-                dataLength: bytes.count) == noErr else { return nil }
-        var sample: CMSampleBuffer?
-        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: formatDescription,
-            sampleCount: pcmFrames, presentationTimeStamp: CMTime(seconds: seconds, preferredTimescale: 90_000),
-            packetDescriptions: nil, sampleBufferOut: &sample) == noErr else { return nil }
-        return sample
+        return AudioSampleBuffers.make(bytes: bytes, seconds: seconds, formatDescription: formatDescription,
+                                       sampleCount: pcmFrames, compressedPacket: false)
     }
 
     func flush() {
         feedLock.withLock {
             _feedEpoch &+= 1
             bridge.startSegment()
-            runtimeFailureMessage = nil
-            stoppedAfterFailure = false
-            loggedFeedError = false
-            lock.lock()
-            let tap = tapDecoder
-            lock.unlock()
-            tap?.flush()
         }
+        tap.flush()
     }
 
     func close() {
-        feedLock.withLock {
-            lock.lock()
-            closed = true
-            lock.unlock()
-            stoppedAfterFailure = true
-            bridge.close()
-        }
-        lock.lock()
-        let tap = tapDecoder
-        tapDecoder = nil
-        lock.unlock()
-        tap?.close()
-    }
-
-    func tapBuffers(
-        for packet: UnsafeMutablePointer<AVPacket>,
-        produced: [CMSampleBuffer],
-        epoch: UInt64
-    ) -> [CMSampleBuffer] {
-        feedLock.withLock {
-            guard epoch == _feedEpoch, !closed, !stoppedAfterFailure else { return [] }
-            lock.lock()
-            if tapDecoder == nil, !tapOpenFailed {
-                let decoder = AudioDecoder()
-                if (try? decoder.open(stream: stream)) != nil { tapDecoder = decoder } else { tapOpenFailed = true }
-            }
-            let tap = tapDecoder
-            lock.unlock()
-            return tap?.decode(packet: packet, epoch: tap?.feedEpoch ?? 0) ?? []
-        }
+        bridge.close()
+        tap.close()
     }
 
     func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        tapBuffers(for: packet, produced: produced, epoch: feedEpoch)
+        tap.buffers(for: packet)
     }
 }
 #endif

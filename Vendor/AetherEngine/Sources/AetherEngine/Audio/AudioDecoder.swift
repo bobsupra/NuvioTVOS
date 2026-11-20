@@ -6,6 +6,7 @@ import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
 import AetherLibswresample
+import os
 
 /// Dialogue processing available on decoded PCM routes. AVPlayer-owned bitstream routes do not use it.
 public enum AudioDialogueEnhancement: String, CaseIterable, Sendable, Equatable {
@@ -82,7 +83,55 @@ final class AudioDecoder: @unchecked Sendable {
 
     /// AE#923. Set before `open`; a change mid-session arrives as a new decoder or a re-anchor.
     var shaping = AudioShaping()
-    private var shapingGraph: AudioShapingGraph?
+    private var shapingStage: AudioShapingStage?
+
+    /// Sodalite#242: the track's loudness correction in dB, nil for none. Can change mid-session; the
+    /// processor ramps to the new value over one buffer. Runs ahead of the shaping graph.
+    var normalizationGainDB: Double? {
+        get { normalization.withLock { $0.gainDB } }
+        set {
+            let processor = normalization.withLock { state -> NormalizationGainProcessor? in
+                state.gainDB = newValue
+                return state.processor
+            }
+            processor?.setGainDB(newValue ?? 0)
+        }
+    }
+
+    /// What the normalization stage did over the session, nil if it never ran.
+    var normalizationStatistics: NormalizationGainProcessor.Statistics? {
+        normalization.withLock { state in
+            guard let current = state.processor?.statistics else {
+                return state.carried.frames > 0 ? state.carried : nil
+            }
+            return state.carried.merged(with: current)
+        }
+    }
+
+    private struct NormalizationState {
+        var gainDB: Double?
+        var processor: NormalizationGainProcessor?
+        /// Figures of processors a format change replaced.
+        var carried = NormalizationGainProcessor.Statistics()
+    }
+    private let normalization = OSAllocatedUnfairLock(initialState: NormalizationState())
+
+    /// The processor for the current output format, built on first use once a gain is set, rebuilt
+    /// when the format changes. Decode thread only.
+    private func normalizationProcessor() -> NormalizationGainProcessor? {
+        let rate = Double(sampleRate)
+        let width = Int(channels)
+        return normalization.withLock { state in
+            if let processor = state.processor, processor.sampleRate == rate, processor.channels == width {
+                return processor
+            }
+            guard state.gainDB != nil || state.processor != nil, rate > 0, width > 0 else { return nil }
+            if let old = state.processor { state.carried = state.carried.merged(with: old.statistics) }
+            let processor = NormalizationGainProcessor(gainDB: state.gainDB ?? 0, sampleRate: rate, channels: width)
+            state.processor = processor
+            return processor
+        }
+    }
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -172,6 +221,7 @@ final class AudioDecoder: @unchecked Sendable {
     /// re-anchors from its own container PTS. On a failed rebuild `swrContext` stays nil and the
     /// caller skips the frame; the next frame retries, mirroring the lazy-init failure mode.
     private func rebuildResampler(for frame: UnsafeMutablePointer<AVFrame>) -> CMSampleBuffer? {
+        drainShapingTailIfRebuilding(for: frame)
         let flushed = emitPending()
         EngineLog.emit(
             "[AudioDecoder] input format changed mid-stream ("
@@ -185,13 +235,39 @@ final class AudioDecoder: @unchecked Sendable {
         return flushed
     }
 
+    /// The output rate and channel count a frame's resampler will be built for.
+    private func resolvedOutput(for frame: UnsafeMutablePointer<AVFrame>) -> (rate: Int32, channels: Int32) {
+        let rate = frame.pointee.sample_rate > 0 ? frame.pointee.sample_rate : sampleRate
+        let frameChannels = frame.pointee.ch_layout.nb_channels
+        var width = frameChannels > 0 && frameChannels <= 8 ? frameChannels : channels
+        if shaping.isActive { width = shaping.outputChannels(forSource: width) }
+        return (rate, width)
+    }
+
+    /// AUD-207: a format change replaces the shaping graph, and its held latency belongs to the
+    /// format it was built for. Pushed out here, before `sampleRate` and `channels` move.
+    private func drainShapingTailIfRebuilding(for frame: UnsafeMutablePointer<AVFrame>) {
+        guard let stage = shapingStage, stage.hasGraph else { return }
+        let (rate, width) = resolvedOutput(for: frame)
+        var outLayout = AVChannelLayout()
+        makeResamplerOutputLayout(width, into: &outLayout)
+        var inLayout = AVChannelLayout()
+        if frame.pointee.ch_layout.nb_channels > 0 {
+            av_channel_layout_copy(&inLayout, &frame.pointee.ch_layout)
+        } else {
+            av_channel_layout_default(&inLayout, width)
+        }
+        defer { av_channel_layout_uninit(&inLayout); av_channel_layout_uninit(&outLayout) }
+        stage.drainIfRebuilding(sampleRate: rate, outputLayout: &outLayout, sourceLayout: &inLayout) { planes, count, pts in
+            self.appendShaped(planes, count: count, pts: pts)
+        }
+    }
+
     private func initResamplerFromFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> Bool {
         // Refresh rate/channels from the frame (codecpar was a hint, the frame is truth). Runs on the
         // first frame and again after a mid-stream format change tore the context down (#452).
-        if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
-        if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
-        if shaping.isActive { channels = shaping.outputChannels(forSource: channels) }
+        (sampleRate, channels) = resolvedOutput(for: frame)
 
         var outLayout = AVChannelLayout()
         // #401: this is the order the stamped layout has to name, so both come from one place.
@@ -227,17 +303,19 @@ final class AudioDecoder: @unchecked Sendable {
         )
         guard ret >= 0, let swr = swrContext else { return false }
         if shaping.isActive {
-            AudioShapingMatrix.apply(to: swr, input: &inLayout, output: &outLayout,
-                                     dialogueGain: shaping.dialogueGain, lfeMixLevel: shaping.lfeMixLevel)
-            shapingGraph = AudioShapingGraph(shaping: shaping, sampleRate: sampleRate, layout: &outLayout,
-                                             sourceHasCentre: AudioShapingMatrix.hasCentre(&inLayout),
-                                             outputFormat: AV_SAMPLE_FMT_FLT)
-            EngineLog.emit("[AudioDecoder] AE#923 shaping \(shaping.summary): "
-                           + "\(frameChannels)ch -> \(channels)ch"
-                           + (shapingGraph == nil ? ", filter graph unavailable, dynamics off" : ""),
-                           category: .swPlayback)
-        } else {
-            shapingGraph = nil
+            let stage = shapingStage ?? AudioShapingStage(shaping: shaping, outputFormat: AV_SAMPLE_FMT_FLT)
+            shapingStage = stage
+            stage.applyMatrix(to: swr, input: &inLayout, output: &outLayout)
+            let hadGraph = stage.hasGraph
+            let hasGraph = stage.configure(sampleRate: sampleRate, outputLayout: &outLayout, sourceLayout: &inLayout) {
+                planes, count, pts in self.appendShaped(planes, count: count, pts: pts)
+            }
+            if !hadGraph || !hasGraph {
+                EngineLog.emit("[AudioDecoder] AE#923 shaping \(shaping.summary): "
+                               + "\(frameChannels)ch -> \(channels)ch"
+                               + (hasGraph ? "" : ", filter graph unavailable, dynamics off"),
+                               category: .swPlayback)
+            }
         }
         guard swr_init(swr) >= 0 else {
             swr_free(&swrContext)
@@ -271,8 +349,12 @@ final class AudioDecoder: @unchecked Sendable {
         resetPending()
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
-        audioProcessor.reset()
-        shapingGraph?.reset()
+        shapingStage?.reset()
+        // The limiter's delay line holds pre-seek audio; the next buffer builds a fresh one.
+        normalization.withLock { state in
+            if let old = state.processor { state.carried = state.carried.merged(with: old.statistics) }
+            state.processor = nil
+        }
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -317,15 +399,31 @@ final class AudioDecoder: @unchecked Sendable {
                 }
             }
         }
+        // Sodalite#242: the limiter's delay line holds the last few ms; silence pushes them out.
+        if let processor = normalization.withLock({ $0.processor }), swrContext != nil {
+            let frames = processor.lookaheadFrames
+            var tail = [Float](repeating: 0, count: frames * Int(channels))
+            tail.withUnsafeMutableBufferPointer { buffer in
+                guard let base = buffer.baseAddress else { return }
+                processor.process(interleaved: base, frames: frames)
+                if let stage = shapingStage, stage.hasGraph {
+                    stage.process(base, frames: frames, pts: nil) { planes, count, pts in
+                        appendShaped(planes, count: count, pts: pts)
+                    }
+                } else {
+                    base.withMemoryRebound(to: UInt8.self, capacity: buffer.count * 4) {
+                        pendingBytes.append($0, count: buffer.count * 4)
+                    }
+                    pendingSampleCount += frames
+                }
+            }
+        }
         // The shaping graph holds back its latency; the drain pushes it out, sample-aligned.
-        shapingGraph?.drain { planes, count, pts in appendShaped(planes, count: count, pts: pts) }
+        shapingStage?.drain { planes, count, pts in appendShaped(planes, count: count, pts: pts) }
         // Force-emit whatever is left below the coalescing threshold (emitPending only needs > 0 samples).
         if let sampleBuffer = emitPending() { results.append(sampleBuffer) }
         return results
     }
-
-    /// Preserve the PCM decoder's coalesced tail when the generic software host reaches EOF.
-    func endOfStream() -> [CMSampleBuffer] { drain() }
 
     func tapBuffers(
         for packet: UnsafeMutablePointer<AVPacket>,
@@ -443,13 +541,18 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
-        if let graph = shapingGraph {
+        if let processor = normalizationProcessor() {
+            tempBuffer.withMemoryRebound(to: Float.self, capacity: Int(convertedSamples) * Int(channels)) {
+                processor.process(interleaved: $0, frames: Int(convertedSamples))
+            }
+        }
+        if let stage = shapingStage, stage.hasGraph {
             // The graph runs on its own sample count; the pts rides along in samples and comes back
             // with the output sample it belongs to (see AudioShapingGraph, Timing).
             let pts: Int64? = frame.pointee.pts == Self.noPTS ? nil
                 : av_rescale_q(frame.pointee.pts, timeBase, AVRational(num: 1, den: sampleRate))
             tempBuffer.withMemoryRebound(to: Float.self, capacity: Int(convertedSamples) * Int(channels)) {
-                graph.process($0, frames: Int(convertedSamples), pts: pts) { planes, count, pts in
+                stage.process($0, frames: Int(convertedSamples), pts: pts) { planes, count, pts in
                     appendShaped(planes, count: count, pts: pts)
                 }
             }

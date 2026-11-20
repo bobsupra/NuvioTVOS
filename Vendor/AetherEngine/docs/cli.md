@@ -14,6 +14,7 @@
 - Custom byte sources: [customio](#customio), [smbtest](#smbtest)
 - Live: [live](#live), [dvr](#dvr), [hlsfixture](#hlsfixture), [hlslive](#hlslive)
 - Dolby Vision: [dovitest](#dovitest), [feltest](#feltest), [dvsurvey](#dvsurvey), [eltype](#eltype), [elsurvey](#elsurvey), [elframe](#elframe), [felcurves](#felcurves), [dmpass](#dmpass)
+- Performance: [bench](#bench)
 - [Fixtures](#fixtures)
 
 ## Building with optional components
@@ -55,11 +56,12 @@ Most subcommands take a media source URL (`file://` or `http(s)://`). `live`, `d
 | Test the software decoder alone | [`swdecode`](#swdecode) | Decoder open, frame count and first-frame format, no render layer. |
 | Inspect a disc image | [`disc-inspect`](#disc-inspect), then `probe` | Recognition stages, titles and chapters. |
 | Pull stills or scrub previews | [`extract`](#extract), [`scrubpreview`](#scrubpreview) | `FrameExtractor` stills, and compositor or keyframe scrub previews. |
+| Check a change did not make frames slower | [`bench`](#bench) | Per-frame time of the software path's frame work, and a verdict against a saved baseline. |
 | Dolby Vision Profile 7 / FEL | [`eltype`](#eltype), [`dvsurvey`](#dvsurvey), [`feltest`](#feltest), [`dmpass`](#dmpass), [`play --fel`](#dolby-vision---fel---assert-dv) | FEL or MEL, metadata survey, the composer audit, metadata pass-through, and the live route. |
 
 ## Subcommands at a glance
 
-Twenty-nine subcommands plus the bare-URL `serve` alias.
+Thirty subcommands plus the bare-URL `serve` alias.
 
 | Subcommand | Purpose |
 |---|---|
@@ -92,6 +94,7 @@ Twenty-nine subcommands plus the bare-URL `serve` alias.
 | [`elframe <url>`](#elframe) | Write one FEL keyframe composed with and without its residual. |
 | [`felcurves <url> <out.rpu>`](#felcurves) | Fold a FEL source into per-scene Profile 8.1 curves. |
 | [`dmpass <url>`](#dmpass) | Check that the FEL route keeps the display-management metadata. |
+| [`bench`](#bench) | Time the software path's per-frame work and compare it with a baseline. |
 | `<url>` | Alias for `serve`. The alias takes no flags. |
 
 ```bash
@@ -164,12 +167,16 @@ The [Works on](#shared-flags) column lists where it is accepted.
 
 ### Object audio (`--atmos-bed`)
 
-`--atmos-bed <layout>` sets `LoadOptions.objectAudioRendering = .apac(layout)`. A TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC. Layouts: `5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6` (#731, #744). It renders only in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits.
+`--atmos-bed <layout>` sets `LoadOptions.objectAudioRendering = .apac(layout)`. A TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC. Layouts: `5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6` (#731, #744). DTS:X with a layout below 7.1.4 is rendered as 7.1.4. It renders only in a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits.
+
+`play --no-dtsx-objects` sets `LoadOptions.rendersDTSXObjectAudio = false`: TrueHD Atmos still renders into the `--atmos-bed` layout, and DTS keeps the channel bridge (#1060). The log then says `DTS:X rendering is off for this load`.
 
 - The master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16).
 - The log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed and heights routed one to one into …`) and the `[SpatialAudioBridge] bed levels` lines.
 - A DTS-HD MA track whose frames do not decode as DTS:X logs `DTS-HD MA track is not DTS:X this engine renders (…); keeping the channel bridge` instead.
 - On `play` the 1 Hz line adds `obj=<active>/<declared> up=<overhead> bed=<layout>`, and `hch=<n>` for height channels.
+
+**Use a release build** (`swift build -c release`) for anything that plays the bed. A debug build renders it about five times slower than real time, so `play` waits on audio and ends in `VERDICT: clock did not advance` although nothing is wrong. aetherctl prints a note when a debug build gets `--atmos-bed`.
 
 With `--bed-format lpcm` it sets `.lpcm(layout)` instead, which serves the bed as 24-bit PCM (`CODECS="…,ipcm"`, log `delivered as ipcm (lossless 24-bit PCM)`). With `--bed-format auto` it sets `.render(layout)`, the form a host should use: PCM, or APAC when the route plays over AirPlay.
 
@@ -403,6 +410,7 @@ The log line says which it was: `[HLSVideoEngine] i-frame rendition: served segm
 The log's `[HLSVideoEngine] stereo:` line names what was chosen and why.
 
 - A stereo master carries `REQ-VIDEO-LAYOUT="CH-STEREO"` at `EXT-X-VERSION:12`.
+- A Dolby Vision Profile 20 source is served as `CODECS="dvh1.20.LL"` under `auto` and as `dvh1.05.LL` under `mono`. A Mac's AVPlayer refuses the `dvh1.20` master (`-12927`), so only the `mono` form plays there. The `serve` harness has no 2D fallback, unlike a full session.
 - A packed HEVC init carries a `vexu` with `eyes` and `pack`.
 - H.264 stays 2D, because AVPlayer refuses it packed over HLS.
 
@@ -481,6 +489,7 @@ swift run aetherctl play --fel --fel-output <p7-file.mkv>      # compose it on A
 swift run aetherctl play --fel --surface --cycle-el 10 <p7-file.mkv>   # flip the residual off and on every 10 s over a visible window (--window is the same flag)
 swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>   # DEBUG: pulse a pinned frame's DV metadata (from dvsurvey)
 swift run aetherctl play --upscale <sd-or-720p-url>           # opt in to upscaling sub-1080p SDR video to the display (LoadOptions.upscalesLowResolutionVideo, #846); logs one [Upscale] line and an UPSCALE line once the first frame is upscaled
+swift run aetherctl play --tone-map 600 <hdr10-url>           # opt in to tone mapping HDR10 brighter than 600 nit to 600 nit (LoadOptions.videoProcessing, #957); logs one [VideoProcessing] line and a PROCESSING line once the first frame is processed
 ```
 
 ### Telemetry
@@ -591,6 +600,7 @@ Other lines `play` prints:
 | `--subtitle-delay-reach SECONDS`, `--subtitle-advance-reach SECONDS` | Set `maximumSubtitleDelaySeconds` / `maximumSubtitleAdvanceSeconds` before the load (0 to 600), after `--subtitle-offset-reach` (AE#1031). | engine default |
 | `--preserve-ass-markup` | `LoadOptions.preserveASSMarkup`. | off |
 | `--skip-attachments` | `LoadOptions.skipsContainerAttachments` (AE#956). | off |
+| `--iframes` | `LoadOptions.serveIFramePlaylist` (AE#682) on a full session, where the still ladder prefetches into the rendition. | off |
 
 **Audio**
 
@@ -620,6 +630,7 @@ Other lines `play` prints:
 | `--dv-pin <spec>` | DEBUG: pulses a pinned frame's DV metadata. | off |
 | `--upscale` | `LoadOptions.upscalesLowResolutionVideo` (#846). | off |
 | `--line-art` | `LoadOptions.upscaleScaler = .lineArt` (AE#1039); implies `--upscale`. | off |
+| `--tone-map <nits>` | `LoadOptions.videoProcessing` with this `targetPeakNits` (#957). | off |
 | `--deinterlace-field-rate field\|frame` | `LoadOptions.deinterlaceFieldRate` (AE#492). | `field` |
 | `--native-video-frame-diagnostics` | `LoadOptions.nativeVideoFrameDiagnostics`. | off |
 | `--native-video-frame-recovery` | Bounded SDR native decoded-output repair. | off |
@@ -957,6 +968,10 @@ See [dolby-vision-fel.md](dolby-vision-fel.md).
 
 `--line-art` runs the line-art scaler instead (`LoadOptions.upscaleScaler = .lineArt`, AE#1039) and implies `--upscale`. It also takes 1080p and 10-bit SDR. The `UPSCALE` line then ends in `scaler=lineArt`, and the `[Upscale] timing` lines show the chain's GPU time under `metal`.
 
+### Tone map (`--tone-map`)
+
+`--tone-map <nits>` opts in to the picture processing with that target peak (`LoadOptions.videoProcessing`, #957). It logs one `[VideoProcessing]` line, and a `PROCESSING toneMap <source> nit (<mastering|maxCLL>) -> <target> nit` line once the first frame is processed, again with `disabled: <reason>` if it switches itself off. The stage needs macOS 26; before that the line says `not taken (needs OS 26)`.
+
 ### Dropped audio (`--drop-audio`)
 
 `--drop-audio` forces every audio pipeline to fail, so the AE#462 video-only drop can be observed without a source this build has no decoder for. The loopback cascade skips both the stream-copy probe and the bridge, and `SoftwarePlaybackHost` refuses its decoder open.
@@ -999,6 +1014,8 @@ Nothing binds a render surface in a CLI run, so the absolute drop level belongs 
 - The reader makes one long-lived unranged GET, no ranged probes and no tail read.
 - A seek lands only inside the resident span that reaches the producer's frontier; every other target is rejected (AE#958).
 - On VOD it needs `--declared-duration S`, which fills `LoadOptions.declaredDurationSeconds`. The duration estimate normally comes from the tail read, which this shape skips.
+
+**`--iframes`** sets `LoadOptions.serveIFramePlaylist` (AE#682). `serve --iframes` only lists the rendition; `play` also runs the 1 Hz still ladder that reads into it. The log says `[StillLadder] reading through the I-frame rendition`. To see the effect, add `--served-url`, wait about 45 s, and `curl` `iframe<N>.mp4` next to the printed URL: an index near the playhead is answered from the cache in about a millisecond, one far from it pays the read (and for HDR the tone map).
 
 **`--skip-attachments`** sets `LoadOptions.skipsContainerAttachments` (AE#956). A Matroska source then opens without reading its attached files (the fonts of its ASS subtitles). The observable is the open itself. Against a throttled origin and an MKV that carries fonts, the time to the first `[AetherEngine]` load line drops by the fonts' transfer time, and the `[AVIOReader]` byte counts drop by their size.
 
@@ -1292,11 +1309,12 @@ Activates two subtitle tracks at once on one source (primary + secondary) and pr
 
 Plays a source through the audio-only pipeline (`LoadOptions.audioOnly`) and reports which host took it: bare AVPlayer, or the FFmpeg renderer path. It exercises the same dispatch a music host sees.
 
-**Usage:** `aetherctl audio [--seconds N] <url>`
+**Usage:** `aetherctl audio [--seconds N] [--gain DB] <url>`
 
 | Flag | Meaning | Default |
 |---|---|---|
 | `--seconds N` | Run length. See [Shared flags](#shared-flags). | 10 |
+| `--gain DB` | Sets `LoadOptions.normalizationGainDB` and prints `normalizationGainReport` before stopping, e.g. `requested=+8.0 applied=+8.0 host=AVPlayer stage=tap limiter=3.3 dB 97.2%`. | off |
 
 **Exit codes**
 
@@ -2126,6 +2144,61 @@ swift run --traits DualLayerDolbyVision aetherctl dmpass --frames 120 --out /tmp
 | `AETHER_DM_PRINT=1` (or `hex`) | Echoes the per-frame `[dm-digest]` lines in `dmpass`. |
 | `AETHER_DM_DIGEST` = `1`, `log` or `hex` | Runs the same digest inside any host. `hex` adds both RPU byte strings to each line. |
 | `AETHER_DM_DIGEST_FILE` | Appends the JSON form to a file. |
+
+## bench
+
+Times the work the software path does around each decoded frame, and fails when a case got slower than a saved baseline. It calls `AetherEngine.runPerFrameBenchmarks`, which returns a `PerFrameBenchmarkReport` with one `PerFrameBenchmarkResult` per case. No source is needed: it builds its frames itself, a 4K P010 frame and 8-bit NV12 frames for the upscale sources.
+
+**Usage:** `aetherctl bench [--iterations N] [--json out.json] [--baseline base.json] [--tolerance PCT]`, or `aetherctl bench --compare <base.json> <new.json> [--tolerance PCT]`
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--iterations N` | Timed runs per case (10 to 100000), after 20 untimed ones. | 300 |
+| `--json PATH` | Writes the report as JSON, to keep as a baseline. | off |
+| `--baseline PATH` | Compares this run with a saved report. | off |
+| `--tolerance PCT` | How much slower a case's median may get before it counts as a regression. | 20 |
+| `--compare BASE NEW` | Compares two saved reports and runs nothing. This is how a report saved on an Apple TV is checked. | off |
+
+```bash
+swift run -c release aetherctl bench --json /tmp/base.json
+swift run -c release aetherctl bench --baseline /tmp/base.json
+```
+
+**Cases.** All times are microseconds of wall time per frame.
+
+| Case | What it times |
+|---|---|
+| `normalizer: frame already tagged` | The output metadata check on a frame that already carries everything. The usual case. |
+| `normalizer: tag in place` | Writing the attachments on a frame the decoder lets us change. |
+| `normalizer: owned copy` | Copying a frame the decoder still owns into a pool of our own, then tagging it. |
+| `renderer: sample buffer` | Wrapping a frame for the display layer, format description cache hit. |
+| `chain: pass-through, wall time` | The frame chain with one pass-through stage, which runs as one kernel. Its GPU time is in the note. Needs OS 26 and real hardware. |
+| `chain: two passes through RGB, wall time` | The same frame through the RGB texture, as every chain with a real stage runs. |
+| `chain: tone map, one kernel, wall time` | The frame chain with the BT.2390 tone-map stage, a 1000 nit master to a 600 nit target, run inside the one round-trip kernel. The real kernel, which costs the same on any picture. |
+| `chain: tone map, two passes, wall time` | The same tone map as its own pass between the two passes through RGB, as when it shares a chain with a stage that needs the texture. |
+| `sei: HDR10 scan of a 250 KB key frame` | The in-band scan for the HDR10 SEI. |
+| `upscale: 480p to 2160p, automatic, wall time` | The `upscalesLowResolutionVideo` stage on a 16:9 DVD frame (720x480) for a 3840x2160 display: VT super resolution at the largest factor the device offers, then MetalFX. |
+| `upscale: 720p to 2160p, automatic, wall time` | The same stage on a 1280x720 frame. |
+| `upscale: 720p to 2160p, MetalFX only, wall time` | MetalFX alone on the 720p frame, the rung the stage drops to without an ML pass. |
+| `upscale: 1080p to 2160p, line art, wall time` | `upscaleScaler = .lineArt` on a 1920x1080 frame, upscale network only (its lower rung). |
+| `upscale: 1080p to 2160p, line art with restore, wall time` | The same with the restore pass and the highlight clamp, the stage's top rung. |
+
+The upscale cases build the stage playback builds for that plan, with its VT session and MetalFX scaler, and wait for each frame's ML pass. Their note names the plan's steps (for example `1280x720 -> ML 2x 2560x1440 -> MetalFX 3840x2160`) and the median ML and GPU time. A case is skipped with the reason when the device cannot build it: MetalFX needs tvOS 27.1, and every upscale case needs OS 26 and real hardware. The display size is fixed, so `--iterations` is the only flag that changes them.
+
+**Verdict.** A case regresses when:
+
+- its median grows by more than the tolerance and by more than 50 us. Below that the same build moves between runs: in-place tagging measured 18 us, then 48 us, on the A12 Apple TV;
+- or it ran in the baseline and is skipped or missing now. A broken frame chain reports its cases as skipped, and that must not pass.
+
+Each regression is printed with its reason. Compare reports from the same device only; the tool prints a note when the device or picture size differ. The rule is `PerFrameBenchmarkReport.regressions(against:tolerance:)`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | No regression, or no baseline given. |
+| 1 | At least one regression, or a report could not be read or written. |
+| 64 | Bad arguments. |
+
+On an Apple TV, a host calls `AetherEngine.runPerFrameBenchmarks` and saves the report as JSON (`PerFrameBenchmarkReport` is `Codable`), and `--compare` checks it on the Mac. Measured numbers are in [measurements.md](measurements.md#per-frame-cost-of-the-software-path-ae957).
 
 ## Fixtures
 

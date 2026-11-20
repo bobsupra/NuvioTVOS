@@ -317,6 +317,8 @@ public final class Demuxer: @unchecked Sendable {
     /// representation readers it has opened before any of them belongs to a provider. Guarded by
     /// `providerLock`.
     private var pendingDASHOpener: DASHSourceOpener?
+    /// Audit DMX-201: the remote disc image's size probe, cancellable before any reader exists.
+    private var pendingDiscOpen: HTTPDiscIOReader.OpenHandle?
 
     private func adoptOwnedSourceReader(_ reader: IOReader) {
         providerLock.lock()
@@ -340,9 +342,11 @@ public final class Demuxer: @unchecked Sendable {
         providerLock.lock()
         let reader = _ownedSourceReader
         let dash = pendingDASHOpener
+        let discOpen = pendingDiscOpen
         providerLock.unlock()
         reader?.cancel()
         dash?.cancel()
+        discOpen?.cancel()
     }
 
     /// Audit HLS-2: `markClosed()` before the provider exists used to be a no-op, so a teardown
@@ -914,7 +918,34 @@ public final class Demuxer: @unchecked Sendable {
     /// recognizable disc, in which case any warm is back in the store for the streaming reader.
     private func openHTTPDiscImage(url: URL, extraHeaders: [String: String], selectTitleID: Int?) throws -> Bool {
         let warm = HTTPDiscIOReader.takePrewarm(for: url, extraHeaders: extraHeaders)
-        if let discReader = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm) {
+        // Registered before the probe, and the close flag read after it: markClosed() sets the flag and
+        // then cancels, so whichever side runs second still stops the open (audit DMX-201).
+        let openHandle = HTTPDiscIOReader.OpenHandle()
+        providerLock.lock()
+        pendingDiscOpen = openHandle
+        providerLock.unlock()
+        defer {
+            providerLock.lock()
+            pendingDiscOpen = nil
+            providerLock.unlock()
+        }
+        if isCloseRequested {
+            if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+            throw DemuxerError.openFailed(code: -1)
+        }
+        let opened: HTTPDiscIOReader?
+        do {
+            opened = try HTTPDiscIOReader.open(url: url, extraHeaders: extraHeaders, prewarmed: warm,
+                                               handle: openHandle)
+        } catch {
+            if isCloseRequested, let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+            throw error
+        }
+        if opened == nil, isCloseRequested {
+            if let warm { SourcePrewarmStore.shared.store(warm, for: url) }
+            throw DemuxerError.openFailed(code: -1)
+        }
+        if let discReader = opened {
             adoptOwnedSourceReader(discReader)
             if isCloseRequested {
                 releaseOwnedSourceReader()
@@ -1152,6 +1183,9 @@ public final class Demuxer: @unchecked Sendable {
     /// AE#782: a producer restart just seeked here, so the reader anchors its connection at the next
     /// read it cannot serve from memory instead of detouring.
     func notePlaybackRepositioned() { avioProvider?.notePlaybackRepositioned() }
+
+    /// AE#472: wake held connections asleep in paused state.
+    func notifyPlayIntentChanged() { avioProvider?.notifyPlayIntentChanged() }
 
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
     /// 50 MB/60 s ensures codec params are populated without noticeably slowing open.
@@ -1887,7 +1921,14 @@ public final class Demuxer: @unchecked Sendable {
         }
         let size = avio_size(pb)
         guard size > 0 else { return declared }
-        return Int64((Double(size) * 8 / titleSeconds).rounded())
+        return Self.discBitRate(sizeBytes: size, titleSeconds: titleSeconds, fallback: declared)
+    }
+
+    /// A host-declared size over a short title can pass Int64.max, which traps the conversion (audit DMX-202).
+    static func discBitRate(sizeBytes: Int64, titleSeconds: Double, fallback: Int64) -> Int64 {
+        let rate = (Double(sizeBytes) * 8 / titleSeconds).rounded()
+        guard rate.isFinite, rate >= 0, rate < 9.2e18 else { return fallback }
+        return Int64(rate)
     }
 
     /// AVFormatContext.start_time in AV_TIME_BASE units. Non-zero on re-muxed
@@ -2925,20 +2966,15 @@ public final class Demuxer: @unchecked Sendable {
         // Audit HLS-103: libavformat flushes its packet queue before it even tries a seek, so on a
         // source that cannot rewind a refused seek is pure loss. A live AVIOReader reports itself
         // seekable by design, so live callers keep their own rules.
-        guard isSourceSeekable else { return false }
-        dropPeekedPacketsLocked()
-        clearLatchedReadStateLocked(ctx)  // AE#944
-        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) { return true }
-        if seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) { return true }
+        guard beginByteSpaceRepositionLocked(ctx) else { return false }
+        if seekByDiscMapsLocked(ctx, sourceSeconds: seconds) { return true }
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
             #if DEBUG
             EngineLog.emit("[Demuxer] Seek to \(seconds)s failed: \(ret)", category: .demux)
             #endif
         }
-        avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
-        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
-        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        finishByteSpaceRepositionLocked(ctx)
         return ret >= 0
     }
 
@@ -2966,12 +3002,12 @@ public final class Demuxer: @unchecked Sendable {
             resetAfterTimeSeek(ctx)
             return true
         }
-        guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
-        dropPeekedPacketsLocked()
-        clearLatchedReadStateLocked(ctx)  // AE#944
-        if dvdTimeMap != nil, let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
+        guard beginByteSpaceRepositionLocked(ctx) else { return false }
+        // DMX-R206: the EP map was consulted by the other entry points only, so a Blu-ray title seeking
+        // here fell back to the timestamp search its tables exist to avoid.
+        if let timeBase = ctx.pointee.streams[Int(streamIndex)]?.pointee.time_base,
            timeBase.num > 0, timeBase.den > 0,
-           seekByDVDTimeMapLocked(ctx, sourceSeconds: Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)) {
+           seekByDiscMapsLocked(ctx, sourceSeconds: Double(timestamp) * Double(timeBase.num) / Double(timeBase.den)) {
             return true
         }
         let ret = avformat_seek_file(
@@ -3002,10 +3038,34 @@ public final class Demuxer: @unchecked Sendable {
                 category: .demux
             )
         }
-        avformat_flush(ctx)
-        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
-        lastReadClipIdx = -1
+        finishByteSpaceRepositionLocked(ctx)
         return ret >= 0
+    }
+
+    /// The steps every byte-space reposition starts with: refuse a source that cannot rewind (audit
+    /// HLS-103: libavformat flushes its packet queue before it even tries a seek, so on such a source a
+    /// refused seek is pure loss), drop the peeked packets and clear the latched AVIO state (AE#944).
+    /// Caller holds `accessLock`.
+    private func beginByteSpaceRepositionLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> Bool {
+        guard isSourceSeekable else { return false }
+        dropPeekedPacketsLocked()
+        clearLatchedReadStateLocked(ctx)
+        return true
+    }
+
+    /// The steps every `avformat_seek_file` reposition ends with. The second `clearLatchedReadStateLocked`
+    /// matters for the ones that ran under a read deadline: a read the deadline cut must not outlive it
+    /// (AE#944). Caller holds `accessLock`.
+    private func finishByteSpaceRepositionLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
+        clearLatchedReadStateLocked(ctx)
+        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
+        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+    }
+
+    /// A disc title seeks by its tables (Blu-ray EP maps, DVD time map) whichever entry point asks.
+    private func seekByDiscMapsLocked(_ ctx: UnsafeMutablePointer<AVFormatContext>, sourceSeconds seconds: Double) -> Bool {
+        seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds)
     }
 
     /// AE#859: whether the sync sample a forward seek to `timestamp` chose lies behind a hole in the
@@ -3069,6 +3129,30 @@ public final class Demuxer: @unchecked Sendable {
     /// #268: the source reader repositions itself on segmented sources whose natural axis is time.
     var timeSeekableReader: TimeSeekableIOReader? {
         (avioProvider as? CustomIOReaderBridge)?.timeSeekableReader
+    }
+
+    /// AE#1075: the open went through `openDASH`, so the container is the virtual fragmented MP4.
+    /// Read from the provider rather than the container name, which a plain MP4 shares.
+    var isDASHSource: Bool {
+        (avioProvider as? CustomIOReaderBridge)?.isDASHSource ?? false
+    }
+
+    /// AE#1075: a DASH source's declared video random-access points, seconds from the first. Empty for
+    /// every other source and for a DASH one whose sidx does not promise a SAP at every subsegment.
+    var dashRandomAccessStartsSeconds: [Double] {
+        (avioProvider as? CustomIOReaderBridge)?.dashRandomAccessStartsSeconds ?? []
+    }
+
+    /// AE#1075: how far audio can run ahead of video in a DASH source's read order, see
+    /// `DASHVirtualLayout.interleaveLeadSeconds`. 0 for every other source.
+    var dashInterleaveLeadSeconds: Double {
+        (avioProvider as? CustomIOReaderBridge)?.dashInterleaveLeadSeconds ?? 0
+    }
+
+    /// AE#1079: the longest video subsegment of a DASH source, see
+    /// `DASHVirtualLayout.videoSubsegmentSeconds`. 0 for every other source.
+    var dashVideoSubsegmentSeconds: Double {
+        (avioProvider as? CustomIOReaderBridge)?.dashVideoSubsegmentSeconds ?? 0
     }
 
     /// Every engine seek target is an ABSOLUTE source PTS, while a `TimeSeekableIOReader` addresses
@@ -3172,26 +3256,21 @@ public final class Demuxer: @unchecked Sendable {
             resetAfterTimeSeek(ctx)
             return true
         }
-        guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
-        dropPeekedPacketsLocked()
+        guard beginByteSpaceRepositionLocked(ctx) else { return false }
         // #112 round 9: the deadline lives on the provider protocol. Casting to AVIOReader here left a
         // disc-adapter source (CustomIOReaderBridge over HTTPDiscIOReader) unbounded: one positioning
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
-        clearLatchedReadStateLocked(ctx)  // AE#944
         // The software path and the subtitle side reader reposition here, so a disc title seeks by its
         // EP maps or its DVD time map here too, whichever stream anchors the request.
-        if seekByDiscTableLocked(ctx, sourceSeconds: seconds) || seekByDVDTimeMapLocked(ctx, sourceSeconds: seconds) {
+        if seekByDiscMapsLocked(ctx, sourceSeconds: seconds) {
             let completed = !(avioProvider?.readDeadlineFired ?? false) && probeControl?.isStopped != true
             clearLatchedReadStateLocked(ctx)  // AE#944: a read the deadline cut must not outlive it
             return completed
         }
         let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
-        avformat_flush(ctx)
-        clearLatchedReadStateLocked(ctx)  // AE#944: a read the deadline cut must not outlive it
-        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
-        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        finishByteSpaceRepositionLocked(ctx)
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
         let capped = avioProvider?.readDeadlineFired ?? false
@@ -3484,15 +3563,9 @@ public final class Demuxer: @unchecked Sendable {
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
         noteCompositionRepairSeekLocked()  // #409: re-anchor on the next keyframe
-        guard isSourceSeekable else { return false }  // audit HLS-103, see `seek(to:)`
-        dropPeekedPacketsLocked()
-        clearLatchedReadStateLocked(ctx)  // AE#944
+        guard beginByteSpaceRepositionLocked(ctx) else { return false }
         let ret = avformat_seek_file(ctx, -1, Int64.min, byteTarget, Int64.max, AVSEEK_FLAG_BYTE)
-        avformat_flush(ctx)
-        // AE#944: only ever called under seekByteEstimate's deadline, which may have cut this seek's reads.
-        clearLatchedReadStateLocked(ctx)
-        resetSubpictureAssembly()  // #651: libavformat just dropped the parsers this stands in for
-        lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+        finishByteSpaceRepositionLocked(ctx)
         return ret >= 0
     }
 

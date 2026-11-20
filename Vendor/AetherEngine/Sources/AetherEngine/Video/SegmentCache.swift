@@ -20,11 +20,7 @@ final class SegmentCache: @unchecked Sendable {
 
     static let defaultBackwardWindow = 20
 
-    struct StaleSweepResult: Sendable, Equatable {
-        let inspectedCount: Int
-        let removedCount: Int
-        let failureCount: Int
-    }
+    typealias StaleSweepResult = SessionDirectoryLiveness.SweepResult
 
     /// AE#412: where a stored segment's first random-access point sits, as an offset from the
     /// segment's ADVERTISED start (its plan boundary). An offset, not an absolute time, so it is
@@ -47,6 +43,7 @@ final class SegmentCache: @unchecked Sendable {
 
     private let condition = NSCondition()
     private let availableVolumeBytes: @Sendable (URL) -> Int64?
+    private let reusesVolumeCapacity: Bool
     private let onResidentSetChanged: (@Sendable () -> Void)?
 
     private let forwardWindow: Int
@@ -131,6 +128,7 @@ final class SegmentCache: @unchecked Sendable {
     /// Monotonic across prunes; NOT decremented by pruneOutsideWindow. Lets VideoSegmentProvider
     /// detect gaps below the producer's write head after eviction erases them from indexRange().
     private var _highestStoredIndex: Int = -1
+    private var _totalStoredCount: Int = 0
 
     /// Audit SEG-4: every stored generation of an index gets its own file name, so a URL names exactly
     /// one set of bytes. A reader dropping a vanished entry, or a prune deleting a doomed one after
@@ -196,7 +194,7 @@ final class SegmentCache: @unchecked Sendable {
         retentionBudgetBytes: Int = 0,
         hardDiskLimitBytes: Int? = nil,
         freeDiskReserveBytes: Int = 0,
-        availableVolumeBytes: @escaping @Sendable (URL) -> Int64? = SegmentCache.availableVolumeBytes,
+        availableVolumeBytes: (@Sendable (URL) -> Int64?)? = nil,
         baseDirectory: URL? = nil,
         sessionID: String = UUID().uuidString,
         now: Date = Date(),
@@ -208,7 +206,9 @@ final class SegmentCache: @unchecked Sendable {
         self.retentionBudgetBytes = retentionBudgetBytes
         self.hardDiskLimitBytes = hardDiskLimitBytes.map { max(1, $0) }
         self.freeDiskReserveBytes = max(0, freeDiskReserveBytes)
-        self.availableVolumeBytes = availableVolumeBytes
+        self.availableVolumeBytes = availableVolumeBytes ?? SegmentCache.availableVolumeBytes
+        // An injected probe is a test double whose answers the test scripts call by call.
+        self.reusesVolumeCapacity = availableVolumeBytes == nil
         self.nativeLiveDVRPolicy = nativeLiveDVRPolicy
         self.onResidentSetChanged = onResidentSetChanged
 
@@ -259,10 +259,8 @@ final class SegmentCache: @unchecked Sendable {
         if fd >= 0 { Darwin.close(fd) }
     }
 
-    /// Bounded crash-remnant cleanup. Only expired sibling directories are eligible; the current
-    /// UUID and fresh sessions are never removed. Preserve upstream creation-time age and held-lock
-    /// liveness checks. Both directory inspection and deletion are capped
-    /// so a cache root with many crash remnants cannot create an unbounded startup I/O burst.
+    /// Bounded crash-remnant cleanup, through the sweep the software packet spool shares
+    /// (`SessionDirectoryLiveness.sweepStale`): expired sibling directories whose marker is not held.
     static func sweepStaleSessionDirs(
         baseDir: URL,
         currentSession: String,
@@ -270,45 +268,9 @@ final class SegmentCache: @unchecked Sendable {
         maxEntries: Int = 128,
         maxRemovals: Int = 16
     ) -> StaleSweepResult {
-        let fm = FileManager.default
-        guard maxEntries > 0, maxRemovals > 0 else {
-            return StaleSweepResult(inspectedCount: 0, removedCount: 0, failureCount: 0)
-        }
-        var failures = 0
-        guard let enumerator = fm.enumerator(
-            at: baseDir,
-            includingPropertiesForKeys: [.isDirectoryKey, .creationDateKey],
-            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants],
-            errorHandler: { _, _ in failures += 1; return false }
-        ) else {
-            return StaleSweepResult(inspectedCount: 0, removedCount: 0, failureCount: max(1, failures))
-        }
-
-        let cutoff = now.addingTimeInterval(-3600)
-        var inspected = 0
-        var removed = 0
-        while inspected < maxEntries, let entry = enumerator.nextObject() as? URL {
-            inspected += 1
-            guard entry.lastPathComponent != currentSession, removed < maxRemovals else { continue }
-            let values: URLResourceValues
-            do { values = try entry.resourceValues(forKeys: [.isDirectoryKey, .creationDateKey]) }
-            catch { failures += 1; continue }
-            // An unreadable creation date counts as old, as before; liveness still spares a held one.
-            guard values.isDirectory == true, (values.creationDate.map { $0 < cutoff } ?? true) else { continue }
-            // Old does not mean abandoned: spare sessions whose marker is held (AE#451).
-            if SessionDirectoryLiveness.isLive(entry) {
-                EngineLog.emit("[SegmentCache] sweep spared live session dir \(entry.lastPathComponent)",
-                               category: .session)
-                continue
-            }
-            do {
-                try fm.removeItem(at: entry)
-                removed += 1
-            } catch {
-                failures += 1
-            }
-        }
-        return StaleSweepResult(inspectedCount: inspected, removedCount: removed, failureCount: failures)
+        SessionDirectoryLiveness.sweepStale(
+            base: baseDir, currentSession: currentSession, now: now,
+            maxEntries: maxEntries, maxRemovals: maxRemovals, logPrefix: "[SegmentCache]")
     }
 
     // MARK: - Writer side
@@ -435,6 +397,7 @@ final class SegmentCache: @unchecked Sendable {
             entryBytes[index] = data.count
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
+            _totalStoredCount &+= 1
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
@@ -476,8 +439,9 @@ final class SegmentCache: @unchecked Sendable {
             }
         }
         condition.lock()
-        // Sealed or not, this staging file is no longer being written.
-        if renameOK { stagingReservations.removeValue(forKey: stagingPath) }
+        // Sealed or not, this staging file is no longer being written; a failed rename deleted it, so
+        // its reservation goes too, and the muxer no longer remembers the path (audit SEG-204).
+        stagingReservations.removeValue(forKey: stagingPath)
         if inProgress[index] == stagingPath { inProgress.removeValue(forKey: index) }
         if renameOK {
             if sealedFromStaging.updateValue(byteCount, forKey: stagingPath) == nil {
@@ -506,6 +470,7 @@ final class SegmentCache: @unchecked Sendable {
             entryBytes[index] = byteCount
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
+            _totalStoredCount &+= 1
             // A later epoch produced what an earlier one passed over: a re-anchor moved the
             // boundaries and this index is no longer a hole (#358).
             foldCounts.removeValue(forKey: index)
@@ -605,6 +570,40 @@ final class SegmentCache: @unchecked Sendable {
             .volumeAvailableCapacity.map(Int64.init)
     }
 
+    /// The staging write path asks for the free space on every 64 KiB write when a reserve is set,
+    /// and each ask is a stat call on the producer thread. The answer is reused for a short interval,
+    /// less what this cache has admitted since, so a burst cannot walk past the reserve on a stale
+    /// number. An eviction drops it, because that is the moment the number is known to be wrong.
+    private static let volumeCapacityReuseSeconds: Double = 0.5
+    private let volumeProbeLock = NSLock()
+    private var volumeProbe: (at: DispatchTime, free: Int64, admittedSince: Int64)?
+
+    private func freeVolumeBytesForAdmission(bytes: Int) -> Int64? {
+        guard reusesVolumeCapacity else { return availableVolumeBytes(sessionDir) }
+        let now = DispatchTime.now()
+        volumeProbeLock.lock()
+        if var probe = volumeProbe,
+           Double(now.uptimeNanoseconds &- probe.at.uptimeNanoseconds) / 1e9 < Self.volumeCapacityReuseSeconds {
+            probe.admittedSince += Int64(bytes)
+            volumeProbe = probe
+            let remaining = probe.free - probe.admittedSince + Int64(bytes)
+            volumeProbeLock.unlock()
+            return remaining
+        }
+        volumeProbeLock.unlock()
+        guard let free = availableVolumeBytes(sessionDir) else { return nil }
+        volumeProbeLock.lock()
+        volumeProbe = (now, free, Int64(bytes))
+        volumeProbeLock.unlock()
+        return free
+    }
+
+    private func invalidateVolumeCapacityProbe() {
+        volumeProbeLock.lock()
+        volumeProbe = nil
+        volumeProbeLock.unlock()
+    }
+
     func stagingWriteAdmission(path: URL, bytes: Int, waitForConsumer: Bool = false,
                                shouldStop: () -> Bool = { false }) -> SegmentWriteAdmission {
         guard !shouldStop() else { return .cancelled }
@@ -631,7 +630,7 @@ final class SegmentCache: @unchecked Sendable {
             if hasRoom {
                 if freeDiskReserveBytes > 0 {
                     // An unknown capacity does not silently disable an explicitly requested reserve.
-                    guard let free = availableVolumeBytes(sessionDir), free >= 0 else {
+                    guard let free = freeVolumeBytesForAdmission(bytes: bytes), free >= 0 else {
                         return rejectedForStorage(shouldStop: shouldStop)
                     }
                     let (required, overflow) = Int64(freeDiskReserveBytes).addingReportingOverflow(Int64(bytes))
@@ -642,6 +641,7 @@ final class SegmentCache: @unchecked Sendable {
                         condition.unlock()
                         for url in more { try? FileManager.default.removeItem(at: url) }
                         if more.isEmpty { return rejectedForStorage(shouldStop: shouldStop) }
+                        invalidateVolumeCapacityProbe()
                         onResidentSetChanged?()
                         continue // An open reader may still own an unlinked file: measure again.
                     }
@@ -1163,6 +1163,14 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return _highestStoredIndex
+    }
+
+    /// Segments ever stored or adopted, never reduced by pruning or a restart. The revive budgets
+    /// read it as "the session produced something since the last death".
+    var totalStoredCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return _totalStoredCount
     }
 
     /// Largest K such that every index in [startIdx ... K] is resident, walking forward until the first

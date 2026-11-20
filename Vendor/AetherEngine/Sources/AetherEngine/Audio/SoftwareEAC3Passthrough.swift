@@ -58,30 +58,16 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
 
     private let formatDescription: CMAudioFormatDescription
     private let timeBase: AVRational
-    private let stream: UnsafeMutablePointer<AVStream>
-    /// Decodes for the audio tap only: `decode` itself never runs it. Opened on the first tap, since
-    /// most sessions never tap, and under the lock because the tap runs on the demux thread while
-    /// `close` can come from the main actor.
-    private var tapDecoder: AudioDecoder?
-    private var tapOpenFailed = false
-    private var closed = false
-    private var stoppedAfterFailure = false
-    private var runtimeFailureMessage: String?
+    /// Decodes for the audio tap only: `decode` itself never runs it.
+    private let tap: LazyTapDecoder
     private let lock = NSLock()
-    private var _feedEpoch: UInt64 = 0
     /// Where the next packet sits when the container left its stamps out.
     private var nextSeconds: Double?
 
     init(stream: UnsafeMutablePointer<AVStream>, formatDescription: CMAudioFormatDescription) throws {
         self.formatDescription = formatDescription
         self.timeBase = stream.pointee.time_base
-        self.stream = stream
-    }
-
-    var feedEpoch: UInt64 {
-        lock.lock()
-        defer { lock.unlock() }
-        return _feedEpoch
+        self.tap = LazyTapDecoder(stream: stream)
     }
 
     // MARK: - Format description
@@ -206,43 +192,24 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
     // MARK: - SoftwareAudioProducing
 
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
-        lock.lock()
-        defer { lock.unlock() }
-        return decodeLocked(packet)
-    }
-
-    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64) -> [CMSampleBuffer] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard epoch == _feedEpoch else { return [] }
-        return decodeLocked(packet)
-    }
-
-    /// Caller holds `lock`, including the producer-epoch check.
-    private func decodeLocked(_ packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
-        guard !closed, !stoppedAfterFailure else { return [] }
-        guard let data = packet.pointee.data, packet.pointee.size > 0 else {
-            return []
-        }
+        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return [] }
         let tb = timeBase
         let ticks = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
         let seconds: Double
+        lock.lock()
         if ticks != Int64.min, tb.den > 0 {
             seconds = Double(ticks) * Double(tb.num) / Double(tb.den)
         } else if let next = nextSeconds {
             seconds = next
         } else {
-            // Leading packets may have no presentation stamp before the first useful access unit.
-            // Skip them; they are not evidence that the selected JOC producer has failed.
+            lock.unlock()
             return []
         }
         nextSeconds = seconds + Double(Self.framesPerPacket) / Self.sampleRate
+        lock.unlock()
         guard let buffer = Self.sampleBuffer(
             bytes: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
-            seconds: seconds, formatDescription: formatDescription) else {
-            recordRuntimeFailureLocked("E-AC-3 JOC sample-buffer creation failed")
-            return []
-        }
+            seconds: seconds, formatDescription: formatDescription) else { return [] }
         return [buffer]
     }
 
@@ -251,81 +218,22 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
     static func sampleBuffer(
         bytes: UnsafeRawBufferPointer, seconds: Double, formatDescription: CMAudioFormatDescription
     ) -> CMSampleBuffer? {
-        var block: CMBlockBuffer?
-        guard CMBlockBufferCreateWithMemoryBlock(
-            allocator: kCFAllocatorDefault, memoryBlock: nil, blockLength: bytes.count,
-            blockAllocator: kCFAllocatorDefault, customBlockSource: nil, offsetToData: 0,
-            dataLength: bytes.count, flags: 0, blockBufferOut: &block) == noErr, let block,
-              CMBlockBufferReplaceDataBytes(
-                with: bytes.baseAddress!, blockBuffer: block, offsetIntoDestination: 0,
-                dataLength: bytes.count) == noErr else { return nil }
-        var description = AudioStreamPacketDescription(
-            mStartOffset: 0, mVariableFramesInPacket: 0, mDataByteSize: UInt32(bytes.count))
-        var sample: CMSampleBuffer?
-        guard CMAudioSampleBufferCreateReadyWithPacketDescriptions(
-            allocator: kCFAllocatorDefault, dataBuffer: block, formatDescription: formatDescription,
-            sampleCount: 1, presentationTimeStamp: CMTime(seconds: seconds, preferredTimescale: 90_000),
-            packetDescriptions: &description, sampleBufferOut: &sample) == noErr else { return nil }
-        return sample
+        AudioSampleBuffers.make(bytes: bytes, seconds: seconds, formatDescription: formatDescription,
+                                sampleCount: 1, compressedPacket: true)
     }
 
     func flush() {
         lock.lock()
-        _feedEpoch &+= 1
         nextSeconds = nil
-        stoppedAfterFailure = false
-        runtimeFailureMessage = nil
-        let tap = tapDecoder
         lock.unlock()
-        tap?.flush()
+        tap.flush()
     }
 
     func close() {
-        lock.lock()
-        _feedEpoch &+= 1
-        closed = true
-        stoppedAfterFailure = true
-        let tap = tapDecoder
-        tapDecoder = nil
-        lock.unlock()
-        tap?.close()
-    }
-
-    func tapBuffers(
-        for packet: UnsafeMutablePointer<AVPacket>,
-        produced: [CMSampleBuffer],
-        epoch: UInt64
-    ) -> [CMSampleBuffer] {
-        lock.lock()
-        defer { lock.unlock() }
-        guard epoch == _feedEpoch, !closed, !stoppedAfterFailure else { return [] }
-        if tapDecoder == nil, !tapOpenFailed {
-            let decoder = AudioDecoder()
-            if (try? decoder.open(stream: stream)) != nil { tapDecoder = decoder } else { tapOpenFailed = true }
-        }
-        let tap = tapDecoder
-        return tap?.decode(packet: packet, epoch: tap?.feedEpoch ?? 0) ?? []
+        tap.close()
     }
 
     func tapBuffers(for packet: UnsafeMutablePointer<AVPacket>, produced: [CMSampleBuffer]) -> [CMSampleBuffer] {
-        tapBuffers(for: packet, produced: produced, epoch: feedEpoch)
-    }
-
-    func takeRuntimeFailure() -> String? {
-        lock.lock()
-        defer { lock.unlock() }
-        defer { runtimeFailureMessage = nil }
-        return runtimeFailureMessage
-    }
-
-    func stopAfterFailure(_ message: String) {
-        lock.lock()
-        recordRuntimeFailureLocked(message)
-        lock.unlock()
-    }
-
-    private func recordRuntimeFailureLocked(_ message: String) {
-        stoppedAfterFailure = true
-        if runtimeFailureMessage == nil { runtimeFailureMessage = message }
+        tap.buffers(for: packet)
     }
 }

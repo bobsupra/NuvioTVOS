@@ -171,8 +171,13 @@ The only rewrite happens as the bytes are served: each moof gets the virtual fil
   - There is no adaptive switching: the session plays the representations it opened with.
   - Every carried audio track is fetched while it plays, selected or not. For the reporting asset that was three AAC tracks totalling about 310 kbit/s next to a 1 Mbit/s video.
   - Text and image (thumbnail) adaptation sets are not carried.
+- **Audio cap.** At most 16 audio tracks are carried, the first 16 in manifest order. Each track is its own file, reader, connection and block cache, and a hostile MPD can declare thousands of audio sets. The rest are logged and dropped.
 - **Languages.** An adaptation set's `lang` replaces a track's `und`, mapped to ISO 639-2/T (`en` becomes `eng`, `de-DE` becomes `deu`).
+- **Credentials and limits.** `LoadOptions.httpHeaders` that carry a credential (`Authorization`, `Cookie`, `X-Emby-Token` and the like) go only to the origin of the manifest URL, the same rule a redirect follows. A `BaseURL` that names another host, another port or plain http behind an https manifest gets the other headers and no credentials. The manifest is read through the bounded fetch: a body over 8 MB fails the open as too large, and so does a trickle that outlasts 120 s. A declared head (`Initialization` or `indexRange`) wider than 64 MB is refused. Numbers in the MPD or in the boxes that overflow end the open with an error instead of crashing.
 - **Network cost.** One request for the manifest and one per representation before the first media byte. During playback each representation file is read forward in requests that grow the way a single file's do. A small block cache per file (eight 1 MiB blocks) sits in front of them. It matters because libavformat reads an interleaved file in decode order, switching between a video fragment and the audio fragments beside it on every sample. Without the cache, each return to the video file would cost a fresh request: measured 1,042 requests for 45 s of one video file, against 65 with the cache. The origin byte total is the same as for the equivalent single MP4.
+- **No cue prewarm.** A seekable file normally gets a seek to its middle before the segment plan is built, which is how libavformat loads an MKV's Cues or an MP4's `stss` (see [Segment plan](architecture-native.md#segment-plan)). The virtual MP4 has neither: it is fragmented, and libavformat indexes it one fragment at a time, so the seek would add only the fragment at the middle. The native route skips it for a DASH source (AE#1075). Measured on a 10 minute presentation behind an origin with 80 ms latency and 4 MB/s, the seek cost about 5.7 MB and 2 s before `readyToPlay`, and the plan came out the same without it.
+- **Segment plan from the `sidx`.** The video representation's `sidx` says which subsegments start with a random-access point and when. The native route cuts its HLS segments on those points instead of on an even grid that ignores the GOPs (AE#1075, see [Declared boundaries](architecture-native.md#segment-plan)). Measured on a 5 minute presentation with keyframes 1.5 to 9 s apart: every segment decodes on its own (35 of 35, against 25 of 40 on the grid), and seeks to 15, 150 and 285 s land exactly, where the grid landed 1.8 and 3.3 s late.
+- **Software route read-ahead from the interleave.** The software path's read gate normally stops reading once decoded audio is 4 s ahead of the clock or 256 video packets are parked. Interleaved by subsegment, audio can sit a whole audio subsegment ahead of the next video in read order, and video a whole video subsegment ahead of the next audio. So for a DASH source the gate is sized from the `sidx`: the audio lead grows by the longest audio subsegment, and the packet cap covers the 4 s lead plus the longest video subsegment at the stream's frame rate (AE#1079, see `SoftwareReadGateBudget`). Both are clamped at 15 s. Measured at 60 fps: 10 s audio against 4 s video subsegments froze the picture for 3 to 5 s at every audio subsegment while the sound played on, and 10 s video against 2 s audio held the clock at 10 s. Both now play through with the picture on the clock.
 - **Refused, with the reason in the error:** live manifests (`type="dynamic"`), more than one Period, `SegmentTemplate` and `SegmentList` addressing, an initialization segment in a separate file, hierarchical `sidx` (`reference_type` 1), and encryption (`ContentProtection`, `pssh`, `encv` / `enca`). An unplayable audio adaptation set is skipped when the video plays. An unplayable video one fails the load.
 - **Seeking a fragmented MP4.** libavformat indexes such a file one fragment at a time. Without a guard, a forward seek whose next sync sample starts an unread fragment lands on whatever later fragment an earlier read indexed (a start at 150 s and a seek to 60 s rendered 122 s). So `Demuxer.seek(to:streamIndex:)` checks the samples between the target and the chosen sync sample for a hole in the index. If it finds one, it lands on the sync sample before the target instead. This applies to every fragmented MP4, not only to DASH.
 
@@ -325,10 +330,25 @@ Some files carry timestamps or bitstreams that a player would show wrongly. The 
 | MP4 whose composition offsets are missing only in later regions (judder after a seek) | Streams the same slot repair per sequence | None | [architecture › MP4 with composition offsets missing only in later regions](architecture-native.md#mp4-with-composition-offsets-missing-only-in-later-regions), [regression and reproduction](notes/partial-composition-regression.md) |
 | H.264 VOD whose parameter sets change mid-file (audio, no picture) | Moves the session to the software path | Software decode | [Below](#h264-vod-with-changing-parameter-sets) |
 | A video sample whose NAL chain overruns it, or confirmed HEVC with an incomplete two-byte NAL header (AE#561, #960) | Cuts an overlong chain at its last complete NAL; removes incomplete HEVC headers while preserving valid NALs, dropping a sample with no complete header. A CoreMedia refusal that still happens rebuilds the session on the software path, once | None, or software decode | [architecture › A video sample whose NAL chain overruns it](architecture-native.md#a-video-sample-whose-nal-chain-overruns-it) |
+| HEVC coded 3840x2176 and cropped to 2160 by a conformance window, on tvOS. An Apple TV (AppleTV18,1, tvOS 27.2.1) restarts when its hardware decoder gets this SPS | Sets the window's offsets to zero in the init segment and in the in-band SPS of every sample, and crops the 16 padding lines with a `clap` box instead (`HEVCConformanceCrop`) | None, hardware decode stays | [Below](#hevc-coded-3840x2176-and-cropped-to-2160) |
 | 24p film stamped with 2:3 pulldown times, 50 and 33 ms per frame (Sodalite#236) | Puts each frame on its 24p slot on the native route (`PulldownCadenceRetimer`) | None | [architecture › 2:3 pulldown timing on 24p film](architecture-native.md#23-pulldown-timing-on-24p-film) |
 | A declared frame rate that is not a standard rate (mkvmerge writes the first frame's duration, so such a file declares 20 fps) | Measures the rate on the head packets the probe already queued and uses that (23.976 here) for the display switch, the master's `FRAME-RATE` and the frame grid | None | |
 
 On the pulldown clip, 587 of 606 frame steps came out at exactly 41.7 ms, where every step had been 50 or 33. Content that is not film (true 30p or 60p, constant-rate stretches) is untouched.
+
+#### HEVC coded 3840x2176 and cropped to 2160
+
+**The problem.** Some encoders pad a 2160-line picture to 2176 lines and crop the 16 extra lines with the SPS conformance window. On an Apple TV (AppleTV18,1, tvOS 27.2.1) the hardware decoder takes such a stream and the device restarts within about 160 ms of the first frame. An iPhone plays the same segments. The software path plays them on the Apple TV.
+
+**What was measured.** One variable was changed at a time on the device. The same pictures play once the window's offsets are zero. An ordinary x265 encode restarts the device as soon as it carries this window. The level, the HRD parameters, the timing SEI, the access unit delimiters and the coding tools make no difference.
+
+**What happens.** On tvOS the muxer rewrites the SPS so the window's four offsets are zero. This covers the configuration record in the init segment (an `hvcC` record or Annex-B parameter sets) and the in-band SPS of every sample, Annex-B or length-prefixed (an `hev1` or Matroska source).
+
+Without the window the decoder hands out all 2176 lines. So the sample entry states the coded height, and a `clap` box (clean aperture, the container's own crop) of 3840x2160 hides the 16 padding lines. The device played this combination in the same test series.
+
+The `clap` carries a vertical offset of +8, not the -8 the spec asks for. tvOS applies that offset with the opposite sign to the spec and to macOS. Measured on an Apple TV (AppleTV14,1) with a test pattern, over HLS and from an MP4: -8 shows lines 16 to 2175, so 16 lines of picture go missing at the top and 16 padding lines show at the bottom. +8 shows exactly lines 0 to 2159. The same file would sit 16 lines low on macOS, which is another reason the repair stays on tvOS.
+
+The repair is fail-closed. Only a 4:2:0 base-layer SPS of exactly 3840x2176 with a bottom crop of 16 lines and no other crop is rewritten. Other platforms keep the window, since only the Apple TV failed on it.
 
 #### H.264 VOD with changing parameter sets
 
@@ -681,6 +701,7 @@ AVPlayer ends a muxed HLS item the moment its audio runs out, however much video
 
 - **Padded:** AC-3, E-AC-3 and FLAC always; AAC-LC and ALAC since FFmpegBuild 3.10.0 (the encoders come from the FFmpeg build).
 - **Not padded:** HE-AAC, MP3, Opus and a stand-in sample entry (the APAC bed). These log `AE#847 audio tail not padded` with the reason.
+- **Cap.** The fill is at most 10 minutes (`AudioTailPadding.maxFillSeconds`), written packet by packet as the encoder produces it. A final segment is seconds long, so only a corrupt last timestamp ever reaches the cap, and the log says `capped`.
 - **Limit.** The fill exists only in the segment written at end of file. On a source that arrives barely faster than its bitrate, with a silent tail longer than the producer's lead, AVPlayer waits at the end of the audio until that segment exists, and then plays on.
 
 ### Audio shaping
@@ -732,6 +753,8 @@ AVPlayer ends a muxed HLS item the moment its audio runs out, however much video
 - It is used instead of an instant-attack limiter because it measured far cleaner. On a steady overload its THD was -155 dB against -48.6. On two tones under limiting bass hits, its splatter above 3 kHz was -67 dB against -42 (relative to the tones), at the input's own floor.
 
 **Timing.** `dialoguenhance` delays its content by three quarters of its FFT window (1536 samples at 48 kHz, 3072 at 96 kHz) and stamps its output with its input's timestamps regardless. So the engine runs the graph on a sample counter of its own: it drops the delay's priming, pushes the same number of silent samples at the end of the stream, and carries the timestamps itself. Output sample k is then input sample k. Measured: an impulse at sample 60000 of a stereo source comes out of the bridge at sample 60000 with 96000 samples in and out, and the software decoder presents it at 1.25000 s, its source time.
+
+**A source that changes layout mid-stream.** A live programme can switch between stereo and 5.1. The remix matrix follows the new layout and lifts the front centre when there is one. The graph's `dialoguenhance` runs only when there is none, so the engine rebuilds the graph when that answer changes (`AudioShapingStage`). The loudness measurement and the graph's held tail carry over, so the gain does not restart at 0 dB and the last milliseconds before the change are not dropped. A mono source gets no matrix lift, only the graph's.
 
 **Requirements.** The graph (`AudioShapingGraph`) needs FFmpegBuild 3.11.0 or later, which adds `abuffer`, `abuffersink`, `aformat`, `aresample`, `pan`, `dialoguenhance`, `acompressor` and `alimiter`. The loudness target needs no filter of its own (it is Swift, `LoudnessNormalizer`). Where the graph cannot be built, the remix still applies and the log says the dynamics do not; the loudness target is then off as well, because without the limiter its gain could clip.
 
@@ -919,6 +942,7 @@ tvOS sends APAC over HDMI as Dolby MAT, and some sinks show Dolby Atmos for it o
 
 - The stream is 2 s of digital silence written bit by bit from the E-AC-3 and object audio specifications (`Scripts/make-silent-atmos.swift`).
 - It plays only while the engine's player plays or waits to play a rendered item on a route whose every output is HDMI, and is released otherwise.
+- **Its player goes with the stream.** The second player is built when the stream starts and thrown away when it is released, at `stop()` too. Kept around paused and empty, it held an Apple TV 4K's HDMI route (tvOS 27.3) in its 32-channel layout, and on an engine reused across titles the next title's 5.1 PCM reached the receiver as Dolby Atmos (#1081).
 - **Pause grace.** A pause does not stop it at once. It keeps playing for 60 s and pauses only if the engine's player is still paused then, because stopping it let the output leave Atmos, and a Samsung HW-Q990H re-locked on every resume and scrub (#848). The grace is bounded so a long pause does not keep the receiver busy, and it ends before tvOS's shortest screen saver delay.
 - **DTS:X.** A rendered DTS:X programme runs it too. tvOS carries a bed with heights over HDMI only as Dolby MAT, so the receiver shows Dolby Atmos for an intact DTS:X bed either way. Without the stream, the Sonos above, with Continuous Audio off, kept a DTS:X bed rendered to PCM on stereo.
 - **AirPlay.** Not run. There is no sink indicator to light, and the second player restarting beside the programme on resume left a HomePod pair silent after a pause (#834).
@@ -1119,6 +1143,7 @@ PGS / HDMV PGS / DVB / DVD produce `.image(SubtitleImage)`. The indexed pixel pl
 - **DVB (#971) and DVD on a rescaled encode (#993)** report the video frame instead of their 720x576 / 720x480 plane, since that display covers the whole picture with non-square pixels. A DVD on video wider than 16:9 reports the 16:9 frame at the video's width, as the picture was cropped out of it.
 - **Several objects (#146).** A display set carrying multiple composition objects (a forced sign plus dialogue is a common real-disc shape) fans into one cue per object, all sharing the set's start PTS, and every object is kept and rendered.
 - **Forced flag.** Each object's `AV_SUBTITLE_FLAG_FORCED` rides along as `SubtitleImage.isForced`, surfaced per cue via `SubtitleCue.isForced`. Track-level forcedness stays on `TrackInfo.isForced`.
+- **Size cap.** A bitmap canvas or object larger than 4096x4096 pixels is refused and produces no cue. A UHD Blu-ray canvas is 3840x2160. A hostile display set of about 100 KB could otherwise make the decoder allocate around 1 GB.
 
 #### External files
 
@@ -1625,6 +1650,10 @@ With a fixed 4 s lead instead, the buffer runs dry before every 10 s segment and
 - `SourceProbe.isLive` flags no-duration network streams, so hosts can detect and reload.
 - **Mid-stream joins (#107).** Sources joined mid-stream deliver their first samples at arbitrary PTS hours past zero. They anchor the clock at the first decoded sample on every session shape (live, live+DVR, and a plain VOD open of the same URL or of a mid-broadcast capture file), publishing session-relative positions while `sourceTime` stays on the source axis for subtitles.
 
+**Reads on a live source return what has arrived (AE#1076).** FFmpeg reads a network source through a 256 KB buffer. On a live source the reader hands back whatever bytes are there instead of waiting until that buffer is full, the way a socket read does. Waiting for the full 256 KB cost 4 s per read on a 0.5 Mbit/s tuner sub-channel. That showed up as a 1.7 to 2.9 s `open_input` and as a live edge that moved in 3 s steps. A VOD read still fills its request.
+
+Measured with `aetherctl play --live` against an origin that sends MPEG-2 + AC-3 in real time, PAT and PMT in the first packets: `open_input` went from 3.07 s to 20 ms at 0.68 Mbit/s and from 0.44 s to 2 ms at 4.8 Mbit/s.
+
 **A PAT program that never sends its PMT.** The TS demuxer only knows its stream list is complete once every program its PAT lists has sent a PMT. Until then `avformat_find_stream_info` cannot take its "all info found" exit. Some IPTV panels and restreamers pass on a multiplex fragment whose PAT still lists a program they do not carry. Without a release, such a channel reads the whole playback budget (50 MiB / 60 s) after every stream it has is resolved.
 
 - The engine releases that wait once the stream analysis has received data for 2.5 s while one program still has no PMT and another has its PMT and an audio or video stream. 2.5 s is five missed repetitions of the 0.5 s PMT interval ETSI TR 101 290 expects.
@@ -1636,6 +1665,16 @@ With a fixed 4 s lead instead, the buffer runs dry before every 10 s segment and
 
 Measured through `aetherctl play --live` on a live-paced synthetic channel, median of 5: the stream analysis went from 58.7 s (32 MB, three requests, because the reader reconnects at the end of the 30 s fixture and the pass runs on to its 60 s cap) to 2.5 s (1.6 MB, one request), with both tracks. With audio that starts 5 s late it takes 4.9 s, and with a join 3 s into a 10 s GOP 7.6 s, the same as those channels without the silent program.
 
+### Live AC-3 that changes layout
+
+Some channels carry AC-3 2.0 during ads and 5.1 during the programme on the same PID. The fMP4 `dac3` / `dec3` box (the audio track's configuration) is written once per init segment, from one parsed frame.
+
+- On a live source the producer compares each stream-copied AC-3 / E-AC-3 frame with the layout of the current init: sample rate, bsid, `acmod`, LFE, and the E-AC-3 substreams.
+- A new layout counts only after three frames in a row, and a frame flagged corrupt is skipped, so one damaged packet does not cost a discontinuity.
+- On a change it cuts at the next keyframe, marks the segment with `#EXT-X-DISCONTINUITY` and gives it a versioned `#EXT-X-MAP` primed with a frame in the new layout, the same rotation as the SSAI program switch. The log line is `audio layout change`.
+- Until that keyframe, the frames in the new layout stay in the segment on the old init.
+- A bridged track is untouched: its encoder output keeps one layout.
+
 ## Known limitations
 
 Things that work today but have a documented edge case, or are deferred behind an upstream dependency.
@@ -1645,6 +1684,7 @@ Things that work today but have a documented edge case, or are deferred behind a
 - **Now Playing and the audio session.** On the HLS-loopback path of tvOS 26, manual `MPNowPlayingInfoCenter` writes race the player; a host with a custom transport lets the engine own the card instead (`ownsVideoNowPlayingSession`). The engine activates the audio session per playback, not at launch, so tvOS can negotiate the HDMI channel count (AetherEngine#24). Both are host contracts: [api › Now Playing and the audio session](api.md#now-playing-and-the-audio-session).
 - **AV1 on Apple TV is software-decoded.** No current Apple TV chip ships hardware AV1. The `SoftwarePlaybackHost` + dav1d path handles it, but CPU use is clearly higher than with hardware HEVC. For 10-bit AV1, film grain and the P010 conversion run on the GPU, so what stays on the CPU is dav1d's decode. A Profile 10.1 source keeps its Dolby Vision there ([Dolby Vision signaling](#dolby-vision-signaling)). Where the chip decodes AV1 (A17 Pro, M3 and later), Main profile AV1 takes the native route; High and Professional stay on software. Future Apple TV chips with hardware AV1 will be picked up automatically by `VTCapabilityProbe`.
 - **AV1 Dolby Vision Profile 10.0 does not play on the software path.** dav1d / libavcodec cannot decode the proprietary DV colour space, so a Profile 10.0 source (DV-only, no fallback base layer) would show a green / purple picture there. The load fails instead, with `AetherEngineError.dolbyVisionUnplayableOnSoftwarePath` and the error kind `.dolbyVisionRequiresHardware`. HEVC Profile 5 is refused the same way when it reaches the software path (#176). Profiles 10.1 and 10.4 are unaffected, because they carry an HDR10 / HLG base layer. Profile 10.0 only plays through the native AVPlayer path on hosts with hardware AV1 decode.
+- **Software decode stops at 8192x8192 pixels.** The software host and frame extraction refuse a picture larger than that, which still covers 8K UHD (7680x4320) and DCI 8K (8192x4320). The cap keeps a hostile stream from making the decoder allocate gigabytes.
 - **Dolby Vision Profile 5 / AV1 Profile 10.0 thumbnails need the `DolbyVisionStillReshaping` trait.** Without it such a source yields no still ([Frame extraction](#frame-extraction)). A frame that carries no DV metadata falls back to the standard path.
 
 ## Moved sections

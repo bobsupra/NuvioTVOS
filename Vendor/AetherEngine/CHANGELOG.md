@@ -12,6 +12,489 @@ the public-API contract.
 
 _Nothing yet._
 
+## [7.70.0] - 2026-11-17
+
+### Security
+
+- **A DASH manifest can no longer collect your server credentials.** The token, cookie and Authorization
+  headers now go only to the host the manifest came from. A `BaseURL` on another host, port or plain http
+  gets the other headers without them.
+- **Hostile streams no longer crash the app on trap-prone values.** An absurd H.264 SPS size, an hvcC
+  rewrite that outgrows its 16-bit length, extreme Dolby Vision layer times, a crafted Profile 7 RPU, a
+  Blu-ray CLPI EP map, a huge disc size or seek target, and an out-of-range subtitle index now end
+  gracefully instead of trapping.
+- **A hostile PGS or other bitmap subtitle can no longer allocate about 1 GB.** Subtitle decoders cap the
+  canvas at 4096x4096 pixels, video decoders at 8192x8192 (8K still plays).
+
+### Added
+
+- **A host can choose how long a native audio switch waits for the frame it holds** (PR #1082,
+  thanks to playovahq). `heldPictureFrameWaitSeconds` (default 0.5 s, as before, at most 3 s) bounds
+  the read of the outgoing picture. 0 holds nothing.
+- **An audio switch stands still for the full wait only once where the output vends no paused frame.**
+  It used to wait 0.5 s on every switch and then show black anyway. After one empty read, later switches
+  probe for 0.15 s until a read succeeds again.
+
+### Fixed
+
+- **The `av_parser_init` calls compile against FFmpeg 9 headers too** (PR #1083, thanks to playovahq).
+  The function takes an `enum AVCodecID` there and an `int` in FFmpeg 8, and the six calls were written
+  for the `int`. They now go through one helper that compiles against either. Nothing changes with the
+  bundled FFmpegBuild. This matters to a host that links its own FFmpeg 9.
+- **Backing out of a remote HLS stream while it was still starting no longer leaves its sound playing.** A
+  stop or a channel change during the engine's trust probe or subtitle-playlist fetch used to mount and play
+  the old URL on the torn-down player, or over the new channel's item.
+- **A scrub preview no longer shows the previous item's picture after a zap.** Live and VOD stills that
+  finished decoding after the session ended were returned anyway.
+- **The scrubber no longer jumps to a stale position after a seek or zap during a stall.** The
+  playlist-shift relay wrote its clock fold after a read that can wait seconds.
+- **Picking an Apple TV for an interlaced title moves the picture again after an interrupted reload.** A
+  failed AE#1070 reload restored its old receiver answer onto the session that replaced it.
+- **A cancelled reload no longer reports success over a dead session.** `reloadAtCurrentPosition()` on a
+  custom source, and an audio switch whose caller cancelled, used to leave the player paused in `.loading`
+  with no error. A failure is now thrown and published as `.error`.
+- **A skipped track's loudness cut no longer carries over to the next track.** The normalization tap and
+  volume fallback were written after a newer load had started.
+- **Closed captions no longer show the previous session's lines after an audio switch or AirPlay reload.**
+- **The last title picked during a disc load is the one that plays.** Earlier picks used to win.
+- **A live stream rebuilt after a muxer failure no longer has its source closed by the old pump's
+  watchdog.**
+- **Tone mapping no longer risks a crash when a title's HDR metadata changes mid-stream.** Each frame on
+  the GPU now keeps alive the texture cache its textures came from. The tone mapper could release that
+  cache while two frames were still in flight: on a metadata change, an overrun switch-off, or HDR10+
+  appearing.
+- **On iOS, tone mapping and line-art upscaling survive the app going to the background.** iOS refuses GPU
+  work in the background. Three refused frames used to switch the stage off for the rest of the process
+  and reload the session to native. Those frames now go out as decoded and do not count as failures.
+- **Tone mapping and line-art upscaling work on the first Apple TV 4K (A10X).** Its GPU lacks non-uniform
+  threadgroups, which these stages assumed. They now dispatch whole threadgroups there, as the FEL
+  composer already did.
+- **PiP subtitles show the right track after a track switch.** The compositor reused its rendered overlay
+  whenever cue ids matched, and ids repeat across sidecar tracks and between primary and secondary cues.
+  It also kept an overlay drawn for an older frame size.
+- **Cancelling a held still or a scrub preview no longer pins the main thread.** A cancelled wait used to
+  spin until its 3 s or 2 s deadline.
+- **A recording no longer ends on one bad timestamp.** The TS muxer refused a packet whose decode
+  timestamp did not rise, and the recording stopped as `.writeFailed`. The writer now repairs or drops that
+  packet and keeps recording.
+- **A read error no longer leaves a subtitle file cut short but marked complete.** The native subtitle
+  readers restart on a read error, and only a real end of file finishes a whole-program track.
+- **A deinterlace filter error no longer freezes the picture or fills memory.** The graph is rebuilt on the
+  next interlaced frame (hardware falls back to software), and frames pass through as decoded after
+  repeated failures.
+- **The last interlaced picture is no longer lost at the end of a stream.** The deinterlacer is flushed
+  before the decoder is reset.
+- **VideoToolbox errors reported after a decode call are now counted and logged.** An error that ends the
+  session (`kVTInvalidSessionErr`, `kVTVideoDecoderMalfunctionErr`) starts the normal session recovery.
+- **After a video session rebuild on the software host, the audio no longer repeats up to a quarter
+  second.** The reposition uses the clock instead of the published time.
+- **A long film no longer fails on its third healed network outage.** The read-error and credential
+  revive limits now count only failures in a row without progress, so a session that heals every outage
+  keeps going. Three deaths in a row without a stored segment in between still give up.
+- **Calling `retryLiveSourceRecovery()` on a live session that is not parked does nothing.** A second call
+  after a successful reopen used to stop the healthy producer and end a running recording.
+- **Live blocking playlist reloads hold again after a host retry.** After `retryLiveSourceRecovery()` every
+  hold used to answer at once.
+- **A live segment that was evicted while still listed answers 404 at once.** It used to wait 30 s and then
+  answer a retriable 503, and segments below the window answered 503 too. AVPlayer resyncs on the 404.
+- **Stopping the load of a remote `.iso`, `.img` or `.udf` cancels its size probe.** Up to four range
+  requests used to keep running for about two minutes, outside the origin request budget.
+- **A pause during a load in the background no longer cancels the load (iOS).** Pausing while a next
+  episode or track loaded in the background tore the session down under the load, and the host's `load()`
+  threw `CancellationError`. The decision now waits for the load to return.
+- **A background video paused by the system is released like one paused by the app (iOS).** Taking out
+  AirPods, or pausing from AVKit's own controls, left the whole pipeline running into the suspension. It is
+  now released after the grace window, like a `pause()`.
+- **Background video sound resumes after a short phone call (iOS).** Since 7.69.1 a native video keeps
+  playing in the background, but the end of a call never resumed it. A call that ends inside the 15 s
+  grace window with `.shouldResume` now resumes it. A longer call finds the pipeline released, as before.
+- **Pulling out AirPods or headphones during a call no longer resumes the film on the speaker when the
+  call ends.**
+- **With background playback off, the end of a call no longer restarts a software-decoded video's sound in
+  the background.**
+- **Tone mapping and upscaling come back after a transient Metal compiler failure.** A failed kernel build
+  is retried after 60 s instead of staying off until the app relaunches.
+- **A quick return during a background teardown no longer ends the next grace window early (iOS).** A
+  foreground and background round trip inside the 3.5 s teardown drain could end the new window's
+  background-task assertion.
+- **A cancelled load no longer leaves its tracks and format published.** After a host cancelled `load()`,
+  the idle engine kept publishing the cancelled item's tracks, duration, metadata and video format.
+- **`currentAVPlayerItem` goes nil when the item is removed.** After a stop or background teardown it kept
+  naming, and retaining, the removed item (regression since AE#998).
+- **Dialogue Boost and Night Mode work in a film that follows a music track.** After the engine had played
+  one track through AVPlayer, live shaping changes on later video sessions were ignored, and
+  `audioShapingState` read `.unavailable` for FFmpeg-hosted tracks.
+- **Dialogue lift no longer doubles or disappears when a source changes layout.** A live 2.0 to 5.1 switch
+  raised the dialogue twice, a 5.1 to 2.0 switch dropped the lift, and a VOD TrueHD whose layout was
+  unresolved at start behaved the same. A mono source is now lifted once.
+- **The loudness target keeps its measurement across a format change on the software host.** At every
+  5.1/2.0 programme boundary the gain fell to 0 dB and climbed back at 2 dB/s, and the graph's last
+  milliseconds were dropped.
+- **The software video host no longer drops the last audio at end of file.** Up to about 21 ms, and about
+  58 ms with a dialogue lift, were lost.
+- **Normalized tracks end with a valid timestamp.** The last ~5 ms went to the renderer with an invalid PTS.
+- **A live PAFF channel keeps its fields paired after a programme change.** The field joiner re-arms from the
+  new SPS instead of staying off for the rest of the session.
+- **One damaged E-AC-3 frame no longer costs a discontinuity.** A new audio layout counts after three frames
+  in a row, and frames flagged corrupt are skipped.
+- **An audio or title switch on a remote disc image keeps its held connection and request headers.** A disc
+  title switch also shows the new title's track lists.
+- **Header updates reach a live stream the engine rerouted through its own ingest.** `updateRequestHeaders`
+  used to promise the next rebuild, which that reader never had.
+- **A non-seekable live source gets its live-reset hand-off.** A failed AE#627 live join is no longer
+  reported as `nativeItemFailed`.
+- **Sidecar subtitles on another origin keep their own headers across a reload.**
+- **One transient 5xx or reset on a VOD HLS segment no longer ends the ingest.** The segment is retried up to
+  three times. 1xx interim responses (103 Early Hints) no longer desync the persistent connection, and an
+  https to http redirect there is upgraded to https.
+- **Spools left by a killed software session are swept after one hour instead of one day.** Unrelated
+  entries in the temp directory no longer hide them.
+- **Log redaction also covers camelCase token names, whole `Cookie` headers, `Optional("...")`, short
+  `Basic` credentials and a raw `@` in a password.** A long run of `e-` in a logged URL no longer burns CPU.
+- **`SMB://` is accepted, and an `SMBURL` error never repeats the password.**
+- **A Blu-ray seek by stream timestamp uses the disc's EP map.** `seek(to:streamIndex:)` checked only the
+  DVD time map and fell back to a byte estimate on Blu-ray.
+- **Dolby Vision layer joins and RPU walks no longer see empty NAL units.** One Annex-B scanner now serves
+  every walker; some used to emit zero-length units that were written into the joined stream.
+- **Infinite or NaN float samples no longer crash or freeze the loudness target.** They are left out of
+  the measurement.
+- **A live packet without a PTS no longer produces a segment that claims to last 1e14 seconds.** It cuts
+  on its DTS instead.
+- **A crafted DASH manifest or MP4 box no longer crashes the app.** Huge durations or byte ranges,
+  overflowing sidx times, cut mvhd/tkhd/elst/mdhd boxes, oversized box lengths and large
+  `base_data_offset` values now fail the open or leave the box unpatched.
+- **DASH manifest and head reads are bounded.** A manifest over 8 MB, or one that trickles for more than
+  120 s, fails the open instead of filling memory. A manifest with dozens of audio sets carries the first 16.
+
+### Performance
+
+- **Live scrub previews keep six warm decoders, as VOD does, inside the AE#1059 memory budget.** The live
+  path used to trim the shared list to two and ignore the budget.
+- **The disk-reserve check no longer reads the volume's free space on every 64 KiB write.** The reading
+  is reused for 0.5 s.
+- **The normalization tap no longer allocates on the audio render thread.**
+- **The end-of-file silence fill (AE#847) is capped at 10 minutes and written as it is encoded.** A corrupt
+  last timestamp used to build hours of silent packets in memory first.
+- **A GPU pipeline that fails to build is not recompiled on every stage build.** The frame chain and the
+  upscaler used to recompile both shader libraries each time after a failure; a failure is now kept for 60 s.
+
+## [7.69.1] - 2026-11-17
+
+### Fixed
+
+- **After a rendered Atmos title, the next 5.1 title no longer reaches the receiver as Atmos (AE#1081).**
+  On tvOS the `AtmosOutputActivator` keeps a second player looping a silent Atmos stream while a TrueHD
+  Atmos or DTS:X bed plays. At `stop()` that player was paused and emptied but stayed on the engine, and
+  it kept the HDMI route in its 32-channel layout. On an engine reused across titles, a 5.1 PCM title
+  played afterwards showed as Dolby Atmos on the receiver until the process ended. The player is now built
+  when the stream starts and released with it. Thanks to narenh for the report and the side by side with
+  a fresh engine.
+
+- **Native video on iOS can keep its sound in the background (AE#1080).** The engine kept a playing native
+  session alive when the app left the foreground, but the AVPlayer inside still had the `.automatic`
+  background policy, and under it iOS pauses any item that carries video. The native player now uses
+  `.continuesIfPossible` while `backgroundPlaybackEnabled` is on and goes back to `.automatic` when it is
+  off. The host app still needs the `audio` background mode. tvOS is unchanged. Thanks to nulltuple for
+  the report.
+
+- **DASH on the software path no longer freezes the picture at every subsegment (AE#1079).** The read gate
+  stopped reading at 4 s of audio lead or 256 parked video packets. The DASH source interleaves whole
+  subsegments, so the next video could sit behind a whole audio subsegment, or the next audio behind a
+  whole video one. With 10 s audio and 4 s video subsegments at 60 fps the picture froze for 3 to 5 s at
+  every audio subsegment while the sound played on. With 10 s video and 2 s audio the clock stalled at
+  10 s. The gate is now sized from the subsegment durations in the `sidx`. Other sources are unchanged.
+  Thanks to nulltuple for the analysis and the fixture.
+
+- **A live channel at a low bitrate opens in milliseconds instead of seconds (AE#1076).** The network reader
+  held every live read until FFmpeg's whole 256 KB buffer was full. On a 0.5 Mbit/s HDHomeRun sub-channel
+  that is 4 s per read: `open_input` took 1.7 to 2.9 s against 0.3 s on the main channels, and during
+  playback the live edge moved in 3 s steps. A live read now returns what has arrived. Measured on a
+  real-time 0.68 Mbit/s MPEG-TS origin, `open_input` went from 3.07 s to 20 ms. VOD reads are unchanged.
+  Thanks to en0x for the measurements that pointed at it.
+
+- **A live session stays live after an audio-track switch.** The rebuild behind `selectAudioTrack`
+  (and the disc-title pick and the custom-source `reloadAtCurrentPosition`) runs `stopInternal`, which
+  clears `isLive`, `isSequentialOrigin` and the live window, and then reopens through `loadNative` or
+  `loadSoftware`, which never set them again. A live MPEG-TS channel switched to its second audio track
+  came back with `isLive == false` and no DVR window, and every `startRecording(to:)` threw `.notLive`
+  until the next `load`. The rebuild now takes the liveness of the session's options exactly as `load`
+  does. Thanks to MistyKuu for the fix (#1078).
+
+## [7.69.0] - 2026-11-16
+
+### Added
+
+- **Track loudness on audio-only sessions, lifts included (Sodalite#242).** `LoadOptions.normalizationGainDB`
+  applies a track's ReplayGain or a server's normalization gain, and `setNormalizationGain(_:)` changes it
+  mid-track. `volume` stops at 1.0, so a quiet master could only be left quiet; this runs inside the engine
+  behind a -1 dBFS lookahead limiter. On the AVPlayer audio host it is an `MTAudioProcessingTap` on the item,
+  so no track moves to the FFmpeg host for it; there it runs in the decoder. `normalizationGainReport` gives
+  the applied gain, host, stage and limiter work, and the engine logs it when a track is torn down. Measured
+  with `aetherctl audio --gain 8` on a sine peaking at -5.7 dBFS: 3.3 dB of limiting on both hosts, exactly
+  what -1 dBFS takes off +2.3.
+
+- **`aetherctl bench` times the upscale stage (#957).** Every picture-quality stage should come with its
+  measured cost, and the upscaler had none in the benchmark. Five new cases run the stage playback builds:
+  480p and 720p through VT super resolution and MetalFX, 720p through MetalFX alone, and 1080p line art
+  with and without the restore pass, each to a 3840x2160 display. The note names the plan and the median
+  ML and GPU time; a case the device cannot build is skipped with the reason.
+
+### Changed
+
+- **AVKit's scrub thumbnails near the playhead are ready before the scrub.** With `serveIFramePlaylist`,
+  every thumbnail used to be read from the source when AVKit asked for it, and for HDR also decoded, tone
+  mapped and encoded, so AVKit showed a grey placeholder for a moment per thumbnail. The still ladder now
+  reads every segment within two minutes of the playhead ahead of time while the link is idle, builds the
+  HDR JPEGs with it, and then fills in the rest of the title. Measured on a Mac against an origin with
+  40 ms latency, a prefetched thumbnail is served in about 1 ms against about 75 ms cold. Thanks to Harsh
+  for the report.
+
+- **MPEG-DASH starts about 2 s sooner on a slow origin (#1075).** Before the segment plan, the native route
+  seeks to the middle of a file so libavformat loads its keyframe index. A DASH source has no such index (its
+  virtual MP4 is fragmented), so the seek only fetched the fragment there. It is skipped now. Measured on a
+  10 minute presentation behind an origin with 80 ms latency and 4 MB/s, `readyToPlay` moved from 6.2 s to
+  4.25 s, 13 fewer requests, with the same segment plan and the same seek landings. Thanks to nulltuple for
+  the report.
+
+- **The upscaler and the picture processing keep two frames on the GPU (#957).** Each stage committed
+  one frame and waited for it on the decoder's thread, so the GPU sat idle between frames and the wait
+  counted against the frame budget. Frames now go to the renderer when their GPU work completes, in
+  decode order, with at most two in flight. On an A12 Apple TV, 720p upscaled to 2160p holds the
+  decoder's thread about 9.5 ms per frame instead of 29.5 ms (GPU time unchanged, no dropped frames).
+  Seeks and the end of stream deliver the frames still in flight first. The VideoToolbox super
+  resolution pass runs off the decoder's thread as well: its MetalFX step is encoded when VT answers, so
+  the next frame's ML pass overlaps this frame's MetalFX work. Not yet measured on a device where VT
+  super resolution works (the A12 refuses it).
+
+### Fixed
+
+- **Audio-only AAC, FLAC, MP3 or AC-3 in Matroska no longer stays silent.** The audio-only dispatch only
+  looked at the codec, so a whitelisted codec in a container AVFoundation does not open (MKA, Ogg,
+  MPEG-TS, ASF) went to the AVPlayer audio host, which answered "Cannot Open" with the clock at 0. Only
+  containers AVFoundation reads now go to AVPlayer; the rest goes to the FFmpeg host. `aetherctl audio` on
+  AAC, FLAC, MP3 and MP2 in MKA: silent before, playing now; M4A still plays on AVPlayer.
+
+- **MPEG-DASH segments start on a keyframe, and seeks land where they were aimed (#1075).** A DASH
+  source has no keyframe index, so the native route laid its HLS segments on an even grid that ignored the
+  GOPs. Wherever a boundary missed a keyframe, the segment depended on the one before it and a seek landed
+  late. The plan now comes from the video `sidx`, which marks each subsegment that starts with a random-access
+  point. On a 5 minute presentation with keyframes 1.5 to 9 s apart, `segverify` found 35 of 35 segments
+  independent (25 of 40 before), and seeks to 15, 150 and 285 s landed exactly (151.83 and 288.33 s before).
+
+- **No thin bright line around upscaled DVDs (#846).** Many DVDs carry a dark half-line in the outermost
+  rows and columns, which the ML pass sharpened into a bright line a few samples in. The outer 8 output samples
+  on every side are now a bilinear scale of the source, as they already were on axes without room for the
+  mirrored margin, so the edge looks as it does with upscaling off. Reported and diagnosed by classicjazz.
+
+- **Apple TV no longer restarts on HEVC coded 3840x2176 and cropped to 2160.** An Apple TV (AppleTV18,1,
+  tvOS 27.2.1) restarted within about 160 ms of the first frame when the hardware decoder got
+  an SPS with that conformance window. On tvOS the native remux now sets the window's offsets to zero, in
+  the init segment and in the in-band SPS of each sample, and crops the 16 padding lines with a `clap` box
+  instead. The box's vertical offset uses the sign tvOS reads (+8), the opposite of the spec, because
+  with the spec's -8 an Apple TV cut 16 lines off the top and showed 16 black lines at the bottom. Other
+  geometries and other platforms are untouched. Thanks to UnknownCoder807 for the fix (PR #1072).
+
+- **Upscaling keeps working where VideoToolbox super resolution fails every pass (#957).** An A12 Apple
+  TV (tvOS 27.2) reports VT super resolution and then refuses every frame. The stage switched itself off
+  after three failures and the session went back to native, so 720p video was not upscaled at all. Three
+  ML failures in a row now drop the ML pass and MetalFX alone takes the source to the same target
+  (about 29.5 ms per 720p frame to 2160p in 24 fps playback on the A12, inside the 37.5 ms budget, no
+  dropped frames). If the pass never worked, later loads in
+  the process plan without it. `$activeUpscale` shows `degraded` with `mlScale` nil.
+
+- **Live AC-3 follows a change from 2.0 to 5.1 on the same stream.** A channel with 2.0 ads and a 5.1
+  programme on one PID stayed 2.0 when playback started on an ad, because the `dac3` box in the init
+  segment was written once from the first frame. When the AC-3 or E-AC-3 layout changes, the next segment
+  now starts at a keyframe with a new init built from a frame in the new layout.
+
+## [7.68.0] - 2026-11-15
+
+### Added
+
+- **Dolby Vision Profile 20 plays (Dolby Vision on MV-HEVC, Apple's 3D format).** Until now the load failed
+  with `unsupported Dolby Vision profile 20.0`. In 2D the base view is served as Profile 5. Its RPU already
+  is a Profile 5 RPU, so the colours come out right instead of green and purple. On visionOS the stereo session
+  keeps `dvh1.20` and the second view, which is not yet confirmed on a Vision Pro. Stills and scrub thumbnails reshape it like Profile 5. Thanks to
+  John Appleseed for the request and the sample.
+- **A 3D session AVPlayer refuses at startup falls back to 2D.** The session is rebuilt once with
+  `stereoPresentation = .mono` at the same position, instead of failing.
+
+- **`LoadOptions.videoProcessing`: tone map HDR10 titles brighter than the display to its peak (#957).** Off
+  by default. With `VideoProcessingOptions(targetPeakNits:)` set, an HDR10 title whose declared peak is above
+  the target plays on the software host, every frame runs the BT.2390 tone map, and the frame tells the
+  display the target, so it does not tone map a second time. The cost is the software path's (no AVPlayer
+  PiP, the picture stays on this device over AirPlay, E-AC-3 Atmos as its channel bed). Dolby Vision,
+  HDR10+, HLG, SDR, a panel the load settles in SDR, a title at or below the target and one with no
+  declared metadata keep their route; the load logs one `[VideoProcessing]` line saying why. `$activeVideoProcessing` reports what runs. Falling
+  behind, failing, or HDR10+ in the stream switches it off, and a session it alone moved goes back to the
+  native path. On the A12 Apple TV a 4K60 HDR10 title fits. `aetherctl play --tone-map <nits>` runs it.
+
+- **A BT.2390 tone map stage for the frame chain, timed by `aetherctl bench` (#957).** Groundwork for HDR
+  tone mapping to a display's peak. The stage maps an HDR10 picture from its source peak to a lower target
+  and declares the mapped metadata, and it runs inside the chain's one round-trip kernel. `aetherctl bench`
+  gains `chain: tone map, one kernel, wall time` and `chain: tone map, two passes, wall time`, and the HDR10
+  probe gains `chain+tonemap` for timing it in playback.
+
+### Fixed
+
+- **Interlaced H.264 shows a picture on an Apple TV picked from the AirPlay button (#1070).** It plays on
+  the software path for deinterlacing, and that path's picture stays on the device, so the Apple TV only got
+  the sound. While the host reports a receiver that shows video (`setAirPlayReceiverShowsVideo(true)`), it
+  now takes the native route, and a session already playing reloads at its position when that changes.
+  The receiver gets the stream without the device's deinterlacer. Thanks to cdguy for the report and the sample.
+- **Field-coded 1080i H.264 no longer bounces on the native route (#1070).** Broadcast streams that code
+  each field as a picture of its own (PAFF) reached AVPlayer one field per sample, so every field showed
+  as a frame and the picture jumped up and down. The two fields of a frame now go into one sample.
+- **An HDR start no longer waits five seconds for a mode switch that has already ended (#1067).** When the
+  play gate opened right after the panel's switch had ended, but tvOS still reported a switch in progress,
+  the gate waited for a second end that never came and only gave up at its cap. It now proceeds after at
+  most one second, unless a new switch starts in that time. The HDR master refusal line also says whether
+  the engine's display criteria were still set at that moment, and on which window. Thanks to en0x for the
+  report and logs.
+
+## [7.67.1] - 2026-11-14
+
+### Changed
+
+- **A frame chain stage can declare the colour volume of its output (#957, #1065).** Internal groundwork for a
+  later tone map stage. The chain writes the frames' HDR10 metadata from the last stage that declares one, so
+  the display is told what it gets and does not tone map a second time. The two existing stages declare
+  nothing, so no frame changes today. Thanks to bdavid21wnec for the change.
+
+### Fixed
+
+- **The FEL curve fold no longer crashes on a GOP with undated packets (#1064).** With `DolbyVisionFelCurves`
+  on, a stream-copy cut of a Profile 7 FEL file can start with packets that carry neither a PTS nor a DTS.
+  Measuring the frame spacing then subtracted `AV_NOPTS_VALUE` and trapped on the overflow. Such a GOP now keeps
+  the stream's mapping, and the next GOP fits afresh. A span too wide to subtract between two valid timestamps
+  is caught the same way. Thanks to orut34iop for the fix and the byte-identical control runs.
+- **An audio pick during a load no longer drops the Dolby Vision route (#1061).** A `selectAudioTrack` made as
+  soon as `audioTracks` published landed inside the load's display handshake. Its rebuild replaced the load
+  before the load had stored its panel answers, so a DV or HDR title went to the media playlist (HDR10 base
+  layer, no DV signaling) and `videoFormat` stayed `.sdr`. The pick now waits for the load to return and then
+  rebuilds as any later pick does, and the host's `load()` returns normally instead of throwing
+  `CancellationError`. `selectTitle(id:)` waits the same way. A rebuild that still finds no load-time panel
+  answer says so in the log. Thanks to andreiborisov for the report and the code trace.
+- **The engine builds without warnings under Xcode 27.2 again (#1062).** Six diagnostics in five files: a
+  main actor-isolated notification key read from a Sendable closure, `String(cString:)` on an array,
+  `M_SQRT1_2`, the synchronous `AVMetadataItem.stringValue`, and a `weak var` that was never mutated. The audio
+  menu now loads a rendition's title asynchronously and drops an answer whose item or selection changed while
+  it waited. Thanks to YangHanqing for the report.
+- **The APAC tests no longer expect two encoders to write the same bytes (#1063).** On an M6 under macOS 27.0.1,
+  two encoders fed the same PCM wrote different packets on every run, while the decoded audio matched at a signal to error ratio of about
+  93 dB. Three tests compared the bytes and failed there. They now decode both runs and require a ratio above
+  60 dB; a swapped packet measures 12.7 dB and a repeated one 15.7 dB, so both still fail. Test
+  change only, the encoder settings are untouched. Thanks to YangHanqing for the report and the measurements.
+
+## [7.67.0] - 2026-11-14
+
+### Added
+
+- **`LoadOptions.rendersDTSXObjectAudio` keeps DTS:X on the channel bridge while TrueHD Atmos renders (#1060).**
+  Since 7.66.1 DTS:X asked into 5.1.2, 5.1.4 or 7.1.2 renders as 7.1.4, which left a host no way to put TrueHD
+  Atmos into a small bed and keep DTS:X on the 7.1 bridge in the same load. `false` does that for every DTS
+  track of the load, so switching between the two tracks needs no reload, and the automatic audio pick stops
+  preferring DTS:X. The default, `true`, changes nothing. `aetherctl play --no-dtsx-objects` sets it. Thanks to
+  Desima-AP for the request.
+- **AVKit's subtitle menu can show a track the host draws itself (#1052).** `setNativeSubtitleSelected(track:markerOnly:)`
+  with `markerOnly: true` ticks the track in the menu and offers Off, but serves it as empty segments and runs no
+  OCR, so nothing is drawn over the host's own bitmap overlay. `setNativeSubtitleRendering(true)` turns it into a
+  full rendition for PiP, AirPlay and external displays, and `false` goes back to the marker. Thanks to Anquietas
+  for the request.
+- **`aetherctl bench` and `AetherEngine.runPerFrameBenchmarks` time the software path's per-frame work (#957).**
+  Latency regressions there had no number to catch them. The benchmark times the output metadata normalizer,
+  the renderer's sample buffer, the frame chain and the HDR10 SEI scan on a 4K P010 frame, saves the report as
+  JSON and fails against a baseline when a median grows past a tolerance. Covered by
+  `PerFrameBenchmarkReportsEveryCaseTests`.
+
+### Fixed
+
+- **Scrubbing a 4K title no longer holds up to six still decoders open (#1059).** Each one costs 100 to 160 MB
+  on an Apple TV 4K, and a held fast-forward took the app from 180 MB to about 1.1 GB. The open decoders now
+  share a budget of six 1080p pictures, so a 4K title keeps one and the others close down to their cached
+  still. Resident decoders close after 3 s idle instead of 10 s, and the new `releaseScrubPreviewDecoders()`
+  closes them when the host's scrub ends. Covered by `Issue1059ScrubDecoderBudgetTests`. Thanks to samimt55
+  for the measurements.
+- **Profile 7 FEL no longer freezes the picture on an Apple TV 4K (A12) when a chroma curve is rejected (#1055).**
+  When the parser rejected one chroma curve (for example an MMR coefficient too large for the fixed-point
+  form) and the other chroma curve was MMR, the chroma kernel read the rejected curve's range with an
+  unclamped last-pivot index. The A12 executed that guarded load and read 4 GiB past the parameter buffer.
+  That is a GPU page fault, and from then on every frame was lost while the sound played on. Every pivot
+  index the kernels form is now bounded, so the frame composes with the rejected component as identity. A
+  Mac never showed it. Covered by `DoviCurveIndexBoundsTests`, see
+  [Dolby Vision FEL › Earlier fixes worth remembering](docs/dolby-vision-fel.md#44-earlier-fixes-worth-remembering).
+  Thanks to Desima-AP for the GPU restart reports, the address arithmetic and the patch.
+- **A GPU fault during FEL composition no longer costs every later frame (#1055 follow-up).** After the first
+  in-place frame that fails on the GPU, the dual-layer decoder composes into the output pool for the rest of
+  the session. A frame that fails there still shows its base layer. Before, tvOS refusing the process's GPU work
+  after a fault meant every frame was dropped while the sound played on. Suggested by Desima-AP.
+- **A short timestamp spike on a live software session no longer mutes the sound for good (#1053).** A Jellyfin
+  OTA channel (MPEG-2 + AC-3) sent a run of packets stamped 347 s ahead, then returned. The fold that hides
+  such jumps looked at video only and moved audio by read order, and the two streams cross a TS splice at
+  different bytes, so a few AC-3 frames reached the renderer 347 s ahead of the clock. Each stream now folds
+  its own jumps, and the second stream of a splice takes over the first one's offset to stay in sync. The
+  live read-ahead also stopped reading a spike as a full reservoir. Reproduced and verified with `aetherctl`
+  on a spiked TS served at real time. Thanks to l984-451 for the report and the full log.
+- **A timestamp jump no longer drains the audio lead on live software sessions without DVR (#1053 follow-up).**
+  At every video jump the combined loop waited for its whole parked video queue (~3.5 s) before flushing the
+  decoder and read no audio meanwhile, so a 4 s audio lead fell to 0.33 s. The flush now runs when the first
+  post-jump packet reaches the head of that queue, and audio keeps flowing (3.30 s minimum lead on the spike,
+  3.37 s with no jump at all).
+- **A PGS set decoded while a seek goes out is no longer drawn at the landing (AE#1022, round 3).** A drain
+  batch planned before the seek, or a tick planned while it was out, still decoded around the departure. It
+  published a set whose clear was unread as open after the seek had closed the open sets, and the clock drew
+  it at the landing until the landing's reset closed it (retest over a reader capped at 10x the bitrate: the
+  set of 22 s on screen for 0.37 s at a 63 s landing). Such a batch is now dropped, and no tick is planned
+  until the seek lands. Not reproduced on the Mac, where these seeks land in a few milliseconds; covered by
+  `Issue1022LandingWindowTests`. Thanks to Desima-AP for the retest.
+- **HDR10 on the software path now reaches the television with its static metadata (#957).** VideoToolbox
+  attaches no mastering display or content light level to the frames it decodes, so the software path sent
+  HDR10 with none, and the television tone-mapped without knowing the master. The decoder now reads the
+  stream's values (from the container, the `hvcC` / `av1C`, or the SEI or AV1 metadata OBUs of the first key
+  frames) and attaches them to every frame. A frame that already carries its own keeps them. The libavcodec
+  decoder (dav1d AV1, VP9, H.264 High 10 from x264, HEVC Rext) sent none either; it now attaches the values
+  its frames carry, or the container's. Covered by `SoftwarePathCarriesStreamHDR10MetadataTests` and
+  `HDR10MetadataFromAV1AndDecodedFramesTests`.
+- **HDR10 HEVC on the software path no longer copies every frame (#957).** VideoToolbox tagged a PQ BT.2020
+  HEVC clip's frames BT.709, so the engine copied each 4K frame to retag it, about 7 ms per frame on an A12
+  Apple TV. The format description now names the stream's colour and HDR10 values, VideoToolbox attaches
+  them itself, and no frame is copied. Values found only in a key frame (common for AV1) go into a new
+  description and session at that key frame, so those streams skip the copy too. Covered by
+  `DecoderFormatCarriesStreamColourAndHDR10Tests`.
+- **The software path's format description follows a change of HDR10 metadata (#957).** The renderer reused
+  its format description while size, pixel format and colour tags stayed the same, so mastering display
+  and content light level values that changed mid-stream never reached the display layer: it kept the
+  first frame's. The values are now part of the cache key. Covered by
+  `FormatDescriptionFollowsHDR10MetadataTests`.
+
+### Changed
+
+- **A frame chain of pass-through stages runs as one kernel (#957).** It turned each frame into a 66 MB RGB
+  texture and back, about 10 ms of GPU time per 4K frame on an A12 Apple TV. A chain whose stages all leave
+  the picture alone, at its own size, now runs as one kernel without that texture, moving four luma samples
+  per access with the colour arithmetic folded: 2.7 ms of GPU time and 4.0 ms in all, the same picture. No
+  playback path builds such a chain yet (line art changes the picture and the size, and keeps the two
+  passes); it is the fast path for chains that only convert, and the benchmark times it. Covered by
+  `FrameChainTests`.
+
+## [7.66.1] - 2026-11-13
+
+### Fixed
+
+- **DTS:X keeps its heights when a smaller bed is asked for.** With `objectAudioRendering` set to 5.1.2,
+  5.1.4 or 7.1.2, DTS:X fell back to the 7.1 channel bridge, so a host that sets the layout to match the
+  room lost DTS:X's heights and the receiver never switched to Atmos. It is now rendered as 7.1.4, the
+  smallest bed that carries its channels one to one, and the receiver maps that onto its speakers.
+  TrueHD Atmos still renders into the layout asked for. Thanks to vZone71 for the report. Covered by
+  `SoftwareAtmosRouteTests` and `DTSXObjectMetadataMappingTests`.
+
+- **`softwareNowPlayingActive` turns true only once the engine's command targets are registered (#1051).**
+  Since 7.64.0 the flag went true before the targets existed, so a host that swaps play, pause and toggle
+  for its own the moment the flag turns true removed nothing, and both answered every press (a toggle
+  cancelled itself). It also stayed true while the engine waited behind another one for the shared
+  surface. It now goes true after registration and false when another engine takes the surface. Thanks
+  to Desima-AP for the report and the measurement. Covered by `NowPlayingRoutingTests`.
+
 ## [7.66.0] - 2026-11-13
 
 ### Added

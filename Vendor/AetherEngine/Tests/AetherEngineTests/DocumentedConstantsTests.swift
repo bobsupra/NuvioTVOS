@@ -596,6 +596,19 @@ final class DocumentedConstantsTests: XCTestCase {
 
     // MARK: - Split-layer join repair (docs/dolby-vision-fel.md)
 
+    func testFramePipelineDepthAndSettleMatchDocumentation() throws {
+        XCTAssertEqual(PipelinedFrameStage.defaultDepth, 2)
+        XCTAssertEqual(PipelinedFrameStage.settleTimeout, 0.5)
+        let docs = try documentation()
+        assertDocumented("It keeps up to two frames on the GPU at once", docs)
+        assertDocumented("`settle()` gives up after 0.5 s", docs)
+    }
+
+    func testHeldPictureFrameWaitMatchesDocumentation() throws {
+        XCTAssertEqual(AetherEngine.defaultHeldPictureFrameWaitSeconds, 0.5)
+        assertDocumented("waits up to 0.5 s for that frame", try documentation())
+    }
+
     func testLayerJoinRepairRunMatchesDocumentation() throws {
         XCTAssertEqual(DolbyVisionLayerJoin<Int>.agreeingRunForRepair, 16)
         assertDocumented("once sixteen units agreed", try felDocument())

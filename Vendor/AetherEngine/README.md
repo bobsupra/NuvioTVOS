@@ -35,11 +35,12 @@ AetherEngine is a video and audio player engine for iOS, tvOS, macOS and visionO
 ## Highlights
 
 - **Plays nearly everything:** MKV, MP4, WebM, MPEG-TS, AVI, WMV, DVD and Blu-ray ISOs and folders, on-demand MPEG-DASH, and every codec FFmpeg knows. [Full list](docs/features.md)
-- **HDR done right:** HDR10, HDR10+, HLG, and Dolby Vision Profiles 5, 7, 8 and AV1 Profile 10. On Apple TV the TV really switches into the matching HDR mode.
+- **HDR done right:** HDR10, HDR10+, HLG, and Dolby Vision Profiles 5, 7, 8, 20 (3D) and AV1 Profile 10. On Apple TV the TV really switches into the matching HDR mode.
 - **Dolby Atmos:** E-AC-3 Atmos is passed through untouched, to HDMI receivers and to AirPods with spatial audio.
 - **Lossless height channels from TrueHD and DTS:X** (the overhead speakers of a Blu-ray Atmos or DTS:X mix), as an optional component.
 - **Audio shaping:** dialogue lift, night mode and a loudness target for quiet films, all opt-in.
 - **Upscaling:** low-resolution SDR video scaled up to the display, with a line-art scaler for animation, opt-in.
+- **Tone mapping:** HDR10 titles brighter than the display mapped down to its peak by the engine instead of the TV, opt-in.
 - **Subtitles of every kind:** text, ASS, PGS, DVB, DVD, teletext, closed captions, external files, and subtitles that survive Picture in Picture and AirPlay.
 - **Live TV:** the engine reads live HLS itself, with DVR timeshift (pause and rewind live TV), recording over the same connection, and recovery when a channel breaks.
 - **Any source:** URLs, your own byte reader (`IOReader`), and SMB shares.
@@ -50,7 +51,7 @@ AetherEngine is a video and audio player engine for iOS, tvOS, macOS and visionO
 Add the package:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.66.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.70.0")
 ```
 
 Play a video:
@@ -132,8 +133,8 @@ AetherEngine follows [Semantic Versioning](https://semver.org). Every `public` d
 ## Used by
 
 <!-- used-by:start -->
-- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
-- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
+- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV, iPhone, iPad and Mac.
+- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native media player for Mac, iPhone and iPad.
 - [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
 - [KSKPix](https://ksktech.dev/kskpix): KSKPix is a premium IPTV player for Live TV, Movies & Series.
 - [Syravo](https://syravo.app): Xtream Codes, Jellyfin and radio client for iPhone, iPad and Apple TV.
@@ -156,6 +157,7 @@ AetherEngine follows [Semantic Versioning](https://semver.org). Every `public` d
 - [Lume](https://github.com/bilipp/Lume/): SwiftUI native open source IPTV and media player for iOS, tvOS and macOS.
 - [Prowlogue](https://prowlogue.app/): Native Apple TV client for the Jellyfin media server.
 - [BoraMin](https://github.com/jonpurdy/boramin): A native, minimal, iCloud-syncing SMB and HTTP(S) video player for tvOS, iPhone, and Mac.
+- [Arcfin](https://git.psmattas.com/ArcFin/ArcFin): A premium native Jellyfin media client for the Apple ecosystem.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).

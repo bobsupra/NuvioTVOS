@@ -81,6 +81,9 @@ protocol AVIOProvider: AnyObject {
     /// AE#782: the demuxer was just repositioned for playback (a producer restart), so the next read
     /// that needs the network is where playback continues, not index work that returns. Default no-op.
     func notePlaybackRepositioned()
+
+    /// AE#472: notify the provider that play/pause intent changed to wake any thread held in paused sleep.
+    func notifyPlayIntentChanged()
 }
 
 extension AVIOProvider {
@@ -88,6 +91,7 @@ extension AVIOProvider {
     func beginIndexPass() {}
     func endIndexPass() {}
     func notePlaybackRepositioned() {}
+    func notifyPlayIntentChanged() {}
     var currentSourceOffset: Int64? { nil }
     var sourceSurvivesReopen: Bool { false }
 }

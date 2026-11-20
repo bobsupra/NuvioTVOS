@@ -262,28 +262,6 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
         }
 
-        guard let ctx = avcodec_alloc_context3(codec) else {
-            throw VideoDecoderError.sessionCreationFailed(status: -1)
-        }
-        codecContext = ctx
-
-        guard avcodec_parameters_to_context(ctx, codecpar) >= 0 else {
-            throw VideoDecoderError.noCodecParameters
-        }
-
-        // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
-        ctx.pointee.get_format = { _, fmts in
-            guard let fmts = fmts else { return AV_PIX_FMT_NONE }
-            var i = 0
-            while fmts[i] != AV_PIX_FMT_NONE {
-                if fmts[i] != AV_PIX_FMT_VIDEOTOOLBOX {
-                    return fmts[i]
-                }
-                i += 1
-            }
-            return AV_PIX_FMT_YUV420P
-        }
-
         let tuning = Dav1dDecodeTuningPolicy.tuning(
             codecID: codecpar.pointee.codec_id,
             width: codecpar.pointee.width,
@@ -292,38 +270,51 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             availableThreadCount: Self.playbackThreadCount(
                 activeProcessorCount: ProcessInfo.processInfo.activeProcessorCount)
         )
-
-        if decodesSingleThreaded {
-            ctx.pointee.thread_count = 1
-            ctx.pointee.thread_type = 0
-        } else {
-            ctx.pointee.thread_count = Int32(tuning.threadCount)
-            ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+        var options: [String: String] = ["hwaccel": "none"]
+        if let maximumFrameDelay = tuning.maximumFrameDelay {
+            options["max_frame_delay"] = "\(maximumFrameDelay)"
         }
 
         // 10-bit AV1 converts on the GPU, and its grain is applied there: dav1d only exports the
         // parameters. Decided before the open, since that is when dav1d reads whether to apply it.
         gpuConverter = nil
-        if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
-           codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
-           let converter = GPUFrameConverter() {
-            gpuConverter = converter
-            ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
-        }
+        let ctx: UnsafeMutablePointer<AVCodecContext>
+        do {
+            ctx = try FFmpegDecoderContext.open(
+                codec: codec, codecpar: codecpar, maxPixels: FFmpegDecoderContext.maxVideoPixels,
+                // Belt-and-suspenders with the get_format rejection: some decoders ignore get_format.
+                options: options
+            ) { ctx in
+                // Reject VideoToolbox pixel format to force pure software decode (some decoders ignore this).
+                ctx.pointee.get_format = FFmpegDecoderContext.softwareOnlyGetFormat
 
-        // Belt-and-suspenders hwaccel=none: some decoders ignore get_format.
-        var opts: OpaquePointer?
-        av_dict_set(&opts, "hwaccel", "none", 0)
-        if let maximumFrameDelay = tuning.maximumFrameDelay {
-            av_dict_set(&opts, "max_frame_delay", "\(maximumFrameDelay)", 0)
-        }
+                if decodesSingleThreaded {
+                    // #544: a still run is one short GOP decoded once. Frame-level threading buys throughput
+                    // nobody is waiting for and costs output delay plus a second worker pool.
+                    ctx.pointee.thread_count = 1
+                    ctx.pointee.thread_type = 0
+                } else {
+                    ctx.pointee.thread_count = Int32(tuning.threadCount)
+                    ctx.pointee.thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE
+                }
 
-        if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
-        guard avcodec_open2(ctx, codec, &opts) >= 0 else {
-            av_dict_free(&opts)
+                if GPUFrameConverter.enabled, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
+                   codecpar.pointee.format == AV_PIX_FMT_YUV420P10LE.rawValue,
+                   let converter = GPUFrameConverter() {
+                    gpuConverter = converter
+                    ctx.pointee.export_side_data |= Int32(AV_CODEC_EXPORT_DATA_FILM_GRAIN)
+                }
+
+                if onCacheTiming != nil { ctx.pointee.flags |= AV_CODEC_FLAG_COPY_OPAQUE }
+            }
+        } catch FFmpegDecoderContext.Failure.allocation {
+            throw VideoDecoderError.sessionCreationFailed(status: -1)
+        } catch FFmpegDecoderContext.Failure.parameters {
+            throw VideoDecoderError.noCodecParameters
+        } catch {
             throw VideoDecoderError.sessionCreationFailed(status: -2)
         }
-        av_dict_free(&opts)
+        codecContext = ctx
 
         containerColor = ColorDescription(codecpar: codecpar)
         containerHDR10 = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
@@ -498,32 +489,9 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
                 if deinterlacer.ensureGraph(frame: f, timeBase: timeBase),
                    deinterlacer.push(f) >= 0 {
                     decodedFormatKey?.deinterlace = deinterlacer.activeDeinterlace
+                    av_frame_unref(f)
                     if filtered == nil { filtered = av_frame_alloc() }
-                    if let out = filtered {
-                        while deinterlacer.pull(into: out) >= 0 {  // filter holds 1-2 frames lookahead; push can yield EAGAIN
-                            // Untimestamped output is unschedulable: yadif's SECOND field is
-                            // cur.pts + next.pts, which is NOPTS whenever either source frame
-                            // lacked a PTS (live TS delivers those); an invalid-PTS sample
-                            // can't be paced by the render synchronizer and can wedge the
-                            // display queue. Drop it; at field rate the neighbor field covers.
-                            if out.pointee.pts == Int64.min {
-                                droppedUntimestampedFields += 1
-                                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
-                                    EngineLog.emit(
-                                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
-                                        category: .swPlayback
-                                    )
-                                }
-                                av_frame_unref(out)
-                                continue
-                            }
-                            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
-                            // halve the link time_base, and send_field puts the two fields of a frame
-                            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
-                            emit(out, timeBase: deinterlacer.outputTimeBase)
-                            av_frame_unref(out)
-                        }
-                    }
+                    if let out = filtered { emitFilteredFramesLocked(out) }
                     lock.unlock()
                     continue
                 }
@@ -537,6 +505,39 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
         av_frame_free(&frame)
         if filtered != nil { av_frame_free(&filtered) }
+    }
+
+    /// Pulls everything the deinterlacer can produce into `out` and emits it. Called under `lock`.
+    /// A pull error other than EAGAIN or EOF drops the graph (DEC-202).
+    private func emitFilteredFramesLocked(_ out: UnsafeMutablePointer<AVFrame>) {
+        while true {
+            let ret = deinterlacer.pull(into: out)  // filter holds 1-2 frames lookahead; push can yield EAGAIN
+            guard ret >= 0 else {
+                deinterlacer.noteGraphError(afterPull: ret)
+                break
+            }
+            // Untimestamped output is unschedulable: yadif's SECOND field is
+            // cur.pts + next.pts, which is NOPTS whenever either source frame
+            // lacked a PTS (live TS delivers those); an invalid-PTS sample
+            // can't be paced by the render synchronizer and can wedge the
+            // display queue. Drop it; at field rate the neighbor field covers.
+            if out.pointee.pts == Int64.min {
+                droppedUntimestampedFields += 1
+                if droppedUntimestampedFields == 1 || droppedUntimestampedFields % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] dropped \(droppedUntimestampedFields) untimestamped deinterlaced frame(s)",
+                        category: .swPlayback
+                    )
+                }
+                av_frame_unref(out)
+                continue
+            }
+            // Filtered PTS rides the sink's time_base, NOT the stream's: yadif/bwdif
+            // halve the link time_base, and send_field puts the two fields of a frame
+            // on odd/even ticks of that halved base (see DeinterlaceFilter class doc).
+            emit(out, timeBase: deinterlacer.outputTimeBase)
+            av_frame_unref(out)
+        }
     }
 
     /// Convert + deliver one decoded (or deinterlaced) frame: skip threshold, pixel buffer
@@ -635,6 +636,17 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.unlock()
         guard ret >= 0 else { return }
         drainDecodedFrames()
+        // DEC-203: the deinterlacer still holds the last picture, waiting for a next one that never comes.
+        lock.lock()
+        defer { lock.unlock() }
+        guard codecContext != nil, deinterlacer.isActive else { return }
+        if deinterlacer.sendEndOfStream() >= 0 {
+            var out = av_frame_alloc()
+            if let out { emitFilteredFramesLocked(out) }
+            av_frame_free(&out)
+        }
+        // An EOF'ed graph takes no more input, whatever the caller's flush asks for.
+        deinterlacer.teardown()
     }
 
     /// `resetFilterGraph: false` keeps the deinterlace graph across still-extraction runs, avoiding

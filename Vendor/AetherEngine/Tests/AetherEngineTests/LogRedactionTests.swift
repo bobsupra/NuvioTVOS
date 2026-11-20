@@ -353,7 +353,7 @@ struct LogRedactionTests {
     @Test("the other backends' credential names are covered", arguments: [
         ("Authorization: Bearer SECRETopaque12345", "Authorization: Bearer <redacted>"),
         ("Authorization: Basic dmluY2VudDpzZWNyZXQxMjM0", "Authorization: Basic <redacted>"),
-        ("Cookie: PHPSESSID=SECRETsess123; other=1", "Cookie: <redacted>; other=1"),
+        ("Cookie: PHPSESSID=SECRETsess123; other=1", "Cookie: <redacted>"),
         ("Set-Cookie: session=SECRETsess123; Path=/", "Set-Cookie: <redacted>; Path=/"),
         ("X-Api-Key: SECRETkey123", "X-Api-Key: <redacted>"),
         ("https://h/a?api-key=SECRETkey123&x=1", "https://h/a?api-key=<redacted>&x=1"),
@@ -406,6 +406,58 @@ struct LogRedactionTests {
         #expect(captured.first?.contains("api_key=<redacted>") == true)
         #expect(captured.first?.contains(token) == false)
         #expect(captured.first?.contains("Static=true") == true)
+    }
+
+    // MARK: - Remaining credential shapes (audit SUB-205, SUB-206)
+
+    @Test("a camelCase credential name is matched, an identifier without an assignment is not", arguments: [
+        ("apiToken=SECRETab12 done", "apiToken=<redacted> done"),
+        ("userToken: SECRETab12", "userToken: <redacted>"),
+        ("plexToken=SECRETab12&x=1", "plexToken=<redacted>&x=1"),
+        ("dbPassword=SECRETab12 ok", "dbPassword=<redacted> ok"),
+        ("[session] hasToken=true refreshTokenAt=120s", "[session] hasToken=true refreshTokenAt=120s"),
+    ])
+    func camelCaseNames(input: String, expected: String) {
+        #expect(LogRedaction.redact(input) == expected)
+    }
+
+    @Test("every pair of a request Cookie header goes, a Set-Cookie keeps its attributes")
+    func cookieHeaderPairs() {
+        #expect(LogRedaction.redact("Cookie: lang=en; PHPSESSID=SECRETabc") == "Cookie: <redacted>")
+        #expect(LogRedaction.redact("Set-Cookie: session=SECRETabc; Path=/") == "Set-Cookie: <redacted>; Path=/")
+    }
+
+    @Test("a Swift optional and an escaped quote do not leave the tail of the value")
+    func optionalAndEscapedQuote() {
+        #expect(LogRedaction.redact(#"api_key: Optional("SECRETabc")"#) == #"api_key: Optional("<redacted>")"#)
+        #expect(LogRedaction.redact(#"{"password":"ab\"cd","x":1}"#) == #"{"password":"<redacted>","x":1}"#)
+    }
+
+    @Test("a short Basic credential after the Authorization name is redacted, prose is not")
+    func shortBasicCredential() {
+        #expect(LogRedaction.redact("Authorization: Basic dTpwYXNz") == "Authorization: Basic <redacted>")
+        #expect(LogRedaction.redact("falling back to basic realm") == "falling back to basic realm")
+    }
+
+    @Test("a raw @ inside the password stays inside the redacted span")
+    func atSignInPassword() {
+        #expect(LogRedaction.redact("smb://user:p@ss@host/share") == "smb://user:<redacted>@host/share")
+        #expect(LogRedaction.redact("see http://a.test and foo@bar") == "see http://a.test and foo@bar")
+    }
+
+    /// The scan used to start at every `e` after a `-` and run to the end of the line, quadratic on
+    /// `e-e-e-...`. The JSON prefilter rejects those starts before any scan; checked directly, since a
+    /// wall-clock bound flaked under the parallel suite.
+    @Test("a long run of e- starts is rejected before any scan")
+    func repeatedEncodedStarts() {
+        let run = Array(("https://h/" + String(repeating: "e-", count: 32 * 1024)).utf8)
+        let starts = run.indices.filter { run[$0] == UInt8(ascii: "e") }
+        #expect(starts.allSatisfy { !LogRedaction.startsLikeJSON(run, at: $0) })
+        #expect(LogRedaction.startsLikeJSON(Array("eyJzdG9y".utf8), at: 0))
+        let line = String(decoding: run, as: UTF8.self)
+        #expect(LogRedaction.redact(line) == line)
+        let blob = "http://addon/v1-eyJzdG9yZXMiOlsiYSJdLCJjIjoiU0VDUkVUeHl6IiwidCI6InQifQ/manifest.json"
+        #expect(!LogRedaction.redact(blob).contains("eyJzdG9yZXM"))
     }
 
     /// `.verbose` never reaches the handler; it still goes to OSLog, which is why redaction sits on the

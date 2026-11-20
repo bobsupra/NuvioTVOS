@@ -205,9 +205,7 @@ final class ClosedCaptionTap: @unchecked Sendable {
         let id = nextID
         nextID += 1
         let cue = SubtitleCue(id: id, startTime: pts, endTime: pts + Self.provisionalDwell, body: .text(text))
-        var lo = 0, hi = cues.count
-        while lo < hi { let m = (lo + hi) / 2; if cues[m].startTime < cue.startTime { lo = m + 1 } else { hi = m } }
-        cues.insert(cue, at: lo)
+        cues.insert(cue, at: AetherEngine.lowerBoundByStartTime(cue.startTime, in: cues))
         openCueID = id
     }
 
@@ -222,8 +220,9 @@ final class ClosedCaptionTap: @unchecked Sendable {
         let snapshot = cues
         let seq = publishSeq
         let idx = ccStreamIndex
-        Task { @MainActor [weak engine] in
-            engine?.updateClosedCaptionCues(snapshot, seq: seq, ccStreamIndex: idx)
+        Task { @MainActor [weak engine, weak self] in
+            guard let self else { return }
+            engine?.updateClosedCaptionCues(snapshot, seq: seq, ccStreamIndex: idx, from: self)
         }
     }
 }
@@ -306,8 +305,14 @@ extension AetherEngine {
     /// Receive the tap's latest cue snapshot (off the pump thread). Drops out-of-order snapshots (the
     /// MainActor hops aren't FIFO) so a stale one can't overwrite a fresher one. Mirror into `subtitleCues`
     /// only while the CC track is the active primary subtitle.
+    ///
+    /// Audit SUB-203: `seq` counts per tap and setup resets the engine's side to 0, so a replaced tap
+    /// still ingesting on an abandoned pump would pass the order check with its old count, and the new
+    /// tap's snapshots would then be dropped until they caught up. Only the current tap is heard.
     @MainActor
-    func updateClosedCaptionCues(_ snapshot: [SubtitleCue], seq: Int, ccStreamIndex: Int32) {
+    func updateClosedCaptionCues(_ snapshot: [SubtitleCue], seq: Int, ccStreamIndex: Int32,
+                                 from tap: ClosedCaptionTap) {
+        guard closedCaptionTap === tap else { return }
         guard seq > ccLastSnapshotSeq else { return }
         ccLastSnapshotSeq = seq
         ccCueSnapshot = snapshot
