@@ -499,6 +499,7 @@ class DetailsViewModel: ObservableObject {
         id: String,
         type: String,
         relatedItemsSnapshot: [RelatedTitle]? = nil,
+        collectionSnapshot: TmdbMovieCollection? = nil,
         relatedPeopleSnapshot: [TmdbPersonMetadata]? = nil,
         relatedCompaniesSnapshot: [MetaCompany]? = nil,
         simklRatingsSnapshot: SimklTitleRatings? = nil
@@ -543,6 +544,7 @@ class DetailsViewModel: ObservableObject {
                 isInWatchlist: SelectedLibraryService.isInLibrary(meta: cached),
                 isWatched: WatchedStore.contains(meta: cached),
                 moreLikeThis: relatedItemsSnapshot ?? [],
+                collection: collectionSnapshot,
                 companies: relatedCompaniesSnapshot ?? [],
                 people: relatedPeopleSnapshot ?? [],
                 simklRatings: simklRatingsSnapshot
@@ -561,12 +563,14 @@ class DetailsViewModel: ObservableObject {
                 isLoading: true,
                 error: nil,
                 moreLikeThis: relatedItemsSnapshot ?? [],
+                collection: collectionSnapshot,
                 companies: relatedCompaniesSnapshot ?? [],
                 people: relatedPeopleSnapshot ?? [],
                 simklRatings: simklRatingsSnapshot
             )
         } else {
             if let relatedItemsSnapshot { uiState.moreLikeThis = relatedItemsSnapshot }
+            if let collectionSnapshot { uiState.collection = collectionSnapshot }
             if let relatedCompaniesSnapshot { uiState.companies = relatedCompaniesSnapshot }
             if let relatedPeopleSnapshot { uiState.people = relatedPeopleSnapshot }
             if let simklRatingsSnapshot { uiState.simklRatings = simklRatingsSnapshot }
@@ -824,6 +828,16 @@ class DetailsViewModel: ObservableObject {
                     }
                 }
 
+                // 2b. TMDB Movie Collection (Chronological release order)
+                if !isSeries && TmdbDetailsService.useCollections {
+                    group.addTask {
+                        let collection = await TmdbDetailsService.fetchCollection(for: meta)
+                        await MainActor.run { [weak self] in
+                            self?.applyCollection(collection, for: meta.id, generation: generation)
+                        }
+                    }
+                }
+
                 // 3. TMDB Episodes (TV series)
                 if isSeries {
                     group.addTask {
@@ -941,6 +955,11 @@ class DetailsViewModel: ObservableObject {
         if !companies.isEmpty {
             uiState.companies = companies
         }
+    }
+
+    private func applyCollection(_ collection: TmdbMovieCollection?, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
+        uiState.collection = collection
     }
 
     private func applyComments(_ comments: [TraktCommentReview], for metaId: String, generation: UInt64) {

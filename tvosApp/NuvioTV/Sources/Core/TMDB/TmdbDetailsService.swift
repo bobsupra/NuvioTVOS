@@ -201,6 +201,7 @@ enum TmdbDetailsService {
     private static let apiBase = URL(string: "https://api.themoviedb.org/3")!
     private static let imageBase = "https://image.tmdb.org/t/p/"
     private static let localizedDetailsCache = TmdbLocalizedDetailsCache()
+    private static let movieCollectionCache = TmdbMovieCollectionCache()
     private static let findCache = TmdbFindCache()
     private static let detailsCache = TmdbDetailsCache()
 
@@ -263,6 +264,7 @@ enum TmdbDetailsService {
     static func clearCache() async {
         await findCache.clear()
         await localizedDetailsCache.clear()
+        await movieCollectionCache.clear()
         await detailsCache.clear()
         session.configuration.urlCache?.removeAllCachedResponses()
     }
@@ -546,6 +548,81 @@ enum TmdbDetailsService {
             mediaType: resolved.mediaType,
             limit: limit
         )
+    }
+
+    /// Fetches the TMDB movie collection franchise that this title belongs to,
+    /// sorted in chronological release order.
+    static func fetchCollection(for meta: NuvioMeta) async -> TmdbMovieCollection? {
+        if requestContext == nil {
+            return await withRequestContext { await fetchCollection(for: meta) }
+        }
+        guard useCollections, isEnabled, apiKey != nil else { return nil }
+        let isSeries = meta.isSeries || isSeries(meta.type)
+        guard !isSeries else { return nil }
+        guard let resolved = await resolveTmdbId(for: meta), resolved.mediaType == "movie" else { return nil }
+        guard let details = await fetchLocalizedDetails(tmdbId: resolved.id, mediaType: "movie"),
+              let belongs = details.belongsToCollection,
+              belongs.id > 0 else {
+            return nil
+        }
+        return await fetchCollectionDetails(collectionId: belongs.id, fallbackName: belongs.name)
+    }
+
+    private static func fetchCollectionDetails(
+        collectionId: Int,
+        fallbackName: String?
+    ) async -> TmdbMovieCollection? {
+        guard let apiKey else { return nil }
+        let cacheKey = "\(collectionId):\(preferredLanguage)"
+        let cacheGeneration = await movieCollectionCache.snapshotGeneration()
+        if let cached = await movieCollectionCache.value(for: cacheKey) {
+            return cached
+        }
+        var components = URLComponents(
+            url: apiBase.appendingPathComponent("collection/\(collectionId)"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: preferredLanguage)
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await data(for: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(TmdbMovieCollectionResponse.self, from: data) else {
+            return nil
+        }
+
+        let sortedParts = (decoded.parts ?? []).sorted { a, b in
+            let dateA = a.releaseDate ?? ""
+            let dateB = b.releaseDate ?? ""
+            if dateA.isEmpty && dateB.isEmpty { return a.id < b.id }
+            if dateA.isEmpty { return false }
+            if dateB.isEmpty { return true }
+            return dateA < dateB
+        }
+
+        let items = sortedParts.compactMap { mapDiscoverItemFast($0, defaultType: "movie") }
+        guard !items.isEmpty else { return nil }
+
+        let name = (decoded.name ?? fallbackName)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let collectionName = (name?.isEmpty == false)
+            ? name!
+            : L10n.string("settings_tmdb_module_collections", fallback: "Collections")
+
+        let result = TmdbMovieCollection(
+            id: decoded.id,
+            name: collectionName,
+            overview: decoded.overview?.trimmingCharacters(in: .whitespacesAndNewlines),
+            posterURL: imageURL(decoded.posterPath, size: "w500"),
+            backdropURL: imageURL(decoded.backdropPath, size: "w1280"),
+            items: items
+        )
+
+        await movieCollectionCache.insert(result, for: cacheKey, ifGeneration: cacheGeneration)
+        return result
     }
 
     /// Fetches full season and episode listings from TMDB, enabling unreleased/TBD episodes
@@ -1802,6 +1879,33 @@ private actor TmdbFindCache {
     }
 }
 
+private actor TmdbMovieCollectionCache {
+    private var values = TmdbResponseCache<TmdbMovieCollection>(capacity: 128)
+    private var generation: UInt64 = 0
+
+    func snapshotGeneration() -> UInt64 {
+        generation
+    }
+
+    func value(for key: String) -> TmdbMovieCollection? {
+        values.value(for: key)
+    }
+
+    func insert(
+        _ value: TmdbMovieCollection,
+        for key: String,
+        ifGeneration expectedGeneration: UInt64
+    ) {
+        guard generation == expectedGeneration else { return }
+        values.insert(value, for: key)
+    }
+
+    func clear() {
+        generation &+= 1
+        values.removeAll()
+    }
+}
+
 private actor TmdbLocalizedDetailsCache {
     private var values = TmdbResponseCache<TmdbLocalizedDetailsResponse>(capacity: 256)
     private var generation: UInt64 = 0
@@ -1829,6 +1933,34 @@ private actor TmdbLocalizedDetailsCache {
     }
 }
 
+private struct TmdbBelongsToCollectionDTO: Decodable {
+    let id: Int
+    let name: String?
+    let posterPath: String?
+    let backdropPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name
+        case posterPath = "poster_path"
+        case backdropPath = "backdrop_path"
+    }
+}
+
+private struct TmdbMovieCollectionResponse: Decodable {
+    let id: Int
+    let name: String?
+    let overview: String?
+    let posterPath: String?
+    let backdropPath: String?
+    let parts: [TmdbListItem]?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, overview, parts
+        case posterPath = "poster_path"
+        case backdropPath = "backdrop_path"
+    }
+}
+
 private struct TmdbLocalizedDetailsResponse: Decodable {
     let title: String?
     let name: String?
@@ -1843,6 +1975,7 @@ private struct TmdbLocalizedDetailsResponse: Decodable {
     let genres: [TmdbGenreDTO]?
     let contentRatings: TmdbTvContentRatingsContainer?
     let releaseDates: TmdbMovieReleaseDatesContainer?
+    let belongsToCollection: TmdbBelongsToCollectionDTO?
 
     enum CodingKeys: String, CodingKey {
         case title, name, overview, genres, translations
@@ -1854,6 +1987,7 @@ private struct TmdbLocalizedDetailsResponse: Decodable {
         case images
         case contentRatings = "content_ratings"
         case releaseDates = "release_dates"
+        case belongsToCollection = "belongs_to_collection"
     }
 }
 

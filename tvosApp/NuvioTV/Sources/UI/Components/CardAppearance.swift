@@ -30,6 +30,9 @@ struct CardAppearance: Equatable {
         var appearance = CardAppearance()
         if let value = defaults.string(forKey: SettingsKey.customPosterURLPattern) { appearance.customPosterURLPattern = value }
         if let value = defaults.string(forKey: SettingsKey.customPosterEnabledScreens) { appearance.customPosterEnabledScreens = value }
+        if !appearance.customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            appearance.customPosterEnabledScreens = "all"
+        }
         if let value = defaults.object(forKey: SettingsKey.trailersEnabled) as? Bool { appearance.trailersEnabled = value }
         if let value = defaults.object(forKey: SettingsKey.trailerDelay) as? Int { appearance.trailerDelay = value }
         if let value = defaults.string(forKey: SettingsKey.cardCornerRadius) { appearance.cardCornerRadius = value }
@@ -82,11 +85,14 @@ struct CardAppearanceProvider: ViewModifier {
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
 
     func body(content: Content) -> some View {
+        let effectiveScreens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? customPosterEnabledScreens
+            : "all"
         content.environment(
             \.cardAppearance,
             CardAppearance(
                 customPosterURLPattern: customPosterURLPattern,
-                customPosterEnabledScreens: customPosterEnabledScreens,
+                customPosterEnabledScreens: effectiveScreens,
                 trailersEnabled: trailersEnabled,
                 trailerDelay: trailerDelay,
                 cardCornerRadius: cardCornerRadius,

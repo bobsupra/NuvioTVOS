@@ -394,6 +394,7 @@ struct DetailsNavigationEntry {
 
 enum DetailsFocusTargetKind: Hashable {
     case moreLikeThis
+    case collection
     case cast
     case network
     case production
@@ -412,6 +413,7 @@ struct DetailsRelatedItemsSnapshot {
     let peopleAreFallback: Bool
     let companies: [MetaCompany]
     let simklRatings: SimklTitleRatings?
+    let collection: TmdbMovieCollection?
     let profileID: String?
     let source: String
     let language: String
@@ -432,11 +434,12 @@ struct DetailsRelatedItemsSnapshot {
         people: [TmdbPersonMetadata],
         peopleAreFallback: Bool = false,
         companies: [MetaCompany] = [],
-        simklRatings: SimklTitleRatings?
+        simklRatings: SimklTitleRatings?,
+        collection: TmdbMovieCollection? = nil
     ) -> DetailsRelatedItemsSnapshot? {
         let isKnown: Bool
         switch focusTarget.kind {
-        case .moreLikeThis:
+        case .moreLikeThis, .collection:
             isKnown = items.contains(where: { $0.id == focusTarget.itemID })
         case .cast:
             isKnown = people.contains(where: { $0.id == focusTarget.itemID })
@@ -452,6 +455,7 @@ struct DetailsRelatedItemsSnapshot {
             peopleAreFallback: peopleAreFallback,
             companies: companies,
             simklRatings: simklRatings,
+            collection: collection,
             profileID: ProfileSettings.activeProfileID,
             source: TraktSettingsStore.moreLikeThisSource.rawValue,
             language: TmdbDetailsService.preferredLanguage,
@@ -3384,7 +3388,7 @@ struct ContentView: View {
             onCreateWatchParty: WatchPartyConfiguration.isEnabled ? { meta, episode in
                 createWatchPartyFromDetails(meta: meta, episode: episode)
             } : nil,
-            onOpenTitle: { nextId, nextType, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings in
+            onOpenTitle: { nextId, nextType, focusTarget, displayedRelatedItems, displayedPeople, displayedCompanies, displayedSimklRatings, displayedCollection in
                 pendingDetailsFocusRequest = nil
                 var relatedSnapshot: DetailsRelatedItemsSnapshot? = nil
                 if let focusTarget, let displayedRelatedItems {
@@ -3395,7 +3399,8 @@ struct ContentView: View {
                         items: displayedRelatedItems,
                         people: displayedPeople,
                         companies: displayedCompanies,
-                        simklRatings: displayedSimklRatings
+                        simklRatings: displayedSimklRatings,
+                        collection: displayedCollection
                     )
                 }
                 let transition = DetailsNavigationContextTransition.pushingCurrentDetails(
@@ -5023,77 +5028,35 @@ private struct TVMainTabView: View {
                 .tabItem { Label(TVTab.home.title, systemImage: TVTab.home.symbol) }
                 .tag(TVTab.home)
             if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
-                Group {
-                    if selectedTab == .party {
-                        partyTabContent
-                    } else {
-                        Color.clear
-                    }
-                }
-                .tabItem { Label(TVTab.party.title, systemImage: TVTab.party.symbol) }
-                .tag(TVTab.party)
+                partyTabContent
+                    .tabItem { Label(TVTab.party.title, systemImage: TVTab.party.symbol) }
+                    .tag(TVTab.party)
             }
-            Group {
-                if selectedTab == .search {
-                    searchTab
-                        .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .search)
-                } else {
-                    Color.clear
-                }
-            }
-            .tabItem { Label(TVTab.search.title, systemImage: TVTab.search.symbol) }
-            .tag(TVTab.search)
-            Group {
-                if selectedTab == .library {
-                    libraryTabContent
-                        .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .library)
-                } else {
-                    Color.clear
-                }
-            }
-            .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
-            .tag(TVTab.library)
+            searchTab
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .search)
+                .tabItem { Label(TVTab.search.title, systemImage: TVTab.search.symbol) }
+                .tag(TVTab.search)
+            libraryTabContent
+                .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .library)
+                .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
+                .tag(TVTab.library)
             if TVTab.isIPTVEnabled && nativeIPTVEnabled {
-                Group {
-                    if selectedTab == .liveTV {
-                        liveTVTabContent
-                    } else {
-                        Color.clear
-                    }
-                }
-                .tabItem { liveTVTabLabel }
-                .tag(TVTab.liveTV)
+                liveTVTabContent
+                    .tabItem { liveTVTabLabel }
+                    .tag(TVTab.liveTV)
             }
             if showCalendarTab {
-                Group {
-                    if selectedTab == .calendar {
-                        calendarTabContent
-                    } else {
-                        Color.clear
-                    }
-                }
-                .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
-                .tag(TVTab.calendar)
+                calendarTabContent
+                    .tabItem { Label(TVTab.calendar.title, systemImage: TVTab.calendar.symbol) }
+                    .tag(TVTab.calendar)
             }
             if showSurpriseMeTab {
-                Group {
-                    if selectedTab == .surprise {
-                        surpriseMeTabContent
-                    } else {
-                        Color.clear
-                    }
-                }
-                .tabItem { Label(TVTab.surprise.title, systemImage: TVTab.surprise.symbol) }
-                .tag(TVTab.surprise)
+                surpriseMeTabContent
+                    .tabItem { Label(TVTab.surprise.title, systemImage: TVTab.surprise.symbol) }
+                    .tag(TVTab.surprise)
             }
-            Group {
-                if selectedTab == .settings {
-                    settingsTabContent
-                } else {
-                    Color.clear
-                }
-            }
-            .tabItem { settingsTabLabel }.tag(TVTab.settings)
+            settingsTabContent
+                .tabItem { settingsTabLabel }.tag(TVTab.settings)
             ForEach(directCollectionDestinations + genreCollectionDestinations) { destination in
                 collectionTabContent(destination)
                     .tabItem { collectionTabLabel(destination) }
@@ -5152,26 +5115,14 @@ private struct TVMainTabView: View {
         }
         if WatchPartyConfiguration.isEnabled && showWatchPartyTab {
             Tab(TVTab.party.title, systemImage: TVTab.party.symbol, value: TVTab.party) {
-                if selectedTab == .party {
-                    partyTabContent
-                } else {
-                    Color.clear
-                }
+                partyTabContent
             }
         }
         Tab(TVTab.search.title, systemImage: TVTab.search.symbol, value: TVTab.search) {
-            if selectedTab == .search {
-                searchTab
-            } else {
-                Color.clear
-            }
+            searchTab
         }
         Tab(TVTab.library.title, systemImage: TVTab.library.symbol, value: TVTab.library) {
-            if selectedTab == .library {
-                libraryTabContent
-            } else {
-                Color.clear
-            }
+            libraryTabContent
         }
     }
 
@@ -5185,37 +5136,21 @@ private struct TVMainTabView: View {
             coreTabs
             if TVTab.isIPTVEnabled && nativeIPTVEnabled {
                 Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
-                    if selectedTab == .liveTV {
-                        liveTVTabContent
-                    } else {
-                        Color.clear
-                    }
+                    liveTVTabContent
                 }
             }
             if showCalendarTab {
                 Tab(TVTab.calendar.title, systemImage: TVTab.calendar.symbol, value: TVTab.calendar) {
-                    if selectedTab == .calendar {
-                        calendarTabContent
-                    } else {
-                        Color.clear
-                    }
+                    calendarTabContent
                 }
             }
             if showSurpriseMeTab {
                 Tab(TVTab.surprise.title, systemImage: TVTab.surprise.symbol, value: TVTab.surprise) {
-                    if selectedTab == .surprise {
-                        surpriseMeTabContent
-                    } else {
-                        Color.clear
-                    }
+                    surpriseMeTabContent
                 }
             }
             Tab(value: TVTab.settings) {
-                if selectedTab == .settings {
-                    settingsTabContent
-                } else {
-                    Color.clear
-                }
+                settingsTabContent
             } label: { settingsTabLabel }
             // A tab builder takes at most 10 direct children.
             Group {
@@ -5727,76 +5662,17 @@ private struct TVTopBarSelectionSynchronizer: UIViewRepresentable {
 #endif
 
 /// Experimental: associate Home's vertical rows with the system's top bar.
-/// The marker lives inside the scroll content, so its closest scroll ancestor
-/// is the intended vertical container rather than one of the horizontal rows.
 private struct TVTopBarScrollLink: UIViewRepresentable {
     let enabled: Bool
 
-    func makeUIView(context: Context) -> Marker {
-        let marker = Marker()
-        marker.isUserInteractionEnabled = false
-        marker.backgroundColor = .clear
-        return marker
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.isUserInteractionEnabled = false
+        view.backgroundColor = .clear
+        return view
     }
 
-    func updateUIView(_ view: Marker, context: Context) {
-        view.setEnabled(enabled)
-    }
-
-    static func dismantleUIView(_ view: Marker, coordinator: ()) {
-        view.setEnabled(false)
-    }
-
-    final class Marker: UIView {
-        private weak var linkedController: UIViewController?
-        private weak var linkedScroll: UIScrollView?
-        private var enabled = false
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            scheduleUpdate()
-        }
-
-        override func didMoveToSuperview() {
-            super.didMoveToSuperview()
-            scheduleUpdate()
-        }
-
-        func setEnabled(_ value: Bool) {
-            enabled = value
-            if !value { unlink() }
-            else { scheduleUpdate() }
-        }
-
-        private func scheduleUpdate() {
-            DispatchQueue.main.async { [weak self] in self?.updateLink() }
-        }
-
-        private func updateLink() {
-            guard enabled, window != nil else { unlink(); return }
-            var ancestor = superview
-            while ancestor != nil && !(ancestor is UIScrollView) { ancestor = ancestor?.superview }
-            guard let scroll = ancestor as? UIScrollView else { unlink(); return }
-            var responder: UIResponder? = self
-            while let current = responder, !(current is UIViewController) { responder = current.next }
-            guard let controller = responder as? UIViewController,
-                  !(controller is UINavigationController), !(controller is UITabBarController) else { unlink(); return }
-            if linkedController === controller && linkedScroll === scroll { return }
-            unlink()
-            controller.setContentScrollView(scroll, for: .top)
-            linkedController = controller
-            linkedScroll = scroll
-        }
-
-        private func unlink() {
-            if let controller = linkedController, let scroll = linkedScroll,
-               controller.contentScrollView(for: .top) === scroll {
-                controller.setContentScrollView(nil, for: .top)
-            }
-            linkedController = nil
-            linkedScroll = nil
-        }
-    }
+    func updateUIView(_ uiView: UIView, context: Context) {}
 }
 #endif
 

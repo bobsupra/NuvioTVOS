@@ -1621,11 +1621,14 @@ struct PosterGridCard: View {
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
 
     private var customPosterArtworkURL: String? {
-        CustomPosterURLResolver.resolve(
+        let screens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? customPosterEnabledScreens
+            : "all"
+        return CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: meta,
             screen: customPosterScreen,
-            enabledScreens: customPosterEnabledScreens,
+            enabledScreens: screens,
             shape: meta.tileShape == .square ? "square" : "poster"
         )
     }

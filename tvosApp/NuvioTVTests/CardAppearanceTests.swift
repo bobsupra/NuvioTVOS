@@ -56,6 +56,19 @@ final class CardAppearanceTests: XCTestCase {
         XCTAssertTrue(appearance.hideUnwatchedEpisodeDescriptions)
     }
 
+    func testCustomPosterArtworkAppliesToAllScreensWhenURLIsPresent() {
+        let suite = "nuvio.tests.cardAppearance.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set("https://example.com/poster?id={id}", forKey: SettingsKey.customPosterURLPattern)
+        defaults.set("home", forKey: SettingsKey.customPosterEnabledScreens)
+
+        let appearance = CardAppearance.stored(in: defaults)
+        XCTAssertEqual(appearance.customPosterURLPattern, "https://example.com/poster?id={id}")
+        XCTAssertEqual(appearance.customPosterEnabledScreens, "all")
+    }
+
     func testDetailsBackdropIsBlurredOnceAtASmallSize() throws {
         let format = UIGraphicsImageRendererFormat()
         format.scale = 1

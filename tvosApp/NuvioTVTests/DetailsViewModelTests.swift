@@ -703,4 +703,58 @@ final class DetailsViewModelTests: XCTestCase {
         XCTAssertEqual(viewModel.uiState.people.first?.id, person.id)
         XCTAssertEqual(viewModel.uiState.companies.first?.id, company.id)
     }
+
+    func testLoadDetailsSeedsCollectionSnapshotImmediately() {
+        let item1 = RelatedTitle(id: "tmdb:101", name: "Iron Man", type: "movie", posterURL: nil, backdropURL: nil, year: 2008)
+        let item2 = RelatedTitle(id: "tmdb:102", name: "Iron Man 2", type: "movie", posterURL: nil, backdropURL: nil, year: 2010)
+        let collection = TmdbMovieCollection(
+            id: 555,
+            name: "Iron Man Collection",
+            overview: "Iron Man film series",
+            posterURL: nil,
+            backdropURL: nil,
+            items: [item1, item2]
+        )
+
+        let task = viewModel.loadDetails(
+            id: "tt0816692",
+            type: "movie",
+            collectionSnapshot: collection
+        )
+        defer { task.cancel() }
+
+        // Immediately seeded on frame 0
+        XCTAssertEqual(viewModel.uiState.collection?.id, 555)
+        XCTAssertEqual(viewModel.uiState.collection?.name, "Iron Man Collection")
+        XCTAssertEqual(viewModel.uiState.collection?.items.count, 2)
+        XCTAssertEqual(viewModel.uiState.collection?.items.first?.id, "tmdb:101")
+    }
+
+    func testDetailsRelatedItemsSnapshotCapturesCollectionTarget() {
+        let item = RelatedTitle(id: "tmdb:101", name: "Iron Man", type: "movie", posterURL: nil, backdropURL: nil, year: 2008)
+        let collection = TmdbMovieCollection(
+            id: 555,
+            name: "Iron Man Collection",
+            overview: nil,
+            posterURL: nil,
+            backdropURL: nil,
+            items: [item]
+        )
+
+        let snapshot = DetailsRelatedItemsSnapshot.capture(
+            parentID: "tt0816692",
+            parentType: "movie",
+            focusTarget: DetailsFocusTarget(kind: .collection, itemID: item.id),
+            items: [item],
+            people: [],
+            companies: [],
+            simklRatings: nil,
+            collection: collection
+        )
+
+        XCTAssertNotNil(snapshot)
+        XCTAssertEqual(snapshot?.collection?.id, 555)
+        XCTAssertEqual(snapshot?.collection?.name, "Iron Man Collection")
+        XCTAssertEqual(snapshot?.items.count, 1)
+    }
 }

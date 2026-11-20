@@ -18,6 +18,8 @@ struct CollectionHomeTab: View {
 
     @StateObject private var model: CollectionHomeModel
     @State private var focusedFailureActionID: String?
+    @State private var isSettledActive = false
+    @State private var settleTask: Task<Void, Never>?
 
     init(
         destination: CollectionHomeDestination,
@@ -50,16 +52,25 @@ struct CollectionHomeTab: View {
 
     var body: some View {
         Group {
-            if isActive {
+            if isSettledActive {
                 home
             } else {
                 Color.clear
             }
         }
+        .onAppear {
+            if isActive && !isSettledActive {
+                scheduleActivation()
+            }
+        }
+        .onDisappear {
+            cancelActivation()
+        }
         .onChange(of: isActive) { _, active in
-            if !active {
-                model.releaseCatalogs()
-                focusedFailureActionID = nil
+            if active {
+                scheduleActivation()
+            } else {
+                cancelActivation()
             }
         }
         .onChange(of: model.failures.map(\.id)) { _, failureIDs in
@@ -67,6 +78,27 @@ struct CollectionHomeTab: View {
                 self.focusedFailureActionID = nil
             }
         }
+    }
+
+    private func scheduleActivation() {
+        settleTask?.cancel()
+        settleTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, isActive else { return }
+            isSettledActive = true
+        }
+    }
+
+    private func cancelActivation() {
+        settleTask?.cancel()
+        settleTask = nil
+        isSettledActive = false
+        model.releaseCatalogs()
+        focusedFailureActionID = nil
     }
 
     private var hasPartialFailures: Bool {
@@ -77,7 +109,7 @@ struct CollectionHomeTab: View {
         TVHomeView(
             store: model.store,
             repository: CinemetaCatalogRepository(),
-            isActive: isActive,
+            isActive: isSettledActive,
             isFullScreenOverlayPresented: isFullScreenOverlayPresented,
             isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
             isVisibleCardMenuPresented: isVisibleCardMenuPresented,

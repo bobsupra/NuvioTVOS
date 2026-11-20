@@ -197,6 +197,110 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertFalse(shouldGrant(request, .aether, true), "One load can receive only one additional window")
     }
 
+    @MainActor
+    func testMPVStartupWatchdogGraceTracksCurrentOpeningEntryRatherThanUILoading() {
+        let coordinator = PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        defer { coordinator.stopAll() }
+
+        let remoteVOD = PlaybackLoadRequest(videoURL: URL(string: "https://example.test/movie.mp4")!)
+        coordinator.load(remoteVOD)
+        let firstGeneration = coordinator.loadGeneration
+        let witness = coordinator.mpvController.loadfileOpenWitness
+        coordinator.mpvController.isPlayerLoading = false
+
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "A dispatched request waiting for loadfile submission has no grace")
+
+        witness.arm(entryID: nil)
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "A failed or unidentified loadfile submission cannot claim grace")
+
+        witness.arm(entryID: 41)
+        XCTAssertTrue(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "A paused MPV loadfile entry still opening on a remote VOD receives grace")
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: true
+        ), "One load can receive only one additional window")
+
+        witness.finishOpening(entryID: 40)
+        XCTAssertTrue(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "A stale terminal event cannot clear the current MPV entry")
+        witness.finishOpening(entryID: 41, redirectTo: 45)
+        XCTAssertEqual(witness.openingEntryID, 45, "REDIRECT moves the witness to its inserted playlist entry")
+        XCTAssertTrue(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "A redirected entry remains eligible while it is still opening")
+        witness.finishOpening(entryID: 41)
+        XCTAssertTrue(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "A stale source-entry terminal event cannot clear its redirect target")
+        witness.finishOpening(entryID: 45)
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: firstGeneration,
+            graceAlreadyGranted: false
+        ), "FILE_LOADED clears grace for the redirected entry")
+
+        coordinator.load(remoteVOD)
+        let replacementGeneration = coordinator.loadGeneration
+        witness.reset()
+        witness.arm(entryID: 42)
+        witness.finishOpening(entryID: 41)
+        XCTAssertTrue(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: replacementGeneration,
+            graceAlreadyGranted: false
+        ), "A stale prior-entry terminal event cannot clear a replacement load")
+
+        witness.finishOpening(entryID: 42)
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: replacementGeneration,
+            graceAlreadyGranted: false
+        ), "A matching terminal event clears the replacement load")
+
+        for request in [
+            PlaybackLoadRequest(
+                videoURL: URL(string: "https://example.test/channel.ts")!,
+                isLiveStream: true
+            ),
+            PlaybackLoadRequest(
+                videoURL: URL(string: "https://example.test/event.mp4")!,
+                isSports: true
+            )
+        ] {
+            coordinator.load(request)
+            let generation = coordinator.loadGeneration
+            witness.reset()
+            witness.arm(entryID: 43)
+            XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+                generation: generation,
+                graceAlreadyGranted: false
+            ), "Live and sports requests keep the existing no-grace scope")
+        }
+
+        coordinator.load(remoteVOD)
+        let stoppingGeneration = coordinator.loadGeneration
+        witness.arm(entryID: 44)
+        coordinator.stopAll()
+        XCTAssertFalse(witness.isOpening, "Destroying MPV clears the open-entry witness")
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: stoppingGeneration,
+            graceAlreadyGranted: false
+        ), "A stopped coordinator load cannot receive grace")
+    }
+
     func testDebridAndTorrentAcceptISOExtensions() {
         XCTAssertTrue(DebridVideo.isPlayable("Movie.1080p.BluRay.iso"))
         XCTAssertTrue(DebridVideo.isPlayable("Disc.IMG"))

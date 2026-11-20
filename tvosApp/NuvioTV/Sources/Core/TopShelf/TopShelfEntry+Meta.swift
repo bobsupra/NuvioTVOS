@@ -65,7 +65,7 @@ enum TopShelfCustomPosters {
         let store = ProfileSettings.current
         let pattern = store.string(forKey: SettingsKey.customPosterURLPattern) ?? ""
         guard !pattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return (nil, nil) }
-        let screens = store.string(forKey: SettingsKey.customPosterEnabledScreens)
+        let screens = "all"
         func resolved(_ shape: String) -> String? {
             CustomPosterURLResolver.resolve(
                 pattern: pattern, meta: meta, screen: screen, enabledScreens: screens, shape: shape)

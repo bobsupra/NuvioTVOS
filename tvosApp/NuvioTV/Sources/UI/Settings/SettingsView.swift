@@ -2914,17 +2914,22 @@ private struct AppearanceSettingsView: View {
                         let committedPattern = CustomPosterURLResolver.sanitizePattern(customPosterURLDraft)
                         customPosterURLDraft = committedPattern
                         customPosterURLPattern = committedPattern
+                        if !committedPattern.isEmpty {
+                            customPosterEnabledScreens = "all"
+                        }
                     }
                 )
                 .onAppear {
                     customPosterURLDraft = customPosterURLPattern
+                    if !customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        customPosterEnabledScreens = "all"
+                    }
                 }
                 .onChange(of: customPosterURLPattern) { _, newPattern in
                     customPosterURLDraft = newPattern
-                }
-
-                if !customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    customPosterScreens
+                    if !newPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        customPosterEnabledScreens = "all"
+                    }
                 }
             }
 
@@ -3077,6 +3082,9 @@ private struct AppearanceSettingsView: View {
             ProfileSettings.notifySettingsChanged()
         }
         .onChange(of: customPosterURLPattern) { oldPattern, newPattern in
+            if !newPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                customPosterEnabledScreens = "all"
+            }
             if oldPattern != newPattern {
                 Task {
                     await PosterArtworkCache.clearAllArtwork()
@@ -3091,36 +3099,6 @@ private struct AppearanceSettingsView: View {
                 }
             }
             ProfileSettings.notifySettingsChanged()
-        }
-    }
-
-    private func customPosterScreenBinding(for screen: CustomPosterScreen) -> Binding<Bool> {
-        Binding(
-            get: {
-                CustomPosterScreen.fromStorageValue(customPosterEnabledScreens).contains(screen)
-            },
-            set: { isEnabled in
-                var screens = CustomPosterScreen.fromStorageValue(customPosterEnabledScreens)
-                if isEnabled {
-                    screens.insert(screen)
-                } else {
-                    screens.remove(screen)
-                }
-                customPosterEnabledScreens = CustomPosterScreen.storageValue(for: screens)
-            }
-        )
-    }
-
-    @ViewBuilder
-    private var customPosterScreens: some View {
-        let screens = CustomPosterScreen.allCases.filter { $0 != .tvRecommendations }
-        ForEach(screens) { screen in
-            SettingsToggleRow(
-                title: "Apply to \(screen.title)",
-                subtitle: "Use custom poster artwork on \(screen.title.lowercased()) cards.",
-                isOn: customPosterScreenBinding(for: screen),
-                accentColor: accentColor
-            )
         }
     }
 }
@@ -5664,6 +5642,7 @@ private struct IntegrationSettingsView: View {
     @AppStorage private var wetrakrClientID: String
     @AppStorage private var wetrakrClientSecret: String
     @AppStorage private var nuvioSyncScrobbleEnabled: Bool
+    @AppStorage private var watchProgressSource: TraktWatchProgressSource
     @State private var traktClientIDDraft: String
     @State private var traktClientSecretDraft: String
     @State private var traktRedirectURIDraft: String
@@ -5718,6 +5697,11 @@ private struct IntegrationSettingsView: View {
         self.accentColor = accentColor
         let profileStore = ProfileSettings.store(for: profileID)
         self.profileStore = profileStore
+        _watchProgressSource = AppStorage(
+            wrappedValue: TraktDefaults.watchProgressSource,
+            SettingsKey.traktWatchProgressSource,
+            store: profileStore
+        )
         let storedTraktRedirectURI = TraktConfig.redirectURI(in: profileStore)
         let trimmedProfileID = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let profileScope = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
@@ -5847,17 +5831,20 @@ private struct IntegrationSettingsView: View {
                     accentColor: accentColor
                 )
 
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_nuvio_sync_scrobble", fallback: "Nuvio Sync"),
-                    subtitle: L10n.string(
-                        "tvos_settings_nuvio_sync_scrobble_subtitle",
-                        fallback: "Also save playback progress and watched episodes when another source is selected."
-                    ),
-                    isOn: $nuvioSyncScrobbleEnabled,
-                    accentColor: accentColor
-                )
+                if watchProgressSource != .nuvioSync {
+                    SettingsToggleRow(
+                        title: L10n.string("tvos_settings_nuvio_sync_scrobble", fallback: "Nuvio Sync"),
+                        subtitle: L10n.string(
+                            "tvos_settings_nuvio_sync_scrobble_subtitle",
+                            fallback: "Also save playback progress and watched episodes when another source is selected."
+                        ),
+                        isOn: $nuvioSyncScrobbleEnabled,
+                        accentColor: accentColor
+                    )
+                }
 
-                if RemoteTrackingState.isProgressSourceAuthenticated(.trakt, in: ProfileSettings.current) {
+                if watchProgressSource != .trakt,
+                   RemoteTrackingState.isProgressSourceAuthenticated(.trakt, in: profileStore) {
                     SettingsToggleRow(
                         title: L10n.string("tvos_settings_trakt_scrobble", fallback: "Trakt Scrobble"),
                         subtitle: L10n.string("tvos_settings_trakt_scrobble_subtitle", fallback: "Broadcast playback progress and watched updates to Trakt"),
@@ -5869,7 +5856,8 @@ private struct IntegrationSettingsView: View {
                     )
                 }
 
-                if RemoteTrackingState.isProgressSourceAuthenticated(.simkl, in: ProfileSettings.current) {
+                if watchProgressSource != .simkl,
+                   RemoteTrackingState.isProgressSourceAuthenticated(.simkl, in: profileStore) {
                     SettingsToggleRow(
                         title: L10n.string("tvos_settings_simkl_scrobble", fallback: "Simkl Scrobble"),
                         subtitle: L10n.string("tvos_settings_simkl_scrobble_subtitle", fallback: "Broadcast playback progress and watched updates to Simkl"),
@@ -5881,7 +5869,8 @@ private struct IntegrationSettingsView: View {
                     )
                 }
 
-                if RemoteTrackingState.isProgressSourceAuthenticated(.mdblist, in: ProfileSettings.current) {
+                if watchProgressSource != .mdblist,
+                   RemoteTrackingState.isProgressSourceAuthenticated(.mdblist, in: profileStore) {
                     SettingsToggleRow(
                         title: L10n.string("tvos_settings_mdblist_scrobble", fallback: "MDBList Scrobble"),
                         subtitle: L10n.string("tvos_settings_mdblist_scrobble_subtitle", fallback: "Broadcast playback progress and watched updates to MDBList"),
@@ -5893,7 +5882,8 @@ private struct IntegrationSettingsView: View {
                     )
                 }
 
-                if RemoteTrackingState.isProgressSourceAuthenticated(.wetrakr, in: ProfileSettings.current) {
+                if watchProgressSource != .wetrakr,
+                   RemoteTrackingState.isProgressSourceAuthenticated(.wetrakr, in: profileStore) {
                     SettingsToggleRow(
                         title: L10n.string("tvos_settings_wetrakr_scrobble", fallback: "WeTrakr Scrobble"),
                         subtitle: L10n.string("tvos_settings_wetrakr_scrobble_subtitle", fallback: "Broadcast playback progress and watched updates to WeTrakr"),
@@ -6315,7 +6305,11 @@ private struct IntegrationSettingsView: View {
             TraktDeviceLoginSheet(viewModel: traktViewModel, accentColor: accentColor)
         }
         .sheet(isPresented: $showingTraktSettings) {
-            TraktConnectedSettingsSheet(viewModel: traktViewModel, accentColor: accentColor)
+            TraktConnectedSettingsSheet(
+                viewModel: traktViewModel,
+                accentColor: accentColor,
+                watchProgressSource: $watchProgressSource
+            )
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(isPresented: $showingSimklLogin, onDismiss: {
@@ -6329,6 +6323,7 @@ private struct IntegrationSettingsView: View {
             SimklConnectedSettingsSheet(
                 viewModel: simklViewModel,
                 accentColor: accentColor,
+                watchProgressSource: $watchProgressSource,
                 onReconnect: {
                     showingSimklSettings = false
                     Task { @MainActor in
@@ -6348,7 +6343,11 @@ private struct IntegrationSettingsView: View {
             MdbListDeviceLoginSheet(viewModel: mdbListViewModel, accentColor: accentColor)
         }
         .sheet(isPresented: $showingMdbListSettings) {
-            MdbListConnectedSettingsSheet(viewModel: mdbListViewModel, accentColor: accentColor)
+            MdbListConnectedSettingsSheet(
+                viewModel: mdbListViewModel,
+                accentColor: accentColor,
+                watchProgressSource: $watchProgressSource
+            )
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(isPresented: $showingWeTrakrLogin, onDismiss: {
@@ -6360,7 +6359,11 @@ private struct IntegrationSettingsView: View {
             WeTrakrDeviceLoginSheet(viewModel: wetrakrViewModel, accentColor: accentColor)
         }
         .sheet(isPresented: $showingWeTrakrSettings) {
-            WeTrakrConnectedSettingsSheet(viewModel: wetrakrViewModel, accentColor: accentColor)
+            WeTrakrConnectedSettingsSheet(
+                viewModel: wetrakrViewModel,
+                accentColor: accentColor,
+                watchProgressSource: $watchProgressSource
+            )
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .sheet(isPresented: $showingTmdbOptions) {
@@ -9471,6 +9474,7 @@ private struct TraktConnectionSettingsCard: View {
 private struct TraktConnectedSettingsSheet: View {
     @ObservedObject var viewModel: TraktSettingsViewModel
     let accentColor: Color
+    @Binding var watchProgressSource: TraktWatchProgressSource
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -9549,18 +9553,20 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("tvos_settings_trakt_features", fallback: "Trakt Features"),
                             subtitle: L10n.string("tvos_settings_trakt_features_subtitle", fallback: "Choose how Trakt is used throughout Nuvio")
                         ) {
-                            SettingsToggleRow(
-                                title: L10n.string("tvos_settings_trakt_scrobble", fallback: "Scrobble Playback"),
-                                subtitle: L10n.string(
-                                    "tvos_settings_trakt_scrobble_sheet_subtitle",
-                                    fallback: "Send playback progress and watched updates to your Trakt account"
-                                ),
-                                isOn: Binding(
-                                    get: { RemoteTrackingState.isScrobbleEnabled(for: .trakt) },
-                                    set: { RemoteTrackingState.setScrobbleEnabled($0, for: .trakt) }
-                                ),
-                                accentColor: accentColor
-                            )
+                            if watchProgressSource != .trakt {
+                                SettingsToggleRow(
+                                    title: L10n.string("tvos_settings_trakt_scrobble", fallback: "Scrobble Playback"),
+                                    subtitle: L10n.string(
+                                        "tvos_settings_trakt_scrobble_sheet_subtitle",
+                                        fallback: "Send playback progress and watched updates to your Trakt account"
+                                    ),
+                                    isOn: Binding(
+                                        get: { RemoteTrackingState.isScrobbleEnabled(for: .trakt) },
+                                        set: { RemoteTrackingState.setScrobbleEnabled($0, for: .trakt) }
+                                    ),
+                                    accentColor: accentColor
+                                )
+                            }
 
                             SettingsChoiceRow(
                                 title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
@@ -10151,6 +10157,7 @@ private struct MdbListConnectionSettingsCard: View {
 private struct MdbListConnectedSettingsSheet: View {
     @ObservedObject var viewModel: MdbListSettingsViewModel
     let accentColor: Color
+    @Binding var watchProgressSource: TraktWatchProgressSource
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -10222,18 +10229,20 @@ private struct MdbListConnectedSettingsSheet: View {
                             title: L10n.string("tvos_settings_mdblist_features", fallback: "MDBList Features"),
                             subtitle: L10n.string("tvos_settings_mdblist_features_subtitle", fallback: "Choose where playback, watched updates, and the Library are stored")
                         ) {
-                            SettingsToggleRow(
-                                title: L10n.string("tvos_settings_mdblist_scrobble", fallback: "Scrobble Playback"),
-                                subtitle: L10n.string(
-                                    "tvos_settings_mdblist_scrobble_sheet_subtitle",
-                                    fallback: "Send playback progress and watched updates to your MDBList account"
-                                ),
-                                isOn: Binding(
-                                    get: { RemoteTrackingState.isScrobbleEnabled(for: .mdblist) },
-                                    set: { RemoteTrackingState.setScrobbleEnabled($0, for: .mdblist) }
-                                ),
-                                accentColor: accentColor
-                            )
+                            if watchProgressSource != .mdblist {
+                                SettingsToggleRow(
+                                    title: L10n.string("tvos_settings_mdblist_scrobble", fallback: "Scrobble Playback"),
+                                    subtitle: L10n.string(
+                                        "tvos_settings_mdblist_scrobble_sheet_subtitle",
+                                        fallback: "Send playback progress and watched updates to your MDBList account"
+                                    ),
+                                    isOn: Binding(
+                                        get: { RemoteTrackingState.isScrobbleEnabled(for: .mdblist) },
+                                        set: { RemoteTrackingState.setScrobbleEnabled($0, for: .mdblist) }
+                                    ),
+                                    accentColor: accentColor
+                                )
+                            }
 
                             SettingsChoiceRow(
                                 title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
@@ -10458,6 +10467,7 @@ private struct MdbListDeviceLoginSheet: View {
 private struct SimklConnectedSettingsSheet: View {
     @ObservedObject var viewModel: SimklSettingsViewModel
     let accentColor: Color
+    @Binding var watchProgressSource: TraktWatchProgressSource
     var onReconnect: (() -> Void)? = nil
 
     @Environment(\.dismiss) private var dismiss
@@ -10545,18 +10555,20 @@ private struct SimklConnectedSettingsSheet: View {
                             title: L10n.string("tvos_settings_simkl_features", fallback: "Simkl Features"),
                             subtitle: L10n.string("tvos_settings_simkl_features_subtitle", fallback: "Choose how Simkl is used throughout Nuvio")
                         ) {
-                            SettingsToggleRow(
-                                title: L10n.string("tvos_settings_simkl_scrobble", fallback: "Scrobble Playback"),
-                                subtitle: L10n.string(
-                                    "tvos_settings_simkl_scrobble_sheet_subtitle",
-                                    fallback: "Send playback progress and watched updates to your Simkl account"
-                                ),
-                                isOn: Binding(
-                                    get: { RemoteTrackingState.isScrobbleEnabled(for: .simkl) },
-                                    set: { RemoteTrackingState.setScrobbleEnabled($0, for: .simkl) }
-                                ),
-                                accentColor: accentColor
-                            )
+                            if watchProgressSource != .simkl {
+                                SettingsToggleRow(
+                                    title: L10n.string("tvos_settings_simkl_scrobble", fallback: "Scrobble Playback"),
+                                    subtitle: L10n.string(
+                                        "tvos_settings_simkl_scrobble_sheet_subtitle",
+                                        fallback: "Send playback progress and watched updates to your Simkl account"
+                                    ),
+                                    isOn: Binding(
+                                        get: { RemoteTrackingState.isScrobbleEnabled(for: .simkl) },
+                                        set: { RemoteTrackingState.setScrobbleEnabled($0, for: .simkl) }
+                                    ),
+                                    accentColor: accentColor
+                                )
+                            }
 
                             SettingsChoiceRow(
                                 title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
@@ -11352,6 +11364,7 @@ private struct WeTrakrDeviceLoginSheet: View {
 private struct WeTrakrConnectedSettingsSheet: View {
     @ObservedObject var viewModel: WeTrakrSettingsViewModel
     let accentColor: Color
+    @Binding var watchProgressSource: TraktWatchProgressSource
 
     @Environment(\.dismiss) private var dismiss
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -11426,18 +11439,20 @@ private struct WeTrakrConnectedSettingsSheet: View {
                             title: L10n.string("tvos_settings_wetrakr_features", fallback: "WeTrakr Features"),
                             subtitle: L10n.string("tvos_settings_wetrakr_features_subtitle", fallback: "Choose how WeTrakr is used throughout Nuvio")
                         ) {
-                            SettingsToggleRow(
-                                title: L10n.string("tvos_settings_wetrakr_scrobble", fallback: "Scrobble Playback"),
-                                subtitle: L10n.string(
-                                    "tvos_settings_wetrakr_scrobble_sheet_subtitle",
-                                    fallback: "Send playback progress and watched updates to your WeTrakr account"
-                                ),
-                                isOn: Binding(
-                                    get: { RemoteTrackingState.isScrobbleEnabled(for: .wetrakr) },
-                                    set: { RemoteTrackingState.setScrobbleEnabled($0, for: .wetrakr) }
-                                ),
-                                accentColor: accentColor
-                            )
+                            if watchProgressSource != .wetrakr {
+                                SettingsToggleRow(
+                                    title: L10n.string("tvos_settings_wetrakr_scrobble", fallback: "Scrobble Playback"),
+                                    subtitle: L10n.string(
+                                        "tvos_settings_wetrakr_scrobble_sheet_subtitle",
+                                        fallback: "Send playback progress and watched updates to your WeTrakr account"
+                                    ),
+                                    isOn: Binding(
+                                        get: { RemoteTrackingState.isScrobbleEnabled(for: .wetrakr) },
+                                        set: { RemoteTrackingState.setScrobbleEnabled($0, for: .wetrakr) }
+                                    ),
+                                    accentColor: accentColor
+                                )
+                            }
 
                             SettingsChoiceRow(
                                 title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
@@ -11621,16 +11636,6 @@ private struct PlaybackSettingsView: View {
     let onSubtitleLanguages: () -> Void
 
     @AppStorage(SettingsKey.playerEngine) private var playerEngine = "Auto"
-    @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
-    @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
-    @AppStorage(SettingsKey.dualLayerRoute) private var dualLayerRoute = "softwareHost"
-    @AppStorage(SettingsKey.foldsDolbyVisionFEL) private var foldsDolbyVisionFEL = false
-    @AppStorage(SettingsKey.lowResUpscaling) private var lowResUpscaling = true
-    @AppStorage(SettingsKey.upscaleScaler) private var upscaleScaler = "smart"
-    @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false
-    @AppStorage(SettingsKey.preserveSubwooferBassInStereo) private var preserveSubwooferBassInStereo = false
-    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
-    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
     @AppStorage(SettingsKey.externalPlayer) private var externalPlayer = ExternalPlayer.builtIn.rawValue
     @AppStorage(SettingsKey.externalPlayerForwardSubtitles) private var externalPlayerForwardSubtitles = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
@@ -11679,8 +11684,6 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.forcedSubtitles) private var forcedSubtitles = true
     @AppStorage(SettingsKey.frameRateMatching) private var frameRateMatching = "Always"
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
-    @AppStorage(SettingsKey.hybridDiskCacheEnabled) private var hybridDiskCacheEnabled = false
-    @AppStorage(SettingsKey.hybridDiskCacheLimitGB) private var hybridDiskCacheLimitGB = 20
     @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Off"
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
@@ -11692,14 +11695,12 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.shuffleAllSeries) private var shuffleAllSeries = false
     @AppStorage(SettingsKey.sceneFeatureEnabled) private var sceneFeatureEnabled = true
 
+    @State private var showingAudioVideoProcessingSettings = false
     @State private var showingPlayerButtonSettings = false
     @State private var showingInSightSectionsSettings = false
     @State private var inSightSectionsEnabledCount = TVSceneTabOrder.enabledTabCount()
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
-    private let dualLayerRoutes = ["softwareHost", "avPlayerOutput"]
-    private let upscaleScalers = ["smart", "lineArt", "automatic", "off"]
-    private let loudnessTargetPresets = ["standard", "night", "boost"]
     private let externalPlayers = ExternalPlayer.settingsOptions
     private let streamQualities = ["Highest", "4K", "1080p", "720p", "Smallest"]
     private let frameRateModes = ["Off", "On start/stop", "Always"]
@@ -11707,7 +11708,6 @@ private struct PlaybackSettingsView: View {
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max", "Ultra"]
     private let assModes = ["Off", "Strip", "Scale", "Force"]
-    private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
     private let streamSortModes = StreamSortOption.allCases.filter { $0 != .recommended }.map(\.rawValue)
     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
 
@@ -11814,177 +11814,6 @@ private struct PlaybackSettingsView: View {
                 )
                 .settingsEntryAnchor()
 
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_truehd_spatial_audio", fallback: "Atmos & DTS:X Spatial Audio (Beta)"),
-                    subtitle: L10n.string(
-                        "tvos_settings_truehd_spatial_audio_subtitle",
-                        fallback: "Use supported Atmos and DTS:X audio on native and FEL playback. TrueHD/DTS:X use APAC. Requires tvOS 26+ and AetherEngine; applies next playback."
-                    ),
-                    isOn: $trueHDSpatialAudio,
-                    accentColor: accentColor
-                )
-                .disabled(!SpatialAudioSettings.isSupported)
-                .opacity(SpatialAudioSettings.isSupported ? 1 : 0.46)
-
-                SettingsToggleRow(
-                    title: L10n.string(
-                        "tvos_settings_lossless_audio_bridge",
-                        fallback: "Lossless Audio Bridge (eARC / AVR)"
-                    ),
-                    subtitle: L10n.string(
-                        "tvos_settings_lossless_audio_bridge_subtitle",
-                        fallback: "AetherEngine only. Transcodes non-streamable surround audio (TrueHD, DTS-HD MA, Opus) to 24-bit 7.1 LPCM for AVRs and eARC soundbars. Off uses 5.1 Dolby Digital Plus for ARC compatibility."
-                    ),
-                    isOn: $losslessAudioBridge,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string(
-                        "tvos_settings_preserve_subwoofer_bass",
-                        fallback: "Preserve Subwoofer Bass in Stereo"
-                    ),
-                    subtitle: L10n.string(
-                        "tvos_settings_preserve_subwoofer_bass_subtitle",
-                        fallback: "AetherEngine only. When downmixing surround (5.1/7.1) to stereo for soundbars, headphones, or 2.1 systems, folds the LFE subwoofer channel into stereo instead of discarding it."
-                    ),
-                    isOn: $preserveSubwooferBassInStereo,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: L10n.string(
-                        "tvos_settings_loudness_normalizer",
-                        fallback: "Audio Loudness Normalizer (EBU R128)"
-                    ),
-                    subtitle: L10n.string(
-                        "tvos_settings_loudness_normalizer_subtitle",
-                        fallback: "AetherEngine only. Automatically lifts quiet audio and dialogue up to +18 dB using real-time EBU R128 integrated loudness tracking without latency or distortion."
-                    ),
-                    isOn: $loudnessNormalizer,
-                    accentColor: accentColor
-                )
-
-                if loudnessNormalizer {
-                    SettingsOptionRow(
-                        title: L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"),
-                        subtitle: L10n.string(
-                            "tvos_settings_loudness_target_subtitle",
-                            fallback: "Standard (-24 LUFS) is the broadcast reference. Night (-20 LUFS) provides extra dialogue lift for quiet environments. Boost (-16 LUFS) provides maximum gain for quiet movies."
-                        ),
-                        selection: $loudnessTargetPreset,
-                        options: loudnessTargetPresets,
-                        accentColor: accentColor,
-                        optionLabel: { preset in
-                            switch preset {
-                            case "night":
-                                return "Night Listening (-20 LUFS)"
-                            case "boost":
-                                return "Quiet Source Boost (-16 LUFS)"
-                            default:
-                                return "Cinema / Standard (-24 LUFS)"
-                            }
-                        }
-                    )
-                }
-
-                SettingsToggleRow(
-                    title: L10n.string(
-                        "tvos_settings_prefer_dual_layer_dolby_vision",
-                        fallback: "Full Dolby Vision P7 FEL (Experimental)"
-                    ),
-                    subtitle: L10n.string(
-                        "tvos_settings_prefer_dual_layer_dolby_vision_subtitle",
-                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with fast single-layer conversion. Turn on for full pixel-level dual-layer composition. Applies next playback."
-                    ),
-                    isOn: Binding(
-                        get: { preferDualLayerDolbyVision },
-                        set: { newValue in
-                            preferDualLayerDolbyVision = newValue
-                            if newValue {
-                                #if canImport(AetherEngine)
-                                Task(priority: .utility) {
-                                    await AetherEngine.prewarmDualLayerDolbyVision()
-                                }
-                                #endif
-                            }
-                        }
-                    ),
-                    accentColor: accentColor
-                )
-
-                if preferDualLayerDolbyVision {
-                    SettingsOptionRow(
-                        title: L10n.string("tvos_settings_dual_layer_route", fallback: "Dual-Layer Route"),
-                        subtitle: L10n.string(
-                            "tvos_settings_dual_layer_route_subtitle",
-                            fallback: "Software Host decodes both layers via CPU/Metal (default). AVPlayer Output composes over native hardware video output (lower memory)."
-                        ),
-                        selection: $dualLayerRoute,
-                        options: dualLayerRoutes,
-                        accentColor: accentColor,
-                        optionLabel: { route in
-                            switch route {
-                            case "avPlayerOutput":
-                                return "AVPlayer Output (Lower Memory)"
-                            default:
-                                return "Software Host (Default)"
-                            }
-                        }
-                    )
-                }
-
-                SettingsToggleRow(
-                    title: L10n.string(
-                        "tvos_settings_folds_dolby_vision_fel",
-                        fallback: "Dolby Vision FEL Dynamic Curves"
-                    ),
-                    subtitle: L10n.string(
-                        "tvos_settings_folds_dolby_vision_fel_subtitle",
-                        fallback: "AetherEngine only. On performs full scene-by-scene Profile 7 FEL curve reshaping for HDR displays. Off uses fast Profile 8.1 fallback for instantaneous seeks on 4K remuxes."
-                    ),
-                    isOn: $foldsDolbyVisionFEL,
-                    accentColor: accentColor
-                )
-
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_upscale_scaler", fallback: "Upscaling Mode"),
-                    subtitle: L10n.string(
-                        "tvos_settings_upscale_scaler_subtitle",
-                        fallback: "AetherEngine only. Auto automatically applies Anime4K to animation and MetalFX to movies & TV shows. You can also force a specific engine or turn upscaling off."
-                    ),
-                    selection: Binding(
-                        get: {
-                            lowResUpscaling ? upscaleScaler : "off"
-                        },
-                        set: { newValue in
-                            if newValue == "off" {
-                                lowResUpscaling = false
-                                upscaleScaler = "off"
-                            } else {
-                                lowResUpscaling = true
-                                upscaleScaler = newValue
-                            }
-                        }
-                    ),
-                    options: upscaleScalers,
-                    accentColor: accentColor,
-                    optionLabel: { scaler in
-                        switch scaler {
-                        case "smart":
-                            return L10n.string("tvos_settings_upscale_auto", fallback: "Auto (Content-Adaptive)")
-                        case "lineArt":
-                            return L10n.string("tvos_settings_upscale_anime", fallback: "Anime (Anime4K)")
-                        case "automatic":
-                            return L10n.string("tvos_settings_upscale_metal", fallback: "MetalFX (Super Resolution)")
-                        case "off":
-                            return L10n.string("tvos_settings_upscale_off", fallback: "Off")
-                        default:
-                            return L10n.string("tvos_settings_upscale_auto", fallback: "Auto (Content-Adaptive)")
-                        }
-                    }
-                )
-
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_external_player", fallback: "External Player"),
                     subtitle: L10n.string(
@@ -12017,41 +11846,23 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_buffer_profile", fallback: "Buffer Profile"),
                     subtitle: L10n.string(
                         "tvos_settings_buffer_profile_aether",
-                        fallback: "Aether stores stream segments on disk; MPV caches packet payloads on disk. Hybrid Disk Cache adds a persistent origin cache."
+                        fallback: "Aether stores stream segments on disk; MPV caches packet payloads on disk."
                     ),
                     selection: $networkCache,
                     options: cacheModes,
                     accentColor: accentColor
                 )
 
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_hybrid_disk_cache", fallback: "Hybrid Disk Cache"),
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_audio_video_processing", fallback: "Audio & Video Processing"),
                     subtitle: L10n.string(
-                        "tvos_settings_hybrid_disk_cache_subtitle",
-                        fallback: "Cache stream segments to disk storage for large forward buffering and instant seeking."
+                        "tvos_settings_audio_video_processing_subtitle",
+                        fallback: "Spatial audio, lossless audio bridge, Dolby Vision FEL, upscaling, and disk cache"
                     ),
-                    isOn: $hybridDiskCacheEnabled,
-                    accentColor: accentColor
+                    value: L10n.string("tvos_settings_open", fallback: "Open"),
+                    accentColor: accentColor,
+                    action: { showingAudioVideoProcessingSettings = true }
                 )
-
-                if hybridDiskCacheEnabled {
-                    SettingsOptionRow(
-                        title: L10n.string("tvos_settings_disk_cache_limit", fallback: "Disk Cache Limit"),
-                        subtitle: L10n.string(
-                            "tvos_settings_disk_cache_limit_subtitle",
-                            fallback: "Maximum storage allocated for stream disk cache. Older titles are pruned automatically."
-                        ),
-                        selection: Binding(
-                            get: { "\(hybridDiskCacheLimitGB) GB" },
-                            set: { newValue in
-                                hybridDiskCacheLimitGB = Int(newValue.replacingOccurrences(of: " GB", with: "")) ?? 20
-                            }
-                        ),
-                        options: diskCacheLimitOptions,
-                        accentColor: accentColor
-                    )
-                }
-
             }
 
             SettingsGroup(
@@ -12078,38 +11889,6 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .disabled(!seekPreviewEnabled)
-
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_timeline_segments", fallback: "Opening & Ending on the Timeline"),
-                    subtitle: L10n.string(
-                        "tvos_settings_timeline_segments_subtitle",
-                        fallback: "Color the opening and the ending on the timeline"
-                    ),
-                    isOn: $timelineSegmentsEnabled,
-                    accentColor: accentColor
-                )
-
-                SubtitleColorRow(
-                    title: L10n.string("tvos_settings_timeline_opening_color", fallback: "Opening Color"),
-                    subtitle: L10n.string(
-                        "tvos_settings_timeline_opening_color_subtitle",
-                        fallback: "The opening on the timeline and its badge in Chapters"
-                    ),
-                    selection: $timelineOpeningColor,
-                    accentColor: accentColor,
-                    colors: PlaybackChapters.colorChoices
-                )
-
-                SubtitleColorRow(
-                    title: L10n.string("tvos_settings_timeline_ending_color", fallback: "Ending Color"),
-                    subtitle: L10n.string(
-                        "tvos_settings_timeline_ending_color_subtitle",
-                        fallback: "The ending on the timeline and its badge in Chapters"
-                    ),
-                    selection: $timelineEndingColor,
-                    accentColor: accentColor,
-                    colors: PlaybackChapters.colorChoices
-                )
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_seekr_enabled", fallback: "Use Seekr"),
@@ -12208,24 +11987,19 @@ private struct PlaybackSettingsView: View {
                 title: L10n.string("tvos_settings_playback_behavior", fallback: "Playback Behavior"),
                 subtitle: L10n.string(
                     "tvos_settings_playback_behavior_subtitle",
-                    fallback: "Automatic playback and segment controls"
+                    fallback: "Queue progression, recommendations, and player display"
                 )
             ) {
                 SettingsToggleRow(
-                    title: L10n.string("player_show_finish_time", fallback: "Show estimated finish time"),
-                    subtitle: L10n.string("player_show_finish_time_subtitle", fallback: "Show when the current video is expected to finish in the player controls."),
-                    isOn: $playerShowFinishTime,
-                    accentColor: accentColor
-                )
-                SettingsToggleRow(
-                    title: L10n.string("details_shuffle_all_series", fallback: "Shuffle for all series"),
+                    title: L10n.string("tvos_settings_auto_play_next_episode", fallback: "Auto-Play Next Episode"),
                     subtitle: L10n.string(
-                        "details_shuffle_all_series_subtitle",
-                        fallback: "The Shuffle button normally appears only on shows with stand-alone episodes, such as sitcoms. Turn this on to show it on every series."
+                        "tvos_settings_auto_play_next_after_end_subtitle",
+                        fallback: "Play the next episode after the current episode fully ends. You can cancel from the Next Episode prompt."
                     ),
-                    isOn: $shuffleAllSeries,
+                    isOn: $autoPlayNext,
                     accentColor: accentColor
                 )
+
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
                     subtitle: L10n.string(
@@ -12237,6 +12011,13 @@ private struct PlaybackSettingsView: View {
                 )
 
                 SettingsToggleRow(
+                    title: L10n.string("player_show_finish_time", fallback: "Show estimated finish time"),
+                    subtitle: L10n.string("player_show_finish_time_subtitle", fallback: "Show when the current video is expected to finish in the player controls."),
+                    isOn: $playerShowFinishTime,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
                     subtitle: L10n.string(
                         "playback_show_loading_status_sub",
@@ -12244,6 +12025,56 @@ private struct PlaybackSettingsView: View {
                     ),
                     isOn: $showLoadingStatus,
                     accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("details_shuffle_all_series", fallback: "Shuffle for all series"),
+                    subtitle: L10n.string(
+                        "details_shuffle_all_series_subtitle",
+                        fallback: "The Shuffle button normally appears only on shows with stand-alone episodes, such as sitcoms. Turn this on to show it on every series."
+                    ),
+                    isOn: $shuffleAllSeries,
+                    accentColor: accentColor
+                )
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_chapters_skip", fallback: "Chapters & Skip"),
+                subtitle: L10n.string(
+                    "tvos_settings_chapters_skip_subtitle",
+                    fallback: "Timeline chapter markers and automatic segment skipping"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_timeline_segments", fallback: "Opening & Ending on the Timeline"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_segments_subtitle",
+                        fallback: "Color the opening and the ending on the timeline"
+                    ),
+                    isOn: $timelineSegmentsEnabled,
+                    accentColor: accentColor
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("tvos_settings_timeline_opening_color", fallback: "Opening Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_opening_color_subtitle",
+                        fallback: "The opening on the timeline and its badge in Chapters"
+                    ),
+                    selection: $timelineOpeningColor,
+                    accentColor: accentColor,
+                    colors: PlaybackChapters.colorChoices
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("tvos_settings_timeline_ending_color", fallback: "Ending Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_ending_color_subtitle",
+                        fallback: "The ending on the timeline and its badge in Chapters"
+                    ),
+                    selection: $timelineEndingColor,
+                    accentColor: accentColor,
+                    colors: PlaybackChapters.colorChoices
                 )
 
                 SettingsToggleRow(
@@ -12285,17 +12116,15 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoSkipMovieCredits,
                     accentColor: accentColor
                 )
+            }
 
-                SettingsToggleRow(
-                    title: L10n.string("tvos_settings_auto_play_next_episode", fallback: "Auto-Play Next Episode"),
-                    subtitle: L10n.string(
-                        "tvos_settings_auto_play_next_after_end_subtitle",
-                        fallback: "Play the next episode after the current episode fully ends. You can cancel from the Next Episode prompt."
-                    ),
-                    isOn: $autoPlayNext,
-                    accentColor: accentColor
+            SettingsGroup(
+                title: L10n.string("tvos_settings_trailers_previews", fallback: "Trailers & Previews"),
+                subtitle: L10n.string(
+                    "tvos_settings_trailers_previews_subtitle",
+                    fallback: "Automatic trailer previews on Home cards and Details view"
                 )
-
+            ) {
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_autoplay_trailers", fallback: "Autoplay Trailers"),
                     subtitle: L10n.string("tvos_settings_start_previews_after_focus_settles", fallback: "Start previews after focus settles"),
@@ -12350,13 +12179,41 @@ private struct PlaybackSettingsView: View {
                 .disabled(!trailersEnabled)
             }
 
-            SettingsGroup(title: L10n.string("tvos_settings_smart_playback", fallback: "Smart Playback"), subtitle: L10n.string("tvos_settings_automatically_choose_streams_and_matchin_9ca69e9f", fallback: "Automatically choose streams and matching subtitles")) {
+            SettingsGroup(
+                title: L10n.string("tvos_settings_smart_stream_selection", fallback: "Smart Stream Selection"),
+                subtitle: L10n.string(
+                    "tvos_settings_smart_stream_selection_subtitle",
+                    fallback: "Automatically resolve and launch the best link for instant playback"
+                )
+            ) {
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_auto_select_stream", fallback: "Auto Select Stream"),
                     subtitle: L10n.string("tvos_settings_skip_the_stream_picker_and_choose_the_be_da51db1f", fallback: "Skip the stream picker and choose the best link. Hold Play on details to pick manually."),
                     isOn: $smartStreamSelection,
                     accentColor: accentColor
                 )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_stream_quality", fallback: "Stream Quality"),
+                    subtitle: L10n.string("tvos_settings_quality_target_used_when_selecting_a_lin_74ea86c2", fallback: "Quality target used when selecting a link; resume also matches last DV/HDR/Atmos"),
+                    selection: $smartStreamQuality,
+                    options: streamQualities,
+                    accentColor: accentColor
+                )
+                .opacity((smartStreamSelection && !smartStreamUseTopResult) ? 1 : 0.46)
+                .disabled(!smartStreamSelection || smartStreamUseTopResult)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_use_top_result", fallback: "Use Top Result"),
+                    subtitle: L10n.string(
+                        "tvos_settings_use_top_result_subtitle",
+                        fallback: "Play the first available source in the list, respecting your stream sort and add-on order (bypasses smart quality scoring)"
+                    ),
+                    isOn: $smartStreamUseTopResult,
+                    accentColor: accentColor
+                )
+                .opacity(smartStreamSelection ? 1 : 0.46)
+                .disabled(!smartStreamSelection)
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_reuse_last_link", fallback: "Reuse Last Link"),
@@ -12421,28 +12278,6 @@ private struct PlaybackSettingsView: View {
                 )
 
                 SettingsToggleRow(
-                    title: L10n.string("tvos_settings_use_top_result", fallback: "Use Top Result"),
-                    subtitle: L10n.string(
-                        "tvos_settings_use_top_result_subtitle",
-                        fallback: "Play the first available source in the list, respecting your stream sort and add-on order (bypasses smart quality scoring)"
-                    ),
-                    isOn: $smartStreamUseTopResult,
-                    accentColor: accentColor
-                )
-                .opacity(smartStreamSelection ? 1 : 0.46)
-                .disabled(!smartStreamSelection)
-
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_stream_quality", fallback: "Stream Quality"),
-                    subtitle: L10n.string("tvos_settings_quality_target_used_when_selecting_a_lin_74ea86c2", fallback: "Quality target used when selecting a link; resume also matches last DV/HDR/Atmos"),
-                    selection: $smartStreamQuality,
-                    options: streamQualities,
-                    accentColor: accentColor
-                )
-                .opacity((smartStreamSelection && !smartStreamUseTopResult) ? 1 : 0.46)
-                .disabled(!smartStreamSelection || smartStreamUseTopResult)
-
-                SettingsToggleRow(
                     title: L10n.string("tvos_settings_match_subtitle_language", fallback: "Match Subtitle Language"),
                     // The player half (auto-selecting the subtitle track) applies to every playback,
                     // including manual stream picks, so the row is never locked.
@@ -12451,6 +12286,30 @@ private struct PlaybackSettingsView: View {
                         fallback: "Turn on the subtitle track matching Preferred Subtitle in the player. With Auto Select Stream, also prefer links that have it."
                     ),
                     isOn: $smartSubtitleMatching,
+                    accentColor: accentColor
+                )
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_stream_sources_sorting", fallback: "Source Filters & Sorting"),
+                subtitle: L10n.string(
+                    "tvos_settings_stream_sources_sorting_subtitle",
+                    fallback: "Stream ranking, debrid cache filters, and codec priorities"
+                )
+            ) {
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_stream_sort", fallback: "Stream Sort"),
+                    subtitle: L10n.string("tvos_settings_stream_sort_subtitle", fallback: "Default ordering when opening sources (Quality merges all add-ons and ranks by 4K/1080p)"),
+                    selection: $streamSortOption,
+                    options: streamSortModes,
+                    accentColor: accentColor
+                )
+                .disabled(recommendedStreamSort)
+
+                SettingsToggleRow(
+                    title: L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended"),
+                    subtitle: L10n.string("stream_sort_recommended_setting_subtitle", fallback: "Ranks available sources using information reported by add-ons. Metadata may be incomplete or inaccurate; playback quality is not guaranteed."),
+                    isOn: $recommendedStreamSort,
                     accentColor: accentColor
                 )
 
@@ -12465,22 +12324,6 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_prefer_hardware_codecs", fallback: "Prefer Hardware Decoded Streams"),
                     subtitle: L10n.string("tvos_settings_prefer_hardware_codecs_subtitle", fallback: "Prioritize HEVC and H.264 streams over AV1 for 4K content to prevent high CPU load (300%+), reduce heat, and ensure native Dolby Vision and HDR support on Apple TV"),
                     isOn: $preferHardwareDecodedStreams,
-                    accentColor: accentColor
-                )
-
-                SettingsOptionRow(
-                    title: L10n.string("tvos_settings_stream_sort", fallback: "Stream Sort"),
-                    subtitle: L10n.string("tvos_settings_stream_sort_subtitle", fallback: "Default ordering when opening sources (Quality merges all add-ons and ranks by 4K/1080p)"),
-                    selection: $streamSortOption,
-                    options: streamSortModes,
-                    accentColor: accentColor
-                )
-                .disabled(recommendedStreamSort)
-
-                SettingsToggleRow(
-                    title: L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended"),
-                    subtitle: L10n.string("stream_sort_recommended_setting_subtitle", fallback: "Ranks available sources using information reported by add-ons. Metadata may be incomplete or inaccurate; playback quality is not guaranteed."),
-                    isOn: $recommendedStreamSort,
                     accentColor: accentColor
                 )
 
@@ -12599,6 +12442,18 @@ private struct PlaybackSettingsView: View {
             }
             .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .fullScreenCover(isPresented: $showingAudioVideoProcessingSettings) {
+            SettingsFeatureSettingsSheet(
+                title: L10n.string("tvos_settings_audio_video_processing", fallback: "Audio & Video Processing"),
+                subtitle: L10n.string(
+                    "tvos_settings_audio_video_processing_manage_subtitle",
+                    fallback: "Advanced audio and video rendering, HDR/FEL reshaping, upscaling, and disk caching"
+                )
+            ) {
+                AudioVideoProcessingSettingsSection(accentColor: accentColor)
+            }
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
     }
 
     private var visiblePlayerButtonCount: Int {
@@ -12629,6 +12484,257 @@ private struct PlaybackSettingsView: View {
         guard !ordered.isEmpty else { return L10n.string("tvos_settings_system", fallback: "System") }
         guard ordered.count > 2 else { return ordered.joined(separator: ", ") }
         return "\(ordered[0]), \(ordered[1]) +\(ordered.count - 2)"
+    }
+}
+
+@MainActor
+private struct AudioVideoProcessingSettingsSection: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
+    @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false
+    @AppStorage(SettingsKey.preserveSubwooferBassInStereo) private var preserveSubwooferBassInStereo = false
+    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
+    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
+    @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
+    @AppStorage(SettingsKey.dualLayerRoute) private var dualLayerRoute = "softwareHost"
+    @AppStorage(SettingsKey.foldsDolbyVisionFEL) private var foldsDolbyVisionFEL = false
+    @AppStorage(SettingsKey.lowResUpscaling) private var lowResUpscaling = true
+    @AppStorage(SettingsKey.upscaleScaler) private var upscaleScaler = "smart"
+    @AppStorage(SettingsKey.hybridDiskCacheEnabled) private var hybridDiskCacheEnabled = false
+    @AppStorage(SettingsKey.hybridDiskCacheLimitGB) private var hybridDiskCacheLimitGB = 20
+
+    private let dualLayerRoutes = ["softwareHost", "avPlayerOutput"]
+    private let upscaleScalers = ["smart", "lineArt", "automatic", "off"]
+    private let loudnessTargetPresets = ["standard", "night", "boost"]
+    private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            SettingsGroup(
+                title: L10n.string("tvos_settings_audio_processing", fallback: "Audio Processing"),
+                subtitle: L10n.string(
+                    "tvos_settings_audio_processing_subtitle",
+                    fallback: "Spatial audio, lossless audio bridge, bass downmixing, and loudness normalization"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_truehd_spatial_audio", fallback: "Atmos & DTS:X Spatial Audio (Beta)"),
+                    subtitle: L10n.string(
+                        "tvos_settings_truehd_spatial_audio_subtitle",
+                        fallback: "Render TrueHD Atmos and DTS:X to 9.1.6 using lossy APAC. Requires tvOS 26+ and AetherEngine; applies to the next playback."
+                    ),
+                    isOn: $trueHDSpatialAudio,
+                    accentColor: accentColor
+                )
+                .settingsEntryAnchor()
+                .disabled(!SpatialAudioSettings.isSupported)
+                .opacity(SpatialAudioSettings.isSupported ? 1 : 0.46)
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_lossless_audio_bridge",
+                        fallback: "Lossless Audio Bridge (eARC / AVR)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_lossless_audio_bridge_subtitle",
+                        fallback: "AetherEngine only. Transcodes non-streamable surround audio (TrueHD, DTS-HD MA, Opus) to 24-bit 7.1 LPCM for AVRs and eARC soundbars. Off uses 5.1 Dolby Digital Plus for ARC compatibility."
+                    ),
+                    isOn: $losslessAudioBridge,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_preserve_subwoofer_bass",
+                        fallback: "Preserve Subwoofer Bass in Stereo"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_preserve_subwoofer_bass_subtitle",
+                        fallback: "AetherEngine only. When downmixing surround (5.1/7.1) to stereo for soundbars, headphones, or 2.1 systems, folds the LFE subwoofer channel into stereo instead of discarding it."
+                    ),
+                    isOn: $preserveSubwooferBassInStereo,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_loudness_normalizer",
+                        fallback: "Audio Loudness Normalizer (EBU R128)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_loudness_normalizer_subtitle",
+                        fallback: "AetherEngine only. Automatically lifts quiet audio and dialogue up to +18 dB using real-time EBU R128 integrated loudness tracking without latency or distortion."
+                    ),
+                    isOn: $loudnessNormalizer,
+                    accentColor: accentColor
+                )
+
+                if loudnessNormalizer {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"),
+                        subtitle: L10n.string(
+                            "tvos_settings_loudness_target_subtitle",
+                            fallback: "Standard (-24 LUFS) is the broadcast reference. Night (-20 LUFS) provides extra dialogue lift for quiet environments. Boost (-16 LUFS) provides maximum gain for quiet movies."
+                        ),
+                        selection: $loudnessTargetPreset,
+                        options: loudnessTargetPresets,
+                        accentColor: accentColor,
+                        optionLabel: { preset in
+                            switch preset {
+                            case "night":
+                                return "Night Listening (-20 LUFS)"
+                            case "boost":
+                                return "Quiet Source Boost (-16 LUFS)"
+                            default:
+                                return "Cinema / Standard (-24 LUFS)"
+                            }
+                        }
+                    )
+                }
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_video_processing", fallback: "Video Processing"),
+                subtitle: L10n.string(
+                    "tvos_settings_video_processing_subtitle",
+                    fallback: "Profile 7 Dolby Vision FEL, dynamic curves, and intelligent upscaling"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_prefer_dual_layer_dolby_vision",
+                        fallback: "Full Dolby Vision P7 FEL (Experimental)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_prefer_dual_layer_dolby_vision_subtitle",
+                        fallback: "AetherEngine only. When off, Profile 7 FEL uses native hardware decoding with fast single-layer conversion. Turn on for full pixel-level dual-layer composition. Applies next playback."
+                    ),
+                    isOn: Binding(
+                        get: { preferDualLayerDolbyVision },
+                        set: { newValue in
+                            preferDualLayerDolbyVision = newValue
+                            if newValue {
+                                #if canImport(AetherEngine)
+                                Task(priority: .utility) {
+                                    await AetherEngine.prewarmDualLayerDolbyVision()
+                                }
+                                #endif
+                            }
+                        }
+                    ),
+                    accentColor: accentColor
+                )
+
+                if preferDualLayerDolbyVision {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_dual_layer_route", fallback: "Dual-Layer Route"),
+                        subtitle: L10n.string(
+                            "tvos_settings_dual_layer_route_subtitle",
+                            fallback: "Software Host decodes both layers via CPU/Metal (default). AVPlayer Output composes over native hardware video output (lower memory)."
+                        ),
+                        selection: $dualLayerRoute,
+                        options: dualLayerRoutes,
+                        accentColor: accentColor,
+                        optionLabel: { route in
+                            switch route {
+                            case "avPlayerOutput":
+                                return "AVPlayer Output (Lower Memory)"
+                            default:
+                                return "Software Host (Default)"
+                            }
+                        }
+                    )
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_folds_dolby_vision_fel",
+                        fallback: "Dolby Vision FEL Dynamic Curves"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_folds_dolby_vision_fel_subtitle",
+                        fallback: "AetherEngine only. On performs full scene-by-scene Profile 7 FEL curve reshaping for HDR displays. Off uses fast Profile 8.1 fallback for instantaneous seeks on 4K remuxes."
+                    ),
+                    isOn: $foldsDolbyVisionFEL,
+                    accentColor: accentColor
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_upscale_scaler", fallback: "Upscaling Mode"),
+                    subtitle: L10n.string(
+                        "tvos_settings_upscale_scaler_subtitle",
+                        fallback: "AetherEngine only. Auto automatically applies Anime4K to animation and MetalFX to movies & TV shows. You can also force a specific engine or turn upscaling off."
+                    ),
+                    selection: Binding(
+                        get: {
+                            lowResUpscaling ? upscaleScaler : "off"
+                        },
+                        set: { newValue in
+                            if newValue == "off" {
+                                lowResUpscaling = false
+                                upscaleScaler = "off"
+                            } else {
+                                lowResUpscaling = true
+                                upscaleScaler = newValue
+                            }
+                        }
+                    ),
+                    options: upscaleScalers,
+                    accentColor: accentColor,
+                    optionLabel: { scaler in
+                        switch scaler {
+                        case "smart":
+                            return L10n.string("tvos_settings_upscale_auto", fallback: "Auto (Content-Adaptive)")
+                        case "lineArt":
+                            return L10n.string("tvos_settings_upscale_anime", fallback: "Anime (Anime4K)")
+                        case "automatic":
+                            return L10n.string("tvos_settings_upscale_metal", fallback: "MetalFX (Super Resolution)")
+                        case "off":
+                            return L10n.string("tvos_settings_upscale_off", fallback: "Off")
+                        default:
+                            return L10n.string("tvos_settings_upscale_auto", fallback: "Auto (Content-Adaptive)")
+                        }
+                    }
+                )
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_stream_disk_cache", fallback: "Disk Cache"),
+                subtitle: L10n.string(
+                    "tvos_settings_stream_disk_cache_subtitle",
+                    fallback: "Persistent stream cache on Apple TV SSD for instant seeks and rewinds"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_hybrid_disk_cache", fallback: "Hybrid Disk Cache"),
+                    subtitle: L10n.string(
+                        "tvos_settings_hybrid_disk_cache_subtitle",
+                        fallback: "3-tier cache to Apple TV SSD (Demand, 10-min forward fill, whole-file background archive) with instant seek and rewind."
+                    ),
+                    isOn: $hybridDiskCacheEnabled,
+                    accentColor: accentColor
+                )
+
+                if hybridDiskCacheEnabled {
+                    SettingsOptionRow(
+                        title: L10n.string("tvos_settings_disk_cache_limit", fallback: "Disk Cache Limit"),
+                        subtitle: L10n.string(
+                            "tvos_settings_disk_cache_limit_subtitle",
+                            fallback: "Maximum storage allocated for stream disk cache. Older titles are pruned automatically."
+                        ),
+                        selection: Binding(
+                            get: { "\(hybridDiskCacheLimitGB) GB" },
+                            set: { newValue in
+                                hybridDiskCacheLimitGB = Int(newValue.replacingOccurrences(of: " GB", with: "")) ?? 20
+                            }
+                        ),
+                        options: diskCacheLimitOptions,
+                        accentColor: accentColor
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -13994,8 +14100,6 @@ private struct AdvancedSettingsView: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
     @AppStorage(SettingsKey.playbackDebug) private var playbackDebug = false
-    @State private var isClearingTestHistory = false
-    @State private var testHistoryStatus = ContinueWatchingTestData.status
     @State private var isClearingCache = false
     @State private var clearedCacheStatus: String?
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
@@ -14113,39 +14217,6 @@ private struct AdvancedSettingsView: View {
                     // body, every Continue Watching entry was decoded on each redraw.
                     continueWatchingRowDiagnostic = await ContinueWatchingStore.rowDiagnosticInBackground()
                 }
-
-                // Scrobbles fail silently by design (the caller ignores the
-                // result), so this is the only place a rejected one is visible.
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_simkl_scrobble", fallback: "Simkl Scrobble"),
-                    value: SimklProgressService.scrobbleDiagnostic,
-                    isDiagnostic: true
-                )
-
-                SettingsActionRow(
-                    title: L10n.string("tvos_settings_clear_test_watch_history", fallback: "Remove Test Watch History"),
-                    subtitle: L10n.string(
-                        "tvos_settings_clear_test_watch_history_subtitle",
-                        fallback: "Deletes the seeded entries from this Apple TV and your account, leaving real history untouched"
-                    ),
-                    value: isClearingTestHistory ? "Working…" : "Remove",
-                    accentColor: accentColor,
-                    action: {
-                        guard !isClearingTestHistory else { return }
-                        isClearingTestHistory = true
-                        Task { @MainActor in
-                            await ContinueWatchingTestData.clear()
-                            testHistoryStatus = ContinueWatchingTestData.status
-                            isClearingTestHistory = false
-                        }
-                    }
-                )
-
-                SettingsInfoRow(
-                    title: L10n.string("tvos_settings_test_watch_history", fallback: "Test Watch History"),
-                    value: testHistoryStatus,
-                    isDiagnostic: true
-                )
             }
 
             SettingsGroup(

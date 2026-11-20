@@ -606,6 +606,29 @@ enum PlaybackThumbnailSourceFallback {
 // Compose plumbing and iOS-only UIViewController overrides (home indicator,
 // status-bar, screen-edge gestures — none exist on tvOS) removed.
 
+/// Tracks whether the currently submitted loadfile entry is still opening.
+/// This deliberately stays independent of UI loading and first-frame readiness:
+/// lifecycle/resync work can reset the latter while MPV is still opening media.
+@MainActor
+final class MPVLoadfileOpenWitness {
+    private(set) var openingEntryID: Int64?
+    var isOpening: Bool { openingEntryID != nil }
+
+    func reset() {
+        openingEntryID = nil
+    }
+
+    func arm(entryID: Int64?) {
+        openingEntryID = entryID
+    }
+
+    /// Completes or redirects the witness only for its own playlist entry.
+    func finishOpening(entryID: Int64?, redirectTo nextEntryID: Int64? = nil) {
+        guard openingEntryID == entryID else { return }
+        openingEntryID = nextEntryID
+    }
+}
+
 final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling, ScrubThumbnailProviding {
     /// Synchronously revoke Party control admission before parking the engine.
     var onWillSuspendPlayback: (() -> Void)?
@@ -619,6 +642,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     // MARK: - Trickplay & Seek Previews
     private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
     private let seekPreviewLaneHost = SeekPreviewLaneHost()
+    let loadfileOpenWitness = MPVLoadfileOpenWitness()
+    var hasPendingLoadfileOpen: Bool { loadfileOpenWitness.isOpening }
     private var externalTrickplayProvider: (any TrickplayProviding)?
     private var loadGeneration: UInt64 = 0
     private let firstFrameReadiness = MPVFirstFrameReadiness()
@@ -1575,6 +1600,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func loadFile(_ urlString: String) {
+        loadfileOpenWitness.reset()
         chapters = []
         chapterListKey = ""
         resetStartupDisplayGateState(clearAnchor: true)
@@ -1596,6 +1622,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func load(_ request: PlaybackLoadRequest) {
+        loadfileOpenWitness.reset()
         resetStartupDisplayGateState(clearAnchor: true)
         firstFrameReadiness.reset()
         teardownMPVRemoteCommands()
@@ -1752,10 +1779,12 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         recordPlaybackSystemDiagnostic(
             "load_submit source=\(sourceKind) live=\(pendingIsLiveStream) cache=\(cachePolicy.source) drawable=\(metalLayer.drawableSize.width)x\(metalLayer.drawableSize.height) pixelFormat=\(metalLayer.pixelFormat.rawValue)"
         )
-        command("loadfile", args: [url, "replace"])
+        let loadfileStatus = command("loadfile", args: [url, "replace"])
         // loadfile replace creates its playlist entry synchronously. Unlike
         // path/duration, the entry ID distinguishes reloading the same URL.
-        firstFrameReadiness.arm(playlistEntryID: readOptionalInt64Property("playlist/0/id"))
+        let playlistEntryID = loadfileStatus.flatMap { $0 >= 0 ? readOptionalInt64Property("playlist/0/id") : nil }
+        loadfileOpenWitness.arm(entryID: playlistEntryID)
+        firstFrameReadiness.arm(playlistEntryID: playlistEntryID)
         setAspectMode(currentAspectMode)
     }
 
@@ -2353,6 +2382,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func destroyPlayer() {
+        loadfileOpenWitness.reset()
         chapters = []
         chapterListKey = ""
         firstFrameReadiness.reset()
@@ -3658,8 +3688,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                     let frameToken = self.firstFrameReadiness.token
                     let entryID = self.eventPlaylistEntryID
                     DispatchQueue.main.async {
-                        guard self.mpv == mpv,
-                              self.watchPartyRemoteIntent == nil
+                        guard self.mpv == mpv else { return }
+                        self.loadfileOpenWitness.finishOpening(entryID: entryID)
+                        guard self.watchPartyRemoteIntent == nil
                                 || self.firstFrameReadiness.matches(token: frameToken, playlistEntryID: entryID) else { return }
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
                         self.memoryWatchdog.record(event: "file_loaded")
@@ -3744,11 +3775,27 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                         self.scheduleDisplayCriteriaProbe()
                     }
                 case MPV_EVENT_END_FILE:
+                    let endFileData = eventPtr.pointee.data.map {
+                        UnsafePointer<mpv_event_end_file>(OpaquePointer($0)).pointee
+                    }
+                    if let endFileData {
+                        let redirectEntryID = endFileData.reason == MPV_END_FILE_REASON_REDIRECT
+                            && endFileData.playlist_insert_num_entries > 0
+                            ? endFileData.playlist_insert_id
+                            : nil
+                        let entryID = endFileData.playlist_entry_id
+                        DispatchQueue.main.async {
+                            guard self.mpv == mpv else { return }
+                            self.loadfileOpenWitness.finishOpening(
+                                entryID: entryID,
+                                redirectTo: redirectEntryID
+                            )
+                        }
+                    }
                     DispatchQueue.main.async {
                         self.subtitleTranslationState.cancelPendingTranslations()
                     }
-                    if let data = eventPtr.pointee.data {
-                        let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
+                    if let endFile = endFileData {
                         if endFile.reason == MPV_END_FILE_REASON_EOF {
                             self.setCleanEndState(true)
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
@@ -3926,12 +3973,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         pendingTrackCommandsLock.unlock()
     }
 
-    private func command(_ command: String, args: [String?] = [], checkForErrors: Bool = true) {
-        guard mpv != nil else { return }
+    @discardableResult
+    private func command(_ command: String, args: [String?] = [], checkForErrors: Bool = true) -> CInt? {
+        guard let mpv else { return nil }
         var cargs = makeCArgs(command, args).map { $0.flatMap { UnsafePointer<CChar>(strdup($0)) } }
         defer { for ptr in cargs where ptr != nil { free(UnsafeMutablePointer(mutating: ptr!)) } }
         let ret = mpv_command(mpv, &cargs)
         if checkForErrors { checkError(ret) }
+        return ret
     }
 
     private func makeCArgs(_ command: String, _ args: [String?]) -> [String?] {

@@ -837,12 +837,10 @@ An agent may report the upgrade complete only when:
 - remaining device-only or loader-only limitations are stated explicitly; and
 - the agent clearly says whether changes were committed or pushed.
 
-## Sources / Stream Picker Refresh Gesture
+## Sources / Stream Picker Refresh
 
-Last verified: 2026-09-25. Applies to `tvosApp/NuvioTV/Sources/UI/Details/DetailsScreen.swift`.
+Last verified: 2026-11-18. Applies to `tvosApp/NuvioTV/Sources/UI/Details/DetailsScreen.swift`.
 
-### Remote Hold-Up Gesture
-- In `TvStreamPickerOverlay`, users can **press and hold the Up arrow button** (`UIPress.PressType.upArrow` for $\ge 0.5$s) on the Apple TV Siri Remote to trigger a full sources re-fetch / refresh.
-- Managed by `RemoteUpHoldPressCatcher` / `UpHoldPressHostView` with `UILongPressGestureRecognizer(minimumPressDuration: 0.5)`.
-- Displays the animated refresh toast (`details_refreshing_sources` / "Refreshing sources…") and re-executes `onRefresh?()`.
-- Active whenever not actively resolving a debrid stream (`isActive: !isResolvingDebrid`).
+### Sources Refresh
+- Sources are refreshed using the explicit refresh button (`TvStreamIconButton(systemImage: "arrow.clockwise")`) in the filter chips row.
+- The previous remote hold-up gesture recognizer (`RemoteUpHoldPressCatcher` / `UpHoldPressHostView`) has been removed.

@@ -13202,6 +13202,16 @@ struct CatalogBrowseUiState {
     var isLoadingMore: Bool = false
 }
 
+/// TMDB movie collection franchise (e.g. Marvel Cinematic Universe / Star Wars / Harry Potter).
+struct TmdbMovieCollection: Identifiable, Equatable {
+    let id: Int
+    let name: String
+    let overview: String?
+    let posterURL: String?
+    let backdropURL: String?
+    let items: [RelatedTitle]
+}
+
 /// UI state for details screen
 struct DetailsUiState {
     var isLoading: Bool = true
@@ -13218,6 +13228,8 @@ struct DetailsUiState {
     var isWatched: Bool = false
     /// Related titles under the cast row (TMDB, Trakt, or Simkl recommendations).
     var moreLikeThis: [RelatedTitle] = []
+    /// Movie collection franchise (TMDB movie series).
+    var collection: TmdbMovieCollection? = nil
     /// Production companies + networks from TMDB.
     var companies: [MetaCompany] = []
     /// TMDB creator/director and cast people, including profile photos.

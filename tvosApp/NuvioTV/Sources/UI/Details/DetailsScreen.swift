@@ -46,8 +46,8 @@ struct DetailsScreen: View {
     let onBack: () -> Void
     /// Host a room for the current title or a specific series episode.
     var onCreateWatchParty: ((NuvioMeta, NuvioVideo?) -> Void)? = nil
-    /// Open another title (More Like This / production catalog).
-    var onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
+    /// Open another title (More Like This / collection / production catalog).
+    var onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, TmdbMovieCollection?) -> Void)? = nil
     /// Open a production company / network catalog.
     var onOpenProduction: ((MetaCompany, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
     /// Open the movies and series associated with a TMDB person.
@@ -174,7 +174,7 @@ struct DetailsScreen: View {
               let target = initialFocusTarget else { return nil }
         let isKnown: Bool
         switch target.kind {
-        case .moreLikeThis:
+        case .moreLikeThis, .collection:
             isKnown = snapshot.items.contains(where: { $0.id == target.itemID })
         case .cast:
             isKnown = snapshot.people.contains(where: { $0.id == target.itemID })
@@ -182,6 +182,12 @@ struct DetailsScreen: View {
             isKnown = snapshot.companies.contains(where: { $0.id == target.itemID })
         }
         return isKnown ? target : nil
+    }
+
+    private var validInitialCollectionSnapshot: TmdbMovieCollection? {
+        guard let snapshot = initialRelatedItemsSnapshot,
+              snapshot.isValid(for: id, type: type) else { return nil }
+        return snapshot.collection
     }
 
     private var validInitialFocusPersonName: String? {
@@ -236,7 +242,7 @@ struct DetailsScreen: View {
         ) -> Void,
         onBack: @escaping () -> Void,
         onCreateWatchParty: ((NuvioMeta, NuvioVideo?) -> Void)? = nil,
-        onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil,
+        onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, TmdbMovieCollection?) -> Void)? = nil,
         onOpenProduction: ((MetaCompany, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil,
         onOpenPerson: ((TmdbPersonMetadata, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, Bool) -> Void)? = nil
     ) {
@@ -371,8 +377,8 @@ struct DetailsScreen: View {
                     onRateClick: { showingMdbListRating = true },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onTrailerClick: { resumeFrom in openTrailer(for: viewModel.uiState.meta!, resumeFrom: resumeFrom) },
-                    onOpenTitle: { contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings in
-                        onOpenTitle?(contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings)
+                    onOpenTitle: { contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings, collection in
+                        onOpenTitle?(contentId, contentType, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings, collection)
                     },
                     onOpenProduction: { company, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings in
                         onOpenProduction?(company, relatedFocusID, relatedItems, relatedPeople, relatedCompanies, relatedSimklRatings)
@@ -573,6 +579,7 @@ struct DetailsScreen: View {
                     id: id,
                     type: type,
                     relatedItemsSnapshot: validInitialRelatedItemsSnapshot,
+                    collectionSnapshot: validInitialCollectionSnapshot,
                     relatedPeopleSnapshot: validInitialRelatedPeopleSnapshot,
                     relatedCompaniesSnapshot: validInitialRelatedCompaniesSnapshot,
                     simklRatingsSnapshot: validInitialSimklRatingsSnapshot
@@ -637,6 +644,7 @@ struct DetailsScreen: View {
             id: id,
             type: type,
             relatedItemsSnapshot: validInitialRelatedItemsSnapshot,
+            collectionSnapshot: validInitialCollectionSnapshot,
             relatedPeopleSnapshot: validInitialRelatedPeopleSnapshot,
             relatedCompaniesSnapshot: validInitialRelatedCompaniesSnapshot,
             simklRatingsSnapshot: validInitialSimklRatingsSnapshot
@@ -655,6 +663,7 @@ struct DetailsScreen: View {
             id: id,
             type: type,
             relatedItemsSnapshot: validInitialRelatedItemsSnapshot,
+            collectionSnapshot: validInitialCollectionSnapshot,
             relatedPeopleSnapshot: validInitialRelatedPeopleSnapshot,
             relatedCompaniesSnapshot: validInitialRelatedCompaniesSnapshot,
             simklRatingsSnapshot: validInitialSimklRatingsSnapshot
@@ -1001,6 +1010,7 @@ struct DetailsScreen: View {
                 includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
                 cachedOnly: cachedOnly,
                 preserveAddonStreams: preserveAddonOrder,
+                includeUnknownCacheStatus: true,
                 selectionMode: .automatic
             )
             let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
@@ -1245,6 +1255,7 @@ struct DetailsScreen: View {
                         includeDebrid: debridIsEnabled || torrentIsEnabled,
                         cachedOnly: cachedOnly,
                         preserveAddonStreams: preserveAddonOrder,
+                        includeUnknownCacheStatus: true,
                         selectionMode: .automatic
                     )
                     let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
@@ -4435,7 +4446,7 @@ struct TvDetailsContent: View {
     var onRateClick: (() -> Void)? = nil
     let onShareClick: () -> Void
     let onTrailerClick: (Double?) -> Void
-    var onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
+    var onOpenTitle: ((String, String, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, TmdbMovieCollection?) -> Void)? = nil
     var onOpenProduction: ((MetaCompany, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?) -> Void)? = nil
     var onOpenPerson: ((TmdbPersonMetadata, DetailsFocusTarget?, [RelatedTitle]?, [TmdbPersonMetadata], [MetaCompany], SimklTitleRatings?, Bool) -> Void)? = nil
     var onCommentSelect: ((TraktCommentReview) -> Void)? = nil
@@ -4443,6 +4454,7 @@ struct TvDetailsContent: View {
 
     @FocusState private var actionFocus: DetailsActionFocus?
     @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
+    @FocusState private var collectionCardFocus: String?
     @FocusState private var relatedCardFocus: String?
     @FocusState private var castCardFocus: String?
     @FocusState private var networkCardFocus: String?
@@ -5021,12 +5033,24 @@ struct TvDetailsContent: View {
                             scrollProxy: scrollProxy
                         )
                     }
+                    if let collection = uiState.collection, !collection.items.isEmpty {
+                        relatedTitlesRow(
+                            title: collection.name.isEmpty
+                                ? L10n.string("settings_tmdb_module_collections", fallback: "Collections")
+                                : collection.name,
+                            items: collection.items,
+                            scrollProxy: scrollProxy,
+                            restoresFocusKind: .collection,
+                            externalFocus: $collectionCardFocus
+                        )
+                    }
                     if !uiState.moreLikeThis.isEmpty {
                         relatedTitlesRow(
                             title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
                             items: uiState.moreLikeThis,
                             scrollProxy: scrollProxy,
-                            restoresMoreLikeThisFocus: true
+                            restoresFocusKind: .moreLikeThis,
+                            externalFocus: $relatedCardFocus
                         )
                     }
                 }
@@ -5405,6 +5429,9 @@ struct TvDetailsContent: View {
                         .onChange(of: uiState.moreLikeThis.map(\.id)) { _, _ in
                             restoreFocusWhenAvailable(using: scrollProxy)
                         }
+                        .onChange(of: uiState.collection?.items.map(\.id)) { _, _ in
+                            restoreFocusWhenAvailable(using: scrollProxy)
+                        }
                         .onChange(of: uiState.people.map(\.id)) { _, _ in
                             restoreFocusWhenAvailable(using: scrollProxy)
                             reconcileRestoredCastFocus()
@@ -5643,7 +5670,7 @@ struct TvDetailsContent: View {
 
     private func detailsSection(for target: DetailsFocusTarget) -> TvDetailsFocusSection {
         switch target.kind {
-        case .moreLikeThis: return .related
+        case .moreLikeThis, .collection: return .related
         case .cast: return .cast
         case .network: return .network
         case .production: return .production
@@ -5653,7 +5680,7 @@ struct TvDetailsContent: View {
     private func isFocusTargetSectionEnabled(_ target: DetailsFocusTarget) -> Bool {
         activeDetailsSections.contains { section in
             switch (target.kind, section) {
-            case (.moreLikeThis, .related), (.cast, .cast), (.network, .network), (.production, .production):
+            case (.moreLikeThis, .related), (.collection, .related), (.cast, .cast), (.network, .network), (.production, .production):
                 return true
             default:
                 return false
@@ -5665,6 +5692,8 @@ struct TvDetailsContent: View {
         switch target.kind {
         case .moreLikeThis:
             return uiState.moreLikeThis.contains(where: { $0.id == target.itemID })
+        case .collection:
+            return uiState.collection?.items.contains(where: { $0.id == target.itemID }) ?? false
         case .cast:
             return resolvedFocusItemID(for: target) != nil
         case .network:
@@ -5683,6 +5712,8 @@ struct TvDetailsContent: View {
         switch target.kind {
         case .moreLikeThis:
             return uiState.moreLikeThis.contains(where: { $0.id == target.itemID }) ? target.itemID : nil
+        case .collection:
+            return (uiState.collection?.items.contains(where: { $0.id == target.itemID }) ?? false) ? target.itemID : nil
         case .cast:
             let availablePeople = uiState.people.isEmpty ? displayedCastPeople : uiState.people
             if let exactMatch = availablePeople.first(where: { $0.id == target.itemID }) {
@@ -5710,6 +5741,7 @@ struct TvDetailsContent: View {
     private func focusedItemID(for kind: DetailsFocusTargetKind) -> String? {
         switch kind {
         case .moreLikeThis: return relatedCardFocus
+        case .collection: return collectionCardFocus
         case .cast: return castCardFocus
         case .network: return networkCardFocus
         case .production: return productionCardFocus
@@ -5719,6 +5751,7 @@ struct TvDetailsContent: View {
     private func setFocusedItemID(_ itemID: String?, for kind: DetailsFocusTargetKind) {
         switch kind {
         case .moreLikeThis: relatedCardFocus = itemID
+        case .collection: collectionCardFocus = itemID
         case .cast: castCardFocus = itemID
         case .network: networkCardFocus = itemID
         case .production: productionCardFocus = itemID
@@ -6070,6 +6103,7 @@ struct TvDetailsContent: View {
 
     private func relatedRowsAreEmpty(meta: NuvioMeta?) -> Bool {
         uiState.moreLikeThis.isEmpty
+            && (uiState.collection?.items.isEmpty ?? true)
             && AniListTitleIndex.related(metaID: meta?.id ?? "").isEmpty
     }
 
@@ -6077,9 +6111,10 @@ struct TvDetailsContent: View {
         title: String,
         items: [RelatedTitle],
         scrollProxy: ScrollViewProxy,
-        restoresMoreLikeThisFocus: Bool = false
+        restoresFocusKind: DetailsFocusTargetKind? = nil,
+        externalFocus: FocusState<String?>.Binding? = nil
     ) -> some View {
-        let restoreTarget = restoresMoreLikeThisFocus && focusRestoreAttemptTarget?.kind == .moreLikeThis
+        let restoreTarget = restoresFocusKind != nil && focusRestoreAttemptTarget?.kind == restoresFocusKind
             ? focusRestoreAttemptTarget
             : nil
         return TvDetailsRelatedRow(
@@ -6087,16 +6122,16 @@ struct TvDetailsContent: View {
             items: items,
             entryLocked: focusedDetailsSection != .related,
             focusRequestID: restoreTarget?.itemID,
-            externalFocus: restoresMoreLikeThisFocus ? $relatedCardFocus : nil,
-            onMounted: restoresMoreLikeThisFocus ? {
-                setFocusRestoreSectionMounted(for: .moreLikeThis, mounted: true, using: scrollProxy)
+            externalFocus: externalFocus,
+            onMounted: restoresFocusKind != nil ? {
+                setFocusRestoreSectionMounted(for: restoresFocusKind!, mounted: true, using: scrollProxy)
             } : nil,
-            onUnmounted: restoresMoreLikeThisFocus ? {
-                setFocusRestoreSectionMounted(for: .moreLikeThis, mounted: false, using: scrollProxy)
+            onUnmounted: restoresFocusKind != nil ? {
+                setFocusRestoreSectionMounted(for: restoresFocusKind!, mounted: false, using: scrollProxy)
             } : nil,
-            onItemFocus: restoresMoreLikeThisFocus ? { item in
+            onItemFocus: restoresFocusKind != nil ? { item in
                 focusRestoreItemDidFocus(
-                    DetailsFocusTarget(kind: .moreLikeThis, itemID: item.id),
+                    DetailsFocusTarget(kind: restoresFocusKind!, itemID: item.id),
                     using: scrollProxy
                 )
             } : nil,
@@ -6119,24 +6154,27 @@ struct TvDetailsContent: View {
                     metaToCache = metaToCache.withImdbId(resolvedCardId)
                 }
                 CinemetaCatalogRepository.cacheCatalogMetadata(metaToCache)
-                if restoresMoreLikeThisFocus {
+                if let restoresFocusKind {
                     cancelFocusRestoration()
                     onOpenTitle?(
                         resolvedCardId,
                         item.type,
-                        DetailsFocusTarget(kind: .moreLikeThis, itemID: item.id),
+                        DetailsFocusTarget(kind: restoresFocusKind, itemID: item.id),
                         items,
                         uiState.people,
                         uiState.companies,
-                        uiState.simklRatings
+                        uiState.simklRatings,
+                        uiState.collection
                     )
                 } else {
-                    onOpenTitle?(resolvedCardId, item.type, nil, nil, uiState.people, uiState.companies, uiState.simklRatings)
+                    onOpenTitle?(resolvedCardId, item.type, nil, nil, uiState.people, uiState.companies, uiState.simklRatings, uiState.collection)
                 }
             },
             onBack: handleDetailsBack,
             onFocus: {
-                guard focusRestoreAttemptTarget == nil || focusRestoreAttemptTarget?.kind == .moreLikeThis else { return }
+                guard focusRestoreAttemptTarget == nil
+                    || focusRestoreAttemptTarget?.kind == .moreLikeThis
+                    || focusRestoreAttemptTarget?.kind == .collection else { return }
                 if focusedDetailsSection != .related {
                     focusedDetailsSection = .related
                     withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
@@ -10588,9 +10626,8 @@ private struct TvStreamPickerOverlay: View {
     @State private var lastPlayedSourceIndex: Int?
     @State private var pickerIsVisible = false
     @State private var streamBadgeSettings = StreamBadgeSettingsStore.snapshot
-    @State private var showRefreshToast = false
     @State private var isRefreshing = false
-    @State private var refreshToastTask: Task<Void, Never>?
+    @State private var refreshTask: Task<Void, Never>?
     @State private var unavailableAlertMessage: String?
     @State private var didPresentInitialAvailabilityMessage = false
     @State private var episodeRatings: [NuvioExternalRating] = []
@@ -10710,42 +10747,7 @@ private struct TvStreamPickerOverlay: View {
                     x: canvasWidth - 64 - panelWidth / 2,
                     y: panelCenterY
                 )
-
-                if showRefreshToast {
-                    VStack {
-                        HStack(spacing: 14) {
-                            Image(systemName: "arrow.clockwise")
-                                .font(.system(size: 22, weight: .semibold))
-                                .rotationEffect(.degrees(isRefreshing ? 360 : 0))
-                                .animation(
-                                    isRefreshing
-                                        ? .linear(duration: 0.9).repeatForever(autoreverses: false)
-                                        : .default,
-                                    value: isRefreshing
-                                )
-                            Text(L10n.string("details_refreshing_sources", fallback: "Refreshing sources…"))
-                                .font(.system(size: 22, weight: .semibold))
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 28)
-                        .padding(.vertical, 14)
-                        .background(.ultraThinMaterial, in: Capsule())
-                        .overlay(
-                            Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
-                        )
-                        .padding(.top, 40)
-                        Spacer()
-                    }
-                    .transition(.opacity.combined(with: .move(edge: .top)))
-                    .allowsHitTesting(false)
-                    .zIndex(10)
-                }
             }
-            .background(
-                RemoteUpHoldPressCatcher(isActive: !isResolvingDebrid) {
-                    performRefresh()
-                }
-            )
             // The picker mounts before discovery finishes, so this seed usually
             // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
             // first card once results exist.
@@ -11800,109 +11802,16 @@ private struct TvStreamPickerOverlay: View {
         didSeedStreamFocus = false
         restoredSourceFocusID = nil
         isRefreshing = true
-        withAnimation(.easeInOut(duration: 0.25)) {
-            showRefreshToast = true
-        }
         onRefresh?()
 
-        refreshToastTask?.cancel()
-        refreshToastTask = Task { @MainActor in
+        refreshTask?.cancel()
+        refreshTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 2_000_000_000)
             guard !Task.isCancelled else { return }
             withAnimation(.easeInOut(duration: 0.25)) {
                 isRefreshing = false
-                showRefreshToast = false
             }
         }
-    }
-}
-
-private struct RemoteUpHoldPressCatcher: UIViewRepresentable {
-    let isActive: Bool
-    let onHoldUp: () -> Void
-
-    func makeUIView(context: Context) -> UpHoldPressHostView {
-        let view = UpHoldPressHostView()
-        view.configure(isActive: isActive, onHoldUp: onHoldUp)
-        return view
-    }
-
-    func updateUIView(_ uiView: UpHoldPressHostView, context: Context) {
-        uiView.configure(isActive: isActive, onHoldUp: onHoldUp)
-    }
-
-    static func dismantleUIView(_ uiView: UpHoldPressHostView, coordinator: ()) {
-        uiView.removeRecognizers()
-    }
-}
-
-private final class UpHoldPressHostView: UIView, UIGestureRecognizerDelegate {
-    private var onHoldUp: () -> Void = {}
-    private var isActive = true
-    private weak var attachedWindow: UIWindow?
-    private var upHoldRecognizer: UILongPressGestureRecognizer?
-
-    func configure(isActive: Bool, onHoldUp: @escaping () -> Void) {
-        self.isActive = isActive
-        self.onHoldUp = onHoldUp
-        updateRecognizerState()
-    }
-
-    override func didMoveToWindow() {
-        super.didMoveToWindow()
-        removeRecognizers()
-        guard let window else { return }
-
-        let upHold = UILongPressGestureRecognizer(
-            target: self,
-            action: #selector(handleUpHold(_:))
-        )
-        // Support both upArrow (newer Siri Remote D-pad) and playPause (older trackpad Siri Remote) to refresh streams
-        upHold.allowedPressTypes = [
-            NSNumber(value: UIPress.PressType.upArrow.rawValue),
-            NSNumber(value: UIPress.PressType.playPause.rawValue)
-        ]
-        upHold.minimumPressDuration = 0.5
-        upHold.cancelsTouchesInView = false
-        upHold.delegate = self
-        upHold.isEnabled = isActive
-
-        window.addGestureRecognizer(upHold)
-        upHoldRecognizer = upHold
-        attachedWindow = window
-        updateRecognizerState()
-    }
-
-    func removeRecognizers() {
-        if let attachedWindow, let upHoldRecognizer {
-            attachedWindow.removeGestureRecognizer(upHoldRecognizer)
-        }
-        upHoldRecognizer = nil
-        attachedWindow = nil
-    }
-
-    private func updateRecognizerState() {
-        upHoldRecognizer?.isEnabled = isActive
-    }
-
-    @objc private func handleUpHold(_ recognizer: UILongPressGestureRecognizer) {
-        guard isActive else { return }
-        if recognizer.state == .began {
-            onHoldUp()
-        }
-    }
-
-    // MARK: - UIGestureRecognizerDelegate
-
-    func gestureRecognizer(
-        _ gestureRecognizer: UIGestureRecognizer,
-        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
-    ) -> Bool {
-        true
-    }
-
-    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
-        isActive
     }
 }
 

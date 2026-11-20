@@ -412,22 +412,28 @@ final class PlaybackSessionCoordinator: ObservableObject {
             return true
         }
         guard !graceAlreadyGranted,
-              activeBackend == .aether,
               dispatchedLoadGeneration == generation,
               let request = lastRequest,
               !request.isLiveStream,
               !request.isSports,
-              PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString),
-              let progress = aetherController?.startupLoadCheckpointWitness,
-              progress.ownerLoadGeneration == generation,
-              let floor = progress.engineGenerationFloor,
-              let pGen = progress.progressGeneration,
-              pGen >= floor,
-              let cp = progress.checkpoint,
-              cp >= .containerOpened else {
+              PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString) else {
             return false
         }
-        return true
+        if activeBackend == .aether {
+            guard let progress = aetherController?.startupLoadCheckpointWitness,
+                  progress.ownerLoadGeneration == generation,
+                  let floor = progress.engineGenerationFloor,
+                  let pGen = progress.progressGeneration,
+                  pGen >= floor,
+                  let cp = progress.checkpoint,
+                  cp >= .containerOpened else {
+                return false
+            }
+            return true
+        } else if activeBackend == .mpv {
+            return mpvController.hasPendingLoadfileOpen
+        }
+        return false
     }
 
     func hasDispatchedCurrentLoad(generation: UInt64) -> Bool {

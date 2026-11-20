@@ -848,7 +848,7 @@ class PlayerViewModel: ObservableObject {
     private var isFailingOver = false
     private var toastClearTask: Task<Void, Never>?
     private var loadWatchdogGeneration: UInt64?
-    private var loadWatchdogDiscGraceGranted = false
+    private var loadWatchdogGraceGranted = false
     /// A source that hasn't started within this long is treated as dead.
     private let loadTimeoutSeconds: UInt64 = 30
 
@@ -3165,7 +3165,7 @@ class PlayerViewModel: ObservableObject {
         let targetGeneration = sessionCoordinator.loadGeneration
         if loadWatchdogGeneration != targetGeneration {
             loadWatchdogGeneration = targetGeneration
-            loadWatchdogDiscGraceGranted = false
+            loadWatchdogGraceGranted = false
         }
         let timeoutSeconds = loadTimeoutSeconds
         loadWatchdogTask = Task { [weak self] in
@@ -3184,11 +3184,12 @@ class PlayerViewModel: ObservableObject {
             var elapsedTimeout = timeoutSeconds
             if self.sessionCoordinator.shouldGrantStartupWatchdogGrace(
                 generation: targetGeneration,
-                graceAlreadyGranted: self.loadWatchdogDiscGraceGranted
+                graceAlreadyGranted: self.loadWatchdogGraceGranted
             ) {
-                self.loadWatchdogDiscGraceGranted = true
+                self.loadWatchdogGraceGranted = true
                 elapsedTimeout += timeoutSeconds
-                print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] Remote stream actively progressing in Aether (source/container open); allowing one additional \(timeoutSeconds)s startup window (\(elapsedTimeout)s total).")
+                let backend = self.sessionCoordinator.activeBackend.rawValue
+                print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] Remote \(backend) startup is still in progress. Allowing an additional \(timeoutSeconds)s (\(elapsedTimeout)s total).")
                 try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
                 guard !Task.isCancelled,
                       self.sessionCoordinator.loadGeneration == targetGeneration,
@@ -7072,7 +7073,11 @@ class PlayerViewModel: ObservableObject {
         }
         guard let matchingTrack = audioTracks.first(where: { audioTrack($0, matches: preferred) }) else { return }
         didApplyAudioPreference = true
+        let wasDifferent = audioTracks.first(where: { $0.isSelected })?.id != matchingTrack.id
         selectAudio(matchingTrack, persist: false)
+        if wasDifferent {
+            didApplySubtitlePreference = false
+        }
     }
 
     static func automaticSubtitlePolicy(
@@ -7087,12 +7092,19 @@ class PlayerViewModel: ObservableObject {
                let matchingLanguage = preferredSubtitleLanguages.first(where: { selectedAudioTrack(selectedAudio, matches: $0) }) {
                 return .forced(language: matchingLanguage)
             }
+            if selectedAudio == nil,
+               allowForcedSubtitles,
+               let prefAudio = preferredAudioLanguage,
+               let matchingLanguage = preferredSubtitleLanguages.first(where: { SubtitleLanguagePreferences.matches(prefAudio, target: $0) }) {
+                return .forced(language: matchingLanguage)
+            }
             return .preferredLanguages(preferredSubtitleLanguages)
         }
 
-        if let selectedAudio,
+        let audioToMatch = selectedAudio ?? preferredAudioLanguage.map { AudioTrack(id: "", name: $0, language: $0, isSelected: true) }
+        if let audioToMatch,
            let preferredAudioLanguage,
-           selectedAudioTrack(selectedAudio, matches: preferredAudioLanguage) {
+           selectedAudioTrack(audioToMatch, matches: preferredAudioLanguage) {
             if allowForcedSubtitles {
                 return .forced(language: preferredAudioLanguage)
             }
@@ -7111,10 +7123,13 @@ class PlayerViewModel: ObservableObject {
         guard !didApplySubtitlePreference else { return }
         guard pendingTrackSelection?.subtitle == nil else { return }
         guard SubtitleLanguagePreferences.smartMatchingEnabled() else { return }
+        // Do not lock subtitle preference before audio tracks arrive from the demuxer
+        guard !audioTracks.isEmpty else { return }
+        let effectiveAudio = audioTracks.first(where: { $0.isSelected }) ?? audioTracks.first
         let allowForcedSubtitles = Self.allowsAutomaticForcedSubtitles
         let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
         guard let policy = Self.automaticSubtitlePolicy(
-            selectedAudio: audioTracks.first(where: { $0.isSelected }),
+            selectedAudio: effectiveAudio,
             preferredAudioLanguage: SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta),
             preferredSubtitleLanguages: preferredLanguages,
             allowForcedSubtitles: allowForcedSubtitles
@@ -8805,7 +8820,7 @@ class PlayerViewModel: ObservableObject {
 
     private var hasActiveScrobbleServices: Bool {
         let store = ProfileSettings.current
-        return !RemoteTrackingState.activeScrobbleSources(in: store).isEmpty
+        return !RemoteTrackingState.playbackScrobbleSources(in: store).isEmpty
     }
 
     static func shouldReportPlaybackProgress(
@@ -8872,7 +8887,7 @@ class PlayerViewModel: ObservableObject {
         guard ProfileSettings.isActiveStore(store),
               Self.isCurrentPlaybackProfile(profileID) else { return }
 
-        let activeSources = RemoteTrackingState.activeScrobbleSources(in: store)
+        let activeSources = RemoteTrackingState.playbackScrobbleSources(in: store)
         guard !activeSources.isEmpty else { return }
 
         guard Self.shouldReportPlaybackProgress(
