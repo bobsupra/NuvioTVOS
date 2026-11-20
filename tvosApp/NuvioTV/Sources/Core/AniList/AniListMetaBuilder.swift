@@ -230,17 +230,18 @@ enum AniListMetaBuilder {
     // MARK: Franchise
 
     /// The tabs of a series, first to last: from `start`, back along the prequels and forward
-    /// along the sequels, through TV / TV short / ONA entries only. `missing` are the next
-    /// entries to fetch before the chain is complete.
+    /// along the sequels. Only TV / TV short / ONA entries become tabs; up to two films, OVAs or
+    /// specials between two of them are passed through. `missing` are the next entries to fetch
+    /// before the chain is complete.
     static func chain(from start: Int, entries: [Int: AniListMedia]) -> (ids: [Int], missing: [Int]) {
         guard let first = entries[start], isTab(first) else { return ([start], []) }
         var ids = [start]
         var seen: Set<Int> = [start]
         var missing: [Int] = []
 
-        func step(from media: AniListMedia, relation: String, latest: Bool) -> AniListMedia? {
+        func related(_ media: AniListMedia, _ relation: String, latest: Bool, _ isWanted: (AniListMedia) -> Bool) -> AniListMedia? {
             let candidates = (media.relations?.edges ?? []).compactMap { edge -> AniListMedia? in
-                guard edge.relationType == relation, let node = edge.node, isTab(node), node.type != "MANGA" else { return nil }
+                guard edge.relationType == relation, let node = edge.node, node.type != "MANGA", isWanted(node) else { return nil }
                 return node
             }
             let ordered = candidates.sorted { lhs, rhs in
@@ -250,8 +251,30 @@ enum AniListMetaBuilder {
             return ordered.first { !seen.contains($0.id) }
         }
 
+        /// The next season in `relation`'s direction, also past a film, an OVA or a special
+        /// between two seasons (Goblin Slayer → Goblin's Crown → Goblin Slayer II), which stays
+        /// out of the tabs. `missing` is an entry on the way that isn't fetched yet.
+        func next(from media: AniListMedia, relation: String, latest: Bool) -> (season: AniListMedia?, missing: Int?) {
+            var current = media
+            var bridges = 0
+            while true {
+                if let season = related(current, relation, latest: latest, isTab) {
+                    return (season, nil)
+                }
+                guard bridges < maxBridges,
+                      let bridge = related(current, relation, latest: latest, isBridge) else { return (nil, nil) }
+                seen.insert(bridge.id)
+                bridges += 1
+                guard let full = entries[bridge.id] else { return (nil, bridge.id) }
+                current = full
+            }
+        }
+
         var cursor = first
-        while let previous = step(from: cursor, relation: "PREQUEL", latest: true) {
+        while true {
+            let step = next(from: cursor, relation: "PREQUEL", latest: true)
+            if let id = step.missing { missing.append(id) }
+            guard let previous = step.season else { break }
             seen.insert(previous.id)
             guard let full = entries[previous.id] else {
                 missing.append(previous.id)
@@ -261,16 +284,28 @@ enum AniListMetaBuilder {
             cursor = full
         }
         cursor = first
-        while let next = step(from: cursor, relation: "SEQUEL", latest: false) {
-            seen.insert(next.id)
-            guard let full = entries[next.id] else {
-                missing.append(next.id)
+        while true {
+            let step = next(from: cursor, relation: "SEQUEL", latest: false)
+            if let id = step.missing { missing.append(id) }
+            guard let following = step.season else { break }
+            seen.insert(following.id)
+            guard let full = entries[following.id] else {
+                missing.append(following.id)
                 break
             }
             ids.append(full.id)
             cursor = full
         }
         return (ids, missing)
+    }
+
+    /// Entries a season chain passes through without making them tabs: a film, an OVA or a
+    /// special between two seasons. At most `maxBridges` in a row.
+    static let bridgeFormats: Set<String> = ["MOVIE", "OVA", "SPECIAL"]
+    static let maxBridges = 2
+
+    static func isBridge(_ media: AniListMedia) -> Bool {
+        (media.type == nil || media.type == "ANIME") && media.format.map { bridgeFormats.contains($0) } ?? false
     }
 
     /// The season before `media`: its latest prequel that is a series (TV, TV Short or ONA).
