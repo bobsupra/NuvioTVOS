@@ -121,7 +121,9 @@ enum AniListMetaBuilder {
             name: title(media.title, language: language),
             description: plainText(media.description),
             posterUrl: media.coverImage?.extraLarge ?? media.coverImage?.large,
-            backgroundUrl: media.bannerImage,
+            // No background: AniList's banner is a thin strip, which a 16:9 background shows
+            // zoomed in to a few blurred shapes (see `background(artwork:)`).
+            backgroundUrl: nil,
             type: contentType(media),
             year: year(media),
             genres: media.genres,
@@ -208,7 +210,7 @@ enum AniListMetaBuilder {
             year: label.isEmpty ? nil : label,
             rating: media.averageScore.map { Double($0) / 10 },
             overview: plainText(media.description),
-            backdropURL: media.bannerImage
+            backdropURL: nil
         )
     }
 
@@ -460,10 +462,12 @@ enum AniListMetaBuilder {
         }
     }
 
-    /// The background of a title: TheTVDB's 16:9 fanart first, AniList's banner (a thin strip)
-    /// when there is none. Without either, the details screen shows the poster.
-    static func background(tabs: [AniListMedia], artwork: Artwork) -> String? {
-        artwork.background ?? tabs.first?.bannerImage ?? tabs.lazy.compactMap(\.bannerImage).first
+    /// The background of a title: a 16:9 picture (TheTVDB's fanart, TMDB's or Metahub's
+    /// backdrop), never AniList's banner. The banner is a strip about 4.75 : 1; filling the
+    /// screen zooms it about 2.7 times, to a few shapes that blur to one flat color. Without a
+    /// picture, the details screen shows the poster, as for any title without a background.
+    static func background(artwork: Artwork) -> String? {
+        artwork.background
     }
 
     /// A whole title: `tabs` are the entries of the series in order (one for a film, an OVA or
@@ -503,7 +507,7 @@ enum AniListMetaBuilder {
             name: title(root.title, language: language),
             description: plainText(root.description),
             posterUrl: root.coverImage?.extraLarge ?? root.coverImage?.large,
-            backgroundUrl: background(tabs: tabs, artwork: artwork),
+            backgroundUrl: background(artwork: artwork),
             logoUrl: artwork.logo,
             type: isFilm ? "movie" : "series",
             year: startYear,
