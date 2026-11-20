@@ -109,8 +109,8 @@ enum SettingsCategory: String, CaseIterable, Identifiable {
     }
 }
 
-/// The desktop app's Settings groups. Settings shows these instead of the
-/// flat category list while the Nuvio sidebar is on.
+/// The desktop app's Settings groups, which Settings lists in place of its
+/// categories.
 enum SettingsPageGroup: String, CaseIterable, Identifiable {
     case you, look, media, services, system
 
@@ -284,6 +284,48 @@ enum SettingsLeaf: String, Hashable, Identifiable {
         }
     }
 
+    /// The page's sections in the desktop app's order. Nil is the part
+    /// with no heading.
+    var sections: [String?] {
+        switch self {
+        case .about: return ["ABOUT", "ANNOUNCEMENTS", nil]
+        case .acc: return ["Account", "Profiles"]
+        case .adv: return ["STARTUP", "DIAGNOSTICS", "CACHE", "NAVIGATION", "RESET"]
+        case .app: return ["THEME", "DISPLAY", "NUVIO ANDROID TV STYLING"]
+        case .cd: return ["SOURCES", "DISCOVERY", "SEARCH"]
+        case .cs: return ["CONNECTED SERVICES", "ACCOUNTS", "RESULT MANAGEMENT"]
+        case .cw: return ["VISIBILITY", "POSTER CARD STYLE", "NEXT UP BEHAVIOR", "SORT ORDER"]
+        case .detail: return ["APPEARANCE", "SECTIONS"]
+        case .home: return ["HOME LAYOUT", "HERO CATALOGS", "CATALOGS"]
+        case .hover: return ["BEHAVIOR", "TRAILER"]
+        case .int: return ["INTEGRATIONS"]
+        case .lay: return ["HOME", "STREAMS", "Navigation Bar"]
+        case .pb: return [nil]
+        case .pbAudio: return ["Audio"]
+        case .pbBuffer: return ["Buffer and cache"]
+        case .pbIface: return ["Player interface", "Seeking Previews"]
+        case .pbP2p: return ["P2P STREAMING"]
+        case .pbPlayer: return ["PLAYER"]
+        case .pbSkip: return ["SKIP SEGMENTS"]
+        case .pbStream: return ["STREAM SELECTION", "STREAM AUTO-PLAY", "SOURCE FILTERS & SORTING"]
+        case .pbSubs: return ["Subtitles", "SUBTITLE RENDERING"]
+        case .pbUpnext: return ["NEXT EPISODE"]
+        case .pbVideo: return ["VIDEO OUTPUT"]
+        case .poster: return ["POSTER CARD STYLE", "CUSTOM POSTER SOURCE"]
+        case .servers: return [nil]
+        case .topshelf: return [nil]
+        case .trk: return ["Accounts", "Sources", "Trakt features", "Simkl features", "MDBList features", "WeTrakr features", "Tracking Add-ons"]
+        case .usenet: return [nil]
+        default: return [nil]
+        }
+    }
+
+    /// The localization key of a section heading.
+    static func sectionKey(_ section: String) -> String {
+        let slug = section.lowercased().map { $0.isLetter || $0.isNumber ? $0 : "_" }
+        return "tvos_settings_section_" + String(slug)
+    }
+
     /// Sub-pages listed at the top of this page.
     var children: [SettingsLeaf] {
         switch self {
@@ -317,40 +359,51 @@ enum SettingsLeaf: String, Hashable, Identifiable {
     }
 }
 
-private struct SettingsLeafKey: EnvironmentKey {
-    static let defaultValue: SettingsLeaf? = nil
+/// One section of one grouped Settings page.
+struct SettingsPlace: Hashable {
+    let leaf: SettingsLeaf
+    let section: String?
+
+    init(_ leaf: SettingsLeaf, _ section: String?) {
+        self.leaf = leaf
+        self.section = section
+    }
 }
 
-private struct SettingsGroupHeaderHiddenKey: EnvironmentKey {
+private struct SettingsPlaceKey: EnvironmentKey {
+    static let defaultValue: SettingsPlace? = nil
+}
+
+private struct SettingsGroupChromeHiddenKey: EnvironmentKey {
     static let defaultValue = false
 }
 
 extension EnvironmentValues {
-    /// The grouped Settings page being drawn. Nil in the flat list, where
-    /// every row shows.
-    var settingsLeaf: SettingsLeaf? {
-        get { self[SettingsLeafKey.self] }
-        set { self[SettingsLeafKey.self] = newValue }
+    /// The page section being drawn. A category view draws only the rows
+    /// tagged for it. Nil draws every row.
+    var settingsPlace: SettingsPlace? {
+        get { self[SettingsPlaceKey.self] }
+        set { self[SettingsPlaceKey.self] = newValue }
     }
 
-    /// A section drawn on a page other than its main one shows no heading,
-    /// because the heading names the main page's subject.
-    var settingsGroupHeaderHidden: Bool {
-        get { self[SettingsGroupHeaderHiddenKey.self] }
-        set { self[SettingsGroupHeaderHiddenKey.self] = newValue }
+    /// A tagged section draws its rows without its own heading and card,
+    /// because the page draws the desktop app's heading above them.
+    var settingsGroupChromeHidden: Bool {
+        get { self[SettingsGroupChromeHiddenKey.self] }
+        set { self[SettingsGroupChromeHiddenKey.self] = newValue }
     }
 }
 
-private struct SettingsLeafGate: ViewModifier {
-    let leaves: [SettingsLeaf]
-    let primary: SettingsLeaf?
-    @Environment(\.settingsLeaf) private var current
+private struct SettingsPlaceGate: ViewModifier {
+    let places: [SettingsPlace]
+    let isGroup: Bool
+    @Environment(\.settingsPlace) private var current
 
     @ViewBuilder
     func body(content: Content) -> some View {
         if let current {
-            if leaves.contains(current) {
-                content.environment(\.settingsGroupHeaderHidden, primary != nil && primary != current)
+            if places.contains(current) {
+                content.environment(\.settingsGroupChromeHidden, isGroup)
             }
         } else {
             content
@@ -359,14 +412,14 @@ private struct SettingsLeafGate: ViewModifier {
 }
 
 extension View {
-    /// Places a row on one page of grouped Settings.
-    func settingsLeaf(_ leaf: SettingsLeaf) -> some View {
-        modifier(SettingsLeafGate(leaves: [leaf], primary: nil))
+    /// Places a row in one section of one grouped Settings page.
+    func settingsLeaf(_ leaf: SettingsLeaf, section: String?) -> some View {
+        modifier(SettingsPlaceGate(places: [SettingsPlace(leaf, section)], isGroup: false))
     }
 
-    /// Places a section on every page that takes one of its rows.
-    func settingsLeaves(primary: SettingsLeaf, others: [SettingsLeaf]) -> some View {
-        modifier(SettingsLeafGate(leaves: [primary] + others, primary: primary))
+    /// Places a section wherever one of its rows goes.
+    func settingsPlaces(_ places: [SettingsPlace]) -> some View {
+        modifier(SettingsPlaceGate(places: places, isGroup: true))
     }
 }
 
@@ -2029,8 +2082,6 @@ struct SettingsView: View {
     @State private var presentedProfilePinMode: ProfilePinSheetMode?
     @FocusState private var focusedCategory: SettingsCategory?
     @Environment(\.nuvioRailExitCount) private var nuvioRailExitCount
-    @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
-    @AppStorage(SettingsKey.useTopNavigation) private var usesTopNavigation = false
     /// The group whose pages the detail pane shows.
     @State private var groupSelection: SettingsPageGroup = .you
     /// The pages opened inside the group, outermost first. Empty, the pane
@@ -2041,15 +2092,7 @@ struct SettingsView: View {
     @FocusState private var pageBackFocused: Bool
     /// A page is opening or closing, and focus is on its way to a row.
     @State private var pageOpening = false
-
-    /// Settings is grouped as on desktop while the Nuvio sidebar is in use.
-    private var usesGroups: Bool { useNuvioRail && !usesTopNavigation }
     @FocusState private var focusedLanguagePreference: LanguagePickerKind?
-    /// Whether focus has entered the current category's detail pane at least once.
-    /// The entry lock (land on the first row) only fires on the first entry; after
-    /// that, re-entry stays unlocked so the detail's own focus restoration can
-    /// return to the last row instead of being blocked by the lock.
-    @State private var detailVisited = false
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -2080,12 +2123,6 @@ struct SettingsView: View {
                 categoryGrid
                     .focusSection()
                     .defaultFocusIfAvailable($focusedCategory, selectedCategory)
-                    .onChange(of: focusedCategory) { _, newValue in
-                        // focusedCategory goes nil exactly when focus leaves the
-                        // sidebar for the detail pane — record that so re-entry is
-                        // no longer locked to the first row.
-                        if newValue == nil { detailVisited = true }
-                    }
                     // The open Nuvio sidebar covers the category list, so tvOS
                     // sends Right from it straight into the detail pane. Focus
                     // goes to the selected category instead.
@@ -2095,59 +2132,17 @@ struct SettingsView: View {
                         guard !pageOpening else { return }
                         DispatchQueue.main.async { focusedCategory = selectedCategory }
                     }
-                    .onChange(of: selectedCategory) { oldCat, newCat in
-                        TVHomeDebugTrace.log("settings.selectedCategory changed from \(oldCat.rawValue) to \(newCat.rawValue)")
-                        // A newly opened category should lock to its first row again.
-                        detailVisited = false
-                    }
 
-                Group {
-                    if usesGroups {
-                        groupedPane
-                    } else if selectedCategory == .subtitles {
-                        VStack(alignment: .leading, spacing: 28) {
-                            selectedCategoryHeader
-                            SubtitleStyleSettingsView(accentColor: accentColor)
-                        }
-                        .padding(.leading, 44)
-                        .padding(.trailing, 72)
-                        // No bottom padding: the scrolling controls run all the way
-                        // to the screen edge (the preview above stays pinned), so the
-                        // list isn't cut short with dead space below it.
-                        .padding(.top, 56)
-                    } else {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 28) {
-                                selectedCategoryHeader
-                                categoryContent(selectedCategory)
-                            }
-                            .padding(.leading, 44)
-                            .padding(.trailing, 72)
-                            .padding(.vertical, 56)
-                            // No TVTopBarScrollAnchor here: this ScrollView is rebuilt for every
-                            // category (.id below), and moving the top bar's content scroll view
-                            // to each new instance left the bar hidden and the header clipped
-                            // after scrolling down and back up.
-                        }
-                        // Every category shares this one ScrollView, so without a
-                        // per-category identity SwiftUI reuses it and carries the
-                        // previous category's scroll offset into the next one.
-                        // (Subtitles looked right only because it lives in the
-                        // other branch, which is rebuilt on the way in.)
-                        .id(selectedCategory)
-                    }
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .focusSection()
-                // Lock every detail row except the first while focus is still in
-                // the sidebar and this category hasn't been entered yet, so the
-                // first right-press lands on the first row regardless of which pill
-                // it came from. Cleared once focus enters so re-entry isn't blocked.
-                .environment(\.settingsEntryLocked, !usesGroups && focusedCategory != nil && !detailVisited)
-                // Back from a setting returns focus to its selected category;
-                // Back from the category list remains handled by the TabView.
+                groupedPane
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .focusSection()
+                    // Pages take focus through their back button, so no row
+                    // is locked while focus is in the group list.
+                    .environment(\.settingsEntryLocked, false)
+                    // Back closes the open page. From a group's page list it
+                    // returns focus to the group.
                 .onExitCommand {
-                    guard usesGroups, !leafPath.isEmpty else {
+                    guard !leafPath.isEmpty else {
                         focusedCategory = selectedCategory
                         return
                     }
@@ -2155,7 +2150,6 @@ struct SettingsView: View {
                 }
             }
             .onAppear(perform: alignGroupSelection)
-            .onChange(of: usesGroups) { _, _ in alignGroupSelection() }
             .disabled(presentedLanguagePicker != nil || presentedProfilePinMode != nil)
             .allowsHitTesting(presentedLanguagePicker == nil && presentedProfilePinMode == nil)
 
@@ -2335,7 +2329,6 @@ struct SettingsView: View {
                 .padding(.leading, 10)
 
             VStack(alignment: .leading, spacing: 14) {
-                if usesGroups {
                     ForEach(SettingsPageGroup.allCases) { group in
                         let isSelectedGroup = group == groupSelection
                         SettingsCategoryPill(
@@ -2352,35 +2345,6 @@ struct SettingsView: View {
                         .focused($focusedCategory, equals: group.anchorCategory)
                         .disabled(!(isSelectedGroup || focusedCategory != nil))
                     }
-                } else {
-                ForEach(SettingsCategory.allCases) { category in
-                    let isSelectedCategory = selectedCategory == category
-                    let isFocusedCategory = focusedCategory == category
-                    // Fixes "left out of the detail pane flashes the wrong pill":
-                    // while focus is in the detail pane (focusedCategory == nil), only
-                    // the open category stays focusable. A left-press is directional
-                    // and tvOS lands on the geometric nearest *focusable* pill, so
-                    // with a single candidate it goes straight to the open one — no
-                    // wrong pill ever receives focus, so none can flash. All pills
-                    // become focusable again the moment focus is back in the sidebar,
-                    // so up/down still moves between every category. Disabling is safe
-                    // visually here: PosterCardButtonStyle ignores isEnabled, so a
-                    // non-focusable pill looks identical to a focusable one.
-                    let isFocusable = isSelectedCategory || focusedCategory != nil
-
-                    SettingsCategoryPill(
-                        title: category.title,
-                        iconName: category.iconName,
-                        isSelected: isSelectedCategory,
-                        isFocused: isFocusedCategory,
-                        accentColor: accentColor
-                    ) {
-                        selectedCategory = category
-                    }
-                    .focused($focusedCategory, equals: category)
-                    .disabled(!isFocusable)
-                }
-                }
             }
         }
         .padding(.leading, 58)
@@ -2393,7 +2357,6 @@ struct SettingsView: View {
     /// In grouped Settings the pill focus tag is the group's anchor category,
     /// so the selected category has to be that anchor.
     private func alignGroupSelection() {
-        guard usesGroups else { return }
         groupSelection = .containing(selectedCategory)
         if selectedCategory != groupSelection.anchorCategory {
             selectedCategory = groupSelection.anchorCategory
@@ -2438,10 +2401,22 @@ struct SettingsView: View {
                         if !leaf.children.isEmpty {
                             leafRows(leaf.children, lockToFirst: false)
                         }
-                        ForEach(leaf.sources) { category in
-                            categoryContent(category)
+                        ForEach(Array(leaf.sections.enumerated()), id: \.offset) { _, section in
+                            VStack(alignment: .leading, spacing: 14) {
+                                if let section {
+                                    Text(L10n.string(SettingsLeaf.sectionKey(section), fallback: section))
+                                        .font(.appFont(size: 20, weight: .bold))
+                                        .textCase(.uppercase)
+                                        .kerning(1.2)
+                                        .foregroundColor(.white.opacity(0.56))
+                                        .padding(.leading, 6)
+                                }
+                                ForEach(leaf.sources) { category in
+                                    categoryContent(category)
+                                }
+                            }
+                            .environment(\.settingsPlace, SettingsPlace(leaf, section))
                         }
-                        .environment(\.settingsLeaf, leaf)
                     }
                     .padding(.leading, 44)
                     .padding(.trailing, 72)
@@ -2495,7 +2470,9 @@ struct SettingsView: View {
                     openLeaf(leaf)
                 }
                 .focused($focusedLeafRow, equals: leaf)
-                .disabled(lockToFirst && focusedCategory != nil && leaf != leaves.first)
+                // Not while a page is closing: focus is on its way back to
+                // the row that opened it, which may not be the first.
+                .disabled(lockToFirst && !pageOpening && focusedCategory != nil && leaf != leaves.first)
             }
         }
     }
@@ -2528,15 +2505,6 @@ struct SettingsView: View {
         .focused($pageBackFocused)
         .focusEffectDisabledIfAvailable()
         .accessibilityLabel(L10n.format("tvos_settings_back_from_page", fallback: "Back from %@", leaf.title))
-    }
-
-    private var selectedCategoryHeader: some View {
-        SettingsDetailHeader(
-            title: selectedCategory.title,
-            subtitle: selectedCategory.subtitle,
-            iconName: selectedCategory.iconName,
-            accentColor: accentColor
-        )
     }
 
     @ViewBuilder
@@ -2787,6 +2755,7 @@ private struct AccountSettingsView: View {
                     Spacer()
                 }
                 .padding(.bottom, 6)
+                .settingsLeaf(.acc, section: "Profiles")
 
                 SettingsActionRow(
                     title: L10n.string("profile_change", fallback: "Switch Profile"),
@@ -2802,7 +2771,7 @@ private struct AccountSettingsView: View {
                 .settingsEntryAnchor(activeProfile != nil && onSwitchProfile != nil)
                 .opacity(activeProfile != nil && onSwitchProfile != nil ? 1 : 0.46)
                 .disabled(activeProfile == nil || onSwitchProfile == nil)
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Profiles")
 
                 // First focusable row in the pane carries the entry anchor —
                 // without one the entry lock leaves the pane unenterable.
@@ -2820,7 +2789,7 @@ private struct AccountSettingsView: View {
                 )
                 .settingsEntryAnchor(activeProfile != nil && onSwitchProfile == nil && onChangeProfileName != nil)
                 .disabled(activeProfile == nil || onChangeProfileName == nil)
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Profiles")
 
                 SettingsActionRow(
                     title: L10n.string("profile_choose_avatar", fallback: "Choose Avatar"),
@@ -2835,7 +2804,7 @@ private struct AccountSettingsView: View {
                 }
                 .opacity(activeProfile != nil && onChangeProfileAvatar != nil ? 1 : 0.46)
                 .disabled(activeProfile == nil || onChangeProfileAvatar == nil)
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Profiles")
 
                 SettingsActionRow(
                     title: L10n.string("profile_background_title", fallback: "Profile Background"),
@@ -2850,7 +2819,7 @@ private struct AccountSettingsView: View {
                 }
                 .opacity(activeProfile != nil && onChangeProfileBackground != nil ? 1 : 0.46)
                 .disabled(activeProfile == nil || onChangeProfileBackground == nil)
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Profiles")
 
                 SettingsToggleRow(
                     title: L10n.string("profile_pin_title", fallback: "Profile PIN lock"),
@@ -2864,7 +2833,7 @@ private struct AccountSettingsView: View {
                 .settingsEntryAnchor(activeProfile == nil || onChangeProfileName == nil)
                 .opacity(canManagePin ? 1 : 0.46)
                 .disabled(!canManagePin)
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Profiles")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -2878,7 +2847,7 @@ private struct AccountSettingsView: View {
                     isOn: $autoSelectLastProfile,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.adv)
+                .settingsLeaf(.adv, section: "STARTUP")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -2892,9 +2861,9 @@ private struct AccountSettingsView: View {
                     isOn: $requireProfileSelectionAfterBackground,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.adv)
+                .settingsLeaf(.adv, section: "STARTUP")
             }
-            .settingsLeaves(primary: .acc, others: [.adv])
+            .settingsPlaces([SettingsPlace(.acc, "Profiles"), SettingsPlace(.adv, "STARTUP")])
 
             SettingsGroup(
                 title: L10n.string("settings_account", fallback: "Account"),
@@ -2910,14 +2879,14 @@ private struct AccountSettingsView: View {
                     title: L10n.string("tvos_account_status", fallback: "Status"),
                     value: accountStatusText
                 )
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Account")
 
                 if let accountEmail, !accountEmail.isEmpty {
                     SettingsInfoRow(
                         title: L10n.string("tvos_account_email", fallback: "Email"),
                         value: accountEmail
                     )
-                    .settingsLeaf(.acc)
+                    .settingsLeaf(.acc, section: "Account")
                 }
 
                 SettingsToggleRow(
@@ -2932,7 +2901,7 @@ private struct AccountSettingsView: View {
                     isOn: $syncWatchState,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Account")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -2946,7 +2915,7 @@ private struct AccountSettingsView: View {
                     isOn: $iCloudSyncEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.acc)
+                .settingsLeaf(.acc, section: "Account")
 
                 if iCloudSyncEnabled {
                     SettingsActionRow(
@@ -2961,14 +2930,14 @@ private struct AccountSettingsView: View {
                             ICloudSettingsSyncManager.shared.syncNow()
                         }
                     )
-                    .settingsLeaf(.acc)
+                    .settingsLeaf(.acc, section: "Account")
 
                     if let lastSync = iCloudSyncManager.lastSyncDate {
                         SettingsInfoRow(
                             title: L10n.string("tvos_settings_icloud_last_sync", fallback: "Last iCloud Sync"),
                             value: DateFormatter.localizedString(from: lastSync, dateStyle: .short, timeStyle: .medium)
                         )
-                        .settingsLeaf(.acc)
+                        .settingsLeaf(.acc, section: "Account")
                     }
                 }
 
@@ -2987,7 +2956,7 @@ private struct AccountSettingsView: View {
                         }
                         .opacity(onSignIn != nil ? 1 : 0.46)
                         .disabled(onSignIn == nil)
-                        .settingsLeaf(.acc)
+                        .settingsLeaf(.acc, section: "Account")
                     }
 
                     SettingsActionRow(
@@ -3003,7 +2972,7 @@ private struct AccountSettingsView: View {
                     }
                     .opacity(onSignOut != nil ? 1 : 0.46)
                     .disabled(onSignOut == nil)
-                    .settingsLeaf(.acc)
+                    .settingsLeaf(.acc, section: "Account")
                 } else {
                     SettingsActionRow(
                         title: L10n.string("tvos_account_sign_in", fallback: "Sign In"),
@@ -3018,10 +2987,10 @@ private struct AccountSettingsView: View {
                     }
                     .opacity(onSignIn != nil ? 1 : 0.46)
                     .disabled(onSignIn == nil)
-                    .settingsLeaf(.acc)
+                    .settingsLeaf(.acc, section: "Account")
                 }
             }
-            .settingsLeaves(primary: .acc, others: [])
+            .settingsPlaces([SettingsPlace(.acc, "Account")])
         }
         .onAppear { refreshEditableName() }
         .onChange(of: activeProfile) { _, _ in refreshEditableName() }
@@ -3409,7 +3378,7 @@ private struct AppearanceSettingsView: View {
                     isLiquidGlass: liquidGlassCards
                 )
                 .id(customPosterURLPattern)
-                .settingsLeaf(.poster)
+                .settingsLeaf(.poster, section: "POSTER CARD STYLE")
 
                 SettingsOptionRow(
                     title: L10n.string("settings_poster_card_radius", fallback: "Corner Radius"),
@@ -3427,7 +3396,7 @@ private struct AppearanceSettingsView: View {
                         cardCornerRadius = CardCornerRadiusOption.from(rawValue: cardCornerRadius).rawValue
                     }
                 }
-                .settingsLeaf(.poster)
+                .settingsLeaf(.poster, section: "POSTER CARD STYLE")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_liquid_glass_cards", fallback: "Liquid Glass Cards"),
@@ -3438,7 +3407,7 @@ private struct AppearanceSettingsView: View {
                     isOn: $liquidGlassCards,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.poster)
+                .settingsLeaf(.poster, section: "POSTER CARD STYLE")
 
                 SettingsTextFieldRow(
                     title: "Custom Poster URL",
@@ -3467,9 +3436,9 @@ private struct AppearanceSettingsView: View {
                         customPosterEnabledScreens = "all"
                     }
                 }
-                .settingsLeaf(.poster)
+                .settingsLeaf(.poster, section: "CUSTOM POSTER SOURCE")
             }
-            .settingsLeaves(primary: .poster, others: [])
+            .settingsPlaces([SettingsPlace(.poster, "POSTER CARD STYLE"), SettingsPlace(.poster, "CUSTOM POSTER SOURCE")])
 
             SettingsGroup(
                 title: L10n.string("settings_sidebar_tabs", fallback: "Sidebar"),
@@ -3481,7 +3450,7 @@ private struct AppearanceSettingsView: View {
                     isOn: $useTopNavigation,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.lay)
+                .settingsLeaf(.lay, section: "Navigation Bar")
                 SettingsToggleRow(
                     title: L10n.string("nav_calendar", fallback: "Calendar"),
                     subtitle: L10n.string(
@@ -3491,7 +3460,7 @@ private struct AppearanceSettingsView: View {
                     isOn: $showCalendarTab,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.lay)
+                .settingsLeaf(.lay, section: "Navigation Bar")
                 SettingsToggleRow(
                     title: L10n.string("nav_watch_party", fallback: "Watch Party"),
                     subtitle: L10n.string(
@@ -3501,9 +3470,9 @@ private struct AppearanceSettingsView: View {
                     isOn: $showWatchPartyTab,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.lay)
+                .settingsLeaf(.lay, section: "Navigation Bar")
             }
-            .settingsLeaves(primary: .lay, others: [])
+            .settingsPlaces([SettingsPlace(.lay, "Navigation Bar")])
 
             SettingsGroup(
                 title: L10n.string("appearance_nuvio_android_tv_styling", fallback: "Nuvio Android TV Styling"),
@@ -3523,7 +3492,7 @@ private struct AppearanceSettingsView: View {
                 )
                 .opacity(useTopNavigation ? 0.46 : 1)
                 .disabled(useTopNavigation)
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
 
                 SettingsToggleRow(
                     title: L10n.string("appearance_cw_perish_animation", fallback: "Continue Watching Perish Animation"),
@@ -3534,8 +3503,9 @@ private struct AppearanceSettingsView: View {
                     isOn: $continueWatchingPerishAnimation,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
             }
+            .settingsPlaces([SettingsPlace(.app, "NUVIO ANDROID TV STYLING")])
 
             SettingsGroup(
                 title: L10n.string("tvos_appearance_focus_outline", fallback: "Focus Outline"),
@@ -3545,9 +3515,9 @@ private struct AppearanceSettingsView: View {
                 )
             ) {
                 SettingsSwatchRow(swatches: accentSwatches, selection: $theme, accentColor: accentColor)
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "THEME")
             }
-            .settingsLeaves(primary: .app, others: [])
+            .settingsPlaces([SettingsPlace(.app, "THEME")])
 
             SettingsGroup(
                 title: L10n.string("tvos_appearance_app_background", fallback: "App Background"),
@@ -3557,7 +3527,7 @@ private struct AppearanceSettingsView: View {
                 )
             ) {
                 SettingsSwatchRow(swatches: backgroundSwatches, selection: $bodyColor, accentColor: accentColor)
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "THEME")
 
                 SettingsToggleRow(
                     title: L10n.string("appearance_amoled_mode", fallback: "AMOLED Mode"),
@@ -3568,7 +3538,7 @@ private struct AppearanceSettingsView: View {
                     isOn: $amoled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "DISPLAY")
 
                 SettingsToggleRow(
                     title: L10n.string("appearance_amoled_surfaces_mode", fallback: "AMOLED Surfaces"),
@@ -3581,9 +3551,9 @@ private struct AppearanceSettingsView: View {
                 )
                 .opacity(amoled ? 1 : 0.46)
                 .disabled(!amoled)
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "DISPLAY")
             }
-            .settingsLeaves(primary: .app, others: [])
+            .settingsPlaces([SettingsPlace(.app, "THEME"), SettingsPlace(.app, "DISPLAY")])
 
             SettingsGroup(
                 title: L10n.string("appearance_font_and_language", fallback: "Font and Language"),
@@ -3606,7 +3576,7 @@ private struct AppearanceSettingsView: View {
                 .onChange(of: appFont) { _, newValue in
                     AppFontManager.shared.setFont(AppFont.fromStored(newValue), persist: true)
                 }
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "DISPLAY")
 
                 // Same SettingsActionRow + LanguagePickerWindow pattern as Preferred Audio.
                 SettingsActionRow(
@@ -3621,9 +3591,9 @@ private struct AppearanceSettingsView: View {
                     onAppLanguage()
                 }
                 .focused(languageFocus, equals: .appLanguage)
-                .settingsLeaf(.app)
+                .settingsLeaf(.app, section: "DISPLAY")
             }
-            .settingsLeaves(primary: .app, others: [])
+            .settingsPlaces([SettingsPlace(.app, "DISPLAY")])
         }
         .onAppear {
             let resolvedFont = AppFont.fromStored(appFont)
@@ -4914,7 +4884,7 @@ private struct LayoutDiscoverySettingsView: View {
                     gridItemsPerRow: gridItemsPerRow,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_layout", fallback: "Layout"),
@@ -4930,7 +4900,7 @@ private struct LayoutDiscoverySettingsView: View {
                 .onAppear {
                     if homeLayout == "Classic" { homeLayout = "Modern" }
                 }
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_hero", fallback: "Hero Section"),
@@ -4941,7 +4911,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $heroEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 if homeLayout == "Grid View" {
                     HeroCatalogSelectionRow(
@@ -4949,7 +4919,7 @@ private struct LayoutDiscoverySettingsView: View {
                         accentColor: accentColor
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                    .settingsLeaf(.home)
+                    .settingsLeaf(.home, section: "HERO CATALOGS")
 
                     SettingsStepperRow(
                         title: L10n.string(
@@ -4967,7 +4937,7 @@ private struct LayoutDiscoverySettingsView: View {
                         accentColor: accentColor
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                    .settingsLeaf(.home)
+                    .settingsLeaf(.home, section: "HOME LAYOUT")
 
                     SettingsStepperRow(
                         title: L10n.string(
@@ -4988,7 +4958,7 @@ private struct LayoutDiscoverySettingsView: View {
                             : "\(gridItemsPerRow) items"
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                    .settingsLeaf(.home)
+                    .settingsLeaf(.home, section: "HOME LAYOUT")
                 }
 
                 SettingsToggleRow(
@@ -5005,7 +4975,7 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(heroEnabled ? 1 : 0.46)
                 .disabled(!heroEnabled)
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsToggleRow(
                     title: L10n.string("layout_ambient_mode", fallback: "Ambient Mode"),
@@ -5016,7 +4986,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $ambientMode,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_hero_ratings", fallback: "Hero Ratings"),
@@ -5029,7 +4999,7 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(heroEnabled ? 1 : 0.46)
                 .disabled(!heroEnabled)
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_continue_labels", fallback: "Continue Watching Labels"),
@@ -5040,7 +5010,7 @@ private struct LayoutDiscoverySettingsView: View {
                     accentColor: accentColor,
                     optionLabel: { L10n.optionLabel(CardLabelVisibility(rawValue: $0)?.label ?? $0) }
                 )
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "NEXT UP BEHAVIOR")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_poster_labels", fallback: "Poster Labels"),
@@ -5051,7 +5021,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $posterLabels,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.poster)
+                .settingsLeaf(.poster, section: "POSTER CARD STYLE")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5065,7 +5035,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $catalogAddonNames,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsToggleRow(
                     title: L10n.string("layout_landscape_posters", fallback: "Landscape Posters"),
@@ -5076,10 +5046,10 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $landscapePosters,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.poster)
+                .settingsLeaf(.poster, section: "POSTER CARD STYLE")
 
             }
-            .settingsLeaves(primary: .home, others: [.cw, .poster])
+            .settingsPlaces([SettingsPlace(.home, "HOME LAYOUT"), SettingsPlace(.home, "HERO CATALOGS"), SettingsPlace(.cw, "NEXT UP BEHAVIOR"), SettingsPlace(.poster, "POSTER CARD STYLE")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_focused_poster", fallback: "Focused Poster"),
@@ -5100,7 +5070,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $focusedPosterBackdropEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "BEHAVIOR")
 
                 SettingsStepperRow(
                     title: L10n.string(
@@ -5119,9 +5089,9 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(focusedPosterBackdropEnabled ? 1 : 0.46)
                 .disabled(!focusedPosterBackdropEnabled)
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "BEHAVIOR")
             }
-            .settingsLeaves(primary: .hover, others: [])
+            .settingsPlaces([SettingsPlace(.hover, "BEHAVIOR")])
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_settings_home_catalogs", fallback: "Home Catalogs"),
@@ -5131,7 +5101,7 @@ private struct LayoutDiscoverySettingsView: View {
             ) {
                 showingHomeCatalogOrderSettings = true
             }
-            .settingsLeaf(.home)
+            .settingsLeaf(.home, section: "CATALOGS")
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tmdb_collections_title", fallback: "Collections"),
@@ -5141,7 +5111,7 @@ private struct LayoutDiscoverySettingsView: View {
             ) {
                 showingCollectionsSettings = true
             }
-            .settingsLeaf(.lay)
+            .settingsLeaf(.lay, section: "HOME")
 
             SettingsGroup(
                 title: L10n.string("layout_section_continue_watching", fallback: "Continue Watching"),
@@ -5163,7 +5133,7 @@ private struct LayoutDiscoverySettingsView: View {
                     NotificationCenter.default.post(name: TraktSettingsStore.continueWatchingChangedNotification, object: nil)
                     NotificationCenter.default.post(name: ContinueWatchingStore.changedNotification, object: nil)
                 }
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "VISIBILITY")
 
                 SettingsToggleRow(
                     title: L10n.string("layout_cw_landscape", fallback: "Landscape Cards"),
@@ -5180,7 +5150,7 @@ private struct LayoutDiscoverySettingsView: View {
                     NotificationCenter.default.post(name: TraktSettingsStore.continueWatchingChangedNotification, object: nil)
                     NotificationCenter.default.post(name: ContinueWatchingStore.changedNotification, object: nil)
                 }
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "POSTER CARD STYLE")
 
                 SettingsOptionRow(
                     title: L10n.string("layout_cw_sort_mode", fallback: "Sort Order"),
@@ -5203,7 +5173,7 @@ private struct LayoutDiscoverySettingsView: View {
                     NotificationCenter.default.post(name: TraktSettingsStore.continueWatchingChangedNotification, object: nil)
                     NotificationCenter.default.post(name: ContinueWatchingStore.changedNotification, object: nil)
                 }
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "SORT ORDER")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5219,7 +5189,7 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(continueWatchingVisible ? 1 : 0.46)
                 .disabled(!continueWatchingVisible)
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "NEXT UP BEHAVIOR")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_show_unaired", fallback: "Show Unaired Next Up"),
@@ -5232,7 +5202,7 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(continueWatchingVisible ? 1 : 0.46)
                 .disabled(!continueWatchingVisible)
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "NEXT UP BEHAVIOR")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_episode_ratings", fallback: "Episode Ratings"),
@@ -5252,7 +5222,7 @@ private struct LayoutDiscoverySettingsView: View {
                 .onChange(of: continueWatchingEpisodeRatings) { _, newValue in
                     AddonRatingsService.setEpisodeRatingsChoice(newValue)
                 }
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "NEXT UP BEHAVIOR")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5268,9 +5238,9 @@ private struct LayoutDiscoverySettingsView: View {
                 )
                 .opacity(continueWatchingVisible ? 1 : 0.46)
                 .disabled(!continueWatchingVisible)
-                .settingsLeaf(.cw)
+                .settingsLeaf(.cw, section: "NEXT UP BEHAVIOR")
             }
-            .settingsLeaves(primary: .cw, others: [])
+            .settingsPlaces([SettingsPlace(.cw, "VISIBILITY"), SettingsPlace(.cw, "POSTER CARD STYLE"), SettingsPlace(.cw, "SORT ORDER"), SettingsPlace(.cw, "NEXT UP BEHAVIOR")])
 
             SettingsGroup(
                 title: L10n.string("nav_calendar", fallback: "Calendar"),
@@ -5288,9 +5258,9 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $homeCalendarToday,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
             }
-            .settingsLeaves(primary: .home, others: [])
+            .settingsPlaces([SettingsPlace(.home, "HOME LAYOUT")])
 
             SettingsGroup(
                 title: L10n.string("tvos_layout_discovery", fallback: "Discovery"),
@@ -5314,7 +5284,7 @@ private struct LayoutDiscoverySettingsView: View {
                         searchStyle = "Netflix"
                     }
                 }
-                .settingsLeaf(.cd)
+                .settingsLeaf(.cd, section: "SEARCH")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5328,7 +5298,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $preferAddonArtworkInSearch,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.cd)
+                .settingsLeaf(.cd, section: "SEARCH")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_discover_entry", fallback: "Discover Entry"),
@@ -5345,7 +5315,7 @@ private struct LayoutDiscoverySettingsView: View {
                         discoverLocation = "Search"
                     }
                 }
-                .settingsLeaf(.cd)
+                .settingsLeaf(.cd, section: "SEARCH")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5359,7 +5329,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $hideUnreleased,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5373,9 +5343,9 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $showFullDates,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.home)
+                .settingsLeaf(.home, section: "HOME LAYOUT")
             }
-            .settingsLeaves(primary: .cd, others: [.home])
+            .settingsPlaces([SettingsPlace(.cd, "SEARCH"), SettingsPlace(.home, "HOME LAYOUT")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_details_page", fallback: "Details Page"),
@@ -5396,7 +5366,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $detailsActionsBelowInfo,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
 
                 SettingsFeatureSummaryCard(
                     featureName: L10n.string("tvos_settings_details_sections", fallback: "Details Sections"),
@@ -5406,9 +5376,9 @@ private struct LayoutDiscoverySettingsView: View {
                 ) {
                     showingDetailsSectionsSettings = true
                 }
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "SECTIONS")
             }
-            .settingsLeaves(primary: .detail, others: [])
+            .settingsPlaces([SettingsPlace(.detail, "APPEARANCE"), SettingsPlace(.detail, "SECTIONS")])
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_settings_stream_list", fallback: "Stream List"),
@@ -5421,7 +5391,7 @@ private struct LayoutDiscoverySettingsView: View {
             ) {
                 showingStreamListEditor = true
             }
-            .settingsLeaf(.lay)
+            .settingsLeaf(.lay, section: "STREAMS")
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_episode_spoilers", fallback: "Episode Spoilers"),
@@ -5442,7 +5412,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $blurUnwatchedEpisodes,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5456,7 +5426,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $hideUnwatchedEpisodeDescriptions,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5470,7 +5440,7 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $hideUnwatchedEpisodeTitles,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -5484,12 +5454,12 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $revealNextEpisodeSpoilers,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
             }
-            .settingsLeaves(primary: .detail, others: [])
+            .settingsPlaces([SettingsPlace(.detail, "APPEARANCE")])
 
             TopShelfSettingsGroup(accentColor: accentColor)
-            .settingsLeaf(.topshelf)
+            .settingsLeaf(.topshelf, section: nil)
         }
         .onAppear(perform: refreshSummaryCounts)
         .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.addonOrderChangedNotification).receive(on: RunLoop.main)) { _ in
@@ -6446,7 +6416,7 @@ private struct IntegrationSettingsView: View {
             ) {
                 showingAddonsSettings = true
             }
-            .settingsLeaf(.cd)
+            .settingsLeaf(.cd, section: "SOURCES")
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_settings_plugins", fallback: "Plugins"),
@@ -6460,11 +6430,11 @@ private struct IntegrationSettingsView: View {
                 showingPluginsSettings = true
             }
             .onAppear { pluginSummaryCount = PluginStore.shared.repositories.count }
-            .settingsLeaf(.cd)
+            .settingsLeaf(.cd, section: "SOURCES")
 
             // The original AIOStreams running inside Nuvio (AIOStreamsHost).
             AIOStreamsHostSummaryCard(accentColor: accentColor)
-            .settingsLeaf(.cd)
+            .settingsLeaf(.cd, section: "SOURCES")
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_watch_progress_title", fallback: "Continue Watching & Scrobbling"),
@@ -6483,7 +6453,7 @@ private struct IntegrationSettingsView: View {
                     options: RemoteTrackingState.availableProgressSources().map(\.label),
                     accentColor: accentColor
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Sources")
 
                 if watchProgressSource.usesContinueWatchingWindow {
                     ContinueWatchingWindowChoiceRow(viewModel: traktViewModel, accentColor: accentColor)
@@ -6499,7 +6469,7 @@ private struct IntegrationSettingsView: View {
                         isOn: $nuvioSyncScrobbleEnabled,
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.trk)
+                    .settingsLeaf(.trk, section: "Sources")
                 }
 
                 if watchProgressSource != .trakt,
@@ -6513,7 +6483,7 @@ private struct IntegrationSettingsView: View {
                         ),
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.trk)
+                    .settingsLeaf(.trk, section: "Trakt features")
                 }
 
                 if watchProgressSource != .simkl,
@@ -6527,7 +6497,7 @@ private struct IntegrationSettingsView: View {
                         ),
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.trk)
+                    .settingsLeaf(.trk, section: "Simkl features")
                 }
 
                 if watchProgressSource != .mdblist,
@@ -6541,7 +6511,7 @@ private struct IntegrationSettingsView: View {
                         ),
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.trk)
+                    .settingsLeaf(.trk, section: "MDBList features")
                 }
 
                 if watchProgressSource != .wetrakr,
@@ -6555,7 +6525,7 @@ private struct IntegrationSettingsView: View {
                         ),
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.trk)
+                    .settingsLeaf(.trk, section: "WeTrakr features")
                 }
 
                 SettingsChoiceRow(
@@ -6565,9 +6535,9 @@ private struct IntegrationSettingsView: View {
                     options: RemoteTrackingState.availableLibrarySources().map(\.label),
                     accentColor: accentColor
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Sources")
             }
-            .settingsLeaves(primary: .trk, others: [])
+            .settingsPlaces([SettingsPlace(.trk, "Sources"), SettingsPlace(.trk, "Trakt features"), SettingsPlace(.trk, "Simkl features"), SettingsPlace(.trk, "MDBList features"), SettingsPlace(.trk, "WeTrakr features")])
 
             SettingsGroup(
                 title: L10n.string("settings_simkl_title", fallback: "Simkl"),
@@ -6583,10 +6553,10 @@ private struct IntegrationSettingsView: View {
                         simklViewModel.credentialsDidChange()
                     }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 SettingsInfoRow(title: L10n.string("tvos_settings_simkl_redirect_uri", fallback: "Simkl Redirect URI"), value: SimklConfig.redirectURI)
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 SimklConnectionSettingsCard(
                     viewModel: simklViewModel,
@@ -6595,9 +6565,9 @@ private struct IntegrationSettingsView: View {
                     onStartLogin: connectSimkl,
                     onOpenSettings: { showingSimklSettings = true }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
             }
-            .settingsLeaves(primary: .trk, others: [])
+            .settingsPlaces([SettingsPlace(.trk, "Accounts")])
 
             SettingsGroup(
                 title: L10n.string("settings_mdblist_title", fallback: "MDBList (Watch Progress & Scrobble)"),
@@ -6612,9 +6582,9 @@ private struct IntegrationSettingsView: View {
                     onStartLogin: connectMdbList,
                     onOpenSettings: { showingMdbListSettings = true }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
             }
-            .settingsLeaves(primary: .trk, others: [])
+            .settingsPlaces([SettingsPlace(.trk, "Accounts")])
 
             SettingsGroup(
                 title: "WeTrakr",
@@ -6630,10 +6600,10 @@ private struct IntegrationSettingsView: View {
                         wetrakrViewModel.credentialsDidChange()
                     }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 SettingsInfoRow(title: "WeTrakr Activation URL", value: WeTrakrConfig.activationURL)
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 WeTrakrConnectionSettingsCard(
                     viewModel: wetrakrViewModel,
@@ -6642,9 +6612,9 @@ private struct IntegrationSettingsView: View {
                     onStartLogin: connectWeTrakr,
                     onOpenSettings: { showingWeTrakrSettings = true }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
             }
-            .settingsLeaves(primary: .trk, others: [])
+            .settingsPlaces([SettingsPlace(.trk, "Accounts")])
 
             SettingsGroup(
                 title: L10n.string("mdblist_trakt_title", fallback: "Trakt"),
@@ -6666,7 +6636,7 @@ private struct IntegrationSettingsView: View {
                         traktViewModel.credentialsDidChange()
                     }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 SettingsTextFieldRow(
                     title: "Trakt Client Secret (optional)",
@@ -6684,7 +6654,7 @@ private struct IntegrationSettingsView: View {
                         traktViewModel.credentialsDidChange()
                     }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 SettingsTextFieldRow(
                     title: "Trakt Redirect URI",
@@ -6694,7 +6664,7 @@ private struct IntegrationSettingsView: View {
                     fieldWidth: 460,
                     onCommit: commitTraktRedirectURI
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
 
                 TraktConnectionSettingsCard(
                     viewModel: traktViewModel,
@@ -6703,9 +6673,9 @@ private struct IntegrationSettingsView: View {
                     onStartLogin: connectTrakt,
                     onOpenSettings: { showingTraktSettings = true }
                 )
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Accounts")
             }
-            .settingsLeaves(primary: .trk, others: [])
+            .settingsPlaces([SettingsPlace(.trk, "Accounts")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_tracking_addons", fallback: "Tracking Add-ons"),
@@ -6725,9 +6695,9 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingTrackingAddons = true
                 }
-                .settingsLeaf(.trk)
+                .settingsLeaf(.trk, section: "Tracking Add-ons")
             }
-            .settingsLeaves(primary: .trk, others: [])
+            .settingsPlaces([SettingsPlace(.trk, "Tracking Add-ons")])
 
             SettingsGroup(
                 title: L10n.string("nav_surprise_me", fallback: "Surprise Me"),
@@ -6747,9 +6717,9 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingSurpriseMeOptions = true
                 }
-                .settingsLeaf(.cd)
+                .settingsLeaf(.cd, section: "DISCOVERY")
             }
-            .settingsLeaves(primary: .cd, others: [])
+            .settingsPlaces([SettingsPlace(.cd, "DISCOVERY")])
 
             SettingsGroup(
                 title: L10n.string("settings_ai_subtitles_title", fallback: "AI Subtitles"),
@@ -6763,9 +6733,9 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingAISubtitleOptions = true
                 }
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "Subtitles")
             }
-            .settingsLeaves(primary: .pbSubs, others: [])
+            .settingsPlaces([SettingsPlace(.pbSubs, "Subtitles")])
 
             SettingsGroup(
                 title: L10n.string("tvos_integrations_metadata", fallback: "Metadata Providers"),
@@ -6782,7 +6752,7 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingTmdbOptions = true
                 }
-                .settingsLeaf(.int)
+                .settingsLeaf(.int, section: "INTEGRATIONS")
 
                 SettingsActionRow(
                     title: L10n.string("settings_anime_integrations", fallback: "Anime Integrations"),
@@ -6792,7 +6762,7 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingAniListOptions = true
                 }
-                .settingsLeaf(.int)
+                .settingsLeaf(.int, section: "INTEGRATIONS")
 
                 SettingsActionRow(
                     title: L10n.string("settings_mdblist_ratings_title", fallback: "MDBList Ratings & Badges (API Key)"),
@@ -6802,18 +6772,18 @@ private struct IntegrationSettingsView: View {
                 ) {
                     showingMdbListOptions = true
                 }
-                .settingsLeaf(.int)
+                .settingsLeaf(.int, section: "INTEGRATIONS")
             }
-            .settingsLeaves(primary: .int, others: [])
+            .settingsPlaces([SettingsPlace(.int, "INTEGRATIONS")])
 
             SettingsGroup(title: L10n.string("iptv_settings_title", fallback: "Live TV"),
                           subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")) {
                 SettingsToggleRow(title: L10n.string("iptv_enable_title", fallback: "Native IPTV"),
                                   subtitle: L10n.string("iptv_enable_subtitle", fallback: "Show Live TV in navigation"),
                                   isOn: $nativeIPTVEnabled, accentColor: accentColor)
-                .settingsLeaf(.cd)
+                .settingsLeaf(.cd, section: "SOURCES")
             }
-            .settingsLeaves(primary: .cd, others: [])
+            .settingsPlaces([SettingsPlace(.cd, "SOURCES")])
 
             SettingsGroup(
                 title: L10n.string("tvos_integrations_debrid", fallback: "Debrid"),
@@ -6829,7 +6799,7 @@ private struct IntegrationSettingsView: View {
                     accentColor: accentColor,
                     isAvailable: hasAnyDebridConnected
                 )
-                .settingsLeaf(.cs)
+                .settingsLeaf(.cs, section: "CONNECTED SERVICES")
 
                 SettingsToggleRow(
                     title: L10n.string("debrid_enable_title", fallback: "Resolve playable links"),
@@ -6838,7 +6808,7 @@ private struct IntegrationSettingsView: View {
                     accentColor: accentColor,
                     isAvailable: hasAnyDebridConnected
                 )
-                .settingsLeaf(.cs)
+                .settingsLeaf(.cs, section: "CONNECTED SERVICES")
 
                 if debridEnabled && connectedProviders.count > 1 {
                     SettingsChoiceRow(
@@ -6848,7 +6818,7 @@ private struct IntegrationSettingsView: View {
                         options: connectedProviders.map { $0.debridKind.rawValue },
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.cs)
+                    .settingsLeaf(.cs, section: "CONNECTED SERVICES")
                 }
 
                 SettingsActionRow(
@@ -6862,7 +6832,7 @@ private struct IntegrationSettingsView: View {
                 ) {
                     debridAccountToConnect = .realDebrid
                 }
-                .settingsLeaf(.cs)
+                .settingsLeaf(.cs, section: "ACCOUNTS")
 
                 SettingsActionRow(
                     title: L10n.string("tvos_settings_torbox", fallback: "TorBox"),
@@ -6872,7 +6842,7 @@ private struct IntegrationSettingsView: View {
                 ) {
                     debridAccountToConnect = .torbox
                 }
-                .settingsLeaf(.cs)
+                .settingsLeaf(.cs, section: "ACCOUNTS")
 
                 SettingsActionRow(
                     title: L10n.string("tvos_settings_premiumize", fallback: "Premiumize"),
@@ -6884,9 +6854,9 @@ private struct IntegrationSettingsView: View {
                 ) {
                     debridAccountToConnect = .premiumize
                 }
-                .settingsLeaf(.cs)
+                .settingsLeaf(.cs, section: "ACCOUNTS")
             }
-            .settingsLeaves(primary: .cs, others: [])
+            .settingsPlaces([SettingsPlace(.cs, "CONNECTED SERVICES"), SettingsPlace(.cs, "ACCOUNTS")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_p2p_title", fallback: "P2P BitTorrent"),
@@ -6898,7 +6868,7 @@ private struct IntegrationSettingsView: View {
                     isOn: p2pToggleBinding,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbP2p)
+                .settingsLeaf(.pbP2p, section: "P2P STREAMING")
 
                 if p2pIsEnabled {
                     SettingsToggleRow(
@@ -6907,7 +6877,7 @@ private struct IntegrationSettingsView: View {
                         isOn: $p2pHideTorrentStats,
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.pbP2p)
+                    .settingsLeaf(.pbP2p, section: "P2P STREAMING")
 
                     SettingsStepperRow(
                         title: L10n.string("tvos_settings_p2p_cache_limit_title", fallback: "Cache Storage Limit"),
@@ -6918,7 +6888,7 @@ private struct IntegrationSettingsView: View {
                         suffix: " GB",
                         accentColor: accentColor
                     )
-                    .settingsLeaf(.pbP2p)
+                    .settingsLeaf(.pbP2p, section: "P2P STREAMING")
 
                     SettingsActionRow(
                         title: L10n.string("tvos_settings_p2p_clear_cache_title", fallback: "Clear Torrent Cache"),
@@ -6930,21 +6900,21 @@ private struct IntegrationSettingsView: View {
                     }
                     .disabled(isRefreshingTorrentCache)
                     .task { await refreshTorrentCacheSize() }
-                    .settingsLeaf(.pbP2p)
+                    .settingsLeaf(.pbP2p, section: "P2P STREAMING")
                 }
             }
-            .settingsLeaves(primary: .pbP2p, others: [])
+            .settingsPlaces([SettingsPlace(.pbP2p, "P2P STREAMING")])
 
             SMBSettingsSection(accentColor: accentColor)
-            .settingsLeaf(.servers)
+            .settingsLeaf(.servers, section: nil)
 
             UsenetSettingsSection(accentColor: accentColor)
-            .settingsLeaf(.usenet)
+            .settingsLeaf(.usenet, section: nil)
 
             JellyfinSettingsSection(accentColor: accentColor)
-            .settingsLeaf(.servers)
+            .settingsLeaf(.servers, section: nil)
             PlexSettingsSection(accentColor: accentColor)
-            .settingsLeaf(.servers)
+            .settingsLeaf(.servers, section: nil)
         }
         .onAppear {
             refreshAddonSummaryCount()
@@ -13143,7 +13113,7 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .settingsEntryAnchor()
-                .settingsLeaf(.pbPlayer)
+                .settingsLeaf(.pbPlayer, section: "PLAYER")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_external_player", fallback: "External Player"),
@@ -13155,7 +13125,7 @@ private struct PlaybackSettingsView: View {
                     options: externalPlayers,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbPlayer)
+                .settingsLeaf(.pbPlayer, section: "PLAYER")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_forward_subtitles_externally", fallback: "Forward Subtitles Externally"),
@@ -13165,7 +13135,7 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(externalPlayer == ExternalPlayer.builtIn.rawValue ? 0.46 : 1)
                 .disabled(externalPlayer == ExternalPlayer.builtIn.rawValue)
-                .settingsLeaf(.pbPlayer)
+                .settingsLeaf(.pbPlayer, section: "PLAYER")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_frame_rate_matching", fallback: "Frame Rate Matching"),
@@ -13174,7 +13144,7 @@ private struct PlaybackSettingsView: View {
                     options: frameRateModes,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbVideo)
+                .settingsLeaf(.pbVideo, section: "VIDEO OUTPUT")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_buffer_profile", fallback: "Buffer Profile"),
@@ -13186,7 +13156,7 @@ private struct PlaybackSettingsView: View {
                     options: cacheModes,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbBuffer)
+                .settingsLeaf(.pbBuffer, section: "Buffer and cache")
 
                 SettingsActionRow(
                     title: L10n.string("tvos_settings_audio_video_processing", fallback: "Audio & Video Processing"),
@@ -13198,9 +13168,9 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor,
                     action: { showingAudioVideoProcessingSettings = true }
                 )
-                .settingsLeaf(.pb)
+                .settingsLeaf(.pb, section: nil)
             }
-            .settingsLeaves(primary: .pbPlayer, others: [.pbVideo, .pbBuffer, .pb])
+            .settingsPlaces([SettingsPlace(.pbPlayer, "PLAYER"), SettingsPlace(.pbVideo, "VIDEO OUTPUT"), SettingsPlace(.pbBuffer, "Buffer and cache"), SettingsPlace(.pb, nil)])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_seeking_previews", fallback: "Seeking Previews"),
@@ -13215,7 +13185,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $seekPreviewEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbIface)
+                .settingsLeaf(.pbIface, section: "Seeking Previews")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_seeking_preview_beyond_buffer", fallback: "Previews Beyond the Buffer"),
@@ -13227,7 +13197,7 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .disabled(!seekPreviewEnabled)
-                .settingsLeaf(.pbIface)
+                .settingsLeaf(.pbIface, section: "Seeking Previews")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_seekr_enabled", fallback: "Use Seekr"),
@@ -13240,7 +13210,7 @@ private struct PlaybackSettingsView: View {
                     isAvailable: !seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                 )
                 .disabled(!seekPreviewEnabled)
-                .settingsLeaf(.pbIface)
+                .settingsLeaf(.pbIface, section: "Seeking Previews")
 
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
@@ -13262,9 +13232,9 @@ private struct PlaybackSettingsView: View {
                 .onChange(of: seekrApiKey) { _, _ in
                     checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
                 }
-                .settingsLeaf(.pbIface)
+                .settingsLeaf(.pbIface, section: "Seeking Previews")
             }
-            .settingsLeaves(primary: .pbIface, others: [])
+            .settingsPlaces([SettingsPlace(.pbIface, "Seeking Previews")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_subtitle_autosync_title", fallback: "AutoSubSync"),
@@ -13282,7 +13252,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $subtitleAutoSync,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "Subtitles")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_subtitle_autosync_tolerance", fallback: "AutoSubSync Tolerance"),
@@ -13300,9 +13270,9 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .disabled(!subtitleAutoSync)
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "Subtitles")
             }
-            .settingsLeaves(primary: .pbSubs, others: [])
+            .settingsPlaces([SettingsPlace(.pbSubs, "Subtitles")])
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
@@ -13315,7 +13285,7 @@ private struct PlaybackSettingsView: View {
             ) {
                 showingPlayerButtonSettings = true
             }
-            .settingsLeaf(.pbIface)
+            .settingsLeaf(.pbIface, section: "Player interface")
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_settings_insight_sections", fallback: "InSight Sections"),
@@ -13328,7 +13298,7 @@ private struct PlaybackSettingsView: View {
             ) {
                 showingInSightSectionsSettings = true
             }
-            .settingsLeaf(.pbIface)
+            .settingsLeaf(.pbIface, section: "Player interface")
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_playback_behavior", fallback: "Playback Behavior"),
@@ -13346,7 +13316,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoPlayNext,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbUpnext)
+                .settingsLeaf(.pbUpnext, section: "NEXT EPISODE")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_post_play_recommendations", fallback: "Post-Play Recommendations"),
@@ -13357,7 +13327,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $postPlayRecommendationsEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbUpnext)
+                .settingsLeaf(.pbUpnext, section: "NEXT EPISODE")
 
                 SettingsToggleRow(
                     title: L10n.string("player_show_finish_time", fallback: "Show estimated finish time"),
@@ -13365,7 +13335,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $playerShowFinishTime,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbIface)
+                .settingsLeaf(.pbIface, section: "Player interface")
 
                 SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
@@ -13376,7 +13346,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $showLoadingStatus,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbIface)
+                .settingsLeaf(.pbIface, section: "Player interface")
 
                 SettingsToggleRow(
                     title: L10n.string("details_shuffle_all_series", fallback: "Shuffle for all series"),
@@ -13387,9 +13357,9 @@ private struct PlaybackSettingsView: View {
                     isOn: $shuffleAllSeries,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
             }
-            .settingsLeaves(primary: .pbUpnext, others: [.pbIface, .detail])
+            .settingsPlaces([SettingsPlace(.pbUpnext, "NEXT EPISODE"), SettingsPlace(.pbIface, "Player interface"), SettingsPlace(.detail, "APPEARANCE")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_chapters_skip", fallback: "Chapters & Skip"),
@@ -13407,7 +13377,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $timelineSegmentsEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
 
                 SubtitleColorRow(
                     title: L10n.string("tvos_settings_timeline_opening_color", fallback: "Opening Color"),
@@ -13419,7 +13389,7 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor,
                     colors: PlaybackChapters.colorChoices
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
 
                 SubtitleColorRow(
                     title: L10n.string("tvos_settings_timeline_ending_color", fallback: "Ending Color"),
@@ -13431,7 +13401,7 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor,
                     colors: PlaybackChapters.colorChoices
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
 
                 SettingsToggleRow(
                     title: L10n.string("auto_skip_intro", fallback: "Intro / Opening"),
@@ -13442,7 +13412,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoSkipIntro,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
 
                 SettingsToggleRow(
                     title: L10n.string("auto_skip_recap", fallback: "Recap"),
@@ -13453,7 +13423,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoSkipRecap,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
 
                 SettingsToggleRow(
                     title: L10n.string("auto_skip_outro", fallback: "Outro / Ending"),
@@ -13464,7 +13434,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoSkipOutro,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
 
                 SettingsToggleRow(
                     title: L10n.string("auto_skip_movie_credits", fallback: "End Credits"),
@@ -13475,9 +13445,9 @@ private struct PlaybackSettingsView: View {
                     isOn: $autoSkipMovieCredits,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSkip)
+                .settingsLeaf(.pbSkip, section: "SKIP SEGMENTS")
             }
-            .settingsLeaves(primary: .pbSkip, others: [])
+            .settingsPlaces([SettingsPlace(.pbSkip, "SKIP SEGMENTS")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_trailers_previews", fallback: "Trailers & Previews"),
@@ -13492,7 +13462,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $trailersEnabled,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "TRAILER")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
@@ -13502,7 +13472,7 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_card_trailer_sound", fallback: "Card Trailer Sound"),
@@ -13512,7 +13482,7 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "TRAILER")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_trailer_sound", fallback: "Trailer Sound"),
@@ -13529,7 +13499,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     accentColor: accentColor
                 )
-                .settingsLeaf(.detail)
+                .settingsLeaf(.detail, section: "APPEARANCE")
 
                 SettingsStepperRow(
                     title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
@@ -13542,7 +13512,7 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "TRAILER")
 
                 SettingsChoiceRow(
                     title: L10n.string("tvos_settings_trailer_source", fallback: "Trailer Source"),
@@ -13555,7 +13525,7 @@ private struct PlaybackSettingsView: View {
                     optionLabels: trailerSourceLabels,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "TRAILER")
 
                 SettingsChoiceRow(
                     title: L10n.string("tvos_settings_trailer_language", fallback: "Trailer Language"),
@@ -13570,9 +13540,9 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(TrailerSourceMode.fromStored(trailerSource) == .trailerioOnly ? 0.46 : 1)
                 .disabled(TrailerSourceMode.fromStored(trailerSource) == .trailerioOnly)
-                .settingsLeaf(.hover)
+                .settingsLeaf(.hover, section: "TRAILER")
             }
-            .settingsLeaves(primary: .hover, others: [.detail])
+            .settingsPlaces([SettingsPlace(.hover, "TRAILER"), SettingsPlace(.detail, "APPEARANCE")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_smart_stream_selection", fallback: "Smart Stream Selection"),
@@ -13587,7 +13557,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $smartStreamSelection,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "STREAM AUTO-PLAY")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_use_top_result", fallback: "Use Top Result"),
@@ -13600,7 +13570,7 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(smartStreamSelection ? 1 : 0.46)
                 .disabled(!smartStreamSelection)
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "STREAM AUTO-PLAY")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_reuse_last_link", fallback: "Reuse Last Link"),
@@ -13611,7 +13581,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $reuseLastLink,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "STREAM SELECTION")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_last_link_cache", fallback: "Last Link Cache"),
@@ -13628,7 +13598,7 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(reuseLastLink ? 1 : 0.46)
                 .disabled(!reuseLastLink)
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "STREAM SELECTION")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_prefer_binge_group", fallback: "Prefer Same Source / Binge Group"),
@@ -13645,7 +13615,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbUpnext)
+                .settingsLeaf(.pbUpnext, section: "NEXT EPISODE")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_remember_last_source_focus", fallback: "Remember Last Source Focus"),
@@ -13656,7 +13626,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $rememberLastSourceFocus,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "STREAM SELECTION")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_background_prefetch", fallback: "Background Pre-fetch"),
@@ -13667,7 +13637,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $backgroundStreamPreFetch,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "STREAM AUTO-PLAY")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_match_subtitle_language", fallback: "Match Subtitle Language"),
@@ -13680,9 +13650,9 @@ private struct PlaybackSettingsView: View {
                     isOn: $smartSubtitleMatching,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "Subtitles")
             }
-            .settingsLeaves(primary: .pbStream, others: [.pbUpnext, .pbSubs])
+            .settingsPlaces([SettingsPlace(.pbStream, "STREAM AUTO-PLAY"), SettingsPlace(.pbStream, "STREAM SELECTION"), SettingsPlace(.pbUpnext, "NEXT EPISODE"), SettingsPlace(.pbSubs, "Subtitles")])
 
             SettingsGroup(
                 title: L10n.string("tvos_settings_stream_sources_sorting", fallback: "Source Filters & Sorting"),
@@ -13699,7 +13669,7 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .disabled(recommendedStreamSort)
-                .settingsLeaf(.cs)
+                .settingsLeaf(.cs, section: "RESULT MANAGEMENT")
 
                 SettingsToggleRow(
                     title: L10n.string("stream_sort_recommended", fallback: "Nuvio Recommended"),
@@ -13707,7 +13677,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $recommendedStreamSort,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "SOURCE FILTERS & SORTING")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_cached_only", fallback: "Cached Only"),
@@ -13715,7 +13685,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $cachedOnlyStreams,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "SOURCE FILTERS & SORTING")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_prefer_hardware_codecs", fallback: "Prefer Hardware Decoded Streams"),
@@ -13723,7 +13693,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $preferHardwareDecodedStreams,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "SOURCE FILTERS & SORTING")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_preserve_addon_order", fallback: "Preserve Addon Results & Order"),
@@ -13731,9 +13701,9 @@ private struct PlaybackSettingsView: View {
                     isOn: $preserveAddonStreamOrder,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbStream)
+                .settingsLeaf(.pbStream, section: "SOURCE FILTERS & SORTING")
             }
-            .settingsLeaves(primary: .pbStream, others: [.cs])
+            .settingsPlaces([SettingsPlace(.cs, "RESULT MANAGEMENT"), SettingsPlace(.pbStream, "SOURCE FILTERS & SORTING")])
 
             SettingsGroup(
                 title: L10n.string("tvos_playback_audio_subtitles", fallback: "Audio & Subtitle Languages"),
@@ -13754,7 +13724,7 @@ private struct PlaybackSettingsView: View {
                     onAudioLanguage()
                 }
                 .focused(languageFocus, equals: .audio)
-                .settingsLeaf(.pbAudio)
+                .settingsLeaf(.pbAudio, section: "Audio")
 
                 SettingsActionRow(
                     title: L10n.string(
@@ -13771,7 +13741,7 @@ private struct PlaybackSettingsView: View {
                     onSubtitleLanguages()
                 }
                 .focused(languageFocus, equals: .subtitles)
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "Subtitles")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_playback_forced_subtitles", fallback: "Forced Subtitles"),
@@ -13782,7 +13752,7 @@ private struct PlaybackSettingsView: View {
                     isOn: $forcedSubtitles,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "Subtitles")
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_ass_ssa_override", fallback: "ASS/SSA Override"),
@@ -13791,9 +13761,9 @@ private struct PlaybackSettingsView: View {
                     options: assModes,
                     accentColor: accentColor
                 )
-                .settingsLeaf(.pbSubs)
+                .settingsLeaf(.pbSubs, section: "SUBTITLE RENDERING")
             }
-            .settingsLeaves(primary: .pbSubs, others: [.pbAudio])
+            .settingsPlaces([SettingsPlace(.pbAudio, "Audio"), SettingsPlace(.pbSubs, "Subtitles"), SettingsPlace(.pbSubs, "SUBTITLE RENDERING")])
 
         }
         .onReceive(NotificationCenter.default.publisher(for: TVSceneTabOrder.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -15579,7 +15549,9 @@ private struct AdvancedSettingsView: View {
                     accentColor: accentColor
                 )
                 .settingsEntryAnchor()
+                .settingsLeaf(.adv, section: "NAVIGATION")
             }
+            .settingsPlaces([SettingsPlace(.adv, "NAVIGATION")])
 
             SettingsGroup(
                 title: L10n.string("advanced_section_diagnostics", fallback: "Diagnostics"),
@@ -15594,6 +15566,7 @@ private struct AdvancedSettingsView: View {
                     isOn: $playbackDiagnostics,
                     accentColor: accentColor
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 #if os(tvOS)
                 SettingsToggleRow(
@@ -15605,6 +15578,7 @@ private struct AdvancedSettingsView: View {
                     }),
                     accentColor: accentColor
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
                 SettingsActionRow(
                     title: L10n.string("tvos_settings_view_playback_history", fallback: "View / Export Diagnostic History"),
                     subtitle: L10n.string("tvos_settings_view_playback_history_detail", fallback: "Inspect, delete or download recent diagnostic history from this Apple TV"),
@@ -15612,6 +15586,7 @@ private struct AdvancedSettingsView: View {
                     accentColor: accentColor,
                     action: { showingPlaybackHistory = true }
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
                 #endif
 
                 // Whether the app can hand its rows to the Top Shelf extension: a sideloaded
@@ -15630,6 +15605,7 @@ private struct AdvancedSettingsView: View {
                     accentColor: accentColor,
                     action: {}
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_playback_debug_overlay", fallback: "Playback Debug Overlay"),
@@ -15637,6 +15613,7 @@ private struct AdvancedSettingsView: View {
                     isOn: $playbackDebug,
                     accentColor: accentColor
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_focus_highlighter", fallback: "Focus Highlighter"),
@@ -15644,6 +15621,7 @@ private struct AdvancedSettingsView: View {
                     isOn: $focusHighlighter,
                     accentColor: accentColor
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 // The pull either ran or it did not. Without this, a session the
                 // server rejects looks identical to an account with no history:
@@ -15653,6 +15631,7 @@ private struct AdvancedSettingsView: View {
                     value: NuvioSyncManager.accountSyncDiagnostic,
                     isDiagnostic: true
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 // Reports how many synced rows arrived versus how many could be
                 // rendered. A large "awaiting metadata" count means add-ons could
@@ -15662,6 +15641,7 @@ private struct AdvancedSettingsView: View {
                     value: NuvioSyncManager.progressSyncDiagnostic,
                     isDiagnostic: true
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 // Why the row holds what it holds: how many entries survived
                 // each stage between the ledger and the screen.
@@ -15687,7 +15667,9 @@ private struct AdvancedSettingsView: View {
                 .onReceive(NotificationCenter.default.publisher(for: TrailerPlaybackDiagnostics.didUpdateNotification).receive(on: RunLoop.main)) { _ in
                     lastTrailerDiagnostic = TrailerPlaybackDiagnostics.shared.settingsSummary
                 }
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
             }
+            .settingsPlaces([SettingsPlace(.adv, "DIAGNOSTICS")])
 
             SettingsGroup(
                 title: L10n.string("settings_cache_title", fallback: "Cache"),
@@ -15706,7 +15688,9 @@ private struct AdvancedSettingsView: View {
                     accentColor: accentColor,
                     action: clearCache
                 )
+                .settingsLeaf(.adv, section: "CACHE")
             }
+            .settingsPlaces([SettingsPlace(.adv, "CACHE")])
 
             SettingsGroup(title: L10n.string("subtitle_style_reset", fallback: "Reset"), subtitle: L10n.string("tvos_settings_clear_local_tvos_settings_saved_by_this_screen", fallback: "Clear local tvOS settings saved by this screen")) {
                 SettingsActionRow(
@@ -15716,7 +15700,9 @@ private struct AdvancedSettingsView: View {
                     accentColor: accentColor,
                     action: resetSettings
                 )
+                .settingsLeaf(.adv, section: "RESET")
             }
+            .settingsPlaces([SettingsPlace(.adv, "RESET")])
         }
         #if os(tvOS)
         .fullScreenCover(isPresented: $showingPlaybackHistory) {
@@ -15776,10 +15762,12 @@ private struct AboutSettingsView: View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(title: L10n.string("tvos_settings_nuviotv", fallback: "NuvioTV"), subtitle: L10n.string("tvos_settings_build_and_runtime_information", fallback: "Build and runtime information")) {
                 SettingsInfoRow(title: L10n.string("tvos_settings_app_version", fallback: "App Version"), value: appVersion)
+                .settingsLeaf(.about, section: nil)
                 SettingsInfoRow(
                     title: L10n.string("release_update_latest_version", fallback: "Latest Version"),
                     value: releaseUpdateService.latestStatus
                 )
+                .settingsLeaf(.about, section: "ABOUT")
                 if releaseUpdateService.isEnabled {
                     SettingsActionRow(
                         title: L10n.string("release_update_check_now", fallback: "Check Now"),
@@ -15795,6 +15783,7 @@ private struct AboutSettingsView: View {
                     }
                     // The first focusable row of the pane when it's shown.
                     .settingsEntryAnchor()
+                    .settingsLeaf(.about, section: "ABOUT")
                 }
                 SettingsToggleRow(
                     title: L10n.string("release_update_check_toggle", fallback: "Check for Updates"),
@@ -15811,6 +15800,7 @@ private struct AboutSettingsView: View {
                     accentColor: accentColor
                 )
                 .settingsEntryAnchor(!releaseUpdateService.isEnabled)
+                .settingsLeaf(.about, section: "ABOUT")
                 SettingsActionRow(
                     title: L10n.string("sideload_updates_title", fallback: "Sideload Updates"),
                     subtitle: L10n.string("sideload_updates_row_subtitle", fallback: "Install new versions with atvloadly on your network"),
@@ -15826,6 +15816,7 @@ private struct AboutSettingsView: View {
                         .environmentObject(atvloadlyService)
                         .modifier(ClearPresentationBackgroundIfAvailable())
                 }
+                .settingsLeaf(.about, section: "ABOUT")
                 if let release = releaseUpdateService.latestRelease {
                     SettingsActionRow(
                         title: L10n.string("release_update_details", fallback: "Release Details"),
@@ -15838,11 +15829,16 @@ private struct AboutSettingsView: View {
                     .sheet(isPresented: $showingReleaseQR) {
                         ReleaseQRCodeSheet(release: release)
                     }
+                    .settingsLeaf(.about, section: "ABOUT")
                 }
                 SettingsInfoRow(title: L10n.string("tvos_settings_engine_core", fallback: "Engine Core"), value: L10n.string("tvos_settings_pure_swift", fallback: "Pure Swift"))
+                .settingsLeaf(.about, section: "ABOUT")
                 SettingsInfoRow(title: L10n.string("tvos_settings_playback_stack", fallback: "Playback Stack"), value: "AetherEngine / MPVKit")
+                .settingsLeaf(.about, section: "ABOUT")
                 SettingsInfoRow(title: L10n.string("tvos_settings_catalog_protocol", fallback: "Catalog Protocol"), value: L10n.string("tvos_settings_stremio_compatible", fallback: "Stremio compatible"))
+                .settingsLeaf(.about, section: "ABOUT")
             }
+            .settingsPlaces([SettingsPlace(.about, nil), SettingsPlace(.about, "ABOUT")])
 
             SettingsGroup(
                 title: L10n.string("announcements_title", fallback: "Announcements"),
@@ -15852,6 +15848,7 @@ private struct AboutSettingsView: View {
                     title: L10n.string("announcements_status", fallback: "Message Status"),
                     value: announcementService.status
                 )
+                .settingsLeaf(.about, section: "ANNOUNCEMENTS")
                 SettingsToggleRow(
                     title: L10n.string("announcements_check_toggle", fallback: "Check for Announcements"),
                     subtitle: L10n.string("announcements_check_toggle_subtitle", fallback: "Check for notices from the NuvioTV maintainers"),
@@ -15866,6 +15863,7 @@ private struct AboutSettingsView: View {
                     ),
                     accentColor: accentColor
                 )
+                .settingsLeaf(.about, section: "ANNOUNCEMENTS")
                 if let announcement = announcementService.firstActiveAnnouncement {
                     SettingsActionRow(
                         title: L10n.string("announcement_read_message", fallback: "Read Message"),
@@ -15875,11 +15873,13 @@ private struct AboutSettingsView: View {
                     ) {
                         selectedAnnouncement = announcement
                     }
+                    .settingsLeaf(.about, section: "ANNOUNCEMENTS")
                 }
             }
             .sheet(item: $selectedAnnouncement) { announcement in
                 AppNoticeDetailsSheet(notice: .announcement(announcement))
             }
+            .settingsPlaces([SettingsPlace(.about, "ANNOUNCEMENTS")])
 
             SettingsGroup(
                 title: L10n.string("about_licenses_attributions", fallback: "Open Source"),
@@ -15904,7 +15904,9 @@ private struct AboutSettingsView: View {
                 ) {
                     showingLicenses = true
                 }
+                .settingsLeaf(.about, section: "ABOUT")
             }
+            .settingsPlaces([SettingsPlace(.about, "ABOUT")])
         }
         .sheet(isPresented: $showingLicenses) {
             LicensesAttributionsSheet(accentColor: accentColor)
@@ -24308,11 +24310,18 @@ private struct SettingsGroup<Content: View>: View {
     let title: String
     let subtitle: String
     @ViewBuilder let content: Content
-    @Environment(\.settingsGroupHeaderHidden) private var headerHidden
+    @Environment(\.settingsGroupChromeHidden) private var chromeHidden
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            if !headerHidden {
+        if chromeHidden {
+            // Rows only. A sheet opened from a row must draw its own sections
+            // in full, so the flag stops here.
+            VStack(spacing: 12) {
+                content
+            }
+            .environment(\.settingsGroupChromeHidden, false)
+        } else {
+            VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 5) {
                     Text(title)
                         .font(.appFont(size: 28, weight: .bold))
@@ -24323,19 +24332,19 @@ private struct SettingsGroup<Content: View>: View {
                         .foregroundColor(.white.opacity(0.56))
                         .fixedSize(horizontal: false, vertical: true)
                 }
-            }
 
-            VStack(spacing: 12) {
-                content
+                VStack(spacing: 12) {
+                    content
+                }
             }
+            .padding(24)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .settingsGlass(shape: RoundedRectangle(cornerRadius: 32, style: .continuous), isProminent: false)
+            .overlay(
+                RoundedRectangle(cornerRadius: 32, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+            )
         }
-        .padding(24)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .settingsGlass(shape: RoundedRectangle(cornerRadius: 32, style: .continuous), isProminent: false)
-        .overlay(
-            RoundedRectangle(cornerRadius: 32, style: .continuous)
-                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
-        )
     }
 }
 
