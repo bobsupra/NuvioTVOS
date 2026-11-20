@@ -970,9 +970,6 @@ struct TVCatalogRow: View {
         }
     }
 
-    /// How far along a row Back still slides back to its first card (further, it jumps).
-    private static let backSlideLimit = 24
-
     private func traceRowLayout(
         enabled: Bool,
         rowID: String,

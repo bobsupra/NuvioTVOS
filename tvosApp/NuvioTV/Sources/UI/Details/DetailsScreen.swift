@@ -4485,7 +4485,6 @@ struct TvDetailsContent: View {
     /// The episode strip holds its episodes' focus and Details only hears of it, so a move along
     /// the strip redraws the strip, not all of Details. Details puts focus on an episode by asking the strip.
     @State private var episodeFocusRequest = TvEpisodeFocusRequest()
-    @State private var isTrailerParkedForScroll = false
     /// The section that currently owns focus. Other sections expose only their
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
@@ -4795,21 +4794,7 @@ struct TvDetailsContent: View {
         onBack()
     }
 
-    /// A background trailer behind the lower sections was drawn blurred, every video frame
-    /// across the screen. Scrolled down, it now pauses and gives way to the backdrop blurred
-    /// once; back at the top it goes on where it was.
-    private func updateTrailerParkingForScroll() {
-        let shouldPark = isScrolledDown
-            && isTrailerPlaying
-            && !isFullscreenTrailerPresented
-        guard shouldPark != isTrailerParkedForScroll else { return }
-        isTrailerParkedForScroll = shouldPark
-        if shouldPark {
-            trailerPlayer.pause()
-        } else if isTrailerPlaying, !isFullscreenTrailerPresented {
-            trailerPlayer.play()
-        }
-    }
+
 
     private func pauseBackgroundTrailerForExit() {
         trailerTask?.cancel()
@@ -5002,8 +4987,6 @@ struct TvDetailsContent: View {
                         onEpisodeMenuPresented?(isPresented)
                     },
                     onBack: handleDetailsBack,
-                    episodeFocusRequest: episodeFocusRequest,
-                    onEpisodeFocusChange: handleEpisodeFocusChange,
                     restrictFocusToKey: restoreEpisodeKey,
                     entryLocked: focusedDetailsSection != .episodes,
                     onMoveUpFromSeason: {
@@ -5876,6 +5859,18 @@ struct TvDetailsContent: View {
         restoreFocusWhenAvailable(using: scrollProxy)
     }
 
+    private func scrollID(for section: TvDetailsFocusSection) -> String {
+        switch section {
+        case .actions: return TvDetailsScrollID.topSection
+        case .episodes: return TvDetailsScrollID.episodesSection
+        case .cast: return TvDetailsScrollID.castSection
+        case .related: return TvDetailsScrollID.moreLikeThisSection
+        case .network: return TvDetailsScrollID.networkSection
+        case .production: return TvDetailsScrollID.productionSection
+        case .comments: return TvDetailsScrollID.commentsSection
+        }
+    }
+
     private func restoreFocusWhenAvailable(using scrollProxy: ScrollViewProxy) {
         guard let target = focusRestoreTarget else { return }
         guard isEnabled else {
@@ -6183,40 +6178,7 @@ struct TvDetailsContent: View {
         try? await Task.sleep(nanoseconds: Self.lowerSectionsAfterFocus)
     }
 
-    private func handleEpisodeFocusChange(_ newFocus: String?) {
-        episodeFocusMemory.generation &+= 1
-        if newFocus != nil {
-            setEpisodeFocused(true)
-        } else if isEpisodeFocused {
-            // A move along the strip passes through "no episode focused" for a moment, which
-            // redrew all of Details twice per move; only an exit that lasts counts.
-            let generation = episodeFocusMemory.generation
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                guard episodeFocusMemory.generation == generation else { return }
-                setEpisodeFocused(false)
-            }
-        }
-        // Restoration landed — lift the restriction.
-        if let newFocus, newFocus == restoreEpisodeKey {
-            restoreEpisodeKey = nil
-        }
-    }
 
-    private func setEpisodeFocused(_ focused: Bool) {
-        guard isEpisodeFocused != focused else { return }
-        isEpisodeFocused = focused
-    }
-
-    /// The episode control holding focus, as the strip reported it.
-    private var currentEpisodeFocus: String? {
-        episodeFocusMemory.focusedKey
-    }
-
-    /// Puts focus on episode control `key`, by asking the strip.
-    private func setEpisodeFocus(_ key: String?) {
-        guard let key, episodeFocusMemory.focusedKey != key else { return }
-        episodeFocusRequest = TvEpisodeFocusRequest(key: key, generation: episodeFocusRequest.generation &+ 1)
-    }
 
     private func cancelPendingFocusHandoff() {
         guard pendingPlayFocusGeneration != nil else { return }
@@ -6592,21 +6554,7 @@ private enum TvDetailsFocusActivity {
     }
 }
 
-private final class TvDetailsEpisodeFocusMemory {
-    var generation = 0
-    /// The episode control the strip last reported focused.
-    var focusedKey: String?
-}
 
-/// Details asking the episode strip to put focus on an episode control, a new generation each
-/// time. One that a strip only now built finds is applied if it is under a second old.
-private struct TvEpisodeFocusRequest: Equatable {
-    var key: String?
-    var generation = 0
-    var issuedAt = ProcessInfo.processInfo.systemUptime
-
-    var isFresh: Bool { ProcessInfo.processInfo.systemUptime - issuedAt < 1 }
-}
 
 private enum TvDetailsScrollID {
     static let topSection = "tv-details-top-section"
@@ -10305,7 +10253,9 @@ private struct TvDetailsEpisodes: View {
             video: video,
             fallbackArtworkURL: meta.backdropUrl,
             continueProgress: continueProgress(for: video),
-            isWatched: watchedEpisodeKeys.contains(watchKey),
+            isWatched: watchedEpisodeKeys.contains(watchKey)
+                || trustedWatchedEpisodeKeys.contains(watchKey),
+            isRevealableNextEpisode: watchKey == revealableNextEpisodeKey,
             watchCount: episodeWatchCount,
             isSeasonWatched: isSeasonWatched,
             episodeRatings: epRating,
@@ -10560,24 +10510,7 @@ private enum TvEpisodeFocus {
     static func card(_ videoID: String) -> String { "episode-card\u{1}\(videoID)" }
 }
 
-extension TvEpisodeCard: Equatable {
-    /// What the card shows; the actions are left out (closures can't be compared). The strip's
-    /// actions read its state when they run, so a card kept from an earlier render still acts on
-    /// the current episode list.
-    static func == (lhs: TvEpisodeCard, rhs: TvEpisodeCard) -> Bool {
-        lhs.video == rhs.video
-            && lhs.fallbackArtworkURL == rhs.fallbackArtworkURL
-            && lhs.continueProgress == rhs.continueProgress
-            && lhs.isWatched == rhs.isWatched
-            && lhs.watchCount == rhs.watchCount
-            && lhs.isSeasonWatched == rhs.isSeasonWatched
-            && lhs.episodeRatings == rhs.episodeRatings
-            && lhs.smartStreamSelection == rhs.smartStreamSelection
-            && (lhs.onPlayManually == nil) == (rhs.onPlayManually == nil)
-            && (lhs.onBack == nil) == (rhs.onBack == nil)
-            && (lhs.onMoveUp == nil) == (rhs.onMoveUp == nil)
-    }
-}
+
 
 private enum TvEpisodeCardLayout {
     static let width: CGFloat = 660

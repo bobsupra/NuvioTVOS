@@ -302,16 +302,11 @@ enum TVTab: Hashable, Identifiable, CaseIterable {
         var tabs: [Self] = [.home]
         if isWatchPartyEnabled { tabs.append(.party) }
         tabs += [.search, .library]
-        if isIPTVEnabled && ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
+        if ProfileSettings.current.bool(forKey: SettingsKey.nativeIPTVEnabled) { tabs.append(.liveTV) }
         if isCalendarEnabled { tabs.append(.calendar) }
         if ProfileSettings.current.bool(forKey: SettingsKey.showSurpriseMeTab) { tabs.append(.surprise) }
         tabs.append(.settings)
         return tabs
-    }
-
-    /// Native IPTV (disabled for now until ready).
-    static var isIPTVEnabled: Bool {
-        false
     }
 
     /// Settings → Appearance → Sidebar → Calendar (on unless turned off).
@@ -5082,7 +5077,7 @@ private struct TVMainTabView: View {
                 .environment(\.tvTopBarScrollEnabled, useTopNavigation && selectedTab == .library)
                 .tabItem { Label(TVTab.library.title, systemImage: TVTab.library.symbol) }
                 .tag(TVTab.library)
-            if TVTab.isIPTVEnabled && nativeIPTVEnabled {
+            if nativeIPTVEnabled {
                 liveTVTabContent
                     .tabItem { liveTVTabLabel }
                     .tag(TVTab.liveTV)
@@ -5176,7 +5171,7 @@ private struct TVMainTabView: View {
                 Tab(value: TVTab.profile) { Color.clear } label: { profileTabLabel }
             }
             coreTabs
-            if TVTab.isIPTVEnabled && nativeIPTVEnabled {
+            if nativeIPTVEnabled {
                 Tab(TVTab.liveTV.title, systemImage: TVTab.liveTV.symbol, value: TVTab.liveTV) {
                     liveTVTabContent
                 }
@@ -5503,13 +5498,7 @@ private final class TVHomeFocusWork {
     /// fast run of moves the scroll is still on its way and can show a row two or three behind
     /// the focused one, which vanished when the rows around focus moved on without it.
     var rowsBuiltDuringRun: Set<String> = []
-    /// The card holding focus in its row (when `TVCatalogRow.ownsCardFocus` is true). Home does
-    /// not re-render as focus moves along a row, but when it redraws for another reason this
-    /// is the card it knows is focused.
-    var rowFocusedCardID: String?
-    /// Bumped whenever focus leaves a card in a row that owns its focus: so if focus drops out
-    /// to nowhere (e.g. system UI), Home's next redraw knows nothing is focused.
-    var rowFocusBlurGeneration: Int = 0
+
 
     func cancelAll() {
         cachedVisibleSections = nil
@@ -6030,8 +6019,6 @@ struct TVHomeView: View {
     @State private var jellyfinSections: [TVHomeSection] = []
     @State private var plexSections: [TVHomeSection] = []
     @State private var isLoading = true
-    @State private var settledRowIndex: Int = 0
-    @State private var rowBuildReach: Int = 3
     @State private var profileGateFailedLoadIdentity: TVHomeContentIdentity?
     @State private var focusedMeta: NuvioMeta?
     /// Collection folder currently focused on Home. When set, the hero shows
