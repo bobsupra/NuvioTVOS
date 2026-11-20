@@ -9864,13 +9864,7 @@ struct TVHomeView: View {
     /// collection below a catalog.
     private func homeOrderedSections(_ sections: [TVHomeSection]) -> [TVHomeSection] {
         guard collectionHome == nil else { return sections }
-        let pinnedCollections = sections.filter {
-            $0.isCollectionRow && $0.isPinnedCollection
-        }
-        let remainder = sections.filter {
-            !($0.isCollectionRow && $0.isPinnedCollection)
-        }
-        return pinnedCollections + TVHomeCatalogOrder.apply(to: remainder)
+        return TVHomeCatalogOrder.applyKeepingPinnedCollectionsFirst(to: sections)
     }
 
     /// Puts the current For You rows at the top of the rows already on Home,
@@ -11819,6 +11813,15 @@ enum TVHomeCatalogOrder {
         }
         let unknown = sections.filter { bestIndex(for: $0) == nil }
         return known + unknown
+    }
+
+    /// Home's row order: pinned collections above every other row, and each
+    /// group in the saved order. Pinned collections follow the saved order
+    /// among themselves, as in the desktop app, rather than the order of the
+    /// collections list.
+    static func applyKeepingPinnedCollectionsFirst(to sections: [TVHomeSection]) -> [TVHomeSection] {
+        let isPinned: (TVHomeSection) -> Bool = { $0.isCollectionRow && $0.isPinnedCollection }
+        return apply(to: sections.filter(isPinned)) + apply(to: sections.filter { !isPinned($0) })
     }
 
     /// One row as the Settings list needs it: what to call it, which add-on it
