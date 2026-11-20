@@ -323,6 +323,26 @@ final class MultiServiceScrobbleTests: XCTestCase {
         XCTAssertFalse(activeAfterDisable.contains(.mdblist))
     }
 
+    func testPlaybackScrobbleSourcesIncludeSelectedProviderAndPreserveOptIns() {
+        let store = ProfileSettings.current
+        authenticateTrakt(in: store)
+        authenticateMdbList(in: store)
+        RemoteTrackingState.setScrobbleEnabled(true, for: .mdblist, in: store)
+        store.set(TraktWatchProgressSource.trakt.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+
+        XCTAssertFalse(RemoteTrackingState.isScrobbleEnabled(for: .trakt, in: store))
+        let selectedTraktSources = RemoteTrackingState.playbackScrobbleSources(in: store)
+        XCTAssertEqual(selectedTraktSources, [.trakt, .mdblist])
+        XCTAssertEqual(selectedTraktSources.count, Set(selectedTraktSources).count)
+        XCTAssertFalse(selectedTraktSources.contains(.nuvioSync))
+
+        // A stored Trakt opt-in remains intact when another source is selected.
+        RemoteTrackingState.setScrobbleEnabled(true, for: .trakt, in: store)
+        store.set(TraktWatchProgressSource.mdblist.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+        XCTAssertTrue(RemoteTrackingState.isScrobbleEnabled(for: .trakt, in: store))
+        XCTAssertEqual(RemoteTrackingState.playbackScrobbleSources(in: store), [.trakt, .mdblist])
+    }
+
     func testMdbListWithApiKeyOnlyEnablesLibraryAndProgressWithoutOAuthSession() {
         let store = ProfileSettings.current
         store.set("ratings-api-key", forKey: SettingsKey.mdbListApiKey)

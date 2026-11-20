@@ -1074,6 +1074,21 @@ enum RemoteTrackingState {
         }
     }
 
+    /// Playback always reports to the authenticated Continue Watching source;
+    /// other authenticated trackers still require their explicit opt-in.
+    static func playbackScrobbleSources(
+        in store: UserDefaults = ProfileSettings.current
+    ) -> [TraktWatchProgressSource] {
+        let selectedSource = TraktSettingsStore.watchProgressSource(in: store)
+        return TraktWatchProgressSource.allCases.filter { source in
+            guard source != .nuvioSync else { return false }
+            if source == selectedSource {
+                return isProgressSourceAuthenticated(source, in: store)
+            }
+            return isScrobbleEnabled(for: source, in: store)
+        }
+    }
+
     static func availableProgressSources(
         in store: UserDefaults = ProfileSettings.current
     ) -> [TraktWatchProgressSource] {
@@ -2755,7 +2770,7 @@ struct TraktProgressService {
             )
         }
 
-        var targets = RemoteTrackingState.activeScrobbleSources(in: store)
+        var targets = RemoteTrackingState.playbackScrobbleSources(in: store)
         if isPeriodicHeartbeat {
             targets.removeAll { $0 == .simkl }
         }
