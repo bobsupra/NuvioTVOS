@@ -5,19 +5,21 @@ final class DebridStreamPresentationTests: XCTestCase {
     private var testStore: UserDefaults!
     private var suiteName: String!
 
-    override func setUp() {
-        super.setUp()
+    override func setUp() async throws {
+        try await super.setUp()
         suiteName = "test.debrid.presentation.\(UUID().uuidString)"
         testStore = UserDefaults(suiteName: suiteName)!
         LocalDebridTestURLProtocol.handler = nil
         LocalDebridTestURLProtocol.firstBatchHashes = []
+        await LocalDebridService.resetRealDebridAvailabilityCacheForTesting()
     }
 
-    override func tearDown() {
+    override func tearDown() async throws {
         testStore.removePersistentDomain(forName: suiteName)
         LocalDebridTestURLProtocol.handler = nil
         LocalDebridTestURLProtocol.firstBatchHashes = []
-        super.tearDown()
+        await LocalDebridService.resetRealDebridAvailabilityCacheForTesting()
+        try await super.tearDown()
     }
 
     func testProviderKindShortNames() {

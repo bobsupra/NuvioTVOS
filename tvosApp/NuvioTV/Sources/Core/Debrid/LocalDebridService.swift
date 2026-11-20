@@ -31,6 +31,13 @@ private actor RealDebridAvailabilityCache {
         disabledUntil = Date().addingTimeInterval(duration)
     }
 
+    func resetForTesting() {
+        cache = [:]
+        lastRequestTime = Date.distantPast
+        isEndpointDisabled = false
+        disabledUntil = Date.distantPast
+    }
+
     func lookup(hashes: [String]) -> (statuses: [String: LocalDebridCacheStatus], missing: [String]) {
         let now = Date()
         var statuses: [String: LocalDebridCacheStatus] = [:]
@@ -106,6 +113,10 @@ struct LocalDebridService: Sendable {
         Dictionary(uniqueKeysWithValues: hashes.map { ($0, .unknown) })
     }
 
+    static func resetRealDebridAvailabilityCacheForTesting() async {
+        await RealDebridAvailabilityCache.shared.resetForTesting()
+    }
+
     // MARK: - TorBox
 
     private func checkTorboxCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCacheStatus]? {
@@ -150,7 +161,7 @@ struct LocalDebridService: Sendable {
 
     private func checkRealDebridCached(apiKey: String, hashes: [String]) async -> [String: LocalDebridCacheStatus] {
         guard await RealDebridAvailabilityCache.shared.isAvailable() else {
-            return [:]
+            return unknownStatuses(for: hashes)
         }
         let (cachedStatuses, missing) = await RealDebridAvailabilityCache.shared.lookup(hashes: hashes)
         if missing.isEmpty {
