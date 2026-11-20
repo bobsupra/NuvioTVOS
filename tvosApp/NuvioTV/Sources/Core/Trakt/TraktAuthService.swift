@@ -3310,12 +3310,7 @@ struct TraktProgressService {
     }
 
     private static func traktDate(_ value: String?) -> Date? {
-        guard let value, !value.isEmpty else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: value) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: value)
+        TraktISODate.parse(value)
     }
 
     private static func runtimeSeconds(for meta: NuvioMeta) -> Double {
@@ -4495,12 +4490,7 @@ struct TraktHistoryService {
     }
 
     private static func historyDate(_ value: String?) -> Date? {
-        guard let value, !value.isEmpty else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: value) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: value)
+        TraktISODate.parse(value)
     }
 }
 
@@ -5029,12 +5019,7 @@ struct TraktLibraryService {
     }
 
     private static func traktDate(_ value: String?) -> Date? {
-        guard let value, !value.isEmpty else { return nil }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: value) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: value)
+        TraktISODate.parse(value)
     }
 }
 
