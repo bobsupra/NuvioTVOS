@@ -12371,7 +12371,8 @@ private struct TvStreamCard: View {
             nuvioBadges: nuvioBadges,
             fileSizeLabel: fileSizeLabel,
             isScrolling: isFocused || previewFocused,
-            scale: style.badgeScale
+            scale: style.badgeScale,
+            flatArtwork: badgePlacement == .bottom
         )
     }
 
@@ -12568,6 +12569,7 @@ private struct TvStreamImportedBadgeRow: View {
     let isScrolling: Bool
     /// The stream list's text size (Settings → Playback → Stream List).
     var scale: CGFloat = 1
+    var flatArtwork = false
 
     @State private var contentWidth: CGFloat = 0
     @State private var animationStart = Date()
@@ -12634,7 +12636,7 @@ private struct TvStreamImportedBadgeRow: View {
             }
 
             ForEach(Array(badges.enumerated()), id: \.offset) { _, badge in
-                TvStreamImportedBadge(badge: badge, scale: scale)
+                TvStreamImportedBadge(badge: badge, scale: scale, flatArtwork: flatArtwork)
             }
 
             if let fileSizeLabel {
@@ -12666,15 +12668,17 @@ private struct TvStreamImportedBadgeRow: View {
 
 private struct TvStreamImportedBadge: View {
     let badge: StreamBadgeFilter
-    var scale: CGFloat = 1
+    let scale: CGFloat
+    let flatArtwork: Bool
     /// The image, kept on this Apple TV by `StreamBadgeImageStore` (it used to be downloaded
     /// again by `AsyncImage`, with a spinner, every time the card came on screen).
     @State private var image: UIImage?
     @State private var failed = false
 
-    init(badge: StreamBadgeFilter, scale: CGFloat = 1) {
+    init(badge: StreamBadgeFilter, scale: CGFloat, flatArtwork: Bool) {
         self.badge = badge
         self.scale = scale
+        self.flatArtwork = flatArtwork
         _image = State(initialValue: Self.imageURL(of: badge).flatMap {
             StreamBadgeImageStore.shared.cachedImage(for: $0)
         })
@@ -12686,8 +12690,11 @@ private struct TvStreamImportedBadge: View {
     }
 
     var body: some View {
+        let imageURL = Self.imageURL(of: badge)
+        let showBacking = !flatArtwork || imageURL == nil || failed
+
         Group {
-            if let url = Self.imageURL(of: badge) {
+            if let url = imageURL {
                 ZStack {
                     if let image {
                         Image(uiImage: image).resizable().scaledToFit()
@@ -12712,11 +12719,13 @@ private struct TvStreamImportedBadge: View {
         .frame(minWidth: 54 * scale, maxWidth: 150 * scale, minHeight: 30 * scale, maxHeight: 30 * scale)
         .padding(.horizontal, 6 * scale)
         .padding(.vertical, 4 * scale)
-        .background(background)
-        .overlay(
-            RoundedRectangle(cornerRadius: 7, style: .continuous)
-                .stroke(border, lineWidth: border == .clear ? 0 : 1)
-        )
+        .background(showBacking ? background : .clear)
+        .overlay {
+            if showBacking {
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .stroke(border, lineWidth: border == .clear ? 0 : 1)
+            }
+        }
         .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
     }
 
