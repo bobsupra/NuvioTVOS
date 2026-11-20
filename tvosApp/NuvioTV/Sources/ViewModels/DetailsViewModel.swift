@@ -579,7 +579,10 @@ class DetailsViewModel: ObservableObject {
         let task = Task { [weak self] in
             guard let self else { return }
             do {
-                let meta = try await repository.getMetadata(id: id, type: type)
+                // The viewer waits on it: AniList asks go ahead of Home rows and lists.
+                let meta = try await AniListClient.$isInteractive.withValue(true) {
+                    try await repository.getMetadata(id: id, type: type)
+                }
                 guard !Task.isCancelled,
                       self.detailsRequestGeneration == requestGeneration else { return }
                 self.didLoadMetadataSuccessfully = true
@@ -784,18 +787,21 @@ class DetailsViewModel: ObservableObject {
             if AniListService.isAniListTitle(meta.id) {
                 // The ratings as for any title: AniList's own, then MDBList and the rating
                 // add-ons by the IMDb id it maps to.
-                async let ratingsTask = Self.combinedRatings(for: meta)
                 if !skipMoreLikeThisFetch {
-                    let extras = await AniListService.extras(metaID: meta.id)
-                    guard self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
-                    if !extras.people.isEmpty {
-                        self.uiState.people = extras.people
-                    }
-                    if !extras.recommendations.isEmpty {
-                        self.uiState.moreLikeThis = extras.recommendations
+                    // Apart from the ratings: when AniList's rate limit holds the cast back, it
+                    // waits for the limit without holding the ratings back.
+                    Task { @MainActor [weak self] in
+                        let extras = await AniListService.extras(metaID: meta.id)
+                        guard let self, self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
+                        if !extras.people.isEmpty {
+                            self.uiState.people = extras.people
+                        }
+                        if !extras.recommendations.isEmpty {
+                            self.uiState.moreLikeThis = extras.recommendations
+                        }
                     }
                 }
-                let ratings = await ratingsTask
+                let ratings = await Self.combinedRatings(for: meta)
                 self.applyMdbRatings(ratings, for: meta.id, generation: generation)
                 // In the selected library under the IMDb/TMDB ids it maps to.
                 if let member = await Self.aniListLibraryMembership(for: meta) {

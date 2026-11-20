@@ -317,11 +317,14 @@ enum AniListService {
         let quoted = "“\(trimmed)”"
         let answer: AniListClient.Answer
         do {
-            answer = try await AniListClient.shared.answer(
-                AniListQueries.search,
-                variables: ["search": trimmed, "perPage": 30, "isAdult": isAdultVariable],
-                ttl: searchTTL
-            )
+            // The viewer waits on it: ahead of Home rows and lists after a start.
+            answer = try await AniListClient.$isInteractive.withValue(true) {
+                try await AniListClient.shared.answer(
+                    AniListQueries.search,
+                    variables: ["search": trimmed, "perPage": 30, "isAdult": isAdultVariable],
+                    ttl: searchTTL
+                )
+            }
         } catch {
             AniListDiagnostics.note(.search, "\(quoted): failed: \(AniListDiagnostics.describe(error))")
             return .failure
@@ -685,7 +688,7 @@ enum AniListService {
     /// Characters with their Japanese voice actors, and AniList's recommendations.
     static func extras(metaID: String) async -> (people: [TmdbPersonMetadata], recommendations: [RelatedTitle]) {
         guard AniListSettings.opensTitles, let id = AniListMetaBuilder.aniListID(from: metaID),
-              let data = try? await AniListClient.shared.query(AniListQueries.extras, variables: ["id": id], ttl: finishedTTL),
+              let data = await extrasAnswer(id: id),
               let media = try? decoder.decode(AniListMediaResponse.self, from: data).data?.Media else {
             return ([], [])
         }
@@ -711,6 +714,30 @@ enum AniListService {
             .filter { $0.type == nil || $0.type == "ANIME" }
             .map { AniListMetaBuilder.relatedTitle($0, relation: nil, language: language) }
         return (people, recommendations)
+    }
+
+    /// Waits between asks when AniList's rate limit held the cast back.
+    static let extrasRetryDelay: TimeInterval = 20
+    static let extrasAttempts = 3
+
+    /// The cast and recommendations query, which the viewer waits on. Held back by AniList's
+    /// rate limit with nothing saved yet (after a start or an update), it is asked again once
+    /// the limit lets go, while the title stays open, instead of leaving Cast and More Like
+    /// This empty.
+    private static func extrasAnswer(id: Int) async -> Data? {
+        for attempt in 1...extrasAttempts {
+            do {
+                return try await AniListClient.$isInteractive.withValue(true) {
+                    try await AniListClient.shared.query(AniListQueries.extras, variables: ["id": id], ttl: finishedTTL)
+                }
+            } catch AniListClient.ClientError.rateLimited where attempt < extrasAttempts {
+                try? await Task.sleep(nanoseconds: UInt64(extrasRetryDelay * 1_000_000_000))
+                if Task.isCancelled { return nil }
+            } catch {
+                return nil
+            }
+        }
+        return nil
     }
 
     static func clearCache() async {
