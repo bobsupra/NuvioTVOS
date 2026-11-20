@@ -15,8 +15,10 @@ enum IPTVXMLTVError: Error, Equatable { case invalidDocument, tooLarge }
 /// Reads only programmes relevant to the requested channels and time window.
 /// Does not fetch a guide or persist it; callers decide how to handle failure.
 enum IPTVXMLTV {
-    static let maximumBytes = 16 * 1024 * 1024
-    static let maximumProgrammes = 100_000
+    // XMLTV guides for providers with thousands of channels are commonly
+    // 50-120 MB uncompressed with 100k+ programmes; 16 MB / 100k refused them.
+    static let maximumBytes = 128 * 1024 * 1024
+    static let maximumProgrammes = 400_000
 
     static func parse(_ data: Data, channelIDs: Set<String>, window: Range<Date>) throws -> [IPTVProgramme] {
         guard data.count <= maximumBytes else { throw IPTVXMLTVError.tooLarge }
