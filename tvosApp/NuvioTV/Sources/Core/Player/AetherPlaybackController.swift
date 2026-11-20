@@ -5600,7 +5600,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     func addAudioUrl(_ url: String) {
         // Not supported — dual-URL sessions must use MPV.
-        print("[Aether] addAudioUrl ignored (use MPV for separate audio URL): \(url.prefix(80))")
+        print("[Aether] addAudioUrl ignored (use MPV for separate audio URL): \(URL(string: url).map { AddonTransportUrls.diagnosticDescription(for: $0) } ?? "?")")
     }
 
     func applySubtitleStyle() {
