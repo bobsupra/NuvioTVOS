@@ -6378,6 +6378,10 @@ private struct TvDetailsBackdrop: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
     @State private var backdropImage: UIImage?
+    /// Where `backdropImage` came from. The details open with the card's picture (an AniList
+    /// card's poster) and switch to the title's background moments later; the blurred copy is
+    /// made from, and kept under, the picture shown, never the one still loading.
+    @State private var backdropImageURL: URL?
     /// The backdrop blurred once, faded in over the sharp one instead of blurring it live (a
     /// full-screen blur worked out again on every frame).
     @State private var blurredBackdrop: UIImage?
@@ -6406,16 +6410,19 @@ private struct TvDetailsBackdrop: View {
         self.onTrailerReadyForDisplay = onTrailerReadyForDisplay
 
         var cachedInitial: UIImage? = nil
+        var cachedInitialURL: URL? = nil
         for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
             let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !trimmed.isEmpty, let url = URL(string: trimmed) {
                 if let cached = BackdropImageCache.shared.cachedImage(for: url) {
                     cachedInitial = cached
+                    cachedInitialURL = url
                     break
                 }
             }
         }
         _backdropImage = State(initialValue: cachedInitial)
+        _backdropImageURL = State(initialValue: cachedInitialURL)
     }
 
     var body: some View {
@@ -6425,17 +6432,15 @@ private struct TvDetailsBackdrop: View {
             if let backdropImage {
                 // One sharp image throughout (switching between two versions of it when the
                 // blurred copy arrived could flash as Details opened); live blur only until the
-                // blurred copy is ready.
-                Image(uiImage: backdropImage)
-                    .resizable()
-                    .scaledToFill()
+                // blurred copy is ready. Each is drawn in the screen's frame, so a picture of
+                // another shape (a poster) can't make the backdrop taller and push the picture
+                // below the screen.
+                Self.screenFilling(backdropImage)
                     .blur(radius: blurredBackdrop != nil ? 0 : blurRadius, opaque: true)
                     .animation(.easeInOut(duration: 0.35), value: blurRadius)
                     .ignoresSafeArea()
                 if let blurredBackdrop {
-                    Image(uiImage: blurredBackdrop)
-                        .resizable()
-                        .scaledToFill()
+                    Self.screenFilling(blurredBackdrop)
                         .opacity(blurRadius > 0 ? 1 : 0)
                         .animation(.easeInOut(duration: 0.35), value: blurRadius)
                         .ignoresSafeArea()
@@ -6478,20 +6483,27 @@ private struct TvDetailsBackdrop: View {
         .task(id: targetArtworkURL) {
             guard let url = targetArtworkURL else {
                 backdropImage = nil
+                backdropImageURL = nil
                 return
             }
             if let cached = BackdropImageCache.shared.cachedImage(for: url) {
                 backdropImage = cached
+                backdropImageURL = url
             } else if let loaded = await BackdropImageCache.shared.image(for: url) {
                 guard !Task.isCancelled else { return }
                 backdropImage = loaded
+                backdropImageURL = url
             }
         }
-        .task(id: BlurredBackdropKey(url: targetArtworkURL, hasImage: backdropImage != nil)) {
-            guard let url = targetArtworkURL, let backdropImage else {
+        // Keyed by the picture shown: blurring when the target changed, while the earlier
+        // picture was still shown, kept the poster's blur under the background's address.
+        .task(id: backdropImageURL) {
+            guard let url = backdropImageURL, let backdropImage else {
                 if blurredBackdrop != nil { blurredBackdrop = nil }
                 return
             }
+            // Live blur meanwhile, not the earlier picture's blurred copy.
+            blurredBackdrop = nil
             let blurred = await TvDetailsBlurredBackdrop.image(for: url, from: backdropImage)
             guard !Task.isCancelled else { return }
             blurredBackdrop = blurred
@@ -6499,9 +6511,15 @@ private struct TvDetailsBackdrop: View {
         .ignoresSafeArea()
     }
 
-    private struct BlurredBackdropKey: Equatable {
-        let url: URL?
-        let hasImage: Bool
+    /// `image` filling the frame it is given, top first, without setting that frame's size.
+    private static func screenFilling(_ image: UIImage) -> some View {
+        Color.clear
+            .overlay(alignment: .top) {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            }
+            .clipped()
     }
 }
 
