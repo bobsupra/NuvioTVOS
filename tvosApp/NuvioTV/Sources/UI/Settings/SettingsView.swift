@@ -1702,6 +1702,19 @@ private enum LanguagePickerKind: Hashable {
     case subtitles
 }
 
+private struct NuvioRailExitCountKey: EnvironmentKey {
+    static let defaultValue = 0
+}
+
+extension EnvironmentValues {
+    /// How many times focus has left the Nuvio sidebar for the page. A page
+    /// watches it to choose where that focus lands.
+    var nuvioRailExitCount: Int {
+        get { self[NuvioRailExitCountKey.self] }
+        set { self[NuvioRailExitCountKey.self] = newValue }
+    }
+}
+
 struct SettingsView: View {
     @Binding var selectedCategory: SettingsCategory
     let activeProfile: Profile?
@@ -1750,6 +1763,7 @@ struct SettingsView: View {
     @State private var presentedLanguagePicker: LanguagePickerKind?
     @State private var presentedProfilePinMode: ProfilePinSheetMode?
     @FocusState private var focusedCategory: SettingsCategory?
+    @Environment(\.nuvioRailExitCount) private var nuvioRailExitCount
     @FocusState private var focusedLanguagePreference: LanguagePickerKind?
     /// Whether focus has entered the current category's detail pane at least once.
     /// The entry lock (land on the first row) only fires on the first entry; after
@@ -1791,6 +1805,12 @@ struct SettingsView: View {
                         // sidebar for the detail pane — record that so re-entry is
                         // no longer locked to the first row.
                         if newValue == nil { detailVisited = true }
+                    }
+                    // The open Nuvio sidebar covers the category list, so tvOS
+                    // sends Right from it straight into the detail pane. Focus
+                    // goes to the selected category instead.
+                    .onChange(of: nuvioRailExitCount) { _, _ in
+                        DispatchQueue.main.async { focusedCategory = selectedCategory }
                     }
                     .onChange(of: selectedCategory) { oldCat, newCat in
                         TVHomeDebugTrace.log("settings.selectedCategory changed from \(oldCat.rawValue) to \(newCat.rawValue)")

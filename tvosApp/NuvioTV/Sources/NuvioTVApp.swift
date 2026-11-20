@@ -5292,6 +5292,8 @@ private struct TVMainTabView: View {
     @State private var observedTabSettings: TVMainTabSettings?
     @State private var tabSettingsReadThrough = TVMainTabSettingsReadThrough()
     @FocusState private var railFocus: TVTab?
+    /// Counts the times focus has left the Nuvio sidebar for the page.
+    @State private var nuvioRailExitCount = 0
     @State private var selectedSettingsCategory: SettingsCategory = .account
     @State private var collectionDestinations: [CollectionHomeDestination] = []
     @State private var directCollectionDestinations: [CollectionHomeDestination] = []
@@ -5812,7 +5814,21 @@ private struct TVMainTabView: View {
                 nuvioRailSection
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // The content's focus section starts past the closed sidebar, so
+            // Right from any sidebar row finds it, whether or not a row of the
+            // page lines up with that row. The page itself still fills the screen.
+            .padding(.leading, -TVNuvioRail.collapsedWidth)
             .focusSection()
+            .padding(.leading, TVNuvioRail.collapsedWidth)
+            .environment(\.nuvioRailExitCount, nuvioRailExitCount)
+            .onChange(of: railFocus) { previous, current in
+                guard previous != nil, current == nil else { return }
+                // Focus is briefly nowhere while the sidebar moves it to the
+                // current section. Only a lasting exit counts.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                    if railFocus == nil { nuvioRailExitCount += 1 }
+                }
+            }
             .onExitCommand { railFocus = nuvioRailTabs.contains(selectedTab) ? selectedTab : .home }
 
             TVNuvioRail(
@@ -5976,14 +5992,20 @@ private struct TVNuvioRail: View {
     let onSelect: (TVTab) -> Void
     let onProfile: () -> Void
 
-    @FocusState private var avatarFocused: Bool
+    private var avatarFocused: Bool { focus.wrappedValue == .profile }
+    /// Focus is outside the sidebar, so the next row it reaches is an entry.
+    @State private var cameFromContent = true
+    @FocusState private var entryStripFocused: Bool
 
     static let collapsedWidth: CGFloat = 128
     static let expandedWidth: CGFloat = 360
     /// The desktop sidebar's timing: 200 ms, fast out, slow in.
     static let motion = Animation.timingCurve(0.4, 0, 0.2, 1, duration: 0.2)
 
-    private var isExpanded: Bool { avatarFocused || focus.wrappedValue != nil }
+    private var isExpanded: Bool { focus.wrappedValue != nil || entryStripFocused }
+
+    /// The row focus lands on when it enters the closed sidebar.
+    private var landingTab: TVTab? { tabs.contains(selection) ? selection : tabs.first }
 
     /// The filled variant of a section's symbol when there is one, as the
     /// desktop sidebar's icons are solid.
@@ -6000,7 +6022,7 @@ private struct TVNuvioRail: View {
                 }
             }
             .buttonStyle(TVNuvioRailButtonStyle())
-            .focused($avatarFocused)
+            .focused(focus, equals: .profile)
             .focusEffectDisabledIfAvailable()
             .accessibilityLabel(TVTab.profile.title)
             .padding(.top, 64)
@@ -6038,6 +6060,25 @@ private struct TVNuvioRail: View {
             // Balances the profile row so the sections sit at the screen's centre.
             Color.clear.frame(height: 144)
         }
+        // tvOS only moves Left onto a row that is level with the focused
+        // item, so from the top of a page it would not reach the sidebar. This
+        // full-height strip is level with everything. It takes the focus and
+        // passes it to the current section.
+        .background(alignment: .leading) {
+            Color.clear
+                .frame(width: 80)
+                .frame(maxHeight: .infinity)
+                .contentShape(Rectangle())
+                .focusable(focus.wrappedValue == nil)
+                .focused($entryStripFocused)
+                .focusEffectDisabledIfAvailable()
+                .accessibilityHidden(true)
+        }
+        .onChange(of: entryStripFocused) { _, focused in
+            guard focused, let landingTab else { return }
+            cameFromContent = false
+            DispatchQueue.main.async { focus.wrappedValue = landingTab }
+        }
         .padding(.leading, 24)
         .frame(width: isExpanded ? Self.expandedWidth : Self.collapsedWidth, alignment: .leading)
         .frame(maxHeight: .infinity)
@@ -6046,7 +6087,17 @@ private struct TVNuvioRail: View {
         .background(Color.black)
         .animation(Self.motion, value: isExpanded)
         .focusSection()
-        .defaultFocus(focus, tabs.contains(selection) ? selection : tabs.first, priority: .userInitiated)
+        .defaultFocus(focus, landingTab, priority: .userInitiated)
+        // tvOS moves focus to the row nearest the one it came from. Arriving
+        // from the content, it goes to the current section instead.
+        .onChange(of: focus.wrappedValue) { previous, current in
+            if current == nil { cameFromContent = true }
+            guard cameFromContent, let current else { return }
+            cameFromContent = false
+            guard previous == nil, let landingTab, current != landingTab else { return }
+            // After tvOS has finished its own move, or the request is dropped.
+            DispatchQueue.main.async { focus.wrappedValue = landingTab }
+        }
         .ignoresSafeArea()
     }
 }
@@ -6060,25 +6111,31 @@ private struct TVNuvioRailRow<Icon: View>: View {
     let labelIsProminent: Bool
     @ViewBuilder let icon: () -> Icon
 
+    private static var slot: CGFloat { 80 }
+
     var body: some View {
-        HStack(spacing: 0) {
-            icon().frame(width: 64, height: 64)
-            if isExpanded {
-                Text(label)
-                    .font(.system(size: 29, weight: .semibold))
-                    .foregroundStyle(Color.white.opacity(isFocused || labelIsProminent ? 1 : 0.6))
-                    .lineLimit(1)
-                    .padding(.leading, 18)
-                    .padding(.trailing, 22)
-                    .transition(.opacity.combined(with: .move(edge: .leading)))
+        // The row's own frame is only the icon slot. tvOS looks for the next
+        // item past the focused frame's edge, so a frame as wide as the open
+        // sidebar would make Right skip everything the sidebar covers. The
+        // platter and the label are drawn outside that frame.
+        icon().frame(width: 64, height: 64)
+            .padding(8)
+            .background(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                    .fill(Color.white.opacity(isFocused ? 0.14 : 0))
+                    .frame(width: isExpanded ? TVNuvioRail.expandedWidth - 48 : Self.slot)
             }
-        }
-        .padding(8)
-        .frame(width: isExpanded ? TVNuvioRail.expandedWidth - 48 : nil, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .fill(Color.white.opacity(isFocused ? 0.14 : 0))
-        )
+            .overlay(alignment: .leading) {
+                if isExpanded {
+                    Text(label)
+                        .font(.system(size: 29, weight: .semibold))
+                        .foregroundStyle(Color.white.opacity(isFocused || labelIsProminent ? 1 : 0.6))
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.leading, Self.slot + 10)
+                        .transition(.opacity.combined(with: .move(edge: .leading)))
+                }
+            }
         .scaleEffect(isFocused ? 1.04 : 1, anchor: .leading)
         .animation(.easeOut(duration: 0.18), value: isFocused)
     }
