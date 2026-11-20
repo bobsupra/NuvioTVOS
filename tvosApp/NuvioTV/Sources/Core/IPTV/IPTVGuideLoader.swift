@@ -11,16 +11,17 @@ struct IPTVGuideLoader {
               let host = url.host, !host.isEmpty else { throw IPTVGuideLoadError.invalidURL }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("NuvioTV", forHTTPHeaderField: "User-Agent")
-        let (bytes, response) = try await session.bytes(for: request)
+        // Download the whole file, then read it mapped from disk. Appending
+        // one byte at a time from `bytes(for:)` took minutes for guides of
+        // tens of megabytes on Apple TV.
+        let (fileURL, response) = try await session.download(for: request)
+        defer { try? FileManager.default.removeItem(at: fileURL) }
         guard let http = response as? HTTPURLResponse else { throw IPTVGuideLoadError.invalidResponse }
         guard (200..<300).contains(http.statusCode) else { throw IPTVGuideLoadError.httpStatus(http.statusCode) }
         guard http.expectedContentLength <= Int64(IPTVXMLTV.maximumBytes) else { throw IPTVGuideLoadError.tooLarge }
-        var data = Data()
-        for try await byte in bytes {
-            if data.count.isMultiple(of: 4096) { try Task.checkCancellation() }
-            guard data.count < IPTVXMLTV.maximumBytes else { throw IPTVGuideLoadError.tooLarge }
-            data.append(byte)
-        }
+        let size = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int) ?? 0
+        guard size <= IPTVXMLTV.maximumBytes else { throw IPTVGuideLoadError.tooLarge }
+        let data = try Data(contentsOf: fileURL, options: .mappedIfSafe)
         try Task.checkCancellation()
         let payload = data
         let parsing = Task.detached(priority: .utility) {
