@@ -497,6 +497,9 @@ enum SettingsKey {
     static let deviceLocal = Set([
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
         p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage,
+        // The account payload of other devices has no value for it, and a
+        // pull would switch the sidebar off again.
+        useNuvioRail,
         aniListClientID, malClientID
     ])
 
