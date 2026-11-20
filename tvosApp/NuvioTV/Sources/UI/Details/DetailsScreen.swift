@@ -9864,6 +9864,7 @@ private struct TvDetailsEpisodes: View {
                         ForEach(seasons, id: \.self) { season in
                             TvSeasonPill(
                                 title: seasonTitle(season),
+                                detail: seasonDetail(season),
                                 isSelected: season == selectedSeason,
                                 onFocus: onFocus,
                                 onMoveUp: onMoveUpFromSeason,
@@ -9894,12 +9895,19 @@ private struct TvDetailsEpisodes: View {
                 }
             }
         } else {
-            Text(seasonTitle(selectedSeason))
-                .font(.system(size: 32, weight: .semibold))
-                .foregroundColor(.black)
-                .padding(.horizontal, 34)
-                .frame(height: 70)
-                .background(Color.white, in: Capsule())
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(seasonTitle(selectedSeason))
+                    .font(.system(size: 32, weight: .semibold))
+                if let detail = seasonDetail(selectedSeason) {
+                    Text(detail)
+                        .font(.system(size: 24, weight: .medium))
+                        .opacity(0.6)
+                }
+            }
+            .foregroundColor(.black)
+            .padding(.horizontal, 34)
+            .frame(height: 70)
+            .background(Color.white, in: Capsule())
         }
     }
 
@@ -9921,15 +9929,20 @@ private struct TvDetailsEpisodes: View {
     }
 
     private func seasonTitle(_ season: Int) -> String {
-        // AniList titles name each tab after its AniList entry.
-        if let name = AniListTitleIndex.tabTitle(metaID: meta.id, season: season) {
-            return name
+        // AniList titles name each tab after its AniList entry; the year is drawn apart.
+        if let label = AniListTitleIndex.tabLabel(metaID: meta.id, season: season) {
+            return label.name
         }
         if AniListMetaBuilder.isAniListID(meta.id) {
             // AniList's entries aren't seasons.
             return seasons.count > 1 ? "Part \(season)" : "Episodes"
         }
         return season <= 0 ? "Specials" : "Season \(season)"
+    }
+
+    /// The year of an AniList tab, smaller and dimmer next to its name.
+    private func seasonDetail(_ season: Int) -> String? {
+        AniListTitleIndex.tabLabel(metaID: meta.id, season: season)?.year.map { String($0) }
     }
 
     private func continueProgress(for video: NuvioVideo) -> Double? {
@@ -10006,6 +10019,8 @@ private enum TvEpisodeCardLayout {
 
 private struct TvSeasonPill: View {
     let title: String
+    /// Drawn after the title, smaller and dimmer (an AniList tab's year).
+    var detail: String? = nil
     let isSelected: Bool
     let onFocus: () -> Void
     let onMoveUp: () -> Void
@@ -10016,20 +10031,28 @@ private struct TvSeasonPill: View {
 
     var body: some View {
         Button(action: action) {
-            Text(title)
-                .font(.system(size: 30, weight: .semibold))
-                .foregroundColor(isSelected || isFocused ? .black : .white.opacity(0.66))
-                .padding(.horizontal, 30)
-                .frame(height: 70)
-                .background {
-                    if isSelected || isFocused {
-                        Capsule().fill(Color.white)
-                    } else {
-                        Capsule()
-                            .fill(Color.white.opacity(0.12))
-                            .background(Color.black.opacity(0.25), in: Capsule())
-                    }
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text(title)
+                    .font(.system(size: 30, weight: .semibold))
+                if let detail {
+                    Text(detail)
+                        .font(.system(size: 23, weight: .medium))
+                        .opacity(0.6)
                 }
+            }
+            .lineLimit(1)
+            .foregroundColor(isSelected || isFocused ? .black : .white.opacity(0.66))
+            .padding(.horizontal, 30)
+            .frame(height: 70)
+            .background {
+                if isSelected || isFocused {
+                    Capsule().fill(Color.white)
+                } else {
+                    Capsule()
+                        .fill(Color.white.opacity(0.12))
+                        .background(Color.black.opacity(0.25), in: Capsule())
+                }
+            }
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)

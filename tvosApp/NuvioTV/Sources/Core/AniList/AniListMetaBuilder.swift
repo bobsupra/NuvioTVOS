@@ -509,31 +509,154 @@ enum AniListMetaBuilder {
             .map(\.title)
     }
 
-    /// Names of the tabs, by season number.
-    /// The tabs' names: each entry's own, without what it shares with the first ("Shingeki no
-    /// Kyojin Season 3 Part 2" → "Season 3 Part 2 · 2019"), the first by its format ("TV ·
-    /// 2013"). A title of one entry says what it is: "TV · 12 episodes · 2023". Never "Season N":
-    /// AniList's entries aren't seasons.
+    /// A tab's name and its year, which the season pills draw smaller.
+    struct TabLabel: Equatable {
+        let name: String
+        let year: Int?
+
+        var text: String {
+            [name, year.map { String($0) }].compactMap { $0 }.joined(separator: " · ")
+        }
+    }
+
+    /// Names of the tabs, by season number, as text ("Season 2 · 2021").
     static func tabTitles(_ tabs: [AniListMedia], language: AniListSettings.TitleLanguage) -> [Int: String] {
+        tabLabels(tabs, language: language).mapValues(\.text)
+    }
+
+    /// Names of the tabs, by season number. Each entry's name loses what it shares with the
+    /// first ("Shingeki no Kyojin Season 3 Part 2" → "Season 3 Part 2"), then:
+    /// - a rest that only numbers the entry ("2nd Season", "Season 2", "II", "2") is
+    ///   "Season N", and the first tab is then "Season 1";
+    /// - any other rest stays ("Yuukaku-hen", "The Final Season", "Season 3 Part 2");
+    /// - an entry that isn't TV or ONA says its format first ("Movie · Mugen Ressha-hen");
+    /// - the first tab, when the others aren't seasons, is its format ("TV").
+    /// A title of one entry says what it is: "TV · 12 episodes". The year stays apart.
+    static func tabLabels(_ tabs: [AniListMedia], language: AniListSettings.TitleLanguage) -> [Int: TabLabel] {
         let names = tabs.map { title($0.title, language: language) }
-        guard let base = names.first else { return [:] }
-        if tabs.count == 1, let only = tabs.first {
-            return [1: singleTitle(only)]
+        guard let base = names.first, let first = tabs.first else { return [:] }
+        if tabs.count == 1 {
+            return [1: TabLabel(name: singleName(first), year: year(first))]
         }
-        var titles: [Int: String] = [:]
-        for (index, media) in tabs.enumerated() {
-            let short = index == 0 ? "" : shortName(names[index], base: base)
-            let label = short.isEmpty ? (formatLabel(media.format) ?? names[index]) : short
-            titles[index + 1] = [label, year(media).map { String($0) }].compactMap { $0 }.joined(separator: " · ")
+        var labels: [Int: TabLabel] = [:]
+        var hasSeasons = false
+        for (index, media) in tabs.enumerated() where index > 0 {
+            let short = shortName(names[index], base: base)
+            let name: String
+            if short.isEmpty {
+                name = formatLabel(media.format) ?? names[index]
+            } else if short != names[index], let season = seasonName(short, base: base) {
+                name = season
+                hasSeasons = true
+            } else {
+                name = short
+            }
+            labels[index + 1] = TabLabel(name: withFormat(name, of: media), year: year(media))
         }
-        return titles
+        let firstName = hasSeasons ? "Season 1" : (formatLabel(first.format) ?? base)
+        labels[1] = TabLabel(name: withFormat(firstName, of: first), year: year(first))
+        return labels
+    }
+
+    /// "TV · 12 episodes": what a title of one entry is.
+    static func singleName(_ media: AniListMedia) -> String {
+        var parts: [String] = [formatLabel(media.format) ?? "TV"]
+        if let count = media.episodes, count > 1 { parts.append("\(count) episodes") }
+        return parts.joined(separator: " · ")
     }
 
     static func singleTitle(_ media: AniListMedia) -> String {
-        var parts: [String] = [formatLabel(media.format) ?? "TV"]
-        if let count = media.episodes, count > 1 { parts.append("\(count) episodes") }
-        if let year = year(media) { parts.append(String(year)) }
-        return parts.joined(separator: " · ")
+        TabLabel(name: singleName(media), year: year(media)).text
+    }
+
+    /// The format before the name of an entry that isn't TV or ONA ("Movie · Mugen Ressha-hen").
+    private static func withFormat(_ name: String, of media: AniListMedia) -> String {
+        guard !isTab(media), let format = formatLabel(media.format), name != format else { return name }
+        return "\(format) · \(name)"
+    }
+
+    private static let seasonOrdinals = [
+        "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth",
+    ]
+
+    /// "Season N" when the rest of an entry's name numbers it:
+    /// - "2nd Season", "Second Season", "Season 2", "Season II" → "Season 2", with what follows
+    ///   ("2nd Season Part 2" → "Season 2 Part 2", "Season 2: Arc" → "Season 2: Arc");
+    /// - a bare "2" or "II" → "Season 2", also before a colon and words the first entry's name
+    ///   has ("II: Isekai Ittara Honki Dasu").
+    /// nil for anything else, and for numbers past 30 ("Mob Psycho 100").
+    static func seasonName(_ rest: String, base: String) -> String? {
+        let words = rest.split(whereSeparator: { $0 == " " }).map(String.init)
+        guard let head = words.first else { return nil }
+        let separators = CharacterSet(charactersIn: ":-–—~,.!")
+        func word(_ index: Int) -> String {
+            guard words.indices.contains(index) else { return "" }
+            return words[index].trimmingCharacters(in: separators).lowercased()
+        }
+        func seasonNumber(_ text: String) -> Int? {
+            if let value = Int(text) { return value }
+            return romanNumber(text)
+        }
+        func ordinal(_ text: String) -> Int? {
+            if let index = seasonOrdinals.firstIndex(of: text) { return index + 1 }
+            let digits = text.prefix { $0.isNumber }
+            let suffix = text.dropFirst(digits.count)
+            guard !digits.isEmpty, ["st", "nd", "rd", "th"].contains(String(suffix)) else { return nil }
+            return Int(digits)
+        }
+
+        var found: Int?
+        var used = 0
+        var explicit = false
+        if word(0) == "season", let value = seasonNumber(word(1)) {
+            found = value; used = 2; explicit = true
+        } else if word(1) == "season", let value = ordinal(word(0)) {
+            found = value; used = 2; explicit = true
+        } else if let value = seasonNumber(head.trimmingCharacters(in: separators).lowercased()) {
+            found = value; used = 1
+        }
+        guard let number = found, (1...30).contains(number) else { return nil }
+
+        let tail = words.dropFirst(used).joined(separator: " ")
+            .trimmingCharacters(in: separators.union(.whitespaces))
+        if tail.isEmpty || base.range(of: tail, options: [.caseInsensitive, .diacriticInsensitive]) != nil {
+            return "Season \(number)"
+        }
+        guard explicit else { return nil }
+        let lower = tail.lowercased()
+        let joint = lower.hasPrefix("part") || lower.hasPrefix("cour") ? " " : ": "
+        return "Season \(number)\(joint)\(tail)"
+    }
+
+    /// II…XXX as a number; nil for anything else, and for a lone "I".
+    static func romanNumber(_ text: String) -> Int? {
+        let values: [Character: Int] = ["i": 1, "v": 5, "x": 10]
+        let letters = Array(text.lowercased())
+        guard letters.count >= 1, letters.count <= 6, letters.allSatisfy({ values[$0] != nil }) else { return nil }
+        var total = 0
+        for (index, letter) in letters.enumerated() {
+            let value = values[letter]!
+            if index + 1 < letters.count, value < values[letters[index + 1]]! {
+                total -= value
+            } else {
+                total += value
+            }
+        }
+        // Only the canonical spelling: "IIII" or "VX" aren't numbers.
+        guard total >= 2, total <= 30, roman(total) == text.lowercased() else { return nil }
+        return total
+    }
+
+    private static func roman(_ value: Int) -> String {
+        var value = value
+        var text = ""
+        for (number, letters) in [(10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")] {
+            while value >= number {
+                text += letters
+                value -= number
+            }
+        }
+        return text
     }
 
     /// `name` without the words it shares with `base` at its start; all of it when they share

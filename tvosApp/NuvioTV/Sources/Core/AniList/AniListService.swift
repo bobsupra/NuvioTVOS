@@ -430,12 +430,12 @@ enum AniListService {
         guard let meta = AniListMetaBuilder.meta(tabs: tabs, episodes: episodes, language: language, artwork: artwork) else {
             throw DetailsError.notFound
         }
-        let tabTitles = AniListMetaBuilder.tabTitles(tabs, language: language)
+        let tabLabels = AniListMetaBuilder.tabLabels(tabs, language: language)
         let seasonByEntry = Dictionary(uniqueKeysWithValues: tabs.enumerated().map { ($1.id, $0 + 1) })
         let related = AniListMetaBuilder.related(tabs: tabs, language: language)
         // Under the series' id and its entries' too, however the title was opened.
         for key in Set([meta.id, id] + tabs.map { AniListMetaBuilder.metaID($0.id) }) {
-            AniListTitleIndex.store(metaID: key, tabTitles: tabTitles, seasonByEntry: seasonByEntry, related: related)
+            AniListTitleIndex.store(metaID: key, tabLabels: tabLabels, seasonByEntry: seasonByEntry, related: related)
         }
         return meta
     }
@@ -756,7 +756,7 @@ enum AniListService {
 /// tabs, the tab of each entry, and its Related row. Filled when the title loads.
 enum AniListTitleIndex {
     private struct Entry {
-        let tabTitles: [Int: String]
+        let tabLabels: [Int: AniListMetaBuilder.TabLabel]
         let seasonByEntry: [Int: Int]
         let related: [RelatedTitle]
     }
@@ -764,16 +764,27 @@ enum AniListTitleIndex {
     private static let lock = NSLock()
     private static var entries: [String: Entry] = [:]
 
-    static func store(metaID: String, tabTitles: [Int: String], seasonByEntry: [Int: Int], related: [RelatedTitle]) {
+    static func store(
+        metaID: String,
+        tabLabels: [Int: AniListMetaBuilder.TabLabel],
+        seasonByEntry: [Int: Int],
+        related: [RelatedTitle]
+    ) {
         lock.lock()
         defer { lock.unlock() }
-        entries[metaID.lowercased()] = Entry(tabTitles: tabTitles, seasonByEntry: seasonByEntry, related: related)
+        entries[metaID.lowercased()] = Entry(tabLabels: tabLabels, seasonByEntry: seasonByEntry, related: related)
     }
 
+    /// The tab's name with its year ("Season 2 · 2021").
     static func tabTitle(metaID: String, season: Int) -> String? {
+        tabLabel(metaID: metaID, season: season)?.text
+    }
+
+    /// The tab's name and year apart, for the season pills.
+    static func tabLabel(metaID: String, season: Int) -> AniListMetaBuilder.TabLabel? {
         lock.lock()
         defer { lock.unlock() }
-        return entries[metaID.lowercased()]?.tabTitles[season]
+        return entries[metaID.lowercased()]?.tabLabels[season]
     }
 
     /// The tab an entry opened from a card shows first: `anilist:182255` inside `anilist:154587`.
