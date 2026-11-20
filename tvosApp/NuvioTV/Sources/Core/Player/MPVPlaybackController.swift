@@ -1499,7 +1499,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     @objc private func appWillResignActive() {
         screensaverDebugLog("[ScreensaverDebug][MPVController] appWillResignActive")
-        suspendPlaybackForBackgroundOrInactive()
+        // Control Center, Siri and system alerts make the app inactive without
+        // leaving it. Keep playing, as the Aether path and the Apple TV app do;
+        // only didEnterBackground (Home, another app, sleep) suspends playback.
     }
 
     @objc private func enterBackground() {
