@@ -692,9 +692,18 @@ enum AniListService {
         let language = AniListSettings.titleLanguage
         let people = (media.characters?.edges ?? []).compactMap { edge -> TmdbPersonMetadata? in
             guard let name = edge.node?.name?.full, !name.isEmpty else { return nil }
-            let voice = edge.voiceActors?.first?.name?.full
+            let actor = edge.voiceActors?.first
+            let voice = actor?.name?.full
             let role = voice ?? (edge.role == "MAIN" ? "Main" : edge.role == "SUPPORTING" ? "Supporting" : nil)
-            return TmdbPersonMetadata(name: name, role: role, profileURL: edge.node?.image?.large, tmdbId: nil)
+            return TmdbPersonMetadata(
+                name: name,
+                role: role,
+                profileURL: edge.node?.image?.large,
+                tmdbId: nil,
+                aniListCharacterID: edge.node?.id,
+                aniListStaffID: voice == nil ? nil : actor?.id,
+                aniListStaffImage: actor?.image?.large
+            )
         }
         let recommendations = (media.recommendations?.nodes ?? [])
             .filter { ($0.rating ?? 0) > 0 }
@@ -705,6 +714,7 @@ enum AniListService {
     }
 
     static func clearCache() async {
+        AniListPeople.removeAll()
         await AniListClient.shared.clearCache()
     }
 

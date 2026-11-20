@@ -113,6 +113,58 @@ struct AniListPerson: Decodable, Hashable {
 
 struct AniListName: Decodable, Hashable {
     var full: String? = nil
+    /// In its own script (花江夏樹); asked only for the person page.
+    var native: String? = nil
+}
+
+/// A voice actor for the person page: who they are and their anime roles.
+struct AniListStaff: Decodable, Hashable {
+    let id: Int
+    var name: AniListName? = nil
+    var image: AniListImage? = nil
+    var description: String? = nil
+    var dateOfBirth: AniListDate? = nil
+    var dateOfDeath: AniListDate? = nil
+    var homeTown: String? = nil
+    var characterMedia: AniListRoleConnection? = nil
+}
+
+/// A character for the person page, when no voice actor is known: who it is and where it appears.
+struct AniListCharacter: Decodable, Hashable {
+    let id: Int
+    var name: AniListName? = nil
+    var image: AniListImage? = nil
+    var description: String? = nil
+    var dateOfBirth: AniListDate? = nil
+    var media: AniListRoleConnection? = nil
+}
+
+struct AniListRoleConnection: Decodable, Hashable {
+    var edges: [AniListRoleEdge]? = nil
+}
+
+/// One title of a voice actor or a character: the title, the role, and (for a voice actor)
+/// the characters they voice in it.
+struct AniListRoleEdge: Decodable, Hashable {
+    var characterRole: String? = nil
+    var characters: [AniListPerson]? = nil
+    var node: AniListMedia? = nil
+}
+
+/// `{ "data": { "Staff": … } }`
+struct AniListStaffResponse: Decodable {
+    struct DataField: Decodable {
+        let Staff: AniListStaff?
+    }
+    let data: DataField?
+}
+
+/// `{ "data": { "Character": … } }`
+struct AniListCharacterResponse: Decodable {
+    struct DataField: Decodable {
+        let Character: AniListCharacter?
+    }
+    let data: DataField?
 }
 
 struct AniListImage: Decodable, Hashable {

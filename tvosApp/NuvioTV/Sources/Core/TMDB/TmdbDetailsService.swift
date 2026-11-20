@@ -36,6 +36,14 @@ struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
     let tmdbId: Int?
     /// Nil when the source doesn't say (AniList, fallbacks).
     var credit: Credit? = nil
+    /// An AniList title's cast card is a character (`name`, `profileURL`) with its Japanese
+    /// voice actor (`role`): the ids and the actor's photo open their AniList page.
+    var aniListCharacterID: Int? = nil
+    var aniListStaffID: Int? = nil
+    var aniListStaffImage: String? = nil
+
+    /// Whether a click opens an AniList voice actor's or character's page.
+    var hasAniListPage: Bool { aniListStaffID != nil || aniListCharacterID != nil }
 
     /// The role to show under the name: "Creator" and "Director" in the app's
     /// language, decided by the credit type; a cast member's character name,
@@ -106,6 +114,9 @@ struct RelatedTitle: Identifiable, Equatable {
     let rating: Double?
     let overview: String?
     let backdropURL: String?
+    /// Shown under the name in place of the type and year: an AniList role
+    /// ("Tanjiro Kamado · 2019").
+    let caption: String?
 
     init(
         id: String,
@@ -115,7 +126,8 @@ struct RelatedTitle: Identifiable, Equatable {
         year: String?,
         rating: Double?,
         overview: String?,
-        backdropURL: String? = nil
+        backdropURL: String? = nil,
+        caption: String? = nil
     ) {
         self.id = id
         self.type = type
@@ -125,6 +137,7 @@ struct RelatedTitle: Identifiable, Equatable {
         self.rating = rating
         self.overview = overview
         self.backdropURL = backdropURL
+        self.caption = caption
     }
 
     var asMeta: NuvioMeta {
