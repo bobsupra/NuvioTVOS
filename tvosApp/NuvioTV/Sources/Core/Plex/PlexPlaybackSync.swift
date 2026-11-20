@@ -55,14 +55,22 @@ final class PlexPlaybackSync {
     func item(for url: URL) -> Item? {
         let index = PlexLibraryIndex.shared
         let found: (server: PlexServerConfig, title: PlexIndexedTitle, item: PlexIndexedItem)?
+        let remembered: PlexRememberedItem?
         if url.path.hasPrefix("/library/parts/") {
             found = index.locate(partPath: url.path, preferredHost: url.host)
+            remembered = found == nil ? index.rememberedItem(partPath: url.path) : nil
         } else if let converted = PlexClient.transcodedRatingKey(url) {
             found = index.locate(ratingKey: converted.ratingKey, preferredHost: url.host)
+            remembered = found == nil ? index.rememberedItem(ratingKey: converted.ratingKey) : nil
         } else {
             found = nil
+            remembered = nil
         }
-        return found.map { Item(serverID: $0.server.id, ratingKey: $0.item.ratingKey, durationMs: $0.item.durationMs) }
+        if let found {
+            return Item(serverID: found.server.id, ratingKey: found.item.ratingKey, durationMs: found.item.durationMs)
+        }
+        // A looked-up title's file replayed after a relaunch.
+        return remembered.map { Item(serverID: $0.serverID, ratingKey: $0.ratingKey, durationMs: $0.durationMs) }
     }
 
     private func item(forString url: String?) -> Item? {
@@ -106,9 +114,12 @@ final class PlexPlaybackSync {
         return components.url ?? url
     }
 
-    /// Headers safe to store with a link: a Plex link is stored without its token.
+    /// Headers safe to store with a link: a Plex link is stored without its
+    /// token. A looked-up title's file is remembered, so the stored link is
+    /// still recognised (and given its token) after a relaunch.
     func headersForStorage(url: String, headers: [String: String]) -> [String: String] {
-        guard item(forString: url) != nil else { return headers }
+        guard let item = item(forString: url) else { return headers }
+        PlexLibraryIndex.shared.rememberLookedUpItem(serverID: item.serverID, ratingKey: item.ratingKey)
         return headers.filter { $0.key != PlexClient.tokenHeader }
     }
 

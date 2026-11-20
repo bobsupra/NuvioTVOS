@@ -124,6 +124,38 @@ final class PlexPlaybackSyncTests: XCTestCase {
         XCTAssertEqual(found.first?.item.ratingKey, "a2")
     }
 
+    func testALookedUpTitleResumesAndItsStoredLinkWorksAfterARelaunch() {
+        // A movie found by a lookup in a library too large to sync.
+        let moviePart = "/library/parts/77/1/file.mkv"
+        let movie = PlexIndexedItem(ratingKey: "777", partKey: moviePart, container: "mkv", size: 1, durationMs: 5_400_000)
+        let title = PlexIndexedTitle(
+            contentId: "plex-\(serverID)-700", serverID: serverID, libraryID: "9", libraryName: "Huge", ratingKey: "700",
+            type: "movie", name: "Big", overview: nil, year: 2001, genres: nil, rating: nil, contentRating: nil,
+            premiereDate: nil, durationMs: 5_400_000, imdbId: "tt7770001", tmdbId: nil, thumb: nil, art: nil, cast: nil,
+            directors: nil, items: [movie]
+        )
+        PlexLibraryIndex.shared.recordLookup(contentId: "tt7770001", libraries: [(serverID: serverID, libraryID: "9")], found: [title])
+        PlexLibraryIndex.shared.setWatchStates(["777": PlexWatchState(viewOffsetMs: 2_700_000)], forServerID: serverID, merging: true)
+        let link = "http://10.0.0.5:32400\(moviePart)"
+        let url = URL(string: link)!
+        XCTAssertEqual(sync.resumePosition(for: url, fallback: 30), 2_700)
+
+        // Stored for Continue Watching without its token.
+        let stored = sync.headersForStorage(url: link, headers: [PlexClient.tokenHeader: "t", "User-Agent": "x"])
+        XCTAssertNil(stored[PlexClient.tokenHeader])
+
+        // After a relaunch the looked-up title is gone, but the link is still
+        // recognised: the current address, a token, and progress reports.
+        PlexLibraryIndex.shared.reload()
+        XCTAssertTrue(PlexLibraryIndex.shared.titles(matching: "tt7770001").isEmpty)
+        let resolved = sync.resolve(url: url, headers: stored)
+        XCTAssertEqual(resolved.url.absoluteString, "http://192.168.1.10:32400\(moviePart)")
+        XCTAssertNotNil(resolved.headers[PlexClient.tokenHeader])
+        XCTAssertEqual(sync.item(for: url)?.ratingKey, "777")
+        sync.report(.playing, url: link, currentTime: 2_710, duration: 5_400)
+        XCTAssertEqual(sent.map(\.timeMs), [2_710_000])
+    }
+
     func testFinishingMarksWatchedLocallyAndClearsThePosition() {
         sync.report(.playing, url: storedLink, currentTime: 100, duration: 600)
         sync.report(.stopped, url: storedLink, currentTime: 590, duration: 600)

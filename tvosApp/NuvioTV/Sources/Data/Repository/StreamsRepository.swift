@@ -25,6 +25,12 @@ final class StreamsRepository: ObservableObject {
     private var activeJob: Task<Void, Never>?
     private var activeRequestKey: String?
     private var activeAddonManifestURLs: [URL]?
+    /// Counts discovery runs, so work left over from an earlier run of the
+    /// same request key can't change a newer one.
+    private var discoveryRun = 0
+    /// The current run's add-on subtitles once fetched, for Plex streams
+    /// that arrive after them.
+    private var runExternalSubtitles: (run: Int, subtitles: [NuvioSubtitle])?
 
     /// Actor-backed success-only cache (no permanent failure entries).
     private static let manifestCache = StreamManifestCache()
@@ -246,6 +252,45 @@ final class StreamsRepository: ObservableObject {
         )
     }
 
+    /// For a lookup in a Plex library too large to sync that outlasted the
+    /// wait: adds its streams to the list if the same run of it is still
+    /// open, after the other owned groups (SMB, Jellyfin) and before the
+    /// add-ons.
+    private func addPlexStreams(whenFinished lookup: Task<Bool, Never>, requestKey: String, videoId: String, run: Int) {
+        Task { [weak self] in
+            guard await lookup.value, let self, self.isCurrentRun(run, requestKey: requestKey) else { return }
+            let tracks = await self.plexTracks(videoId: videoId)
+            guard self.isCurrentRun(run, requestKey: requestKey),
+                  var plex = self.plexStreamGroup(videoId: videoId, tracks: tracks) else { return }
+            // Arriving after the add-on subtitles were merged into the list.
+            if let external = self.runExternalSubtitles, external.run == run {
+                plex.streams = plex.streams.map { $0.mergingExternalSubtitles(external.subtitles) }
+            }
+            var groups = self.state.groups
+            if let index = groups.firstIndex(where: { $0.addonId == plex.addonId }) {
+                groups[index] = plex
+            } else {
+                let owned: Set<String> = ["local.smb", "local.jellyfin"]
+                groups.insert(plex, at: groups.prefix { owned.contains($0.addonId) }.count)
+            }
+            // Only the groups change. The loading and resolved-targets flags
+            // stay as they are: the in-player picker stops once targets are
+            // resolved and no group is loading.
+            self.state = StreamsDiscoveryState(
+                requestKey: requestKey,
+                revision: self.state.revision &+ 1,
+                groups: groups,
+                isAnyLoading: self.state.isAnyLoading,
+                emptyStateReason: nil,
+                hasResolvedTargets: self.state.hasResolvedTargets
+            )
+        }
+    }
+
+    private func isCurrentRun(_ run: Int, requestKey: String) -> Bool {
+        discoveryRun == run && activeRequestKey == requestKey && state.requestKey == requestKey
+    }
+
     // MARK: - Public API
 
     func load(
@@ -407,12 +452,29 @@ final class StreamsRepository: ObservableObject {
     private func runDiscovery(requestKey: String, type: String, videoId: String,
                               addonManifestURLs: [URL]) async {
         guard !Task.isCancelled else { return }
+        discoveryRun &+= 1
+        let run = discoveryRun
+        // A title in a Plex library too large to sync is looked up while due
+        // syncs run. A lookup slower than the wait adds its streams later.
+        let lookupStarted = Date()
+        let plexLookup = PlexSessionManager.shared.startOversizedLookup(contentId: Self.baseContentId(from: videoId), type: type)
         await PlexSessionManager.shared.syncDueServersBeforeStreamList()
         guard !Task.isCancelled else { return }
+        if let plexLookup {
+            let remaining = PlexSessionManager.streamListLookupWait - Date().timeIntervalSince(lookupStarted)
+            if !(await PlexSessionManager.shared.waitForLookup(plexLookup, timeout: remaining)) {
+                addPlexStreams(whenFinished: plexLookup, requestKey: requestKey, videoId: videoId, run: run)
+            }
+            guard !Task.isCancelled else { return }
+        }
         let plexTracks = await plexTracks(videoId: videoId)
         guard !Task.isCancelled else { return }
         let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId), plexStreamGroup(videoId: videoId, tracks: plexTracks)]
             .compactMap { $0 }
+        // The owned groups as shown now, with Plex streams a slow lookup added.
+        func currentOwnedGroups() -> [AddonStreamGroup] {
+            state.requestKey == requestKey ? state.groups : ownedGroups
+        }
         state = StreamsDiscoveryState(
             requestKey: requestKey,
             revision: state.revision &+ 1,
@@ -433,9 +495,9 @@ final class StreamsRepository: ObservableObject {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
-                groups: ownedGroups,
+                groups: currentOwnedGroups(),
                 isAnyLoading: false,
-                emptyStateReason: ownedGroups.isEmpty ? .noAddonsConfigured : nil,
+                emptyStateReason: currentOwnedGroups().isEmpty ? .noAddonsConfigured : nil,
                 hasResolvedTargets: true
             )
             return
@@ -491,16 +553,16 @@ final class StreamsRepository: ObservableObject {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
-                groups: ownedGroups,
+                groups: currentOwnedGroups(),
                 isAnyLoading: false,
-                emptyStateReason: ownedGroups.isEmpty ? .noCompatibleAddons : nil,
+                emptyStateReason: currentOwnedGroups().isEmpty ? .noCompatibleAddons : nil,
                 hasResolvedTargets: true
             )
             return
         }
 
         // Create every group as loading *before* any request so chips appear immediately.
-        let initialGroups = ownedGroups + targets.map {
+        let initialGroups = currentOwnedGroups() + targets.map {
             AddonStreamGroup(
                 addonId: $0.addonId,
                 displayName: $0.displayName,
@@ -569,6 +631,7 @@ final class StreamsRepository: ObservableObject {
         let externalSubtitles = await fetchExternalSubtitles(
             type: type, videoId: videoId, manifestURLs: enabledURLs)
         guard !Task.isCancelled, activeRequestKey == requestKey else { return }
+        runExternalSubtitles = (run, externalSubtitles)
 
         var finalGroups = state.groups
         if !externalSubtitles.isEmpty {

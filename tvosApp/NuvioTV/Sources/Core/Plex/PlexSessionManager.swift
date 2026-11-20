@@ -13,8 +13,47 @@ enum PlexConnectionState: Equatable {
 }
 
 struct PlexSyncReport: Equatable {
+    struct OversizedLibrary: Equatable {
+        let name: String
+        /// 0 when the server didn't say.
+        let itemCount: Int
+    }
+
+    struct LibraryFailure: Equatable {
+        let name: String
+        let reason: String
+    }
+
     let titles: Int
     let episodes: Int
+    /// Libraries too large to sync. Stream lists ask the server about each
+    /// title in them instead.
+    var oversizedLibraries: [OversizedLibrary] = []
+    /// Libraries whose listing failed. Their titles from the last sync stay.
+    var failedLibraries: [LibraryFailure] = []
+}
+
+/// What a sync found, library by library (`PlexSessionManager.syncLibraries`).
+struct PlexLibrarySyncOutcome {
+    var titles: [PlexIndexedTitle] = []
+    var states: [String: PlexWatchState] = [:]
+    var markers: [String: String] = [:]
+    /// Libraries too large to sync, by id, with their item counts.
+    var oversized: [String: Int] = [:]
+    var oversizedLibraries: [PlexSyncReport.OversizedLibrary] = []
+    var failures: [PlexSyncReport.LibraryFailure] = []
+    var firstFailure: Error?
+    /// Libraries listed, or kept because they hadn't changed.
+    var syncedLibraries = 0
+    /// Every library not too large to sync was listed in full, so `states`
+    /// is complete for those libraries.
+    var listedEverything = true
+
+    /// Whether `states` can replace the server's watch state. Not when a
+    /// library was kept, failed or was too large to sync: those keep the
+    /// states read before (titles looked up in an oversized library among
+    /// them), and the new states are merged in.
+    var replacesWatchStates: Bool { listedEverything && oversized.isEmpty }
 }
 
 enum PlexSyncState: Equatable {
@@ -24,15 +63,15 @@ enum PlexSyncState: Equatable {
     case failed(String)
 }
 
-/// Resumes a wait once, whichever of the sync or the time limit ends first.
+/// Resumes a wait once, whichever of the work or the time limit ends first.
 @MainActor
-private final class PlexSyncWaitGate {
+private final class PlexWaitGate<Value> {
     private var resumed = false
 
-    func resume(_ continuation: CheckedContinuation<Void, Never>) {
+    func resume(_ continuation: CheckedContinuation<Value, Never>, returning value: Value) {
         guard !resumed else { return }
         resumed = true
-        continuation.resume()
+        continuation.resume(returning: value)
     }
 }
 
@@ -139,6 +178,8 @@ final class PlexSessionManager: ObservableObject {
             reset.watchStateReadAt = nil
             reset.libraryChangeMarkers = nil
             reset.lastSyncDate = nil
+            reset.lastSyncAttemptDate = nil
+            reset.oversizedLibraries = nil
             store.upsert(reset)
         }
         store.setAccount(name: user.name, token: token)
@@ -216,14 +257,26 @@ final class PlexSessionManager: ObservableObject {
                   !server.selectedLibraryIDs.isEmpty,
                   connectionState(for: server.id).isConnected else { continue }
             if case .syncing = syncState(for: server.id) { continue }
-            guard Self.isSyncDue(lastSyncDate: server.lastSyncDate, minimumInterval: minimumInterval) else { continue }
+            guard Self.isSyncDue(
+                lastSyncDate: server.lastSyncDate,
+                lastAttemptDate: server.lastSyncAttemptDate,
+                minimumInterval: minimumInterval
+            ) else { continue }
             sync(server)
         }
     }
 
-    nonisolated static func isSyncDue(lastSyncDate: Date?, minimumInterval: TimeInterval, now: Date = Date()) -> Bool {
-        guard let lastSyncDate else { return true }
-        return now.timeIntervalSince(lastSyncDate) >= minimumInterval
+    /// Due once `minimumInterval` has passed since the later of the last
+    /// finished sync and the last attempt, so a failed sync waits as long as
+    /// a finished one.
+    nonisolated static func isSyncDue(
+        lastSyncDate: Date?,
+        lastAttemptDate: Date? = nil,
+        minimumInterval: TimeInterval,
+        now: Date = Date()
+    ) -> Bool {
+        guard let last = [lastSyncDate, lastAttemptDate].compactMap({ $0 }).max() else { return true }
+        return now.timeIntervalSince(last) >= minimumInterval
     }
 
     /// Before a stream list reads the Plex titles: syncs the servers that are
@@ -240,15 +293,15 @@ final class PlexSessionManager: ObservableObject {
             return syncTasks[server.id]
         }
         guard !running.isEmpty else { return }
-        let gate = PlexSyncWaitGate()
+        let gate = PlexWaitGate<Void>()
         await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
             Task { @MainActor in
                 for task in running { await task.value }
-                gate.resume(continuation)
+                gate.resume(continuation, returning: ())
             }
             Task { @MainActor in
                 try? await Task.sleep(nanoseconds: UInt64(timeout * 1_000_000_000))
-                gate.resume(continuation)
+                gate.resume(continuation, returning: ())
             }
         }
     }
@@ -357,6 +410,12 @@ final class PlexSessionManager: ObservableObject {
     /// contents haven't changed since its last sync is kept as it is, so a
     /// routine sync of a large, unchanged library is one small request.
     /// `force` lists everything again (the Sync button).
+    ///
+    /// Each library stands alone: one whose listing fails keeps its titles
+    /// from the last sync while the others sync, and one too large to sync
+    /// is skipped and looked up a title at a time by stream lists
+    /// (`lookUpInOversizedLibraries`). The sync fails only when no library
+    /// synced.
     func sync(_ server: PlexServerConfig, force: Bool = false) {
         guard !server.selectedLibraryIDs.isEmpty,
               let client = client(forServerID: server.id),
@@ -364,6 +423,10 @@ final class PlexSessionManager: ObservableObject {
         let profileID = activeProfileID
         syncTasks[server.id]?.cancel()
         syncStates[server.id] = .syncing(found: 0, library: "")
+        if var attempted = PlexServerStore.shared.server(id: server.id) {
+            attempted.lastSyncAttemptDate = Date()
+            PlexServerStore.shared.upsert(attempted)
+        }
 
         syncTasks[server.id] = Task { [weak self] in
             guard let self else { return }
@@ -371,68 +434,52 @@ final class PlexSessionManager: ObservableObject {
                 // Fresh change markers; the connected list can be hours old.
                 let libraries = (try? await client.libraries()) ?? connectedLibraries
                 let selected = libraries.filter { server.selectedLibraryIDs.contains($0.id) }
-                let previousMarkers = server.libraryChangeMarkers ?? [:]
                 let previousTitles = PlexLibraryIndex.shared.titlesByServerID[server.id] ?? []
-                var markers: [String: String] = [:]
-                var titles: [PlexIndexedTitle] = []
-                var states: [String: PlexWatchState] = [:]
                 let readAt = Int64(Date().timeIntervalSince1970)
-                var listedEverything = true
-                var found = 0
-                for library in selected {
-                    try Task.checkCancellation()
-                    markers[library.id] = library.changeMarker
-                    let kept = previousTitles.filter { $0.libraryID == library.id }
-                    // Titles synced before file formats were kept are listed once more.
-                    let hasFileDetails = kept.isEmpty || kept.contains { $0.items.contains { $0.details != nil } }
-                    if !force, hasFileDetails, let marker = library.changeMarker, previousMarkers[library.id] == marker {
-                        titles += kept
-                        found += kept.reduce(0) { $0 + $1.items.count }
-                        listedEverything = false
-                        continue
-                    }
-                    let foundBefore = found
-                    let libraryName = library.name
-                    let serverID = server.id
-                    let progress: (Int, Int?) -> Void = { count, _ in
+                let serverID = server.id
+                let outcome = try await Self.syncLibraries(
+                    selected,
+                    client: client,
+                    serverID: serverID,
+                    previousTitles: previousTitles,
+                    previousMarkers: server.libraryChangeMarkers ?? [:],
+                    knownOversized: server.oversizedLibraries ?? [:],
+                    force: force,
+                    onProgress: { found, libraryName in
                         Task { @MainActor [weak self] in
                             guard let self, case .syncing = self.syncStates[serverID] else { return }
-                            self.syncStates[serverID] = .syncing(found: foundBefore + count, library: libraryName)
+                            self.syncStates[serverID] = .syncing(found: found, library: libraryName)
                         }
                     }
-                    if library.type == "movie" {
-                        let movies = try await client.items(libraryID: library.id, type: .movie, onPageFetched: progress)
-                        found += movies.count
-                        for movie in movies { states[movie.ratingKey] = PlexWatchState(movie) }
-                        titles += PlexLibraryResolver.resolve(movies: movies, shows: [], episodes: [], serverID: server.id, library: library)
-                    } else {
-                        let shows = try await client.items(libraryID: library.id, type: .show, onPageFetched: progress)
-                        found += shows.count
-                        let episodes = try await client.items(libraryID: library.id, type: .episode, onPageFetched: progress)
-                        found += episodes.count
-                        for episode in episodes { states[episode.ratingKey] = PlexWatchState(episode) }
-                        titles += PlexLibraryResolver.resolve(movies: [], shows: shows, episodes: episodes, serverID: server.id, library: library)
-                    }
-                }
+                )
                 try Task.checkCancellation()
                 guard self.activeProfileID == profileID else { return }
+                // Nothing synced: report why, and leave the index as it was.
+                if let failure = outcome.firstFailure, outcome.syncedLibraries == 0, outcome.oversized.isEmpty {
+                    throw failure
+                }
+                let titles = outcome.titles
                 if titles != previousTitles {
                     try PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
                 }
-                // Kept libraries' states stay; what was played in them since
-                // the last read arrives through `refreshWatchStates`.
-                PlexLibraryIndex.shared.setWatchStates(states, forServerID: server.id, merging: !listedEverything)
-                if !listedEverything { await self.refreshWatchStates(forServerID: server.id) }
+                // Kept, failed and oversized libraries keep their states; what
+                // was played in them since the last read arrives through
+                // `refreshWatchStates`.
+                PlexLibraryIndex.shared.setWatchStates(outcome.states, forServerID: server.id, merging: !outcome.replacesWatchStates)
+                if !outcome.replacesWatchStates { await self.refreshWatchStates(forServerID: server.id) }
                 if var updated = PlexServerStore.shared.server(id: server.id) {
                     updated.lastSyncDate = Date()
                     updated.lastSyncTitleCount = titles.count
-                    updated.libraryChangeMarkers = markers
-                    if listedEverything { updated.watchStateReadAt = readAt }
+                    updated.libraryChangeMarkers = outcome.markers
+                    updated.oversizedLibraries = outcome.oversized.isEmpty ? nil : outcome.oversized
+                    if outcome.listedEverything { updated.watchStateReadAt = readAt }
                     PlexServerStore.shared.upsert(updated)
                 }
                 self.syncStates[server.id] = .done(PlexSyncReport(
                     titles: titles.count,
-                    episodes: titles.filter { $0.type == "series" }.reduce(0) { $0 + $1.items.count }
+                    episodes: titles.filter { $0.type == "series" }.reduce(0) { $0 + $1.items.count },
+                    oversizedLibraries: outcome.oversizedLibraries,
+                    failedLibraries: outcome.failures
                 ))
             } catch is CancellationError {
                 // Superseded by a newer sync or a disconnect.
@@ -443,5 +490,192 @@ final class PlexSessionManager: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Lists each library that changed since the last sync and keeps the rest
+    /// as they were. A library whose listing fails keeps its titles and
+    /// marker from the last sync; one too large to sync is skipped, and one
+    /// already known to be too large isn't asked again unless `force`.
+    /// Throws only for cancellation and a refused token.
+    nonisolated static func syncLibraries(
+        _ libraries: [PlexLibrary],
+        client: PlexClient,
+        serverID: String,
+        previousTitles: [PlexIndexedTitle],
+        previousMarkers: [String: String],
+        knownOversized: [String: Int],
+        force: Bool,
+        onProgress: @escaping (_ found: Int, _ library: String) -> Void = { _, _ in }
+    ) async throws -> PlexLibrarySyncOutcome {
+        var outcome = PlexLibrarySyncOutcome()
+        var found = 0
+        for library in libraries {
+            try Task.checkCancellation()
+            // Only the Sync button checks again: a library past the limit
+            // rarely drops under it, and each check downloads a page of it.
+            if !force, let count = knownOversized[library.id] {
+                outcome.oversized[library.id] = count
+                outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: count))
+                continue
+            }
+            let kept = previousTitles.filter { $0.libraryID == library.id }
+            // Titles synced before file formats were kept are listed once more.
+            let hasFileDetails = kept.isEmpty || kept.contains { $0.items.contains { $0.details != nil } }
+            if !force, hasFileDetails, let marker = library.changeMarker, previousMarkers[library.id] == marker {
+                outcome.markers[library.id] = marker
+                outcome.titles += kept
+                found += kept.reduce(0) { $0 + $1.items.count }
+                outcome.listedEverything = false
+                outcome.syncedLibraries += 1
+                continue
+            }
+            let foundBefore = found
+            let progress: (Int, Int?) -> Void = { count, _ in onProgress(foundBefore + count, library.name) }
+            do {
+                if library.type == "movie" {
+                    let movies = try await client.items(libraryID: library.id, type: .movie, onPageFetched: progress)
+                    found += movies.count
+                    for movie in movies { outcome.states[movie.ratingKey] = PlexWatchState(movie) }
+                    outcome.titles += PlexLibraryResolver.resolve(movies: movies, shows: [], episodes: [], serverID: serverID, library: library)
+                } else {
+                    // Episodes first: in a library too large to sync they are
+                    // what passes the limit, and the first page says so.
+                    let episodes = try await client.items(libraryID: library.id, type: .episode, onPageFetched: progress)
+                    let shows = try await client.items(
+                        libraryID: library.id,
+                        type: .show,
+                        onPageFetched: { count, total in progress(episodes.count + count, total) }
+                    )
+                    found += episodes.count + shows.count
+                    for episode in episodes { outcome.states[episode.ratingKey] = PlexWatchState(episode) }
+                    outcome.titles += PlexLibraryResolver.resolve(movies: [], shows: shows, episodes: episodes, serverID: serverID, library: library)
+                }
+                outcome.markers[library.id] = library.changeMarker
+                outcome.syncedLibraries += 1
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as PlexClient.ClientError where error.isUnauthorized {
+                throw error
+            } catch let error as PlexClient.ClientError where error.isLibraryTooLarge {
+                outcome.oversized[library.id] = error.itemCount ?? 0
+                outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: error.itemCount ?? 0))
+            } catch {
+                if let count = knownOversized[library.id] {
+                    // The Sync button couldn't check it again: still too large.
+                    outcome.oversized[library.id] = count
+                    outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: count))
+                    continue
+                }
+                outcome.titles += kept
+                if let marker = previousMarkers[library.id] { outcome.markers[library.id] = marker }
+                outcome.failures.append(PlexSyncReport.LibraryFailure(name: library.name, reason: error.localizedDescription))
+                outcome.firstFailure = outcome.firstFailure ?? error
+                outcome.listedEverything = false
+            }
+        }
+        return outcome
+    }
+
+    // MARK: - Libraries too large to sync
+
+    /// How long the answer for one title in a library too large to sync is
+    /// used before the server is asked again.
+    nonisolated static let oversizedLookupInterval: TimeInterval = 15 * 60
+
+    /// How long a stream list waits for that lookup, counted from when it
+    /// starts, before it shows what it has.
+    nonisolated static let streamListLookupWait: TimeInterval = 2.5
+
+    /// Starts looking a stream list's title up in libraries too large to
+    /// sync. Nil when no connected server has one.
+    func startOversizedLookup(contentId: String, type: String) -> Task<Bool, Never>? {
+        guard hasOversizedLibraries, NSClassFromString("XCTestCase") == nil else { return nil }
+        return Task { await self.lookUpInOversizedLibraries(contentId: contentId, type: type) }
+    }
+
+    /// Whether `lookup` finished within `timeout`. It keeps running either way.
+    func waitForLookup(_ lookup: Task<Bool, Never>, timeout: TimeInterval) async -> Bool {
+        let gate = PlexWaitGate<Bool>()
+        return await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+            Task { @MainActor in
+                _ = await lookup.value
+                gate.resume(continuation, returning: true)
+            }
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(max(0, timeout) * 1_000_000_000))
+                gate.resume(continuation, returning: false)
+            }
+        }
+    }
+
+    /// Whether a connected server has a selected library too large to sync.
+    var hasOversizedLibraries: Bool {
+        PlexServerStore.shared.servers.contains { server in
+            guard let oversized = server.oversizedLibraries,
+                  server.selectedLibraryIDs.contains(where: { oversized[$0] != nil }) else { return false }
+            return connectionState(for: server.id).isConnected
+        }
+    }
+
+    /// Asks each connected server about one title in its libraries too large
+    /// to sync, and adds what it finds to `PlexLibraryIndex` for stream lists
+    /// and playback, with Plex's watch state for each movie or episode found.
+    /// The name and year come from the metadata cache, filled when the
+    /// title's details load; without them nothing is asked.
+    /// - Returns: whether anything was found.
+    @discardableResult
+    func lookUpInOversizedLibraries(contentId: String, type: String) async -> Bool {
+        guard let meta = CinemetaCatalogRepository.cachedMetadata(for: contentId) else { return false }
+        let target = PlexLargeLibraryLookup.Target(contentId: contentId, meta: meta)
+        let wantsShows = type == "series" || meta.isSeries
+        let index = PlexLibraryIndex.shared
+        var requests: [(serverID: String, library: PlexLibrary, client: PlexClient)] = []
+        for server in PlexServerStore.shared.servers {
+            guard let oversized = server.oversizedLibraries,
+                  let client = client(forServerID: server.id),
+                  case .connected(let libraries) = connectionState(for: server.id) else { continue }
+            for library in libraries where oversized[library.id] != nil
+                && server.selectedLibraryIDs.contains(library.id)
+                && (library.type == "show") == wantsShows {
+                if index.wasLookedUp(contentId: contentId, serverID: server.id, libraryID: library.id, within: Self.oversizedLookupInterval) {
+                    continue
+                }
+                requests.append((server.id, library, client))
+            }
+        }
+        guard !requests.isEmpty else { return false }
+        let profileID = activeProfileID
+        let results = await withTaskGroup(of: (serverID: String, library: PlexLibrary, found: PlexLargeLibraryLookup.Found?).self) { group in
+            for request in requests {
+                group.addTask {
+                    let found = try? await PlexLargeLibraryLookup.find(
+                        target, in: request.library, serverID: request.serverID, client: request.client
+                    )
+                    return (request.serverID, request.library, found)
+                }
+            }
+            var results: [(serverID: String, library: PlexLibrary, found: PlexLargeLibraryLookup.Found?)] = []
+            for await result in group { results.append(result) }
+            return results
+        }
+        guard activeProfileID == profileID else { return false }
+        // A failed request is asked again on the next stream list.
+        let answered = results.compactMap { result -> (serverID: String, libraryID: String, found: PlexLargeLibraryLookup.Found)? in
+            result.found.map { (serverID: result.serverID, libraryID: result.library.id, found: $0) }
+        }
+        guard !answered.isEmpty else { return false }
+        for (serverID, lookups) in Dictionary(grouping: answered, by: { $0.serverID }) {
+            let states = lookups.reduce(into: [String: PlexWatchState]()) { all, lookup in
+                all.merge(lookup.found.states) { _, new in new }
+            }
+            if !states.isEmpty { index.setWatchStates(states, forServerID: serverID, merging: true) }
+        }
+        let titles = answered.flatMap { $0.found.titles }
+        index.recordLookup(
+            contentId: contentId,
+            libraries: answered.map { (serverID: $0.serverID, libraryID: $0.libraryID) },
+            found: titles
+        )
+        return !titles.isEmpty
     }
 }
