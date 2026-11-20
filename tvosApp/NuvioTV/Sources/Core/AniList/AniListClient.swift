@@ -10,6 +10,11 @@ import ImageIO
 /// requests wait for a free slot. When AniList says to slow down, or the request fails, the
 /// last answer on disk is used even if it is old. Answers saved by another build of the app
 /// are dropped when this one first asks.
+///
+/// What the viewer waits on goes first (`isInteractive`: a search, a title they opened, its
+/// cast, a change they made). Everything else (Home rows, lists, the calendar, Continue
+/// Watching) uses at most `backgroundPerMinute` of the slots, steps aside while the viewer
+/// waits, and waits longer for a slot instead of failing.
 actor AniListClient {
     static let shared = AniListClient(dropsAnswersFromOtherBuilds: true)
 
@@ -30,9 +35,16 @@ actor AniListClient {
 
     private static let endpoint = URL(string: "https://graphql.anilist.co")!
     /// Below the current limit of 30 a minute, so a burst never trips it.
-    private static let requestsPerMinute = 25
+    static let requestsPerMinute = 25
+    /// The slots background work may use; the rest stay free for what the viewer waits on.
+    static let backgroundPerMinute = 17
     /// Longest wait for a free slot before an old answer, or an error, is returned instead.
     private static let longestWait: TimeInterval = 20
+    /// The same for background work, which nobody waits on directly.
+    private static let longestBackgroundWait: TimeInterval = 60
+
+    /// Set around what the viewer waits on: `AniListClient.$isInteractive.withValue(true) { … }`.
+    @TaskLocal static var isInteractive = false
 
     /// The last answer AniList gave, for the status in Settings → Integrations → AniList.
     struct Status {
@@ -46,7 +58,9 @@ actor AniListClient {
     private(set) var status = Status()
     private var sentAt: [Date] = []
     private var blockedUntil: Date?
-    private var inFlight: [String: Task<Answer, Error>] = [:]
+    private var inFlight: [String: (task: Task<Answer, Error>, isInteractive: Bool)] = [:]
+    /// Requests the viewer waits on that are waiting for a slot; background ones let them go first.
+    private var interactiveWaiting = 0
 
     init(session: URLSession? = nil, cache: AniListDiskCache = AniListDiskCache(), dropsAnswersFromOtherBuilds: Bool = false) {
         if let session {
@@ -92,12 +106,20 @@ actor AniListClient {
         if saves, let fresh = cache.read(key: key, maxAge: ttl) {
             return Answer(data: fresh, isSaved: true)
         }
-        if let running = inFlight[key] {
-            return try await running.value
+        // A change the viewer made, or an answer that must be current, is waited on too.
+        let interactive = Self.isInteractive || !saves
+        // The same request already on its way, unless it is background work still waiting
+        // for a slot behind what the viewer waits on.
+        if let running = inFlight[key], running.isInteractive || !interactive {
+            return try await running.task.value
         }
-        let task = Task { try await self.send(body: body, key: key, notesStatus: notesStatus, token: token, saves: saves) }
-        inFlight[key] = task
-        defer { inFlight[key] = nil }
+        let task = Task {
+            try await self.send(body: body, key: key, notesStatus: notesStatus, token: token, saves: saves, interactive: interactive)
+        }
+        inFlight[key] = (task, interactive)
+        defer {
+            if inFlight[key]?.task == task { inFlight[key] = nil }
+        }
         return try await task.value
     }
 
@@ -216,9 +238,16 @@ actor AniListClient {
         return Double(clear) / Double(side * side) >= 0.05
     }
 
-    private func send(body: Data, key: String, notesStatus: Bool, token: String? = nil, saves: Bool = true) async throws -> Answer {
+    private func send(
+        body: Data,
+        key: String,
+        notesStatus: Bool,
+        token: String? = nil,
+        saves: Bool = true,
+        interactive: Bool = false
+    ) async throws -> Answer {
         do {
-            try await waitForSlot()
+            try await waitForSlot(interactive: interactive)
         } catch {
             if notesStatus { noteFailure("Waiting for AniList's rate limit") }
             if saves, let stale = cache.read(key: key, maxAge: .infinity) { return Answer(data: stale, isSaved: true) }
@@ -271,22 +300,30 @@ actor AniListClient {
         status.lastFailureMessage = message.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private func waitForSlot() async throws {
-        let deadline = Date().addingTimeInterval(Self.longestWait)
+    private func waitForSlot(interactive: Bool) async throws {
+        let deadline = Date().addingTimeInterval(interactive ? Self.longestWait : Self.longestBackgroundWait)
+        if interactive { interactiveWaiting += 1 }
+        defer { if interactive { interactiveWaiting -= 1 } }
         while true {
             let now = Date()
             sentAt.removeAll { now.timeIntervalSince($0) >= 60 }
-            var readyAt = now
-            if let blockedUntil, blockedUntil > readyAt {
-                readyAt = blockedUntil
-            }
-            if sentAt.count >= Self.requestsPerMinute, let oldest = sentAt.first {
-                readyAt = max(readyAt, oldest.addingTimeInterval(60))
+            var readyAt = max(now, blockedUntil ?? now)
+            readyAt = max(readyAt, Self.slotTime(sent: sentAt, now: now, limit: interactive ? Self.requestsPerMinute : Self.backgroundPerMinute))
+            if !interactive, interactiveWaiting > 0 {
+                // Look again once the viewer's request has gone.
+                readyAt = max(readyAt, now.addingTimeInterval(0.5))
             }
             if readyAt <= now { return }
             guard readyAt <= deadline else { throw ClientError.rateLimited }
             try await Task.sleep(nanoseconds: UInt64(readyAt.timeIntervalSince(now) * 1_000_000_000) + 50_000_000)
         }
+    }
+
+    /// When a request fits under `limit` a minute, given those sent in the last minute (oldest
+    /// first): now, or when enough of them have left the minute.
+    static func slotTime(sent: [Date], now: Date, limit: Int) -> Date {
+        guard limit > 0, sent.count >= limit else { return now }
+        return sent[sent.count - limit].addingTimeInterval(60)
     }
 
     private func noteLimits(from response: HTTPURLResponse?) {
