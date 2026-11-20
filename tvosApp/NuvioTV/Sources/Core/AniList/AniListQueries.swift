@@ -80,6 +80,47 @@ enum AniListQueries {
     }
     """
 
+    /// A voice actor's page: who they are and their anime roles, the best known first.
+    static let staff = """
+    query ($id: Int) {
+      Staff(id: $id) {
+        id
+        name { full native }
+        image { large }
+        description(asHtml: false)
+        dateOfBirth { year month day }
+        dateOfDeath { year month day }
+        homeTown
+        characterMedia(sort: [POPULARITY_DESC], perPage: 50) {
+          edges {
+            characterRole
+            characters { id name { full } }
+            node { \(relationNodeFields) bannerImage isAdult }
+          }
+        }
+      }
+    }
+    """
+
+    /// A character's page (no voice actor known): who it is and the anime it is in.
+    static let character = """
+    query ($id: Int) {
+      Character(id: $id) {
+        id
+        name { full native }
+        image { large }
+        description(asHtml: false)
+        dateOfBirth { year month day }
+        media(type: ANIME, sort: [POPULARITY_DESC], perPage: 50) {
+          edges {
+            characterRole
+            node { \(relationNodeFields) bannerImage isAdult }
+          }
+        }
+      }
+    }
+    """
+
     // MARK: The viewer's account (asked with their token)
 
     static let viewer = """

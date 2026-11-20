@@ -4978,8 +4978,9 @@ struct TvDetailsContent: View {
                     onPersonClick: { person in
                         let clean = person.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                         guard !clean.isEmpty && clean != "cast" else { return }
-                        // AniList characters have no TMDB page to open.
-                        guard !AniListMetaBuilder.isAniListID(meta.id) else { return }
+                        // An AniList title's characters open their voice actor's AniList page
+                        // (or the character's); they have no TMDB page.
+                        guard !AniListMetaBuilder.isAniListID(meta.id) || person.hasAniListPage else { return }
                         stopBackgroundTrailer(manual: false)
                         onOpenPerson?(
                             person,
