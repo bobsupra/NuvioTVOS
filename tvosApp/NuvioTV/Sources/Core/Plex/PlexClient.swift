@@ -117,6 +117,11 @@ struct PlexClient {
         let message: String
         /// The token was refused: the user has to sign in again.
         var isUnauthorized = false
+        /// The library holds more items than one listing reads
+        /// (`syncItemLimit`).
+        var isLibraryTooLarge = false
+        /// How many items the server said the library holds, when it said.
+        var itemCount: Int? = nil
         var errorDescription: String? { message }
     }
 
@@ -436,20 +441,29 @@ struct PlexClient {
         case episode = 4
     }
 
+    /// The most items one listing reads. A library with more is too large to
+    /// keep on the Apple TV, so its titles are looked up one at a time
+    /// (`search`) when a stream list opens.
+    static let syncItemLimit = 500_000
+
     /// Every item of one type in a section. A single request per page covers a
     /// whole library (episodes included), so syncs need no per-show requests.
     /// - Parameter viewedSince: only items played at or after this time (Unix
     ///   seconds), for refreshing watch state without listing the library.
+    /// - Throws: an error with `isLibraryTooLarge` set when the section holds
+    ///   more than `maxItems`, after the first page when the server reports
+    ///   its size.
     func items(
         libraryID: String,
         type: ItemType,
         viewedSince: Int64? = nil,
+        maxItems: Int = PlexClient.syncItemLimit,
         onPageFetched: ((Int, Int?) -> Void)? = nil
     ) async throws -> [PlexMediaItem] {
         var all: [PlexMediaItem] = []
         var start = 0
         let pageSize = 500
-        for _ in 0..<1_000 {
+        for _ in 0...(maxItems / pageSize) {
             try Task.checkCancellation()
             var query = [
                 "type": String(type.rawValue),
@@ -464,6 +478,9 @@ struct PlexClient {
             }
             let data = try await get("library/sections/\(libraryID)/all", query: query)
             let page = try JSONDecoder().decode(ItemsPayload.self, from: data).MediaContainer
+            if let total = page.totalSize, total > maxItems {
+                throw Self.libraryTooLarge(itemCount: total)
+            }
             let metadata = page.Metadata ?? []
             all.append(contentsOf: metadata.map(Self.mapItem))
             start += metadata.count
@@ -471,8 +488,50 @@ struct PlexClient {
             if metadata.isEmpty { return all }
             if let total = page.totalSize, start >= total { return all }
             if page.totalSize == nil, metadata.count < pageSize { return all }
+            // Without a total, one more page tells a library of exactly
+            // `maxItems` (an empty page) from a larger one.
+            if start > maxItems { break }
         }
-        throw ClientError(message: "The Plex library exceeded the sync page limit")
+        throw Self.libraryTooLarge(itemCount: nil)
+    }
+
+    private static func libraryTooLarge(itemCount: Int?) -> ClientError {
+        ClientError(
+            message: L10n.string("plex_library_too_large", fallback: "This library is too large to sync."),
+            isLibraryTooLarge: true,
+            itemCount: itemCount
+        )
+    }
+
+    /// Titles of one type in a section named `title`, for libraries too large
+    /// to sync: exactly that name when `exact`, otherwise any name that
+    /// contains it. `year` narrows the search when the title's year is known.
+    func search(
+        libraryID: String,
+        type: ItemType,
+        title: String,
+        exact: Bool = false,
+        year: Int? = nil,
+        limit: Int = 50
+    ) async throws -> [PlexMediaItem] {
+        var query = [
+            "type": String(type.rawValue),
+            "includeGuids": "1",
+            "X-Plex-Container-Start": "0",
+            "X-Plex-Container-Size": String(limit)
+        ]
+        // Plex filter syntax: `title=N` matches names that contain N, and
+        // `title==N` (the key `title=` with value `N`) only the name N.
+        query[exact ? "title=" : "title"] = title
+        if let year { query["year"] = String(year) }
+        let data = try await get("library/sections/\(libraryID)/all", query: query)
+        return (try JSONDecoder().decode(ItemsPayload.self, from: data).MediaContainer.Metadata ?? []).map(Self.mapItem)
+    }
+
+    /// Every episode of one show, with its files.
+    func episodes(showRatingKey: String) async throws -> [PlexMediaItem] {
+        let data = try await get("library/metadata/\(showRatingKey)/allLeaves", query: ["includeGuids": "1"])
+        return (try JSONDecoder().decode(ItemsPayload.self, from: data).MediaContainer.Metadata ?? []).map(Self.mapItem)
     }
 
     /// Current resume position and watch count for one item, read live so a
@@ -697,6 +756,9 @@ struct PlexClient {
         guard var components = URLComponents(string: base + normalizedPath) else { return nil }
         guard !query.isEmpty else { return components.url }
         components.queryItems = query.sorted { $0.key < $1.key }.map { URLQueryItem(name: $0.key, value: $0.value) }
+        // URLComponents leaves "+" as is, and servers read it as a space
+        // ("Romeo + Juliet" would be searched as "Romeo   Juliet").
+        components.percentEncodedQuery = components.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         return components.url
     }
 

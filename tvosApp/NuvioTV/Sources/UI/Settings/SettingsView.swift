@@ -16200,6 +16200,9 @@ private struct PlexServerRow: View {
         if let count = server.lastSyncTitleCount {
             parts.append(L10n.format("smb_title_count", fallback: "%d titles", count))
         }
+        if server.oversizedLibraries?.isEmpty == false {
+            parts.append(L10n.string("plex_server_found_per_title", fallback: "Large libraries found per title"))
+        }
         if case .failed(let message) = connectionState { parts.append(message) }
         if case .failed(let message) = syncState { parts.append(message) }
         return parts.joined(separator: " — ")
@@ -16419,6 +16422,7 @@ private struct PlexLibrarySelectionSheet: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @ObservedObject private var sessionManager = PlexSessionManager.shared
+    @ObservedObject private var serverStore = PlexServerStore.shared
     @State private var selectedLibraryIDs: Set<String>
     @State private var syncAutomatically: Bool
 
@@ -16427,6 +16431,17 @@ private struct PlexLibrarySelectionSheet: View {
         self.accentColor = accentColor
         _selectedLibraryIDs = State(initialValue: Set(server.selectedLibraryIDs))
         _syncAutomatically = State(initialValue: server.syncAutomatically)
+    }
+
+    private func librarySubtitle(_ library: PlexLibrary) -> String {
+        let type = library.type == "movie"
+            ? L10n.string("plex_library_movies", fallback: "Movies")
+            : L10n.string("plex_library_shows", fallback: "TV Shows")
+        guard serverStore.server(id: server.id)?.oversizedLibraries?[library.id] != nil else { return type }
+        return type + " · " + L10n.string(
+            "plex_library_found_per_title",
+            fallback: "Too large to sync. Plex streams are found when you open a title."
+        )
     }
 
     var body: some View {
@@ -16459,9 +16474,7 @@ private struct PlexLibrarySelectionSheet: View {
                             ForEach(libraries) { library in
                                 SettingsToggleRow(
                                     title: library.name,
-                                    subtitle: library.type == "movie"
-                                        ? L10n.string("plex_library_movies", fallback: "Movies")
-                                        : L10n.string("plex_library_shows", fallback: "TV Shows"),
+                                    subtitle: librarySubtitle(library),
                                     isOn: Binding(
                                         get: { selectedLibraryIDs.contains(library.id) },
                                         set: { isOn in
@@ -16522,6 +16535,37 @@ private struct PlexLibrarySelectionSheet: View {
             ) {
                 SettingsInfoRow(title: L10n.string("smb_matched_titles", fallback: "Matched Titles"), value: "\(report.titles)")
                 SettingsInfoRow(title: L10n.string("smb_matched_episodes", fallback: "Matched Episodes"), value: "\(report.episodes)")
+            }
+            if !report.oversizedLibraries.isEmpty {
+                SettingsGroup(
+                    title: L10n.string("plex_sync_oversized_title", fallback: "Found per Title"),
+                    subtitle: L10n.string(
+                        "plex_sync_oversized_subtitle",
+                        fallback: "Too large to sync. Plex streams from these libraries are found when you open a title."
+                    )
+                ) {
+                    ForEach(Array(report.oversizedLibraries.enumerated()), id: \.offset) { _, library in
+                        SettingsInfoRow(
+                            title: library.name,
+                            value: library.itemCount > 0
+                                ? L10n.format("plex_sync_oversized_items", fallback: "%@ items", library.itemCount.formatted())
+                                : L10n.string("plex_sync_oversized_value", fallback: "Too large to sync")
+                        )
+                    }
+                }
+            }
+            if !report.failedLibraries.isEmpty {
+                SettingsGroup(
+                    title: L10n.string("plex_sync_failed_libraries_title", fallback: "Not Synced"),
+                    subtitle: L10n.string(
+                        "plex_sync_failed_libraries_subtitle",
+                        fallback: "These libraries keep the titles from their last sync."
+                    )
+                ) {
+                    ForEach(Array(report.failedLibraries.enumerated()), id: \.offset) { _, failure in
+                        SettingsInfoRow(title: failure.name, value: failure.reason, isDiagnostic: true)
+                    }
+                }
             }
         case .failed(let message):
             SettingsGroup(

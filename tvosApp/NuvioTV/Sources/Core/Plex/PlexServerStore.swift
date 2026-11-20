@@ -20,6 +20,14 @@ struct PlexServerConfig: Codable, Identifiable, Equatable {
     var watchStateReadAt: Int64?
     /// Each synced library's change marker at its last sync.
     var libraryChangeMarkers: [String: String]?
+    /// When a sync last started, whether or not it finished. Automatic syncs
+    /// count from here too, so a sync that fails waits the usual interval
+    /// instead of running again on the next stream list.
+    var lastSyncAttemptDate: Date?
+    /// Libraries too large to sync (more than `PlexClient.syncItemLimit`
+    /// items) by id, with the item count the server reported, or 0 when it
+    /// didn't say. A stream list asks the server about its title instead.
+    var oversizedLibraries: [String: Int]?
 
     init(
         id: String,

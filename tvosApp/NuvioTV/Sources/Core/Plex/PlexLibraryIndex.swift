@@ -155,6 +155,16 @@ enum PlexLibraryResolver {
     }
 }
 
+/// A movie or episode of a looked-up title whose link was stored
+/// (`PlexLibraryIndex.rememberLookedUpItem`).
+struct PlexRememberedItem: Codable, Equatable {
+    let serverID: String
+    let ratingKey: String
+    /// Every file of the item: `/library/parts/...` paths.
+    let partKeys: [String]
+    let durationMs: Int64?
+}
+
 /// Persisted Plex titles per server, for the active profile. Mirrors
 /// `JellyfinLibraryIndex`, including where it stores its payload.
 @MainActor
@@ -173,6 +183,22 @@ final class PlexLibraryIndex: ObservableObject {
     /// A server has an entry here once its state has been read at least once.
     @Published private(set) var watchStatesByServerID: [String: [String: PlexWatchState]] = [:]
 
+    /// Titles found by asking a server about one title in a library too large
+    /// to sync, by the content id they were found for, and when each library
+    /// was asked ("server|library"). Kept in memory only, for stream lists and
+    /// playback; past `lookedUpLimit` content ids the oldest go, times and all.
+    private var lookedUpTitles: [String: [PlexIndexedTitle]] = [:]
+    private var lookupTimes: [String: [String: Date]] = [:]
+    private var lookedUpOrder: [String] = []
+    nonisolated static let lookedUpLimit = 30
+
+    /// Movies and episodes of looked-up titles whose link was stored for
+    /// Continue Watching. Looked-up titles are gone after a relaunch, so a
+    /// replayed link is recognised from here. Saved, newest last, at most
+    /// `rememberedLimit`.
+    private var rememberedItems: [PlexRememberedItem] = []
+    nonisolated static let rememberedLimit = 200
+
     enum IndexError: LocalizedError {
         case persistenceFailed
         var errorDescription: String? { "The Plex library index could not be saved." }
@@ -181,13 +207,97 @@ final class PlexLibraryIndex: ObservableObject {
     private init() {
         titlesByServerID = Self.load()
         watchStatesByServerID = Self.loadWatchStates()
+        rememberedItems = Self.loadRememberedItems()
         PlexWatched.rebuild(titles: titlesByServerID, states: watchStatesByServerID)
     }
 
     func reload() {
         titlesByServerID = Self.load()
         watchStatesByServerID = Self.loadWatchStates()
+        rememberedItems = Self.loadRememberedItems()
+        lookedUpTitles = [:]
+        lookupTimes = [:]
+        lookedUpOrder = []
         PlexWatched.rebuild(titles: titlesByServerID, states: watchStatesByServerID)
+    }
+
+    // MARK: - Libraries too large to sync
+
+    /// Whether `contentId` was looked up in this library less than `interval` ago.
+    func wasLookedUp(
+        contentId: String,
+        serverID: String,
+        libraryID: String,
+        within interval: TimeInterval,
+        now: Date = Date()
+    ) -> Bool {
+        guard let date = lookupTimes[Self.normalizedContentId(contentId)]?["\(serverID)|\(libraryID)"] else { return false }
+        return now.timeIntervalSince(date) < interval
+    }
+
+    /// Records a lookup of `contentId` in `libraries` and the titles it found
+    /// there, replacing what earlier lookups found in those libraries.
+    func recordLookup(
+        contentId: String,
+        libraries: [(serverID: String, libraryID: String)],
+        found: [PlexIndexedTitle],
+        at date: Date = Date()
+    ) {
+        let key = Self.normalizedContentId(contentId)
+        let titles = (lookedUpTitles[key] ?? []).filter { title in
+            !libraries.contains { $0.serverID == title.serverID && $0.libraryID == title.libraryID }
+        } + found
+        lookedUpTitles[key] = titles.isEmpty ? nil : titles
+        var times = lookupTimes[key] ?? [:]
+        for library in libraries { times["\(library.serverID)|\(library.libraryID)"] = date }
+        lookupTimes[key] = times
+        lookedUpOrder.removeAll { $0 == key }
+        lookedUpOrder.append(key)
+        while lookedUpOrder.count > Self.lookedUpLimit {
+            let oldest = lookedUpOrder.removeFirst()
+            lookedUpTitles.removeValue(forKey: oldest)
+            lookupTimes.removeValue(forKey: oldest)
+        }
+    }
+
+    private func lookedUp(forServerID serverID: String) -> [PlexIndexedTitle] {
+        lookedUpOrder.flatMap { lookedUpTitles[$0] ?? [] }.filter { $0.serverID == serverID }
+    }
+
+    /// Keeps a looked-up movie or episode whose link is being stored, so the
+    /// link still plays and reports progress after a relaunch. Synced titles
+    /// need nothing: the index finds them.
+    func rememberLookedUpItem(serverID: String, ratingKey: String) {
+        let synced = titlesByServerID[serverID]?.contains { $0.items.contains { $0.ratingKey == ratingKey } } ?? false
+        guard !synced,
+              let item = lookedUp(forServerID: serverID).flatMap(\.items).first(where: { $0.ratingKey == ratingKey }) else { return }
+        var updated = rememberedItems.filter { !($0.serverID == serverID && $0.ratingKey == ratingKey) }
+        updated.append(PlexRememberedItem(
+            serverID: serverID,
+            ratingKey: ratingKey,
+            partKeys: item.files.map(\.partKey),
+            durationMs: item.durationMs
+        ))
+        if updated.count > Self.rememberedLimit { updated.removeFirst(updated.count - Self.rememberedLimit) }
+        guard updated != rememberedItems else { return }
+        rememberedItems = updated
+        persistRememberedItems()
+    }
+
+    /// A remembered movie or episode with this file (`/library/parts/...`).
+    func rememberedItem(partPath: String) -> PlexRememberedItem? {
+        rememberedItems.last { $0.partKeys.contains(partPath) }
+    }
+
+    /// A remembered movie or episode with this rating key.
+    func rememberedItem(ratingKey: String) -> PlexRememberedItem? {
+        rememberedItems.last { $0.ratingKey == ratingKey }
+    }
+
+    /// A content id as stream lists match it: trimmed, without `imdb:`.
+    nonisolated static func normalizedContentId(_ contentId: String) -> String {
+        let trimmed = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.lowercased().hasPrefix("imdb:") ? String(trimmed.dropFirst(5)) : trimmed
     }
 
     // MARK: - Watch state
@@ -254,7 +364,7 @@ final class PlexLibraryIndex: ObservableObject {
         let servers = PlexServerStore.shared.servers
         let preferred = servers.filter { preferredHost != nil && $0.baseURL?.host == preferredHost }
         for server in preferred + servers.filter({ candidate in !preferred.contains(where: { $0.id == candidate.id }) }) {
-            for title in titlesByServerID[server.id] ?? [] {
+            for title in (titlesByServerID[server.id] ?? []) + lookedUp(forServerID: server.id) {
                 if let item = title.items.first(where: { $0.ratingKey == ratingKey }) {
                     return (server, title, item)
                 }
@@ -268,7 +378,7 @@ final class PlexLibraryIndex: ObservableObject {
         let servers = PlexServerStore.shared.servers
         let preferred = servers.filter { preferredHost != nil && $0.baseURL?.host == preferredHost }
         for server in preferred + servers.filter({ candidate in !preferred.contains(where: { $0.id == candidate.id }) }) {
-            for title in titlesByServerID[server.id] ?? [] {
+            for title in (titlesByServerID[server.id] ?? []) + lookedUp(forServerID: server.id) {
                 if let item = title.items.first(where: { $0.files.contains { $0.partKey == partPath } }) {
                     return (server, title, item)
                 }
@@ -284,21 +394,23 @@ final class PlexLibraryIndex: ObservableObject {
             + titlesByServerID.filter { !known.contains($0.key) }.values.flatMap { $0 }
     }
 
-    /// Titles for a Plex content id, or for a catalog title by IMDb or TMDB id.
+    /// Titles for a Plex content id, or for a catalog title by IMDb or TMDB id,
+    /// then the ones looked up for it in libraries too large to sync.
     func titles(matching contentId: String) -> [PlexIndexedTitle] {
-        var trimmed = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = Self.normalizedContentId(contentId)
         guard !trimmed.isEmpty else { return [] }
-        if trimmed.lowercased().hasPrefix("imdb:") {
-            trimmed = String(trimmed.dropFirst(5))
-        }
         let targetImdb = trimmed.lowercased().hasPrefix("tt") ? NuvioMeta.canonicalImdbID(from: trimmed) : nil
         let targetTmdb = trimmed.hasPrefix("tmdb:") ? Int(trimmed.dropFirst(5)) : nil
-        return titles().filter { title in
+        let synced = titles().filter { title in
             if title.contentId == trimmed { return true }
             if let targetImdb, let imdb = title.imdbId, NuvioMeta.canonicalImdbID(from: imdb) == targetImdb { return true }
             if let targetTmdb, title.tmdbId == targetTmdb { return true }
             return false
         }
+        let lookedUp = (lookedUpTitles[trimmed] ?? []).filter { found in
+            !synced.contains { $0.serverID == found.serverID && $0.ratingKey == found.ratingKey }
+        }
+        return synced + lookedUp
     }
 
     func meta(forContentId contentId: String) -> NuvioMeta? {
@@ -377,6 +489,16 @@ final class PlexLibraryIndex: ObservableObject {
     }
 
     func removeAll(forServerID serverID: String) {
+        for key in Array(lookedUpTitles.keys) {
+            lookedUpTitles[key]?.removeAll { $0.serverID == serverID }
+        }
+        for key in Array(lookupTimes.keys) {
+            lookupTimes[key] = lookupTimes[key]?.filter { !$0.key.hasPrefix("\(serverID)|") }
+        }
+        if rememberedItems.contains(where: { $0.serverID == serverID }) {
+            rememberedItems.removeAll { $0.serverID == serverID }
+            persistRememberedItems()
+        }
         if watchStatesByServerID[serverID] != nil {
             var states = watchStatesByServerID
             states.removeValue(forKey: serverID)
@@ -406,6 +528,22 @@ final class PlexLibraryIndex: ObservableObject {
         guard let data = LargePayloadStore.read(key: watchStateKey, directory: storageDirectoryName),
               let decoded = try? JSONDecoder().decode([String: [String: PlexWatchState]].self, from: data) else { return [:] }
         return decoded
+    }
+
+    private static var rememberedKey: String {
+        "plexRememberedItems.\(ProfileSettings.activeProfileID ?? "default")"
+    }
+
+    private static func loadRememberedItems() -> [PlexRememberedItem] {
+        guard let data = LargePayloadStore.read(key: rememberedKey, directory: storageDirectoryName),
+              let decoded = try? JSONDecoder().decode([PlexRememberedItem].self, from: data) else { return [] }
+        return decoded
+    }
+
+    private func persistRememberedItems() {
+        if let data = try? JSONEncoder().encode(rememberedItems) {
+            _ = LargePayloadStore.write(data, key: Self.rememberedKey, directory: Self.storageDirectoryName)
+        }
     }
 
     private func persist(_ titles: [String: [PlexIndexedTitle]]) -> Bool {
