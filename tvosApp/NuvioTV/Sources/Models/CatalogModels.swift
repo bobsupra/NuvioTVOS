@@ -12765,19 +12765,27 @@ enum ProfileSettings {
     static var activeProfileScope: String { activeProfileID ?? "default" }
 
     /// The suite backing a given profile id, or `.standard` when there is none.
-    /// `UserDefaults(suiteName:)` returns the same shared store for a name, so
-    /// repeated calls for one profile all read and write the same values.
+    /// Each profile's suite is created once and reused, so every call for a
+    /// profile returns the same object. ContentView passes this to
+    /// `.defaultAppStorage` in its body; a new object on every body run made
+    /// SwiftUI treat the storage as changed and redraw every `@AppStorage`
+    /// view (all rows and cards) each time ContentView re-rendered.
     ///
     /// This accessor must stay read-only. On upgrade, a profile suite may still
     /// contain a legacy oversized preference blob; writing the identity marker
     /// here would reach cfprefsd before `setActiveProfile` has purged it.
     static func store(for profileId: String?) -> UserDefaults {
-        guard let id = profileId, !id.isEmpty,
-              let suite = UserDefaults(suiteName: "\(suitePrefix).\(id)") else {
-            return .standard
-        }
+        guard let id = profileId, !id.isEmpty else { return .standard }
+        storesLock.lock()
+        defer { storesLock.unlock() }
+        if let cached = stores[id] { return cached }
+        guard let suite = UserDefaults(suiteName: "\(suitePrefix).\(id)") else { return .standard }
+        stores[id] = suite
         return suite
     }
+
+    private static let storesLock = NSLock()
+    nonisolated(unsafe) private static var stores: [String: UserDefaults] = [:]
 
     /// Point reads/writes at a profile. Called on launch and on every switch.
     /// Seeds the profile from the pre-profile global settings the first time it
