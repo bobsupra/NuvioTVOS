@@ -353,7 +353,7 @@ struct DetailsScreen: View {
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
-                        let isPreFetched = (viewModel.prefetchedStreamId == streamId && !viewModel.uiState.streams.isEmpty)
+                        let isPreFetched = viewModel.hasLoadedStreams(for: streamId)
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched)
                     },
                     onEpisodePlayManually: { video in
@@ -364,7 +364,7 @@ struct DetailsScreen: View {
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
-                        let isPreFetched = (viewModel.prefetchedStreamId == streamId && !viewModel.uiState.streams.isEmpty)
+                        let isPreFetched = viewModel.hasLoadedStreams(for: streamId)
                         startStreamFlow(streamId: streamId, type: "series", reload: !isPreFetched, forceManualPicker: true)
                     },
                     onEpisodeMenuPresented: { isPresented in
@@ -738,9 +738,11 @@ struct DetailsScreen: View {
         if let episode = requestedEpisode {
             pendingEpisodeSubtitle = "S\(episode.season) · E\(episode.episode) · \(episode.title)"
             let streamId = canonicalEpisodeStreamId(for: episode, meta: meta)
+            viewModel.streamSelectionStarted(for: streamId)
             viewModel.prepareStreams(forId: streamId, type: "series")
         } else {
             pendingEpisodeSubtitle = ""
+            viewModel.streamSelectionStarted(for: meta.streamId)
             viewModel.prepareStreams(forId: meta.streamId, type: meta.type)
         }
         isStreamPickerPresented = true
@@ -853,6 +855,7 @@ struct DetailsScreen: View {
         guard let meta = viewModel.uiState.meta else { return }
         streamPickerAvailabilityMessage = nil
         let targetStreamId = (DetailsViewModel.isNonCanonicalStreamId(streamId) && !DetailsViewModel.isNonCanonicalStreamId(meta.streamId)) ? meta.streamId : streamId
+        viewModel.streamSelectionStarted(for: targetStreamId)
 
         let activeProfileId = ProfileSettings.activeProfileID
 
