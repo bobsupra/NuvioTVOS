@@ -451,6 +451,9 @@ class DetailsViewModel: ObservableObject {
     private(set) var prefetchedEpisode: NuvioVideo?
     private(set) var prefetchStartTime: Date?
     private(set) var requestedStreamId: String?
+    /// The stream id of what the viewer chose to play on this title. Once set,
+    /// pre-fetch may not load another episode's streams over it.
+    private(set) var chosenStreamId: String?
 
     private let repository: CatalogRepository
     private let streamDiscoveryMode: DetailsStreamDiscoveryMode
@@ -515,6 +518,7 @@ class DetailsViewModel: ObservableObject {
         prefetchedStreamId = nil
         prefetchedEpisode = nil
         prefetchStartTime = nil
+        chosenStreamId = nil
         if let requested = requestedStreamId {
             let isSameTarget = requested == id
                 || (requested.hasPrefix("tmdb:") && id.hasPrefix("tmdb:"))
@@ -598,9 +602,12 @@ class DetailsViewModel: ObservableObject {
 
                 // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
                 // reload them immediately with the resolved canonical stream id.
-                if let requested = self.requestedStreamId,
-                   Self.isNonCanonicalStreamId(requested) || (requested != resolvedMeta.streamId && !Self.isNonCanonicalStreamId(resolvedMeta.streamId)) {
-                    self.prepareStreams(forId: resolvedMeta.streamId, type: resolvedMeta.type, forceRefresh: true)
+                if let requested = self.requestedStreamId {
+                    let canonical = Self.streamIdAfterMetadataLoad(requested: requested, metaStreamId: resolvedMeta.streamId)
+                    if canonical != requested {
+                        if self.chosenStreamId == requested { self.chosenStreamId = canonical }
+                        self.prepareStreams(forId: canonical, type: resolvedMeta.type, forceRefresh: true)
+                    }
                 }
 
                 // Present primary metadata immediately for instant smooth transition.
@@ -672,6 +679,7 @@ class DetailsViewModel: ObservableObject {
         prefetchedStreamId = nil
         prefetchedEpisode = nil
         prefetchStartTime = nil
+        chosenStreamId = nil
         requestedStreamId = nil
     }
 
@@ -706,6 +714,35 @@ class DetailsViewModel: ObservableObject {
         id.hasPrefix("tmdb:") || id.hasPrefix("simkl:") || id.hasPrefix("trakt:") || id.hasPrefix("wetrakr:")
     }
 
+    /// The id to ask add-ons by once the title's metadata has loaded, for
+    /// streams requested earlier as `requested`. An episode keeps its season
+    /// and episode: only the title part is replaced by the metadata's
+    /// canonical id. Asking by the series id alone returns streams for any
+    /// episode of the show.
+    static func streamIdAfterMetadataLoad(requested: String, metaStreamId: String) -> String {
+        let position = StreamsRepository.seasonEpisode(fromVideoId: requested)
+        if let season = position.season, let episode = position.episode {
+            guard !isNonCanonicalStreamId(metaStreamId) else { return requested }
+            let title = StreamsRepository.baseContentId(from: requested)
+            return title == metaStreamId ? requested : "\(metaStreamId):\(season):\(episode)"
+        }
+        if isNonCanonicalStreamId(requested) || (requested != metaStreamId && !isNonCanonicalStreamId(metaStreamId)) {
+            return metaStreamId
+        }
+        return requested
+    }
+
+    /// The viewer picked a movie or an episode to play.
+    func streamSelectionStarted(for streamId: String) {
+        chosenStreamId = streamId
+    }
+
+    /// Whether the streams on hand were loaded for `streamId`, by pre-fetch or
+    /// by an earlier pick.
+    func hasLoadedStreams(for streamId: String) -> Bool {
+        requestedStreamId == streamId && !uiState.streams.isEmpty
+    }
+
     func triggerStreamPreFetch(for meta: NuvioMeta) {
         let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
         guard prefetchEnabled else { return }
@@ -715,6 +752,9 @@ class DetailsViewModel: ObservableObject {
         }
         guard !Self.isNonCanonicalStreamId(targetStreamId) else { return }
         guard prefetchedStreamId != targetStreamId else { return }
+        // The default episode can change after the viewer has picked one, when
+        // fuller metadata or progress arrives. Their streams stay.
+        guard chosenStreamId == nil || chosenStreamId == targetStreamId else { return }
 
         prefetchedStreamId = targetStreamId
         prefetchedEpisode = targetEpisode
