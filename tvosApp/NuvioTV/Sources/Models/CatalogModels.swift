@@ -13236,6 +13236,9 @@ struct DetailsUiState {
     var isWatched: Bool = false
     /// Related titles under the cast row (TMDB, Trakt, or Simkl recommendations).
     var moreLikeThis: [RelatedTitle] = []
+    /// Counts the pictures found for an anime title's Related row after it was drawn (MyAnimeList
+    /// names its relations without pictures): a change draws the row again with them.
+    var relatedPicturesRevision: Int = 0
     /// Movie collection franchise (TMDB movie series).
     var collection: TmdbMovieCollection? = nil
     /// Production companies + networks from TMDB.

@@ -551,7 +551,7 @@ enum AddonRatingsService {
         // An AniList episode is asked by the IMDb episode it maps to (TheTVDB's numbering), and
         // kept under its own id.
         let askedId: String
-        if AniListMetaBuilder.isAniListID(cleanId) {
+        if AniListMetaBuilder.isAniListID(cleanId) || AnimeSource.isMALTitle(cleanId) {
             guard let mapped = await AniListStreamIds.imdbEpisodeID(for: cleanId) else {
                 await AddonEpisodeRatingsCache.shared.setRatings([], for: cacheKey)
                 return []
@@ -687,7 +687,7 @@ enum AddonRatingsService {
         // Pre-warm SeriesGraph cache for parent series IDs to resolve in one single batch HTTP call
         var parentIds = Set<String>()
         // (AniList episodes are asked by their IMDb episode one by one, see `addonRatingsForEpisode`.)
-        for id in missing where !AniListMetaBuilder.isAniListID(id) {
+        for id in missing where !AniListMetaBuilder.isAniListID(id) && !AnimeSource.isMALTitle(id) {
             let parts = id.split(separator: ":")
             if parts.count >= 3 {
                 parentIds.insert(String(parts[0]))
@@ -1120,7 +1120,7 @@ enum AddonRatingsService {
     /// Cache key shared by the hero and Details for one title.
     static func homeHeroRatingsKey(for meta: NuvioMeta) -> String {
         // An AniList season has its own AniList score, though IMDb has one title for the show.
-        if AniListMetaBuilder.isAniListID(meta.id) { return meta.id.lowercased() }
+        if AnimeSource.isAnimeTitleID(meta.id) { return meta.id.lowercased() }
         return NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id) ?? meta.id
     }
 

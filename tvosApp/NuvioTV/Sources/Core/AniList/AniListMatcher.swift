@@ -246,13 +246,37 @@ enum AniListMatcher {
 /// (when turned on) anime from Cinemeta through `AniListMatcher`.
 enum AniListScrobbler {
     struct Target: Equatable {
+        /// The AniList entry; 0 for a MyAnimeList title's entry AniList isn't known to have.
         let entryID: Int
         let episode: Int
         let label: String
+        /// The MAL entry of a MyAnimeList title (`mal:ID`), written to the MAL list as it is.
+        var malID: Int? = nil
+
+        var hasAniListEntry: Bool { entryID > 0 }
     }
 
     /// The AniList entry and episode of what is playing or shown.
     static func target(meta: NuvioMeta, video: NuvioVideo?, season: Int?, episode: Int?) async -> Target? {
+        if AnimeSource.isMALTitle(meta.id) {
+            // A MyAnimeList title: its MAL entry, and the AniList entry it maps to.
+            let malEntry: Int
+            let number: Int
+            let label: String
+            if let video, let id = AnimeSource.malID(from: video.id), let found = AniListAccount.episodeNumber(in: video.id) {
+                malEntry = id
+                number = found
+                label = "E\(found)"
+            } else if !meta.isSeries, let id = AnimeSource.malID(from: meta.id) {
+                malEntry = id
+                number = 1
+                label = meta.name
+            } else {
+                return nil
+            }
+            let aniList = await AniListOfflineMaps.shared.aniListID(mal: malEntry) ?? 0
+            return Target(entryID: aniList, episode: number, label: label, malID: malEntry)
+        }
         if AniListMetaBuilder.isAniListID(meta.id) {
             if let video, let entryID = AniListMetaBuilder.aniListID(from: video.id),
                let number = AniListAccount.episodeNumber(in: video.id) {
@@ -279,16 +303,16 @@ enum AniListScrobbler {
         guard AniListSettings.scrobbles || MALSettings.scrobbles else { return }
         Task.detached(priority: .utility) {
             guard let target = await target(meta: meta, video: video, season: season, episode: episode) else {
-                if !AniListMetaBuilder.isAniListID(meta.id), AniListSettings.scrobblesCinemeta, meta.isAnime {
+                if !AnimeSource.isAnimeTitleID(meta.id), AniListSettings.scrobblesCinemeta, meta.isAnime {
                     AniListDiagnostics.note(.account, "\(meta.name): not found on AniList, nothing written")
                 }
                 return
             }
-            if AniListSettings.scrobbles {
+            if AniListSettings.scrobbles, target.hasAniListEntry {
                 await AniListAccount.perform(.watched(episode: target.episode, byPlaying: true), entryID: target.entryID, reason: "Watched \(target.label)")
             }
             // And on MyAnimeList, when logged in there too.
-            await MALAccount.watched(aniListID: target.entryID, episode: target.episode)
+            await malWatched(target, episode: target.episode)
         }
     }
 
@@ -301,13 +325,13 @@ enum AniListScrobbler {
             let action: AniListAccount.Action = watched
                 ? .watched(episode: target.episode, byPlaying: false)
                 : .unwatched(episode: target.episode)
-            if AniListSettings.scrobbles {
+            if AniListSettings.scrobbles, target.hasAniListEntry {
                 await AniListAccount.perform(action, entryID: target.entryID, reason: watched ? "Marked \(target.label) watched" : "Marked \(target.label) unwatched")
             }
             if watched {
-                await MALAccount.watched(aniListID: target.entryID, episode: target.episode)
+                await malWatched(target, episode: target.episode)
             } else {
-                await MALAccount.unwatched(aniListID: target.entryID, episode: target.episode)
+                await malUnwatched(target, episode: target.episode)
             }
         }
     }
@@ -317,25 +341,44 @@ enum AniListScrobbler {
     static func markSeason(meta: NuvioMeta, videos: [NuvioVideo], watched: Bool) {
         guard AniListSettings.scrobbles || MALSettings.scrobbles, !videos.isEmpty else { return }
         Task.detached(priority: .utility) {
-            var byEntry: [Int: [Int]] = [:]
+            // Per entry (a MyAnimeList title's by its MAL entry).
+            var byEntry: [String: (target: Target, episodes: [Int])] = [:]
             for video in videos.sorted(by: { $0.episode < $1.episode }) {
                 guard let target = await target(meta: meta, video: video, season: video.season, episode: video.episode) else { continue }
-                byEntry[target.entryID, default: []].append(target.episode)
+                let key = "\(target.entryID)|\(target.malID ?? 0)"
+                byEntry[key, default: (target, [])].episodes.append(target.episode)
             }
-            for (entryID, episodes) in byEntry {
-                guard let first = episodes.min(), let last = episodes.max() else { continue }
+            for (_, entry) in byEntry {
+                guard let first = entry.episodes.min(), let last = entry.episodes.max() else { continue }
                 let action: AniListAccount.Action = watched
                     ? .watched(episode: last, byPlaying: false)
                     : .unwatched(episode: first)
-                if AniListSettings.scrobbles {
-                    await AniListAccount.perform(action, entryID: entryID, reason: watched ? "Marked a season watched" : "Marked a season unwatched")
+                if AniListSettings.scrobbles, entry.target.hasAniListEntry {
+                    await AniListAccount.perform(action, entryID: entry.target.entryID, reason: watched ? "Marked a season watched" : "Marked a season unwatched")
                 }
                 if watched {
-                    await MALAccount.watched(aniListID: entryID, episode: last)
+                    await malWatched(entry.target, episode: last)
                 } else {
-                    await MALAccount.unwatched(aniListID: entryID, episode: first)
+                    await malUnwatched(entry.target, episode: first)
                 }
             }
+        }
+    }
+
+    /// The MAL list: a MyAnimeList title's own entry, else the AniList entry's MAL entry.
+    private static func malWatched(_ target: Target, episode: Int) async {
+        if let mal = target.malID {
+            await MALAccount.watched(mal: mal, episode: episode)
+        } else {
+            await MALAccount.watched(aniListID: target.entryID, episode: episode)
+        }
+    }
+
+    private static func malUnwatched(_ target: Target, episode: Int) async {
+        if let mal = target.malID {
+            await MALAccount.unwatched(mal: mal, episode: episode)
+        } else {
+            await MALAccount.unwatched(aniListID: target.entryID, episode: episode)
         }
     }
 }

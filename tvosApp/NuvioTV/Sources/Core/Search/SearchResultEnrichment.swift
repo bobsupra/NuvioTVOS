@@ -37,7 +37,7 @@ enum SearchResultEnrichment {
     /// AniList limits to 30 a minute) nor merged with another source's copy of the same
     /// anime, which would hand them its IMDb id.
     static func isAniListCard(_ meta: NuvioMeta) -> Bool {
-        AniListMetaBuilder.isAniListID(meta.id)
+        AniListMetaBuilder.isAniListID(meta.id) || AnimeSource.isMALTitle(meta.id)
     }
 
     /// Returns `results` with the leading entries merged with their refreshed
