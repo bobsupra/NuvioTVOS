@@ -40,7 +40,7 @@ final class ProviderCredentialSyncTests: XCTestCase {
 
     func testPullIgnoresOtherProvidersAndReportsNoChangeForSameKey() {
         store.set("same", forKey: SettingsKey.mdbListApiKey)
-        let rows = [row("mdblist", ["api_key": "same"]), row("debrid:torbox", ["api_key": "x"]), row("animeskip", ["client_id": "y"])]
+        let rows = [row("mdblist", ["api_key": "same"]), row("introdb", ["api_key": "x"]), row("animeskip", ["client_id": "y"])]
         XCTAssertTrue(ProviderCredentialSync.apply(rows: rows, to: store).isEmpty)
         XCTAssertNil(store.string(forKey: SettingsKey.tmdbApiKey))
     }
@@ -64,5 +64,35 @@ final class ProviderCredentialSyncTests: XCTestCase {
         let pushed = ProviderCredentialSync.pushRows(merging: .tmdb, value: "k", into: [row("mdblist", ["api_key": "m"])])
         XCTAssertEqual(pushed.compactMap { $0["provider"] as? String }, ["mdblist", "tmdb"])
         XCTAssertEqual((pushed[1]["credential_json"] as? [String: String])?["api_key"], "k")
+    }
+
+    func testDebridKeyFillsAnEmptySlotAndSelectsTheService() {
+        let changed = ProviderCredentialSync.apply(rows: [row("debrid:torbox", ["api_key": "tb-key"])], to: store)
+        XCTAssertEqual(changed, [.torbox])
+        XCTAssertEqual(store.string(forKey: SettingsKey.torboxAccessToken), "tb-key")
+        XCTAssertEqual(store.string(forKey: SettingsKey.debridProvider), DebridProviderKind.torbox.rawValue)
+        XCTAssertEqual(store.string(forKey: SettingsKey.debridApiKey), "tb-key")
+    }
+
+    func testDebridKeyNeverReplacesThisAppleTVsToken() {
+        store.set("device-token", forKey: SettingsKey.realDebridAccessToken)
+        store.set(DebridProviderKind.realDebrid.rawValue, forKey: SettingsKey.debridProvider)
+        let changed = ProviderCredentialSync.apply(rows: [row("debrid:realdebrid", ["api_key": "account-key"])], to: store)
+        XCTAssertTrue(changed.isEmpty)
+        XCTAssertEqual(store.string(forKey: SettingsKey.realDebridAccessToken), "device-token")
+    }
+
+    func testDebridKeyKeepsAnExistingServiceChoice() {
+        store.set(DebridProviderKind.realDebrid.rawValue, forKey: SettingsKey.debridProvider)
+        store.set("rd", forKey: SettingsKey.realDebridAccessToken)
+        ProviderCredentialSync.apply(rows: [row("debrid:premiumize", ["api_key": "pm"])], to: store)
+        XCTAssertEqual(store.string(forKey: SettingsKey.premiumizeAccessToken), "pm")
+        XCTAssertEqual(store.string(forKey: SettingsKey.debridProvider), DebridProviderKind.realDebrid.rawValue)
+    }
+
+    func testDebridKeysAreNeverPushed() {
+        XCTAssertFalse(ProviderCredentialSync.Provider.torbox.isPushed)
+        XCTAssertFalse(ProviderCredentialSync.Provider.realDebrid.isPushed)
+        XCTAssertTrue(ProviderCredentialSync.Provider.mdblist.isPushed)
     }
 }

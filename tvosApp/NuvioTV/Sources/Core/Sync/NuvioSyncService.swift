@@ -1956,6 +1956,7 @@ final class NuvioSyncManager: ObservableObject {
     /// Sends a key saved on this Apple TV to the account, merged into the
     /// rows the account already has.
     func pushProviderCredential(_ provider: ProviderCredentialSync.Provider) {
+        guard provider.isPushed else { return }
         Task { @MainActor in
             guard let authManager, let profileViewModel,
                   let key = currentSyncKey(), completedInitialPullKeys.contains(key),

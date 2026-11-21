@@ -5,18 +5,25 @@ import Foundation
 /// `sync_push_provider_credentials` instead: one row per provider, with
 /// `credential_json` such as `{"api_key": "…"}`.
 ///
-/// The Apple TV handles the MDBList and TMDB keys, more carefully than the
-/// desktop app in both directions so a key is never lost:
+/// The Apple TV handles the MDBList, TMDB and debrid keys, more carefully
+/// than the desktop app in both directions so a key is never lost:
 /// - a pull applies only non-empty keys, so a device without one cannot
 ///   clear this Apple TV's;
 /// - a push happens only when a non-empty key that differs from the
 ///   account's is saved here, and sends every row the account already has
 ///   with just that provider changed, so keys this Apple TV doesn't know
-///   (debrid, AnimeSkip, IntroDB) stay as they are.
+///   (AnimeSkip, IntroDB) stay as they are.
+///
+/// Debrid keys only come in, and only into an empty slot: the Apple TV's own
+/// debrid sign-in stores a device token that can expire, which must neither
+/// be replaced by nor sent to the account as an API key.
 enum ProviderCredentialSync {
     enum Provider: String, CaseIterable, Sendable {
         case mdblist
         case tmdb
+        case realDebrid = "debrid:realdebrid"
+        case premiumize = "debrid:premiumize"
+        case torbox = "debrid:torbox"
 
         var field: String { "api_key" }
 
@@ -24,6 +31,23 @@ enum ProviderCredentialSync {
             switch self {
             case .mdblist: return SettingsKey.mdbListApiKey
             case .tmdb: return SettingsKey.tmdbApiKey
+            case .realDebrid: return SettingsKey.realDebridAccessToken
+            case .premiumize: return SettingsKey.premiumizeAccessToken
+            case .torbox: return SettingsKey.torboxAccessToken
+            }
+        }
+
+        var isDebrid: Bool { rawValue.hasPrefix("debrid:") }
+
+        /// Whether a key saved on this Apple TV is sent to the account.
+        var isPushed: Bool { !isDebrid }
+
+        var debridKind: DebridProviderKind? {
+            switch self {
+            case .realDebrid: return .realDebrid
+            case .premiumize: return .premiumize
+            case .torbox: return .torbox
+            case .mdblist, .tmdb: return nil
             }
         }
     }
@@ -52,10 +76,33 @@ enum ProviderCredentialSync {
             let current = store.string(forKey: provider.localKey)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard current != value else { continue }
+            if provider.isDebrid, !current.isEmpty { continue }
             store.set(value, forKey: provider.localKey)
             changed.append(provider)
         }
+        if changed.contains(where: \.isDebrid) {
+            selectDebridProviderIfNeeded(in: store)
+        }
         return changed
+    }
+
+    /// With no debrid service chosen yet, picks the first one that now has a
+    /// key, in the order the settings import uses (TorBox, Premiumize,
+    /// Real-Debrid), and keeps the active key in step with the choice.
+    static func selectDebridProviderIfNeeded(in store: UserDefaults) {
+        var selected = DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider))
+        if selected == .none {
+            for provider in [Provider.torbox, .premiumize, .realDebrid] {
+                let key = store.string(forKey: provider.localKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if !key.isEmpty, let kind = provider.debridKind {
+                    selected = kind
+                    break
+                }
+            }
+        }
+        guard selected != .none else { return }
+        store.set(selected.rawValue, forKey: SettingsKey.debridProvider)
+        store.set(DebridCredentials.token(for: selected, store: store), forKey: SettingsKey.debridApiKey)
     }
 
     /// The push payload: every pulled row as it is, with `provider`'s row
