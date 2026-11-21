@@ -7527,6 +7527,9 @@ struct TVHomeView: View {
     @State private var browsingSection: TVHomeSection?
     @State private var browsePresentationGeneration = 0
     @State private var gridHeroIndex = 0
+    /// Grid View hero titles taken from Home's collections when no catalog row
+    /// can supply them, as the desktop app does.
+    @State private var collectionHeroItems: [NuvioMeta] = []
     @State private var didRequestInitialGridHeroFocus = false
     /// The Grid hero owns its own focus state, so `focusedCardID` goes nil while
     /// it is focused. Home still holds focus then, and arming the focus restore
@@ -9093,6 +9096,9 @@ struct TVHomeView: View {
                             using: verticalScrollProxy
                         )
                     }
+                }
+                .task(id: collectionHeroRequestKey) {
+                    await loadCollectionHero(key: collectionHeroRequestKey)
                 }
                 .onChange(of: isGridHeroFocused) { wasFocused, isFocused in
                     if isFocused {
@@ -11097,7 +11103,67 @@ struct TVHomeView: View {
                 if result.count == TVHomeGridLayout.heroPageLimit { return result }
             }
         }
-        return result
+        return result.isEmpty ? collectionHeroItems : result
+    }
+
+    /// Identifies the collections the fallback hero is built from; nil when the
+    /// catalog rows supply the hero or Grid View isn't showing it.
+    private var collectionHeroRequestKey: String? {
+        guard homeLayout == "Grid View", heroEnabled else { return nil }
+        let sections = visibleSections
+        let hasCatalogHero = sections.contains {
+            $0.id != TVHomeSection.continueWatchingId && $0.id != TVHomeSection.upcomingId
+                && $0.id != TVHomeSection.calendarTodayId && $0.collectionFolders.isEmpty
+                && !$0.items.isEmpty
+        }
+        guard !hasCatalogHero else { return nil }
+        let folderIDs = sections.flatMap(\.collectionFolders).map(\.id)
+        guard !folderIDs.isEmpty else { return nil }
+        return "\(contentIdentity.profileId)|\(contentIdentity.catalogRevision)|" + folderIDs.joined(separator: ",")
+    }
+
+    /// The desktop app's collection hero: the first sources of Home's
+    /// collections, the first titles of each, merged in turn, without
+    /// duplicates, in a fixed shuffled order for this set of collections.
+    private func loadCollectionHero(key: String?) async {
+        guard let key else {
+            if !collectionHeroItems.isEmpty { collectionHeroItems = [] }
+            return
+        }
+        let sources = Array(visibleSections
+            .flatMap(\.collectionFolders)
+            .flatMap(\.sources)
+            .prefix(TVHomeGridLayout.collectionHeroSourceLimit))
+        let profileID = contentIdentity.profileId
+        let resolver = CollectionSourceResolver(
+            repository: repository,
+            settings: ProfileSettings.store(for: profileID)
+        )
+        let results: [[NuvioMeta]] = await withTaskGroup(of: (Int, [NuvioMeta]).self) { group in
+            for (index, source) in sources.enumerated() {
+                group.addTask {
+                    let page = try? await resolver.browse(source, cursor: 0)
+                    return (index, Array((page?.items ?? []).prefix(TVHomeGridLayout.collectionHeroSourceItemLimit)))
+                }
+            }
+            var byIndex: [Int: [NuvioMeta]] = [:]
+            for await (index, items) in group { byIndex[index] = items }
+            return sources.indices.map { byIndex[$0] ?? [] }
+        }
+        guard !Task.isCancelled, collectionHeroRequestKey == key else { return }
+        var merged: [NuvioMeta] = []
+        var seen: Set<String> = []
+        let longest = results.map(\.count).max() ?? 0
+        for position in 0..<longest {
+            for items in results where position < items.count {
+                if seen.insert(items[position].homeTitleIdentity).inserted {
+                    merged.append(items[position])
+                }
+            }
+        }
+        var generator = TVHomeSeededGenerator(seed: UInt64(truncatingIfNeeded: key.hashValueStable))
+        merged.shuffle(using: &generator)
+        collectionHeroItems = Array(merged.prefix(TVHomeGridLayout.heroPageLimit))
     }
 
     private func landscapeFocusedId(for sectionId: String) -> String? {

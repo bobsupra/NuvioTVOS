@@ -1163,6 +1163,9 @@ enum TVHomeGridLayout {
     static let itemSpacing: CGFloat = 28
     static let sectionSpacing: CGFloat = 54
     static let heroPageLimit = 7
+    /// The desktop app's collection hero limits: sources read, titles per source.
+    static let collectionHeroSourceLimit = 6
+    static let collectionHeroSourceItemLimit = 8
     static let seeAllID = "__see_all__"
     /// Inset inside tvOS's 80pt safe area (80 + 61 = 141pt from screen edges) to center the 7-column grid symmetrically.
     static let horizontalPadding: CGFloat = 61
@@ -2329,5 +2332,27 @@ private struct DissolveFrameReporter: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// A repeatable random order: the same seed gives the same shuffle.
+struct TVHomeSeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed == 0 ? 0x9E3779B97F4A7C15 : seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E3779B97F4A7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
+    }
+}
+
+extension String {
+    /// FNV-1a: stable across launches, unlike `hashValue`.
+    var hashValueStable: UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in utf8 { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        return hash
     }
 }
