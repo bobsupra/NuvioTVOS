@@ -2511,7 +2511,20 @@ enum MdbListDetailsService {
 
     /// One request for every rating of a title (the per-provider endpoint
     /// cost up to nine requests per title against the daily limit).
+    /// An empty `apiKey` asks with the connected MDBList account instead, as
+    /// the desktop app does: a key overrides the account when both exist.
     static func requestTitleRatings(imdbID: String, mediaType: String, apiKey: String) async -> TitleResult {
+        guard !apiKey.isEmpty else {
+            let service = MdbListAuthService(profileScope: MdbListRuntimeSession.profileScope())
+            guard service.hasOAuthAuthorization(),
+                  let response = try? await service.authorizedRequest(
+                    path: "/imdb/\(mediaType)/\(imdbID)",
+                    method: .get
+                  ) else {
+                return .failed
+            }
+            return titleResult(status: response.statusCode, data: response.data)
+        }
         var components = URLComponents()
         components.scheme = "https"
         components.host = "api.mdblist.com"
@@ -2607,10 +2620,10 @@ enum MdbListDetailsService {
 
     private static func mdbListRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
         let defaults = ProfileSettings.current
+        let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard defaults.bool(forKey: SettingsKey.mdbListEnabled),
-              let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey)?
-                .trimmingCharacters(in: .whitespacesAndNewlines),
-              !apiKey.isEmpty else {
+              !apiKey.isEmpty || MdbListRuntimeSession.isAuthenticated(in: defaults) else {
             return []
         }
 
