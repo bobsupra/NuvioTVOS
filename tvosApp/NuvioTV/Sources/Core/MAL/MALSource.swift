@@ -2,14 +2,15 @@ import Foundation
 
 // MARK: - Which source a title comes from
 
-/// Where an anime title's details come from: AniList (`anilist:ID`) or MyAnimeList (`mal:ID`).
-/// Both are built by the same engine (`AniListService`, `AniListMetaBuilder`), which reads
-/// `current` for the ids it makes and reads: the work on a `mal:` title runs inside
+/// Where an anime title's details come from: AniList (`anilist:ID`), MyAnimeList (`mal:ID`) or
+/// Kitsu (`kitsu:ID`). All are built by the same engine (`AniListService`, `AniListMetaBuilder`),
+/// which reads `current` for the ids it makes and reads: the work on a `mal:` title runs inside
 /// `AnimeSource.$current.withValue(.mal)`, where `mal:ID` and MAL's entry ids are what
-/// `metaID`, `episodeID` and `aniListID(from:)` make and read.
-enum AnimeSource: String, Sendable {
+/// `metaID`, `episodeID` and `aniListID(from:)` make and read (`kitsu:` likewise).
+enum AnimeSource: String, Sendable, CaseIterable {
     case anilist
     case mal
+    case kitsu
 
     @TaskLocal static var current: AnimeSource = .anilist
 
@@ -17,6 +18,7 @@ enum AnimeSource: String, Sendable {
         switch self {
         case .anilist: return "anilist:"
         case .mal: return "mal:"
+        case .kitsu: return "kitsu:"
         }
     }
 
@@ -24,13 +26,23 @@ enum AnimeSource: String, Sendable {
         switch self {
         case .anilist: return "AniList"
         case .mal: return "MyAnimeList"
+        case .kitsu: return "Kitsu"
         }
     }
 
-    /// The source and entry id of `anilist:123`, `MAL:456:7`…; nil for any other id.
+    /// Whether this source's titles are built here (its integration on).
+    var opensTitles: Bool {
+        switch self {
+        case .anilist: return true
+        case .mal: return MALSettings.opensTitles
+        case .kitsu: return KitsuSettings.opensTitles
+        }
+    }
+
+    /// The source and entry id of `anilist:123`, `MAL:456:7`, `kitsu:12`…; nil for any other id.
     static func entry(from id: String) -> (source: AnimeSource, id: Int)? {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        for source in [AnimeSource.anilist, .mal] where trimmed.hasPrefix(source.prefix) {
+        for source in AnimeSource.allCases where trimmed.hasPrefix(source.prefix) {
             let rest = trimmed.dropFirst(source.prefix.count)
             guard let first = rest.split(separator: ":", omittingEmptySubsequences: false).first,
                   let value = Int(first), value > 0 else { return nil }
@@ -45,16 +57,32 @@ enum AnimeSource: String, Sendable {
         return found.id
     }
 
+    /// The Kitsu id in `kitsu:123` or `kitsu:123:4`.
+    static func kitsuID(from id: String) -> Int? {
+        guard let found = entry(from: id), found.source == .kitsu else { return nil }
+        return found.id
+    }
+
     /// A `mal:` title built here from MyAnimeList (MyAnimeList → MAL Titles on).
     static func isMALTitle(_ id: String) -> Bool {
         MALSettings.opensTitles && malID(from: id) != nil
     }
 
-    /// A title this engine builds: an AniList one, or a MyAnimeList one with MAL Titles on.
-    /// Wherever it is asked from: it doesn't read `current`.
+    /// A `kitsu:` title built here from Kitsu (Kitsu on).
+    static func isKitsuTitle(_ id: String) -> Bool {
+        KitsuSettings.opensTitles && kitsuID(from: id) != nil
+    }
+
+    /// A MyAnimeList or Kitsu title built here (not AniList's).
+    static func isOtherSourceTitle(_ id: String) -> Bool {
+        isMALTitle(id) || isKitsuTitle(id)
+    }
+
+    /// A title this engine builds: an AniList one, or a MyAnimeList or Kitsu one with its
+    /// integration on. Wherever it is asked from: it doesn't read `current`.
     static func isAnimeTitleID(_ id: String) -> Bool {
         guard let found = entry(from: id) else { return false }
-        return found.source == .anilist || MALSettings.opensTitles
+        return found.source.opensTitles
     }
 
     /// The source of a title id; `current` for any other id.
@@ -67,12 +95,13 @@ enum AnimeSource: String, Sendable {
         switch entry(from: id)?.source {
         case .anilist: return AniListService.searchBadge
         case .mal: return MALSettings.opensTitles ? AniListService.malBadge : nil
+        case .kitsu: return KitsuSettings.opensTitles ? AniListService.kitsuBadge : nil
         case nil: return nil
         }
     }
 
-    /// The offline tables' entry of an entry of the current source (a MAL entry by the AniList
-    /// entry it maps to).
+    /// The offline tables' entry of an entry of the current source (a MAL or Kitsu entry by the
+    /// AniList entry it maps to).
     static func offlineEntry(_ entryID: Int) async -> AniListOfflineMaps.Entry? {
         guard let aniList = await aniListEntry(entryID) else { return nil }
         return await AniListOfflineMaps.shared.entry(aniListID: aniList)
@@ -86,14 +115,22 @@ enum AnimeSource: String, Sendable {
 
     /// The AniList entry of an entry of the current source, by the offline tables only.
     static func aniListEntry(_ entryID: Int) async -> Int? {
-        guard current == .mal else { return entryID }
-        return await AniListOfflineMaps.shared.aniListID(mal: entryID)
+        switch current {
+        case .anilist: return entryID
+        case .mal: return await AniListOfflineMaps.shared.aniListID(mal: entryID)
+        case .kitsu: return await AniListOfflineMaps.shared.aniListID(kitsu: entryID)
+        }
     }
 
     /// The MAL entry of an entry of the current source.
     static func malEntry(_ entryID: Int) async -> Int? {
-        guard current != .mal else { return entryID }
-        return await MALEpisodeRatings.malID(aniListID: entryID)
+        switch current {
+        case .mal: return entryID
+        case .anilist: return await MALEpisodeRatings.malID(aniListID: entryID)
+        case .kitsu:
+            guard let aniList = await AniListOfflineMaps.shared.aniListID(kitsu: entryID) else { return nil }
+            return await AniListOfflineMaps.shared.entry(aniListID: aniList)?.mal
+        }
     }
 }
 
@@ -484,7 +521,7 @@ enum MALSource {
         case "side_story": return "SIDE_STORY"
         case "parent_story", "full_story": return "PARENT"
         case "summary": return "SUMMARY"
-        case "spin_off": return "SPIN_OFF"
+        case "spin_off", "spinoff": return "SPIN_OFF"
         case "character": return "CHARACTER"
         case "adaptation": return "ADAPTATION"
         default: return "OTHER"

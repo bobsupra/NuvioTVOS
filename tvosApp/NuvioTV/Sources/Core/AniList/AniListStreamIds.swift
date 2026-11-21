@@ -53,9 +53,17 @@ enum AniListStreamIds {
         switch found.source {
         case .anilist:
             ids = await AnimeSource.$current.withValue(.anilist) { await find(entryID: found.id, episode: episode) }
-        case .mal:
-            guard MALSettings.opensTitles, let entryID = await aniListEntry(mal: found.id) else { return [] }
-            let own = episode.map { "mal:\(found.id):\($0)" } ?? "mal:\(found.id)"
+        case .mal, .kitsu:
+            guard found.source.opensTitles else { return [] }
+            let mapped: Int?
+            if found.source == .mal {
+                mapped = await aniListEntry(mal: found.id)
+            } else {
+                mapped = await AniListOfflineMaps.shared.aniListID(kitsu: found.id)
+            }
+            guard let entryID = mapped else { return [] }
+            let prefix = found.source.prefix
+            let own = episode.map { "\(prefix)\(found.id):\($0)" } ?? "\(prefix)\(found.id)"
             let converted = await AnimeSource.$current.withValue(.anilist) { await find(entryID: entryID, episode: episode) }
             ids = [episode.map { "anilist:\(entryID):\($0)" } ?? "anilist:\(entryID)"] + converted.filter { $0 != own }
         }

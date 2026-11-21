@@ -296,6 +296,13 @@ enum MALCatalogs {
         let malEntry: Int?
         if let own = AnimeSource.malID(from: meta.id) {
             malEntry = own
+        } else if let kitsu = AnimeSource.kitsuID(from: meta.id) {
+            let maps = AniListOfflineMaps.shared
+            if let aniList = await maps.aniListID(kitsu: kitsu) {
+                malEntry = await maps.entry(aniListID: aniList)?.mal
+            } else {
+                malEntry = nil
+            }
         } else if let id = AniListMetaBuilder.aniListID(from: meta.id) {
             malEntry = await MALEpisodeRatings.malID(aniListID: id)
         } else if let entry = await AniListService.mappedEntry(for: meta) {
