@@ -5215,38 +5215,80 @@ struct TvDetailsContent: View {
                 )
             }
         case .comments:
+            if hasCommentRows {
+                commentRows(scrollProxy: scrollProxy)
+                    .padding(.top, 40)
+                    .id(TvDetailsScrollID.commentsSection)
+                    .disabled(
+                        restoreEpisodeKey != nil
+                            || !isDetailsFocusReachable(.comments)
+                    )
+            }
+        }
+    }
+
+    /// Trakt's comments, and an anime's reviews from AniList and MAL (`AnimeReviews`).
+    private var hasCommentRows: Bool {
+        !uiState.comments.isEmpty || !uiState.aniListReviews.isEmpty || !uiState.malReviews.isEmpty
+    }
+
+    private func commentRows(scrollProxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 34) {
             if !uiState.comments.isEmpty {
-                TvDetailsCommentsRow(
-                    comments: uiState.comments,
-                    entryLocked: focusedDetailsSection != .comments,
-                    onSelect: { comment in
-                        onCommentSelect?(comment)
-                    },
-                    onBack: handleDetailsBack,
-                    onFocus: {
-                        guard focusRestoreAttemptTarget == nil else { return }
-                        if focusedDetailsSection != .comments {
-                            focusedDetailsSection = .comments
-                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
-                            }
-                        }
-                    }
+                commentRow(uiState.comments, scrollProxy: scrollProxy)
+            }
+            if !uiState.aniListReviews.isEmpty {
+                commentRow(
+                    uiState.aniListReviews,
+                    title: L10n.string("details_anilist_reviews", fallback: "AniList Reviews"),
+                    logo: AnimeFind.aniListIcon,
+                    scrollProxy: scrollProxy
                 )
-                .padding(.top, 40)
-                .id(TvDetailsScrollID.commentsSection)
-                .disabled(
-                    restoreEpisodeKey != nil
-                        || !isDetailsFocusReachable(.comments)
+            }
+            if !uiState.malReviews.isEmpty {
+                commentRow(
+                    uiState.malReviews,
+                    title: L10n.string("details_mal_reviews", fallback: "MAL Reviews"),
+                    logoAsset: MALEpisodeRatings.assetName,
+                    scrollProxy: scrollProxy
                 )
             }
         }
+    }
+
+    private func commentRow(
+        _ comments: [TraktCommentReview],
+        title: String? = nil,
+        logo: UIImage? = nil,
+        logoAsset: String? = nil,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        TvDetailsCommentsRow(
+            comments: comments,
+            title: title,
+            logo: logo,
+            logoAsset: logoAsset,
+            entryLocked: focusedDetailsSection != .comments,
+            onSelect: { comment in
+                onCommentSelect?(comment)
+            },
+            onBack: handleDetailsBack,
+            onFocus: {
+                guard focusRestoreAttemptTarget == nil else { return }
+                if focusedDetailsSection != .comments {
+                    focusedDetailsSection = .comments
+                    withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                        scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                    }
+                } else {
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                    }
+                }
+            }
+        )
     }
 
     /// Offered for an episodic series (see `EpisodeShuffle.suitsShuffle`) with at
@@ -6311,7 +6353,7 @@ struct TvDetailsContent: View {
                     order.append(.production)
                 }
             case .comments:
-                if !uiState.comments.isEmpty {
+                if hasCommentRows {
                     order.append(.comments)
                 }
             }
@@ -7981,6 +8023,10 @@ private struct TvDetailsCompanyCard: View {
 
 private struct TvDetailsCommentsRow: View {
     let comments: [TraktCommentReview]
+    /// The row's name and its source's logo; Trakt's comments as "Top Comments".
+    var title: String? = nil
+    var logo: UIImage? = nil
+    var logoAsset: String? = nil
     let entryLocked: Bool
     let onSelect: (TraktCommentReview) -> Void
     var onBack: (() -> Void)? = nil
@@ -7999,9 +8045,23 @@ private struct TvDetailsCommentsRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Text(L10n.string("details_top_comments", fallback: "Top Comments"))
-                .font(.system(size: 34, weight: .semibold))
-                .foregroundColor(.white.opacity(0.9))
+            HStack(spacing: 14) {
+                if let logo {
+                    Image(uiImage: logo)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 34)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                } else if let logoAsset {
+                    Image(logoAsset)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 34)
+                }
+                Text(title ?? L10n.string("details_top_comments", fallback: "Top Comments"))
+                    .font(.system(size: 34, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+            }
 
             HStack(spacing: 22) {
                 ForEach(Array(comments.enumerated()), id: \.element.id) { index, comment in
@@ -8051,6 +8111,11 @@ private struct TvDetailsCommentCard: View {
                         .foregroundColor(.white)
                         .lineLimit(1)
                     Spacer(minLength: 8)
+                    if let score = comment.scoreText {
+                        Text(score)
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
                     if comment.likes > 0 {
                         Label("\(comment.likes)", systemImage: "heart.fill")
                             .font(.system(size: 18, weight: .medium))
@@ -8058,17 +8123,19 @@ private struct TvDetailsCommentCard: View {
                     }
                 }
 
-                Text(comment.spoiler ? L10n.string("details_spoiler_notice", fallback: "Spoiler — select to read") : comment.comment)
+                Text(comment.spoiler ? L10n.string("details_spoiler_notice", fallback: "Spoiler — select to read") : (comment.summary ?? comment.comment))
                     .font(.system(size: 22, weight: .regular))
                     .foregroundColor(.white.opacity(comment.spoiler ? 0.45 : 0.82))
                     .lineLimit(5)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                if let date = comment.displayDate {
-                    Text(date)
+                let footer = [comment.displayDate, comment.tag].compactMap { $0 }.joined(separator: " · ")
+                if !footer.isEmpty {
+                    Text(footer)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundColor(.white.opacity(0.4))
+                        .lineLimit(1)
                 }
             }
             .padding(24)
@@ -8114,8 +8181,9 @@ private struct CommentDetailOverlay: View {
                         Text(comment.author)
                             .font(.system(size: 36, weight: .bold))
                             .foregroundColor(.white)
-                        if let date = comment.displayDate {
-                            Text(date)
+                        let line = [comment.scoreText, comment.tag, comment.displayDate].compactMap { $0 }.joined(separator: " · ")
+                        if !line.isEmpty {
+                            Text(line)
                                 .font(.system(size: 24, weight: .medium))
                                 .foregroundColor(.white.opacity(0.5))
                         }

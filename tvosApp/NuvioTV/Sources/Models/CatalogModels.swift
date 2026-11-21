@@ -13265,6 +13265,9 @@ struct DetailsUiState {
     var mdbListUserRating: Int? = nil
     /// Top liked Trakt comments (max 5).
     var comments: [TraktCommentReview] = []
+    /// An anime's reviews from AniList and MAL (`AnimeReviews`), shown with the comments.
+    var aniListReviews: [TraktCommentReview] = []
+    var malReviews: [TraktCommentReview] = []
     var isLoadingEnrichment: Bool = false
 }
 
