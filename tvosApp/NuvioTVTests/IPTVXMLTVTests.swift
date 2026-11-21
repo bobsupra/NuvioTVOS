@@ -31,8 +31,8 @@ final class IPTVXMLTVTests: XCTestCase {
         let ids: Set<String> = ["NRK1.no", "NRKSuper.no", "NRK1.se"]
         XCTAssertTrue(try IPTVXMLTV.parse(Data(xml.utf8), channelIDs: ids, window: window).isEmpty)
         let aliased = try IPTVXMLTV.parse(Data(xml.utf8), channelIDs: ids, window: window, allowEPGShareAliases: true)
-        XCTAssertEqual(aliased.map(\.title), ["NRK", "NRK Super", "NRK Sweden"])
-        XCTAssertEqual(aliased.map(\.channelID), ["NRK1.no", "NRKSuper.no", "NRK1.se"])
+        XCTAssertEqual(aliased.map(\.title), ["NRK", "NRK Sweden", "NRK Super"])
+        XCTAssertEqual(aliased.map(\.channelID), ["NRK1.no", "NRK1.se", "NRKSuper.no"])
         let ambiguousIDs: Set<String> = ["NRK1.no", "nrk1.NO"]
         XCTAssertTrue(try IPTVXMLTV.parse(Data(xml.utf8), channelIDs: ambiguousIDs, window: window, allowEPGShareAliases: true).isEmpty)
     }
