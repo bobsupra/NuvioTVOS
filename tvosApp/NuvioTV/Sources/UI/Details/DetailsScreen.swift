@@ -5160,10 +5160,6 @@ struct TvDetailsContent: View {
                         }
                     }
                 )
-                .detailsSnapshot(TvDetailsRowSnapshotKey(
-                    content: networks,
-                    entryLocked: focusedDetailsSection != .network
-                ))
                 .padding(.top, 40)
                 .id(TvDetailsScrollID.networkSection)
                 .disabled(
@@ -5209,10 +5205,6 @@ struct TvDetailsContent: View {
                         }
                     }
                 )
-                .detailsSnapshot(TvDetailsRowSnapshotKey(
-                    content: productionCompanies,
-                    entryLocked: focusedDetailsSection != .production
-                ))
                 .padding(.top, 40)
                 .id(TvDetailsScrollID.productionSection)
                 .disabled(
@@ -5413,7 +5405,7 @@ struct TvDetailsContent: View {
                             let networks = uiState.companies.filter { $0.kind == .network && $0.tmdbId != nil }
 
                             let lowerSections = activeDetailsSections
-                            let builtSections = initialFocusEpisode != nil ? lowerSections.count : builtLowerSectionCount
+                            let builtSections = (initialFocusEpisode != nil || initialFocusTarget != nil) ? lowerSections.count : builtLowerSectionCount
                             if builtSections > 0 {
                                 ForEach(Array(lowerSections.prefix(builtSections)), id: \.self) { section in
                                     renderDetailsSection(
@@ -5444,7 +5436,7 @@ struct TvDetailsContent: View {
                                     .allowsHitTesting(false)
                             }
                             .task {
-                                guard builtLowerSectionCount == 0 else { return }
+                                guard builtLowerSectionCount == 0, initialFocusEpisode == nil, initialFocusTarget == nil else { return }
                                 TvDetailsFocusActivity.start()
                                 // The section right below the actions is there from the start
                                 // (built in the frame after Details' first): built only once
@@ -5560,6 +5552,7 @@ struct TvDetailsContent: View {
                 if focusRestoreRequest != nil {
                     // Restored card focus takes precedence over a retained
                     // calendar episode target when returning through Details.
+                    buildLowerSections(upTo: .max)
                     calendarFocusPending = false
                     restoreGeneration &+= 1
                     restoreEpisodeKey = nil
@@ -5837,6 +5830,7 @@ struct TvDetailsContent: View {
 
     private func beginFocusRestoration(_ target: DetailsFocusTarget, using scrollProxy: ScrollViewProxy) {
         guard initialFocusTarget == target else { return }
+        buildLowerSections(upTo: .max)
         if focusRestoreTarget != target {
             if focusRestoreTarget != nil {
                 cancelFocusRestoration()
@@ -5890,6 +5884,7 @@ struct TvDetailsContent: View {
 
         let section = detailsSection(for: target)
         focusedDetailsSection = section
+        moveDetails(to: section)
         withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
             scrollProxy.scrollTo(scrollID(for: section), anchor: .top)
         }
@@ -5961,6 +5956,7 @@ struct TvDetailsContent: View {
             withTransaction(transaction) {
                 scrollProxy.scrollTo(scrollID(for: section), anchor: .top)
             }
+            moveDetails(to: section)
         }
     }
 
@@ -7959,7 +7955,6 @@ private struct TvDetailsProductionRow: View {
                             },
                             onBack: onBack
                         )
-                        .detailsSnapshot(TvDetailsCardSnapshotKey(item: company, index: index))
                         .disabled(
                             focusRequestID.map { $0 != company.id }
                                 ?? (entryLocked && index != entryCompanyIndex)
@@ -8007,9 +8002,10 @@ private struct TvDetailsCompanyCard: View {
     let onFocus: () -> Void
     var onBack: (() -> Void)? = nil
 
-    @FocusState private var localFocusID: String?
+    @FocusState private var isFocused: Bool
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
 
     private var cardCornerRadius: CGFloat {
         AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 14)
@@ -8019,8 +8015,8 @@ private struct TvDetailsCompanyCard: View {
         RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
     }
 
-    private var isFocused: Bool {
-        externalFocus?.wrappedValue == company.id || localFocusID == company.id
+    private var showsFocusedAppearance: Bool {
+        isFocused || externalFocus?.wrappedValue == company.id
     }
 
     var body: some View {
@@ -8057,16 +8053,21 @@ private struct TvDetailsCompanyCard: View {
                 .modifier(
                     LiquidGlassCardModifier(
                         cornerRadius: cardCornerRadius,
-                        isFocused: isFocused,
+                        isFocused: showsFocusedAppearance,
                         isEnabled: liquidGlassCards,
                         coveredByArtwork: true
                     )
                 )
                 .overlay(
                     shape.stroke(
-                        isFocused ? AppFocusOutline.color : Color.clear,
-                        lineWidth: isFocused ? AppFocusOutline.width : 0
+                        showsFocusedAppearance ? AppFocusOutline.color : Color.clear,
+                        lineWidth: showsFocusedAppearance ? (focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
                     )
+                )
+                .shadow(
+                    color: Color.black.opacity(showsFocusedAppearance ? 0.55 : 0),
+                    radius: showsFocusedAppearance ? 14 : 0,
+                    y: showsFocusedAppearance ? 4 : 0
                 )
 
                 Text(company.name)
@@ -8080,11 +8081,12 @@ private struct TvDetailsCompanyCard: View {
             }
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused(externalFocus ?? $localFocusID, equals: company.id)
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: company.id))
         .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.05 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { _, focused in
+        .scaleEffect(showsFocusedAppearance ? 1.05 : 1)
+        .animation(.easeOut(duration: 0.14), value: showsFocusedAppearance)
+        .onChange(of: showsFocusedAppearance) { _, focused in
             if focused { onFocus() }
         }
         .onExitCommand {
