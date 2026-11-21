@@ -8402,11 +8402,14 @@ private struct TmdbOptionsSheet: View {
                     ) {
                         SettingsNativeTextFieldRow(
                             title: L10n.string("settings_tmdb_api_key", fallback: "TMDB API Key"),
-                            subtitle: L10n.string("settings_tmdb_api_key_subtitle", fallback: "Paste the key from TMDB — stored only on this Apple TV"),
+                            subtitle: L10n.string("settings_tmdb_api_key_subtitle", fallback: "Paste the key from TMDB, or set it in Nuvio on another device: it syncs with your account"),
                             placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                             text: $tmdbApiKey,
                             isSecure: true,
-                            onCommit: normalizeTmdbApiKey
+                            onCommit: {
+                                normalizeTmdbApiKey()
+                                NuvioSyncManager.current?.pushProviderCredential(.tmdb)
+                            }
                         )
 
                         SettingsToggleRow(
@@ -8733,11 +8736,14 @@ private struct MdbListOptionsSheet: View {
                     ) {
                         SettingsNativeTextFieldRow(
                             title: L10n.string("settings_mdblist_api_key", fallback: "MDBList API Key"),
-                            subtitle: L10n.string("settings_mdblist_api_key_subtitle", fallback: "Paste the key from MDBList — stored only on this Apple TV"),
+                            subtitle: L10n.string("settings_mdblist_api_key_subtitle", fallback: "Optional with a connected account. Set here or in Nuvio on another device: it syncs with your account"),
                             placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                             text: $mdbListApiKey,
                             isSecure: true,
-                            onCommit: normalizeMdbListApiKey
+                            onCommit: {
+                                normalizeMdbListApiKey()
+                                NuvioSyncManager.current?.pushProviderCredential(.mdblist)
+                            }
                         )
 
                         SettingsToggleRow(
