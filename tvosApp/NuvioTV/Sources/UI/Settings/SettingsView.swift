@@ -482,6 +482,8 @@ enum SettingsKey {
         aniListHideCinemetaDuplicates, aniListEpisodeDetails, aniListAdult,
         aniListClientID, aniListScrobble, aniListScrobbleCinemeta, aniListListRows, aniListOtherAddons, aniListCatalogs,
         malEnabled, malClientID, malEpisodeRatings, malScrobble, malAdult, malCatalogs, malDetailsButton, aniListDetailsButton, malPlusStatus, aniListPlusStatus, malSeriesScore, aniListScore,
+        malTitles, malSearch, aniListFindInMenu, malFindInMenu,
+        kitsuEnabled, kitsuCatalogs, kitsuSearch, kitsuAdult, kitsuScrobble, kitsuDetailsButton, kitsuScore, kitsuFindInMenu,
         mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
@@ -5599,6 +5601,27 @@ private func layoutVisibleHomeCatalogRows() -> [TVHomeCatalogOrder.SnapshotRow] 
         }
     }
 
+    if KitsuSettings.isEnabled {
+        // Settings → Anime Integrations → Kitsu Catalogs (under AniList's add-on id).
+        let existingIDs = Set(merged.map(\.id))
+        for choice in KitsuCatalogs.chosen() where !existingIDs.contains(KitsuCatalogs.rowID(choice.id)) {
+            guard !KitsuCatalogs.isList(choice.id) || KitsuAccount.isLoggedIn else { continue }
+            let key = KitsuCatalogs.settingsKey(choice.id)
+            guard !deletedKeys.contains(KitsuCatalogs.rowID(choice.id)), !deletedKeys.contains(key) else { continue }
+            merged.append(
+                TVHomeCatalogOrder.SnapshotRow(
+                    id: KitsuCatalogs.rowID(choice.id),
+                    title: KitsuCatalogs.displayTitle(choice),
+                    addonName: KitsuCatalogs.addonName,
+                    addonId: AniListService.addonID,
+                    contentType: AniListService.homeContentType,
+                    catalogId: choice.id,
+                    settingsKey: key
+                )
+            )
+        }
+    }
+
     let orderKeys = TVHomeCatalogOrder.effectiveOrderKeys()
     if !orderKeys.isEmpty {
         var indexByKey: [String: Int] = [:]
@@ -6683,8 +6706,10 @@ private struct AnimeIntegrationsSheet: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.aniListEnabled) private var aniListEnabled = false
     @AppStorage(SettingsKey.malEnabled) private var malEnabled = false
+    @AppStorage(SettingsKey.kitsuEnabled) private var kitsuEnabled = false
     @State private var showingAniList = false
     @State private var showingMAL = false
+    @State private var showingKitsu = false
 
     var body: some View {
         ZStack {
@@ -6734,6 +6759,19 @@ private struct AnimeIntegrationsSheet: View {
                             MALOptionsSheet(accentColor: accentColor)
                                 .modifier(ClearPresentationBackgroundIfAvailable())
                         }
+
+                        SettingsActionRow(
+                            title: "Kitsu",
+                            subtitle: L10n.string("settings_kitsu_integration_subtitle", fallback: "Kitsu catalogs, search and titles, your Kitsu library, watched episodes written to Kitsu"),
+                            value: status(on: kitsuEnabled, name: kitsuEnabled ? KitsuAccount.login?.userName : nil),
+                            accentColor: accentColor
+                        ) {
+                            showingKitsu = true
+                        }
+                        .sheet(isPresented: $showingKitsu) {
+                            KitsuOptionsSheet(accentColor: accentColor)
+                                .modifier(ClearPresentationBackgroundIfAvailable())
+                        }
                     }
                 }
                 .padding(.horizontal, 52)
@@ -6746,6 +6784,341 @@ private struct AnimeIntegrationsSheet: View {
         guard on else { return L10n.string("tvos_common_off", fallback: "Off") }
         guard let name else { return L10n.string("tvos_common_on", fallback: "On") }
         return L10n.format("settings_anime_on_as", fallback: "On · %@", name)
+    }
+}
+
+/// Settings → Anime Integrations → Kitsu.
+private struct KitsuOptionsSheet: View {
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.kitsuEnabled) private var enabled = false
+    @AppStorage(SettingsKey.kitsuSearch) private var search = true
+    @AppStorage(SettingsKey.kitsuAdult) private var adult = false
+    @AppStorage(SettingsKey.kitsuScrobble) private var scrobble = true
+    @AppStorage(SettingsKey.kitsuDetailsButton) private var detailsButton = true
+    @AppStorage(SettingsKey.kitsuFindInMenu) private var findInMenu = true
+    @AppStorage(SettingsKey.kitsuScore) private var kitsuScoreSetting: Bool?
+    @AppStorage(SettingsKey.aniListOtherAddons) private var convertsIDs = true
+    @AppStorage(SettingsKey.aniListTitleLanguage) private var titleLanguage = AniListSettings.TitleLanguage.romaji.rawValue
+    @AppStorage(SettingsKey.aniListSeasonMode) private var seasonMode = AniListSettings.SeasonMode.merged.rawValue
+    @AppStorage(SettingsKey.aniListEpisodeDetails) private var episodeDetails = true
+    @State private var showingCatalogs = false
+    @State private var user = ""
+    @State private var password = ""
+    @State private var accountName: String? = KitsuAccount.login?.userName
+    @State private var loggingIn = false
+    @State private var loginMessage: String?
+    @State private var titlesStatus = ""
+    @State private var serviceStatus = ""
+    @State private var testResult: String?
+    @State private var testing = false
+    @State private var cacheCleared = false
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Kitsu")
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(L10n.string(
+                            "settings_kitsu_header_subtitle",
+                            fallback: "Catalogs, titles and cast from Kitsu's API; search through the Anime Kitsu add-on's title index (Kitsu's own search when it doesn't answer); your library when logged in."
+                        ))
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: "Kitsu",
+                        subtitle: L10n.string("settings_kitsu_setup_subtitle", fallback: "Asked from this Apple TV, with answers kept for a while")
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("settings_kitsu_enable", fallback: "Enable Kitsu"),
+                            subtitle: L10n.string("settings_kitsu_enable_subtitle", fallback: "Kitsu catalogs, search and titles (kitsu:ID)"),
+                            isOn: $enabled,
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: L10n.string("settings_kitsu_score", fallback: "Kitsu Score"),
+                            subtitle: L10n.string(
+                                "settings_kitsu_score_subtitle",
+                                fallback: "Kitsu's average score beside the other ratings, for anime from Cinemeta, AniList and MyAnimeList too. Works with Kitsu off; order it in Rating Providers & Order"
+                            ),
+                            isOn: Binding(get: { kitsuScoreSetting ?? enabled }, set: { kitsuScoreSetting = $0 }),
+                            accentColor: accentColor
+                        )
+                    }
+
+                    titlesGroup
+
+                    accountGroup
+
+                    statusGroup
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+        }
+        .task { await refreshStatus() }
+        .onChange(of: enabled) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: adult) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: search) { _, _ in AniListSettings.notifyHomeChanged() }
+        .sheet(isPresented: $showingCatalogs) {
+            AnimeCatalogPickerSheet(
+                title: L10n.string("settings_kitsu_catalogs", fallback: "Kitsu Catalogs"),
+                subtitle: L10n.string(
+                    "settings_anime_catalogs_header",
+                    fallback: "Each catalog switched on is a row on Home. Order, rename or hide the rows in Layout."
+                ),
+                accentColor: accentColor,
+                load: { KitsuCatalogs.sections(loggedIn: KitsuAccount.isLoggedIn, adult: KitsuSettings.showsAdult) },
+                read: { KitsuCatalogs.chosen() },
+                write: { KitsuCatalogs.save($0) }
+            )
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var titlesGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_kitsu_section_titles", fallback: "Kitsu Titles"),
+            subtitle: L10n.string("settings_kitsu_section_titles_subtitle", fallback: "Kitsu's titles with Kitsu's own data, as AniList's are with AniList's")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_kitsu_catalogs", fallback: "Kitsu Catalogs"),
+                subtitle: L10n.string("settings_kitsu_catalogs_subtitle", fallback: "Trending, airing, popular, top rated, seasons, types, genres and your lists as Home rows"),
+                value: L10n.format("settings_anime_catalogs_count", fallback: "%d on", KitsuCatalogs.chosen().count),
+                accentColor: accentColor
+            ) {
+                showingCatalogs = true
+            }
+
+            SettingsToggleRow(
+                title: L10n.string("settings_kitsu_search", fallback: "Search Kitsu"),
+                subtitle: L10n.string("settings_kitsu_search_subtitle", fallback: "Anime from Kitsu among the search results"),
+                isOn: $search,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_convert_ids", fallback: "Convert IDs for Other Add-ons"),
+                subtitle: L10n.string(
+                    "settings_kitsu_convert_ids_subtitle",
+                    fallback: "Add-ons without kitsu ids get anilist:ID:episode, mal:ID:episode, or the IMDb id with TheTVDB's season and episode. Shared with AniList"
+                ),
+                isOn: $convertsIDs,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_kitsu_find_in_menu", fallback: "Find on Kitsu"),
+                subtitle: L10n.string(
+                    "settings_kitsu_find_in_menu_subtitle",
+                    fallback: "In a card's long-press menu: an anime from Cinemeta or TMDB, or an AniList or MyAnimeList title, opens as the Kitsu title it maps to"
+                ),
+                isOn: $findInMenu,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_title_language", fallback: "Title Language"),
+                subtitle: L10n.string("settings_mal_shared_subtitle", fallback: "Shared with AniList"),
+                selection: labelBinding($titleLanguage, AniListSettings.TitleLanguage.allCases, \.label),
+                options: AniListSettings.TitleLanguage.allCases.map(\.label),
+                accentColor: accentColor
+            )
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_seasons", fallback: "Seasons"),
+                subtitle: L10n.string(
+                    "settings_kitsu_seasons_subtitle",
+                    fallback: "One Title: a series with a tab per Kitsu entry, joined by Kitsu's prequels and sequels. Each Entry: every season on its own. Shared with AniList"
+                ),
+                selection: labelBinding($seasonMode, AniListSettings.SeasonMode.allCases, \.label),
+                options: AniListSettings.SeasonMode.allCases.map(\.label),
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_episode_details", fallback: "Episode Titles and Pictures"),
+                subtitle: L10n.string("settings_kitsu_episode_details_subtitle", fallback: "From api.ani.zip through the AniList entry it maps to. Shared with AniList"),
+                isOn: $episodeDetails,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_adult", fallback: "Adult Titles"),
+                subtitle: L10n.string("settings_kitsu_adult_subtitle", fallback: "Show titles Kitsu rates as adult"),
+                isOn: $adult,
+                accentColor: accentColor,
+                isAvailable: enabled
+            )
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    @ViewBuilder
+    private var accountGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_account", fallback: "Account"),
+            subtitle: L10n.string("settings_kitsu_section_account_subtitle", fallback: "Your Kitsu lists on Home, \"+\" in details, and what you watch written to Kitsu")
+        ) {
+            if let name = accountName {
+                SettingsActionRow(
+                    title: L10n.format("settings_anilist_logged_in", fallback: "Logged in as %@", name),
+                    subtitle: L10n.string("settings_kitsu_logged_in_subtitle", fallback: "Your password isn't kept; the login is renewed by itself"),
+                    value: L10n.string("settings_anilist_log_out", fallback: "Log Out"),
+                    accentColor: accentColor
+                ) {
+                    KitsuAccount.logOut()
+                    accountName = nil
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string("settings_kitsu_scrobble", fallback: "Write Watched Episodes"),
+                    subtitle: L10n.string("settings_kitsu_scrobble_subtitle", fallback: "Watching, and Completed after the last episode"),
+                    isOn: $scrobble,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("settings_kitsu_details_button", fallback: "Kitsu Button in Details"),
+                    subtitle: L10n.string("settings_kitsu_details_button_subtitle", fallback: "Your status and score of the title in your Kitsu library"),
+                    isOn: $detailsButton,
+                    accentColor: accentColor
+                )
+            } else {
+                SettingsTextFieldRow(
+                    title: L10n.string("settings_kitsu_user", fallback: "Email or Name"),
+                    subtitle: L10n.string("settings_kitsu_user_subtitle", fallback: "Your Kitsu account (kitsu.app)"),
+                    placeholder: "name@example.com",
+                    text: $user
+                )
+
+                SettingsTextFieldRow(
+                    title: L10n.string("settings_kitsu_password", fallback: "Password"),
+                    subtitle: L10n.string("settings_kitsu_password_subtitle", fallback: "Used once to log in, never kept"),
+                    placeholder: "••••••••",
+                    text: $password,
+                    isSecure: true
+                )
+
+                SettingsActionRow(
+                    title: L10n.string("settings_kitsu_log_in", fallback: "Log In"),
+                    subtitle: loginMessage ?? L10n.string("settings_kitsu_log_in_subtitle", fallback: "Kitsu takes an app's login only with your email and password"),
+                    value: loggingIn ? "…" : L10n.string("settings_kitsu_log_in_action", fallback: "Log In"),
+                    accentColor: accentColor
+                ) {
+                    guard !loggingIn, !user.isEmpty, !password.isEmpty else { return }
+                    loggingIn = true
+                    loginMessage = nil
+                    let name = user
+                    let secret = password
+                    Task {
+                        do {
+                            let login = try await KitsuAccount.logIn(user: name, password: secret)
+                            accountName = login.userName
+                            password = ""
+                        } catch {
+                            loginMessage = error.localizedDescription
+                        }
+                        loggingIn = false
+                    }
+                }
+            }
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    @ViewBuilder
+    private var statusGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_status", fallback: "Status"),
+            subtitle: L10n.string("settings_kitsu_section_status_subtitle", fallback: "Where Kitsu's titles came from: Kitsu or a saved answer")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_mal_status_titles", fallback: "Last Title or Search"),
+                subtitle: titlesStatus,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_kitsu_status_service", fallback: "Kitsu"),
+                subtitle: serviceStatus,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_test", fallback: "Test Connection"),
+                subtitle: testResult ?? L10n.string("settings_kitsu_test_subtitle", fallback: "Search the Anime Kitsu index and Kitsu for Frieren now, past the saved answers"),
+                value: testing ? "…" : L10n.string("settings_anilist_test_action", fallback: "Test"),
+                accentColor: accentColor
+            ) {
+                guard !testing else { return }
+                testing = true
+                Task {
+                    testResult = await KitsuSource.testConnection()
+                    await refreshStatus()
+                    testing = false
+                }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_clear_cache", fallback: "Clear Saved Answers"),
+                subtitle: L10n.string("settings_kitsu_clear_cache_subtitle", fallback: "Ask Kitsu again for everything (AniList's and MAL's saved answers too)"),
+                value: cacheCleared ? L10n.string("settings_anilist_cleared", fallback: "Cleared") : L10n.string("settings_anilist_clear", fallback: "Clear"),
+                accentColor: accentColor
+            ) {
+                Task {
+                    await AniListService.clearCache()
+                    cacheCleared = true
+                    AniListSettings.notifyHomeChanged()
+                }
+            }
+        }
+        .opacity(enabled ? 1 : 0.46)
+    }
+
+    @MainActor
+    private func refreshStatus() async {
+        titlesStatus = KitsuSettings.isEnabled ? AniListDiagnostics.text(.kitsu) : "Off"
+        serviceStatus = await KitsuSource.statusText()
+    }
+
+    private func labelBinding<Option: RawRepresentable>(
+        _ stored: Binding<String>,
+        _ options: [Option],
+        _ label: KeyPath<Option, String>
+    ) -> Binding<String> where Option.RawValue == String {
+        Binding(
+            get: { (options.first { $0.rawValue == stored.wrappedValue } ?? options[0])[keyPath: label] },
+            set: { newLabel in
+                if let option = options.first(where: { $0[keyPath: label] == newLabel }) {
+                    stored.wrappedValue = option.rawValue
+                }
+            })
     }
 }
 
@@ -6763,6 +7136,18 @@ private struct MALOptionsSheet: View {
     @AppStorage(SettingsKey.malAdult) private var adult = false
     @AppStorage(SettingsKey.malDetailsButton) private var detailsButton = true
     @AppStorage(SettingsKey.malPlusStatus) private var plusStatus = MALSettings.PlusStatus.planToWatch.rawValue
+    @AppStorage(SettingsKey.malTitles) private var malTitles = true
+    @AppStorage(SettingsKey.malSearch) private var malSearch = true
+    @AppStorage(SettingsKey.aniListOtherAddons) private var convertsIDs = true
+    @AppStorage(SettingsKey.malFindInMenu) private var findInMenu = true
+    @AppStorage(SettingsKey.aniListTitleLanguage) private var titleLanguage = AniListSettings.TitleLanguage.romaji.rawValue
+    @AppStorage(SettingsKey.aniListSeasonMode) private var seasonMode = AniListSettings.SeasonMode.merged.rawValue
+    @AppStorage(SettingsKey.aniListEpisodeDetails) private var episodeDetails = true
+    @State private var malTitlesStatus = ""
+    @State private var malServiceStatus = ""
+    @State private var malTestResult: String?
+    @State private var malTesting = false
+    @State private var malCacheCleared = false
     @State private var accountName: String? = MALAccount.login?.userName
     /// The `state` and PKCE verifier of the QR code's address, so the Apple TV takes only its own login.
     @State private var loginState = UUID().uuidString.replacingOccurrences(of: "-", with: "")
@@ -6786,7 +7171,7 @@ private struct MALOptionsSheet: View {
                             .foregroundColor(.white)
                         Text(L10n.string(
                             "settings_mal_header_subtitle",
-                            fallback: "Catalogs and scores from Tenrai, a free API over MyAnimeList; your lists and what you watch through your own MAL API client. Titles open as the AniList titles they map to."
+                            fallback: "Catalogs, search, details and scores from Tenrai, a free API over MyAnimeList (MAL's own API with your Client ID when Tenrai doesn't answer); your lists and what you watch through your own MAL API client."
                         ))
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.62))
@@ -6804,18 +7189,26 @@ private struct MALOptionsSheet: View {
                         )
                     }
 
+                    malTitlesGroup
+
                     ratingsGroup
 
                     homeGroup
 
                     accountGroup
+
+                    malStatusGroup
                 }
                 .padding(.horizontal, 52)
                 .padding(.vertical, 38)
             }
         }
+        .task { await refreshMALStatus() }
         .onChange(of: enabled) { _, _ in AniListSettings.notifyHomeChanged() }
         .onChange(of: adult) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: malTitles) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: malSearch) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: titleLanguage) { _, _ in AniListSettings.notifyHomeChanged() }
         .sheet(isPresented: $showingCatalogs) {
             AnimeCatalogPickerSheet(
                 title: L10n.string("settings_mal_catalogs", fallback: "MAL Catalogs"),
@@ -6830,6 +7223,174 @@ private struct MALOptionsSheet: View {
             )
             .modifier(ClearPresentationBackgroundIfAvailable())
         }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var malTitlesGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_mal_section_titles", fallback: "MyAnimeList Titles"),
+            subtitle: L10n.string("settings_mal_section_titles_subtitle", fallback: "MAL's titles with MAL's own data, as AniList's are with AniList's")
+        ) {
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_titles", fallback: "MAL Titles"),
+                subtitle: L10n.string(
+                    "settings_mal_titles_subtitle",
+                    fallback: "MAL catalogs and search open MAL's titles (mal:ID): seasons, episodes, cast and recommendations from MyAnimeList; add-ons with the mal prefix are asked with mal:ID:episode. Off: they open as the AniList titles they map to"
+                ),
+                isOn: $malTitles,
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_search", fallback: "Search MAL"),
+                subtitle: L10n.string("settings_mal_search_subtitle", fallback: "Anime from MyAnimeList among the search results"),
+                isOn: $malSearch,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_find_in_menu", fallback: "Find on MyAnimeList"),
+                subtitle: L10n.string(
+                    "settings_mal_find_in_menu_subtitle",
+                    fallback: "In a card's long-press menu: an anime from Cinemeta or TMDB, or an AniList title, opens as the MyAnimeList title it maps to"
+                ),
+                isOn: $findInMenu,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_convert_ids", fallback: "Convert IDs for Other Add-ons"),
+                subtitle: L10n.string(
+                    "settings_mal_convert_ids_subtitle",
+                    fallback: "Add-ons without mal ids get anilist:ID:episode, kitsu:ID:episode, or the IMDb id with TheTVDB's season and episode. An episode that can't be placed isn't asked by IMDb. Shared with AniList"
+                ),
+                isOn: $convertsIDs,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+
+            SettingsHelpText(
+                title: L10n.string("settings_mal_ids_title", fallback: "MAL IDs or Converted IDs?"),
+                paragraphs: [
+                    L10n.string("settings_mal_ids_1", fallback: "**Add-ons that take mal: ids get exactly what you opened.** Every season, part, OVA and movie has its own MAL entry, and episodes are numbered the way MAL numbers them, so nothing has to be guessed."),
+                    L10n.string("settings_mal_ids_2", fallback: "**Converted ids are for add-ons that don't know MAL.** They get the AniList entry the MAL entry maps to, then a Kitsu, AniDB, IMDb or TMDB id with season and episode, from the offline tables. That can miss brand-new seasons or number split seasons differently. An episode that can't be placed isn't asked at all rather than asked wrong."),
+                    L10n.string("settings_mal_ids_3", fallback: "**Recommended:** prefer add-ons that take mal: or anilist: ids, and keep conversion on for the rest.")
+                ]
+            )
+            .opacity(malTitles ? 1 : 0.46)
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_title_language", fallback: "Title Language"),
+                subtitle: L10n.string("settings_mal_shared_subtitle", fallback: "Shared with AniList"),
+                selection: malLabelBinding($titleLanguage, AniListSettings.TitleLanguage.allCases, \.label),
+                options: AniListSettings.TitleLanguage.allCases.map(\.label),
+                accentColor: accentColor
+            )
+            .opacity(malTitles ? 1 : 0.46)
+            .disabled(!malTitles)
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_seasons", fallback: "Seasons"),
+                subtitle: L10n.string(
+                    "settings_mal_seasons_subtitle",
+                    fallback: "One Title: a series with a tab per MAL entry, joined by MAL's prequels and sequels. Each Entry: every season on its own. Shared with AniList"
+                ),
+                selection: malLabelBinding($seasonMode, AniListSettings.SeasonMode.allCases, \.label),
+                options: AniListSettings.SeasonMode.allCases.map(\.label),
+                accentColor: accentColor
+            )
+            .opacity(malTitles ? 1 : 0.46)
+            .disabled(!malTitles)
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_episode_details", fallback: "Episode Titles and Pictures"),
+                subtitle: L10n.string("settings_mal_episode_details_subtitle", fallback: "From api.ani.zip by MAL id, with backgrounds and logos from TheTVDB, TMDB or Metahub. Shared with AniList"),
+                isOn: $episodeDetails,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var malStatusGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_status", fallback: "Status"),
+            subtitle: L10n.string("settings_mal_section_status_subtitle", fallback: "Where MAL's titles came from: Tenrai, a saved answer or MAL's own API")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_mal_status_titles", fallback: "Last Title or Search"),
+                subtitle: malTitlesStatus,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshMALStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_mal_status_service", fallback: "Tenrai and MAL API"),
+                subtitle: malServiceStatus,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshMALStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_test", fallback: "Test Connection"),
+                subtitle: malTestResult ?? L10n.string("settings_mal_test_subtitle", fallback: "Search Tenrai and MAL's own API for Frieren now, past the saved answers"),
+                value: malTesting ? "…" : L10n.string("settings_anilist_test_action", fallback: "Test"),
+                accentColor: accentColor
+            ) {
+                guard !malTesting else { return }
+                malTesting = true
+                Task {
+                    malTestResult = await MALSource.testConnection()
+                    await refreshMALStatus()
+                    malTesting = false
+                }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_clear_cache", fallback: "Clear Saved Answers"),
+                subtitle: L10n.string("settings_mal_clear_cache_subtitle", fallback: "Ask Tenrai again for everything (AniList's saved answers too)"),
+                value: malCacheCleared ? L10n.string("settings_anilist_cleared", fallback: "Cleared") : L10n.string("settings_anilist_clear", fallback: "Clear"),
+                accentColor: accentColor
+            ) {
+                Task {
+                    await AniListService.clearCache()
+                    malCacheCleared = true
+                    AniListSettings.notifyHomeChanged()
+                }
+            }
+        }
+        .opacity(enabled ? 1 : 0.46)
+    }
+
+    @MainActor
+    private func refreshMALStatus() async {
+        malTitlesStatus = MALSettings.isEnabled ? AniListDiagnostics.text(.mal) : "Off"
+        malServiceStatus = await MALSource.statusText()
+    }
+
+    private func malLabelBinding<Option: RawRepresentable>(
+        _ stored: Binding<String>,
+        _ options: [Option],
+        _ label: KeyPath<Option, String>
+    ) -> Binding<String> where Option.RawValue == String {
+        Binding(
+            get: { (options.first { $0.rawValue == stored.wrappedValue } ?? options[0])[keyPath: label] },
+            set: { newLabel in
+                if let option = options.first(where: { $0[keyPath: label] == newLabel }) {
+                    stored.wrappedValue = option.rawValue
+                }
+            })
     }
 
     @ViewBuilder
@@ -7166,6 +7727,7 @@ private struct AniListOptionsSheet: View {
     @AppStorage(SettingsKey.aniListSeasonMode) private var seasonMode = AniListSettings.SeasonMode.merged.rawValue
     @AppStorage(SettingsKey.aniListHomeRows) private var homeRows = true
     @AppStorage(SettingsKey.aniListSearch) private var search = true
+    @AppStorage(SettingsKey.aniListFindInMenu) private var findInMenu = true
     @AppStorage(SettingsKey.aniListHideCinemetaDuplicates) private var hideCinemetaDuplicates = false
     @AppStorage(SettingsKey.aniListEpisodeDetails) private var episodeDetails = true
     @AppStorage(SettingsKey.malEnabled) private var malEnabled = false
@@ -7387,6 +7949,17 @@ private struct AniListOptionsSheet: View {
                 isOn: $hideCinemetaDuplicates,
                 accentColor: accentColor,
                 isAvailable: enabled && search
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_find_in_menu", fallback: "Find on AniList"),
+                subtitle: L10n.string(
+                    "settings_anilist_find_in_menu_subtitle",
+                    fallback: "In a card's long-press menu: an anime from Cinemeta or TMDB, or a MyAnimeList title, opens as the AniList title it maps to"
+                ),
+                isOn: $findInMenu,
+                accentColor: accentColor,
+                isAvailable: enabled
             )
         }
     }
@@ -8148,7 +8721,7 @@ private struct MdbListOptionsSheet: View {
                                 RatingProviderOrderRow(
                                     item: item,
                                     accentColor: accentColor,
-                                    canToggle: item.isAddon || item.id == AniListMetaBuilder.ratingSource ? true : mdbListControlsEnabled,
+                                    canToggle: item.isAddon || item.id == AniListMetaBuilder.ratingSource || item.id == AniListMetaBuilder.kitsuRatingSource ? true : mdbListControlsEnabled,
                                     canMoveUp: index > 0,
                                     canMoveDown: index < ratingProviderRows.count - 1,
                                     onToggle: { toggleProvider(item) },
@@ -8252,6 +8825,19 @@ private struct MdbListOptionsSheet: View {
             )
         }
 
+        // Kitsu's own score (Settings → Kitsu → Kitsu Score), like AniList's.
+        do {
+            items.append(
+                RatingProviderRowItem(
+                    id: AniListMetaBuilder.kitsuRatingSource,
+                    title: "Kitsu",
+                    subtitle: L10n.string("settings_rating_provider_kitsu_subtitle", fallback: "Kitsu average score"),
+                    isAddon: false,
+                    isEnabled: AddonRatingsService.isSourceEnabled(AniListMetaBuilder.kitsuRatingSource)
+                )
+            )
+        }
+
         for source in addonRatingSources {
             items.append(
                 RatingProviderRowItem(
@@ -8272,9 +8858,9 @@ private struct MdbListOptionsSheet: View {
         if let idx = ratingProviderRows.firstIndex(where: { $0.id == item.id }) {
             ratingProviderRows[idx].isEnabled = newEnabled
         }
-        if item.isAddon || item.id == AniListMetaBuilder.ratingSource {
+        if item.isAddon || item.id == AniListMetaBuilder.ratingSource || item.id == AniListMetaBuilder.kitsuRatingSource {
             AddonRatingsService.setSourceEnabled(item.id, enabled: newEnabled)
-            if item.id == AniListMetaBuilder.ratingSource {
+            if item.id == AniListMetaBuilder.ratingSource || item.id == AniListMetaBuilder.kitsuRatingSource {
                 // Shown rows filter it out; let them redraw.
                 NotificationCenter.default.post(name: AddonRatingsService.ratingOrderChangedNotification, object: nil)
             }

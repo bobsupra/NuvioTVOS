@@ -4,6 +4,8 @@ import Foundation
 /// character's Japanese voice actor (photo, name in both scripts, birthday, home town, what
 /// AniList says of them) with their anime roles, or the character itself when AniList knows no
 /// voice actor. One AniList request on the click, kept a day on disk and for the session in memory.
+/// A MyAnimeList title's cast (`peopleSource` "mal") opens MAL's page of the person or character,
+/// read from Tenrai (`MALSource.staff`, `MALSource.character`).
 enum AniListPeople {
     struct Page: Equatable {
         let detail: ScenePersonDetail
@@ -56,11 +58,36 @@ enum AniListPeople {
         } else {
             return nil
         }
-        let key = [kind, language.rawValue, showsAdult ? "adult" : "safe", collapses ? "merged" : "each"].joined(separator: "|")
+        let source = person.peopleSource.flatMap(AnimeSource.init(rawValue:)) ?? .anilist
+        let isMAL = source != .anilist
+        let key = [source.rawValue, kind, language.rawValue, showsAdult ? "adult" : "safe", collapses ? "merged" : "each"].joined(separator: "|")
         if let cached = kept(key) { return cached }
 
         let page: Page?
-        if let id = person.aniListStaffID {
+        if isMAL {
+            // A MyAnimeList or Kitsu title's cast: that source's people and characters, whose
+            // titles open as that source's.
+            let adult = source == .kitsu ? KitsuSettings.showsAdult : MALSettings.showsAdult
+            if let id = person.aniListStaffID {
+                let staff: AniListStaff?
+                if source == .kitsu { staff = await KitsuSource.staff(id) } else { staff = await MALSource.staff(id) }
+                page = staff.map { found in
+                    AnimeSource.$current.withValue(source) {
+                        staffPage(found, fallbackName: person.role ?? person.name, language: language, showsAdult: adult, collapsesSeasons: collapses)
+                    }
+                }
+            } else if let id = person.aniListCharacterID {
+                let character: AniListCharacter?
+                if source == .kitsu { character = await KitsuSource.character(id) } else { character = await MALSource.character(id) }
+                page = character.map { found in
+                    AnimeSource.$current.withValue(source) {
+                        characterPage(found, fallbackName: person.name, language: language, showsAdult: adult, collapsesSeasons: collapses)
+                    }
+                }
+            } else {
+                page = nil
+            }
+        } else if let id = person.aniListStaffID {
             page = await fetchStaff(id).map {
                 staffPage($0, fallbackName: person.role ?? person.name, language: language, showsAdult: showsAdult, collapsesSeasons: collapses)
             }

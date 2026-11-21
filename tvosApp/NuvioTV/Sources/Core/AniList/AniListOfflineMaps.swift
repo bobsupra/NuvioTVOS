@@ -92,6 +92,7 @@ actor AniListOfflineMaps {
     private var byTMDBMovie: [Int: [Int]] = [:]
     private var byTVDB: [Int: [Int]] = [:]
     private var byMAL: [Int: Int] = [:]
+    private var byKitsu: [Int: Int] = [:]
 
     init(directory: URL? = nil, session: URLSession = .shared) {
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -114,6 +115,12 @@ actor AniListOfflineMaps {
     func aniListID(mal: Int) async -> Int? {
         guard await ready() != nil else { return nil }
         return byMAL[mal]
+    }
+
+    /// The AniList entry of a Kitsu one.
+    func aniListID(kitsu: Int) async -> Int? {
+        guard await ready() != nil else { return nil }
+        return byKitsu[kitsu]
     }
 
     /// The IMDb id of an AniList entry: its own, else the one the other entries of its TheTVDB
@@ -278,9 +285,10 @@ actor AniListOfflineMaps {
     private func use(_ built: Index) {
         index = built
         var imdb: [String: [Int]] = [:], shows: [Int: [Int]] = [:], movies: [Int: [Int]] = [:], tvdb: [Int: [Int]] = [:]
-        var mal: [Int: Int] = [:]
+        var mal: [Int: Int] = [:], kitsu: [Int: Int] = [:]
         for (id, entry) in built.entries {
             if let value = entry.mal, mal[value].map({ id < $0 }) ?? true { mal[value] = id }
+            if let value = entry.kitsu, kitsu[value].map({ id < $0 }) ?? true { kitsu[value] = id }
             if let value = entry.imdb { imdb[value, default: []].append(id) }
             if let value = entry.tmdbTV { shows[value, default: []].append(id) }
             if let value = entry.tmdbMovie { movies[value, default: []].append(id) }
@@ -293,6 +301,7 @@ actor AniListOfflineMaps {
         byTMDBMovie = movies
         byTVDB = tvdb
         byMAL = mal
+        byKitsu = kitsu
         status = .ready(titles: built.entries.count, builtAt: built.builtAt)
     }
 
