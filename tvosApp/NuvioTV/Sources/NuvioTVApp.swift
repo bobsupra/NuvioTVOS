@@ -942,7 +942,9 @@ struct ContentView: View {
             partyLaunchTask?.cancel(); partyLaunchTask = nil
             creatingParty = false; choosingPartySource = false
         }
-        .onOpenURL(perform: handleDeepLink)
+        // Deep links, and "Find on AniList / MyAnimeList" from a card's long-press menu, in one
+        // modifier: one more step in this chain is more than the type checker manages in time.
+        .modifier(AnimeFindOpening(openURL: handleDeepLink, open: openFoundAnimeTitle))
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             watchPartyOwner.suspendForInactivity()
         }
@@ -1348,6 +1350,16 @@ struct ContentView: View {
                 detailsReturnDestination = .main
                 detailsLibraryWatchedContext = nil
             }
+        }
+    }
+
+    /// "Find on AniList / MyAnimeList" from a card's long-press menu.
+    private func openFoundAnimeTitle(id: String, type: String) {
+        switch activeScreen {
+        case .login, .profileSelection:
+            return
+        default:
+            openDetailsRoot(id: id, type: type)
         }
     }
 

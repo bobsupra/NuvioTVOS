@@ -10,6 +10,7 @@ extension SettingsKey {
     static let kitsuScrobble = "nuvio.tv.settings.integrations.kitsuScrobble"
     static let kitsuDetailsButton = "nuvio.tv.settings.integrations.kitsuDetailsButton"
     static let kitsuScore = "nuvio.tv.settings.integrations.kitsuScore"
+    static let kitsuFindInMenu = "nuvio.tv.settings.integrations.kitsuFindInMenu"
 }
 
 /// Settings → Anime Integrations → Kitsu: Kitsu's catalogs, search and titles (`kitsu:ID`), built
@@ -28,6 +29,7 @@ enum KitsuSettings {
     static var showsAdult: Bool { ProfileSettings.current.bool(forKey: SettingsKey.kitsuAdult) }
     static var scrobbles: Bool { isEnabled && flag(SettingsKey.kitsuScrobble) }
     static var showsDetailsButton: Bool { KitsuAccount.isLoggedIn && flag(SettingsKey.kitsuDetailsButton) }
+    static var findsInMenu: Bool { isEnabled && flag(SettingsKey.kitsuFindInMenu) }
 
     /// Kitsu's average score beside the others, for anime from Cinemeta, AniList and MyAnimeList
     /// too. Works with Kitsu (and MyAnimeList) off; never switched, it follows Kitsu being on.
