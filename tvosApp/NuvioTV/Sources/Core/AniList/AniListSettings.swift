@@ -67,6 +67,7 @@ enum AniListSettings {
     static func showsHomeRows(in store: UserDefaults = ProfileSettings.current) -> Bool {
         (isEnabled(in: store) && !AniListCatalogs.chosen(in: store).isEmpty)
             || (MALSettings.isEnabled(in: store) && !MALCatalogs.chosen(in: store).isEmpty)
+            || (KitsuSettings.isEnabled(in: store) && !KitsuCatalogs.chosen(in: store).isEmpty)
     }
 
     /// Whether a row under AniList's add-on id belongs on Home and in Layout: chosen in AniList
@@ -77,6 +78,10 @@ enum AniListSettings {
         if catalogId.hasPrefix(MALCatalogs.idPrefix) {
             guard MALSettings.isEnabled(in: store), MALCatalogs.chosen(in: store).contains(where: { $0.id == catalogId }) else { return false }
             return !MALCatalogs.isList(catalogId) || MALAccount.isLoggedIn
+        }
+        if catalogId.hasPrefix(KitsuCatalogs.idPrefix) {
+            guard KitsuSettings.isEnabled(in: store), KitsuCatalogs.chosen(in: store).contains(where: { $0.id == catalogId }) else { return false }
+            return !KitsuCatalogs.isList(catalogId) || KitsuAccount.isLoggedIn
         }
         guard isEnabled(in: store), AniListCatalogs.chosen(in: store).contains(where: { $0.id == catalogId }) else { return false }
         return !catalogId.hasPrefix("list-") || AniListAccount.isLoggedIn
@@ -98,12 +103,12 @@ enum AniListSettings {
 
     /// The offline tables are needed: for AniList's or MAL's titles, or only for their scores.
     static var needsOfflineTables: Bool {
-        opensTitles || showsScore || MALSettings.usesOwnScore || MALSettings.showsEpisodeRatings
+        opensTitles || showsScore || KitsuSettings.showsScore || MALSettings.usesOwnScore || MALSettings.showsEpisodeRatings
     }
 
     /// AniList titles open, play and convert their ids: with AniList on, or MyAnimeList on (its
     /// titles open as the AniList titles they map to).
-    static var opensTitles: Bool { isEnabled || MALSettings.isEnabled }
+    static var opensTitles: Bool { isEnabled || MALSettings.isEnabled || KitsuSettings.isEnabled }
 
     static var showsHomeRows: Bool { showsHomeRows(in: ProfileSettings.current) }
 
@@ -179,6 +184,10 @@ enum AniListSettings {
         return [
             isEnabled ? "anilist:on" : "anilist:mal-only",
             MALSettings.isEnabled ? "mal:\(MALCatalogs.signature())" : "mal:off",
+            MALSettings.opensTitles ? "maltitles" : "malmapped",
+            MALSettings.searchesMAL ? "malsearch" : "nomalsearch",
+            KitsuSettings.isEnabled ? "kitsu:\(KitsuCatalogs.signature())" : "kitsu:off",
+            KitsuSettings.searchesKitsu ? "kitsusearch" : "nokitsusearch",
             "catalogs:\(AnimeCatalogSelection.signature(AniListCatalogs.chosen()))",
             showsHomeRows ? "rows" : "norows",
             searchesAniList ? "search" : "nosearch",

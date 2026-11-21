@@ -10154,7 +10154,7 @@ struct TVHomeView: View {
         // Settings → Integrations → AniList: an AniList card already has its description and
         // rating. Its full details would cost AniList requests on every focus, so only its
         // background and logo are asked, from ani.zip.
-        if AniListMetaBuilder.isAniListID(settledMeta.id) {
+        if AnimeSource.isAnimeTitleID(settledMeta.id) {
             enrichAniListHero(settledMeta, in: sectionId)
             return
         }

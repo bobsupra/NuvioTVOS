@@ -66,6 +66,7 @@ enum AniListQueries {
     query ($id: Int) {
       Media(id: $id, type: ANIME) {
         id
+        status
         characters(sort: [ROLE, RELEVANCE, ID], perPage: 25) {
           edges {
             role
