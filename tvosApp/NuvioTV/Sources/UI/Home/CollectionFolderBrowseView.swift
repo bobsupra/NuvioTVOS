@@ -1193,6 +1193,7 @@ struct CollectionFolderResultCard: View {
                         lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
                     )
                 )
+                // Only the focused card casts a shadow (see PosterCard).
                 .shadow(
                     color: .black.opacity(focused ? 0.5 : 0),
                     radius: focused ? 16 : 0

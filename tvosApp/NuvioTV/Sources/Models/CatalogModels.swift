@@ -797,6 +797,22 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     }
 }
 
+/// The last answer, kept for the last question: for a lookup every card makes in its body,
+/// each time with the same setting.
+final class LastValueMemo<Input: Equatable, Output>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var last: (input: Input, output: Output)?
+
+    func value(for input: Input, compute: (Input) -> Output) -> Output {
+        lock.lock()
+        defer { lock.unlock() }
+        if let last, last.input == input { return last.output }
+        let output = compute(input)
+        last = (input, output)
+        return output
+    }
+}
+
 enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable {
     case home
     case continueWatching = "continue_watching"
@@ -820,7 +836,15 @@ enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable {
         }
     }
 
+    /// Every poster card asks this in its body, with the same setting each time: answered once
+    /// per setting, not split and lowercased for every card on every redraw.
+    private static let storageValueMemo = LastValueMemo<String?, Set<CustomPosterScreen>>()
+
     static func fromStorageValue(_ rawValue: String?) -> Set<CustomPosterScreen> {
+        storageValueMemo.value(for: rawValue, compute: parseStorageValue)
+    }
+
+    private static func parseStorageValue(_ rawValue: String?) -> Set<CustomPosterScreen> {
         guard let rawValue else { return Set(allCases) }
         let keys = rawValue
             .split(separator: ",", omittingEmptySubsequences: false)
@@ -955,6 +979,8 @@ enum CustomPosterURLResolver {
         meta: NuvioMeta,
         shape: String = "poster"
     ) -> String? {
+        // No usable pattern (most often none is set): nothing to read from the title.
+        guard preparedPatternMemo.value(for: pattern, compute: preparePattern) != nil else { return nil }
         let ids = extractIDs(from: meta)
         let contentType = meta.isSeries ? "series" : "movie"
         return resolve(pattern: pattern, ids: ids, type: contentType, shape: shape)
@@ -1024,17 +1050,31 @@ enum CustomPosterURLResolver {
         type: String,
         shape: String = "poster"
     ) -> String? {
+        guard let prepared = preparedPatternMemo.value(for: pattern, compute: preparePattern) else { return nil }
+        if prepared.isRPDBFamily {
+            return resolveRPDBWithFallback(pattern: prepared.decoded, ids: ids, type: type, shape: shape)
+        } else {
+            return resolvePattern(pattern: prepared.decoded, ids: ids, type: type, shape: shape)
+        }
+    }
+
+    private struct PreparedPattern {
+        let decoded: String
+        let isRPDBFamily: Bool
+    }
+
+    /// The pattern as cards use it, made once per pattern: every poster card resolves its
+    /// artwork in its body, and made each time it was trimmed, decoded and matched against a
+    /// regular expression (built anew) for every card on every redraw.
+    private static let preparedPatternMemo = LastValueMemo<String, PreparedPattern?>()
+
+    private static func preparePattern(_ pattern: String) -> PreparedPattern? {
         let trimmedPattern = sanitizePattern(pattern)
         if trimmedPattern.isEmpty { return nil }
 
         let decoded = decodePatternPlaceholders(trimmedPattern)
         if !containsPlaceholder(decoded) { return nil }
-
-        if isRPDBFamily(decoded) {
-            return resolveRPDBWithFallback(pattern: decoded, ids: ids, type: type, shape: shape)
-        } else {
-            return resolvePattern(pattern: decoded, ids: ids, type: type, shape: shape)
-        }
+        return PreparedPattern(decoded: decoded, isRPDBFamily: isRPDBFamily(decoded))
     }
 
     private static func resolvePattern(

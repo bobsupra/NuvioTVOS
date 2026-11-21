@@ -31,3 +31,5 @@ struct GridCardSnapshotKey: Equatable {
     let retainsFocusAppearance: Bool
     var width: CGFloat = 0
 }
+
+

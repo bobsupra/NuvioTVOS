@@ -37,6 +37,103 @@ enum TVLayout {
     static let rowLeading: CGFloat = 48
 }
 
+/// The UIKit scroll view under a SwiftUI ScrollView, found from a view in its content.
+final class TVScrollViewBox {
+    weak var scrollView: UIScrollView? {
+        didSet {
+            guard scrollView !== oldValue, let scrollView, oldValue != nil else { return }
+            onReplaced?(scrollView)
+        }
+    }
+
+    /// Called when SwiftUI put the content in another scroll view than the one found before.
+    var onReplaced: ((UIScrollView) -> Void)?
+}
+
+struct TVScrollViewFinder: UIViewRepresentable {
+    let box: TVScrollViewBox
+
+    func makeUIView(context: Context) -> FinderView {
+        let view = FinderView()
+        view.box = box
+        view.isUserInteractionEnabled = false
+        return view
+    }
+
+    func updateUIView(_ uiView: FinderView, context: Context) {
+        uiView.box = box
+        uiView.findScrollView()
+    }
+
+    final class FinderView: UIView {
+        weak var box: TVScrollViewBox?
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            findScrollView()
+        }
+
+        /// Looked for again whenever this is on screen: SwiftUI may put the content in another
+        /// scroll view (Details while its metadata loads), and the one found first, kept alive
+        /// off screen, was moved instead of the one on screen.
+        func findScrollView() {
+            guard let box, window != nil else { return }
+            var view = superview
+            while let current = view {
+                if let scrollView = current as? UIScrollView {
+                    if box.scrollView !== scrollView { box.scrollView = scrollView }
+                    return
+                }
+                view = current.superview
+            }
+        }
+    }
+}
+
+/// Home's vertical scroll view, which Home scrolls itself (its scrolling for focus is off).
+enum TVHomeVerticalScroll {
+    /// The rows' space in Home's scroll content.
+    static let space = "tvHomeRowsContent"
+    static weak var scrollView: UIScrollView?
+}
+
+/// Moves a scroll view the app scrolls itself (its scrolling for focus off): by Core Animation
+/// when animated, which goes on in the render server, outside the main thread, once started.
+/// tvOS's own scroll for focus and a SwiftUI scroll animation both move the scroll view frame by
+/// frame on the main thread, and stall with whatever else a move costs there (the focused card,
+/// the hero, rows being built).
+enum TVScrollMove {
+    static let duration: TimeInterval = 0.36
+
+    static func move(
+        _ scrollView: UIScrollView,
+        to target: CGPoint,
+        animated: Bool,
+        duration: TimeInterval = TVScrollMove.duration
+    ) {
+        let inset = scrollView.adjustedContentInset
+        let maxX = max(scrollView.contentSize.width + inset.right - scrollView.bounds.width, -inset.left)
+        let maxY = max(scrollView.contentSize.height + inset.bottom - scrollView.bounds.height, -inset.top)
+        let offset = CGPoint(
+            x: min(max(target.x, -inset.left), maxX),
+            y: min(max(target.y, -inset.top), maxY)
+        )
+        guard animated else {
+            scrollView.contentOffset = offset
+            return
+        }
+        UIView.animate(
+            withDuration: duration,
+            delay: 0,
+            usingSpringWithDamping: 1,
+            initialSpringVelocity: 0,
+            options: [.beginFromCurrentState, .allowUserInteraction]
+        ) {
+            scrollView.contentOffset = offset
+        }
+    }
+}
+
 /// Materialized cards retain their array position for layout math while
 /// exposing a content-derived SwiftUI identity. This prevents a card view from
 /// being reused for another title when a catalog inserts or reorders items.
@@ -468,6 +565,8 @@ struct TVCatalogRow: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.landscapePosters) private var landscapePosters = false
     @AppStorage(SettingsKey.continueWatchingLandscape) private var continueWatchingLandscape = false
+    /// The row's UIKit scroll view, which the row moves itself.
+    @State private var scrollBox = TVScrollViewBox()
 
     var rowTileShape: CollectionTileShape {
         if let explicitTileShape {
@@ -513,48 +612,6 @@ struct TVCatalogRow: View {
 
     /// How far along a row Back still slides back to its first card (further, it jumps).
     private static let backSlideLimit = 24
-
-    private func alignScrollIndexToRestrictedFocus() {
-        guard let restrictedFocusIndex else { return }
-        let from = scrollIndex ?? initialScrollIndex
-        if restrictedFocusIndex == 0, (1...Self.backSlideLimit).contains(from) {
-            withAnimation(.easeOut(duration: 0.3)) {
-                scrollIndex = restrictedFocusIndex
-                onScrollIndexChange(restrictedFocusIndex)
-            }
-        } else {
-            withTransaction(Transaction(animation: nil)) {
-                scrollIndex = restrictedFocusIndex
-                onScrollIndexChange(restrictedFocusIndex)
-            }
-        }
-    }
-
-    private func materializedCardIndices(visibleCardCount: Int) -> [Int] {
-        guard !items.isEmpty else { return [] }
-        let focusIndex = effectiveScrollIndex
-        var lowerBound = max(0, focusIndex - 4)
-        var upperBound = min(items.count - 1, focusIndex + visibleCardCount)
-
-        let rowPrefix = "\(id)\u{1}"
-        for key in [initialFocusCardKey, restrictFocusToCardKey] {
-            guard let key, key.hasPrefix(rowPrefix) else { continue }
-            if let targetIndex = items.firstIndex(where: { TVHomeCardIdentity.key(rowID: id, item: $0) == key }) {
-                lowerBound = min(lowerBound, targetIndex)
-                upperBound = max(upperBound, targetIndex)
-            }
-        }
-
-        return Array(lowerBound...upperBound)
-    }
-
-    private func materializedCardItems(visibleCardCount: Int) -> [TVCatalogMaterializedCard] {
-        TVHomeCardIdentity.materializedTitles(
-            rowID: id, items: items,
-            indices: materializedCardIndices(visibleCardCount: visibleCardCount)
-        )
-    }
-
     private var stripHeight: CGFloat {
         let imageHeight: CGFloat = homeLayout == "Compact" ? 255 : 315
         return imageHeight + (posterLabels ? 48 : 0) + TVHomeLayout.stripVerticalPadding * 2
@@ -709,22 +766,9 @@ struct TVCatalogRow: View {
                 "focus.begin row=\(id) index=\(targetIndex) items=\(items.count) "
                     + "mounted=\(mountedCount) meta=\(focused.id)"
             )
-            if let restrictFocusToCardKey {
-                guard restrictFocusToCardKey == cardKey else { return }
-                alignScrollIndexToRestrictedFocus()
-            } else if effectiveScrollIndex != targetIndex {
-                let updateScrollPosition = {
-                    scrollIndex = targetIndex
-                    onScrollIndexChange(targetIndex)
-                }
-                if rowCardFocusAnimations {
-                    withAnimation(TVHomeLayout.horizontalGlideAnimation) {
-                        updateScrollPosition()
-                    }
-                } else {
-                    updateScrollPosition()
-                }
-            } else if scrollIndex != targetIndex {
+            // tvOS scrolls the row itself; only remember where it is.
+            if let restrictFocusToCardKey, restrictFocusToCardKey != cardKey { return }
+            if scrollIndex != targetIndex {
                 scrollIndex = targetIndex
                 onScrollIndexChange(targetIndex)
             }
@@ -802,57 +846,128 @@ struct TVCatalogRow: View {
         }
     }
 
-    /// A focus-driven sliding offset strip with momentum-blended glide physics. The focused card
-    /// remains mathematically locked directly under the row title (`TVLayout.rowLeading`) across
-    /// any swipe speed, while cards are lazily windowed via `materializedCardItems`.
+    /// The row as a system scroll view. tvOS scrolls it as focus moves (outside the main
+    /// thread), instead of the row moving its cards by an animated offset on each move; only
+    /// cards near the screen are built.
     private var cardStrip: some View {
         let stripWidth = max(1920, UIScreen.main.bounds.width + horizontalEdgeInset * 2)
         let rowHomeLayout = homeLayout
         let rowCardFocusAnimations = smoothFocus && !suppressFocusAnimations && !fastNavigation
         let rowPosterWidth: CGFloat = TVCollectionFolderCardLayout.cardWidth(shape: rowTileShape, layoutMode: rowHomeLayout)
         let rowCardSpacing: CGFloat = rowHomeLayout == "Compact" ? 22 : 28
-        let visibleCardCount = max(1, Int(ceil(stripWidth / (rowPosterWidth + rowCardSpacing))) + 1)
-        let materializedCards = materializedCardItems(visibleCardCount: visibleCardCount)
-
-        return HStack(alignment: .top, spacing: rowCardSpacing) {
-            ForEach(materializedCards) { card in
-                catalogCard(card, mountedCount: materializedCards.count)
-                    .id(card.id)
+        let cards = TVHomeCardIdentity.materializedTitles(rowID: id, items: items, indices: Array(items.indices))
+        // Where the cards start, under the row's title, in the strip's own coordinates.
+        let titleLeading = horizontalEdgeInset + TVLayout.rowLeading
+        // Room after the last card, so it too comes under the title, as in Nuvio's rows.
+        let trailingRoom = max(titleLeading, stripWidth - titleLeading - rowPosterWidth)
+        return ScrollView(.horizontal, showsIndicators: false) {
+            LazyHStack(alignment: .top, spacing: rowCardSpacing) {
+                ForEach(cards) { card in
+                    catalogCard(card, mountedCount: cards.count)
+                        .id(card.id)
+                }
+            }
+            .padding(.leading, titleLeading)
+            .padding(.trailing, trailingRoom)
+            .padding(.vertical, TVHomeLayout.stripVerticalPadding)
+            .animation(
+                rowCardFocusAnimations && restrictFocusToCardKey == nil
+                    ? TVHomeLayout.scrollAnimation : nil,
+                value: landscapeFocusedId
+            )
+            .background {
+                TVScrollViewFinder(box: scrollBox)
+                    .frame(width: 1, height: 1)
+                    .allowsHitTesting(false)
             }
         }
-        .padding(
-            .leading,
-            CGFloat(materializedCards.first?.index ?? 0) * (rowPosterWidth + rowCardSpacing)
-        )
-        .padding(.vertical, TVHomeLayout.stripVerticalPadding)
-        .offset(
-            x: horizontalEdgeInset + TVLayout.rowLeading
-                - CGFloat(effectiveScrollIndex) * (rowPosterWidth + rowCardSpacing)
-        )
-        .frame(
-            width: stripWidth,
-            height: stripHeight,
-            alignment: .topLeading
-        )
-        .clipped()
+        // The row moves itself (below), so the focused card is always under the title, as in
+        // Nuvio's rows. tvOS's scroll for focus is off: it moves a row only once focus nears its
+        // edge, and at the last card it took the row a card past its end.
+        .scrollDisabled(true)
+        .scrollClipDisabled()
+        .frame(width: stripWidth, height: stripHeight, alignment: .topLeading)
         .offset(x: -horizontalEdgeInset)
-        .animation(
-            rowCardFocusAnimations && restrictFocusToCardKey == nil
-                ? TVHomeLayout.horizontalGlideAnimation : nil,
-            value: effectiveScrollIndex
-        )
-        .animation(
-            rowCardFocusAnimations && restrictFocusToCardKey == nil
-                ? TVHomeLayout.scrollAnimation : nil,
-            value: landscapeFocusedId
-        )
-        .onAppear {
-            alignScrollIndexToRestrictedFocus()
+        .onChange(of: scrollIndex) { _, index in
+            guard restrictFocusToCardKey == nil, let index, cards.indices.contains(index) else { return }
+            moveRow(
+                to: rowOffset(of: index, in: cards, spacing: rowCardSpacing),
+                animated: rowCardFocusAnimations
+            )
         }
-        .onChange(of: restrictedFocusIndex) { _, _ in
-            alignScrollIndexToRestrictedFocus()
+        .onAppear {
+            // Where the row was left (or the card focus goes back to), without animation.
+            let index = effectiveScrollIndex
+            guard index > 0, cards.indices.contains(index) else { return }
+            moveRowOnceFound(to: rowOffset(of: index, in: cards, spacing: rowCardSpacing))
+        }
+        .onChange(of: restrictedFocusIndex) { _, index in
+            guard let index, cards.indices.contains(index) else { return }
+            // Back to the row's first card (Home's Back) from a card further along: the row
+            // slides back, so the cards between come on screen, and are built, a few at a
+            // time. Jumped there at once, all of them were built in one frame (a 250 ms stall
+            // after Back). Focus waits for the first card meanwhile (the restore lock).
+            let from = scrollIndex ?? initialScrollIndex
+            moveRowOnceFound(
+                to: rowOffset(of: index, in: cards, spacing: rowCardSpacing),
+                animated: index == 0 && (1...Self.backSlideLimit).contains(from),
+                duration: 0.3
+            )
         }
         .frame(height: stripHeight)
+    }
+
+    /// The offset that puts card `index` under the title: the cards before it, at rest.
+    private func rowOffset(
+        of index: Int,
+        in cards: [TVCatalogMaterializedCard],
+        spacing: CGFloat
+    ) -> CGFloat {
+        let end = Swift.min(Swift.max(index, 0), cards.count)
+        return cards.prefix(end).reduce(CGFloat(0)) { $0 + restingCardWidth(for: $1) + spacing }
+    }
+
+    /// A card's width while it is not focused (a focused poster in Modern opens as landscape).
+    private func restingCardWidth(for card: TVCatalogMaterializedCard) -> CGFloat {
+        let shape: CollectionTileShape
+        if rowTileShape == .landscape || card.item.tileShape == .landscape {
+            shape = .landscape
+        } else {
+            shape = card.item.tileShape != .poster ? card.item.tileShape : rowTileShape
+        }
+        return TVCollectionFolderCardLayout.cardWidth(shape: shape, layoutMode: homeLayout)
+    }
+
+    @discardableResult
+    private func moveRow(
+        to x: CGFloat,
+        animated: Bool,
+        duration: TimeInterval = TVScrollMove.duration
+    ) -> Bool {
+        guard let scrollView = scrollBox.scrollView else { return false }
+        TVScrollMove.move(
+            scrollView,
+            to: CGPoint(x: x, y: scrollView.contentOffset.y),
+            animated: animated,
+            duration: duration
+        )
+        return true
+    }
+
+    /// As `moveRow`, once the row's UIKit scroll view is there (it is found once the strip is in
+    /// the window, which can be just after the row appears).
+    private func moveRowOnceFound(
+        to x: CGFloat,
+        animated: Bool = false,
+        duration: TimeInterval = TVScrollMove.duration
+    ) {
+        guard !moveRow(to: x, animated: animated, duration: duration) else { return }
+        Task { @MainActor in
+            for _ in 0..<6 {
+                try? await Task.sleep(for: .milliseconds(30))
+                if moveRow(to: x, animated: animated, duration: duration) { return }
+            }
+        }
     }
 
     private func traceRowLayout(
