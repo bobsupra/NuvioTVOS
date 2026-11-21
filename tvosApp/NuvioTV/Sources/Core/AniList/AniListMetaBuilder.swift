@@ -17,6 +17,8 @@ enum AniListMetaBuilder {
     static var idPrefix: String { AnimeSource.current.prefix }
     static let ratingSource = "anilist"
     static let ratingIcon = "https://anilist.co/img/icons/android-chrome-512x512.png"
+    /// A Kitsu title's own score (0–100), shown with Kitsu's logo.
+    static let kitsuRatingSource = "kitsu"
 
     /// Formats that become tabs of one series.
     static let tabFormats: Set<String> = ["TV", "TV_SHORT", "ONA"]
@@ -191,6 +193,9 @@ enum AniListMetaBuilder {
     }
 
     static func rating(_ media: AniListMedia) -> NuvioExternalRating? {
+        if AnimeSource.current == .kitsu {
+            return kitsuRating(entry: media.id, score: media.averageScore)
+        }
         if AnimeSource.current == .mal {
             // MyAnimeList's own score, where the other ratings show MAL's.
             guard let score = media.malScore ?? media.averageScore.map({ Double($0) / 10 }), score > 0 else { return nil }
@@ -207,6 +212,19 @@ enum AniListMetaBuilder {
             url: "https://anilist.co/anime/\(media.id)",
             name: "AniList",
             iconUrl: ratingIcon,
+            max: 100
+        )
+    }
+
+    /// Kitsu's score of a Kitsu entry (0–100), with Kitsu's logo.
+    static func kitsuRating(entry: Int, score: Int?) -> NuvioExternalRating? {
+        guard let score, score > 0 else { return nil }
+        return NuvioExternalRating(
+            source: kitsuRatingSource,
+            value: Double(score),
+            url: "https://kitsu.app/anime/\(entry)",
+            name: "Kitsu",
+            iconUrl: nil,
             max: 100
         )
     }
@@ -250,7 +268,8 @@ enum AniListMetaBuilder {
     /// before the chain is complete.
     static func chain(from start: Int, entries: [Int: AniListMedia]) -> (ids: [Int], missing: [Int]) {
         guard let first = entries[start], isTab(first) else { return ([start], []) }
-        let namesOnly = AnimeSource.current == .mal
+        // MyAnimeList's relations come without formats (Kitsu's and AniList's with them).
+        let namesOnly = AnimeSource.current != .anilist
         var ids = [start]
         var seen: Set<Int> = [start]
         var missing: [Int] = []
@@ -420,7 +439,7 @@ enum AniListMetaBuilder {
             count = lastAired
         } else if !streaming.isEmpty {
             count = streaming.keys.max() ?? streaming.count
-        } else if AnimeSource.current == .mal, let aired = airedOnAniZip(aniZip, now: now) {
+        } else if AnimeSource.current != .anilist, let aired = airedOnAniZip(aniZip, now: now) {
             // MyAnimeList gives no count while a season airs: what ani.zip lists as aired.
             count = aired
         } else if media.status == "FINISHED" || media.status == "RELEASING" {

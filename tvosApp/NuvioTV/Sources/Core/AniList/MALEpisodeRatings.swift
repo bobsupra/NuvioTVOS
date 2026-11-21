@@ -74,6 +74,13 @@ enum MALEpisodeRatings {
     static func target(forEpisodeID id: String) async -> Target? {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        if let kitsu = AnimeSource.kitsuID(from: trimmed) {
+            // A Kitsu title's episode: the MAL entry its entry maps to (both number per entry).
+            guard parts.count == 3, let episode = Int(parts[2]), episode > 0,
+                  let aniList = await AniListOfflineMaps.shared.aniListID(kitsu: kitsu),
+                  let mal = await AniListOfflineMaps.shared.entry(aniListID: aniList)?.mal, mal > 0 else { return nil }
+            return Target(malID: mal, episode: episode)
+        }
         if let mal = AnimeSource.malID(from: trimmed) {
             // A MyAnimeList title's episode: MAL's own entry and number.
             guard parts.count == 3, let episode = Int(parts[2]), episode > 0 else { return nil }
