@@ -12,6 +12,8 @@ enum AniListDiagnostics {
         case mal
         /// Kitsu's titles and search (`KitsuSource`).
         case kitsu
+        /// The last title's AniList and MAL reviews (`AnimeReviews`).
+        case reviews
     }
 
     struct Entry: Equatable {

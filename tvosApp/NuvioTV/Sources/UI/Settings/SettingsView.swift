@@ -484,6 +484,7 @@ enum SettingsKey {
         malEnabled, malClientID, malEpisodeRatings, malScrobble, malAdult, malCatalogs, malDetailsButton, aniListDetailsButton, malPlusStatus, aniListPlusStatus, malSeriesScore, aniListScore,
         malTitles, malSearch, aniListFindInMenu, malFindInMenu,
         kitsuEnabled, kitsuCatalogs, kitsuSearch, kitsuAdult, kitsuScrobble, kitsuDetailsButton, kitsuScore, kitsuFindInMenu,
+        aniListReviews, malReviews,
         mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
@@ -7132,6 +7133,7 @@ private struct MALOptionsSheet: View {
     @AppStorage(SettingsKey.malClientID) private var clientID = ""
     @AppStorage(SettingsKey.malEpisodeRatings) private var episodeRatingsSetting: Bool?
     @AppStorage(SettingsKey.malSeriesScore) private var seriesScoreSetting: Bool?
+    @AppStorage(SettingsKey.malReviews) private var reviewsSetting: Bool?
     @AppStorage(SettingsKey.malScrobble) private var scrobble = true
     @AppStorage(SettingsKey.malAdult) private var adult = false
     @AppStorage(SettingsKey.malDetailsButton) private var detailsButton = true
@@ -7416,6 +7418,16 @@ private struct MALOptionsSheet: View {
                     fallback: "Each episode's MyAnimeList score (1–5) on episode cards, for AniList anime and anime from Cinemeta. Works with MyAnimeList off"
                 ),
                 isOn: Binding(get: { episodeRatingsSetting ?? enabled }, set: { episodeRatingsSetting = $0 }),
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_reviews", fallback: "MAL Reviews"),
+                subtitle: L10n.string(
+                    "settings_mal_reviews_subtitle",
+                    fallback: "MAL's reviews in an anime's details, whichever catalog it is from (AniList, MAL, Kitsu, Cinemeta). Works with MAL off"
+                ),
+                isOn: Binding(get: { reviewsSetting ?? enabled }, set: { reviewsSetting = $0 }),
                 accentColor: accentColor
             )
         }
@@ -7733,6 +7745,7 @@ private struct AniListOptionsSheet: View {
     @AppStorage(SettingsKey.malEnabled) private var malEnabled = false
     @AppStorage(SettingsKey.aniListDetailsButton) private var detailsButton = true
     @AppStorage(SettingsKey.aniListScore) private var aniListScoreSetting: Bool?
+    @AppStorage(SettingsKey.aniListReviews) private var aniListReviewsSetting: Bool?
     @AppStorage(SettingsKey.aniListPlusStatus) private var plusStatus = AniListSettings.PlusStatus.planning.rawValue
     @State private var showingCatalogs = false
     @AppStorage(SettingsKey.aniListAdult) private var adult = false
@@ -7747,6 +7760,7 @@ private struct AniListOptionsSheet: View {
     @State private var statusText = ""
     @State private var homeStatusText = ""
     @State private var searchStatusText = ""
+    @State private var reviewsStatusText = ""
     @State private var accountStatusText = ""
     @State private var accountName: String?
     @State private var tokenDraft = ""
@@ -7796,6 +7810,16 @@ private struct AniListOptionsSheet: View {
                                 fallback: "AniList's average score beside the other ratings, for anime from Cinemeta too. Works with AniList off; order it in Rating Providers & Order"
                             ),
                             isOn: Binding(get: { aniListScoreSetting ?? enabled }, set: { aniListScoreSetting = $0 }),
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: L10n.string("settings_anilist_reviews", fallback: "AniList Reviews"),
+                            subtitle: L10n.string(
+                                "settings_anilist_reviews_subtitle",
+                                fallback: "AniList's reviews in an anime's details, whichever catalog it is from (AniList, MAL, Kitsu, Cinemeta). Works with AniList off"
+                            ),
+                            isOn: Binding(get: { aniListReviewsSetting ?? enabled }, set: { aniListReviewsSetting = $0 }),
                             accentColor: accentColor
                         )
 
@@ -8223,6 +8247,15 @@ private struct AniListOptionsSheet: View {
             }
 
             SettingsActionRow(
+                title: L10n.string("settings_anilist_status_reviews", fallback: "Reviews"),
+                subtitle: reviewsStatusText,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshStatus() }
+            }
+
+            SettingsActionRow(
                 title: L10n.string("settings_anilist_status_account", fallback: "Your List"),
                 subtitle: accountStatusText,
                 value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
@@ -8275,6 +8308,7 @@ private struct AniListOptionsSheet: View {
         statusText = await AniListService.statusText()
         homeStatusText = AniListService.homeStatusText()
         searchStatusText = AniListService.searchStatusText()
+        reviewsStatusText = AniListDiagnostics.text(.reviews)
         accountStatusText = AniListSettings.isEnabled ? AniListDiagnostics.text(.account) : "Off"
         accountName = AniListAccount.login?.viewerName
         if AniListSettings.isEnabled, !updatingOffline {
