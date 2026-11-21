@@ -783,6 +783,50 @@ class DetailsViewModel: ObservableObject {
         return (aniListRatings + mdbRatings + addonRatings).filter { seen.insert($0.source.lowercased()).inserted }
     }
 
+    /// `combinedRatings` as its parts arrive: MDBList's and the add-ons', and an anime's AniList
+    /// score, each shown when it comes instead of all waiting for the slowest. The AniList score
+    /// goes ahead of Home's AniList requests, which fill AniList's limit after a start. `update`
+    /// gets the ratings so far, and `complete` with the last part.
+    nonisolated static func progressiveRatings(
+        for meta: NuvioMeta,
+        update: @escaping @Sendable (_ ratings: [NuvioExternalRating], _ complete: Bool) async -> Void
+    ) async {
+        await withTaskGroup(of: (Int, [NuvioExternalRating]).self) { group in
+            group.addTask {
+                let scores = await AniListClient.$isInteractive.withValue(true) {
+                    await AniListService.ratings(for: meta)
+                }
+                return (0, scores)
+            }
+            group.addTask {
+                let asked = await AniListService.ratingsMeta(for: meta)
+                async let mdbTask = MdbListDetailsService.fetchRatings(forOptional: asked)
+                async let addonTask = AddonRatingsService.fetchRatings(forOptional: asked)
+                let (mdbRatings, addonRatings) = await (mdbTask, addonTask)
+                return (1, mdbRatings + addonRatings)
+            }
+            var parts: [Int: [NuvioExternalRating]] = [:]
+            for await (index, ratings) in group {
+                parts[index] = ratings
+                var seen = Set<String>()
+                let merged = ((parts[0] ?? []) + (parts[1] ?? [])).filter { seen.insert($0.source.lowercased()).inserted }
+                await update(merged, parts.count == 2)
+            }
+        }
+    }
+
+    /// The ratings row: a part so far beside what is shown (the hero's seeded ones, the title's
+    /// own), the whole when the last part arrives.
+    private func applyRatings(_ ratings: [NuvioExternalRating], complete: Bool, for metaId: String, generation: UInt64) {
+        guard !complete else {
+            applyMdbRatings(ratings, for: metaId, generation: generation)
+            return
+        }
+        guard isCurrentRequest(metaId: metaId, generation: generation), !ratings.isEmpty,
+              let currentMeta = uiState.meta else { return }
+        uiState.meta = currentMeta.withExternalRatings(ratings).addingRatings(currentMeta.externalRatings ?? [])
+    }
+
     /// Whether an AniList title is in the selected library (Trakt, Simkl, MDBList, WeTrakr), which
     /// keeps it under the IMDb/TMDB ids it maps to. nil = not known (or the local library).
     nonisolated static func aniListLibraryMembership(for meta: NuvioMeta) async -> Bool? {
@@ -841,8 +885,11 @@ class DetailsViewModel: ObservableObject {
                         }
                     }
                 }
-                let ratings = await Self.combinedRatings(for: meta)
-                self.applyMdbRatings(ratings, for: meta.id, generation: generation)
+                await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
+                    await MainActor.run {
+                        self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
+                    }
+                }
                 // In the selected library under the IMDb/TMDB ids it maps to.
                 if let member = await Self.aniListLibraryMembership(for: meta) {
                     self.applyMdbListWatchlistMembership(member, for: meta.id, generation: generation)
@@ -912,11 +959,12 @@ class DetailsViewModel: ObservableObject {
                     }
                 }
 
-                // 4. External Ratings (MDBList & Add-ons)
+                // 4. External Ratings (MDBList & Add-ons, and an anime's AniList score)
                 group.addTask {
-                    let combinedRatings = await Self.combinedRatings(for: meta)
-                    await MainActor.run { [weak self] in
-                        self?.applyMdbRatings(combinedRatings, for: meta.id, generation: generation)
+                    await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
+                        await MainActor.run {
+                            self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
+                        }
                     }
                 }
 
@@ -1033,11 +1081,11 @@ class DetailsViewModel: ObservableObject {
 
     /// Ratings the Home hero already fetched for this title, so the Details
     /// ratings row is there on the first frame instead of popping in.
+    /// An AniList title, which carries its own AniList score, gets the hero's others too.
     private func seedingCachedRatings(into meta: NuvioMeta) -> NuvioMeta {
-        guard meta.externalRatings?.isEmpty ?? true,
-              let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta),
+        guard let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta),
               !cached.isEmpty else { return meta }
-        return meta.withExternalRatings(cached)
+        return meta.addingRatings(cached)
     }
 
     private func applyCertification(_ certification: String?, for metaId: String, generation: UInt64) {
