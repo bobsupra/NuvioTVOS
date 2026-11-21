@@ -11,7 +11,8 @@ enum IPTVPlaylistLoadError: Error, Equatable {
 
 struct IPTVLoadedPlaylist {
     let channels: [IPTVChannel]
-    let guideURL: URL?
+    let guideURLs: [URL]
+    var guideURL: URL? { guideURLs.first }
 }
 
 /// Downloads only user-configured playlists. Callers own any previously loaded
@@ -70,16 +71,20 @@ struct IPTVPlaylistLoader {
         } catch IPTVChannelImportError.tooLarge {
             throw IPTVPlaylistLoadError.tooLarge
         }
-        let guideURL = playlists.lazy.compactMap { playlist -> URL? in
+        var guideURLs: [URL] = []
+        var seenGuideURLs = Set<String>()
+        for playlist in playlists {
             for raw in [playlist.tvgURL, playlist.xTvgURL].compactMap({ $0 }) {
-                let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, !trimmed.contains(","),
-                      let url = URL(string: trimmed, relativeTo: baseURL)?.absoluteURL, isWebURL(url) else { continue }
-                return url
+                for candidate in raw.split(separator: ",", omittingEmptySubsequences: false) {
+                    let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty,
+                          let url = URL(string: trimmed, relativeTo: baseURL)?.absoluteURL,
+                          isWebURL(url), seenGuideURLs.insert(url.absoluteString).inserted else { continue }
+                    guideURLs.append(url)
+                }
             }
-            return nil
-        }.first
-        return IPTVLoadedPlaylist(channels: channels, guideURL: guideURL)
+        }
+        return IPTVLoadedPlaylist(channels: channels, guideURLs: guideURLs)
     }
 
     private static func isWebURL(_ url: URL) -> Bool {
