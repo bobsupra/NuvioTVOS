@@ -1,9 +1,10 @@
 import Foundation
 
 /// Settings → Anime Integrations → MyAnimeList → MAL Catalogs: MyAnimeList's catalogs from Tenrai
-/// (`MALEpisodeRatings.baseURL`), the viewer's MAL lists from MAL itself. Each title opens as the
-/// AniList title it maps to (offline tables, else AniList's `idMal`), so it has AniList's
-/// details, episodes and streams; a title AniList doesn't know is left out.
+/// (`MALEpisodeRatings.baseURL`; top lists and seasons from MAL's own API when Tenrai doesn't
+/// answer), the viewer's MAL lists from MAL itself. With MAL Titles on, each title is MAL's own
+/// (`mal:ID`, `MALSource`); off, it opens as the AniList title it maps to (offline tables, else
+/// AniList's `idMal`), and a title AniList doesn't know is left out.
 enum MALCatalogs {
     static let idPrefix = "mal-"
     static let addonName = "MyAnimeList"
@@ -92,8 +93,12 @@ enum MALCatalogs {
             let anime = await MALAccount.list(status: status)
             return (await cards(anime), false)
         }
-        guard let url = await Self.url(for: catalogId, page: page, limit: limit),
-              let data = await TenraiPages.shared.data(url) else { return ([], false) }
+        guard let url = await Self.url(for: catalogId, page: page, limit: limit) else { return ([], false) }
+        guard let data = await TenraiPages.shared.data(url) else {
+            // Tenrai doesn't answer: MAL's own top lists and seasons, with a Client ID.
+            guard let anime = await MALSource.officialCatalog(catalogId, page: page, limit: limit) else { return ([], false) }
+            return (await cards(anime), anime.count >= limit)
+        }
         if catalogId == idPrefix + "recommended" {
             let anime = recommendations(from: data)
             return (await cards(anime), !anime.isEmpty)
@@ -191,6 +196,9 @@ enum MALCatalogs {
 
     /// AniList cards of MAL titles, in their order; titles AniList doesn't know are left out.
     static func cards(_ anime: [TenraiAnime]) async -> [NuvioMeta] {
+        if MALSettings.opensTitles {
+            return MALSource.cards(anime, language: AniListSettings.titleLanguage)
+        }
         var aniList: [Int: Int] = [:]
         var missing: [Int] = []
         for item in anime {
@@ -285,13 +293,17 @@ enum MALCatalogs {
     /// title's own entry, a Cinemeta anime's first season. nil leaves MDBList's copy in place.
     static func seriesScore(for meta: NuvioMeta) async -> NuvioExternalRating? {
         guard MALSettings.usesOwnScore else { return nil }
-        let entry: Int?
-        if let id = AniListMetaBuilder.aniListID(from: meta.id) {
-            entry = id
+        let malEntry: Int?
+        if let own = AnimeSource.malID(from: meta.id) {
+            malEntry = own
+        } else if let id = AniListMetaBuilder.aniListID(from: meta.id) {
+            malEntry = await MALEpisodeRatings.malID(aniListID: id)
+        } else if let entry = await AniListService.mappedEntry(for: meta) {
+            malEntry = await MALEpisodeRatings.malID(aniListID: entry)
         } else {
-            entry = await AniListService.mappedEntry(for: meta)
+            malEntry = nil
         }
-        guard let entry, let mal = await MALEpisodeRatings.malID(aniListID: entry),
+        guard let mal = malEntry,
               let url = address("anime/\(mal)", []),
               let data = await TenraiPages.shared.data(url),
               let score = score(fromDetails: data) else { return nil }
@@ -468,32 +480,12 @@ struct TenraiProducers: Decodable {
     var data: [Producer]? = nil
 }
 
-/// Tenrai's answers kept three hours in memory; nothing asked while Tenrai says to wait.
+/// Tenrai's answers for MAL Catalogs, kept three hours: through `TenraiClient`, which keeps
+/// them under Tenrai's limits and waits as long as a 429 says.
 actor TenraiPages {
     static let shared = TenraiPages()
 
-    private var kept: [URL: (data: Data, until: Date)] = [:]
-    private var waitUntil: Date?
-
-    func data(_ url: URL, now: Date = Date()) async -> Data? {
-        if let hit = kept[url], hit.until > now { return hit.data }
-        if let waitUntil, waitUntil > now { return kept[url]?.data }
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 12
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let reply = try? await URLSession.shared.data(for: request),
-              let http = reply.1 as? HTTPURLResponse else { return kept[url]?.data }
-        switch http.statusCode {
-        case 200..<300:
-            kept[url] = (reply.0, now.addingTimeInterval(MALCatalogs.keepFor))
-            if kept.count > 400 { kept = kept.filter { $0.value.until > now } }
-            return reply.0
-        case 429, 503:
-            let seconds = http.value(forHTTPHeaderField: "Retry-After").flatMap { TimeInterval($0) } ?? 60
-            waitUntil = now.addingTimeInterval(min(max(seconds, 1), 3600))
-            return kept[url]?.data
-        default:
-            return kept[url]?.data
-        }
+    func data(_ url: URL) async -> Data? {
+        try? await TenraiClient.shared.get(url: url, ttl: MALCatalogs.keepFor)
     }
 }

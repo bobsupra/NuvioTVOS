@@ -41,6 +41,8 @@ struct TmdbPersonMetadata: Identifiable, Equatable, Hashable {
     var aniListCharacterID: Int? = nil
     var aniListStaffID: Int? = nil
     var aniListStaffImage: String? = nil
+    /// "mal" when the ids above are MyAnimeList's (a MAL title's cast, `MALSource`).
+    var peopleSource: String? = nil
 
     /// Whether a click opens an AniList voice actor's or character's page.
     var hasAniListPage: Bool { aniListStaffID != nil || aniListCharacterID != nil }

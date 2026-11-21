@@ -42,12 +42,31 @@ enum AniListStreamIds {
         return await ids(for: videoId).first { $0.hasPrefix("tt") && $0.contains(":") }
     }
 
+    /// A MyAnimeList title's episode (`mal:ID:EP`) is asked by the AniList entry its MAL entry
+    /// maps to (`anilist:ID:EP`: both number each entry's episodes on their own), then by that
+    /// entry's converted ids.
     private static func ids(for videoId: String) async -> [String] {
-        guard AniListSettings.opensTitles, let entryID = AniListMetaBuilder.aniListID(from: videoId) else { return [] }
+        guard AniListSettings.opensTitles, let found = AnimeSource.entry(from: videoId) else { return [] }
         if let cached = lock.withLock({ known[videoId] }) { return cached }
-        let ids = await find(entryID: entryID, episode: AniListAccount.episodeNumber(in: videoId))
+        let episode = AniListAccount.episodeNumber(in: videoId)
+        var ids: [String]
+        switch found.source {
+        case .anilist:
+            ids = await AnimeSource.$current.withValue(.anilist) { await find(entryID: found.id, episode: episode) }
+        case .mal:
+            guard MALSettings.opensTitles, let entryID = await aniListEntry(mal: found.id) else { return [] }
+            let own = episode.map { "mal:\(found.id):\($0)" } ?? "mal:\(found.id)"
+            let converted = await AnimeSource.$current.withValue(.anilist) { await find(entryID: entryID, episode: episode) }
+            ids = [episode.map { "anilist:\(entryID):\($0)" } ?? "anilist:\(entryID)"] + converted.filter { $0 != own }
+        }
         if !ids.isEmpty { lock.withLock { known[videoId] = ids } }
         return ids
+    }
+
+    /// The AniList entry of a MAL entry: the offline tables', else AniList's `idMal`.
+    static func aniListEntry(mal: Int) async -> Int? {
+        if let found = await AniListOfflineMaps.shared.aniListID(mal: mal) { return found }
+        return await MALCatalogs.aniListIDs(mal: [mal])[mal]
     }
 
     private static func find(entryID: Int, episode: Int?) async -> [String] {

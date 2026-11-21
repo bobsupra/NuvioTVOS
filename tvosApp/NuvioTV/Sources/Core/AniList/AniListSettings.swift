@@ -179,6 +179,8 @@ enum AniListSettings {
         return [
             isEnabled ? "anilist:on" : "anilist:mal-only",
             MALSettings.isEnabled ? "mal:\(MALCatalogs.signature())" : "mal:off",
+            MALSettings.opensTitles ? "maltitles" : "malmapped",
+            MALSettings.searchesMAL ? "malsearch" : "nomalsearch",
             "catalogs:\(AnimeCatalogSelection.signature(AniListCatalogs.chosen()))",
             showsHomeRows ? "rows" : "norows",
             searchesAniList ? "search" : "nosearch",
