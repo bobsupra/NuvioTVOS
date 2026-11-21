@@ -1985,19 +1985,24 @@ class PlayerViewModel: ObservableObject {
             addPendingExternalSubtitlesIfNeeded()
 
         case .preferredLanguages(let preferredLanguages):
-            let hasActivePreferredSubtitle = Self.shouldPreserveBackendSubtitleSelection(
-                subtitles.first(where: { $0.isSelected }),
-                preferredLanguages: preferredLanguages,
-                allowForcedSubtitles: false
-            )
-            let hasPendingOrAddedSubtitles = !pendingExternalSubtitles.isEmpty || !addedExternalSubtitleURLs.isEmpty
-            guard !hasActivePreferredSubtitle, !hasPendingOrAddedSubtitles else { return }
-
-            let smartMatched = Self.smartMatchedSubtitles(in: availableExternalSubtitles)
-            guard let best = smartMatched.first,
-                  !addedExternalSubtitleURLs.contains(best.url),
-                  !pendingExternalSubtitles.contains(where: { $0.url == best.url }) else { return }
-            pendingExternalSubtitles.append(best)
+            // An add-on's subtitle replaces an automatic choice of a language ranked below it:
+            // the file's English, picked at load, gives way to Czech ranked first once an add-on
+            // brings it.
+            let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
+            guard let best = Self.betterRankedAddonSubtitle(
+                selected: subtitles.first(where: { $0.isSelected }),
+                available: availableExternalSubtitles,
+                onTheirWay: pendingExternalSubtitles.filter { !loadedExternalURLs.contains($0.url) },
+                preferredLanguages: preferredLanguages
+            ) else { return }
+            if let track = subtitles.first(where: { $0.externalFilename == best.url }) {
+                selectSubtitle(track, persist: false)
+                return
+            }
+            guard !addedExternalSubtitleURLs.contains(best.url) else { return }
+            if !pendingExternalSubtitles.contains(where: { $0.url == best.url }) {
+                pendingExternalSubtitles.append(best)
+            }
             pendingSelectedExternalSubtitleURL = best.url
             didApplySubtitlePreference = false
             didAddExternalSubtitles = false
@@ -7208,18 +7213,20 @@ class PlayerViewModel: ObservableObject {
 
         case .preferredLanguages(let preferredLanguages):
             // Both playback backends can resolve the preference during load. Keep
-            // that selection instead of replacing it with the first matching row.
-            if Self.shouldPreserveBackendSubtitleSelection(
-                subtitles.first(where: { $0.isSelected }),
-                preferredLanguages: preferredLanguages,
-                allowForcedSubtitles: false
-            ) {
-                didApplySubtitlePreference = true
-                return
-            }
+            // that selection instead of replacing it with the first matching row,
+            // unless a language ranked above it is loaded or still loading: the
+            // backend saw only the file's own subtitles, not the add-ons'.
+            let keptRank = Self.preferredSubtitleRank(
+                of: subtitles.first(where: { $0.isSelected }),
+                in: preferredLanguages
+            )
 
             let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
-            for language in preferredLanguages {
+            for (rank, language) in preferredLanguages.enumerated() {
+                if let keptRank, rank >= keptRank {
+                    didApplySubtitlePreference = true
+                    return
+                }
                 if let matchingTrack = Self.matchingPreferredFullSubtitle(in: subtitles, language: language) {
                     didApplySubtitlePreference = true
                     selectSubtitle(matchingTrack, persist: false)
@@ -7559,6 +7566,52 @@ class PlayerViewModel: ObservableObject {
 
     static func isForcedSubtitle(_ track: SubtitleTrack) -> Bool {
         track.isForced || isForcedSubtitleLabel(track.name)
+    }
+
+    /// Where a subtitle track's language is in the preferred languages (0 = the first); nil
+    /// for Off, a forced track or a language not in the list.
+    static func preferredSubtitleRank(of track: SubtitleTrack?, in languages: [String]) -> Int? {
+        guard let track, track.id != "off", !isForcedSubtitle(track) else { return nil }
+        return languages.firstIndex { language in
+            SubtitleLanguagePreferences.matches(track.language, target: language) ||
+            SubtitleLanguagePreferences.matches(track.name, target: language)
+        }
+    }
+
+    /// The same for an add-on's subtitle.
+    static func preferredSubtitleRank(of subtitle: NuvioSubtitle, in languages: [String]) -> Int? {
+        guard !isForcedSubtitleLabel(subtitle.label) else { return nil }
+        return languages.firstIndex { language in
+            SubtitleLanguagePreferences.matches(subtitle.language, target: language) ||
+            SubtitleLanguagePreferences.matches(subtitle.label, target: language)
+        }
+    }
+
+    /// The add-on subtitle that replaces an automatic choice when add-on subtitles arrive: the
+    /// first full one in the best-ranked preferred language, if that language ranks above the
+    /// selected track's (or the selected track is in none of them) and no subtitle as good is
+    /// already on its way. Nil keeps the choice.
+    static func betterRankedAddonSubtitle(
+        selected: SubtitleTrack?,
+        available: [NuvioSubtitle],
+        onTheirWay: [NuvioSubtitle],
+        preferredLanguages: [String]
+    ) -> NuvioSubtitle? {
+        var best: (subtitle: NuvioSubtitle, rank: Int)?
+        for subtitle in available {
+            guard let rank = preferredSubtitleRank(of: subtitle, in: preferredLanguages) else { continue }
+            if let current = best, current.rank <= rank { continue }
+            best = (subtitle, rank)
+        }
+        guard let best else { return nil }
+        if let selectedRank = preferredSubtitleRank(of: selected, in: preferredLanguages),
+           selectedRank <= best.rank {
+            return nil
+        }
+        let betterOnItsWay = onTheirWay.contains { subtitle in
+            preferredSubtitleRank(of: subtitle, in: preferredLanguages).map { $0 <= best.rank } ?? false
+        }
+        return betterOnItsWay ? nil : best.subtitle
     }
 
     static func matchingPreferredFullSubtitle(in tracks: [SubtitleTrack], language: String) -> SubtitleTrack? {

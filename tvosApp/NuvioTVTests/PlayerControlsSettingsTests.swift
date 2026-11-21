@@ -1382,17 +1382,21 @@ final class PlayerControlsSettingsTests: XCTestCase {
             language: "eng",
             label: "English Full"
         )
-        let cases: [(tracks: [SubtitleTrack], expectedID: String)] = [
+        // Without the file's English, the add-on's English (ranked above Arabic) is loaded and
+        // selected once it arrives; the file's Arabic shows meanwhile.
+        let cases: [(tracks: [SubtitleTrack], expectedID: String, loadsExternal: Bool)] = [
             (
                 [
                     SubtitleTrack(id: "2", name: "English Full", language: "eng", isSelected: false),
                     SubtitleTrack(id: "3", name: "Arabic Full", language: "ara", isSelected: false)
                 ],
-                "2"
+                "2",
+                false
             ),
             (
                 [SubtitleTrack(id: "3", name: "Arabic Full", language: "ara", isSelected: false)],
-                "3"
+                "3",
+                true
             )
         ]
 
@@ -1408,7 +1412,8 @@ final class PlayerControlsSettingsTests: XCTestCase {
             model.mergeExternalSubtitles([englishExternal])
 
             XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, testCase.expectedID)
-            XCTAssertTrue(model.pendingExternalSubtitles.isEmpty)
+            XCTAssertEqual(model.pendingExternalSubtitles.map(\.url), testCase.loadsExternal ? [englishExternal.url] : [])
+            XCTAssertEqual(model.isExternalSubtitleSelected(englishExternal), testCase.loadsExternal)
         }
     }
 
