@@ -43,8 +43,16 @@ struct IPTVLiveView: View {
     @State private var guideNextRefresh: Date?
     @State private var guideFailures = 0
     @State private var guideRequestID: UUID?
-    @State private var selectedGuideURL: URL?
+    @State private var selectedGuideURLs: [URL] = []
     @State private var selectedGuideNeedsSameOrigin = false
+    @State private var guidePageStartOverride: Date?
+    @State private var selectedGuideProgramme: IPTVProgramme?
+    @State private var selectedGuideChannelID: String?
+    @State private var guideTimeFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        return formatter
+    }()
 
     // Channel Selection & Favorites
     @State private var selectedChannelID: String = "sample-nrk1"
@@ -58,12 +66,16 @@ struct IPTVLiveView: View {
     private let xtream = IPTVXtreamClient()
     private let guideLoader = IPTVGuideLoader()
     private let guideClock = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
+    private let guidePageDuration: TimeInterval = 4 * 60 * 60
+    private let guideChannelColumnWidth: CGFloat = 232
 
     // Standard category tabs
     private let defaultCategories = ["Alle", "Norge", "Sport", "Film", "Serier", "Barn", "Nyheter"]
 
     var body: some View {
-        ZStack {
+        let visibleChannels = filteredDisplayChannels
+
+        return ZStack {
             // Background
             Color(red: 0.05, green: 0.05, blue: 0.07)
                 .ignoresSafeArea()
@@ -78,18 +90,22 @@ struct IPTVLiveView: View {
                     // Top Category Filter Pills
                     categoryPillsRow
 
-                    // Two-column content: Channel List + Detail & Schedule Stack
-                    HStack(alignment: .top, spacing: 20) {
-                        // Left Column: Channel List Card
-                        channelListCard
-                            .frame(width: 410, height: 656)
+                    if activeSidebarItem == .guide {
+                        timeGuideView(channels: visibleChannels)
+                    } else {
+                        // Two-column content: Channel List + Detail & Schedule Stack
+                        HStack(alignment: .top, spacing: 20) {
+                            // Left Column: Channel List Card
+                            channelListCard
+                                .frame(width: 410, height: 656)
 
-                        // Right Column: Preview + Schedule
-                        VStack(spacing: 16) {
-                            livePlayerPreviewCard
-                            scheduleEPGCard
+                            // Right Column: Preview + Schedule
+                            VStack(spacing: 16) {
+                                livePlayerPreviewCard
+                                scheduleEPGCard
+                            }
+                            .frame(maxWidth: .infinity)
                         }
-                        .frame(maxWidth: .infinity)
                     }
                 }
             }
@@ -102,7 +118,10 @@ struct IPTVLiveView: View {
             credentialsModalView
         }
         .onAppear(perform: restoreSources)
-        .onReceive(guideClock) { guideNow = $0 }
+        .onReceive(guideClock) { now in
+            guideNow = now
+            refreshGuideIfDue(now: now)
+        }
         .onDisappear {
             requestID = UUID()
             loadTask?.cancel()
@@ -116,6 +135,7 @@ struct IPTVLiveView: View {
     // MARK: - Navigation Tabs
     enum IPTVNavTab: String, CaseIterable {
         case liveTV = "Live TV"
+        case guide = "TV-guide"
         case channels = "Kanalliste"
         case favorites = "Favoritter"
         case categories = "Kategorier"
@@ -125,6 +145,7 @@ struct IPTVLiveView: View {
         var icon: String {
             switch self {
             case .liveTV: return "tv"
+            case .guide: return "calendar"
             case .channels: return "list.bullet"
             case .favorites: return "heart"
             case .categories: return "square.grid.2x2"
@@ -187,6 +208,11 @@ struct IPTVLiveView: View {
         switch tab {
         case .liveTV:
             selectedCategory = "Alle"
+        case .guide:
+            selectedCategory = "Alle"
+            guidePageStartOverride = nil
+            selectedGuideProgramme = nil
+            selectedGuideChannelID = nil
         case .channels:
             selectedCategory = "Alle"
         case .favorites:
@@ -240,6 +266,333 @@ struct IPTVLiveView: View {
             }
         }
         return list
+    }
+
+    // MARK: - Time-based Programme Guide
+    private var guidePageStart: Date {
+        let lower = startOfHour(guideNow.addingTimeInterval(-IPTVGuideRefreshPolicy.lookBehind))
+        let upper = startOfHour(guideNow.addingTimeInterval(IPTVGuideRefreshPolicy.lookAhead - guidePageDuration))
+        return min(max(guidePageStartOverride ?? startOfHour(guideNow), lower), upper)
+    }
+
+    private var guidePageEnd: Date {
+        min(guidePageStart.addingTimeInterval(guidePageDuration), guideNow.addingTimeInterval(IPTVGuideRefreshPolicy.lookAhead))
+    }
+
+    private func startOfHour(_ date: Date) -> Date {
+        Calendar.current.dateInterval(of: .hour, for: date)?.start ?? date
+    }
+
+    private func guideRows(from visibleChannels: [IPTVDisplayChannel], between start: Date, and end: Date) -> [IPTVGuideDisplayRow] {
+        var sourceChannelsByID: [String: IPTVChannel] = [:]
+        for channel in channels where sourceChannelsByID[channel.id] == nil {
+            sourceChannelsByID[channel.id] = channel
+        }
+
+        return visibleChannels.compactMap { displayChannel in
+            guard let sourceChannel = sourceChannelsByID[displayChannel.id],
+                  let guideID = sourceChannel.guideID,
+                  let programmes = guideByChannel[guideID] else { return nil }
+            let visibleProgrammes = programmes.filter { $0.start < end && $0.end > start }
+            guard !visibleProgrammes.isEmpty else { return nil }
+            return IPTVGuideDisplayRow(channel: displayChannel, programmes: visibleProgrammes)
+        }
+    }
+
+    private func timeGuideView(channels visibleChannels: [IPTVDisplayChannel]) -> some View {
+        let pageStart = guidePageStart
+        let pageEnd = guidePageEnd
+        let rows = guideRows(from: visibleChannels, between: pageStart, and: pageEnd)
+        let hasGuideIDs = channels.contains { $0.guideID != nil }
+
+        return GeometryReader { geometry in
+            let timelineWidth = max(1, geometry.size.width - 24 - 20 - guideChannelColumnWidth)
+
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(spacing: 18) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("TV-guide")
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundColor(.white)
+                        Text("\(guideDateRange(start: pageStart, end: pageEnd))  •  \(formatTimeRange(start: pageStart, end: pageEnd))  •  \(rows.count) kanaler")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.85)
+                    }
+
+                    Spacer(minLength: 10)
+                    guidePageButton("Tidligere", icon: "chevron.left", enabled: canBrowseGuideEarlier) {
+                        moveGuidePage(by: -guidePageDuration)
+                    }
+                    guidePageButton("Nå", icon: "dot.circle", enabled: guidePageStartOverride != nil) {
+                        guidePageStartOverride = nil
+                    }
+                    guidePageButton("Senere", icon: "chevron.right", enabled: canBrowseGuideLater) {
+                        moveGuidePage(by: guidePageDuration)
+                    }
+                }
+
+                if guideTask != nil {
+                    HStack(spacing: 10) {
+                        ProgressView()
+                        Text("Laster programguide…")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.72))
+                    }
+                } else if guideFailures > 0 {
+                    HStack(spacing: 14) {
+                        Text("Noen programguide-feeder kunne ikke lastes.")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.72))
+                        guidePageButton("Prøv igjen", icon: "arrow.clockwise", enabled: !selectedGuideURLs.isEmpty) {
+                            retryGuide()
+                        }
+                    }
+                }
+
+                if selectedGuideProgramme != nil {
+                    selectedGuideProgrammeCard
+                }
+
+                if selectedGuideURLs.isEmpty {
+                    guideEmptyState("Ingen TV-guide er konfigurert for denne kilden.", icon: "calendar.badge.exclamationmark")
+                } else if !hasGuideIDs {
+                    guideEmptyState("Kilden har ingen kanaler med EPG-ID.", icon: "tv.slash")
+                } else {
+                    VStack(spacing: 6) {
+                        guideTimeAxis(start: pageStart, width: timelineWidth)
+
+                        if rows.isEmpty {
+                            if guideTask != nil {
+                                guideEmptyState("Venter på programdata…", icon: "clock")
+                            } else if guideUnavailable {
+                                guideEmptyState("Programguiden er utilgjengelig.", icon: "wifi.slash")
+                            } else {
+                                guideEmptyState("Ingen programinformasjon i dette tidsrommet.", icon: "calendar")
+                            }
+                        } else {
+                            ScrollView(.vertical, showsIndicators: false) {
+                                LazyVStack(spacing: 6) {
+                                    ForEach(rows) { row in
+                                        guideChannelRow(row, start: pageStart, end: pageEnd, timelineWidth: timelineWidth)
+                                    }
+                                }
+                                .padding(.bottom, 8)
+                            }
+                        }
+                    }
+                    .padding(12)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18)
+                            .fill(Color(red: 0.08, green: 0.08, blue: 0.11))
+                            .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.08), lineWidth: 1))
+                    )
+                }
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var canBrowseGuideEarlier: Bool {
+        guidePageStart > startOfHour(guideNow.addingTimeInterval(-IPTVGuideRefreshPolicy.lookBehind))
+    }
+
+    private var canBrowseGuideLater: Bool {
+        guidePageStart < startOfHour(guideNow.addingTimeInterval(IPTVGuideRefreshPolicy.lookAhead - guidePageDuration))
+    }
+
+    private func moveGuidePage(by interval: TimeInterval) {
+        let lower = startOfHour(guideNow.addingTimeInterval(-IPTVGuideRefreshPolicy.lookBehind))
+        let upper = startOfHour(guideNow.addingTimeInterval(IPTVGuideRefreshPolicy.lookAhead - guidePageDuration))
+        guidePageStartOverride = min(max(guidePageStart.addingTimeInterval(interval), lower), upper)
+    }
+
+    private func guidePageButton(_ title: String, icon: String, enabled: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .font(.system(size: 16, weight: .semibold))
+                Text(title)
+                    .font(.system(size: 18, weight: .semibold))
+            }
+            .foregroundColor(.white.opacity(enabled ? 0.92 : 0.35))
+            .padding(.horizontal, 16)
+            .frame(height: 48)
+            .background(Capsule().fill(Color.white.opacity(enabled ? 0.1 : 0.045)))
+            .overlay(IPTVGuideFocusOutline(shape: Capsule()))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .disabled(!enabled)
+    }
+
+    private func guideTimeAxis(start: Date, width: CGFloat) -> some View {
+        HStack(spacing: 0) {
+            Text("Kanal")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundColor(.white.opacity(0.74))
+                .padding(.trailing, 10)
+                .frame(width: guideChannelColumnWidth, alignment: .leading)
+
+            HStack(spacing: 0) {
+                ForEach(0..<4, id: \.self) { tick in
+                    Text(guideClockLabel(start.addingTimeInterval(Double(tick) * 60 * 60)))
+                        .font(.system(size: 17, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: width / 4, alignment: .leading)
+                }
+            }
+            .frame(width: width, alignment: .leading)
+            .overlay(alignment: .trailing) {
+                Text(guideClockLabel(start.addingTimeInterval(guidePageDuration)))
+                    .font(.system(size: 17, weight: .medium))
+                    .monospacedDigit()
+                    .foregroundColor(.white.opacity(0.6))
+            }
+        }
+        .padding(.horizontal, 10)
+        .frame(height: 34)
+        .overlay(alignment: .bottom) { Color.white.opacity(0.12).frame(height: 1) }
+    }
+
+    private func guideChannelRow(_ row: IPTVGuideDisplayRow, start: Date, end: Date, timelineWidth: CGFloat) -> some View {
+        HStack(spacing: 0) {
+            HStack(spacing: 12) {
+                channelBadgeView(channel: row.channel, size: CGSize(width: 48, height: 42))
+                Text(row.channel.name)
+                    .font(.system(size: 21, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+            }
+            .padding(.trailing, 10)
+            .frame(width: guideChannelColumnWidth, height: 74, alignment: .leading)
+
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color.white.opacity(0.035))
+                ForEach(Array(row.programmes.enumerated()), id: \.element.start) { index, programme in
+                    let nextStart = index + 1 < row.programmes.count ? row.programmes[index + 1].start : nil
+                    guideProgrammeTile(programme, row: row, start: start, end: end, nextStart: nextStart, timelineWidth: timelineWidth)
+                }
+            }
+            .frame(width: timelineWidth, height: 74)
+            .clipped()
+        }
+        .padding(.horizontal, 10)
+        .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.035)))
+    }
+
+    private func guideProgrammeTile(
+        _ programme: IPTVProgramme,
+        row: IPTVGuideDisplayRow,
+        start: Date,
+        end: Date,
+        nextStart: Date?,
+        timelineWidth: CGFloat
+    ) -> some View {
+        let clippedStart = max(programme.start, start)
+        let clippedEnd = min(min(programme.end, end), nextStart ?? end)
+        let duration = max(1, end.timeIntervalSince(start))
+        let xOffset = CGFloat(clippedStart.timeIntervalSince(start) / duration) * timelineWidth
+        let tileWidth = CGFloat(clippedEnd.timeIntervalSince(clippedStart) / duration) * timelineWidth
+        let isCurrent = programme.start <= guideNow && guideNow < programme.end
+        let shape = RoundedRectangle(cornerRadius: 9)
+
+        return Button {
+            handleGuideProgrammeSelection(programme, channel: row.channel)
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(programme.title)
+                    .font(.system(size: tileWidth < 100 ? 16 : 20, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                if tileWidth >= 100 {
+                    Text(formatTimeRange(start: programme.start, end: programme.end))
+                        .font(.system(size: 15, weight: .medium))
+                        .monospacedDigit()
+                        .foregroundColor(.white.opacity(0.7))
+                        .lineLimit(1)
+                }
+            }
+            .padding(.horizontal, 10)
+            .frame(width: max(1, tileWidth - 3), height: 68, alignment: .leading)
+            .background(shape.fill(isCurrent ? Color(red: 0.35, green: 0.18, blue: 0.58) : Color.white.opacity(0.12)))
+            .overlay(shape.stroke(isCurrent ? Color(red: 0.72, green: 0.48, blue: 1) : Color.white.opacity(0.08), lineWidth: 1))
+            .overlay(IPTVGuideFocusOutline(shape: shape))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .offset(x: xOffset)
+        .accessibilityLabel("\(programme.title), \(formatTimeRange(start: programme.start, end: programme.end))")
+    }
+
+    private func handleGuideProgrammeSelection(_ programme: IPTVProgramme, channel: IPTVDisplayChannel) {
+        if programme.start <= guideNow, guideNow < programme.end, let streamURL = channel.streamURL {
+            selectedChannelID = channel.id
+            selectedCategory = "Alle"
+            activeSidebarItem = .liveTV
+            selectedGuideProgramme = nil
+            selectedGuideChannelID = nil
+            recordRecent(channelID: channel.id)
+            play(url: streamURL, id: channel.id, name: channel.name, logo: nil)
+        } else {
+            selectedGuideProgramme = programme
+            selectedGuideChannelID = channel.id
+        }
+    }
+
+    private var selectedGuideProgrammeCard: some View {
+        let channel = displayChannels.first(where: { $0.id == selectedGuideChannelID })
+        return HStack(alignment: .center, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(selectedGuideProgramme?.title ?? "")
+                    .font(.system(size: 22, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                if let programme = selectedGuideProgramme {
+                    Text("\(channel?.name ?? "")  •  \(formatTimeRange(start: programme.start, end: programme.end))")
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.66))
+                }
+            }
+            Spacer()
+            guidePageButton("Lukk", icon: "xmark", enabled: true) {
+                selectedGuideProgramme = nil
+                selectedGuideChannelID = nil
+            }
+        }
+        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, minHeight: 68)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color.white.opacity(0.07)))
+    }
+
+    private func guideEmptyState(_ message: String, icon: String) -> some View {
+        HStack(spacing: 12) {
+            Image(systemName: icon)
+                .font(.system(size: 22, weight: .medium))
+            Text(message)
+                .font(.system(size: 20, weight: .medium))
+                .lineLimit(2)
+        }
+        .foregroundColor(.white.opacity(0.62))
+        .frame(maxWidth: .infinity, minHeight: 86, alignment: .leading)
+        .padding(.horizontal, 18)
+    }
+
+    private func guideClockLabel(_ date: Date) -> String {
+        guideTimeFormatter.string(from: date)
+    }
+
+    private func guideDateRange(start: Date, end: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .none
+        let startDate = formatter.string(from: start)
+        let endDate = formatter.string(from: end.addingTimeInterval(-1))
+        return startDate == endDate ? startDate : "\(startDate) – \(endDate)"
     }
 
     // MARK: - Left Column: Channel List Card ("Alle kanaler")
@@ -729,13 +1082,6 @@ struct IPTVLiveView: View {
             }
             .padding(40)
         }
-        .onAppear(perform: restoreSources)
-        .onReceive(guideClock) { now in
-            guideNow = now
-            // Only checks whether a refresh is due; it isn't a fetch every minute.
-            refreshGuideIfDue(now: now)
-        }
-        .onDisappear { requestID = UUID(); loadTask?.cancel(); loadTask = nil; guideTask?.cancel(); guideTask = nil; guideRequestID = nil; loading = false }
     }
 
     // MARK: - Display Model & Data Mapping
@@ -756,6 +1102,12 @@ struct IPTVLiveView: View {
         let brandColor: Color
         let logoText: String
         let streamURL: URL?
+    }
+
+    private struct IPTVGuideDisplayRow: Identifiable {
+        let channel: IPTVDisplayChannel
+        let programmes: [IPTVProgramme]
+        var id: String { channel.id }
     }
 
     private var activeSelectedChannel: IPTVDisplayChannel {
@@ -1013,6 +1365,17 @@ struct IPTVLiveView: View {
     }
 
     private func loadSampleNorwegianLineup() {
+        guideTask?.cancel()
+        guideTask = nil
+        guideRequestID = nil
+        guideByChannel = [:]
+        guideUnavailable = false
+        guideNextRefresh = nil
+        guideFailures = 0
+        selectedGuideURLs = []
+        selectedGuideNeedsSameOrigin = false
+        selectedGuideProgramme = nil
+        selectedGuideChannelID = nil
         // Pre-populates the demo source
         let demoSource = IPTVSource(
             id: UUID(),
@@ -1072,9 +1435,7 @@ struct IPTVLiveView: View {
 
     // MARK: - Guide & EPG Calculation Helpers
     private func formatTimeRange(start: Date, end: Date) -> String {
-        let fmt = DateFormatter()
-        fmt.dateFormat = "HH:mm"
-        return "\(fmt.string(from: start)) – \(fmt.string(from: end))"
+        "\(guideTimeFormatter.string(from: start)) – \(guideTimeFormatter.string(from: end))"
     }
 
     private func calculateProgress(start: Date, end: Date) -> CGFloat {
@@ -1091,7 +1452,7 @@ struct IPTVLiveView: View {
 
     private func upcomingProgrammes(for channel: IPTVChannel) -> [IPTVProgramme] {
         guard let id = channel.guideID else { return [] }
-        return guideByChannel[id]?.filter { $0.start >= guideNow }.sorted { $0.start < $1.start } ?? []
+        return Array((guideByChannel[id] ?? []).lazy.drop(while: { $0.start < guideNow }).prefix(2))
     }
 
     private func colorForName(_ name: String) -> Color {
@@ -1128,9 +1489,6 @@ struct IPTVLiveView: View {
                 // If no sources exist yet, load the mockup lineup by default so the user immediately sees the gorgeous UI!
                 loadSampleNorwegianLineup()
             }
-            // Back on the view: the first load, or a refresh or retry that is due.
-            // An empty guide after a failure waits for its retry like any other.
-            refreshGuideIfDue(now: Date())
         } catch {
             sourcesLoaded = false
             loadSampleNorwegianLineup()
@@ -1173,19 +1531,21 @@ struct IPTVLiveView: View {
         loadTask = Task { @MainActor in
             do {
                 var loaded: [IPTVChannel] = []
-                var guideURL: URL?
+                var guideURLs: [URL] = []
                 var guideNeedsSameOrigin = false
 
                 switch source.kind {
                 case .m3u:
                     let playlist = try await loader.loadPlaylist(url: url, sourceID: source.id.uuidString)
                     loaded = playlist.channels
-                    guideURL = playlist.guideURL
+                    guideURLs = playlist.guideURLs
                 case .xtream:
                     guard let u = source.username, let p = source.password else { throw IPTVSourceStoreError.invalidSource }
                     let credentials = IPTVXtreamCredentials(server: url, username: u, password: p, output: source.xtreamOutput)
                     loaded = try await xtream.loadChannels(credentials: credentials, sourceID: source.id.uuidString)
-                    guideURL = IPTVXtreamClient.guideURL(credentials: credentials)
+                    if let guideURL = IPTVXtreamClient.guideURL(credentials: credentials) {
+                        guideURLs = [guideURL]
+                    }
                     guideNeedsSameOrigin = true
                 case .stalker:
                     guard let m = source.mac else { throw IPTVSourceStoreError.invalidSource }
@@ -1221,14 +1581,18 @@ struct IPTVLiveView: View {
                 guideUnavailable = false
                 guideNextRefresh = nil
                 guideFailures = 0
-                selectedGuideURL = guideURL
+                selectedGuideURLs = guideURLs
                 selectedGuideNeedsSameOrigin = guideNeedsSameOrigin
+                selectedGuideProgramme = nil
+                selectedGuideChannelID = nil
                 selectedID = source.id
                 var keys: [String: String] = [:]
                 for channel in loaded { keys[channel.id] = IPTVFavoritesStore.key(sourceID: source.id, channelID: channel.id) }
                 favoriteKeys = keys
                 searchText = ""
-                if let guideURL { loadGuide(url: guideURL, for: source.id, channels: loaded, sameOrigin: guideNeedsSameOrigin) }
+                if !guideURLs.isEmpty {
+                    loadGuide(urls: guideURLs, for: source.id, channels: loaded, sameOrigin: guideNeedsSameOrigin)
+                }
             } catch {
                 errorMessage = "Kunne ikke laste inn kilden."
             }
@@ -1247,7 +1611,7 @@ struct IPTVLiveView: View {
             if selectedID == source.id {
                 selectedID = nil; channels = []
                 favoriteKeys = [:]
-                guideTask?.cancel(); guideTask = nil; guideRequestID = nil; guideByChannel = [:]; guideUnavailable = false; guideNextRefresh = nil; guideFailures = 0; selectedGuideURL = nil; selectedGuideNeedsSameOrigin = false
+                guideTask?.cancel(); guideTask = nil; guideRequestID = nil; guideByChannel = [:]; guideUnavailable = false; guideNextRefresh = nil; guideFailures = 0; selectedGuideURLs = []; selectedGuideNeedsSameOrigin = false; selectedGuideProgramme = nil; selectedGuideChannelID = nil
                 searchText = ""
                 loadSampleNorwegianLineup()
             }
@@ -1270,46 +1634,101 @@ struct IPTVLiveView: View {
 
     /// Fetches the guide when IPTVGuideRefreshPolicy.shouldLoad says so.
     private func refreshGuideIfDue(now: Date) {
-        guard let sourceID = selectedID, let url = selectedGuideURL,
+        guard let sourceID = selectedID, !selectedGuideURLs.isEmpty,
+              channels.contains(where: { $0.guideID != nil }),
               IPTVGuideRefreshPolicy.shouldLoad(isLoading: guideTask != nil, nextRefresh: guideNextRefresh, now: now)
         else { return }
-        loadGuide(url: url, for: sourceID, channels: channels, sameOrigin: selectedGuideNeedsSameOrigin)
+        loadGuide(urls: selectedGuideURLs, for: sourceID, channels: channels, sameOrigin: selectedGuideNeedsSameOrigin)
     }
 
-    /// Loads the guide for the selected source. The guide already shown stays
-    /// until a new one arrives; a failure keeps it and schedules a retry. An
-    /// answer only applies if it is still the latest request, for the same
-    /// source and profile.
-    private func loadGuide(url: URL, for sourceID: UUID, channels: [IPTVChannel], sameOrigin: Bool) {
+    private func retryGuide() {
+        guideNextRefresh = nil
+        refreshGuideIfDue(now: Date())
+    }
+
+    /// Loads every advertised feed. Incremental results apply only to the
+    /// active source/profile; previous useful programmes survive partial errors.
+    private func loadGuide(urls: [URL], for sourceID: UUID, channels: [IPTVChannel], sameOrigin: Bool) {
         let ids = Set(channels.compactMap(\.guideID))
-        guard !ids.isEmpty else { return }
+        guard !urls.isEmpty, !ids.isEmpty else { return }
         let now = Date()
         let window = IPTVGuideRefreshPolicy.window(around: now)
+        let previousGuideByChannel = guideByChannel
         let token = UUID()
         guideRequestID = token
         guideTask?.cancel()
         guideTask = Task { @MainActor in
-            func stillCurrent() -> Bool {
+            @MainActor func stillCurrent() -> Bool {
                 !Task.isCancelled && guideRequestID == token && selectedID == sourceID
                     && ProfileSettings.activeProfileID == profileID
             }
             do {
                 let reader = sameOrigin ? IPTVGuideLoader(session: IPTVAuthenticatedSession.shared) : guideLoader
-                let programmes = try await reader.load(url: url, channelIDs: ids, window: window)
+                let batch = try await reader.load(urls: urls, channelIDs: ids, window: window) { programmes in
+                    guard stillCurrent() else { return }
+                    guideByChannel = mergedGuide(programmes, retaining: previousGuideByChannel, at: Date())
+                    if !guideByChannel.isEmpty { guideUnavailable = false }
+                }
                 guard stillCurrent() else { return }
-                guideByChannel = Dictionary(grouping: programmes, by: \.channelID)
-                guideNow = Date()
-                guideUnavailable = false
-                guideFailures = 0
-                guideNextRefresh = IPTVGuideRefreshPolicy.nextRefresh(after: programmes, loadedAt: now)
+                let finishedAt = Date()
+                guideNow = finishedAt
+                if batch.failedFeedCount == 0 {
+                    guideByChannel = Dictionary(grouping: batch.programmes, by: \.channelID)
+                    guideFailures = 0
+                    guideNextRefresh = IPTVGuideRefreshPolicy.nextRefresh(after: batch.programmes, loadedAt: now)
+                    guideUnavailable = false
+                } else {
+                    guideByChannel = mergedGuide(batch.programmes, retaining: previousGuideByChannel, at: finishedAt)
+                    guideFailures += 1
+                    let retry = IPTVGuideRefreshPolicy.retry(afterFailures: guideFailures, at: finishedAt)
+                    guideNextRefresh = max(retry, finishedAt.addingTimeInterval(IPTVGuideRefreshPolicy.minInterval))
+                    guideUnavailable = guideByChannel.isEmpty
+                }
             } catch {
                 guard stillCurrent() else { return }
                 guideFailures += 1
-                guideNextRefresh = IPTVGuideRefreshPolicy.retry(afterFailures: guideFailures, at: Date())
+                let failedAt = Date()
+                let retry = IPTVGuideRefreshPolicy.retry(afterFailures: guideFailures, at: failedAt)
+                if urls.count > 1 {
+                    let refresh = IPTVGuideRefreshPolicy.nextRefresh(after: [], loadedAt: failedAt)
+                    guideNextRefresh = max(refresh, retry)
+                } else {
+                    guideNextRefresh = retry
+                }
                 // Programmes still on air keep showing; only say unavailable with nothing to show.
                 guideUnavailable = guideByChannel.isEmpty
             }
             guideTask = nil
         }
+    }
+
+    private func mergedGuide(
+        _ programmes: [IPTVProgramme],
+        retaining previous: [String: [IPTVProgramme]],
+        at now: Date
+    ) -> [String: [IPTVProgramme]] {
+        let lowerBound = now.addingTimeInterval(-IPTVGuideRefreshPolicy.lookBehind)
+        let upperBound = now.addingTimeInterval(IPTVGuideRefreshPolicy.lookAhead)
+        var byChannel: [String: [Date: IPTVProgramme]] = [:]
+        for (channelID, schedules) in previous {
+            for programme in schedules where programme.end > lowerBound && programme.start < upperBound {
+                byChannel[channelID, default: [:]][programme.start] = programme
+            }
+        }
+        for programme in programmes where programme.end > lowerBound && programme.start < upperBound {
+            byChannel[programme.channelID, default: [:]][programme.start] = programme
+        }
+        return byChannel.mapValues { $0.values.sorted { $0.start < $1.start } }
+    }
+}
+
+private struct IPTVGuideFocusOutline<Shape: InsettableShape>: View {
+    @Environment(\.isFocused) private var isFocused
+    let shape: Shape
+
+    var body: some View {
+        shape.strokeBorder(isFocused ? Color.white.opacity(0.95) : .clear, lineWidth: 3)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
     }
 }
