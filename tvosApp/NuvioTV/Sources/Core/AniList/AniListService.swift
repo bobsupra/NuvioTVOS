@@ -16,6 +16,14 @@ enum AniListService {
         emoji: nil
     )
 
+    /// Kitsu's mark on cards of Kitsu's rows: its whole logo, no frame.
+    static let kitsuBadge = CollectionOriginPresentation(
+        reference: CollectionOriginReference(collectionID: "kitsu", folderID: "kitsu"),
+        title: "Kitsu",
+        imageURLs: ["asset:rating_kitsu"],
+        emoji: nil
+    )
+
     /// MyAnimeList's mark on cards of MAL's rows.
     static let malBadge = CollectionOriginPresentation(
         reference: CollectionOriginReference(collectionID: "myanimelist", folderID: "myanimelist"),
@@ -29,7 +37,9 @@ enum AniListService {
     static func sourceBadge(rowID: String) -> CollectionOriginPresentation? {
         let prefix = "addon_\(addonID)_\(homeContentType)_"
         guard rowID.hasPrefix(prefix) else { return nil }
-        return rowID.dropFirst(prefix.count).hasPrefix(MALCatalogs.idPrefix) ? malBadge : searchBadge
+        let catalogId = rowID.dropFirst(prefix.count)
+        if catalogId.hasPrefix(KitsuCatalogs.idPrefix) { return kitsuBadge }
+        return catalogId.hasPrefix(MALCatalogs.idPrefix) ? malBadge : searchBadge
     }
 
     static let catalogTTL: TimeInterval = 6 * 3600
@@ -43,8 +53,9 @@ enum AniListService {
 
     private static let decoder = JSONDecoder()
 
+    /// A title built here: an AniList one, or a MyAnimeList one with MAL Titles on (`MALSource`).
     static func isAniListTitle(_ id: String) -> Bool {
-        AniListSettings.opensTitles && AniListMetaBuilder.isAniListID(id)
+        AniListSettings.opensTitles && AnimeSource.isAnimeTitleID(id)
     }
 
     private static var isAdultVariable: Bool? {
@@ -79,14 +90,15 @@ enum AniListService {
         // The offline tables, downloaded when missing or a week old (in the background).
         Task.detached(priority: .background) { await AniListOfflineMaps.shared.refreshIfStale() }
         async let mal = MALCatalogs.homeCatalogs()
-        guard AniListSettings.isEnabled else { return await mal }
+        async let kitsu = KitsuCatalogs.homeCatalogs()
+        guard AniListSettings.isEnabled else { return await mal + kitsu }
         guard !AniListCatalogs.chosen().isEmpty else {
             AniListDiagnostics.note(.home, "Off: no AniList catalog is chosen")
-            return await mal
+            return await mal + kitsu
         }
         async let lists = listCatalogs()
         let rows = await browseCatalogs()
-        return await lists + rows + mal
+        return await lists + rows + mal + kitsu
     }
 
     static func listSettingsKey(_ rowID: String) -> String {
@@ -244,6 +256,9 @@ enum AniListService {
         if catalogId.hasPrefix(MALCatalogs.idPrefix) {
             return await MALCatalogs.browse(catalogId: catalogId, skip: skip)
         }
+        if catalogId.hasPrefix(KitsuCatalogs.idPrefix) {
+            return await KitsuCatalogs.browse(catalogId: catalogId, skip: skip)
+        }
         if let listRow = AniListAccount.listRows.first(where: { $0.id == catalogId }) {
             // One of the viewer's lists: all of it at once.
             guard skip == 0, let byRow = await AniListAccount.listEntries() else {
@@ -306,7 +321,24 @@ enum AniListService {
         }
     }
 
+    /// AniList's results, then all of MyAnimeList's (MAL Titles and Search MAL on) and all of
+    /// Kitsu's (Search Kitsu on): each source shows every title it finds, also one another source
+    /// found too.
     static func search(_ query: String) async -> SearchResult {
+        async let mal = MALSource.search(query)
+        async let kitsu = KitsuSource.search(query)
+        let aniList = await searchAniList(query)
+        let fromMAL = await mal
+        let fromKitsu = await kitsu
+        return SearchResult(
+            items: aniList.items + fromMAL.items + fromKitsu.items,
+            names: aniList.names + fromMAL.names + fromKitsu.names,
+            failed: aniList.failed || fromMAL.failed || fromKitsu.failed
+        )
+    }
+
+    /// AniList's results.
+    private static func searchAniList(_ query: String) async -> SearchResult {
         guard AniListSettings.isEnabled else { return .empty }
         guard AniListSettings.searchesAniList else {
             AniListDiagnostics.note(.search, "Off: Search AniList is off")
@@ -369,10 +401,30 @@ enum AniListService {
         case notFound
     }
 
-    /// The whole title for `anilist:ID`. With "One Title", an entry inside a series gives the
-    /// series under its first entry's id.
+    /// The whole title for `anilist:ID`, or `mal:ID` built from MyAnimeList. With "One Title",
+    /// an entry inside a series gives the series under its first entry's id.
     static func metadata(id: String) async throws -> NuvioMeta? {
-        guard AniListSettings.opensTitles, let startID = AniListMetaBuilder.aniListID(from: id) else { return nil }
+        guard AniListSettings.opensTitles, let source = AnimeSource.entry(from: id)?.source,
+              source.opensTitles else { return nil }
+        return try await AnimeSource.$current.withValue(source) {
+            try await builtMetadata(id: id)
+        }
+    }
+
+    private static func builtMetadata(id: String) async throws -> NuvioMeta? {
+        guard let startID = AniListMetaBuilder.aniListID(from: id) else { return nil }
+        let source = AnimeSource.current
+        let isMAL = source != .anilist
+        let area: AniListDiagnostics.Area = source == .kitsu ? .kitsu : .mal
+        // Built before in this session: Back to a title builds its details screen anew.
+        let signature = AniListSessionCache.signature
+        if let built = AniListSessionCache.title(id, signature: signature) {
+            if isMAL { AniListDiagnostics.note(area, "\(built.meta.name) (\(id)): kept in memory") }
+            for key in built.keys {
+                AniListTitleIndex.store(metaID: key, tabLabels: built.tabLabels, seasonByEntry: built.seasonByEntry, related: built.related)
+            }
+            return built.meta
+        }
         let merge = AniListSettings.seasonMode == .merged
         let language = AniListSettings.titleLanguage
 
@@ -435,16 +487,57 @@ enum AniListService {
         }
         let tabLabels = AniListMetaBuilder.tabLabels(tabs, language: language)
         let seasonByEntry = Dictionary(uniqueKeysWithValues: tabs.enumerated().map { ($1.id, $0 + 1) })
-        let related = AniListMetaBuilder.related(tabs: tabs, language: language)
+        // MyAnimeList names relations only: the entries fetched for the chain give theirs.
+        let related = AniListMetaBuilder.related(tabs: tabs, language: language, known: isMAL ? entries : [:])
+        if isMAL {
+            let answeredBy = source == .kitsu
+                ? KitsuSource.SourceLog.summary(Array(entries.keys))
+                : MALSource.SourceLog.summary(Array(entries.keys))
+            AniListDiagnostics.note(
+                area,
+                "\(meta.name) (\(id)): \(tabs.count) tabs · \(answeredBy)"
+                    + " · background \(artwork.background == nil ? "none" : "ok")"
+            )
+        }
         // Under the series' id and its entries' too, however the title was opened.
         for key in Set([meta.id, id] + tabs.map { AniListMetaBuilder.metaID($0.id) }) {
             AniListTitleIndex.store(metaID: key, tabLabels: tabLabels, seasonByEntry: seasonByEntry, related: related)
         }
+
+        AniListSessionCache.store(
+            AniListSessionCache.Title(
+                meta: meta,
+                tabLabels: tabLabels,
+                seasonByEntry: seasonByEntry,
+                related: related,
+                keys: Array(Set([meta.id, id] + tabs.map { AniListMetaBuilder.metaID($0.id) }))
+            ),
+            finished: tabs.allSatisfy { $0.status == "FINISHED" || $0.status == "CANCELLED" },
+            // A picture that didn't load (a network failure) is asked again soon.
+            missingPictures: AniListSettings.usesEpisodeDetails && artwork.background == nil,
+            signature: signature
+        )
         return meta
     }
 
     /// Entries by id, from disk while they are fresh: finished ones keep a week, airing ones an hour.
     private static func fetchEntries(_ ids: [Int]) async throws -> [AniListMedia] {
+        let source = AnimeSource.current
+        if source != .anilist {
+            do {
+                // The viewer waits on the details: ahead of Home rows.
+                return try await AniListClient.$isInteractive.withValue(true) {
+                    if source == .kitsu { return try await KitsuSource.entries(ids) }
+                    return try await MALSource.entries(ids)
+                }
+            } catch {
+                AniListDiagnostics.note(
+                    source == .kitsu ? .kitsu : .mal,
+                    "\(source.prefix)\(ids.map { String($0) }.joined(separator: ",")): failed · \(MALSource.describe(error))"
+                )
+                throw error
+            }
+        }
         let variables: [String: Any?] = ["ids": ids, "perPage": max(ids.count, 1)]
         if let cached = await AniListClient.shared.cached(AniListQueries.entries, variables: variables),
            let media = try? decoder.decode(AniListPageResponse.self, from: cached.data).data?.Page?.media,
@@ -461,7 +554,18 @@ enum AniListService {
     /// What api.ani.zip knows about one AniList entry: its episodes, TheTVDB's pictures of the
     /// series and its TMDB id. Kept a week for finished entries, a day for the rest.
     static func aniZipMappings(entryID: Int, finished: Bool) async -> AniZipMappingsResponse? {
-        guard let url = URL(string: "https://api.ani.zip/mappings?anilist_id=\(entryID)"),
+        var key = AnimeSource.current == .mal ? "mal_id" : "anilist_id"
+        var id = entryID
+        if AnimeSource.current == .kitsu {
+            // A Kitsu entry by the AniList entry it maps to, else by its own id.
+            if let aniList = await AniListOfflineMaps.shared.aniListID(kitsu: entryID) {
+                key = "anilist_id"
+                id = aniList
+            } else {
+                key = "kitsu_id"
+            }
+        }
+        guard let url = URL(string: "https://api.ani.zip/mappings?\(key)=\(id)"),
               let data = try? await AniListClient.shared.get(url, ttl: finished ? finishedTTL : aniZipTTL) else { return nil }
         return try? decoder.decode(AniZipMappingsResponse.self, from: data)
     }
@@ -483,7 +587,7 @@ enum AniListService {
         guard !artwork.isComplete else { return artwork }
 
         // Ids from the offline tables first, then ani.zip's, then arm-server's.
-        let offline = await AniListOfflineMaps.shared.entry(aniListID: entryID)
+        let offline = await AnimeSource.offlineEntry(entryID)
         let mappings = aniZip?.mappings
         let tmdbID = (isFilm ? offline?.tmdbMovie : offline?.tmdbTV) ?? mappings?.themoviedbID
         if let tmdbID,
@@ -543,12 +647,18 @@ enum AniListService {
     /// a trailer to show when the season has none (Top Shelf). Unlike add-on ids, a different
     /// TheTVDB show is fine here.
     static func earlierSeasonIMDbIDs(metaID: String, limit: Int = 5) async -> [String] {
+        await AnimeSource.$current.withValue(AnimeSource.of(metaID)) {
+            await earlierSeasonIMDbIDsInSource(metaID: metaID, limit: limit)
+        }
+    }
+
+    private static func earlierSeasonIMDbIDsInSource(metaID: String, limit: Int) async -> [String] {
         guard AniListSettings.opensTitles, let id = AniListMetaBuilder.aniListID(from: metaID),
               var current = await prequels(of: id) else { return [] }
         var found: [String] = []
         for _ in 0..<limit {
             guard let previous = AniListMetaBuilder.previousSeason(of: current) else { break }
-            if let imdb = await AniListOfflineMaps.shared.imdb(aniListID: previous), !found.contains(imdb) {
+            if let imdb = await AnimeSource.offlineIMDb(previous), !found.contains(imdb) {
                 found.append(imdb)
             }
             guard let next = await prequels(of: previous) else { break }
@@ -558,6 +668,8 @@ enum AniListService {
     }
 
     static func prequels(of id: Int) async -> AniListMedia? {
+        if AnimeSource.current == .mal { return try? await MALSource.entry(id) }
+        if AnimeSource.current == .kitsu { return try? await KitsuSource.entry(id) }
         guard let data = try? await AniListClient.shared.query(
             AniListQueries.prequels, variables: ["id": id], ttl: finishedTTL, notesStatus: false
         ) else { return nil }
@@ -568,19 +680,35 @@ enum AniListService {
     /// tables', else ani.zip's, else arm-server's. It is never written to the title, whose streams and ratings go by its
     /// AniList id.
     static func trailerIMDbID(metaID: String) async -> String? {
+        await AnimeSource.$current.withValue(AnimeSource.of(metaID)) {
+            await trailerIMDbIDInSource(metaID: metaID)
+        }
+    }
+
+    private static func trailerIMDbIDInSource(metaID: String) async -> String? {
         guard AniListSettings.opensTitles, let id = AniListMetaBuilder.aniListID(from: metaID) else { return nil }
-        if let imdbID = await AniListOfflineMaps.shared.imdb(aniListID: id) { return imdbID }
+        if let imdbID = await AnimeSource.offlineIMDb(id) { return imdbID }
         if let imdbID = await aniZipMappings(entryID: id, finished: false)?.mappings?.imdbID {
             return imdbID
         }
         if let imdbID = await armIMDbID(aniListID: id) { return imdbID }
-        // A season too new for all of them: the earlier seasons' show.
-        return await AniListStreamIds.inherited(entryID: id)?.imdb
+        // A season too new for all of them: the earlier seasons' show (AniList's chain).
+        guard let aniList = await AnimeSource.aniListEntry(id) else { return nil }
+        return await AnimeSource.$current.withValue(.anilist) {
+            await AniListStreamIds.inherited(entryID: aniList)?.imdb
+        }
     }
 
-    /// The IMDb id arm-server has for an AniList entry. Kept a week.
+    /// The IMDb id arm-server has for an AniList entry (a MAL entry while a MAL title is
+    /// built). Kept a week.
     static func armIMDbID(aniListID: Int) async -> String? {
-        guard let url = URL(string: "https://arm.haglund.dev/api/v2/ids?source=anilist&id=\(aniListID)"),
+        let source: String
+        switch AnimeSource.current {
+        case .anilist: source = "anilist"
+        case .mal: source = "myanimelist"
+        case .kitsu: source = "kitsu"
+        }
+        guard let url = URL(string: "https://arm.haglund.dev/api/v2/ids?source=\(source)&id=\(aniListID)"),
               let data = try? await AniListClient.shared.get(url, ttl: finishedTTL) else { return nil }
         return armIMDbID(in: data)
     }
@@ -605,6 +733,12 @@ enum AniListService {
     /// The background and logo for Home's hero while an AniList card is focused, from ani.zip,
     /// TMDB and Metahub only, so moving along a row costs no AniList requests.
     static func heroArtwork(for card: NuvioMeta) async -> AniListMetaBuilder.Artwork? {
+        await AnimeSource.$current.withValue(AnimeSource.of(card.id)) {
+            await heroArtworkInSource(for: card)
+        }
+    }
+
+    private static func heroArtworkInSource(for card: NuvioMeta) async -> AniListMetaBuilder.Artwork? {
         guard AniListSettings.opensTitles, AniListSettings.usesEpisodeDetails,
               let entryID = AniListMetaBuilder.aniListID(from: card.id) else { return nil }
         let isFilm = card.type == "movie"
@@ -621,7 +755,24 @@ enum AniListService {
     /// - a Cinemeta/TMDB anime the offline tables know: the film, or the first season (the
     ///   franchise's main entry; one IMDb title stands for every season).
     /// One small request, kept a day.
+    /// The anime scores beside the others: a MyAnimeList or Kitsu title's own, else AniList's
+    /// (AniList Score), and Kitsu's (Kitsu Score) for any anime.
     static func ratings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
+        async let kitsu = kitsuRatings(for: meta)
+        let own = await sourceRatings(for: meta)
+        return own + (await kitsu)
+    }
+
+    private static func sourceRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
+        if AnimeSource.isMALTitle(meta.id) {
+            // A MyAnimeList title: its entry's own MAL score, ahead of MDBList's copy.
+            return (meta.externalRatings ?? []).filter { $0.source == MdbListDetailsService.providerMyAnimeList }
+        }
+        if AnimeSource.isKitsuTitle(meta.id) {
+            // A Kitsu title: its entry's Kitsu score (Kitsu Score on).
+            guard KitsuSettings.showsScore, AddonRatingsService.isSourceEnabled(AniListMetaBuilder.kitsuRatingSource) else { return [] }
+            return (meta.externalRatings ?? []).filter { $0.source == AniListMetaBuilder.kitsuRatingSource }
+        }
         guard AniListSettings.showsScore, AddonRatingsService.isSourceEnabled(AniListMetaBuilder.ratingSource) else { return [] }
         let id: Int
         if let own = AniListMetaBuilder.aniListID(from: meta.id) {
@@ -643,10 +794,42 @@ enum AniListService {
 
     static let scoreTTL: TimeInterval = 24 * 3600
 
+    /// Kitsu's score (Settings → Kitsu → Kitsu Score) of an anime from Cinemeta, AniList or
+    /// MyAnimeList: the Kitsu entry the offline tables map it to, its score kept a day. Needs
+    /// neither Kitsu nor MyAnimeList on. A Kitsu title carries its own.
+    static func kitsuRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
+        guard KitsuSettings.showsScore, AddonRatingsService.isSourceEnabled(AniListMetaBuilder.kitsuRatingSource),
+              !AnimeSource.isKitsuTitle(meta.id),
+              let kitsu = await kitsuEntry(for: meta),
+              let data = try? await KitsuClient.shared.get("anime/\(kitsu)", query: [("fields[anime]", "averageRating")], ttl: scoreTTL),
+              let anime = KitsuSource.document(data)?.first,
+              let score = anime.attributes?.averageRating,
+              let rating = AniListMetaBuilder.kitsuRating(entry: kitsu, score: Int(score.rounded())) else { return [] }
+        return [rating]
+    }
+
+    /// The Kitsu entry of an anime by the offline tables only: a `kitsu:` id's own, else the one
+    /// of the AniList entry its id (or Cinemeta's, TMDB's) maps to.
+    static func kitsuEntry(for meta: NuvioMeta) async -> Int? {
+        let maps = AniListOfflineMaps.shared
+        let own = AnimeSource.entry(from: meta.id)
+        if let own, own.source == .kitsu { return own.id }
+        let aniList: Int?
+        if let own, own.source == .mal {
+            aniList = await maps.aniListID(mal: own.id)
+        } else if let own {
+            aniList = own.id
+        } else {
+            aniList = await mappedEntry(for: meta)
+        }
+        guard let aniList, let kitsu = await maps.entry(aniListID: aniList)?.kitsu, kitsu > 0 else { return nil }
+        return kitsu
+    }
+
     /// The AniList entry a Cinemeta/TMDB title stands for, by the offline tables only (no
     /// request): the film, or the entry with TheTVDB's first episode, or the only entry.
     static func mappedEntry(for meta: NuvioMeta) async -> Int? {
-        guard !AniListMetaBuilder.isAniListID(meta.id) else { return nil }
+        guard !AniListMetaBuilder.isAniListID(meta.id), !AnimeSource.isOtherSourceTitle(meta.id) else { return nil }
         let imdb = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id)
         let tmdb = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:") ? Int(meta.id.dropFirst(5).prefix { $0 != ":" }) : nil)
         guard imdb != nil || tmdb != nil else { return nil }
@@ -663,6 +846,13 @@ enum AniListService {
     /// title with the IMDb and TMDB ids it maps to (they keep the whole show; Simkl also takes the
     /// `anilist:` id itself, so it keeps the season). Anything else as it is.
     static func libraryMeta(for meta: NuvioMeta) async -> NuvioMeta {
+        guard AnimeSource.isAnimeTitleID(meta.id) else { return meta }
+        return await AnimeSource.$current.withValue(AnimeSource.of(meta.id)) {
+            await libraryMetaInSource(for: meta)
+        }
+    }
+
+    private static func libraryMetaInSource(for meta: NuvioMeta) async -> NuvioMeta {
         guard let id = AniListMetaBuilder.aniListID(from: meta.id), meta.imdbId == nil || meta.tmdbId == nil else { return meta }
         let imdb: String?
         if let known = meta.imdbId {
@@ -670,7 +860,7 @@ enum AniListService {
         } else {
             imdb = await trailerIMDbID(metaID: meta.id)
         }
-        let entry = await AniListOfflineMaps.shared.entry(aniListID: id)
+        let entry = await AnimeSource.offlineEntry(id)
         let tmdb = meta.tmdbId ?? (meta.isSeries ? entry?.tmdbTV : entry?.tmdbMovie)
         guard imdb != nil || tmdb != nil else { return meta }
         return meta.withLibraryIDs(imdbId: imdb, tmdbId: tmdb)
@@ -680,15 +870,40 @@ enum AniListService {
     /// it maps to (their ratings are the whole show's), anything else as it is. nil = an AniList
     /// title nothing maps.
     static func ratingsMeta(for meta: NuvioMeta) async -> NuvioMeta? {
-        guard AniListMetaBuilder.isAniListID(meta.id) else { return meta }
+        guard AnimeSource.isAnimeTitleID(meta.id) else { return meta }
         guard let imdb = await trailerIMDbID(metaID: meta.id) else { return nil }
         return NuvioMeta(id: imdb, name: meta.name, imdbId: imdb, type: meta.isSeries ? "series" : "movie")
     }
 
     /// Characters with their Japanese voice actors, and AniList's recommendations.
     static func extras(metaID: String) async -> (people: [TmdbPersonMetadata], recommendations: [RelatedTitle]) {
-        guard AniListSettings.opensTitles, let id = AniListMetaBuilder.aniListID(from: metaID),
-              let data = await extrasAnswer(id: id),
+        guard AniListSettings.opensTitles, AnimeSource.isAnimeTitleID(metaID) else { return ([], []) }
+        return await AnimeSource.$current.withValue(AnimeSource.of(metaID)) {
+            await extrasInSource(metaID: metaID)
+        }
+    }
+
+    private static func extrasInSource(metaID: String) async -> (people: [TmdbPersonMetadata], recommendations: [RelatedTitle]) {
+        guard let id = AniListMetaBuilder.aniListID(from: metaID) else { return ([], []) }
+        let signature = AniListSessionCache.signature
+        if let kept = AniListSessionCache.extras(metaID, signature: signature) {
+            return kept
+        }
+        if AnimeSource.current == .kitsu {
+            let found = await KitsuSource.extras(entryID: id, language: AniListSettings.titleLanguage)
+            if !found.people.isEmpty || !found.recommendations.isEmpty {
+                AniListSessionCache.storeExtras(found, for: metaID, finished: true, signature: signature)
+            }
+            return found
+        }
+        if AnimeSource.current == .mal {
+            let found = await MALSource.extras(entryID: id, language: AniListSettings.titleLanguage)
+            if !found.people.isEmpty || !found.recommendations.isEmpty {
+                AniListSessionCache.storeExtras(found, for: metaID, finished: true, signature: signature)
+            }
+            return found
+        }
+        guard let data = await extrasAnswer(id: id),
               let media = try? decoder.decode(AniListMediaResponse.self, from: data).data?.Media else {
             return ([], [])
         }
@@ -713,6 +928,12 @@ enum AniListService {
             .compactMap { $0.mediaRecommendation }
             .filter { $0.type == nil || $0.type == "ANIME" }
             .map { AniListMetaBuilder.relatedTitle($0, relation: nil, language: language) }
+        AniListSessionCache.storeExtras(
+            (people, recommendations),
+            for: metaID,
+            finished: media.status == "FINISHED" || media.status == "CANCELLED",
+            signature: signature
+        )
         return (people, recommendations)
     }
 
@@ -741,8 +962,11 @@ enum AniListService {
     }
 
     static func clearCache() async {
+        AniListSessionCache.removeAll()
         AniListPeople.removeAll()
         await AniListClient.shared.clearCache()
+        await MALSource.clearCache()
+        await KitsuSource.clearCache()
     }
 
     /// Asks AniList for "Frieren" right now, past the saved answers: "OK · 5 results" or why not.
@@ -826,16 +1050,109 @@ enum AniListTitleIndex {
 
     /// The tab an entry opened from a card shows first: `anilist:182255` inside `anilist:154587`.
     static func season(ofEntry entryID: String, inMeta metaID: String) -> Int? {
-        guard let entry = AniListMetaBuilder.aniListID(from: entryID) else { return nil }
+        guard let entry = AnimeSource.entry(from: entryID)?.id else { return nil }
         lock.lock()
         defer { lock.unlock() }
         return entries[metaID.lowercased()]?.seasonByEntry[entry]
     }
 
+    /// With the pictures of MyAnimeList's related entries found since the title was built.
     static func related(metaID: String) -> [RelatedTitle] {
         lock.lock()
+        let related = entries[metaID.lowercased()]?.related ?? []
+        lock.unlock()
+        return MALSource.RelatedPictures.filled(related)
+    }
+}
+
+/// AniList titles built in this app session, with their extras (cast and recommendations), so
+/// Back to a title shows it at once: its details screen and repository are made anew and would
+/// build it again from the saved answers. Finished titles keep 6 hours, airing ones 30 minutes,
+/// one without its background 5 minutes (a picture that failed to load is asked again soon);
+/// a change of the settings that shape a title, another profile or Clear Cache drops them.
+enum AniListSessionCache {
+    struct Title {
+        let meta: NuvioMeta
+        let tabLabels: [Int: AniListMetaBuilder.TabLabel]
+        let seasonByEntry: [Int: Int]
+        let related: [RelatedTitle]
+        /// The ids it is kept under: the series', the one it was opened by and its entries'.
+        let keys: [String]
+    }
+
+    typealias Extras = (people: [TmdbPersonMetadata], recommendations: [RelatedTitle])
+
+    private struct Kept<Value> {
+        let value: Value
+        let signature: String
+        let expires: Date
+    }
+
+    static let finishedTTL: TimeInterval = 6 * 3600
+    static let airingTTL: TimeInterval = 30 * 60
+    static let missingPicturesTTL: TimeInterval = 5 * 60
+    /// Past this many ids, the expired ones go, then all of them.
+    static let limit = 300
+
+    private static let lock = NSLock()
+    private static var keptTitles: [String: Kept<Title>] = [:]
+    private static var keptExtras: [String: Kept<Extras>] = [:]
+
+    /// What a built title depends on besides AniList's answers.
+    static var signature: String {
+        [
+            ProfileSettings.activeProfileScope,
+            AniListSettings.seasonMode.rawValue,
+            AniListSettings.titleLanguage.rawValue,
+            AniListSettings.usesEpisodeDetails ? "details" : "nodetails",
+            TmdbDetailsService.useArtwork ? "tmdb-art" : "no-tmdb-art",
+        ].joined(separator: "|")
+    }
+
+    static func title(_ id: String, signature: String, now: Date = Date()) -> Title? {
+        lock.lock()
         defer { lock.unlock() }
-        return entries[metaID.lowercased()]?.related ?? []
+        guard let kept = keptTitles[id.lowercased()], kept.signature == signature, kept.expires > now else { return nil }
+        return kept.value
+    }
+
+    static func store(_ title: Title, finished: Bool, missingPictures: Bool = false, signature: String, now: Date = Date()) {
+        let lifetime = missingPictures ? missingPicturesTTL : (finished ? finishedTTL : airingTTL)
+        let kept = Kept(value: title, signature: signature, expires: now.addingTimeInterval(lifetime))
+        lock.lock()
+        defer { lock.unlock() }
+        trim(&keptTitles, now: now)
+        for key in title.keys {
+            keptTitles[key.lowercased()] = kept
+        }
+    }
+
+    static func extras(_ metaID: String, signature: String, now: Date = Date()) -> Extras? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let kept = keptExtras[metaID.lowercased()], kept.signature == signature, kept.expires > now else { return nil }
+        return kept.value
+    }
+
+    static func storeExtras(_ value: Extras, for metaID: String, finished: Bool, signature: String, now: Date = Date()) {
+        let kept = Kept(value: value, signature: signature, expires: now.addingTimeInterval(finished ? finishedTTL : airingTTL))
+        lock.lock()
+        defer { lock.unlock() }
+        trim(&keptExtras, now: now)
+        keptExtras[metaID.lowercased()] = kept
+    }
+
+    static func removeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        keptTitles.removeAll()
+        keptExtras.removeAll()
+    }
+
+    private static func trim<Value>(_ store: inout [String: Kept<Value>], now: Date) {
+        guard store.count >= limit else { return }
+        store = store.filter { $0.value.expires > now }
+        if store.count >= limit { store.removeAll() }
     }
 }
 

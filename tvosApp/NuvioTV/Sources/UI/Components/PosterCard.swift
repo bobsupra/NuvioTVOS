@@ -668,7 +668,7 @@ struct PosterCard: View {
     private var shownOrigin: CollectionOriginPresentation? {
         if let collectionOrigin, !continueIsUpNext { return collectionOrigin }
         if let sourceBadge { return sourceBadge }
-        if showsAniListOrigin, AniListMetaBuilder.isAniListID(meta.id) { return AniListService.searchBadge }
+        if showsAniListOrigin, let badge = AnimeSource.badge(for: meta.id) { return badge }
         return nil
     }
 
@@ -1673,7 +1673,7 @@ struct PosterGridCard: View {
                 // Settings → Integrations → AniList: tells AniList's results from the add-ons'
                 // copies of the same anime in Search.
                 if let badge = sourceBadge
-                    ?? (customPosterScreen == .search && AniListMetaBuilder.isAniListID(meta.id) ? AniListService.searchBadge : nil) {
+                    ?? (customPosterScreen == .search ? AnimeSource.badge(for: meta.id) : nil) {
                     CollectionOriginBadge(origin: badge)
                         .padding(10)
                 }
@@ -3686,11 +3686,23 @@ struct TitleActionsMenuContent: View {
     @State private var libraryWatchedState: Bool?
     @State private var resolvedLibraryWatchedTaskIdentity: String?
     @State private var libraryWatchedRefreshVersion = 0
+    /// "Find on AniList / MyAnimeList" for an anime the offline tables map (`AnimeFind`).
+    @State private var animeTargets: AnimeFind.Targets?
+    @State private var animeIconLoaded = false
 
     var body: some View {
         contextMenuContent
             .task(id: libraryWatchedTaskIdentity) {
                 await refreshLibraryWatchedState()
+            }
+            .task(id: meta.id) {
+                let found = await AnimeFind.targets(for: meta)
+                guard !Task.isCancelled else { return }
+                animeTargets = found
+                if found?.aniList != nil, AnimeFind.aniListIcon == nil {
+                    await AnimeFind.loadAniListIcon()
+                    animeIconLoaded = AnimeFind.aniListIcon != nil
+                }
             }
             .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
                 libraryWatchedRefreshVersion &+= 1
@@ -3791,6 +3803,8 @@ struct TitleActionsMenuContent: View {
                 Label(L10n.string("action_go_to_details", fallback: "Go to details"), systemImage: "info.circle")
             }
 
+            animeFindButtons
+
             if let onPlayManually {
                 Button {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
@@ -3832,6 +3846,8 @@ struct TitleActionsMenuContent: View {
                 Label(L10n.string("action_go_to_details", fallback: "Go to details"), systemImage: "info.circle")
             }
 
+            animeFindButtons
+
             Button {
                 scheduleWatchedToggle(desiredIsWatched: !isItemWatched)
             } label: {
@@ -3869,6 +3885,55 @@ struct TitleActionsMenuContent: View {
                     }
                 } label: {
                     Label(L10n.string("action_add_to_library", fallback: "Add to library"), systemImage: "plus")
+                }
+            }
+        }
+    }
+
+    /// The anime's AniList, MyAnimeList and Kitsu titles, each with its logo.
+    @ViewBuilder
+    private var animeFindButtons: some View {
+        let _ = animeIconLoaded
+        if let target = animeTargets?.aniList {
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                    AnimeFind.open(target, type: meta.type)
+                }
+            } label: {
+                Label {
+                    Text(L10n.string("action_find_on_anilist", fallback: "Find on AniList"))
+                } icon: {
+                    if let icon = AnimeFind.aniListIcon {
+                        Image(uiImage: icon).renderingMode(.original)
+                    } else {
+                        Image(systemName: "magnifyingglass")
+                    }
+                }
+            }
+        }
+        if let target = animeTargets?.mal {
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                    AnimeFind.open(target, type: meta.type)
+                }
+            } label: {
+                Label {
+                    Text(L10n.string("action_find_on_mal", fallback: "Find on MyAnimeList"))
+                } icon: {
+                    Image(MALEpisodeRatings.assetName).renderingMode(.original)
+                }
+            }
+        }
+        if let target = animeTargets?.kitsu {
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                    AnimeFind.open(target, type: meta.type)
+                }
+            } label: {
+                Label {
+                    Text(L10n.string("action_find_on_kitsu", fallback: "Find on Kitsu"))
+                } icon: {
+                    Image("rating_kitsu").renderingMode(.original)
                 }
             }
         }

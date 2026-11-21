@@ -35,6 +35,8 @@ struct AniListMedia: Decodable, Hashable {
     var tags: [AniListTag]? = nil
     /// The viewer's favourite (asked with their token).
     var isFavourite: Bool? = nil
+    /// MyAnimeList's score (8.62) of an entry read from MAL (`MALSource`); AniList has none.
+    var malScore: Double? = nil
 
     static func == (lhs: AniListMedia, rhs: AniListMedia) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }

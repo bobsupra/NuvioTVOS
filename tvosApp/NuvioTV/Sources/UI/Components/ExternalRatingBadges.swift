@@ -150,6 +150,15 @@ struct TvRatingVisual {
             color: Color(red: 0.11, green: 0.66, blue: 0.31),
             format: { $0 > 10 ? "\(Int($0.rounded()))%" : String(format: "%.1f", $0) }
         ),
+        // A Kitsu title's own score (`AniListMetaBuilder.kitsuRatingSource`), out of 100.
+        TvRatingVisual(
+            source: "kitsu",
+            displayName: "Kitsu",
+            assetName: "rating_kitsu",
+            iconWidth: 34,
+            color: Color(red: 0.97, green: 0.32, blue: 0.22),
+            format: { "\(Int($0.rounded()))%" }
+        ),
     ]
 
     static func visual(for source: String) -> TvRatingVisual? {
