@@ -59,6 +59,16 @@ struct MPVPlaybackLifecycleRestorePlan: Equatable {
     let shouldResume: Bool
 }
 
+/// Where the buffered part of the seek bar ends with MPV.
+enum MPVBufferedPosition {
+    /// `demuxer-cache-time` is the timestamp the demuxer's cache reaches (mpv's "cache-end"),
+    /// not a duration: the bar ends there, never before the playhead. Without it (during a
+    /// seek, before the first packets) the bar ends at the playhead.
+    static func endMs(positionMs: Int64, cacheEndMs: Int64?) -> Int64 {
+        max(positionMs, cacheEndMs ?? 0, 0)
+    }
+}
+
 enum MPVPlaybackLifecyclePolicy {
     static let restoreFailureMessage = "Playback could not resume after returning to Nuvio."
 
@@ -2462,7 +2472,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
         let duration = readDoubleProperty("duration")
         let position = readDoubleProperty("time-pos")
-        let cached = readDoubleProperty("demuxer-cache-time") ?? 0
+        let cacheEnd = readDoubleProperty("demuxer-cache-time")
         let speed = getDouble("speed")
         let paused = getFlag("pause")
         let eofReached = getFlag("eof-reached")
@@ -2519,7 +2529,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
         if let durationMs = milliseconds(from: duration),
            let positionMs = milliseconds(from: position) {
-            let cachedMs = milliseconds(from: cached) ?? 0
+            let cacheEndMs = milliseconds(from: cacheEnd)
             let previousPositionMs = lastVerifiedPositionMs
             let referenceDurationMs = max(durationMs, lastVerifiedDurationMs ?? 0)
             let implausibleEndJump = referenceDurationMs >= 60_000
@@ -2548,7 +2558,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             }
             self.durationMs = durationMs
             self.positionMs = max(positionMs, 0)
-            self.bufferedMs = max(positionMs + cachedMs, 0)
+            self.bufferedMs = MPVBufferedPosition.endMs(positionMs: positionMs, cacheEndMs: cacheEndMs)
         }
         currentSpeed = Float(speed > 0 ? speed : 1.0)
 
@@ -2584,7 +2594,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                     let totalElapsed = (now - watchdog.startTime) * 1000
                     let cacheMs = (watchdog.totalCacheWaitDuration + (watchdog.cacheWaitStartTime.map { now - $0 } ?? 0)) * 1000
                     let seekStateMs = (watchdog.seekingEndTime.flatMap { end in watchdog.seekingStartTime.map { (end - $0) * 1000 } }) ?? 0
-                    seekWatchdogLog("[SeekWatchdog][#\(watchdog.id)] ✅ Seek completed in \(String(format: "%.1f", totalElapsed))ms (seeking: \(String(format: "%.1f", seekStateMs))ms, cacheWait: \(String(format: "%.1f", cacheMs))ms) -> landed at \(positionMs)ms (target: \(watchdog.targetMs)ms, demuxerCached: \(cached)s)")
+                    seekWatchdogLog("[SeekWatchdog][#\(watchdog.id)] ✅ Seek completed in \(String(format: "%.1f", totalElapsed))ms (seeking: \(String(format: "%.1f", seekStateMs))ms, cacheWait: \(String(format: "%.1f", cacheMs))ms) -> landed at \(positionMs)ms (target: \(watchdog.targetMs)ms, demuxerCacheEnd: \(cacheEnd ?? 0)s)")
                     activeSeekWatchdog = nil
                 } else {
                     activeSeekWatchdog = watchdog

@@ -413,6 +413,14 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         )
     }
 
+    func testMPVBufferedBarEndsWhereTheCacheReaches() {
+        // 16:01 played, cache up to 16:05: the bar ends at 16:05, not at 32:06.
+        XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 961_000, cacheEndMs: 965_500), 965_500)
+        // During a seek mpv has no cache end yet, or still the old one: the playhead.
+        XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 993_000, cacheEndMs: nil), 993_000)
+        XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 993_000, cacheEndMs: 965_500), 993_000)
+    }
+
     func testMPVLifecycleRestoreWaitsForActiveAppAndSettledDisplay() {
         XCTAssertFalse(MPVPlaybackLifecyclePolicy.canIssueRestore(
             pending: true,
