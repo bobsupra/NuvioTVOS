@@ -15,8 +15,8 @@ enum IPTVXMLTVError: Error, Equatable { case invalidDocument, tooLarge }
 /// Reads only programmes relevant to the requested channels and time window.
 /// Does not fetch a guide or persist it; callers decide how to handle failure.
 enum IPTVXMLTV {
-    static let maximumBytes = 16 * 1024 * 1024
-    static let maximumProgrammes = 100_000
+    static let maximumXMLBytes = 128 * 1024 * 1024
+    static let maximumProgrammes = 150_000
     private static let epgShareChannelIDRegex = try! NSRegularExpression(
         pattern: #"^(.+)\.[^.]+\.\(([A-Z]{2}),[^()]+\)\.([a-z]{2})$"#
     )
@@ -27,10 +27,42 @@ enum IPTVXMLTV {
         window: Range<Date>,
         allowEPGShareAliases: Bool = false
     ) throws -> [IPTVProgramme] {
-        guard data.count <= maximumBytes else { throw IPTVXMLTVError.tooLarge }
+        guard data.count <= maximumXMLBytes else { throw IPTVXMLTVError.tooLarge }
+        let parser = XMLParser(data: data)
+        return try parse(
+            parser,
+            channelIDs: channelIDs,
+            window: window,
+            allowEPGShareAliases: allowEPGShareAliases
+        )
+    }
+
+    static func parse(
+        contentsOf fileURL: URL,
+        byteCount: Int,
+        channelIDs: Set<String>,
+        window: Range<Date>,
+        allowEPGShareAliases: Bool = false
+    ) throws -> [IPTVProgramme] {
+        guard byteCount <= maximumXMLBytes else { throw IPTVXMLTVError.tooLarge }
+        guard let stream = InputStream(url: fileURL) else { throw IPTVXMLTVError.invalidDocument }
+        let parser = XMLParser(stream: stream)
+        return try parse(
+            parser,
+            channelIDs: channelIDs,
+            window: window,
+            allowEPGShareAliases: allowEPGShareAliases
+        )
+    }
+
+    private static func parse(
+        _ parser: XMLParser,
+        channelIDs: Set<String>,
+        window: Range<Date>,
+        allowEPGShareAliases: Bool
+    ) throws -> [IPTVProgramme] {
         let aliases = allowEPGShareAliases ? channelAliases(for: channelIDs) : [:]
         let reader = Reader(channelIDs: channelIDs, aliases: aliases, window: window)
-        let parser = XMLParser(data: data)
         parser.delegate = reader
         parser.shouldResolveExternalEntities = false
         guard parser.parse(), reader.sawRoot else {
