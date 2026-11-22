@@ -464,6 +464,8 @@ class DetailsViewModel: ObservableObject {
     /// The pictures a MyAnimeList title's Related row is waiting for (`fillMALRelatedPictures`).
     private var relatedPicturesTask: Task<Void, Never>?
     private var relatedPicturesRequest: String?
+    /// The anime reviews asked for this title (`loadAnimeReviews`).
+    private var animeReviewsRequest: String?
     private(set) var watchlistMutationTask: Task<Void, Never>?
     /// Invalidates every asynchronous completion from an older details load.
     /// This is intentionally separate from the content id: the same title can
@@ -608,6 +610,8 @@ class DetailsViewModel: ObservableObject {
                 // Built now, with its Related row: the pictures MAL's relations lack (the card it
                 // opened from had no row to fill yet).
                 self.fillMALRelatedPictures(for: resolvedMeta, generation: requestGeneration)
+                // And an anime's reviews by the full title's ids (a Cinemeta card may lack them).
+                self.loadAnimeReviews(for: resolvedMeta, generation: requestGeneration)
 
                 // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
                 // reload them immediately with the resolved canonical stream id.
@@ -687,6 +691,7 @@ class DetailsViewModel: ObservableObject {
         relatedPicturesTask?.cancel()
         relatedPicturesTask = nil
         relatedPicturesRequest = nil
+        animeReviewsRequest = nil
         uiState.isLoadingEnrichment = false
         prefetchedStreamId = nil
         prefetchedEpisode = nil
@@ -868,6 +873,8 @@ class DetailsViewModel: ObservableObject {
             guard self.detailsRequestGeneration == generation,
                   self.uiState.meta?.id == meta.id else { return }
             TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
+            // AniList's and MAL's reviews of an anime, whichever source the title is from.
+            self.loadAnimeReviews(for: meta, generation: generation)
             self.uiState.isLoadingEnrichment = true
             defer {
                 if self.detailsRequestGeneration == generation {
@@ -1057,6 +1064,36 @@ class DetailsViewModel: ObservableObject {
             }
             guard let self, self.relatedPicturesRequest == request else { return }
             self.relatedPicturesTask = nil
+        }
+    }
+
+    /// AniList's and MAL's reviews of an anime (AniList Reviews, MAL Reviews), apart from the
+    /// rest: an AniList, MAL or Kitsu title, or a Cinemeta anime the offline tables map. Asked with
+    /// the card the details opened from and again with the full title (its IMDb and TMDB ids), once
+    /// each per load; a try that found nothing doesn't keep the next one out. Kept while the
+    /// details stay on this load.
+    private func loadAnimeReviews(for meta: NuvioMeta, generation: UInt64) {
+        let wantsAniList = AnimeReviews.showsAniList
+        let wantsMAL = AnimeReviews.showsMAL
+        guard wantsAniList || wantsMAL else { return }
+        let request = [
+            String(generation), meta.id.lowercased(), meta.imdbId ?? "", meta.tmdbId.map(String.init) ?? "",
+            String(wantsAniList), String(wantsMAL),
+        ].joined(separator: "|")
+        guard animeReviewsRequest != request else { return }
+        animeReviewsRequest = request
+        Task { @MainActor [weak self] in
+            let found = await AnimeReviews.reviews(for: meta)
+            if !found.aniList.isEmpty, AnimeFind.aniListIcon == nil {
+                await AnimeFind.loadAniListIcon()
+            }
+            guard let self, self.detailsRequestGeneration == generation else { return }
+            guard !found.aniList.isEmpty || !found.mal.isEmpty else {
+                if self.animeReviewsRequest == request { self.animeReviewsRequest = nil }
+                return
+            }
+            if !found.aniList.isEmpty { self.uiState.aniListReviews = found.aniList }
+            if !found.mal.isEmpty { self.uiState.malReviews = found.mal }
         }
     }
 
