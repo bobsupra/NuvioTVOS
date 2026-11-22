@@ -27,7 +27,15 @@ final class BackGuardHostView: UIView, UIGestureRecognizerDelegate {
     /// A Back this soon after the previous one lands while what that one closed is still closing.
     static let closingWithin: CFTimeInterval = 1.0
 
-    private var recognizers: [(window: UIWindow, tap: UITapGestureRecognizer)] = []
+    /// A guarded window and its tap. The window is held weakly: tvOS shows a short-lived
+    /// `_UISnapshotWindow` on every tab switch, and holding those strongly kept each one, with
+    /// its ~40 MB of snapshots, alive for the life of the app.
+    private struct Guarded {
+        weak var window: UIWindow?
+        let tap: UITapGestureRecognizer
+    }
+
+    private var recognizers: [Guarded] = []
     private var windowObserver: NSObjectProtocol?
     private var lastBack: CFTimeInterval = -.infinity
     private var lastSwallow: CFTimeInterval = -.infinity
@@ -54,18 +62,21 @@ final class BackGuardHostView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func guardWindow(_ window: UIWindow) {
-        recognizers.removeAll { $0.window !== window && $0.window.windowScene == nil }
+        recognizers.removeAll { entry in
+            guard let guarded = entry.window else { return true }
+            return guarded !== window && guarded.windowScene == nil
+        }
         guard !recognizers.contains(where: { $0.window === window }) else { return }
         let tap = UITapGestureRecognizer(target: self, action: #selector(swallowed(_:)))
         tap.allowedPressTypes = [NSNumber(value: UIPress.PressType.menu.rawValue)]
         tap.allowedTouchTypes = []
         tap.delegate = self
         window.addGestureRecognizer(tap)
-        recognizers.append((window, tap))
+        recognizers.append(Guarded(window: window, tap: tap))
     }
 
     func removeRecognizers() {
-        for entry in recognizers { entry.window.removeGestureRecognizer(entry.tap) }
+        for entry in recognizers { entry.window?.removeGestureRecognizer(entry.tap) }
         recognizers.removeAll()
         if let windowObserver { NotificationCenter.default.removeObserver(windowObserver) }
         windowObserver = nil
