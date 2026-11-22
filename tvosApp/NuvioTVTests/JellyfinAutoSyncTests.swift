@@ -383,7 +383,7 @@ final class JellyfinAutoSyncTests: XCTestCase {
             requestedStartIndices.append(startIndex)
             if startIndex == "1", failSecondPageOnce {
                 failSecondPageOnce = false
-                return (HTTPURLResponse(url: url, statusCode: 503, httpVersion: nil, headerFields: nil)!, Data("temporary failure".utf8))
+                return (HTTPURLResponse(url: url, statusCode: 500, httpVersion: nil, headerFields: nil)!, Data("temporary failure".utf8))
             }
             let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
             let body = startIndex == "0"

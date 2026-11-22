@@ -830,7 +830,7 @@ actor PlaybackStreamCacheServer {
         }
 
         // Tier 3: Archive (Fills whole title from 0 to end in background)
-        archiveTask = Task(priority: .background) { [weak self] in
+        archiveTask = Task(priority: .utility) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
                 let didDispatch = await self.performArchiveStep()
@@ -991,7 +991,7 @@ actor PlaybackStreamCacheServer {
         var scanCursor = min(max(0, archiveScanCursor ?? playheadChunk), total - 1)
         archiveScanCursor = scanCursor
         var scannedChunks = 0
-        let scanLimit = min(total, max(32, archiveSlots * maxBatchChunks * 8))
+        let scanLimit = min(total, max(128, archiveSlots * maxBatchChunks * 8))
         while scannedChunks < scanLimit && dispatched < archiveSlots {
             if Task.isCancelled { return dispatched > 0 }
             let chunk = scanCursor
