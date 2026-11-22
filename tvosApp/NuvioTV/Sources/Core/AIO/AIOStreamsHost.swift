@@ -330,7 +330,7 @@ final class AIOStreamsHost: ObservableObject {
         supports: (String) -> Bool
     ) -> [String] {
         let own = supports(videoId) ? videoId : nil
-        guard videoId.hasPrefix("anilist:") || AnimeSource.isMALTitle(videoId) else { return own.map { [$0] } ?? [] }
+        guard videoId.hasPrefix("anilist:") || AnimeSource.isOtherSourceTitle(videoId) else { return own.map { [$0] } ?? [] }
         let usable = alternatives.filter { $0 != videoId && supports($0) }
         let converted = usable.first { $0.hasPrefix("tt") } ?? usable.first
         switch request {

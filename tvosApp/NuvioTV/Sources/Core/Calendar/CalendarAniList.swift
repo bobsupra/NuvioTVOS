@@ -51,12 +51,15 @@ struct CalendarAniList: Sendable {
     /// The library titles this source takes from TMDB: AniList series, and MyAnimeList series
     /// (by the AniList entries they map to).
     static func handles(_ item: CalendarItem) -> Bool {
-        item.kind == .series && (AniListMetaBuilder.isAniListID(item.id) || AnimeSource.isMALTitle(item.id))
+        item.kind == .series && (AniListMetaBuilder.isAniListID(item.id) || AnimeSource.isOtherSourceTitle(item.id))
     }
 
     /// The AniList entry of a followed title: its own, or its MAL entry's (offline tables).
     static func aniListEntry(of item: CalendarItem) async -> Int? {
         if let id = AniListMetaBuilder.aniListID(from: item.id) { return id }
+        if AnimeSource.isKitsuTitle(item.id), let kitsu = AnimeSource.kitsuID(from: item.id) {
+            return await AniListOfflineMaps.shared.aniListID(kitsu: kitsu)
+        }
         guard AnimeSource.isMALTitle(item.id), let mal = AnimeSource.malID(from: item.id) else { return nil }
         return await AniListOfflineMaps.shared.aniListID(mal: mal)
     }

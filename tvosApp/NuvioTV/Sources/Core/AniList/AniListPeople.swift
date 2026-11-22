@@ -58,25 +58,29 @@ enum AniListPeople {
         } else {
             return nil
         }
-        let isMAL = person.peopleSource == AnimeSource.mal.rawValue
-        let key = [isMAL ? "mal" : "anilist", kind, language.rawValue, showsAdult ? "adult" : "safe", collapses ? "merged" : "each"].joined(separator: "|")
+        let source = person.peopleSource.flatMap(AnimeSource.init(rawValue:)) ?? .anilist
+        let isMAL = source != .anilist
+        let key = [source.rawValue, kind, language.rawValue, showsAdult ? "adult" : "safe", collapses ? "merged" : "each"].joined(separator: "|")
         if let cached = kept(key) { return cached }
 
         let page: Page?
         if isMAL {
-            // A MyAnimeList title's cast: MAL's people and characters, whose titles open as MAL's.
-            let adult = MALSettings.showsAdult
+            // A MyAnimeList or Kitsu title's cast: that source's people and characters, whose
+            // titles open as that source's.
+            let adult = source == .kitsu ? KitsuSettings.showsAdult : MALSettings.showsAdult
             if let id = person.aniListStaffID {
-                let staff = await MALSource.staff(id)
+                let staff: AniListStaff?
+                if source == .kitsu { staff = await KitsuSource.staff(id) } else { staff = await MALSource.staff(id) }
                 page = staff.map { found in
-                    AnimeSource.$current.withValue(.mal) {
+                    AnimeSource.$current.withValue(source) {
                         staffPage(found, fallbackName: person.role ?? person.name, language: language, showsAdult: adult, collapsesSeasons: collapses)
                     }
                 }
             } else if let id = person.aniListCharacterID {
-                let character = await MALSource.character(id)
+                let character: AniListCharacter?
+                if source == .kitsu { character = await KitsuSource.character(id) } else { character = await MALSource.character(id) }
                 page = character.map { found in
-                    AnimeSource.$current.withValue(.mal) {
+                    AnimeSource.$current.withValue(source) {
                         characterPage(found, fallbackName: person.name, language: language, showsAdult: adult, collapsesSeasons: collapses)
                     }
                 }

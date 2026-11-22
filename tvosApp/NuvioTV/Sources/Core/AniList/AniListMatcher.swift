@@ -252,30 +252,47 @@ enum AniListScrobbler {
         let label: String
         /// The MAL entry of a MyAnimeList title (`mal:ID`), written to the MAL list as it is.
         var malID: Int? = nil
+        /// The Kitsu entry of a Kitsu title (`kitsu:ID`), written to the Kitsu library as it is.
+        var kitsuID: Int? = nil
 
         var hasAniListEntry: Bool { entryID > 0 }
     }
 
     /// The AniList entry and episode of what is playing or shown.
     static func target(meta: NuvioMeta, video: NuvioVideo?, season: Int?, episode: Int?) async -> Target? {
-        if AnimeSource.isMALTitle(meta.id) {
-            // A MyAnimeList title: its MAL entry, and the AniList entry it maps to.
-            let malEntry: Int
+        if let own = AnimeSource.entry(from: meta.id), own.source != .anilist, own.source.opensTitles {
+            // A MyAnimeList or Kitsu title: its own entry, and the AniList entry it maps to.
+            let sourceEntry: Int
             let number: Int
             let label: String
-            if let video, let id = AnimeSource.malID(from: video.id), let found = AniListAccount.episodeNumber(in: video.id) {
-                malEntry = id
-                number = found
-                label = "E\(found)"
-            } else if !meta.isSeries, let id = AnimeSource.malID(from: meta.id) {
-                malEntry = id
+            if let video, let found = AnimeSource.entry(from: video.id), found.source == own.source,
+               let episodeNumber = AniListAccount.episodeNumber(in: video.id) {
+                sourceEntry = found.id
+                number = episodeNumber
+                label = "E\(episodeNumber)"
+            } else if !meta.isSeries {
+                sourceEntry = own.id
                 number = 1
                 label = meta.name
             } else {
                 return nil
             }
-            let aniList = await AniListOfflineMaps.shared.aniListID(mal: malEntry) ?? 0
-            return Target(entryID: aniList, episode: number, label: label, malID: malEntry)
+            let maps = AniListOfflineMaps.shared
+            let aniList: Int?
+            if own.source == .mal {
+                aniList = await maps.aniListID(mal: sourceEntry)
+            } else {
+                aniList = await maps.aniListID(kitsu: sourceEntry)
+            }
+            var offline: AniListOfflineMaps.Entry?
+            if let aniList { offline = await maps.entry(aniListID: aniList) }
+            return Target(
+                entryID: aniList ?? 0,
+                episode: number,
+                label: label,
+                malID: own.source == .mal ? sourceEntry : offline?.mal,
+                kitsuID: own.source == .kitsu ? sourceEntry : offline?.kitsu
+            )
         }
         if AniListMetaBuilder.isAniListID(meta.id) {
             if let video, let entryID = AniListMetaBuilder.aniListID(from: video.id),
@@ -311,8 +328,9 @@ enum AniListScrobbler {
             if AniListSettings.scrobbles, target.hasAniListEntry {
                 await AniListAccount.perform(.watched(episode: target.episode, byPlaying: true), entryID: target.entryID, reason: "Watched \(target.label)")
             }
-            // And on MyAnimeList, when logged in there too.
+            // And on MyAnimeList and Kitsu, when logged in there too.
             await malWatched(target, episode: target.episode)
+            await kitsuWatched(target, episode: target.episode)
         }
     }
 
@@ -330,8 +348,10 @@ enum AniListScrobbler {
             }
             if watched {
                 await malWatched(target, episode: target.episode)
+                await kitsuWatched(target, episode: target.episode)
             } else {
                 await malUnwatched(target, episode: target.episode)
+                await kitsuUnwatched(target, episode: target.episode)
             }
         }
     }
@@ -345,7 +365,7 @@ enum AniListScrobbler {
             var byEntry: [String: (target: Target, episodes: [Int])] = [:]
             for video in videos.sorted(by: { $0.episode < $1.episode }) {
                 guard let target = await target(meta: meta, video: video, season: video.season, episode: video.episode) else { continue }
-                let key = "\(target.entryID)|\(target.malID ?? 0)"
+                let key = "\(target.entryID)|\(target.malID ?? 0)|\(target.kitsuID ?? 0)"
                 byEntry[key, default: (target, [])].episodes.append(target.episode)
             }
             for (_, entry) in byEntry {
@@ -358,8 +378,10 @@ enum AniListScrobbler {
                 }
                 if watched {
                     await malWatched(entry.target, episode: last)
+                    await kitsuWatched(entry.target, episode: last)
                 } else {
                     await malUnwatched(entry.target, episode: first)
+                    await kitsuUnwatched(entry.target, episode: first)
                 }
             }
         }
@@ -369,15 +391,33 @@ enum AniListScrobbler {
     private static func malWatched(_ target: Target, episode: Int) async {
         if let mal = target.malID {
             await MALAccount.watched(mal: mal, episode: episode)
-        } else {
+        } else if target.hasAniListEntry {
             await MALAccount.watched(aniListID: target.entryID, episode: episode)
         }
+    }
+
+    /// The Kitsu library: a Kitsu title's own entry, else the one the AniList entry maps to.
+    private static func kitsuEntry(_ target: Target) async -> Int? {
+        guard KitsuAccount.isLoggedIn, KitsuSettings.scrobbles else { return nil }
+        if let kitsu = target.kitsuID { return kitsu }
+        guard target.hasAniListEntry else { return nil }
+        return await AniListOfflineMaps.shared.entry(aniListID: target.entryID)?.kitsu
+    }
+
+    private static func kitsuWatched(_ target: Target, episode: Int) async {
+        guard let kitsu = await kitsuEntry(target) else { return }
+        await KitsuAccount.watched(kitsu: kitsu, episode: episode)
+    }
+
+    private static func kitsuUnwatched(_ target: Target, episode: Int) async {
+        guard let kitsu = await kitsuEntry(target) else { return }
+        await KitsuAccount.unwatched(kitsu: kitsu, episode: episode)
     }
 
     private static func malUnwatched(_ target: Target, episode: Int) async {
         if let mal = target.malID {
             await MALAccount.unwatched(mal: mal, episode: episode)
-        } else {
+        } else if target.hasAniListEntry {
             await MALAccount.unwatched(aniListID: target.entryID, episode: episode)
         }
     }

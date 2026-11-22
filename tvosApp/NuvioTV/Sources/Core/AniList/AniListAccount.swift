@@ -414,7 +414,7 @@ enum AniListAccount {
     /// The episode number in `anilist:ENTRY:EP`.
     static func episodeNumber(in id: String) -> Int? {
         let parts = id.split(separator: ":")
-        guard parts.count >= 3, ["anilist", "mal"].contains(parts[0].lowercased()) else { return nil }
+        guard parts.count >= 3, AnimeSource(rawValue: parts[0].lowercased()) != nil else { return nil }
         return Int(parts[2])
     }
 

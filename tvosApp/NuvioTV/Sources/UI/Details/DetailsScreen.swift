@@ -4486,6 +4486,23 @@ struct TvDetailsContent: View {
     @State private var malStatus: MALAccount.ListStatus?
     @State private var showingMALMenu = false
     @State private var showingMALScore = false
+    @State private var kitsuID: Int?
+    @State private var kitsuEntry: KitsuAccount.Entry?
+    @State private var showingKitsuMenu = false
+    @State private var showingKitsuScore = false
+
+    /// The Kitsu button's menus, joined to the MAL button's (one modifier in the body's chain).
+    private func kitsuMenus(_ meta: NuvioMeta) -> TvDetailsKitsuMenus {
+        TvDetailsKitsuMenus(
+            title: aniListTarget?.label ?? meta.name,
+            entryID: aniListTarget?.entryID,
+            kitsuEntry: aniListTarget?.kitsuID ?? (AnimeSource.isKitsuTitle(meta.id) ? AnimeSource.kitsuID(from: meta.id) : nil),
+            kitsuID: $kitsuID,
+            entry: $kitsuEntry,
+            showingMenu: $showingKitsuMenu,
+            showingScore: $showingKitsuScore
+        )
+    }
     @State private var consumedInitialPlayRequestID: UInt?
     @State private var detailsFocusMoveGeneration = 0
     @State private var pendingPlayFocusGeneration: Int?
@@ -4829,8 +4846,10 @@ struct TvDetailsContent: View {
                 // MyAnimeList title onto its own MAL entry.
                 let openedTitle = openedID ?? meta.id
                 let malEntry = aniListTarget?.malID ?? (AnimeSource.isMALTitle(openedTitle) ? AnimeSource.malID(from: openedTitle) : nil)
+                let kitsuAnime = aniListTarget?.kitsuID ?? (AnimeSource.isKitsuTitle(openedTitle) ? AnimeSource.kitsuID(from: openedTitle) : nil)
                 let aniListEntry = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedTitle)
-                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn, malEntry != nil || aniListEntry != nil {
+                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn || KitsuAccount.isLoggedIn,
+                   malEntry != nil || aniListEntry != nil || kitsuAnime != nil {
                     let added = !uiState.isInWatchlist
                     Task {
                         if AniListAccount.isLoggedIn, let aniListEntry, aniListEntry > 0 {
@@ -4840,6 +4859,13 @@ struct TvDetailsContent: View {
                             await MALAccount.libraryChanged(mal: malEntry, added: added)
                         } else if let aniListEntry, aniListEntry > 0 {
                             await MALAccount.libraryChanged(aniListID: aniListEntry, added: added)
+                        }
+                        if KitsuAccount.isLoggedIn {
+                            var kitsu = kitsuAnime
+                            if kitsu == nil, let aniListEntry, aniListEntry > 0 {
+                                kitsu = await AniListOfflineMaps.shared.entry(aniListID: aniListEntry)?.kitsu
+                            }
+                            if let kitsu { await KitsuAccount.libraryChanged(kitsu: kitsu, added: added) }
                         }
                     }
                 }
@@ -4865,6 +4891,12 @@ struct TvDetailsContent: View {
                 cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 showingMALMenu = true
+            } : nil,
+            kitsuTitle: KitsuAccount.buttonTitle(kitsuEntry),
+            onKitsuClick: (KitsuSettings.showsDetailsButton && kitsuID != nil) ? {
+                cancelFocusRestoration()
+                stopBackgroundTrailer(manual: false)
+                showingKitsuMenu = true
             } : nil,
             onTrailerClick: {
                 cancelFocusRestoration()
@@ -5644,7 +5676,7 @@ struct TvDetailsContent: View {
                 status: $malStatus,
                 showingMenu: $showingMALMenu,
                 showingScore: $showingMALScore
-            ))
+            ).concat(kitsuMenus(meta)))
             .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
@@ -6635,7 +6667,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, shuffle, party, watchlist, watched, rate, anilist, mal, trailer
+    case play, shuffle, party, watchlist, watched, rate, anilist, mal, kitsu, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -6665,6 +6697,9 @@ private struct TvDetailsActionRow: View {
     /// Settings → Anime Integrations → MyAnimeList: the viewer's MAL status ("Watching 5/12").
     var malTitle: String? = nil
     var onMALClick: (() -> Void)? = nil
+    /// Settings → Anime Integrations → Kitsu: the viewer's Kitsu status.
+    var kitsuTitle: String? = nil
+    var onKitsuClick: (() -> Void)? = nil
     let onTrailerClick: () -> Void
     var onBack: (() -> Void)? = nil
     var focus: FocusState<DetailsActionFocus?>.Binding
@@ -6793,6 +6828,24 @@ private struct TvDetailsActionRow: View {
                 .disabled(entryLocked)
             }
 
+            if let onKitsuClick {
+                TvDetailsActionButton(
+                    title: kitsuTitle,
+                    systemName: "k.circle.fill",
+                    iconAsset: "rating_kitsu",
+                    accessibilityLabel: kitsuTitle.map { "Kitsu: \($0)" } ?? "Kitsu",
+                    accessibilityHint: "Changes this title in your Kitsu library",
+                    isPrimary: false,
+                    isWide: true,
+                    focus: focus,
+                    tag: .kitsu,
+                    action: onKitsuClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
+
             TvDetailsActionButton(
                 title: nil,
                 systemName: isWatched ? "eye.fill" : "eye.slash.fill",
@@ -6847,7 +6900,7 @@ private struct TvDetailsAniListMenus: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .task(id: "\(meta.id)|\(episode?.id ?? "")|\(AniListAccount.login?.viewerID ?? 0)|\(MALAccount.login?.userName ?? "")") {
+            .task(id: "\(meta.id)|\(episode?.id ?? "")|\(AniListAccount.login?.viewerID ?? 0)|\(MALAccount.login?.userName ?? "")|\(KitsuAccount.login?.userName ?? "")") {
                 target = await Self.findTarget(meta: meta, episode: episode)
                 if AniListAccount.isLoggedIn, let target, target.hasAniListEntry, !AniListAccount.hasAsked(target.entryID) {
                     await AniListAccount.refreshStates(ids: [target.entryID])
@@ -6921,20 +6974,126 @@ private struct TvDetailsAniListMenus: ViewModifier {
     /// The AniList entry and episode of the play target: an AniList title's own, a Cinemeta
     /// anime's as AniList knows it, an AniList series' first entry before any episode.
     private static func findTarget(meta: NuvioMeta, episode: NuvioVideo?) async -> AniListScrobbler.Target? {
-        guard AniListAccount.isLoggedIn || MALAccount.isLoggedIn else { return nil }
+        guard AniListAccount.isLoggedIn || MALAccount.isLoggedIn || KitsuAccount.isLoggedIn else { return nil }
         if let found = await AniListScrobbler.target(meta: meta, video: episode, season: episode?.season, episode: episode?.episode) {
             return found
         }
         if AniListMetaBuilder.isAniListID(meta.id), let first = AniListAccount.entryIDs(of: meta).first {
             return AniListScrobbler.Target(entryID: first, episode: 0, label: meta.name)
         }
-        // A MyAnimeList series before any episode: its first entry.
-        if AnimeSource.isMALTitle(meta.id),
-           let first = meta.videos?.lazy.compactMap({ AnimeSource.malID(from: $0.id) }).first ?? AnimeSource.malID(from: meta.id) {
-            let aniList = await AniListOfflineMaps.shared.aniListID(mal: first) ?? 0
-            return AniListScrobbler.Target(entryID: aniList, episode: 0, label: meta.name, malID: first)
+        // A MyAnimeList or Kitsu series before any episode: its first entry.
+        if let own = AnimeSource.entry(from: meta.id), own.source != .anilist, own.source.opensTitles {
+            let first = meta.videos?.lazy.compactMap({ video -> Int? in
+                guard let found = AnimeSource.entry(from: video.id), found.source == own.source else { return nil }
+                return found.id
+            }).first ?? own.id
+            let maps = AniListOfflineMaps.shared
+            let aniList: Int?
+            if own.source == .mal {
+                aniList = await maps.aniListID(mal: first)
+            } else {
+                aniList = await maps.aniListID(kitsu: first)
+            }
+            var offline: AniListOfflineMaps.Entry?
+            if let aniList { offline = await maps.entry(aniListID: aniList) }
+            return AniListScrobbler.Target(
+                entryID: aniList ?? 0,
+                episode: 0,
+                label: meta.name,
+                malID: own.source == .mal ? first : offline?.mal,
+                kitsuID: own.source == .kitsu ? first : offline?.kitsu
+            )
         }
         return nil
+    }
+}
+
+/// Details' Kitsu button: the viewer's status of this title in their Kitsu library, and its score.
+private struct TvDetailsKitsuMenus: ViewModifier {
+    let title: String
+    let entryID: Int?
+    /// A Kitsu title's own entry.
+    var kitsuEntry: Int? = nil
+    @Binding var kitsuID: Int?
+    @Binding var entry: KitsuAccount.Entry?
+    @Binding var showingMenu: Bool
+    @Binding var showingScore: Bool
+    @State private var revision = 0
+
+    func body(content: Content) -> some View {
+        content
+            .task(id: "\(entryID ?? 0)|\(kitsuEntry ?? 0)|\(KitsuAccount.login?.userName ?? "")|\(revision)") {
+                var found = kitsuEntry
+                if found == nil, let entryID, entryID > 0 {
+                    found = await AniListOfflineMaps.shared.entry(aniListID: entryID)?.kitsu
+                }
+                guard KitsuSettings.showsDetailsButton, let kitsu = found else {
+                    kitsuID = nil
+                    entry = nil
+                    return
+                }
+                kitsuID = kitsu
+                entry = await KitsuAccount.entry(kitsu: kitsu)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: KitsuAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+                revision &+= 1
+            }
+            .confirmationDialog("Kitsu: \(title)", isPresented: $showingMenu, titleVisibility: .visible) {
+                menuButtons
+            } message: {
+                Text(message)
+            }
+            .confirmationDialog("Score on Kitsu", isPresented: $showingScore, titleVisibility: .visible) {
+                scoreButtons
+            }
+    }
+
+    @ViewBuilder
+    private var menuButtons: some View {
+        if let kitsuID {
+            let current = entry?.status
+            ForEach(KitsuAccount.statuses, id: \.self) { value in
+                Button(KitsuAccount.statusLabel(value) + (current == value ? " ✓" : "")) {
+                    let known = entry
+                    Task { await KitsuAccount.setStatus(value, kitsu: kitsuID, current: known) }
+                }
+            }
+            Button(L10n.string("details_anime_score", fallback: "Score…")) { showingScore = true }
+            if current != nil {
+                Button(L10n.string("details_anime_remove_list", fallback: "Remove from List"), role: .destructive) {
+                    Task { await KitsuAccount.remove(kitsu: kitsuID) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var scoreButtons: some View {
+        if let kitsuID {
+            let score = (entry?.rating ?? 0) / 2
+            ForEach(Array(stride(from: 10, through: 1, by: -1)), id: \.self) { value in
+                Button("\(value)/10" + (score == value ? " ✓" : "")) {
+                    let known = entry
+                    Task { await KitsuAccount.setScore(value, kitsu: kitsuID, current: known) }
+                }
+            }
+            Button(L10n.string("details_anime_remove_score", fallback: "Remove Score"), role: .destructive) {
+                let known = entry
+                Task { await KitsuAccount.setScore(0, kitsu: kitsuID, current: known) }
+            }
+        }
+    }
+
+    private var message: String {
+        guard let entry, let current = entry.status else { return L10n.string("details_anime_not_on_list", fallback: "Not on your list yet") }
+        var parts = [KitsuAccount.statusLabel(current)]
+        parts.append(entry.episodes > 0
+            ? L10n.format("details_anime_episodes_progress", fallback: "%1$d/%2$d episodes", entry.progress, entry.episodes)
+            : L10n.format("details_anime_episodes_count", fallback: "%d episodes", entry.progress))
+        if let rating = entry.rating, rating > 0 {
+            parts.append(L10n.format("details_anime_score_format", fallback: "Score %d/10", rating / 2))
+        }
+        return parts.joined(separator: " · ")
     }
 }
 

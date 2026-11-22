@@ -16,8 +16,25 @@ struct CollectionOriginBadge: View {
         return String(only.dropFirst("asset:".count))
     }
 
+    /// App logos drawn small inside the round dark backing the AniList mark has: Kitsu's orange
+    /// fox, which is lost on orange and red posters on its own.
+    static let circledLogos: Set<String> = ["rating_kitsu"]
+
     var body: some View {
-        if let assetName = Self.plainLogo(origin) {
+        if let assetName = Self.plainLogo(origin), Self.circledLogos.contains(assetName) {
+            ZStack {
+                Circle().fill(Color.black.opacity(0.86))
+                Image(assetName)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(height: 26)
+            }
+            .frame(width: 40, height: 40)
+            .shadow(color: .black.opacity(0.35), radius: 3, y: 1)
+            .allowsHitTesting(false)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(Text(origin.title))
+        } else if let assetName = Self.plainLogo(origin) {
             Image(assetName)
                 .resizable()
                 .scaledToFit()
