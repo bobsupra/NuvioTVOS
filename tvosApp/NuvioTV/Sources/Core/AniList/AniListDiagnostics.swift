@@ -8,6 +8,8 @@ enum AniListDiagnostics {
         case search
         /// The viewer's account: logging in, and what Nuvio last wrote to their list.
         case account
+        /// MyAnimeList's titles and search (`MALSource`).
+        case mal
     }
 
     struct Entry: Equatable {

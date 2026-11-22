@@ -9,8 +9,12 @@ import Foundation
 ///   relations become one series with a tab per entry, under the id of the first entry. The tab
 ///   is the episode's season number. Films, OVAs and specials stay titles of their own and show
 ///   in a Related row.
+///
+/// MyAnimeList's titles (`mal:ID`, `MALSource`) are built the same way inside
+/// `AnimeSource.$current.withValue(.mal)`: the ids are then MAL's and say `mal:`.
 enum AniListMetaBuilder {
-    static let idPrefix = "anilist:"
+    /// `anilist:`, or `mal:` while a MyAnimeList title is built (`AnimeSource.current`).
+    static var idPrefix: String { AnimeSource.current.prefix }
     static let ratingSource = "anilist"
     static let ratingIcon = "https://anilist.co/img/icons/android-chrome-512x512.png"
 
@@ -147,7 +151,7 @@ enum AniListMetaBuilder {
     /// tell a second season from the first. In details only with "Each Entry", where a title is
     /// one season; with "One Title" it is the whole series.
     static func nameUnderLogo(_ meta: NuvioMeta, inDetails: Bool = false) -> String? {
-        guard aniListID(from: meta.id) != nil, !meta.name.isEmpty else { return nil }
+        guard AnimeSource.isAnimeTitleID(meta.id), !meta.name.isEmpty else { return nil }
         if inDetails, AniListSettings.seasonMode != .separate { return nil }
         return meta.name
     }
@@ -187,6 +191,15 @@ enum AniListMetaBuilder {
     }
 
     static func rating(_ media: AniListMedia) -> NuvioExternalRating? {
+        if AnimeSource.current == .mal {
+            // MyAnimeList's own score, where the other ratings show MAL's.
+            guard let score = media.malScore ?? media.averageScore.map({ Double($0) / 10 }), score > 0 else { return nil }
+            return NuvioExternalRating(
+                source: MdbListDetailsService.providerMyAnimeList,
+                value: score,
+                url: "https://myanimelist.net/anime/\(media.id)"
+            )
+        }
         guard let score = media.averageScore, score > 0 else { return nil }
         return NuvioExternalRating(
             source: ratingSource,
@@ -237,14 +250,19 @@ enum AniListMetaBuilder {
     /// before the chain is complete.
     static func chain(from start: Int, entries: [Int: AniListMedia]) -> (ids: [Int], missing: [Int]) {
         guard let first = entries[start], isTab(first) else { return ([start], []) }
+        let namesOnly = AnimeSource.current == .mal
         var ids = [start]
         var seen: Set<Int> = [start]
         var missing: [Int] = []
 
         func related(_ media: AniListMedia, _ relation: String, latest: Bool, _ isWanted: (AniListMedia) -> Bool) -> AniListMedia? {
             let candidates = (media.relations?.edges ?? []).compactMap { edge -> AniListMedia? in
-                guard edge.relationType == relation, let node = edge.node, node.type != "MANGA", isWanted(node) else { return nil }
-                return node
+                guard edge.relationType == relation, let node = edge.node, node.type != "MANGA" else { return nil }
+                // The entry itself when it is fetched: MyAnimeList's relations name an entry
+                // without its format or dates.
+                let known = namesOnly ? (entries[node.id] ?? node) : node
+                guard isWanted(known) else { return nil }
+                return known
             }
             let ordered = candidates.sorted { lhs, rhs in
                 let left = sortKey(lhs), right = sortKey(rhs)
@@ -253,21 +271,34 @@ enum AniListMetaBuilder {
             return ordered.first { !seen.contains($0.id) }
         }
 
+        /// MyAnimeList's relations in `relation`'s direction whose format isn't known yet: they
+        /// are fetched before the chain goes on.
+        func unknown(_ media: AniListMedia, _ relation: String) -> [Int] {
+            guard namesOnly else { return [] }
+            return (media.relations?.edges ?? []).compactMap { edge in
+                guard edge.relationType == relation, let node = edge.node, node.type != "MANGA",
+                      node.format == nil, entries[node.id] == nil, !seen.contains(node.id) else { return nil }
+                return node.id
+            }
+        }
+
         /// The next season in `relation`'s direction, also past a film, an OVA or a special
         /// between two seasons (Goblin Slayer → Goblin's Crown → Goblin Slayer II), which stays
-        /// out of the tabs. `missing` is an entry on the way that isn't fetched yet.
-        func next(from media: AniListMedia, relation: String, latest: Bool) -> (season: AniListMedia?, missing: Int?) {
+        /// out of the tabs. `missing` are entries on the way that aren't fetched yet.
+        func next(from media: AniListMedia, relation: String, latest: Bool) -> (season: AniListMedia?, missing: [Int]) {
             var current = media
             var bridges = 0
             while true {
                 if let season = related(current, relation, latest: latest, isTab) {
-                    return (season, nil)
+                    return (season, [])
                 }
+                let unknownIDs = unknown(current, relation)
+                if !unknownIDs.isEmpty { return (nil, unknownIDs) }
                 guard bridges < maxBridges,
-                      let bridge = related(current, relation, latest: latest, isBridge) else { return (nil, nil) }
+                      let bridge = related(current, relation, latest: latest, isBridge) else { return (nil, []) }
                 seen.insert(bridge.id)
                 bridges += 1
-                guard let full = entries[bridge.id] else { return (nil, bridge.id) }
+                guard let full = entries[bridge.id] else { return (nil, [bridge.id]) }
                 current = full
             }
         }
@@ -275,7 +306,7 @@ enum AniListMetaBuilder {
         var cursor = first
         while true {
             let step = next(from: cursor, relation: "PREQUEL", latest: true)
-            if let id = step.missing { missing.append(id) }
+            missing += step.missing
             guard let previous = step.season else { break }
             seen.insert(previous.id)
             guard let full = entries[previous.id] else {
@@ -288,7 +319,7 @@ enum AniListMetaBuilder {
         cursor = first
         while true {
             let step = next(from: cursor, relation: "SEQUEL", latest: false)
-            if let id = step.missing { missing.append(id) }
+            missing += step.missing
             guard let following = step.season else { break }
             seen.insert(following.id)
             guard let full = entries[following.id] else {
@@ -334,7 +365,7 @@ enum AniListMetaBuilder {
     /// on its own, so a first season says nothing), "S2 E5" from a second entry on (One Title),
     /// and "S1 E5" for any other title. `separator` goes between the season and the episode.
     static func episodeCode(id: String, season: Int, episode: Int, separator: String = " ") -> String {
-        if isAniListID(id), season <= 1 { return "E\(episode)" }
+        if AnimeSource.isAnimeTitleID(id), season <= 1 { return "E\(episode)" }
         return "S\(season)\(separator)E\(episode)"
     }
 
@@ -345,7 +376,7 @@ enum AniListMetaBuilder {
     /// "Season 2 · Episode 4" over the stream list, or "Episode 4" for an AniList title's first
     /// entry (AniList numbers each season on its own).
     static func episodeHeading(_ video: NuvioVideo) -> String {
-        if isAniListID(video.id), video.season <= 1 {
+        if AnimeSource.isAnimeTitleID(video.id), video.season <= 1 {
             // "Episode %d" in every language ("details_episode_number" is the upper-case label).
             return L10n.format("jellyfin_episode_fallback_title", fallback: "Episode %d", video.episode)
         }
@@ -355,7 +386,7 @@ enum AniListMetaBuilder {
     /// The player's episode line ("S1, E5 • Title") as "E5 • Title" for an AniList title's
     /// first entry. Only what is shown changes: the line handed to the player stays as it is.
     static func playerEpisodeLine(_ line: String, titleID: String?) -> String {
-        guard let titleID, isAniListID(titleID), line.hasPrefix("S1, E") else { return line }
+        guard let titleID, AnimeSource.isAnimeTitleID(titleID), line.hasPrefix("S1, E") else { return line }
         return String(line.dropFirst("S1, ".count))
     }
 
@@ -389,6 +420,9 @@ enum AniListMetaBuilder {
             count = lastAired
         } else if !streaming.isEmpty {
             count = streaming.keys.max() ?? streaming.count
+        } else if AnimeSource.current == .mal, let aired = airedOnAniZip(aniZip, now: now) {
+            // MyAnimeList gives no count while a season airs: what ani.zip lists as aired.
+            count = aired
         } else if media.status == "FINISHED" || media.status == "RELEASING" {
             count = 1
         } else {
@@ -413,6 +447,21 @@ enum AniListMetaBuilder {
                 overview: zip?.overview ?? zip?.summary
             )
         }
+    }
+
+    /// The last episode ani.zip lists as aired by `now`.
+    static func airedOnAniZip(_ episodes: [String: AniZipEpisode], now: Date) -> Int? {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(identifier: "UTC")
+        formatter.dateFormat = "yyyy-MM-dd"
+        let today = formatter.string(from: now)
+        let numbers = episodes.compactMap { key, episode -> Int? in
+            guard let number = Int(key), number > 0, let day = episode.airDay else { return nil }
+            return day <= today ? number : nil
+        }
+        return numbers.max()
     }
 
     /// AniList lists streaming episodes as "Episode 5 - Title" in no fixed order.
@@ -527,7 +576,8 @@ enum AniListMetaBuilder {
     /// The Related row: relations of the title's entries that aren't tabs of it.
     static func related(
         tabs: [AniListMedia],
-        language: AniListSettings.TitleLanguage
+        language: AniListSettings.TitleLanguage,
+        known: [Int: AniListMedia] = [:]
     ) -> [RelatedTitle] {
         let tabIDs = Set(tabs.map(\.id))
         var seen = tabIDs
@@ -540,7 +590,8 @@ enum AniListMetaBuilder {
                       let order = relatedTypes.firstIndex(of: relation),
                       !seen.contains(node.id) else { continue }
                 seen.insert(node.id)
-                items.append((order: order, date: sortKey(node), title: relatedTitle(node, relation: relation, language: language)))
+                let full = known[node.id] ?? node
+                items.append((order: order, date: sortKey(full), title: relatedTitle(full, relation: relation, language: language)))
             }
         }
         return items

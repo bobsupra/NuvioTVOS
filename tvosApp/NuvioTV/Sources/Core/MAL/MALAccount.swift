@@ -330,10 +330,15 @@ enum MALAccount {
 
     /// "+" in details: Plan to Watch when it isn't on the list; taken off only while still there.
     static func libraryChanged(aniListID: Int, added: Bool) async {
+        guard isLoggedIn, let mal = await MALEpisodeRatings.malID(aniListID: aniListID) else { return }
+        await libraryChanged(mal: mal, added: added)
+    }
+
+    /// "+" in details for a MAL entry (a MyAnimeList title's own).
+    static func libraryChanged(mal: Int, added: Bool) async {
         // Settings → MyAnimeList → "+" in Details: Plan to Watch, Watching or nothing.
         let wanted = MALSettings.plusStatus
-        guard isLoggedIn, wanted != .off, let mal = await MALEpisodeRatings.malID(aniListID: aniListID),
-              let current = await listStatus(mal: mal) else { return }
+        guard isLoggedIn, wanted != .off, let current = await listStatus(mal: mal) else { return }
         if added {
             guard current.status == nil else { return }
             await update(mal: mal, ["status": wanted.rawValue])
@@ -344,16 +349,24 @@ enum MALAccount {
 
     /// Watched up to `episode` (never back): Watching, or Completed at the last episode.
     static func watched(aniListID: Int, episode: Int) async {
-        guard MALSettings.scrobbles, let mal = await MALEpisodeRatings.malID(aniListID: aniListID),
-              let current = await listStatus(mal: mal) else { return }
+        guard MALSettings.scrobbles, let mal = await MALEpisodeRatings.malID(aniListID: aniListID) else { return }
+        await watched(mal: mal, episode: episode)
+    }
+
+    static func watched(mal: Int, episode: Int) async {
+        guard MALSettings.scrobbles, let current = await listStatus(mal: mal) else { return }
         guard let fields = progress(current, watched: episode) else { return }
         await update(mal: mal, fields)
     }
 
     /// Unwatched from `episode` on: the count goes back to the episode before.
     static func unwatched(aniListID: Int, episode: Int) async {
-        guard MALSettings.scrobbles, let mal = await MALEpisodeRatings.malID(aniListID: aniListID),
-              let current = await listStatus(mal: mal), current.watched >= episode else { return }
+        guard MALSettings.scrobbles, let mal = await MALEpisodeRatings.malID(aniListID: aniListID) else { return }
+        await unwatched(mal: mal, episode: episode)
+    }
+
+    static func unwatched(mal: Int, episode: Int) async {
+        guard MALSettings.scrobbles, let current = await listStatus(mal: mal), current.watched >= episode else { return }
         await update(mal: mal, ["num_watched_episodes": String(max(0, episode - 1)), "status": "watching"])
     }
 

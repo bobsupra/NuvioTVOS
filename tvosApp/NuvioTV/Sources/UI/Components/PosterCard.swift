@@ -668,7 +668,7 @@ struct PosterCard: View {
     private var shownOrigin: CollectionOriginPresentation? {
         if let collectionOrigin, !continueIsUpNext { return collectionOrigin }
         if let sourceBadge { return sourceBadge }
-        if showsAniListOrigin, AniListMetaBuilder.isAniListID(meta.id) { return AniListService.searchBadge }
+        if showsAniListOrigin, let badge = AnimeSource.badge(for: meta.id) { return badge }
         return nil
     }
 
@@ -1673,7 +1673,7 @@ struct PosterGridCard: View {
                 // Settings → Integrations → AniList: tells AniList's results from the add-ons'
                 // copies of the same anime in Search.
                 if let badge = sourceBadge
-                    ?? (customPosterScreen == .search && AniListMetaBuilder.isAniListID(meta.id) ? AniListService.searchBadge : nil) {
+                    ?? (customPosterScreen == .search ? AnimeSource.badge(for: meta.id) : nil) {
                     CollectionOriginBadge(origin: badge)
                         .padding(10)
                 }

@@ -69,10 +69,16 @@ enum MALEpisodeRatings {
 
     // MARK: Ids
 
-    /// The MAL entry and episode of `anilist:ENTRY:EPISODE` or a Cinemeta `ttIMDB:SEASON:EPISODE`.
+    /// The MAL entry and episode of `mal:ENTRY:EPISODE`, `anilist:ENTRY:EPISODE` or a Cinemeta
+    /// `ttIMDB:SEASON:EPISODE`.
     static func target(forEpisodeID id: String) async -> Target? {
         let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
         let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        if let mal = AnimeSource.malID(from: trimmed) {
+            // A MyAnimeList title's episode: MAL's own entry and number.
+            guard parts.count == 3, let episode = Int(parts[2]), episode > 0 else { return nil }
+            return Target(malID: mal, episode: episode)
+        }
         if let entry = AniListMetaBuilder.aniListID(from: trimmed) {
             guard parts.count == 3, let episode = Int(parts[2]), episode > 0,
                   let mal = await malID(aniListID: entry) else { return nil }

@@ -2462,7 +2462,7 @@ actor YouTubeTrailerResolver {
         _ meta: NuvioMeta,
         preview: Bool
     ) async -> TrailerPlaybackSource? {
-        if AniListMetaBuilder.aniListID(from: meta.id) != nil {
+        if AnimeSource.isAnimeTitleID(meta.id) {
             return await resolveAniListTrailer(meta, preview: preview)
         }
 
@@ -4825,15 +4825,22 @@ struct TvDetailsContent: View {
             },
             onWatchlistClick: {
                 cancelFocusRestoration()
-                // An AniList title also goes onto (or off) the viewer's AniList and MAL lists.
-                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn,
-                   let entryID = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedID ?? meta.id) {
+                // An AniList title also goes onto (or off) the viewer's AniList and MAL lists; a
+                // MyAnimeList title onto its own MAL entry.
+                let openedTitle = openedID ?? meta.id
+                let malEntry = aniListTarget?.malID ?? (AnimeSource.isMALTitle(openedTitle) ? AnimeSource.malID(from: openedTitle) : nil)
+                let aniListEntry = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedTitle)
+                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn, malEntry != nil || aniListEntry != nil {
                     let added = !uiState.isInWatchlist
                     Task {
-                        if AniListAccount.isLoggedIn {
-                            await AniListAccount.libraryChanged(entryID: entryID, added: added)
+                        if AniListAccount.isLoggedIn, let aniListEntry, aniListEntry > 0 {
+                            await AniListAccount.libraryChanged(entryID: aniListEntry, added: added)
                         }
-                        await MALAccount.libraryChanged(aniListID: entryID, added: added)
+                        if let malEntry {
+                            await MALAccount.libraryChanged(mal: malEntry, added: added)
+                        } else if let aniListEntry, aniListEntry > 0 {
+                            await MALAccount.libraryChanged(aniListID: aniListEntry, added: added)
+                        }
                     }
                 }
                 onWatchlistClick()
@@ -4848,7 +4855,7 @@ struct TvDetailsContent: View {
                 onRateClick?()
             } : nil,
             aniListTitle: aniListButtonTitle,
-            onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget != nil) ? {
+            onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget?.hasAniListEntry == true) ? {
                 cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 showingAniListMenu = true
@@ -4983,7 +4990,7 @@ struct TvDetailsContent: View {
                         guard !clean.isEmpty && clean != "cast" else { return }
                         // An AniList title's characters open their voice actor's AniList page
                         // (or the character's); they have no TMDB page.
-                        guard !AniListMetaBuilder.isAniListID(meta.id) || person.hasAniListPage else { return }
+                        guard !AnimeSource.isAnimeTitleID(meta.id) || person.hasAniListPage else { return }
                         stopBackgroundTrailer(manual: false)
                         onOpenPerson?(
                             person,
@@ -5029,7 +5036,9 @@ struct TvDetailsContent: View {
             if !relatedRowsAreEmpty(meta: meta) {
                 VStack(alignment: .leading, spacing: 34) {
                     // Settings → Integrations → AniList: the title's OVAs, films and other
-                    // relations, above AniList's recommendations.
+                    // relations, above AniList's recommendations (drawn again as MyAnimeList's
+                    // pictures come in).
+                    let _ = uiState.relatedPicturesRevision
                     if !AniListTitleIndex.related(metaID: meta.id).isEmpty {
                         relatedTitlesRow(
                             title: L10n.string("details_anilist_related", fallback: "Related"),
@@ -5630,6 +5639,7 @@ struct TvDetailsContent: View {
             .modifier(TvDetailsMALMenus(
                 title: aniListTarget?.label ?? meta.name,
                 entryID: aniListTarget?.entryID,
+                malEntry: aniListTarget?.malID,
                 malID: $malID,
                 status: $malStatus,
                 showingMenu: $showingMALMenu,
@@ -6839,7 +6849,7 @@ private struct TvDetailsAniListMenus: ViewModifier {
         content
             .task(id: "\(meta.id)|\(episode?.id ?? "")|\(AniListAccount.login?.viewerID ?? 0)|\(MALAccount.login?.userName ?? "")") {
                 target = await Self.findTarget(meta: meta, episode: episode)
-                if AniListAccount.isLoggedIn, let target, !AniListAccount.hasAsked(target.entryID) {
+                if AniListAccount.isLoggedIn, let target, target.hasAniListEntry, !AniListAccount.hasAsked(target.entryID) {
                     await AniListAccount.refreshStates(ids: [target.entryID])
                 }
             }
@@ -6918,6 +6928,12 @@ private struct TvDetailsAniListMenus: ViewModifier {
         if AniListMetaBuilder.isAniListID(meta.id), let first = AniListAccount.entryIDs(of: meta).first {
             return AniListScrobbler.Target(entryID: first, episode: 0, label: meta.name)
         }
+        // A MyAnimeList series before any episode: its first entry.
+        if AnimeSource.isMALTitle(meta.id),
+           let first = meta.videos?.lazy.compactMap({ AnimeSource.malID(from: $0.id) }).first ?? AnimeSource.malID(from: meta.id) {
+            let aniList = await AniListOfflineMaps.shared.aniListID(mal: first) ?? 0
+            return AniListScrobbler.Target(entryID: aniList, episode: 0, label: meta.name, malID: first)
+        }
         return nil
     }
 }
@@ -6927,6 +6943,8 @@ private struct TvDetailsAniListMenus: ViewModifier {
 private struct TvDetailsMALMenus: ViewModifier {
     let title: String
     let entryID: Int?
+    /// A MyAnimeList title's own MAL entry.
+    var malEntry: Int? = nil
     @Binding var malID: Int?
     @Binding var status: MALAccount.ListStatus?
     @Binding var showingMenu: Bool
@@ -6935,9 +6953,12 @@ private struct TvDetailsMALMenus: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .task(id: "\(entryID ?? 0)|\(MALAccount.login?.userName ?? "")|\(revision)") {
-                guard MALSettings.showsDetailsButton, let entryID,
-                      let mal = await MALEpisodeRatings.malID(aniListID: entryID) else {
+            .task(id: "\(entryID ?? 0)|\(malEntry ?? 0)|\(MALAccount.login?.userName ?? "")|\(revision)") {
+                var found = malEntry
+                if found == nil, let entryID, entryID > 0 {
+                    found = await MALEpisodeRatings.malID(aniListID: entryID)
+                }
+                guard MALSettings.showsDetailsButton, let mal = found else {
                     malID = nil
                     status = nil
                     return
@@ -9937,7 +9958,7 @@ private struct TvDetailsEpisodes: View {
         if let label = AniListTitleIndex.tabLabel(metaID: meta.id, season: season) {
             return label.name
         }
-        if AniListMetaBuilder.isAniListID(meta.id) {
+        if AnimeSource.isAnimeTitleID(meta.id) {
             // AniList's entries aren't seasons.
             return seasons.count > 1 ? "Part \(season)" : "Episodes"
         }

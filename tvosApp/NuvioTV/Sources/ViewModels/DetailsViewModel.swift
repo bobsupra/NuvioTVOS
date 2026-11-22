@@ -461,6 +461,9 @@ class DetailsViewModel: ObservableObject {
     private var streamObserveTask: Task<Void, Never>?
     private var enrichmentTask: Task<Void, Never>?
     private var deferredLoadTask: Task<Void, Never>?
+    /// The pictures a MyAnimeList title's Related row is waiting for (`fillMALRelatedPictures`).
+    private var relatedPicturesTask: Task<Void, Never>?
+    private var relatedPicturesRequest: String?
     private(set) var watchlistMutationTask: Task<Void, Never>?
     /// Invalidates every asynchronous completion from an older details load.
     /// This is intentionally separate from the content id: the same title can
@@ -602,6 +605,9 @@ class DetailsViewModel: ObservableObject {
                 primaryState.isLoading = false
                 primaryState.error = nil
                 self.uiState = primaryState
+                // Built now, with its Related row: the pictures MAL's relations lack (the card it
+                // opened from had no row to fill yet).
+                self.fillMALRelatedPictures(for: resolvedMeta, generation: requestGeneration)
 
                 // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
                 // reload them immediately with the resolved canonical stream id.
@@ -678,6 +684,9 @@ class DetailsViewModel: ObservableObject {
         streamObserveTask = nil
         enrichmentTask?.cancel()
         enrichmentTask = nil
+        relatedPicturesTask?.cancel()
+        relatedPicturesTask = nil
+        relatedPicturesRequest = nil
         uiState.isLoadingEnrichment = false
         prefetchedStreamId = nil
         prefetchedEpisode = nil
@@ -885,6 +894,8 @@ class DetailsViewModel: ObservableObject {
                         }
                     }
                 }
+                // A MyAnimeList title's Related row: the pictures MAL's relations lack.
+                self.fillMALRelatedPictures(for: meta, generation: generation)
                 await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
                     await MainActor.run {
                         self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
@@ -1025,6 +1036,27 @@ class DetailsViewModel: ObservableObject {
                     }
                 }
             }
+        }
+    }
+
+    /// A MyAnimeList title's Related row: the pictures MAL's relations lack, drawn as they come
+    /// in, apart from the cast. Asked once the row is known (the built title, not the card it was
+    /// opened from), and again only for more of the title's entries (its seasons).
+    private func fillMALRelatedPictures(for meta: NuvioMeta, generation: UInt64) {
+        guard AnimeSource.isMALTitle(meta.id), !MALSource.missingPictures(metaID: meta.id).isEmpty else { return }
+        let entryIDs = MALSource.entryIDs(of: meta)
+        let request = meta.id.lowercased() + "|" + entryIDs.map(String.init).joined(separator: ",")
+        if relatedPicturesTask != nil, relatedPicturesRequest == request { return }
+        relatedPicturesTask?.cancel()
+        relatedPicturesRequest = request
+        relatedPicturesTask = Task { @MainActor [weak self] in
+            await MALSource.fillRelatedPictures(metaID: meta.id, entryIDs: entryIDs) { [weak self] in
+                guard let self, self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
+                // A real change of the state: the row reads the pictures as it is drawn.
+                self.uiState.relatedPicturesRevision &+= 1
+            }
+            guard let self, self.relatedPicturesRequest == request else { return }
+            self.relatedPicturesTask = nil
         }
     }
 

@@ -482,6 +482,7 @@ enum SettingsKey {
         aniListHideCinemetaDuplicates, aniListEpisodeDetails, aniListAdult,
         aniListClientID, aniListScrobble, aniListScrobbleCinemeta, aniListListRows, aniListOtherAddons, aniListCatalogs,
         malEnabled, malClientID, malEpisodeRatings, malScrobble, malAdult, malCatalogs, malDetailsButton, aniListDetailsButton, malPlusStatus, aniListPlusStatus, malSeriesScore, aniListScore,
+        malTitles, malSearch,
         mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
@@ -6763,6 +6764,17 @@ private struct MALOptionsSheet: View {
     @AppStorage(SettingsKey.malAdult) private var adult = false
     @AppStorage(SettingsKey.malDetailsButton) private var detailsButton = true
     @AppStorage(SettingsKey.malPlusStatus) private var plusStatus = MALSettings.PlusStatus.planToWatch.rawValue
+    @AppStorage(SettingsKey.malTitles) private var malTitles = true
+    @AppStorage(SettingsKey.malSearch) private var malSearch = true
+    @AppStorage(SettingsKey.aniListOtherAddons) private var convertsIDs = true
+    @AppStorage(SettingsKey.aniListTitleLanguage) private var titleLanguage = AniListSettings.TitleLanguage.romaji.rawValue
+    @AppStorage(SettingsKey.aniListSeasonMode) private var seasonMode = AniListSettings.SeasonMode.merged.rawValue
+    @AppStorage(SettingsKey.aniListEpisodeDetails) private var episodeDetails = true
+    @State private var malTitlesStatus = ""
+    @State private var malServiceStatus = ""
+    @State private var malTestResult: String?
+    @State private var malTesting = false
+    @State private var malCacheCleared = false
     @State private var accountName: String? = MALAccount.login?.userName
     /// The `state` and PKCE verifier of the QR code's address, so the Apple TV takes only its own login.
     @State private var loginState = UUID().uuidString.replacingOccurrences(of: "-", with: "")
@@ -6786,7 +6798,7 @@ private struct MALOptionsSheet: View {
                             .foregroundColor(.white)
                         Text(L10n.string(
                             "settings_mal_header_subtitle",
-                            fallback: "Catalogs and scores from Tenrai, a free API over MyAnimeList; your lists and what you watch through your own MAL API client. Titles open as the AniList titles they map to."
+                            fallback: "Catalogs, search, details and scores from Tenrai, a free API over MyAnimeList (MAL's own API with your Client ID when Tenrai doesn't answer); your lists and what you watch through your own MAL API client."
                         ))
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.62))
@@ -6804,18 +6816,26 @@ private struct MALOptionsSheet: View {
                         )
                     }
 
+                    malTitlesGroup
+
                     ratingsGroup
 
                     homeGroup
 
                     accountGroup
+
+                    malStatusGroup
                 }
                 .padding(.horizontal, 52)
                 .padding(.vertical, 38)
             }
         }
+        .task { await refreshMALStatus() }
         .onChange(of: enabled) { _, _ in AniListSettings.notifyHomeChanged() }
         .onChange(of: adult) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: malTitles) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: malSearch) { _, _ in AniListSettings.notifyHomeChanged() }
+        .onChange(of: titleLanguage) { _, _ in AniListSettings.notifyHomeChanged() }
         .sheet(isPresented: $showingCatalogs) {
             AnimeCatalogPickerSheet(
                 title: L10n.string("settings_mal_catalogs", fallback: "MAL Catalogs"),
@@ -6830,6 +6850,163 @@ private struct MALOptionsSheet: View {
             )
             .modifier(ClearPresentationBackgroundIfAvailable())
         }
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var malTitlesGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_mal_section_titles", fallback: "MyAnimeList Titles"),
+            subtitle: L10n.string("settings_mal_section_titles_subtitle", fallback: "MAL's titles with MAL's own data, as AniList's are with AniList's")
+        ) {
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_titles", fallback: "MAL Titles"),
+                subtitle: L10n.string(
+                    "settings_mal_titles_subtitle",
+                    fallback: "MAL catalogs and search open MAL's titles (mal:ID): seasons, episodes, cast and recommendations from MyAnimeList; add-ons with the mal prefix are asked with mal:ID:episode. Off: they open as the AniList titles they map to"
+                ),
+                isOn: $malTitles,
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_mal_search", fallback: "Search MAL"),
+                subtitle: L10n.string("settings_mal_search_subtitle", fallback: "Anime from MyAnimeList among the search results"),
+                isOn: $malSearch,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_convert_ids", fallback: "Convert IDs for Other Add-ons"),
+                subtitle: L10n.string(
+                    "settings_mal_convert_ids_subtitle",
+                    fallback: "Add-ons without mal ids get anilist:ID:episode, kitsu:ID:episode, or the IMDb id with TheTVDB's season and episode. An episode that can't be placed isn't asked by IMDb. Shared with AniList"
+                ),
+                isOn: $convertsIDs,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+
+            SettingsHelpText(
+                title: L10n.string("settings_mal_ids_title", fallback: "MAL IDs or Converted IDs?"),
+                paragraphs: [
+                    L10n.string("settings_mal_ids_1", fallback: "**Add-ons that take mal: ids get exactly what you opened.** Every season, part, OVA and movie has its own MAL entry, and episodes are numbered the way MAL numbers them, so nothing has to be guessed."),
+                    L10n.string("settings_mal_ids_2", fallback: "**Converted ids are for add-ons that don't know MAL.** They get the AniList entry the MAL entry maps to, then a Kitsu, AniDB, IMDb or TMDB id with season and episode, from the offline tables. That can miss brand-new seasons or number split seasons differently. An episode that can't be placed isn't asked at all rather than asked wrong."),
+                    L10n.string("settings_mal_ids_3", fallback: "**Recommended:** prefer add-ons that take mal: or anilist: ids, and keep conversion on for the rest.")
+                ]
+            )
+            .opacity(malTitles ? 1 : 0.46)
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_title_language", fallback: "Title Language"),
+                subtitle: L10n.string("settings_mal_shared_subtitle", fallback: "Shared with AniList"),
+                selection: malLabelBinding($titleLanguage, AniListSettings.TitleLanguage.allCases, \.label),
+                options: AniListSettings.TitleLanguage.allCases.map(\.label),
+                accentColor: accentColor
+            )
+            .opacity(malTitles ? 1 : 0.46)
+            .disabled(!malTitles)
+
+            SettingsChoiceRow(
+                title: L10n.string("settings_anilist_seasons", fallback: "Seasons"),
+                subtitle: L10n.string(
+                    "settings_mal_seasons_subtitle",
+                    fallback: "One Title: a series with a tab per MAL entry, joined by MAL's prequels and sequels. Each Entry: every season on its own. Shared with AniList"
+                ),
+                selection: malLabelBinding($seasonMode, AniListSettings.SeasonMode.allCases, \.label),
+                options: AniListSettings.SeasonMode.allCases.map(\.label),
+                accentColor: accentColor
+            )
+            .opacity(malTitles ? 1 : 0.46)
+            .disabled(!malTitles)
+
+            SettingsToggleRow(
+                title: L10n.string("settings_anilist_episode_details", fallback: "Episode Titles and Pictures"),
+                subtitle: L10n.string("settings_mal_episode_details_subtitle", fallback: "From api.ani.zip by MAL id, with backgrounds and logos from TheTVDB, TMDB or Metahub. Shared with AniList"),
+                isOn: $episodeDetails,
+                accentColor: accentColor,
+                isAvailable: malTitles
+            )
+        }
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
+    }
+
+    // Split out of `body` so the compiler can check each part in time.
+    @ViewBuilder
+    private var malStatusGroup: some View {
+        SettingsGroup(
+            title: L10n.string("settings_anilist_section_status", fallback: "Status"),
+            subtitle: L10n.string("settings_mal_section_status_subtitle", fallback: "Where MAL's titles came from: Tenrai, a saved answer or MAL's own API")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("settings_mal_status_titles", fallback: "Last Title or Search"),
+                subtitle: malTitlesStatus,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshMALStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_mal_status_service", fallback: "Tenrai and MAL API"),
+                subtitle: malServiceStatus,
+                value: L10n.string("settings_anilist_status_refresh", fallback: "Refresh"),
+                accentColor: accentColor
+            ) {
+                Task { await refreshMALStatus() }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_test", fallback: "Test Connection"),
+                subtitle: malTestResult ?? L10n.string("settings_mal_test_subtitle", fallback: "Search Tenrai and MAL's own API for Frieren now, past the saved answers"),
+                value: malTesting ? "…" : L10n.string("settings_anilist_test_action", fallback: "Test"),
+                accentColor: accentColor
+            ) {
+                guard !malTesting else { return }
+                malTesting = true
+                Task {
+                    malTestResult = await MALSource.testConnection()
+                    await refreshMALStatus()
+                    malTesting = false
+                }
+            }
+
+            SettingsActionRow(
+                title: L10n.string("settings_anilist_clear_cache", fallback: "Clear Saved Answers"),
+                subtitle: L10n.string("settings_mal_clear_cache_subtitle", fallback: "Ask Tenrai again for everything (AniList's saved answers too)"),
+                value: malCacheCleared ? L10n.string("settings_anilist_cleared", fallback: "Cleared") : L10n.string("settings_anilist_clear", fallback: "Clear"),
+                accentColor: accentColor
+            ) {
+                Task {
+                    await AniListService.clearCache()
+                    malCacheCleared = true
+                    AniListSettings.notifyHomeChanged()
+                }
+            }
+        }
+        .opacity(enabled ? 1 : 0.46)
+    }
+
+    @MainActor
+    private func refreshMALStatus() async {
+        malTitlesStatus = MALSettings.isEnabled ? AniListDiagnostics.text(.mal) : "Off"
+        malServiceStatus = await MALSource.statusText()
+    }
+
+    private func malLabelBinding<Option: RawRepresentable>(
+        _ stored: Binding<String>,
+        _ options: [Option],
+        _ label: KeyPath<Option, String>
+    ) -> Binding<String> where Option.RawValue == String {
+        Binding(
+            get: { (options.first { $0.rawValue == stored.wrappedValue } ?? options[0])[keyPath: label] },
+            set: { newLabel in
+                if let option = options.first(where: { $0[keyPath: label] == newLabel }) {
+                    stored.wrappedValue = option.rawValue
+                }
+            })
     }
 
     @ViewBuilder
