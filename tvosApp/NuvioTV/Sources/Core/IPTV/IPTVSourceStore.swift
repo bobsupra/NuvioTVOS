@@ -119,6 +119,7 @@ struct IPTVSourceStore {
         let settings = defaults ?? ProfileSettings.store(for: profileID)
         IPTVFavoritesStore(defaults: settings).save([])
         IPTVRecentChannelStore.remove(from: settings)
+        IPTVCategoryPreferencesStore.removeAll(defaults: settings)
     }
 
     /// Retries every deletion that failed earlier; called at launch.
