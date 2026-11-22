@@ -1562,9 +1562,16 @@ struct StreamAddonStreamDTO: Decodable {
             detailLines.append("Size \(Self.sizeFormatter.string(fromByteCount: size))")
         }
 
+        // An entry with only an `externalUrl` is a link to open, not media
+        // (Stremio protocol), e.g. AIOStreams' "no streams found", statistics
+        // and error entries pointing at github.com. Playing that URL failed
+        // with "Stream Source Invalid".
+        let isExternalLinkOnly = cleaned(url) == nil && usenet == nil
+            && resolve == nil && infoHash == nil && cleaned(externalUrl) != nil
         let isNotPlayable = (behaviorHints?.isNotPlayable == true)
             || (notPlayable == true)
             || (action == true)
+            || isExternalLinkOnly
 
         return NuvioStream(
             url: parsed.directURL,
