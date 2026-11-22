@@ -3685,7 +3685,23 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
                 switch eventPtr.pointee.event_id {
                 case MPV_EVENT_PROPERTY_CHANGE:
-                    DispatchQueue.main.async { self.updateState() }
+                    // Every observed change (each subtitle cue via `sub-text`,
+                    // pause, buffering, seeking) used to rebuild the whole track
+                    // list on the main thread: ~10 mpv property reads per track.
+                    // Only the track properties can change it; everything else
+                    // needs the cheap playback state (which also reads sub-text).
+                    let name = eventPtr.pointee.data.map {
+                        String(cString: UnsafePointer<mpv_event_property>(OpaquePointer($0)).pointee.name)
+                    } ?? ""
+                    let tracksChanged = name == "track-list/count" || name == "aid" || name == "sid" || name.isEmpty
+                    DispatchQueue.main.async {
+                        if tracksChanged {
+                            self.updateState()
+                        } else {
+                            self.refreshPlaybackState()
+                            self.refreshChapters()
+                        }
+                    }
                 case MPV_EVENT_START_FILE:
                     self.eventPlaylistEntryID = eventPtr.pointee.data.map {
                         UnsafePointer<mpv_event_start_file>(OpaquePointer($0)).pointee.playlist_entry_id
