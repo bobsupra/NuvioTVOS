@@ -126,6 +126,7 @@ enum PluginStreamDiscovery {
         defer { Task { await PluginConcurrency.shared.release() } }
         let scraperID = target.scraper.id
         let displayName = target.displayName
+        let logo = target.scraper.logo
         // Emitted lists, in order, shown as they come.
         let (emitted, emitter) = AsyncStream<String>.makeStream()
         let shownSoFar = PluginPartialStreams()
@@ -133,7 +134,7 @@ enum PluginStreamDiscovery {
             var shown: [NuvioStream] = []
             for await json in emitted {
                 let list: Any = (try? JSONSerialization.jsonObject(with: Data(json.utf8))) ?? [Any]()
-                let batch = streams(from: list, providerName: displayName, scraperID: scraperID)
+                let batch = streams(from: list, providerName: displayName, scraperID: scraperID, logo: logo)
                 guard !batch.isEmpty else { continue }
                 shown += await DebridStreamPresentation.present(streams: batch)
                 shownSoFar.set(shown)
@@ -171,7 +172,7 @@ enum PluginStreamDiscovery {
             emitter.finish()
             partials.cancel()
             let presented = await DebridStreamPresentation.present(
-                streams: streams(from: result, providerName: displayName, scraperID: scraperID)
+                streams: streams(from: result, providerName: displayName, scraperID: scraperID, logo: logo)
             )
             return group(presented, error: nil)
         } catch is CancellationError {
@@ -184,11 +185,15 @@ enum PluginStreamDiscovery {
         }
     }
 
-    /// The streams of a `getStreams` result (or an emitted list).
-    static func streams(from result: Any, providerName: String, scraperID: String? = nil) -> [NuvioStream] {
-        ((result as? [Any]) ?? []).compactMap { item -> NuvioStream? in
-            guard let object = item as? [String: Any] else { return nil }
-            return stream(from: object, providerName: providerName, scraperID: scraperID)
+    /// The streams of a `getStreams` result (or an emitted list), with the
+    /// plugin's logo from its manifest, as an add-on's streams get theirs.
+    static func streams(from result: Any, providerName: String, scraperID: String? = nil, logo: String? = nil) -> [NuvioStream] {
+        let logo = logo?.trimmingCharacters(in: .whitespacesAndNewlines)
+        return ((result as? [Any]) ?? []).compactMap { item -> NuvioStream? in
+            guard let object = item as? [String: Any],
+                  let stream = stream(from: object, providerName: providerName, scraperID: scraperID) else { return nil }
+            guard let logo, !logo.isEmpty, stream.addonLogoURL == nil else { return stream }
+            return stream.withAddonLogoURL(logo)
         }
     }
 
