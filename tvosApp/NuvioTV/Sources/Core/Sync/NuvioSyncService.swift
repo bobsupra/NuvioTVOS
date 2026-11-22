@@ -1395,19 +1395,22 @@ final class NuvioSyncManager: ObservableObject {
             let session = bootstrap.session
             let remoteProfiles = bootstrap.profiles
             Self.accountSyncDiagnostic = "applying profiles"
-            let merged = ProfileSyncIndexStore.localProfiles(
-                from: remoteProfiles,
-                preserving: profileViewModel.profiles
-            )
-            isApplyingRemote = true
-            isApplyingRemoteProfiles = true
-            let profilesApplied = profileViewModel.applyRemoteProfiles(merged)
-            // `$activeProfile` can be delivered by SwiftUI after this
-            // synchronous apply returns. Record the imported selection before
-            // clearing the guard so it cannot cancel this same account pull.
-            observedActiveProfileId = profileViewModel.activeProfile?.id
-            isApplyingRemoteProfiles = false
-            isApplyingRemote = false
+            let profilesApplied = TVHomeDebugTrace.measure("home.account.applyProfiles") {
+                let merged = ProfileSyncIndexStore.localProfiles(
+                    from: remoteProfiles,
+                    preserving: profileViewModel.profiles
+                )
+                isApplyingRemote = true
+                isApplyingRemoteProfiles = true
+                let applied = profileViewModel.applyRemoteProfiles(merged)
+                // `$activeProfile` can be delivered by SwiftUI after this
+                // synchronous apply returns. Record the imported selection before
+                // clearing the guard so it cannot cancel this same account pull.
+                observedActiveProfileId = profileViewModel.activeProfile?.id
+                isApplyingRemoteProfiles = false
+                isApplyingRemote = false
+                return applied
+            }
             guard profilesApplied else {
                 throw AuthError(message: "The downloaded profiles could not be applied on this Apple TV.")
             }
@@ -1542,7 +1545,9 @@ final class NuvioSyncManager: ObservableObject {
                 let catalogSettings = try await catalogSettingsRequest
                 try ensureStillSyncing(profileId: activeProfile.id)
                 if let catalogSettings {
-                    let didChange = client.applyHomeCatalogSettings(catalogSettings, localProfileId: activeProfile.id)
+                    let didChange = TVHomeDebugTrace.measure("home.account.applyCatalogSettings") {
+                        client.applyHomeCatalogSettings(catalogSettings, localProfileId: activeProfile.id)
+                    }
                     if didChange {
                         homeCatalogRevision &+= 1
                     }
