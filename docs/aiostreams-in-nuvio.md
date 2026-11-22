@@ -20,6 +20,7 @@ This document explains how the original AIOStreams runs inside Nuvio on Apple TV
   - The addon exists only on this Apple TV. Nuvio never syncs it to the account, because its address works only on this device.
   - With *Save to Nuvio Account* (off by default), Nuvio's settings for AIOStreams and the configuration go into the account instead. Another Apple TV then builds the same configuration in its own AIOStreams (section 7).
 - AIOStreams then behaves like any other addon: **streams, catalogs, metadata and subtitles**. Everything AIOStreams can reach from the Apple TV works, including debrid, Torrentio, Comet, its built-in scrapers and Usenet. Usenet streams play through Nuvio's own NNTP player (Stremio `nzbUrl` + `servers`).
+  - A Usenet stream (`nzbUrl`, no `url`) from an add-on that doesn't name a service (NimeToDex NZB, Usenet Direct, any Stremio NNTP add-on, a plugin through the "Nuvio plugins" card) is typed as AIOStreams' own Usenet add-ons type theirs: `stremio-usenet` with the Stremio NNTP service, cached (`typeUsenetStreams` in `nuvio-main.mjs`, on AIOStreams' `StreamParser`). Without a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and dropped every such stream, whatever the filters; only Result Passthrough brought them back. Parsers with rules of their own (built-in add-ons, TorBox, StreamNZB…) keep them.
 - On the Apple TV 4K, the start sheet showed these times, counted from when Nuvio started Node.js:
 
   > Node.js started 0.2 s · AIOStreams loaded 2.1 s · answering 2.1 s · Nuvio saw it 2.2 s · warm-up: 21 streams in 0.3 s
@@ -323,7 +324,7 @@ The contract is in `aio-node/FFPROBE.md`: three requests (version; format, strea
 - **In AIOStreams:** add the **"Nuvio plugins"** card on the configuration page once. It is a preset that `nuvio-main.mjs` adds to AIOStreams' `PresetManager` at start-up (`fromId` and `getPresetList` wrapped), so AIOStreams' files stay unchanged and the card survives updates.
   - The card fetches `plugins.json` from Nuvio's plugin server (cached for 5 s) and makes **one addon per plugin**, with the plugin's name.
   - It has the usual add-on options (timeout, default 20 s; resources; media types; pin; library; passthrough), the same for each plugin.
-  - A plugin's Usenet stream (`nzbUrl`, no `url`) is typed as AIOStreams' own Usenet add-ons type it: `stremio-usenet` with the Stremio NNTP service, cached. Without a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and dropped every such stream (Usenet Direct: 20 streams taken, 0 shown). Nuvio Usenet plays it with its own servers, as before.
+  - A plugin's Usenet stream (`nzbUrl`, no `url`) is typed as every add-on's (section 1): `stremio-usenet` with the Stremio NNTP service, cached. Before, Usenet Direct had 20 streams taken and 0 shown. Nuvio Usenet plays it with its own servers, as before.
 - **Nuvio's side** (`PluginAIOBridge.swift`) is served on the plugin server, `http://127.0.0.1:8766/<token>/stremio/`:
   - `plugins.json`: the plugins set *Through AIOStreams* (key, name, resources);
   - `p/<key>/manifest.json`: a Stremio manifest with streams and subtitles (for `tt`/`tmdb:` ids or the plugin's own prefixes), plus its catalogs and metadata;
