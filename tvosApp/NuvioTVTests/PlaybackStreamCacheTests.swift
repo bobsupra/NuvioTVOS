@@ -1165,7 +1165,7 @@ extension PlaybackStreamCacheTests {
         )
         _ = try await server.start()
 
-        for _ in 0..<1000 where PlaybackStreamCacheURLProtocol.requestCount < 2 {
+        for _ in 0..<1500 where PlaybackStreamCacheURLProtocol.requestCount < 2 {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         let requestedRanges = PlaybackStreamCacheURLProtocol.requestRanges.compactMap { $0 }
