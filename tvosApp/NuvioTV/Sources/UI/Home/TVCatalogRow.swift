@@ -10,6 +10,15 @@ import Foundation
 
 /// Shared Home vertical rhythm for catalog *and* collection folder rows.
 enum TVHomeLayout {
+    /// Grid View and Desktop share the hero slideshow and grid catalog code.
+    static func isGrid(_ layout: String) -> Bool { layout == "Grid View" || layout == "Desktop" }
+    /// Desktop: one row per catalog with every title, as the desktop app's Home.
+    static func effectiveGridRows(_ stored: Int, layout: String) -> Int {
+        layout == "Desktop" ? 1 : stored
+    }
+    static func effectiveGridItemsPerRow(_ stored: Int, layout: String) -> Int {
+        layout == "Desktop" ? TVHomeGridLayout.seeAllItemsPerRow : stored
+    }
     static let sectionSpacing: CGFloat = 28
     /// Keep the first catalog heading close to the hero description.
     static let heroBottomPadding: CGFloat = 20
@@ -1216,8 +1225,11 @@ struct TVHomeCatalogGridSection: View {
     let onSeeAll: () -> Void
 
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
-    @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
-    @AppStorage(SettingsKey.gridItemsPerRow) private var gridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
+    @AppStorage(SettingsKey.gridRows) private var storedGridRows = TVHomeGridLayout.defaultRows
+    @AppStorage(SettingsKey.gridItemsPerRow) private var storedGridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
+    @AppStorage(SettingsKey.homeLayout) private var gridHomeLayout = "Modern"
+    private var gridRows: Int { TVHomeLayout.effectiveGridRows(storedGridRows, layout: gridHomeLayout) }
+    private var gridItemsPerRow: Int { TVHomeLayout.effectiveGridItemsPerRow(storedGridItemsPerRow, layout: gridHomeLayout) }
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
 
     private var previewItems: [NuvioMeta] {
