@@ -161,6 +161,41 @@ net.Server.prototype.listen = function (...args) {
   return originalListen.apply(this, args);
 };
 
+// MARK: Usenet streams of any add-on
+
+// A Usenet stream (`nzbUrl`, no `url`) from an add-on that doesn't say which
+// service plays it (a plugin through the "Nuvio plugins" card, NimeToDex NZB,
+// Usenet Direct, any Stremio NNTP add-on added by its address) comes into
+// AIOStreams as `stremio-usenet` without a service. AIOStreams' deduplicator
+// has a mode for each stream type but none for that one, and only turns it
+// into cached/uncached when it has a service, so it dropped every such
+// stream: whatever the filters, none was shown, and only Result Passthrough
+// brought them back. Such a stream is typed as AIOStreams' own Usenet add-ons
+// type theirs (StreamNZB): Stremio NNTP, cached. Nuvio Usenet plays it with
+// its own servers, or the stream's. Parsers with rules of their own
+// (AIOStreams' built-in add-ons, TorBox, StreamNZB…) keep them.
+function typeUsenetStreams(core) {
+  const parser = core.StreamParser && core.StreamParser.prototype;
+  if (!parser || typeof parser.getService !== 'function' || typeof parser.getStreamType !== 'function') {
+    log('Usenet streams of add-ons stay as AIOStreams types them: no StreamParser in this AIOStreams');
+    return;
+  }
+  const nntpService = (core.constants && core.constants.STREMIO_NNTP_SERVICE) || 'stremio_nntp';
+  const usenetOnly = (stream) => Boolean(stream && stream.nzbUrl && !stream.url);
+  const getService = parser.getService;
+  parser.getService = function (stream, current) {
+    const service = getService.call(this, stream, current);
+    if (!usenetOnly(stream)) return service;
+    // A service read from the stream's name ("TB", "RD"…) can't play a stream
+    // without a url: only Stremio NNTP can.
+    return service && service.id === nntpService ? service : { id: nntpService, cached: true };
+  };
+  const getStreamType = parser.getStreamType;
+  parser.getStreamType = function (stream, service, current) {
+    return usenetOnly(stream) ? 'stremio-usenet' : getStreamType.call(this, stream, service, current);
+  };
+}
+
 // MARK: Nuvio's plugins as add-ons
 
 // The "Nuvio plugins" card on the configuration page: every plugin set
@@ -262,21 +297,8 @@ function addNuvioPluginsPreset(core) {
     // per add-on, and AIOStreams hands it every stream the plugin answered with.
     static getParser() {
       const Base = super.getParser();
+      // A plugin's Usenet stream is typed as every add-on's (typeUsenetStreams).
       return class NuvioPluginParser extends Base {
-        // A Usenet stream (`nzbUrl`, played by Nuvio Usenet with its own servers)
-        // as AIOStreams' own Usenet add-ons give it: Stremio NNTP, cached. Without
-        // a service, AIOStreams' deduplicator has no mode for `stremio-usenet` and
-        // drops every such stream.
-        getService(stream, current) {
-          if (stream && stream.nzbUrl && !stream.url) return { id: 'stremio_nntp', cached: true };
-          return super.getService(stream, current);
-        }
-
-        getStreamType(stream, service, current) {
-          if (stream && stream.nzbUrl && !stream.url) return 'stremio-usenet';
-          return super.getStreamType(stream, service, current);
-        }
-
         parse(stream) {
           const parsed = super.parse(stream);
           if (!this.nuvioCount) {
@@ -354,6 +376,11 @@ async function holdStartupRefreshes() {
     const resolve = createRequire(path.join(aioRoot, 'packages/server/dist/server.js')).resolve;
     const core = await import(pathToFileURL(resolve('@aiostreams/core')).href);
     mark('core');
+    try {
+      typeUsenetStreams(core);
+    } catch (error) {
+      log(`Usenet streams of add-ons stay as AIOStreams types them: ${error && error.message ? error.message : error}`);
+    }
     try {
       addNuvioPluginsPreset(core);
     } catch (error) {
