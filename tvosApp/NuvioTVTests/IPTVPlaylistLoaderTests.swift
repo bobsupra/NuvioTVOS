@@ -29,6 +29,18 @@ final class IPTVPlaylistLoaderTests: XCTestCase {
         XCTAssertNil(try IPTVPlaylistLoader.parsePlaylist(data: Data(invalid.utf8), sourceID: "fixture", baseURL: base).guideURL)
     }
 
+    func testPlaylistCollectsAndDeduplicatesAllGuideFeedsInHeaderOrder() throws {
+        let input = #"#EXTM3U url-tvg="guide.xml, https://feeds.example/a.xml, file:///tmp/no.xml" x-tvg-url="https://feeds.example/a.xml, /second.xml, https://feeds.example/b.xml""#
+        let result = try IPTVPlaylistLoader.parsePlaylist(data: Data(input.utf8), sourceID: "fixture", baseURL: base)
+        XCTAssertEqual(result.guideURLs.map(\.absoluteString), [
+            "https://example.test/redirected/guide.xml",
+            "https://feeds.example/a.xml",
+            "https://example.test/second.xml",
+            "https://feeds.example/b.xml"
+        ])
+        XCTAssertEqual(result.guideURL, result.guideURLs.first)
+    }
+
     func testMissingSourceAndOversizedPayloadAreRejected() {
         XCTAssertThrowsError(try IPTVPlaylistLoader.parse(data: Data("#EXTM3U".utf8), sourceID: " ", baseURL: base)) {
             XCTAssertEqual($0 as? IPTVPlaylistLoadError, .invalidSourceID)
