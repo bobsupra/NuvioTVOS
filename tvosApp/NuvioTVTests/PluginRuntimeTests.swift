@@ -399,6 +399,20 @@ final class PluginRuntimeTests: XCTestCase {
         XCTAssertEqual(bare.description, "EN")
     }
 
+    func testPluginStreamsCarryThePluginsLogo() throws {
+        let results: [Any] = [
+            ["name": "Provider 1080p", "url": "https://cdn.example.com/video.mp4"],
+            ["name": "UD · NZBGeek", "nzbUrl": "https://api.nzbgeek.info/api?t=get&id=abc&apikey=KEY"]
+        ]
+        let logo = "https://example.com/plugin-logo.png"
+        let streams = PluginStreamDiscovery.streams(from: results, providerName: "Provider", logo: logo)
+        XCTAssertEqual(streams.count, 2)
+        XCTAssertEqual(streams.map(\.addonLogoURL), [logo, logo])
+        // Without a logo in the manifest, none.
+        XCTAssertEqual(PluginStreamDiscovery.streams(from: results, providerName: "Provider").map(\.addonLogoURL), [nil, nil])
+        XCTAssertEqual(PluginStreamDiscovery.streams(from: results, providerName: "Provider", logo: "  ").map(\.addonLogoURL), [nil, nil])
+    }
+
     func testScrapersThatListSeriesGetSeriesForEpisodes() {
         let request = PluginStreamDiscovery.request(
             type: "series", videoID: "tt0944947:1:2", resolvedTMDBID: "1399", scraperDeclaresSeries: true

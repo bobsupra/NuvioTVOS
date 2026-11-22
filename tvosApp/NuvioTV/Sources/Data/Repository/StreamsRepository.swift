@@ -713,7 +713,7 @@ final class StreamsRepository: ObservableObject {
                 && (manifest.resources ?? []).contains { $0.name.caseInsensitiveCompare(resource) == .orderedSame }
         }
         guard someoneNeeds else { return [] }
-        if AniListMetaBuilder.isAniListID(videoId) {
+        if AniListMetaBuilder.isAniListID(videoId) || AnimeSource.isOtherSourceTitle(videoId) {
             return await AniListStreamIds.alternatives(for: videoId)
         }
         // A Cinemeta anime, for add-ons that take only anime ids (kitsu:, anilist:, mal:, anidb:).
@@ -723,7 +723,7 @@ final class StreamsRepository: ObservableObject {
     /// The id plugins are asked by: the title's own, or an AniList title's IMDb id (plugins
     /// take IMDb and TMDB ids), as add-ons that don't take anilist: ids are asked by it.
     nonisolated static func pluginVideoId(for videoId: String) async -> String {
-        guard AniListMetaBuilder.isAniListID(videoId) else { return videoId }
+        guard AniListMetaBuilder.isAniListID(videoId) || AnimeSource.isOtherSourceTitle(videoId) else { return videoId }
         return await AniListStreamIds.alternatives(for: videoId).first { $0.hasPrefix("tt") } ?? videoId
     }
 
@@ -731,7 +731,7 @@ final class StreamsRepository: ObservableObject {
     /// (AIOStreams' "Anime searches"), also when no other add-on needs them or "Ask Other
     /// Add-ons" is off: that setting decides for AIOStreams.
     nonisolated static func aioAlternatives(for videoId: String, have alternatives: [String], aioPresent: Bool) async -> [String] {
-        guard aioPresent, AniListMetaBuilder.isAniListID(videoId),
+        guard aioPresent, AniListMetaBuilder.isAniListID(videoId) || AnimeSource.isOtherSourceTitle(videoId),
               AIOStreamsHost.animeRequestSetting != .aniList else { return alternatives }
         guard alternatives.isEmpty else { return alternatives }
         return await AniListStreamIds.convertedIDs(for: videoId)
@@ -1562,9 +1562,16 @@ struct StreamAddonStreamDTO: Decodable {
             detailLines.append("Size \(Self.sizeFormatter.string(fromByteCount: size))")
         }
 
+        // An entry with only an `externalUrl` is a link to open, not media
+        // (Stremio protocol), e.g. AIOStreams' "no streams found", statistics
+        // and error entries pointing at github.com. Playing that URL failed
+        // with "Stream Source Invalid".
+        let isExternalLinkOnly = cleaned(url) == nil && usenet == nil
+            && resolve == nil && infoHash == nil && cleaned(externalUrl) != nil
         let isNotPlayable = (behaviorHints?.isNotPlayable == true)
             || (notPlayable == true)
             || (action == true)
+            || isExternalLinkOnly
 
         return NuvioStream(
             url: parsed.directURL,

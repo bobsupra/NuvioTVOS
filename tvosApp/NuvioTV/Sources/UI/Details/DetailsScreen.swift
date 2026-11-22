@@ -2446,7 +2446,7 @@ actor YouTubeTrailerResolver {
         _ meta: NuvioMeta,
         preview: Bool
     ) async -> TrailerPlaybackSource? {
-        if AniListMetaBuilder.aniListID(from: meta.id) != nil {
+        if AnimeSource.isAnimeTitleID(meta.id) {
             return await resolveAniListTrailer(meta, preview: preview)
         }
 
@@ -4619,6 +4619,23 @@ struct TvDetailsContent: View {
     @State private var malStatus: MALAccount.ListStatus?
     @State private var showingMALMenu = false
     @State private var showingMALScore = false
+    @State private var kitsuID: Int?
+    @State private var kitsuEntry: KitsuAccount.Entry?
+    @State private var showingKitsuMenu = false
+    @State private var showingKitsuScore = false
+
+    /// The Kitsu button's menus, joined to the MAL button's (one modifier in the body's chain).
+    private func kitsuMenus(_ meta: NuvioMeta) -> TvDetailsKitsuMenus {
+        TvDetailsKitsuMenus(
+            title: aniListTarget?.label ?? meta.name,
+            entryID: aniListTarget?.entryID,
+            kitsuEntry: aniListTarget?.kitsuID ?? (AnimeSource.isKitsuTitle(meta.id) ? AnimeSource.kitsuID(from: meta.id) : nil),
+            kitsuID: $kitsuID,
+            entry: $kitsuEntry,
+            showingMenu: $showingKitsuMenu,
+            showingScore: $showingKitsuScore
+        )
+    }
     @State private var consumedInitialPlayRequestID: UInt?
     @State private var detailsFocusMoveGeneration = 0
     @State private var pendingPlayFocusGeneration: Int?
@@ -4999,15 +5016,31 @@ struct TvDetailsContent: View {
             },
             onWatchlistClick: {
                 cancelFocusRestoration()
-                // An AniList title also goes onto (or off) the viewer's AniList and MAL lists.
-                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn,
-                   let entryID = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedID ?? meta.id) {
+                // An AniList title also goes onto (or off) the viewer's AniList and MAL lists; a
+                // MyAnimeList title onto its own MAL entry.
+                let openedTitle = openedID ?? meta.id
+                let malEntry = aniListTarget?.malID ?? (AnimeSource.isMALTitle(openedTitle) ? AnimeSource.malID(from: openedTitle) : nil)
+                let kitsuAnime = aniListTarget?.kitsuID ?? (AnimeSource.isKitsuTitle(openedTitle) ? AnimeSource.kitsuID(from: openedTitle) : nil)
+                let aniListEntry = aniListTarget?.entryID ?? AniListMetaBuilder.aniListID(from: openedTitle)
+                if AniListAccount.isLoggedIn || MALAccount.isLoggedIn || KitsuAccount.isLoggedIn,
+                   malEntry != nil || aniListEntry != nil || kitsuAnime != nil {
                     let added = !uiState.isInWatchlist
                     Task {
-                        if AniListAccount.isLoggedIn {
-                            await AniListAccount.libraryChanged(entryID: entryID, added: added)
+                        if AniListAccount.isLoggedIn, let aniListEntry, aniListEntry > 0 {
+                            await AniListAccount.libraryChanged(entryID: aniListEntry, added: added)
                         }
-                        await MALAccount.libraryChanged(aniListID: entryID, added: added)
+                        if let malEntry {
+                            await MALAccount.libraryChanged(mal: malEntry, added: added)
+                        } else if let aniListEntry, aniListEntry > 0 {
+                            await MALAccount.libraryChanged(aniListID: aniListEntry, added: added)
+                        }
+                        if KitsuAccount.isLoggedIn {
+                            var kitsu = kitsuAnime
+                            if kitsu == nil, let aniListEntry, aniListEntry > 0 {
+                                kitsu = await AniListOfflineMaps.shared.entry(aniListID: aniListEntry)?.kitsu
+                            }
+                            if let kitsu { await KitsuAccount.libraryChanged(kitsu: kitsu, added: added) }
+                        }
                     }
                 }
                 onWatchlistClick()
@@ -5022,7 +5055,7 @@ struct TvDetailsContent: View {
                 onRateClick?()
             } : nil,
             aniListTitle: aniListButtonTitle,
-            onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget != nil) ? {
+            onAniListClick: (AniListSettings.showsDetailsButton && aniListTarget?.hasAniListEntry == true) ? {
                 cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 showingAniListMenu = true
@@ -5032,6 +5065,12 @@ struct TvDetailsContent: View {
                 cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
                 showingMALMenu = true
+            } : nil,
+            kitsuTitle: KitsuAccount.buttonTitle(kitsuEntry),
+            onKitsuClick: (KitsuSettings.showsDetailsButton && kitsuID != nil) ? {
+                cancelFocusRestoration()
+                stopBackgroundTrailer(manual: false)
+                showingKitsuMenu = true
             } : nil,
             onTrailerClick: {
                 cancelFocusRestoration()
@@ -5158,7 +5197,7 @@ struct TvDetailsContent: View {
                         guard !clean.isEmpty && clean != "cast" else { return }
                         // An AniList title's characters open their voice actor's AniList page
                         // (or the character's); they have no TMDB page.
-                        guard !AniListMetaBuilder.isAniListID(meta.id) || person.hasAniListPage else { return }
+                        guard !AnimeSource.isAnimeTitleID(meta.id) || person.hasAniListPage else { return }
                         stopBackgroundTrailer(manual: false)
                         onOpenPerson?(
                             person,
@@ -5205,7 +5244,9 @@ struct TvDetailsContent: View {
             if !relatedRowsAreEmpty(meta: meta) {
                 VStack(alignment: .leading, spacing: 34) {
                     // Settings → Integrations → AniList: the title's OVAs, films and other
-                    // relations, above AniList's recommendations.
+                    // relations, above AniList's recommendations (drawn again as MyAnimeList's
+                    // pictures come in).
+                    let _ = uiState.relatedPicturesRevision
                     if !AniListTitleIndex.related(metaID: meta.id).isEmpty {
                         relatedTitlesRow(
                             title: L10n.string("details_anilist_related", fallback: "Related"),
@@ -5332,6 +5373,25 @@ struct TvDetailsContent: View {
                 )
             }
         case .comments:
+            if hasCommentRows {
+                commentRows(scrollProxy: scrollProxy)
+                    .padding(.top, 40)
+                    .id(TvDetailsScrollID.commentsSection)
+                    .disabled(
+                        restoreEpisodeKey != nil
+                            || !isDetailsFocusReachable(.comments)
+                    )
+            }
+        }
+    }
+
+    /// Trakt's comments, and an anime's reviews from AniList and MAL (`AnimeReviews`).
+    private var hasCommentRows: Bool {
+        !uiState.comments.isEmpty || !uiState.aniListReviews.isEmpty || !uiState.malReviews.isEmpty
+    }
+
+    private func commentRows(scrollProxy: ScrollViewProxy) -> some View {
+        VStack(alignment: .leading, spacing: 34) {
             if !uiState.comments.isEmpty {
                 TvDetailsCommentsRow(
                     comments: uiState.comments,
@@ -5358,7 +5418,58 @@ struct TvDetailsContent: View {
                         || !isDetailsFocusReachable(.comments)
                 )
             }
+            if !uiState.aniListReviews.isEmpty {
+                commentRow(
+                    uiState.aniListReviews,
+                    title: L10n.string("details_anilist_reviews", fallback: "AniList Reviews"),
+                    logo: AnimeFind.aniListIcon,
+                    scrollProxy: scrollProxy
+                )
+            }
+            if !uiState.malReviews.isEmpty {
+                commentRow(
+                    uiState.malReviews,
+                    title: L10n.string("details_mal_reviews", fallback: "MAL Reviews"),
+                    logoAsset: MALEpisodeRatings.assetName,
+                    scrollProxy: scrollProxy
+                )
+            }
         }
+    }
+
+    private func commentRow(
+        _ comments: [TraktCommentReview],
+        title: String? = nil,
+        logo: UIImage? = nil,
+        logoAsset: String? = nil,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        TvDetailsCommentsRow(
+            comments: comments,
+            title: title,
+            logo: logo,
+            logoAsset: logoAsset,
+            entryLocked: focusedDetailsSection != .comments,
+            onSelect: { comment in
+                onCommentSelect?(comment)
+            },
+            onBack: handleDetailsBack,
+            onFocus: {
+                guard focusRestoreAttemptTarget == nil else { return }
+                if focusedDetailsSection != .comments {
+                    focusedDetailsSection = .comments
+                    withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                        scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                    }
+                } else {
+                    var transaction = Transaction(animation: nil)
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                    }
+                }
+            }
+        )
     }
 
     /// Offered for an episodic series (see `EpisodeShuffle.suitsShuffle`) with at
@@ -5817,11 +5928,12 @@ struct TvDetailsContent: View {
             .modifier(TvDetailsMALMenus(
                 title: aniListTarget?.label ?? meta.name,
                 entryID: aniListTarget?.entryID,
+                malEntry: aniListTarget?.malID,
                 malID: $malID,
                 status: $malStatus,
                 showingMenu: $showingMALMenu,
                 showingScore: $showingMALScore
-            ))
+            ).concat(kitsuMenus(meta)))
             .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
@@ -6539,7 +6651,7 @@ struct TvDetailsContent: View {
                     order.append(.production)
                 }
             case .comments:
-                if !uiState.comments.isEmpty {
+                if hasCommentRows {
                     order.append(.comments)
                 }
             }
@@ -6984,7 +7096,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, shuffle, party, watchlist, watched, rate, anilist, mal, trailer
+    case play, shuffle, party, watchlist, watched, rate, anilist, mal, kitsu, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -7014,6 +7126,9 @@ private struct TvDetailsActionRow: View {
     /// Settings → Anime Integrations → MyAnimeList: the viewer's MAL status ("Watching 5/12").
     var malTitle: String? = nil
     var onMALClick: (() -> Void)? = nil
+    /// Settings → Anime Integrations → Kitsu: the viewer's Kitsu status.
+    var kitsuTitle: String? = nil
+    var onKitsuClick: (() -> Void)? = nil
     let onTrailerClick: () -> Void
     var onBack: (() -> Void)? = nil
     var focus: FocusState<DetailsActionFocus?>.Binding
@@ -7142,6 +7257,24 @@ private struct TvDetailsActionRow: View {
                 .disabled(entryLocked)
             }
 
+            if let onKitsuClick {
+                TvDetailsActionButton(
+                    title: kitsuTitle,
+                    systemName: "k.circle.fill",
+                    iconAsset: "rating_kitsu",
+                    accessibilityLabel: kitsuTitle.map { "Kitsu: \($0)" } ?? "Kitsu",
+                    accessibilityHint: "Changes this title in your Kitsu library",
+                    isPrimary: false,
+                    isWide: true,
+                    focus: focus,
+                    tag: .kitsu,
+                    action: onKitsuClick,
+                    onFocus: onFocus,
+                    onBack: onBack
+                )
+                .disabled(entryLocked)
+            }
+
             TvDetailsActionButton(
                 title: nil,
                 systemName: isWatched ? "eye.fill" : "eye.slash.fill",
@@ -7196,9 +7329,9 @@ private struct TvDetailsAniListMenus: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .task(id: "\(meta.id)|\(episode?.id ?? "")|\(AniListAccount.login?.viewerID ?? 0)|\(MALAccount.login?.userName ?? "")") {
+            .task(id: "\(meta.id)|\(episode?.id ?? "")|\(AniListAccount.login?.viewerID ?? 0)|\(MALAccount.login?.userName ?? "")|\(KitsuAccount.login?.userName ?? "")") {
                 target = await Self.findTarget(meta: meta, episode: episode)
-                if AniListAccount.isLoggedIn, let target, !AniListAccount.hasAsked(target.entryID) {
+                if AniListAccount.isLoggedIn, let target, target.hasAniListEntry, !AniListAccount.hasAsked(target.entryID) {
                     await AniListAccount.refreshStates(ids: [target.entryID])
                 }
             }
@@ -7270,14 +7403,126 @@ private struct TvDetailsAniListMenus: ViewModifier {
     /// The AniList entry and episode of the play target: an AniList title's own, a Cinemeta
     /// anime's as AniList knows it, an AniList series' first entry before any episode.
     private static func findTarget(meta: NuvioMeta, episode: NuvioVideo?) async -> AniListScrobbler.Target? {
-        guard AniListAccount.isLoggedIn || MALAccount.isLoggedIn else { return nil }
+        guard AniListAccount.isLoggedIn || MALAccount.isLoggedIn || KitsuAccount.isLoggedIn else { return nil }
         if let found = await AniListScrobbler.target(meta: meta, video: episode, season: episode?.season, episode: episode?.episode) {
             return found
         }
         if AniListMetaBuilder.isAniListID(meta.id), let first = AniListAccount.entryIDs(of: meta).first {
             return AniListScrobbler.Target(entryID: first, episode: 0, label: meta.name)
         }
+        // A MyAnimeList or Kitsu series before any episode: its first entry.
+        if let own = AnimeSource.entry(from: meta.id), own.source != .anilist, own.source.opensTitles {
+            let first = meta.videos?.lazy.compactMap({ video -> Int? in
+                guard let found = AnimeSource.entry(from: video.id), found.source == own.source else { return nil }
+                return found.id
+            }).first ?? own.id
+            let maps = AniListOfflineMaps.shared
+            let aniList: Int?
+            if own.source == .mal {
+                aniList = await maps.aniListID(mal: first)
+            } else {
+                aniList = await maps.aniListID(kitsu: first)
+            }
+            var offline: AniListOfflineMaps.Entry?
+            if let aniList { offline = await maps.entry(aniListID: aniList) }
+            return AniListScrobbler.Target(
+                entryID: aniList ?? 0,
+                episode: 0,
+                label: meta.name,
+                malID: own.source == .mal ? first : offline?.mal,
+                kitsuID: own.source == .kitsu ? first : offline?.kitsu
+            )
+        }
         return nil
+    }
+}
+
+/// Details' Kitsu button: the viewer's status of this title in their Kitsu library, and its score.
+private struct TvDetailsKitsuMenus: ViewModifier {
+    let title: String
+    let entryID: Int?
+    /// A Kitsu title's own entry.
+    var kitsuEntry: Int? = nil
+    @Binding var kitsuID: Int?
+    @Binding var entry: KitsuAccount.Entry?
+    @Binding var showingMenu: Bool
+    @Binding var showingScore: Bool
+    @State private var revision = 0
+
+    func body(content: Content) -> some View {
+        content
+            .task(id: "\(entryID ?? 0)|\(kitsuEntry ?? 0)|\(KitsuAccount.login?.userName ?? "")|\(revision)") {
+                var found = kitsuEntry
+                if found == nil, let entryID, entryID > 0 {
+                    found = await AniListOfflineMaps.shared.entry(aniListID: entryID)?.kitsu
+                }
+                guard KitsuSettings.showsDetailsButton, let kitsu = found else {
+                    kitsuID = nil
+                    entry = nil
+                    return
+                }
+                kitsuID = kitsu
+                entry = await KitsuAccount.entry(kitsu: kitsu)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: KitsuAccount.changedNotification).receive(on: RunLoop.main)) { _ in
+                revision &+= 1
+            }
+            .confirmationDialog("Kitsu: \(title)", isPresented: $showingMenu, titleVisibility: .visible) {
+                menuButtons
+            } message: {
+                Text(message)
+            }
+            .confirmationDialog("Score on Kitsu", isPresented: $showingScore, titleVisibility: .visible) {
+                scoreButtons
+            }
+    }
+
+    @ViewBuilder
+    private var menuButtons: some View {
+        if let kitsuID {
+            let current = entry?.status
+            ForEach(KitsuAccount.statuses, id: \.self) { value in
+                Button(KitsuAccount.statusLabel(value) + (current == value ? " ✓" : "")) {
+                    let known = entry
+                    Task { await KitsuAccount.setStatus(value, kitsu: kitsuID, current: known) }
+                }
+            }
+            Button(L10n.string("details_anime_score", fallback: "Score…")) { showingScore = true }
+            if current != nil {
+                Button(L10n.string("details_anime_remove_list", fallback: "Remove from List"), role: .destructive) {
+                    Task { await KitsuAccount.remove(kitsu: kitsuID) }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var scoreButtons: some View {
+        if let kitsuID {
+            let score = (entry?.rating ?? 0) / 2
+            ForEach(Array(stride(from: 10, through: 1, by: -1)), id: \.self) { value in
+                Button("\(value)/10" + (score == value ? " ✓" : "")) {
+                    let known = entry
+                    Task { await KitsuAccount.setScore(value, kitsu: kitsuID, current: known) }
+                }
+            }
+            Button(L10n.string("details_anime_remove_score", fallback: "Remove Score"), role: .destructive) {
+                let known = entry
+                Task { await KitsuAccount.setScore(0, kitsu: kitsuID, current: known) }
+            }
+        }
+    }
+
+    private var message: String {
+        guard let entry, let current = entry.status else { return L10n.string("details_anime_not_on_list", fallback: "Not on your list yet") }
+        var parts = [KitsuAccount.statusLabel(current)]
+        parts.append(entry.episodes > 0
+            ? L10n.format("details_anime_episodes_progress", fallback: "%1$d/%2$d episodes", entry.progress, entry.episodes)
+            : L10n.format("details_anime_episodes_count", fallback: "%d episodes", entry.progress))
+        if let rating = entry.rating, rating > 0 {
+            parts.append(L10n.format("details_anime_score_format", fallback: "Score %d/10", rating / 2))
+        }
+        return parts.joined(separator: " · ")
     }
 }
 
@@ -7286,6 +7531,8 @@ private struct TvDetailsAniListMenus: ViewModifier {
 private struct TvDetailsMALMenus: ViewModifier {
     let title: String
     let entryID: Int?
+    /// A MyAnimeList title's own MAL entry.
+    var malEntry: Int? = nil
     @Binding var malID: Int?
     @Binding var status: MALAccount.ListStatus?
     @Binding var showingMenu: Bool
@@ -7294,9 +7541,12 @@ private struct TvDetailsMALMenus: ViewModifier {
 
     func body(content: Content) -> some View {
         content
-            .task(id: "\(entryID ?? 0)|\(MALAccount.login?.userName ?? "")|\(revision)") {
-                guard MALSettings.showsDetailsButton, let entryID,
-                      let mal = await MALEpisodeRatings.malID(aniListID: entryID) else {
+            .task(id: "\(entryID ?? 0)|\(malEntry ?? 0)|\(MALAccount.login?.userName ?? "")|\(revision)") {
+                var found = malEntry
+                if found == nil, let entryID, entryID > 0 {
+                    found = await MALEpisodeRatings.malID(aniListID: entryID)
+                }
+                guard MALSettings.showsDetailsButton, let mal = found else {
                     malID = nil
                     status = nil
                     return
@@ -8220,6 +8470,10 @@ private struct TvDetailsCompanyCard: View {
 
 private struct TvDetailsCommentsRow: View {
     let comments: [TraktCommentReview]
+    /// The row's name and its source's logo; Trakt's comments as "Top Comments".
+    var title: String? = nil
+    var logo: UIImage? = nil
+    var logoAsset: String? = nil
     let entryLocked: Bool
     let onSelect: (TraktCommentReview) -> Void
     var onBack: (() -> Void)? = nil
@@ -8238,9 +8492,23 @@ private struct TvDetailsCommentsRow: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Text(L10n.string("details_top_comments", fallback: "Top Comments"))
-                .font(.system(size: 34, weight: .semibold))
-                .foregroundColor(.white.opacity(0.9))
+            HStack(spacing: 14) {
+                if let logo {
+                    Image(uiImage: logo)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 34)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                } else if let logoAsset {
+                    Image(logoAsset)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(height: 34)
+                }
+                Text(title ?? L10n.string("details_top_comments", fallback: "Top Comments"))
+                    .font(.system(size: 34, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.9))
+            }
 
             TVCAStrip(index: scrollIndex, step: cardWidth + spacing, animated: smoothFocus) {
                 HStack(spacing: 22) {
@@ -8288,6 +8556,11 @@ private struct TvDetailsCommentCard: View {
                         .foregroundColor(.white)
                         .lineLimit(1)
                     Spacer(minLength: 8)
+                    if let score = comment.scoreText {
+                        Text(score)
+                            .font(.system(size: 20, weight: .bold))
+                            .foregroundColor(.white.opacity(0.85))
+                    }
                     if comment.likes > 0 {
                         Label("\(comment.likes)", systemImage: "heart.fill")
                             .font(.system(size: 18, weight: .medium))
@@ -8295,17 +8568,19 @@ private struct TvDetailsCommentCard: View {
                     }
                 }
 
-                Text(comment.spoiler ? L10n.string("details_spoiler_notice", fallback: "Spoiler — select to read") : comment.comment)
+                Text(comment.spoiler ? L10n.string("details_spoiler_notice", fallback: "Spoiler — select to read") : (comment.summary ?? comment.comment))
                     .font(.system(size: 22, weight: .regular))
                     .foregroundColor(.white.opacity(comment.spoiler ? 0.45 : 0.82))
                     .lineLimit(5)
                     .multilineTextAlignment(.leading)
                     .frame(maxWidth: .infinity, alignment: .leading)
 
-                if let date = comment.displayDate {
-                    Text(date)
+                let footer = [comment.displayDate, comment.tag].compactMap { $0 }.joined(separator: " · ")
+                if !footer.isEmpty {
+                    Text(footer)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundColor(.white.opacity(0.4))
+                        .lineLimit(1)
                 }
             }
             .padding(24)
@@ -8351,8 +8626,9 @@ private struct CommentDetailOverlay: View {
                         Text(comment.author)
                             .font(.system(size: 36, weight: .bold))
                             .foregroundColor(.white)
-                        if let date = comment.displayDate {
-                            Text(date)
+                        let line = [comment.scoreText, comment.tag, comment.displayDate].compactMap { $0 }.joined(separator: " · ")
+                        if !line.isEmpty {
+                            Text(line)
                                 .font(.system(size: 24, weight: .medium))
                                 .foregroundColor(.white.opacity(0.5))
                         }
@@ -10672,7 +10948,7 @@ private struct TvDetailsEpisodes: View {
         if let label = AniListTitleIndex.tabLabel(metaID: meta.id, season: season) {
             return label.name
         }
-        if AniListMetaBuilder.isAniListID(meta.id) {
+        if AnimeSource.isAnimeTitleID(meta.id) {
             // AniList's entries aren't seasons.
             return seasons.count > 1 ? "Part \(season)" : "Episodes"
         }

@@ -1,6 +1,7 @@
 import Foundation
 
-/// A Trakt review/comment shown on the details page.
+/// A Trakt review/comment shown on the details page (also AniList's and MAL's anime reviews,
+/// `AnimeReviews`).
 struct TraktCommentReview: Identifiable, Equatable {
     let id: Int64
     let author: String
@@ -9,6 +10,12 @@ struct TraktCommentReview: Identifiable, Equatable {
     let spoiler: Bool
     let rating: Int?
     let createdAt: String?
+    /// An AniList review's one-line summary, shown on its card in place of the start of the text.
+    var summary: String? = nil
+    /// A review's own score as its site writes it ("84%", "8/10").
+    var scoreText: String? = nil
+    /// A MAL review's verdict ("Recommended", "Mixed Feelings", "Not Recommended").
+    var tag: String? = nil
 
     var displayDate: String? {
         guard let createdAt else { return nil }

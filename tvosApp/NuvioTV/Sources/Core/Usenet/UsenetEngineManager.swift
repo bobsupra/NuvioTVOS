@@ -10,6 +10,13 @@ struct UsenetStreamStats: Equatable, Sendable {
     var totalConnections = 0
     var configuredConnections = 0
     var bufferedAheadBytes: Int64 = 0
+    /// The same in seconds of video, once the player knows the duration.
+    var bufferedAheadSeconds: Double?
+    /// Articles kept on disk (Read Ahead on Disk), what they may use now and what tvOS
+    /// reports free (-1: unknown).
+    var diskBytes: Int64 = 0
+    var diskBudgetBytes: Int64 = 0
+    var diskFreeBytes: Int64 = -1
     var cacheHitRate: Double?
     var missingArticles = 0
     var fallbackArticles = 0
@@ -27,7 +34,9 @@ struct UsenetStreamStats: Equatable, Sendable {
     }
 
     var bufferedFormatted: String {
-        ByteCountFormatter.string(fromByteCount: bufferedAheadBytes, countStyle: .memory)
+        let bytes = ByteCountFormatter.string(fromByteCount: bufferedAheadBytes, countStyle: .memory)
+        guard let bufferedAheadSeconds, bufferedAheadSeconds.isFinite else { return bytes }
+        return bytes + " (\(Int(bufferedAheadSeconds.rounded())) s)"
     }
 
     var connectionsText: String { "\(busyConnections)/\(totalConnections)" }
@@ -50,6 +59,18 @@ struct UsenetStreamStats: Equatable, Sendable {
         if fallbackArticles > 0 { parts.append("backup \(fallbackArticles)") }
         if reconnects > 0 { parts.append("reconnect \(reconnects)") }
         return parts.joined(separator: " · ")
+    }
+
+    /// HUD line 3 with Read Ahead on Disk: what it holds, what it may use now and what tvOS
+    /// reports free; nil when it is off.
+    var diskLine: String? {
+        guard diskBudgetBytes > 0 || diskBytes > 0 else { return nil }
+        var line = ByteCountFormatter.string(fromByteCount: diskBytes, countStyle: .file)
+            + " of " + ByteCountFormatter.string(fromByteCount: diskBudgetBytes, countStyle: .file)
+        if diskFreeBytes >= 0 {
+            line += " · tvOS free " + ByteCountFormatter.string(fromByteCount: diskFreeBytes, countStyle: .file)
+        }
+        return line
     }
 
     var summary: String { connectionLine + " · " + cacheLine }
@@ -106,7 +127,14 @@ final class UsenetEngineManager: ObservableObject {
             usenetLog.notice("usenet: \(source.name, privacy: .public) [\(source.kind.rawValue, privacy: .public)] — \(source.volumes.count) file(s), \(health.missing)/\(health.checked) sampled articles missing")
             guard UsenetHealthCheck.isPlayable(health) else { throw UsenetError.releaseIncomplete }
 
-            let session = UsenetStreamSession(source: source, pool: pool, profile: UsenetSettings.profile()) { [weak self] in
+            // Off the main thread: it clears what an earlier stream left on disk.
+            let diskBytes = UsenetSettings.diskReadAheadBytes()
+            let diskReadAhead = await Task.detached(priority: .userInitiated) {
+                UsenetDiskReadAhead.make(sizeBytes: diskBytes)
+            }.value
+            let session = UsenetStreamSession(
+                source: source, pool: pool, profile: UsenetSettings.profile(), diskReadAhead: diskReadAhead
+            ) { [weak self] in
                 Task { @MainActor in self?.reportDamage(generation: current) }
             }
             try await session.prepare()
@@ -258,10 +286,16 @@ final class UsenetEngineManager: ObservableObject {
                 stats.fallbackArticles = poolStats.fallbackArticles
                 stats.reconnects = poolStats.reconnects
                 stats.bufferedAheadBytes = sessionStats.bufferedAheadBytes
+                stats.bufferedAheadSeconds = sessionStats.bufferedAheadSeconds
+                stats.diskBytes = sessionStats.diskBytes
+                stats.diskBudgetBytes = sessionStats.diskBudgetBytes
+                stats.diskFreeBytes = sessionStats.diskFreeBytes
                 stats.missingArticles = sessionStats.missingArticles
                 stats.cacheHitRate = lookups > 0 ? Double(sessionStats.cacheHits) / Double(lookups) : nil
                 if stats != self.activeStats { self.activeStats = stats }
-                try? await Task.sleep(for: .seconds(1))
+                // Twice a second: the seek bar draws the read-ahead from these, and a seek
+                // changes it at once.
+                try? await Task.sleep(for: .milliseconds(500))
             }
         }
     }

@@ -489,7 +489,11 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     func preservingEnrichment(from existing: NuvioMeta?) -> NuvioMeta {
         guard let existing, matches(id: existing.id) || existing.matches(id: id) else { return self }
         var resolved = self
-        if resolved.externalRatings == nil, let existingRatings = existing.externalRatings {
+        if let existingRatings = existing.externalRatings, !existingRatings.isEmpty {
+            // The ratings already shown (MDBList's, the add-ons') stay when the full title brings
+            // only its own, as an AniList title does with its AniList score.
+            resolved = resolved.addingRatings(existingRatings)
+        } else if resolved.externalRatings == nil, let existingRatings = existing.externalRatings {
             resolved = resolved.withExternalRatings(existingRatings)
         }
         let castToUse = (resolved.cast == nil || resolved.cast?.isEmpty == true) ? existing.cast : resolved.cast
@@ -632,6 +636,16 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             isFromAddon: isFromAddon,
             landscapePosterUrl: landscapePosterUrl
         )
+    }
+
+    /// This title's ratings, then `others` of the sources it has none of: its own score replaces
+    /// another's copy of it.
+    func addingRatings(_ others: [NuvioExternalRating]) -> NuvioMeta {
+        let own = externalRatings ?? []
+        let ownSources = Set(own.map { AddonRatingsService.normalizedSourceKey($0.source) })
+        let added = others.filter { !ownSources.contains(AddonRatingsService.normalizedSourceKey($0.source)) }
+        guard !added.isEmpty else { return self }
+        return withExternalRatings(own + added)
     }
 
     func withExternalRatings(_ ratings: [NuvioExternalRating]) -> NuvioMeta {
@@ -13400,6 +13414,9 @@ struct DetailsUiState {
     var isWatched: Bool = false
     /// Related titles under the cast row (TMDB, Trakt, or Simkl recommendations).
     var moreLikeThis: [RelatedTitle] = []
+    /// Counts the pictures found for an anime title's Related row after it was drawn (MyAnimeList
+    /// names its relations without pictures): a change draws the row again with them.
+    var relatedPicturesRevision: Int = 0
     /// Movie collection franchise (TMDB movie series).
     var collection: TmdbMovieCollection? = nil
     /// Production companies + networks from TMDB.
@@ -13412,6 +13429,9 @@ struct DetailsUiState {
     var mdbListUserRating: Int? = nil
     /// Top liked Trakt comments (max 5).
     var comments: [TraktCommentReview] = []
+    /// An anime's reviews from AniList and MAL (`AnimeReviews`), shown with the comments.
+    var aniListReviews: [TraktCommentReview] = []
+    var malReviews: [TraktCommentReview] = []
     var isLoadingEnrichment: Bool = false
 }
 

@@ -472,6 +472,11 @@ class DetailsViewModel: ObservableObject {
     private var streamObserveTask: Task<Void, Never>?
     private var enrichmentTask: Task<Void, Never>?
     private var deferredLoadTask: Task<Void, Never>?
+    /// The pictures a MyAnimeList title's Related row is waiting for (`fillMALRelatedPictures`).
+    private var relatedPicturesTask: Task<Void, Never>?
+    private var relatedPicturesRequest: String?
+    /// The anime reviews asked for this title (`loadAnimeReviews`).
+    private var animeReviewsRequest: String?
     private(set) var watchlistMutationTask: Task<Void, Never>?
     /// Invalidates every asynchronous completion from an older details load.
     /// This is intentionally separate from the content id: the same title can
@@ -625,6 +630,11 @@ class DetailsViewModel: ObservableObject {
                 primaryState.isLoading = false
                 primaryState.error = nil
                 self.uiState = primaryState
+                // Built now, with its Related row: the pictures MAL's relations lack (the card it
+                // opened from had no row to fill yet).
+                self.fillMALRelatedPictures(for: resolvedMeta, generation: requestGeneration)
+                // And an anime's reviews by the full title's ids (a Cinemeta card may lack them).
+                self.loadAnimeReviews(for: resolvedMeta, generation: requestGeneration)
 
                 // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
                 // reload them immediately with the resolved canonical stream id.
@@ -713,6 +723,10 @@ class DetailsViewModel: ObservableObject {
         streamObserveTask = nil
         enrichmentTask?.cancel()
         enrichmentTask = nil
+        relatedPicturesTask?.cancel()
+        relatedPicturesTask = nil
+        relatedPicturesRequest = nil
+        animeReviewsRequest = nil
         uiState.isLoadingEnrichment = false
         prefetchedStreamId = nil
         prefetchedEpisode = nil
@@ -826,6 +840,50 @@ class DetailsViewModel: ObservableObject {
         return (aniListRatings + mdbRatings + addonRatings).filter { seen.insert($0.source.lowercased()).inserted }
     }
 
+    /// `combinedRatings` as its parts arrive: MDBList's and the add-ons', and an anime's AniList
+    /// score, each shown when it comes instead of all waiting for the slowest. The AniList score
+    /// goes ahead of Home's AniList requests, which fill AniList's limit after a start. `update`
+    /// gets the ratings so far, and `complete` with the last part.
+    nonisolated static func progressiveRatings(
+        for meta: NuvioMeta,
+        update: @escaping @Sendable (_ ratings: [NuvioExternalRating], _ complete: Bool) async -> Void
+    ) async {
+        await withTaskGroup(of: (Int, [NuvioExternalRating]).self) { group in
+            group.addTask {
+                let scores = await AniListClient.$isInteractive.withValue(true) {
+                    await AniListService.ratings(for: meta)
+                }
+                return (0, scores)
+            }
+            group.addTask {
+                let asked = await AniListService.ratingsMeta(for: meta)
+                async let mdbTask = MdbListDetailsService.fetchRatings(forOptional: asked)
+                async let addonTask = AddonRatingsService.fetchRatings(forOptional: asked)
+                let (mdbRatings, addonRatings) = await (mdbTask, addonTask)
+                return (1, mdbRatings + addonRatings)
+            }
+            var parts: [Int: [NuvioExternalRating]] = [:]
+            for await (index, ratings) in group {
+                parts[index] = ratings
+                var seen = Set<String>()
+                let merged = ((parts[0] ?? []) + (parts[1] ?? [])).filter { seen.insert($0.source.lowercased()).inserted }
+                await update(merged, parts.count == 2)
+            }
+        }
+    }
+
+    /// The ratings row: a part so far beside what is shown (the hero's seeded ones, the title's
+    /// own), the whole when the last part arrives.
+    private func applyRatings(_ ratings: [NuvioExternalRating], complete: Bool, for metaId: String, generation: UInt64) {
+        guard !complete else {
+            applyMdbRatings(ratings, for: metaId, generation: generation)
+            return
+        }
+        guard isCurrentRequest(metaId: metaId, generation: generation), !ratings.isEmpty,
+              let currentMeta = uiState.meta else { return }
+        uiState.meta = currentMeta.withExternalRatings(ratings).addingRatings(currentMeta.externalRatings ?? [])
+    }
+
     /// Whether an AniList title is in the selected library (Trakt, Simkl, MDBList, WeTrakr), which
     /// keeps it under the IMDb/TMDB ids it maps to. nil = not known (or the local library).
     nonisolated static func aniListLibraryMembership(for meta: NuvioMeta) async -> Bool? {
@@ -858,6 +916,8 @@ class DetailsViewModel: ObservableObject {
             guard self.detailsRequestGeneration == generation,
                   self.uiState.meta?.id == meta.id else { return }
             TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
+            // AniList's and MAL's reviews of an anime, whichever source the title is from.
+            self.loadAnimeReviews(for: meta, generation: generation)
             self.uiState.isLoadingEnrichment = true
             defer {
                 if self.detailsRequestGeneration == generation {
@@ -884,8 +944,13 @@ class DetailsViewModel: ObservableObject {
                         }
                     }
                 }
-                let ratings = await Self.combinedRatings(for: meta)
-                self.applyMdbRatings(ratings, for: meta.id, generation: generation)
+                // A MyAnimeList title's Related row: the pictures MAL's relations lack.
+                self.fillMALRelatedPictures(for: meta, generation: generation)
+                await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
+                    await MainActor.run {
+                        self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
+                    }
+                }
                 // In the selected library under the IMDb/TMDB ids it maps to.
                 if let member = await Self.aniListLibraryMembership(for: meta) {
                     self.applyMdbListWatchlistMembership(member, for: meta.id, generation: generation)
@@ -955,11 +1020,12 @@ class DetailsViewModel: ObservableObject {
                     }
                 }
 
-                // 4. External Ratings (MDBList & Add-ons)
+                // 4. External Ratings (MDBList & Add-ons, and an anime's AniList score)
                 group.addTask {
-                    let combinedRatings = await Self.combinedRatings(for: meta)
-                    await MainActor.run { [weak self] in
-                        self?.applyMdbRatings(combinedRatings, for: meta.id, generation: generation)
+                    await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
+                        await MainActor.run {
+                            self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
+                        }
                     }
                 }
 
@@ -1023,6 +1089,57 @@ class DetailsViewModel: ObservableObject {
         }
     }
 
+    /// A MyAnimeList title's Related row: the pictures MAL's relations lack, drawn as they come
+    /// in, apart from the cast. Asked once the row is known (the built title, not the card it was
+    /// opened from), and again only for more of the title's entries (its seasons).
+    private func fillMALRelatedPictures(for meta: NuvioMeta, generation: UInt64) {
+        guard AnimeSource.isMALTitle(meta.id), !MALSource.missingPictures(metaID: meta.id).isEmpty else { return }
+        let entryIDs = MALSource.entryIDs(of: meta)
+        let request = meta.id.lowercased() + "|" + entryIDs.map(String.init).joined(separator: ",")
+        if relatedPicturesTask != nil, relatedPicturesRequest == request { return }
+        relatedPicturesTask?.cancel()
+        relatedPicturesRequest = request
+        relatedPicturesTask = Task { @MainActor [weak self] in
+            await MALSource.fillRelatedPictures(metaID: meta.id, entryIDs: entryIDs) { [weak self] in
+                guard let self, self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
+                // A real change of the state: the row reads the pictures as it is drawn.
+                self.uiState.relatedPicturesRevision &+= 1
+            }
+            guard let self, self.relatedPicturesRequest == request else { return }
+            self.relatedPicturesTask = nil
+        }
+    }
+
+    /// AniList's and MAL's reviews of an anime (AniList Reviews, MAL Reviews), apart from the
+    /// rest: an AniList, MAL or Kitsu title, or a Cinemeta anime the offline tables map. Asked with
+    /// the card the details opened from and again with the full title (its IMDb and TMDB ids), once
+    /// each per load; a try that found nothing doesn't keep the next one out. Kept while the
+    /// details stay on this load.
+    private func loadAnimeReviews(for meta: NuvioMeta, generation: UInt64) {
+        let wantsAniList = AnimeReviews.showsAniList
+        let wantsMAL = AnimeReviews.showsMAL
+        guard wantsAniList || wantsMAL else { return }
+        let request = [
+            String(generation), meta.id.lowercased(), meta.imdbId ?? "", meta.tmdbId.map(String.init) ?? "",
+            String(wantsAniList), String(wantsMAL),
+        ].joined(separator: "|")
+        guard animeReviewsRequest != request else { return }
+        animeReviewsRequest = request
+        Task { @MainActor [weak self] in
+            let found = await AnimeReviews.reviews(for: meta)
+            if !found.aniList.isEmpty, AnimeFind.aniListIcon == nil {
+                await AnimeFind.loadAniListIcon()
+            }
+            guard let self, self.detailsRequestGeneration == generation else { return }
+            guard !found.aniList.isEmpty || !found.mal.isEmpty else {
+                if self.animeReviewsRequest == request { self.animeReviewsRequest = nil }
+                return
+            }
+            if !found.aniList.isEmpty { self.uiState.aniListReviews = found.aniList }
+            if !found.mal.isEmpty { self.uiState.malReviews = found.mal }
+        }
+    }
+
     private func isCurrentRequest(metaId: String, generation: UInt64) -> Bool {
         !Task.isCancelled && detailsRequestGeneration == generation && uiState.meta?.id == metaId
     }
@@ -1076,11 +1193,11 @@ class DetailsViewModel: ObservableObject {
 
     /// Ratings the Home hero already fetched for this title, so the Details
     /// ratings row is there on the first frame instead of popping in.
+    /// An AniList title, which carries its own AniList score, gets the hero's others too.
     private func seedingCachedRatings(into meta: NuvioMeta) -> NuvioMeta {
-        guard meta.externalRatings?.isEmpty ?? true,
-              let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta),
+        guard let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta),
               !cached.isEmpty else { return meta }
-        return meta.withExternalRatings(cached)
+        return meta.addingRatings(cached)
     }
 
     private func applyCertification(_ certification: String?, for metaId: String, generation: UInt64) {

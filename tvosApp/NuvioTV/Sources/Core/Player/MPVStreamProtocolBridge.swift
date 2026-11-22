@@ -191,7 +191,11 @@ final class MPVStreamSession: NSObject, URLSessionDataDelegate, @unchecked Senda
         config.urlCache = nil
         config.requestCachePolicy = .reloadIgnoringLocalAndRemoteCacheData
         config.timeoutIntervalForRequest = 60
-        config.timeoutIntervalForResource = 300
+        // A live channel is one endless request, and the resource timeout caps a
+        // task's whole lifetime, so 300 s ended every live stream after 5 minutes
+        // (then a full reconnect and rebuffer). Silence is still caught by the
+        // 60 s request timeout above.
+        config.timeoutIntervalForResource = isLiveStream ? 7 * 24 * 3600 : 300
 
         let operationQueue = OperationQueue()
         operationQueue.maxConcurrentOperationCount = 1
