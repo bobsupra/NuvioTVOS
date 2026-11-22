@@ -413,6 +413,27 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         )
     }
 
+    @MainActor
+    func testAetherWillResignActiveDoesNotSuspendPlayback() throws {
+        guard let controller = AetherPlaybackController() else {
+            throw XCTSkip("AetherPlaybackController unavailable in test environment")
+        }
+        controller.loadViewIfNeeded()
+        var didSuspend = false
+        var didWillSuspend = false
+        controller.onPlaybackSuspended = { _, _ in didSuspend = true }
+        controller.onWillSuspendPlayback = { didWillSuspend = true }
+
+        NotificationCenter.default.post(name: UIApplication.willResignActiveNotification, object: nil)
+
+        XCTAssertFalse(didSuspend, "Control Center or Siri dictation making the app inactive must not suspend playback")
+        XCTAssertFalse(didWillSuspend, "willResignActive must not trigger willSuspendPlayback")
+
+        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+
+        XCTAssertTrue(didWillSuspend, "Entering background must trigger willSuspendPlayback")
+    }
+
     func testMPVLifecycleRestoreWaitsForActiveAppAndSettledDisplay() {
         XCTAssertFalse(MPVPlaybackLifecyclePolicy.canIssueRestore(
             pending: true,

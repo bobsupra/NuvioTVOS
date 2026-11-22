@@ -36,6 +36,28 @@ final class ReplacementStreamDetectionTests: XCTestCase {
     }
 
     @MainActor
+    func testFullEpisodeIsNotReplacementWhenResumeExceedsDuration() {
+        XCTAssertFalse(PlayerViewModel.streamLooksLikeReplacement(
+            loadedDuration: 2_525,
+            pendingResumeSeconds: 3_000,
+            expectedDurationSeconds: nil,
+            isStandalonePlaybackSession: false,
+            isLiveStream: false
+        ))
+    }
+
+    @MainActor
+    func testFullEpisodeIsNotReplacementWhenMuchShorterThanExpectedDuration() {
+        XCTAssertFalse(PlayerViewModel.streamLooksLikeReplacement(
+            loadedDuration: 2_869,
+            pendingResumeSeconds: nil,
+            expectedDurationSeconds: 6_000,
+            isStandalonePlaybackSession: false,
+            isLiveStream: false
+        ))
+    }
+
+    @MainActor
     func testShortLiveStreamWithoutKnownMismatchIsNotReplacement() {
         XCTAssertFalse(PlayerViewModel.streamLooksLikeReplacement(
             loadedDuration: 90,
@@ -125,8 +147,8 @@ final class ReplacementStreamDetectionTests: XCTestCase {
             isStandalonePlaybackSession: false,
             isLiveStream: false
         ))
-        // With the other episode's length it was.
-        XCTAssertTrue(PlayerViewModel.streamLooksLikeReplacement(
+        // Even against the other episode's length, a full episode is not a slate.
+        XCTAssertFalse(PlayerViewModel.streamLooksLikeReplacement(
             loadedDuration: 1_344,
             pendingResumeSeconds: nil,
             expectedDurationSeconds: 4_250,

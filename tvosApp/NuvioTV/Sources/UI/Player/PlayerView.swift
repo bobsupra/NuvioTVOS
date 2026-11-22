@@ -58,7 +58,7 @@ struct PlayerView: View {
     /// sources already tried this session. Nil disables failover.
     var reloadCurrentStream: ((_ episode: NuvioVideo?, _ excludedURLs: [String]) async -> PreparedNextStream?)? = nil
     /// Streams alternate sources into the Sources side panel as add-ons respond.
-    var fetchPlaybackSources: ((_ contentId: String, _ type: String) -> AsyncStream<[NuvioStream]>)? = nil
+    var fetchPlaybackSources: ((_ contentId: String, _ type: String, _ episodeTarget: StreamEpisodeTarget?) -> AsyncStream<[NuvioStream]>)? = nil
     /// Resolves a user-selected source for mid-playback switching.
     var resolvePlaybackStream: ((
         _ stream: NuvioStream,
@@ -113,7 +113,7 @@ struct PlayerView: View {
         allowsManualEpisodeSelection: Bool = true,
         resolveNextStream: ((NuvioVideo, UUID?) async -> PreparedNextStream?)? = nil,
         reloadCurrentStream: ((NuvioVideo?, [String]) async -> PreparedNextStream?)? = nil,
-        fetchPlaybackSources: ((String, String) -> AsyncStream<[NuvioStream]>)? = nil,
+        fetchPlaybackSources: ((String, String, StreamEpisodeTarget?) -> AsyncStream<[NuvioStream]>)? = nil,
         resolvePlaybackStream: ((NuvioStream, String, String, UUID?) async -> PreparedNextStream?)? = nil,
         onWatchPartyIncomingMediaResolved: WatchPartyIncomingEpisodePlan.Completion? = nil,
         onWatchPartyEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = nil,

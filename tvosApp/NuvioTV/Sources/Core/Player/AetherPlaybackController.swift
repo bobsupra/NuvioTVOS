@@ -4277,43 +4277,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     @objc private func appWillResignActive() {
-        let observedResumeIntent = AetherPlaybackLifecyclePolicy.shouldResumeAfterBackground(
-            state: engine.state,
-            isPlayerPlaying: isPlayerPlaying,
-            isTransportPlaying: isTransportPlaying,
-            previousIntent: playbackWasPlayingBeforeBackground
-        )
-        if !engine.pictureInPictureActive {
-            let mark = lifecycleReloadToken
-            onWillSuspendPlayback?()
-            guard lifecycleReloadToken == mark else { return }
-        }
-        foregroundReloadActiveCancellationRetryCount = 0
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: state=\(engine.state), isPlayerPlaying=\(isPlayerPlaying), lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
-        let interruptedReload = foregroundReloadTask != nil
-        if !engine.pictureInPictureActive {
-            // Invalidate the task before cancellation so its catch path cannot
-            // publish an expected background interruption as a terminal error.
-            lifecycleReloadToken &+= 1
-            if interruptedReload {
-                needsForegroundReload = true
-            }
-            foregroundReloadTask?.cancel()
-            foregroundReloadTask = nil
-        }
-        playbackWasPlayingBeforeBackground = observedResumeIntent
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: computed playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
-        #if os(tvOS)
-        let pos = lastKnownPositionMs
-        let dur = lastKnownDurationMs
-        onPlaybackSuspended?(pos, dur)
-        #endif
-
-        let shouldReload = AetherPlaybackLifecyclePolicy.shouldReloadAfterBackground(state: engine.state)
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: shouldReload=\(shouldReload)")
-        guard shouldReload || interruptedReload else { return }
-        needsForegroundReload = true
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: set needsForegroundReload=true, playbackWasPlayingBeforeBackground=\(playbackWasPlayingBeforeBackground)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive")
+        // Control Center, Siri and system alerts make the app inactive without
+        // leaving it. Keep playing, as the Apple TV app does;
+        // only didEnterBackground (Home, another app, sleep) suspends playback.
     }
 
     @objc private func appDidEnterBackground() {

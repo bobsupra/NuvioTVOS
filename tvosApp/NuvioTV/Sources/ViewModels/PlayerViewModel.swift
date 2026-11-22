@@ -804,7 +804,7 @@ class PlayerViewModel: ObservableObject {
     /// session so failover never loops a dead source. Nil disables recovery.
     var reloadCurrentStream: ((_ episode: NuvioVideo?, _ excludedURLs: [String]) async -> PreparedNextStream?)?
     /// Streams playable sources into the Sources panel as add-ons respond.
-    var fetchPlaybackSources: ((_ contentId: String, _ type: String) -> AsyncStream<[NuvioStream]>)?
+    var fetchPlaybackSources: ((_ contentId: String, _ type: String, _ episodeTarget: StreamEpisodeTarget?) -> AsyncStream<[NuvioStream]>)?
     /// Resolves a user-picked source into a ready stream (debrid + URL).
     var resolvePlaybackStream: ((
         _ stream: NuvioStream,
@@ -4058,7 +4058,8 @@ class PlayerViewModel: ObservableObject {
             }
         }
 
-        let isPresentingFrames = (hasPresentedCurrentLoad || c.isPlayerPlaying || hasRenderedFirstFrame || time.current > 0.5)
+        let isPresentingFrames = sessionCoordinator.hasDispatchedCurrentLoad(generation: sampledLoadGeneration)
+            && (hasPresentedCurrentLoad || c.isPlayerPlaying || hasRenderedFirstFrame || time.current > 0.5)
             && (c.hasFirstFrameReadyForDisplay || (c.isPlayerPlaying && !c.isPlayerLoading && (c.videoFrameSize != .zero || c.durationMs > 0)))
         if isPresentingFrames {
             if !hasRenderedFirstFrame {
@@ -4107,7 +4108,9 @@ class PlayerViewModel: ObservableObject {
             || (engineStatus == .paused && time.duration > 0 && !c.isPlayerLoading)
             || hasRenderedFirstFrame
             || time.current > 0.5
-        if (hasPresentedCurrentLoad || hasRenderedFirstFrame || engineStatus == .playing || time.current > 0.5) && engineHasStarted {
+        if sessionCoordinator.hasDispatchedCurrentLoad(generation: sampledLoadGeneration)
+            && (hasPresentedCurrentLoad || hasRenderedFirstFrame || engineStatus == .playing || time.current > 0.5)
+            && engineHasStarted {
             isAwaitingStreamStart = false
             hasRenderedFirstFrame = true
             markLoadStarted()
@@ -4117,12 +4120,14 @@ class PlayerViewModel: ObservableObject {
         // idle pipeline reads as paused. Keep reporting `.buffering` until it
         // really starts, so a source/episode switch shows the spinner over the
         // black frame instead of parked transport controls.
+        let isStartingPlayback = engineStatus == .paused || engineStatus == .playing
         let isAwaitingCurrentLoadDispatch = !sessionCoordinator.hasDispatchedCurrentLoad(
             generation: sampledLoadGeneration
         )
         let isAwaitingAetherPresentation = sampledEngineKind == .aether && !hasPresentedCurrentLoad && !hasRenderedFirstFrame
         let latestStatus = (isAwaitingStreamStart
             && !hasRenderedFirstFrame
+            && isStartingPlayback
             && (engineStatus == .paused || isAwaitingCurrentLoadDispatch || isAwaitingAetherPresentation))
             ? .buffering
             : engineStatus
@@ -7756,7 +7761,10 @@ class PlayerViewModel: ObservableObject {
     }
 
     private var panelSourceContentId: String? {
-        currentEpisodeVideo?.id ?? activeMeta?.id
+        if let episode = currentEpisodeVideo {
+            return activeMeta?.canonicalEpisodeStreamId(for: episode) ?? episode.id
+        }
+        return activeMeta?.id
     }
 
     private var panelSourceContentType: String {
@@ -7780,7 +7788,14 @@ class PlayerViewModel: ObservableObject {
         let generation = sourcesLoadGeneration
         isLoadingSources = true
         let type = panelSourceContentType
-        let updates = fetchPlaybackSources(contentId, type)
+        let episodeTarget: StreamEpisodeTarget? = resolvedEpisodeNumbers.map {
+            StreamEpisodeTarget(
+                season: $0.season,
+                episode: $0.episode,
+                allowsMismatch: !(activeMeta?.isAnime ?? false)
+            )
+        }
+        let updates = fetchPlaybackSources(contentId, type, episodeTarget)
         sourcesFetchTask = Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -9205,11 +9220,8 @@ class PlayerViewModel: ObservableObject {
 
     // MARK: - Expired-link / replacement-stream detection
 
-    /// True when the file mpv actually opened can't be the title we set out to
-    /// play. Stream hosts can answer an expired link with a short "slate" clip
-    /// that decodes cleanly (no mpv error), so compare its length with the
-    /// expected title duration and resume point — you can't be 40 min into a
-    /// 2 min file. A short duration alone is not enough to identify a slate.
+    /// Recognizes a short expired-link clip using a mismatch with the expected
+    /// runtime or resume point. These values can be stale for a playable source.
     static func streamLooksLikeReplacement(
         loadedDuration: Double,
         pendingResumeSeconds: Double?,
@@ -9218,6 +9230,8 @@ class PlayerViewModel: ObservableObject {
         isLiveStream _: Bool
     ) -> Bool {
         guard !isStandalonePlaybackSession, loadedDuration > 0 else { return false }
+        let maximumSlateDuration: Double = 5 * 60
+        guard loadedDuration <= maximumSlateDuration else { return false }
         if let resume = pendingResumeSeconds, resume > loadedDuration + 60 {
             return true
         }

@@ -11,6 +11,7 @@ import Foundation
 import UIKit
 import ImageIO
 import OSLog
+import Darwin
 #if canImport(AetherEngine)
 import AetherEngine
 #endif
@@ -95,6 +96,46 @@ enum TVHomeDebugTrace {
         String(format: "%.1f", Double(now() - start) / 1_000_000)
     }
 
+    static func beginHomeOperation(_ name: String) -> UInt64? {
+#if NUVIO_SIDEBAR_WATCHDOG
+        TVSidebarWatchdog.shared.beginHomeOperation(name)
+#else
+        nil
+#endif
+    }
+
+    static func endHomeOperation(_ token: UInt64?) {
+#if NUVIO_SIDEBAR_WATCHDOG
+        TVSidebarWatchdog.shared.endHomeOperation(token)
+#endif
+    }
+
+    static func recordHomeBodyEvaluation() {
+#if NUVIO_SIDEBAR_WATCHDOG
+        TVSidebarWatchdog.shared.recordBodyEvaluation(view: "Home")
+#endif
+    }
+
+    static func recordTabsBodyEvaluation() {
+#if NUVIO_SIDEBAR_WATCHDOG
+        TVSidebarWatchdog.shared.recordBodyEvaluation(view: "Tabs")
+#endif
+    }
+
+    static func sampleViewChanges(_ view: String, printChanges: () -> Void) {
+#if NUVIO_SIDEBAR_WATCHDOG
+        if TVSidebarWatchdog.shared.shouldSampleViewChanges(view) { printChanges() }
+#endif
+    }
+
+    static func measureHomeOperation<T>(_ name: String, block: () -> T) -> T {
+#if NUVIO_SIDEBAR_WATCHDOG
+        return TVSidebarWatchdog.shared.measureHomeOperation(name, block)
+#else
+        return block()
+#endif
+    }
+
     static func breadcrumb(_ message: @autoclosure () -> String) {
         guard enabled else { return }
         let text = message()
@@ -130,8 +171,16 @@ enum TVHomeDebugTrace {
 
     @discardableResult
     static func measure<T>(_ label: @autoclosure () -> String, thresholdMs: Double = 15.0, block: () throws -> T) rethrows -> T {
+#if NUVIO_SIDEBAR_WATCHDOG
+        let measuredLabel = label()
+        let operation = TVSidebarWatchdog.shared.beginMeasuredHomeOperation(measuredLabel)
+        defer { TVSidebarWatchdog.shared.endHomeOperation(operation) }
+        guard enabled else { return try block() }
+        let text = measuredLabel
+#else
         guard enabled else { return try block() }
         let text = label()
+#endif
         breadcrumb("\(text) begin")
         let start = now()
         defer {
@@ -1910,6 +1959,19 @@ struct ContentView: View {
         }
 
         let context = Self.episodeContext(for: item)
+        let savedEpisodeTarget: StreamEpisodeTarget? = {
+            guard item.meta.isSeries || NuvioMeta.isSeriesType(item.meta.type) else { return nil }
+            if let episode = context.current, episode.season >= 0, episode.episode > 0 {
+                return StreamEpisodeTarget(season: episode.season, episode: episode.episode, allowsMismatch: !item.meta.isAnime)
+            }
+            if let season = item.season, let episode = item.episode, season >= 0, episode > 0 {
+                return StreamEpisodeTarget(season: season, episode: episode, allowsMismatch: !item.meta.isAnime)
+            }
+            if let numbers = Self.episodeNumbers(fromSubtitle: item.episodeSubtitle ?? "") {
+                return StreamEpisodeTarget(season: numbers.season, episode: numbers.episode, allowsMismatch: !item.meta.isAnime)
+            }
+            return nil
+        }()
         let provenance = collectionContext(id: item.meta.id, type: item.meta.type, resuming: true)
         playbackEpisodes = context.episodes
         playbackCurrentEpisode = context.current
@@ -1926,16 +1988,19 @@ struct ContentView: View {
         let streamURL = storedStream?.url ?? ""
         let httpHeaders = storedStream?.httpHeaders ?? [:]
         if !streamURL.isEmpty, let url = URL(string: streamURL) {
-            presentPlayback(
-                url: url,
-                meta: item.meta,
-                subtitle: item.episodeSubtitle ?? "",
-                externalSubtitles: [],
-                resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
-                httpHeaders: httpHeaders,
-                collectionContext: provenance
-            )
-            return
+            let savedURLMatchesEpisode = savedEpisodeTarget.map { $0.match(url: url) != .mismatch } ?? true
+            if savedURLMatchesEpisode {
+                presentPlayback(
+                    url: url,
+                    meta: item.meta,
+                    subtitle: item.episodeSubtitle ?? "",
+                    externalSubtitles: [],
+                    resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                    httpHeaders: httpHeaders,
+                    collectionContext: provenance
+                )
+                return
+            }
         }
 
         // If no cached stream is available and Auto Select Stream is off, open manual picker
@@ -1971,6 +2036,7 @@ struct ContentView: View {
                     type: item.meta.type,
                     subtitleLine: item.episodeSubtitle ?? "",
                     profileId: profileId,
+                    episodeTarget: savedEpisodeTarget,
                     startupToken: startupToken
                 )
             }
@@ -3552,6 +3618,7 @@ struct ContentView: View {
             subtitleLine: "S\(episode.season) · E\(episode.episode) · \(episode.title)",
             profileId: profileId,
             seriesMetaId: seriesMeta.id,
+            episodeTarget: StreamEpisodeTarget(season: episode.season, episode: episode.episode, allowsMismatch: !seriesMeta.isAnime),
             startupToken: startupToken
         )
     }
@@ -3567,18 +3634,30 @@ struct ContentView: View {
         profileId: String?,
         excludingURLs: Set<String> = [],
         seriesMetaId: String? = nil,
+        episodeTarget: StreamEpisodeTarget? = nil,
         forceRefresh: Bool = false,
         startupToken: UUID? = nil
     ) async -> PreparedNextStream? {
+        let resolvedEpisodeTarget: StreamEpisodeTarget? = episodeTarget ?? {
+            guard NuvioMeta.isSeriesType(type) else { return nil }
+            let (season, episode) = Self.seasonEpisode(fromContentId: contentId)
+            guard let season, let episode else { return nil }
+            return StreamEpisodeTarget(
+                season: season,
+                episode: episode,
+                allowsMismatch: Self.allowsEpisodeMismatch(type: type, contentId: contentId)
+            )
+        }()
         let streams = await StreamsRepository.shared.collectStreams(
             type: type,
             videoId: contentId,
+            season: resolvedEpisodeTarget?.season,
+            episode: resolvedEpisodeTarget?.episode,
             forceRefresh: forceRefresh || !excludingURLs.isEmpty
         )
         guard !streams.isEmpty else { return nil }
 
         let store = ProfileSettings.store(for: profileId)
-        let quality = store.string(forKey: SettingsKey.smartStreamQuality) ?? "Highest"
         let matchSubtitles = store.object(forKey: SettingsKey.smartSubtitleMatching) as? Bool ?? true
         let languages = SubtitleLanguagePreferences.orderedFromDefaults(defaults: store)
         let cachedOnlyPreference = (store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
@@ -3589,63 +3668,30 @@ struct ContentView: View {
         // Prefer the exact series meta id when resolving an episode stream.
         let resolvedSeriesId = seriesMetaId ?? StreamQualityTags.seriesId(fromContentId: contentId)
         let metaIdForTags = resolvedSeriesId.isEmpty ? contentId : resolvedSeriesId
-        let preferredTags = LastStreamQualityStore.load(metaId: metaIdForTags, profileId: profileId)
-            ?? LastStreamQualityStore.load(metaId: contentId, profileId: profileId)
 
         let debrid = DebridResolver(store: store)
         let useTopResult = (store.object(forKey: SettingsKey.smartStreamUseTopResult) as? Bool) ?? false
         let preserveAddonOrder = (store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
         let preferBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
         let reuseBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
-        let sortRaw = store.string(forKey: SettingsKey.streamSortOption)
-        let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
-
-        let ranked: [NuvioStream]
         let includeDebridOrTorrent = debrid.isEnabled || TorrentSettings.isEnabled()
-        if useTopResult || preserveAddonOrder {
-            let playable = SmartPlaybackSelector.playableStreams(
-                from: streams,
-                includeDebrid: includeDebridOrTorrent,
-                cachedOnly: cachedOnly,
-                preserveAddonStreams: preserveAddonOrder
-            ).filter { !$0.isNotPlayable }
-            let sortedPlayable = StreamPickerListBuilder.sorted(playable, by: sortOption, preserveAddonStreams: preserveAddonOrder)
-            // Prioritize preferred binge group or release fingerprint before taking top result
-            if (preferBingeGroup || reuseBingeGroup), let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
-                let matching = sortedPlayable.first { candidate in
-                    let tags = StreamQualityTags.parse(stream: candidate)
-                    if let pbg = preferredTags.bingeGroup, let sbg = tags.bingeGroup,
-                       pbg.compare(sbg, options: .caseInsensitive) == .orderedSame {
-                        return true
-                    }
-                    if let pfp = preferredTags.releaseFingerprint, let sfp = tags.releaseFingerprint,
-                       pfp.compare(sfp, options: .caseInsensitive) == .orderedSame {
-                        return true
-                    }
-                    return false
-                }
-                if let matching {
-                    ranked = [matching] + sortedPlayable.filter { $0.id != matching.id }
-                } else {
-                    ranked = sortedPlayable
-                }
-            } else {
-                ranked = sortedPlayable
-            }
-        } else {
-            ranked = Self.rankedPlayableStreams(
-                from: streams,
-                qualityPreference: quality,
-                subtitleLanguages: languages,
-                shouldMatchSubtitles: matchSubtitles,
-                includeDebrid: includeDebridOrTorrent,
-                preferredTags: preferredTags,
-                cachedOnly: cachedOnly
-            )
-        }
+        let preferredTags = (preferBingeGroup || reuseBingeGroup)
+            ? LastStreamQualityStore.load(metaId: metaIdForTags, profileId: profileId)
+                ?? LastStreamQualityStore.load(metaId: contentId, profileId: profileId)
+            : nil
+        let subtitleLanguages = matchSubtitles && !useTopResult && !preserveAddonOrder ? languages : []
+        let ranked = StreamPickerListBuilder.automaticStreams(
+            streams: streams,
+            sortOption: StreamSortOption.configured(in: store),
+            includeDebrid: includeDebridOrTorrent,
+            cachedOnly: cachedOnly,
+            preserveAddonStreams: preserveAddonOrder,
+            episodeTarget: resolvedEpisodeTarget,
+            preferredTags: preferredTags,
+            subtitleLanguages: subtitleLanguages
+        )
         guard !ranked.isEmpty else { return nil }
 
-        let (season, episode) = Self.seasonEpisode(fromContentId: contentId)
         for candidate in ranked {
             // Direct URL already known-bad this session.
             if let urlString = candidate.directURL?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -3664,8 +3710,8 @@ struct ContentView: View {
                 if debrid.isEnabled {
                     let result = await debrid.resolvedURL(
                         for: candidate,
-                        season: season,
-                        episode: episode
+                        season: resolvedEpisodeTarget?.season,
+                        episode: resolvedEpisodeTarget?.episode
                     )
                     if case let .success(url, filename, videoSize)? = result {
                         resolvedURL = url
@@ -3690,6 +3736,11 @@ struct ContentView: View {
                     }
                 }
                 guard let url = resolvedURL else { continue }
+                if let resolvedEpisodeTarget,
+                   resolvedEpisodeTarget.match(filename: resolvedFilename ?? "") == .mismatch
+                    || resolvedEpisodeTarget.match(url: url) == .mismatch {
+                    continue
+                }
                 if excludingURLs.contains(url.absoluteString) { continue }
                 PlaybackStartupTiming.markDebridResolved(token: startupToken)
                 LastStreamQualityStore.save(
@@ -3721,6 +3772,7 @@ struct ContentView: View {
             }
 
             guard let urlString = candidate.directURL, let rawURL = URL(string: urlString),
+                  resolvedEpisodeTarget?.match(url: rawURL) != .mismatch,
                   let url = await Self.playableURL(for: rawURL) else { continue }
             PlaybackStartupTiming.markSourcePicked(stream: candidate, token: startupToken)
             LastStreamQualityStore.save(
@@ -3760,7 +3812,8 @@ struct ContentView: View {
     private static func displayedPlaybackSources(
         profileId: String?,
         type: String,
-        streams: [NuvioStream]
+        streams: [NuvioStream],
+        episodeTarget: StreamEpisodeTarget?
     ) -> [NuvioStream] {
         let store = ProfileSettings.store(for: profileId)
         let debrid = DebridResolver(store: store)
@@ -3770,8 +3823,7 @@ struct ContentView: View {
             contentType: type
         )
         let preserveAddonOrder = (store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
-        let sortRaw = store.string(forKey: SettingsKey.streamSortOption)
-        let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
+        let sortOption = StreamSortOption.configured(in: store)
         return StreamPickerListBuilder.displayedStreams(
             streams: streams,
             groups: [],
@@ -3780,7 +3832,8 @@ struct ContentView: View {
             includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonOrder,
-            includeUnknownCacheStatus: true
+            includeUnknownCacheStatus: true,
+            episodeTarget: episodeTarget
         )
     }
 
@@ -3790,7 +3843,8 @@ struct ContentView: View {
     private static func playbackSourcesProgressively(
         contentId: String,
         type: String,
-        profileId: String?
+        profileId: String?,
+        episodeTarget: StreamEpisodeTarget?
     ) -> AsyncStream<[NuvioStream]> {
         let repository = CinemetaCatalogRepository()
         let updates = repository.streamsProgressively(
@@ -3806,7 +3860,8 @@ struct ContentView: View {
                         Self.displayedPlaybackSources(
                             profileId: profileId,
                             type: type,
-                            streams: streams
+                            streams: streams,
+                            episodeTarget: episodeTarget
                         )
                     )
                 }
@@ -3939,28 +3994,6 @@ struct ContentView: View {
         )
     }
 
-    /// Ordered candidates for playback / failover: smart-best first (including
-    /// last-watched DV/HDR/Atmos match), then remaining playable streams.
-    private static func rankedPlayableStreams(
-        from streams: [NuvioStream],
-        qualityPreference: String,
-        subtitleLanguages: [String],
-        shouldMatchSubtitles: Bool,
-        includeDebrid: Bool,
-        preferredTags: StreamQualityTags? = nil,
-        cachedOnly: Bool = false
-    ) -> [NuvioStream] {
-        SmartPlaybackSelector.rankedStreams(
-            from: streams,
-            qualityPreference: qualityPreference,
-            subtitleLanguages: subtitleLanguages,
-            shouldMatchSubtitles: shouldMatchSubtitles,
-            includeDebrid: includeDebrid,
-            preferredTags: preferredTags,
-            cachedOnly: cachedOnly
-        )
-    }
-
     /// Parses the season/episode out of a Stremio series content id of the form
     /// `tt1234567:2:5` (imdb-id : season : episode). Returns `(nil, nil)` for
     /// movies or ids without the trailing numbers.
@@ -3970,6 +4003,14 @@ struct ContentView: View {
             return (nil, nil)
         }
         return (season, episode)
+    }
+
+    private static func allowsEpisodeMismatch(type: String, contentId: String) -> Bool {
+        let normalizedType = type.lowercased()
+        let normalizedID = contentId.lowercased()
+        let animeProviders = ["anilist:", "kitsu:", "mal:", "anidb:", "anime:"]
+        return !normalizedType.contains("anime")
+            && !animeProviders.contains(where: normalizedID.hasPrefix)
     }
 
     private static func episodeNumbers(fromSubtitle subtitle: String) -> (season: Int, episode: Int)? {
@@ -4096,6 +4137,11 @@ struct ContentView: View {
                         profileId: profileId,
                         excludingURLs: excluded,
                         seriesMetaId: meta.id,
+                        episodeTarget: StreamEpisodeTarget(
+                            season: episode.season,
+                            episode: episode.episode,
+                            allowsMismatch: !meta.isAnime
+                        ),
                         forceRefresh: true,
                         startupToken: nil
                     )
@@ -4111,11 +4157,12 @@ struct ContentView: View {
                     startupToken: nil
                 )
             },
-            fetchPlaybackSources: isStandalonePlaybackSession ? nil : { contentId, type in
+            fetchPlaybackSources: isStandalonePlaybackSession ? nil : { contentId, type, episodeTarget in
                 Self.playbackSourcesProgressively(
                     contentId: contentId,
                     type: type,
-                    profileId: profileViewModel.activeProfile?.id
+                    profileId: profileViewModel.activeProfile?.id,
+                    episodeTarget: episodeTarget
                 )
             },
             resolvePlaybackStream: isStandalonePlaybackSession ? nil : { stream, contentId, subtitleLine, startupToken in
@@ -4705,6 +4752,456 @@ private struct TVHomeCoveredFreeze<Content: View>: View, Equatable {
     var body: some View { content }
 }
 
+#if NUVIO_SIDEBAR_WATCHDOG
+/// Temporary measurements for native sidebar reproduction; deliberately independent of focus events.
+private final class TVSidebarWatchdog {
+    private struct HomeOperation {
+        let id: UInt64
+        let name: String
+        let start: TimeInterval
+    }
+    private struct SlowHomeOperation {
+        let name: String
+        let durationMs: Double
+        let ended: TimeInterval
+    }
+
+    static let shared = TVSidebarWatchdog()
+    private let logger = Logger(subsystem: Bundle.main.bundleIdentifier ?? "com.pyksel.nuviotvos", category: "SidebarWatchdog")
+    private let queue = DispatchQueue(label: "nuviotvos.sidebar-watchdog", qos: .utility)
+    private var timer: DispatchSourceTimer?
+    private var previousCPU: (time: TimeInterval, usage: TimeInterval)?
+    private var generation = 0
+    private var pingInFlight = false
+    private var pendingPingSince: TimeInterval?
+    private var lastSpikeLog: TimeInterval = 0
+    private var requestStarted: (from: TVTab, to: TVTab, time: TimeInterval)?
+    private var stalled = false
+    private var currentTab = "unknown"
+    private var mainThreadPort: thread_act_t = 0
+    private var lastHomeTransitionAt: TimeInterval = 0
+    private let homeOperationLock = NSLock()
+    private var nextHomeOperationID: UInt64 = 0
+    private var homeOperations: [HomeOperation] = []
+    private var recentHomeOperations: [SlowHomeOperation] = []
+    private var homeBodyEvaluationTimes = Array(repeating: TimeInterval.zero, count: 128)
+    private var homeBodyEvaluationCount = 0
+    private var homeBodyEvaluationIndex = 0
+    private var tabsBodyEvaluationTimes = Array(repeating: TimeInterval.zero, count: 128)
+    private var tabsBodyEvaluationCount = 0
+    private var tabsBodyEvaluationIndex = 0
+    private var viewChangeSamples: [String: Int] = [:]
+    private var lastViewChangeSample: [String: TimeInterval] = [:]
+    private var scrollConfigurationWritesSinceReport = 0
+    private var scrollKVOFixesSinceReport = 0
+
+    private init() {}
+
+    private func notice(_ message: String) {
+        logger.notice("\(message, privacy: .public)")
+        mirrorToConsole(message)
+    }
+
+    private func warning(_ message: String) {
+        logger.warning("\(message, privacy: .public)")
+        mirrorToConsole(message)
+    }
+
+    private func mirrorToConsole(_ message: String) {
+        guard ProcessInfo.processInfo.environment["NUVIO_SIDEBAR_CONSOLE"] == "1" else { return }
+        fputs("[SidebarWatchdog] \(message)\n", stderr)
+    }
+
+    func beginHomeOperation(_ name: String) -> UInt64? {
+        guard Thread.isMainThread else { return nil }
+        homeOperationLock.lock()
+        guard homeOperations.count < 32 else {
+            homeOperationLock.unlock()
+            return nil
+        }
+        nextHomeOperationID &+= 1
+        let operation = HomeOperation(id: nextHomeOperationID, name: name, start: ProcessInfo.processInfo.systemUptime)
+        homeOperations.append(operation)
+        homeOperationLock.unlock()
+        return operation.id
+    }
+
+    func beginMeasuredHomeOperation(_ label: String) -> UInt64? {
+        let name: String
+        if label.hasPrefix("home.focusedCardID.onChange") { name = "home.focus.change" }
+        else if label.hasPrefix("home.publishHomeSections") { name = "home.sections.publish" }
+        else if label.hasPrefix("home.setContinueWatching") { name = "home.cw.publish" }
+        else if label.hasPrefix("home.refreshContinueWatching") { name = "home.cw.refresh" }
+        else if label.hasPrefix("cw.snapshot.read") { name = "home.cw.snapshot.read" }
+        else if label.hasPrefix("cw.snapshot.prepare") { name = "home.cw.snapshot.prepare" }
+        else if label.hasPrefix("home.topShelf.write") { name = "home.account.topShelfWrite" }
+        else if label.hasPrefix("home.account.refresh.dispatch") { name = "home.account.refreshDispatch" }
+        else if label.hasPrefix("home.account.applyProfiles") { name = "home.account.applyProfiles" }
+        else if label.hasPrefix("home.account.applyCatalogSettings") { name = "home.account.applyCatalogSettings" }
+        else if label.hasPrefix("home.watched.snapshot") { name = "home.watched.snapshot" }
+        else { return nil }
+        return beginHomeOperation(name)
+    }
+
+    func endHomeOperation(_ id: UInt64?) {
+        guard let id else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        homeOperationLock.lock()
+        if let index = homeOperations.lastIndex(where: { $0.id == id }) {
+            let operation = homeOperations.remove(at: index)
+            let durationMs = (now - operation.start) * 1000
+            if durationMs >= 8 {
+                recentHomeOperations.append(SlowHomeOperation(name: operation.name, durationMs: durationMs, ended: now))
+                if recentHomeOperations.count > 24 {
+                    recentHomeOperations.removeFirst(recentHomeOperations.count - 24)
+                }
+            }
+        }
+        homeOperationLock.unlock()
+    }
+
+    func recordBodyEvaluation(view: String) {
+        guard Thread.isMainThread else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        homeOperationLock.lock()
+        if view == "Home" {
+            homeBodyEvaluationTimes[homeBodyEvaluationIndex] = now
+            homeBodyEvaluationIndex = (homeBodyEvaluationIndex + 1) % homeBodyEvaluationTimes.count
+            homeBodyEvaluationCount = min(homeBodyEvaluationCount + 1, homeBodyEvaluationTimes.count)
+        } else if view == "Tabs" {
+            tabsBodyEvaluationTimes[tabsBodyEvaluationIndex] = now
+            tabsBodyEvaluationIndex = (tabsBodyEvaluationIndex + 1) % tabsBodyEvaluationTimes.count
+            tabsBodyEvaluationCount = min(tabsBodyEvaluationCount + 1, tabsBodyEvaluationTimes.count)
+        }
+        homeOperationLock.unlock()
+    }
+
+    func shouldSampleViewChanges(_ view: String) -> Bool {
+        guard Thread.isMainThread else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        homeOperationLock.lock()
+        let samples = viewChangeSamples[view, default: 0]
+        let last = lastViewChangeSample[view, default: 0]
+        guard samples < 12, now - last >= 0.2 else {
+            homeOperationLock.unlock()
+            return false
+        }
+        let times = view == "Home" ? homeBodyEvaluationTimes : tabsBodyEvaluationTimes
+        let count = view == "Home" ? homeBodyEvaluationCount : tabsBodyEvaluationCount
+        let recentEvaluations = times.prefix(count).filter { now - $0 <= 1 }.count
+        guard recentEvaluations >= 3 else {
+            homeOperationLock.unlock()
+            return false
+        }
+        viewChangeSamples[view] = samples + 1
+        lastViewChangeSample[view] = now
+        homeOperationLock.unlock()
+        return true
+    }
+
+    func recordScrollConfigurationWrite(isKVOCorrection: Bool = false) {
+        homeOperationLock.lock()
+        if isKVOCorrection { scrollKVOFixesSinceReport += 1 }
+        else { scrollConfigurationWritesSinceReport += 1 }
+        homeOperationLock.unlock()
+    }
+
+    func measureHomeOperation<T>(_ name: String, _ block: () throws -> T) rethrows -> T {
+        let id = beginHomeOperation(name)
+        defer { endHomeOperation(id) }
+        return try block()
+    }
+
+    private func isHomeDiagnosticRelevant(now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Bool {
+        let requestFresh = requestStarted.map { now - $0.time <= 3 } ?? false
+        return currentTab == Self.label(.home)
+            || (requestFresh && (requestStarted?.from == .home || requestStarted?.to == .home))
+            || now - lastHomeTransitionAt < 3
+    }
+
+    private func homeOperationContext() -> String {
+        let now = ProcessInfo.processInfo.systemUptime
+        homeOperationLock.lock()
+        let inFlight = homeOperations
+        let recent = recentHomeOperations.filter { now - $0.ended <= 3 }
+        let bodyEvaluations = homeBodyEvaluationTimes.prefix(homeBodyEvaluationCount).filter { now - $0 <= 1 }.count
+        let tabsBodyEvaluations = tabsBodyEvaluationTimes.prefix(tabsBodyEvaluationCount).filter { now - $0 <= 1 }.count
+        let scrollWrites = scrollConfigurationWritesSinceReport
+        let scrollCorrections = scrollKVOFixesSinceReport
+        scrollConfigurationWritesSinceReport = 0
+        scrollKVOFixesSinceReport = 0
+        homeOperationLock.unlock()
+        let active = inFlight.isEmpty ? "noneInstrumented" : inFlight.map {
+            "\($0.name):\(Int(max(0, now - $0.start) * 1000))ms"
+        }.joined(separator: ",")
+        let slow = recent.isEmpty ? "noneInstrumented" : recent.map {
+            "\($0.name):\(Int($0.durationMs))ms"
+        }.joined(separator: ",")
+        return "homeOps{active=\(active); recentSlow=\(slow); bodyEvals1s=\(bodyEvaluations); tabBodyEvals1s=\(tabsBodyEvaluations); scrollWrites=\(scrollWrites); scrollKVOCorrections=\(scrollCorrections)}"
+    }
+
+    func start(currentTab: TVTab) {
+        let borrowedMainThread = pthread_mach_thread_np(pthread_self())
+        queue.async { [weak self] in
+            guard let self, self.timer == nil else { return }
+            self.generation &+= 1
+            let activeGeneration = self.generation
+            self.previousCPU = nil
+            self.mainThreadPrevious = nil
+            self.lastSpikeLog = 0
+            self.lastMainLog = 0
+            self.stalled = false
+            self.pendingPingSince = nil
+            self.currentTab = Self.label(currentTab)
+            if currentTab == .home { self.lastHomeTransitionAt = ProcessInfo.processInfo.systemUptime }
+            self.mainThreadPort = borrowedMainThread
+            self.notice("enabled: native sidebar watchdog started")
+            self.notice("Home main-thread operation attribution enabled")
+            let timer = DispatchSource.makeTimerSource(queue: self.queue)
+            timer.schedule(deadline: .now() + .milliseconds(250), repeating: .milliseconds(250), leeway: .milliseconds(50))
+            timer.setEventHandler { [weak self] in self?.sample(generation: activeGeneration) }
+            self.timer = timer
+            timer.resume()
+        }
+    }
+
+    func stop() {
+        queue.async { [weak self] in
+            guard let self else { return }
+            self.generation &+= 1
+            self.timer?.setEventHandler {}
+            self.timer?.cancel()
+            self.timer = nil
+            self.previousCPU = nil
+            self.mainThreadPrevious = nil
+            self.requestStarted = nil
+            self.pingInFlight = false
+            self.pendingPingSince = nil
+            self.stalled = false
+        }
+    }
+
+    func requestedTabChange(from: TVTab, to: TVTab) {
+        let requestedAt = ProcessInfo.processInfo.systemUptime
+        queue.async { [weak self] in
+            guard let self, self.timer != nil, from != to else { return }
+            let fromName = Self.label(from), toName = Self.label(to)
+            self.requestStarted = (from, to, requestedAt)
+            self.notice("tab request \(fromName) -> \(toName)")
+        }
+    }
+
+    func committedTabChange(from: TVTab, to: TVTab) {
+        let committedAt = ProcessInfo.processInfo.systemUptime
+        queue.async { [weak self] in
+            guard let self, self.timer != nil, from != to else { return }
+            let fromName = Self.label(from), toName = Self.label(to)
+            self.currentTab = toName
+            if from == .home || to == .home { self.lastHomeTransitionAt = committedAt }
+            if let request = self.requestStarted, request.from == from, request.to == to {
+                let elapsed = (committedAt - request.time) * 1000
+                self.notice("tab committed \(fromName) -> \(toName), request-to-commit \(Int(elapsed))ms")
+                self.requestStarted = nil
+            } else {
+                self.notice("tab committed \(fromName) -> \(toName)")
+            }
+        }
+    }
+
+    private func sample(generation activeGeneration: Int) {
+        guard generation == activeGeneration, timer != nil else { return }
+        var usage = rusage()
+        let now = ProcessInfo.processInfo.systemUptime
+        if getrusage(RUSAGE_SELF, &usage) == 0 {
+            let cpu = Self.seconds(usage.ru_utime) + Self.seconds(usage.ru_stime)
+            if let previousCPU {
+                let elapsed = now - previousCPU.time
+                if elapsed > 0 {
+                    let percent = (cpu - previousCPU.usage) / elapsed * 100
+                    if percent >= 125, now - lastSpikeLog >= 1 {
+                        lastSpikeLog = now
+                        warning("process CPU \(Int(percent))% of one core over \(Int(elapsed * 1000))ms; selected tab \(currentTab)")
+                    }
+                }
+            }
+            previousCPU = (now, cpu)
+        } else {
+            previousCPU = nil
+        }
+        sampleMainThreadCPU()
+        if let pendingPingSince, !stalled, now - pendingPingSince >= 0.150 {
+            stalled = true
+            let context = isHomeDiagnosticRelevant(now: now) ? " \(homeOperationContext())" : ""
+            warning("main queue stalled: no ping for \(Int((now - pendingPingSince) * 1000))ms; selected tab \(currentTab)\(context)")
+        }
+        guard !pingInFlight else { return }
+        pingInFlight = true
+        let dispatchedAt = now
+        pendingPingSince = now
+        DispatchQueue.main.async { [weak self] in
+            let delay = ProcessInfo.processInfo.systemUptime - dispatchedAt
+            self?.queue.async {
+                guard let self, self.generation == activeGeneration else { return }
+                self.pingInFlight = false
+                let shouldAttachHomeContext = self.stalled || delay >= 0.150
+                let homeContext = shouldAttachHomeContext && self.isHomeDiagnosticRelevant() ? " \(self.homeOperationContext())" : ""
+                if delay >= 0.150 && !self.stalled {
+                    self.warning("main queue stalled: ping delayed \(Int(delay * 1000))ms; selected tab \(self.currentTab)\(homeContext)")
+                }
+                if self.stalled || delay >= 0.150 {
+                    self.notice("main queue recovered; ping delay \(Int(delay * 1000))ms; selected tab \(self.currentTab)\(homeContext)")
+                    self.stalled = false
+                }
+                self.pendingPingSince = nil
+            }
+        }
+    }
+
+    private func sampleMainThreadCPU() {
+        let thread = mainThreadPort
+        guard thread != 0 else { return }
+        var info = thread_basic_info()
+        var count = mach_msg_type_number_t(MemoryLayout<thread_basic_info>.size / MemoryLayout<integer_t>.size)
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                thread_info(thread, thread_flavor_t(THREAD_BASIC_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return }
+        let mainCPU = Self.seconds(info.user_time) + Self.seconds(info.system_time)
+        let now = ProcessInfo.processInfo.systemUptime
+        // Main-thread usage comes from a separate cumulative sample; keep its baseline local.
+        if let old = mainThreadPrevious {
+            let percent = (mainCPU - old.usage) / (now - old.time) * 100
+            if percent >= 80, now - lastMainLog >= 1 {
+                lastMainLog = now
+                let context = isHomeDiagnosticRelevant(now: now) ? " \(homeOperationContext())" : ""
+                warning("main-thread CPU \(Int(percent))% of one core; selected tab \(currentTab)\(context)")
+            }
+        }
+        mainThreadPrevious = (now, mainCPU)
+    }
+
+    private var mainThreadPrevious: (time: TimeInterval, usage: TimeInterval)?
+    private var lastMainLog: TimeInterval = 0
+
+    private static func seconds(_ time: timeval) -> TimeInterval { Double(time.tv_sec) + Double(time.tv_usec) / 1_000_000 }
+    private static func seconds(_ time: time_value_t) -> TimeInterval { Double(time.seconds) + Double(time.microseconds) / 1_000_000 }
+    private static func label(_ tab: TVTab) -> String {
+        if case .collection = tab { return "Collection" }
+        return String(describing: tab)
+    }
+}
+
+private struct TVSidebarWatchdogView: View {
+    @Environment(\.scenePhase) private var scenePhase
+    let isEligible: Bool
+    let selectedTab: TVTab
+    var body: some View {
+        Color.clear
+            .onAppear(perform: update)
+            .onChange(of: scenePhase) { _, _ in update() }
+            .onChange(of: isEligible) { _, _ in update() }
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onDisappear { TVSidebarWatchdog.shared.stop() }
+    }
+    private func update() {
+        if isEligible && scenePhase == .active { TVSidebarWatchdog.shared.start(currentTab: selectedTab) }
+        else { TVSidebarWatchdog.shared.stop() }
+    }
+}
+#endif
+
+private struct TVMainTabSettings: Equatable {
+    let profileID: String?
+    let amoled: Bool
+    let bodyColor: String
+    let discoverLocation: String
+    let showCalendarTab: Bool
+    let showSurpriseMeTab: Bool
+    let useTopNavigation: Bool
+    let showWatchPartyTab: Bool
+    let nativeIPTVEnabled: Bool
+    let searchStyle: String
+    let detectedKeyboardMode: TVOSKeyboardLayoutMode
+    let profileName: String
+
+    static func read(profileID: String?) -> Self {
+        let defaults = ProfileSettings.store(for: profileID)
+        return Self(
+            profileID: profileID,
+            amoled: defaults.object(forKey: SettingsKey.amoled) as? Bool ?? false,
+            bodyColor: defaults.string(forKey: SettingsKey.bodyColor) ?? SettingsBackground.charcoal.rawValue,
+            discoverLocation: defaults.string(forKey: SettingsKey.discoverLocation) ?? "Search",
+            showCalendarTab: defaults.object(forKey: SettingsKey.showCalendarTab) as? Bool ?? true,
+            showSurpriseMeTab: defaults.object(forKey: SettingsKey.showSurpriseMeTab) as? Bool ?? false,
+            useTopNavigation: defaults.object(forKey: SettingsKey.useTopNavigation) as? Bool ?? false,
+            showWatchPartyTab: defaults.object(forKey: SettingsKey.showWatchPartyTab) as? Bool ?? true,
+            nativeIPTVEnabled: defaults.object(forKey: SettingsKey.nativeIPTVEnabled) as? Bool ?? false,
+            searchStyle: defaults.string(forKey: SettingsKey.searchStyle) ?? "Netflix",
+            detectedKeyboardMode: TVOSKeyboardLayoutMode(
+                rawValue: defaults.string(forKey: "nuvio.keyboard.detectedLayout") ?? TVOSKeyboardLayoutMode.linear.rawValue
+            ) ?? .linear,
+            profileName: defaults.string(forKey: SettingsKey.profileName) ?? "Nuvio User"
+        )
+    }
+}
+
+/// Read-through is lazy and cached per current profile until the @AppStorage leaf publishes.
+private final class TVMainTabSettingsReadThrough {
+    private var cached: TVMainTabSettings?
+
+    func snapshot(profileID: String?) -> TVMainTabSettings {
+        if let cached, cached.profileID == profileID { return cached }
+        let snapshot = TVMainTabSettings.read(profileID: profileID)
+        cached = snapshot
+        return snapshot
+    }
+}
+
+/// Isolates raw @AppStorage invalidations from the tab shell. The shell only sees Equatable snapshots.
+private struct TVMainTabSettingsObserver: View {
+    let profileID: String?
+    let onChange: (TVMainTabSettings) -> Void
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
+    @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
+    @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
+    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
+    @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
+    @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
+    @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
+    @AppStorage(SettingsKey.profileName) private var profileName = "Nuvio User"
+
+    private var snapshot: TVMainTabSettings {
+        TVMainTabSettings(
+            profileID: profileID,
+            amoled: amoled,
+            bodyColor: bodyColor,
+            discoverLocation: discoverLocation,
+            showCalendarTab: showCalendarTab,
+            showSurpriseMeTab: showSurpriseMeTab,
+            useTopNavigation: useTopNavigation,
+            showWatchPartyTab: showWatchPartyTab,
+            nativeIPTVEnabled: nativeIPTVEnabled,
+            searchStyle: searchStyle,
+            detectedKeyboardMode: detectedKeyboardMode,
+            profileName: profileName
+        )
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: snapshot, initial: true) { _, newSnapshot in onChange(newSnapshot) }
+    }
+}
+
 private struct TVMainTabView: View {
     @Binding var selectedTab: TVTab
     let activeProfile: Profile?
@@ -4763,17 +5260,8 @@ private struct TVMainTabView: View {
     let onPlayCloudFile: (URL, NuvioMeta) -> Void
     let onPlayLiveChannel: (URL, NuvioMeta, [String: String]) -> Void
     var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
-    @AppStorage(SettingsKey.amoled) private var amoled = false
-    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
-    @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
-    @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
-    @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
-    @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
-    @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
-    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
-    @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
-    @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
-    @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
+    @State private var observedTabSettings: TVMainTabSettings?
+    @State private var tabSettingsReadThrough = TVMainTabSettingsReadThrough()
     @State private var selectedSettingsCategory: SettingsCategory = .account
     @State private var collectionDestinations: [CollectionHomeDestination] = []
     @State private var directCollectionDestinations: [CollectionHomeDestination] = []
@@ -4781,9 +5269,37 @@ private struct TVMainTabView: View {
     @StateObject private var collectionSidebarArtwork = CollectionSidebarArtwork()
     @StateObject private var profileTabAvatar = ProfileTabAvatarRenderer()
     @State private var showingReauthSheet = false
+    @State private var liveTVLoadedCache = IPTVLiveView.LoadedCache()
+    @State private var lastNonHomeTab: TVTab?
 
     private var displayedProfile: Profile? {
         activeProfile
+    }
+
+    private var profileID: String? { activeProfile?.id }
+
+    private var tabSettings: TVMainTabSettings {
+        if let observedTabSettings, observedTabSettings.profileID == profileID {
+            return observedTabSettings
+        }
+        return tabSettingsReadThrough.snapshot(profileID: profileID)
+    }
+
+    private var amoled: Bool { tabSettings.amoled }
+    private var bodyColor: String { tabSettings.bodyColor }
+    private var discoverLocation: String { tabSettings.discoverLocation }
+    private var showCalendarTab: Bool { tabSettings.showCalendarTab }
+    private var showSurpriseMeTab: Bool { tabSettings.showSurpriseMeTab }
+    private var useTopNavigation: Bool { tabSettings.useTopNavigation }
+    private var showWatchPartyTab: Bool { tabSettings.showWatchPartyTab }
+    private var nativeIPTVEnabled: Bool { tabSettings.nativeIPTVEnabled }
+    private var searchStyle: String { tabSettings.searchStyle }
+    private var detectedKeyboardMode: TVOSKeyboardLayoutMode { tabSettings.detectedKeyboardMode }
+    private var settingsProfileName: String { tabSettings.profileName }
+
+    private func receiveTabSettings(_ snapshot: TVMainTabSettings) {
+        guard snapshot.profileID == profileID, observedTabSettings != snapshot else { return }
+        observedTabSettings = snapshot
     }
 
     /// Name shown on the profile tab, mirroring the sidebar header's
@@ -4797,16 +5313,26 @@ private struct TVMainTabView: View {
         Binding(
             get: { selectedTab },
             set: { newTab in
+                #if NUVIO_SIDEBAR_WATCHDOG
+                TVSidebarWatchdog.shared.requestedTabChange(from: selectedTab, to: newTab)
+                #endif
                 selectedTab = newTab
             }
         )
     }
 
     var body: some View {
+#if NUVIO_SIDEBAR_WATCHDOG
+        let _ = TVHomeDebugTrace.recordTabsBodyEvaluation()
+        let _ = TVHomeDebugTrace.sampleViewChanges("Tabs") { Self._printChanges() }
+#endif
         Group {
             if #available(tvOS 18.0, *), !useTopNavigation {
                 tabs
                     .tabViewStyle(.sidebarAdaptable)
+                    #if NUVIO_SIDEBAR_WATCHDOG
+                    .background(TVSidebarWatchdogView(isEligible: !isFullScreenOverlayPresented, selectedTab: selectedTab))
+                    #endif
             } else {
                 tabs
             }
@@ -4913,11 +5439,12 @@ private struct TVMainTabView: View {
             isCovered: isFullScreenOverlayPresented && !homeCatchesUp,
             content: TVHomeView(
                 store: homeStore,
-                repository: CinemetaCatalogRepository(),
+                repository: homeStore.mainCatalogRepository,
                 isActive: selectedTab == .home,
                 isFullScreenOverlayPresented: isFullScreenOverlayPresented,
                 isDetailsOrPlayerOverlayPresented: isDetailsOrPlayerOverlayPresented,
                 isVisibleCardMenuPresented: isVisibleCardMenuPresented,
+                isReturningFromSettings: lastNonHomeTab == .settings,
                 detailsDidDisappearGeneration: detailsDidDisappearGeneration,
                 isProfileFocusPending: isProfileFocusPending,
                 profileGateGeneration: profileGateGeneration,
@@ -4987,7 +5514,7 @@ private struct TVMainTabView: View {
     }
 
     private var liveTVTabContent: some View {
-        IPTVLiveView(profileID: activeProfile?.id ?? "", onPlay: onPlayLiveChannel)
+        IPTVLiveView(profileID: activeProfile?.id ?? "", isActive: selectedTab == .liveTV && !isFullScreenOverlayPresented, loadedCache: liveTVLoadedCache, onPlay: onPlayLiveChannel)
             .id(activeProfile?.id ?? "none")
     }
 
@@ -5250,6 +5777,11 @@ private struct TVMainTabView: View {
     private var tabs: some View {
         tabShell
         .background(
+            TVMainTabSettingsObserver(profileID: profileID, onChange: receiveTabSettings)
+                .defaultAppStorage(ProfileSettings.store(for: profileID))
+                .id(profileID ?? "none")
+        )
+        .background(
             NativeTopBarProfilePlaceholder(
                 enabled: useTopNavigation,
                 title: profileTabTitle,
@@ -5266,6 +5798,11 @@ private struct TVMainTabView: View {
             }
         }
         .onAppear {
+#if NUVIO_SIDEBAR_WATCHDOG
+            let operation = TVHomeDebugTrace.beginHomeOperation("home.tabShell.appear")
+            defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
+            if selectedTab != .home { lastNonHomeTab = selectedTab }
             TVHomeDebugTrace.startWatchdogIfNeeded()
             refreshCollectionDestinations()
             AvatarCatalogStore.shared.loadIfNeeded()
@@ -5279,7 +5816,11 @@ private struct TVMainTabView: View {
                 showingReauthSheet = true
             }
         }
-        .onChange(of: activeProfile?.id) { _, _ in refreshCollectionDestinations() }
+        .onChange(of: activeProfile?.id) { _, newProfileID in
+            if observedTabSettings?.profileID != newProfileID { observedTabSettings = nil }
+            liveTVLoadedCache.clear()
+            refreshCollectionDestinations()
+        }
         .task(id: collectionDestinations.map(\.revision)) {
             await collectionSidebarArtwork.load(collectionDestinations)
         }
@@ -5293,8 +5834,15 @@ private struct TVMainTabView: View {
         .onChange(of: displayedProfile?.avatarId) { _, newValue in
             profileTabAvatar.refresh(avatarId: newValue)
         }
+        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.forceRefreshNotification).receive(on: RunLoop.main)) { _ in
+            homeStore.requestManualCatalogRefresh(profileID: activeProfile?.id)
+        }
         .onChange(of: selectedTab) { oldTab, tab in
             TVHomeDebugTrace.log("app.selectedTab changed from \(oldTab.rawValue) to \(tab.rawValue)")
+            if tab != .home { lastNonHomeTab = tab }
+            #if NUVIO_SIDEBAR_WATCHDOG
+            TVSidebarWatchdog.shared.committedTabChange(from: oldTab, to: tab)
+            #endif
             if oldTab == .settings {
                 syncManager.flushPendingPushes()
             }
@@ -5527,8 +6075,7 @@ private final class TVHomeFocusWork {
         acknowledgedNativeOverlayFocusCardID = nil
         lastFocusTransitionTime = 0
         focusedRowIndex = 0
-        rowHeights.removeAll()
-        rowTops.removeAll()
+        cachedFocusRows = nil
         rowsBuiltDuringRun = []
         rowFocusedCardID = nil
         rowFocusBlurGeneration = 0
@@ -5654,49 +6201,109 @@ struct TVTopBarScrollAnchor: View {
     var body: some View { TVTopBarScrollLink(enabled: enabled && isActive) }
 }
 
+#if os(tvOS)
 struct TVScrollViewFocusConfigurator: UIViewRepresentable {
-    func makeUIView(context: Context) -> UIView {
-        let view = UIView(frame: .zero)
+    var isActive: Bool = true
+    var isEnabled: Bool = true
+
+    func makeUIView(context: Context) -> ConfiguratorView {
+        let view = ConfiguratorView()
         view.isUserInteractionEnabled = false
         view.backgroundColor = .clear
-        DispatchQueue.main.async { [weak view] in
-            guard let view, let scrollView = findScrollView(from: view) else { return }
-            configure(scrollView)
-        }
         return view
     }
 
-    func updateUIView(_ uiView: UIView, context: Context) {
-        DispatchQueue.main.async { [weak uiView] in
-            guard let uiView, let scrollView = findScrollView(from: uiView) else { return }
-            configure(scrollView)
-        }
+    func updateUIView(_ uiView: ConfiguratorView, context: Context) {
+        uiView.isActive = isActive
+        uiView.configureIfNeeded()
     }
 
-    private func configure(_ scrollView: UIScrollView) {
-        // Home owns the hero/row spacing and scrolls each row to an explicit top anchor.
-        // Keep automatic safe-area adjustments and UIKit focus auto-scroll from shifting it during focus updates.
-        scrollView.contentInsetAdjustmentBehavior = .never
-        scrollView.bounces = false
-        scrollView.alwaysBounceVertical = false
-        scrollView.alwaysBounceHorizontal = false
-        scrollView.showsHorizontalScrollIndicator = false
-        scrollView.showsVerticalScrollIndicator = false
-        scrollView.isScrollEnabled = false
-        TVHomeVerticalScroll.scrollView = scrollView
-    }
+    final class ConfiguratorView: UIView {
+        private weak var configuredScrollView: UIScrollView?
+        private var scrollEnabledObservation: NSKeyValueObservation?
+        private var configurationScheduled = false
+        var isActive = true
 
-    private func findScrollView(from view: UIView) -> UIScrollView? {
-        var current: UIView? = view
-        while let c = current {
-            if let sv = c as? UIScrollView {
-                return sv
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil {
+                configureIfNeeded()
             }
-            current = c.superview
         }
-        return nil
+
+        func configureIfNeeded() {
+            guard !configurationScheduled else { return }
+            configurationScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.configurationScheduled = false
+                guard self.window != nil, let scrollView = self.findScrollView() else { return }
+                if self.isActive { TVHomeVerticalScroll.scrollView = scrollView }
+
+                if scrollView.contentInsetAdjustmentBehavior != .never {
+                    scrollView.contentInsetAdjustmentBehavior = .never
+                    self.recordConfigurationWrite()
+                }
+                if scrollView.bounces {
+                    scrollView.bounces = false
+                    self.recordConfigurationWrite()
+                }
+                if scrollView.alwaysBounceVertical {
+                    scrollView.alwaysBounceVertical = false
+                    self.recordConfigurationWrite()
+                }
+                if scrollView.alwaysBounceHorizontal {
+                    scrollView.alwaysBounceHorizontal = false
+                    self.recordConfigurationWrite()
+                }
+                if scrollView.showsHorizontalScrollIndicator {
+                    scrollView.showsHorizontalScrollIndicator = false
+                    self.recordConfigurationWrite()
+                }
+                if scrollView.showsVerticalScrollIndicator {
+                    scrollView.showsVerticalScrollIndicator = false
+                    self.recordConfigurationWrite()
+                }
+                if scrollView.isScrollEnabled {
+                    scrollView.isScrollEnabled = false
+                    self.recordConfigurationWrite()
+                }
+
+                guard self.configuredScrollView !== scrollView else { return }
+                self.scrollEnabledObservation?.invalidate()
+                self.configuredScrollView = scrollView
+                self.scrollEnabledObservation = scrollView.observe(\.isScrollEnabled, options: [.new]) { scrollView, change in
+                    guard change.newValue == true else { return }
+                    MainActor.assumeIsolated {
+                        guard scrollView.isScrollEnabled else { return }
+                        scrollView.isScrollEnabled = false
+                        #if NUVIO_SIDEBAR_WATCHDOG
+                        TVSidebarWatchdog.shared.recordScrollConfigurationWrite(isKVOCorrection: true)
+                        #endif
+                    }
+                }
+            }
+        }
+
+        private func recordConfigurationWrite() {
+            #if NUVIO_SIDEBAR_WATCHDOG
+            TVSidebarWatchdog.shared.recordScrollConfigurationWrite()
+            #endif
+        }
+
+        private func findScrollView() -> UIScrollView? {
+            var current: UIView? = superview
+            while let c = current {
+                if let sv = c as? UIScrollView {
+                    return sv
+                }
+                current = c.superview
+            }
+            return nil
+        }
     }
 }
+#endif
 
 #if os(tvOS)
 private struct TVTopBarSelectionSynchronizer: UIViewRepresentable {
@@ -5929,54 +6536,105 @@ private enum TVHomeProfileFocusTarget: Equatable {
     }
 }
 
-struct TVHomeView: View {
-    /// Failure sets a retry already ran against without improving them, keyed by
-    /// the signature itself (which encodes the add-on set, so two profiles never
-    /// share a verdict). Static because Home is torn down on every profile
-    /// switch, and a per-view copy would forget the verdict exactly when the
-    /// next entry needs it. A relaunch clears it, giving a genuinely transient
-    /// outage a fresh try.
-    @MainActor private static var unimprovedHomeFailures: Set<String> = []
-    /// How long a Home with missing catalogs waits before a return to Home loads it again.
-    private static let partialHomeRetryInterval: TimeInterval = 60
+private struct TVHomeSettingsSnapshot: Equatable {
+    let profileID: String?
+    let amoled: Bool
+    let bodyColor: String
+    let homeCalendarToday: Bool
+    let heroEnabled: Bool
+    let fullscreenHeroBackdrop: Bool
+    let focusedPosterBackdropEnabled: Bool
+    let focusedPosterBackdropDelay: Int
+    let fastNavigation: Bool
+    let hideUnreleased: Bool
+    let continueWatchingVisible: Bool
+    let revealNextEpisodeSpoilers: Bool
+    let continueWatchingSort: String
+    let upNextFromFurthestEpisode: Bool
+    let showUnairedNextUp: Bool
+    let smoothFocus: Bool
+    let homeLayout: String
+    let useTopNavigation: Bool
+    let gridRows: Int
+    let gridItemsPerRow: Int
+    let heroCatalogsData: Data
+    let posterLabels: Bool
+    let catalogAddonNames: Bool
+    let landscapePosters: Bool
+    let continueWatchingLandscape: Bool
+    let tmdbEnabled: Bool
+    let tmdbLanguage: String
+    let tmdbFollowAppLanguage: Bool
+    let tmdbUseArtwork: Bool
+    let tmdbUseBasicInfo: Bool
+    let tmdbApplyToHome: Bool
+    let smbLocalRowEnabled: Bool
+    let jellyfinLocalRowEnabled: Bool
+    let plexLocalRowEnabled: Bool
+    let catalogAutoRefreshInterval: String
 
-    @ObservedObject var store: TVHomeStore
-    let repository: CatalogRepository
-    let isActive: Bool
-    let isFullScreenOverlayPresented: Bool
-    let isDetailsOrPlayerOverlayPresented: Bool
-    let isVisibleCardMenuPresented: Bool
-    var isExternalRetryFocusActive: Bool = false
-    let detailsDidDisappearGeneration: UInt
-    /// True while a freshly picked profile is being prepared. Keeps Home's own
-    /// focus handoff coordinated with the root profile cover.
-    var isProfileFocusPending: Bool = false
-    var profileGateGeneration: UInt = 0
-    var onProfileGateReadinessChange: (TVHomeContentIdentity, UInt, TVProfileGateReadiness) -> Void = { _, _, _ in }
-    let contentIdentity: TVHomeContentIdentity
-    let collectionsRevision: UInt
-    var sessionNeedsReauthentication: Bool = false
-    let onNavigateToDetails: (String, String) -> Void
-    let onPlayTitle: (String, String) -> Void
-    let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
-    let onResumePlayback: (ContinueWatchingItem) -> Void
-    var collectionHome: CollectionHomeModel? = nil
-    var onNavigateToContinueWatchingDetails: ((String, String) -> Void)? = nil
-    var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
-    var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
-    var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
-    var onLongPressCard: ((NuvioMeta) -> Void)? = nil
-    /// Raised instead of `onLongPressCard` for cards in the Continue Watching
-    /// row, which carry resume actions the generic title menu has no use for.
-    var onLongPressContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
-    /// Asks the account for fresh data when Nuvio Sync owns Continue Watching.
-    /// That row is read from the local ledger, so nothing else here would ever
-    /// notice a title deleted on another device.
-    var onRequestAccountRefresh: (Bool) -> Void = { _ in }
-    var onRequestReauth: () -> Void = {}
-    /// Opens a card of the Today row on its episode.
-    var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
+    static func read(profileID: String?) -> Self {
+        let defaults = ProfileSettings.store(for: profileID)
+        func bool(_ key: String, _ fallback: Bool) -> Bool {
+            defaults.object(forKey: key) as? Bool ?? fallback
+        }
+        func string(_ key: String, _ fallback: String) -> String {
+            defaults.string(forKey: key) ?? fallback
+        }
+        return Self(
+            profileID: profileID,
+            amoled: bool(SettingsKey.amoled, false),
+            bodyColor: string(SettingsKey.bodyColor, SettingsBackground.charcoal.rawValue),
+            homeCalendarToday: bool(SettingsKey.homeCalendarToday, true),
+            heroEnabled: bool(SettingsKey.heroEnabled, true),
+            fullscreenHeroBackdrop: bool(SettingsKey.fullscreenHeroBackdrop, true),
+            focusedPosterBackdropEnabled: bool(SettingsKey.focusedPosterBackdropEnabled, true),
+            focusedPosterBackdropDelay: defaults.object(forKey: SettingsKey.focusedPosterBackdropDelay) as? Int ?? 3,
+            fastNavigation: bool(SettingsKey.fastNavigation, false),
+            hideUnreleased: bool(SettingsKey.hideUnreleased, false),
+            continueWatchingVisible: bool(SettingsKey.continueWatchingVisible, true),
+            revealNextEpisodeSpoilers: bool(SettingsKey.revealNextEpisodeSpoilers, false),
+            continueWatchingSort: string(SettingsKey.continueWatchingSort, "Default"),
+            upNextFromFurthestEpisode: bool(SettingsKey.upNextFromFurthestEpisode, true),
+            showUnairedNextUp: bool(SettingsKey.showUnairedNextUp, true),
+            smoothFocus: bool(SettingsKey.smoothFocus, true),
+            homeLayout: string(SettingsKey.homeLayout, "Modern"),
+            useTopNavigation: bool(SettingsKey.useTopNavigation, false),
+            gridRows: defaults.object(forKey: SettingsKey.gridRows) as? Int ?? TVHomeGridLayout.defaultRows,
+            gridItemsPerRow: defaults.object(forKey: SettingsKey.gridItemsPerRow) as? Int ?? TVHomeGridLayout.defaultItemsPerRow,
+            heroCatalogsData: defaults.data(forKey: SettingsKey.heroCatalogs) ?? Data(),
+            posterLabels: bool(SettingsKey.posterLabels, false),
+            catalogAddonNames: bool(SettingsKey.catalogAddonNames, true),
+            landscapePosters: bool(SettingsKey.landscapePosters, false),
+            continueWatchingLandscape: bool(SettingsKey.continueWatchingLandscape, false),
+            tmdbEnabled: bool(SettingsKey.tmdbEnabled, false),
+            tmdbLanguage: string(SettingsKey.tmdbLanguage, "en"),
+            tmdbFollowAppLanguage: bool(SettingsKey.tmdbFollowAppLanguage, true),
+            tmdbUseArtwork: bool(SettingsKey.tmdbUseArtwork, true),
+            tmdbUseBasicInfo: bool(SettingsKey.tmdbUseBasicInfo, true),
+            tmdbApplyToHome: bool(SettingsKey.tmdbApplyToHome, false),
+            smbLocalRowEnabled: bool(SettingsKey.smbLocalRowEnabled, true),
+            jellyfinLocalRowEnabled: bool(SettingsKey.jellyfinLocalRowEnabled, true),
+            plexLocalRowEnabled: bool(SettingsKey.plexLocalRowEnabled, true),
+            catalogAutoRefreshInterval: string(SettingsKey.catalogAutoRefreshInterval, "30 Minutes")
+        )
+    }
+}
 
+private final class TVHomeSettingsReadThrough {
+    private var cached: TVHomeSettingsSnapshot?
+
+    func snapshot(profileID: String?) -> TVHomeSettingsSnapshot {
+        if let cached, cached.profileID == profileID { return cached }
+        let snapshot = TVHomeSettingsSnapshot.read(profileID: profileID)
+        cached = snapshot
+        return snapshot
+    }
+}
+
+private struct TVHomeSettingsObserver: View {
+    let profileID: String?
+    let onChange: (TVHomeSettingsSnapshot) -> Void
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.homeCalendarToday) private var homeCalendarToday = true
@@ -6011,7 +6669,153 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.jellyfinLocalRowEnabled) private var jellyfinLocalRowEnabled = true
     @AppStorage(SettingsKey.plexLocalRowEnabled) private var plexLocalRowEnabled = true
     @AppStorage(SettingsKey.catalogAutoRefreshInterval) private var catalogAutoRefreshInterval = "30 Minutes"
+
+    private var snapshot: TVHomeSettingsSnapshot {
+        TVHomeSettingsSnapshot(
+            profileID: profileID,
+            amoled: amoled,
+            bodyColor: bodyColor,
+            homeCalendarToday: homeCalendarToday,
+            heroEnabled: heroEnabled,
+            fullscreenHeroBackdrop: fullscreenHeroBackdrop,
+            focusedPosterBackdropEnabled: focusedPosterBackdropEnabled,
+            focusedPosterBackdropDelay: focusedPosterBackdropDelay,
+            fastNavigation: fastNavigation,
+            hideUnreleased: hideUnreleased,
+            continueWatchingVisible: continueWatchingVisible,
+            revealNextEpisodeSpoilers: revealNextEpisodeSpoilers,
+            continueWatchingSort: continueWatchingSort,
+            upNextFromFurthestEpisode: upNextFromFurthestEpisode,
+            showUnairedNextUp: showUnairedNextUp,
+            smoothFocus: smoothFocus,
+            homeLayout: homeLayout,
+            useTopNavigation: useTopNavigation,
+            gridRows: gridRows,
+            gridItemsPerRow: gridItemsPerRow,
+            heroCatalogsData: heroCatalogsData,
+            posterLabels: posterLabels,
+            catalogAddonNames: catalogAddonNames,
+            landscapePosters: landscapePosters,
+            continueWatchingLandscape: continueWatchingLandscape,
+            tmdbEnabled: tmdbEnabled,
+            tmdbLanguage: tmdbLanguage,
+            tmdbFollowAppLanguage: tmdbFollowAppLanguage,
+            tmdbUseArtwork: tmdbUseArtwork,
+            tmdbUseBasicInfo: tmdbUseBasicInfo,
+            tmdbApplyToHome: tmdbApplyToHome,
+            smbLocalRowEnabled: smbLocalRowEnabled,
+            jellyfinLocalRowEnabled: jellyfinLocalRowEnabled,
+            plexLocalRowEnabled: plexLocalRowEnabled,
+            catalogAutoRefreshInterval: catalogAutoRefreshInterval
+        )
+    }
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .accessibilityHidden(true)
+            .onChange(of: snapshot, initial: true) { _, value in onChange(value) }
+    }
+}
+
+struct TVHomeView: View {
+    /// How long a Home with missing catalogs waits before a return to Home loads it again.
+    private static let partialHomeRetryInterval: TimeInterval = 60
+
+    @ObservedObject var store: TVHomeStore
+    let repository: CatalogRepository
+    let isActive: Bool
+    let isFullScreenOverlayPresented: Bool
+    let isDetailsOrPlayerOverlayPresented: Bool
+    let isVisibleCardMenuPresented: Bool
+    var isExternalRetryFocusActive: Bool = false
+    var isReturningFromSettings: Bool = false
+    let detailsDidDisappearGeneration: UInt
+    /// True while a freshly picked profile is being prepared. Keeps Home's own
+    /// focus handoff coordinated with the root profile cover.
+    var isProfileFocusPending: Bool = false
+    var profileGateGeneration: UInt = 0
+    var onProfileGateReadinessChange: (TVHomeContentIdentity, UInt, TVProfileGateReadiness) -> Void = { _, _, _ in }
+    let contentIdentity: TVHomeContentIdentity
+    let collectionsRevision: UInt
+    var sessionNeedsReauthentication: Bool = false
+    let onNavigateToDetails: (String, String) -> Void
+    let onPlayTitle: (String, String) -> Void
+    let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
+    let onResumePlayback: (ContinueWatchingItem) -> Void
+    var collectionHome: CollectionHomeModel? = nil
+    var onNavigateToContinueWatchingDetails: ((String, String) -> Void)? = nil
+    var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
+    var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
+    var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
+    var onLongPressCard: ((NuvioMeta) -> Void)? = nil
+    /// Raised instead of `onLongPressCard` for cards in the Continue Watching
+    /// row, which carry resume actions the generic title menu has no use for.
+    var onLongPressContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
+    /// Asks the account for fresh data when Nuvio Sync owns Continue Watching.
+    /// That row is read from the local ledger, so nothing else here would ever
+    /// notice a title deleted on another device.
+    var onRequestAccountRefresh: (Bool) -> Void = { _ in }
+    var onRequestReauth: () -> Void = {}
+    /// Opens a card of the Today row on its episode.
+    var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
+
+    @State private var observedHomeSettings: TVHomeSettingsSnapshot?
+    @State private var homeSettingsReadThrough = TVHomeSettingsReadThrough()
     @Environment(\.scenePhase) private var scenePhase
+
+    private var settingsProfileID: String? {
+        let id = contentIdentity.profileId
+        return id.isEmpty || id == "none" ? nil : id
+    }
+
+    private var homeSettings: TVHomeSettingsSnapshot {
+        if let observedHomeSettings, observedHomeSettings.profileID == settingsProfileID {
+            return observedHomeSettings
+        }
+        return homeSettingsReadThrough.snapshot(profileID: settingsProfileID)
+    }
+
+    private var amoled: Bool { homeSettings.amoled }
+    private var bodyColor: String { homeSettings.bodyColor }
+    private var homeCalendarToday: Bool { homeSettings.homeCalendarToday }
+    private var heroEnabled: Bool { homeSettings.heroEnabled }
+    private var fullscreenHeroBackdrop: Bool { homeSettings.fullscreenHeroBackdrop }
+    private var focusedPosterBackdropEnabled: Bool { homeSettings.focusedPosterBackdropEnabled }
+    private var focusedPosterBackdropDelay: Int { homeSettings.focusedPosterBackdropDelay }
+    private var fastNavigation: Bool { homeSettings.fastNavigation }
+    private var hideUnreleased: Bool { homeSettings.hideUnreleased }
+    private var continueWatchingVisible: Bool { homeSettings.continueWatchingVisible }
+    private var revealNextEpisodeSpoilers: Bool { homeSettings.revealNextEpisodeSpoilers }
+    private var continueWatchingSort: String { homeSettings.continueWatchingSort }
+    private var upNextFromFurthestEpisode: Bool { homeSettings.upNextFromFurthestEpisode }
+    private var showUnairedNextUp: Bool { homeSettings.showUnairedNextUp }
+    private var smoothFocus: Bool { homeSettings.smoothFocus }
+    private var homeLayout: String { homeSettings.homeLayout }
+    private var useTopNavigation: Bool { homeSettings.useTopNavigation }
+    private var gridRows: Int { homeSettings.gridRows }
+    private var gridItemsPerRow: Int { homeSettings.gridItemsPerRow }
+    private var heroCatalogsData: Data { homeSettings.heroCatalogsData }
+    private var posterLabels: Bool { homeSettings.posterLabels }
+    private var catalogAddonNames: Bool { homeSettings.catalogAddonNames }
+    private var landscapePosters: Bool { homeSettings.landscapePosters }
+    private var continueWatchingLandscape: Bool { homeSettings.continueWatchingLandscape }
+    private var tmdbEnabled: Bool { homeSettings.tmdbEnabled }
+    private var tmdbLanguage: String { homeSettings.tmdbLanguage }
+    private var tmdbFollowAppLanguage: Bool { homeSettings.tmdbFollowAppLanguage }
+    private var tmdbUseArtwork: Bool { homeSettings.tmdbUseArtwork }
+    private var tmdbUseBasicInfo: Bool { homeSettings.tmdbUseBasicInfo }
+    private var tmdbApplyToHome: Bool { homeSettings.tmdbApplyToHome }
+    private var smbLocalRowEnabled: Bool { homeSettings.smbLocalRowEnabled }
+    private var jellyfinLocalRowEnabled: Bool { homeSettings.jellyfinLocalRowEnabled }
+    private var plexLocalRowEnabled: Bool { homeSettings.plexLocalRowEnabled }
+    private var catalogAutoRefreshInterval: String { homeSettings.catalogAutoRefreshInterval }
+
+    private func receiveHomeSettings(_ snapshot: TVHomeSettingsSnapshot) {
+        guard snapshot.profileID == settingsProfileID, observedHomeSettings != snapshot else { return }
+        observedHomeSettings = snapshot
+    }
 
     @State private var isBannerDismissed = false
 
@@ -6032,8 +6836,11 @@ struct TVHomeView: View {
     @State private var focusWork = TVHomeFocusWork()
     @State private var rowScrollStore = TVHomeRowScrollStore()
     @State private var homeReloadTask: Task<Void, Never>?
+    @State private var scheduledManualCatalogRefreshGeneration: UInt?
+    @State private var scheduledSettingsReturnRefresh = false
     /// Add-on/catalog settings the last completed load actually read.
     @State private var lastLoadedInputSignature: String?
+    @State private var handledManualRefreshGeneration: UInt = 0
     @State private var rawContinueWatchingItems: [ContinueWatchingItem] = []
     /// False until the selected remote progress source has answered once. Until
     /// then, with nothing to show, the row holds its place with loading cards.
@@ -6065,9 +6872,6 @@ struct TVHomeView: View {
     @State private var simklLoadingTimeoutTask: Task<Void, Never>?
     @State private var simklLoadingStartedAt: Date?
     @State private var isLoadingMoreContinueWatching = false
-    /// Rows the current load still owes, rendered as spinner skeletons until
-    /// their catalog answers. Empty whenever no load is in flight.
-    @State private var homeLoadingPlaceholders: [TVHomeSection] = []
     @State private var watchedTitleKeys: Set<String> = []
     @State private var errorMessage: String?
     @State private var didRequestInitialCardFocus = false
@@ -6127,6 +6931,7 @@ struct TVHomeView: View {
     /// Fast-scroll tracking (matching Android DpadFastScrollModifier):
     /// suppresses intermediate card focus oscillations during continuous remote holding or rapid swiping.
     @State private var isFastScrolling = false
+    @State private var handledMainHomePublicationRevision: UInt = 0
     @State private var scrollToTopGeneration = 0
     @State private var targetScrollToTopSectionId: String?
 
@@ -6409,6 +7214,22 @@ struct TVHomeView: View {
                                 heroBleed: horizontalEdgeInset
                             )
                         } else {
+                            let sharedLoadingRowID: String? = {
+                                guard isActive, !isFullScreenOverlayPresented, browsingSection == nil, scenePhase == .active else { return nil }
+                                var closest: (index: Int, id: String)?
+                                for (index, section) in sections.enumerated()
+                                where section.isLoadingPlaceholder && isHomeRowMaterialized(at: index, id: section.id) {
+                                    if section.id == focusedSectionId { return section.id }
+                                    if let closestRow = closest {
+                                        guard abs(index - focusedRowIndex) < abs(closestRow.index - focusedRowIndex) else { continue }
+                                        closest = (index, section.id)
+                                    } else {
+                                        closest = (index, section.id)
+                                    }
+                                }
+                                guard let closest, abs(closest.index - focusedRowIndex) <= 2 else { return nil }
+                                return closest.id
+                            }()
                             // Keep row shells mounted for native tvOS Up/Down focus.
                             // The focused row ±2 window limits real card/artwork work.
                             ScrollViewReader { verticalScrollProxy in
@@ -6427,23 +7248,18 @@ struct TVHomeView: View {
                                         }
 
                                         ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                                            let isInBuildWindow = (index >= focusedRowIndex - min(3, max(0, rowBuildReach))
-                                                    && index <= focusedRowIndex + min(3, rowBuildReach + 2))
-                                                || ((rowBuildReach >= 3 || focusWork.isStagingRowsAfterJump)
-                                                    && abs(index - settledRowIndex) <= 4)
                                             // A row this run built stays until focus rests (see
                                             // `rowsBuiltDuringRun`); the eight-row bound keeps a long run
                                             // from holding every row it passed.
-                                            let isNearFocusedRow = isInBuildWindow
-                                                || (abs(index - focusedRowIndex) <= 8
-                                                    && focusWork.rowsBuiltDuringRun.contains(section.id))
+                                            let isNearFocusedRow = isHomeRowMaterialized(at: index, id: section.id)
                                             if isNearFocusedRow {
                                                 let _ = focusWork.rowsBuiltDuringRun.insert(section.id)
                                                 homeSectionRow(
                                                     index: index,
                                                     section: section,
                                                     horizontalEdgeInset: horizontalEdgeInset,
-                                                    verticalScrollProxy: verticalScrollProxy
+                                                    verticalScrollProxy: verticalScrollProxy,
+                                                    showsSharedLoadingSpinner: sharedLoadingRowID == section.id
                                                 )
                                                 .onGeometryChange(for: CGRect.self) { proxy in
                                                     proxy.frame(in: .named(TVHomeVerticalScroll.space))
@@ -6487,14 +7303,16 @@ struct TVHomeView: View {
                                             // A row far above may have turned back into its estimated-height
                                             // placeholder; keep the focused row where it is.
                                             if let focusedSectionId {
-                                                verticalScrollProxy.scrollTo(focusedSectionId, anchor: .top)
+                                                if !moveHome(to: focusedSectionId, fast: false, animated: false) {
+                                                    verticalScrollProxy.scrollTo(focusedSectionId, anchor: .top)
+                                                }
                                             }
                                         }
                                     }
                                     #if os(tvOS)
                                     // Place the configurator inside the scroll content so its
                                     // ancestor is the UIScrollView that owns the row offset.
-                                    .background(TVScrollViewFocusConfigurator())
+                                    .background(TVScrollViewFocusConfigurator(isActive: isActive, isEnabled: isEnabled))
                                     .background(TVTopBarScrollLink(enabled: useTopNavigation && isActive))
                                     #endif
                                     .onAppear {
@@ -6596,13 +7414,47 @@ struct TVHomeView: View {
                     .allowsHitTesting(false)
             }
         }
-        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey):\(collectionHome == nil || isActive)") {
+        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey):\(homeLayout == "Grid View"): \(collectionHome == nil || isActive)") {
             guard collectionHome == nil || isActive else { return }
+            if collectionHome == nil {
+                isLoading = store.mainCatalogIsLoading
+                errorMessage = store.mainCatalogErrorMessage
+                handleMainHomePublication()
+            }
             focusWork.heroEnrichmentTask?.cancel()
             focusWork.enrichedHeroMetadata.removeAll()
-            let isLoaded = store.isLoaded(for: contentIdentity)
-            let inputsChanged = repository.homeCatalogInputSignature != lastLoadedInputSignature
-            await loadWithAutomaticRetry(for: contentIdentity, forceReload: !isLoaded || inputsChanged)
+            let identity = contentIdentity
+            if collectionHome == nil, store.manualCatalogRefreshGeneration > store.handledManualCatalogRefreshGeneration {
+                if store.manualCatalogRefreshProfileID == settingsProfileID {
+                    guard isActive else { isLoading = false; return }
+                    if schedulePendingManualCatalogRefresh() {
+                        await homeReloadTask?.value
+                    }
+                    return
+                }
+                store.markManualCatalogRefreshHandled(store.manualCatalogRefreshGeneration)
+            }
+            let currentInputSignature = repository.homeCatalogInputSignature
+            let currentLoadKey = TVHomeMainCatalogLoadKey(
+                identity: identity,
+                catalogInputSignature: currentInputSignature,
+                tmdbSettingsKey: tmdbHomeSettingsKey,
+                isGridLayout: homeLayout == "Grid View"
+            )
+            if collectionHome == nil, store.isLoaded(for: identity) {
+                lastLoadedInputSignature = store.loadedCatalogInputSignature
+            }
+            if collectionHome == nil, isReturningFromSettings, isActive, !isFullScreenOverlayPresented {
+                if store.isLoaded(for: currentLoadKey) {
+                    lastLoadedInputSignature = currentInputSignature
+                    isLoading = false
+                    return
+                }
+            }
+            let isLoaded = collectionHome == nil ? store.isLoaded(for: currentLoadKey) : store.isLoaded(for: contentIdentity)
+            let inputsChanged = currentInputSignature != lastLoadedInputSignature
+            await loadWithAutomaticRetry(for: identity, forceReload: !isLoaded || inputsChanged)
+            guard !Task.isCancelled, identity == contentIdentity else { return }
             if !isLoaded, collectionHome == nil {
                 // Add-on metadata providers are configured by the time Home has
                 // loaded, so this is the pass that recovers titles an earlier sync
@@ -6650,7 +7502,14 @@ struct TVHomeView: View {
             row: $calendarToday
         ))
         .onAppear {
+#if NUVIO_SIDEBAR_WATCHDOG
+            let operation = TVHomeDebugTrace.beginHomeOperation("home.lifecycle.appear")
+            defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
             TVHomeDebugTrace.startWatchdogIfNeeded()
+            if collectionHome == nil, store.isLoaded(for: contentIdentity) {
+                lastLoadedInputSignature = store.loadedCatalogInputSignature
+            }
             reportProfileGateReadiness()
             // A TabView may recreate Home instead of keeping it mounted. Arm
             // before its saved focus is restored so the first layout pass is
@@ -6672,7 +7531,9 @@ struct TVHomeView: View {
                 }
             }
             // Classic was never a distinct layout; collapse legacy values to Modern.
-            if homeLayout == "Classic" { homeLayout = "Modern" }
+            if homeLayout == "Classic" {
+                ProfileSettings.store(for: settingsProfileID).set("Modern", forKey: SettingsKey.homeLayout)
+            }
             refreshContinueWatching()
             refreshWatchedTitles()
             scheduleContinueWatchingRefresh()
@@ -6738,6 +7599,10 @@ struct TVHomeView: View {
         // TabView can keep Home mounted while Settings is selected, so returning
         // to Home does not reliably produce another onAppear.
         .onChange(of: isActive) { oldActive, active in
+#if NUVIO_SIDEBAR_WATCHDOG
+            let operation = TVHomeDebugTrace.beginHomeOperation(active ? "home.lifecycle.activate" : "home.lifecycle.deactivate")
+            defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
             TVHomeDebugTrace.log(
                 "home.isActive changed from \(oldActive) to \(active) "
                     + "(focusedCardID=\(currentFocusedCardID ?? "nil"), "
@@ -6772,21 +7637,18 @@ struct TVHomeView: View {
                 }
                 if currentFocusedCardID != nil {
                     releaseReturnFocusAnimationSuppression()
-                } else {
-                    // Fallback release: returning from Settings finds focusedCardID == nil
-                    // because the view tree was unmounted. Ensure animation suppression and
-                    // pending focus target are guaranteed to release within 0.5s even if focus
-                    // restoration takes an unexpected path or lands on a different card.
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                        guard self.isActive else { return }
-                        if let pending = self.pendingInitialFocusCardKey {
-                            TVHomeDebugTrace.log("home.isActive fallback timer clearing pendingInitialFocusCardKey=\(pending)")
-                            self.pendingInitialFocusCardKey = nil
-                        }
-                        if self.suppressReturnFocusAnimations {
-                            TVHomeDebugTrace.log("home.isActive fallback timer releasing animation suppression")
-                            self.releaseReturnFocusAnimationSuppression()
-                        }
+                }
+                // Ensure animation suppression and pending focus target are guaranteed to release
+                // within 0.35s even if focus restoration takes an unexpected path or lands on a different card.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    guard self.isActive else { return }
+                    if let pending = self.pendingInitialFocusCardKey {
+                        TVHomeDebugTrace.log("home.isActive fallback timer clearing pendingInitialFocusCardKey=\(pending)")
+                        self.pendingInitialFocusCardKey = nil
+                    }
+                    if self.suppressReturnFocusAnimations {
+                        TVHomeDebugTrace.log("home.isActive fallback timer releasing animation suppression")
+                        self.releaseReturnFocusAnimationSuppression()
                     }
                 }
                 if usesRemoteProgress {
@@ -6976,16 +7838,10 @@ struct TVHomeView: View {
                 await load(for: identity, forceReload: true)
             }
         }
-        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.forceRefreshNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive && !isFullScreenOverlayPresented else { return }
-            homeReloadTask?.cancel()
-            let identity = contentIdentity
-            homeReloadTask = Task { @MainActor in
-                await load(for: identity, forceReload: true)
-            }
-        }
         .onDisappear {
             focusWork.cancelAll()
+            store.suspendMainHomePublicationForFastScrolling = false
+            isFastScrolling = false
             collectionHome?.cancel()
             // The profile-focus retry is owned by a `.task(id:)` and cancels
             // automatically when this Home view leaves the hierarchy.
@@ -7010,6 +7866,17 @@ struct TVHomeView: View {
                 isLoadingFocusActive = false
             }
         }
+        .onChange(of: store.mainCatalogIsLoading) { _, loading in
+            guard collectionHome == nil else { return }
+            isLoading = loading
+        }
+        .onChange(of: store.mainCatalogErrorMessage) { _, message in
+            guard collectionHome == nil else { return }
+            errorMessage = message
+        }
+        .onChange(of: store.mainHomePublicationRevision, initial: true) { _, _ in
+            handleMainHomePublication()
+        }
         .onChange(of: profileGateReadiness) { _, _ in
             reportProfileGateReadiness()
         }
@@ -7024,13 +7891,15 @@ struct TVHomeView: View {
             reportProfileGateReadiness()
         }
         .onChange(of: contentIdentity) { _, _ in
+            if observedHomeSettings?.profileID != settingsProfileID { observedHomeSettings = nil }
             nativeProfileFocusedCardKey = nil
             didNativeFocusGridHero = false
             reportProfileGateReadiness()
         }
         .onChange(of: isFullScreenOverlayPresented) { oldVal, isPresented in
             if oldVal && !isPresented && isActive {
-                checkAndTriggerAutoRefresh()
+                handleMainHomePublication()
+                if !schedulePendingManualCatalogRefresh() { checkAndTriggerAutoRefresh() }
                 if pendingContinueWatchingRefreshAfterOverlay {
                     pendingContinueWatchingRefreshAfterOverlay = false
                     if usesRemoteProgress {
@@ -7046,9 +7915,16 @@ struct TVHomeView: View {
         }
         .onChange(of: isActive) { oldVal, active in
             if !oldVal && active && !isFullScreenOverlayPresented {
-                checkAndTriggerAutoRefresh()
+                handleMainHomePublication()
+                if !schedulePendingManualCatalogRefresh() {
+                    if isReturningFromSettings { refreshSettingsReturnCatalogIfNeeded() }
+                    else { checkAndTriggerAutoRefresh() }
+                }
             }
             if active, collectionHome == nil { AIHomeCatalogStore.shared.refreshIfNeeded() }
+        }
+        .onChange(of: store.manualCatalogRefreshGeneration) { _, _ in
+            _ = schedulePendingManualCatalogRefresh()
         }
         .onReceive(AIHomeCatalogStore.shared.$revision.dropFirst()) { _ in
             applyAIHomeSections()
@@ -7114,6 +7990,10 @@ struct TVHomeView: View {
     }
 
     var body: some View {
+#if NUVIO_SIDEBAR_WATCHDOG
+        let _ = TVHomeDebugTrace.recordHomeBodyEvaluation()
+        let _ = TVHomeDebugTrace.sampleViewChanges("Home") { Self._printChanges() }
+#endif
         let _ = TVHomeDebugTrace.breadcrumb("home.body.render active=\(isActive) row=\(focusedRowIndex)")
         bodyWithModifiers
             .overlay { ambientModeOverlay }
@@ -7122,17 +8002,32 @@ struct TVHomeView: View {
                 browseSectionView(section: section)
             }
             .onExitCommand(perform: canHandleExitCommand ? handleBackCommand : nil)
+            .background(
+                TVHomeSettingsObserver(profileID: settingsProfileID, onChange: receiveHomeSettings)
+                    .defaultAppStorage(ProfileSettings.store(for: settingsProfileID))
+                    .id(settingsProfileID ?? "none")
+            )
     }
 
     /// Settings > Layout > Ambient Mode: backdrops from the rows on Home after a
     /// minute without remote input, only while Home is on screen with nothing over it.
     private var ambientModeOverlay: some View {
-        AmbientModeOverlay(
-            isEligible: isActive && !isFullScreenOverlayPresented && browsingSection == nil && !showsLoading,
-            slides: AmbientModeOverlay.slides(
+#if NUVIO_SIDEBAR_WATCHDOG
+        let slides = TVHomeDebugTrace.measureHomeOperation("home.ambient.slides") {
+            AmbientModeOverlay.slides(
                 from: Array(store.sections.lazy.flatMap(\.items).prefix(200)),
                 backdropURL: { Self.preferredBackdropURL(for: $0) }
             )
+        }
+#else
+        let slides = AmbientModeOverlay.slides(
+            from: Array(store.sections.lazy.flatMap(\.items).prefix(200)),
+            backdropURL: { Self.preferredBackdropURL(for: $0) }
+        )
+#endif
+        return AmbientModeOverlay(
+            isEligible: isActive && !isFullScreenOverlayPresented && browsingSection == nil && !showsLoading,
+            slides: slides
         )
     }
 
@@ -7826,7 +8721,7 @@ struct TVHomeView: View {
                 detailsPlayerRestoreGeneration = overlayRestoreGeneration
                 detailsPlayerRestorePresentationID = fullScreenOverlayPresentationID
             }
-            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration, isFullScreen: wasDetailsPlayerRestore)
         } else {
             setFocusedCardID(target)
         }
@@ -7972,7 +8867,7 @@ struct TVHomeView: View {
             "home.overlay.dismissal restoring source=\(source) target=\(target) "
                 + "presentation=\(presentationID) gen=\(overlayRestoreGeneration)"
         )
-        restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        restoreOverlayFocus(to: target, generation: overlayRestoreGeneration, isFullScreen: isFullScreen)
     }
 
     private func clearDetailsPlayerReturnRestore(clearExpectedFocus: Bool = true) {
@@ -7988,6 +8883,10 @@ struct TVHomeView: View {
 
     private func restoreFocusState(for rawTarget: String) {
         guard let target = validRestoreTarget(rawTarget) ?? (rawTarget.isEmpty ? nil : rawTarget) else { return }
+#if NUVIO_SIDEBAR_WATCHDOG
+        let operation = TVHomeDebugTrace.beginHomeOperation("home.focus.restore")
+        defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
         for (sectionIndex, section) in visibleSections.enumerated() {
             let prefix = "\(section.id)\u{1}"
             guard target.hasPrefix(prefix) else { continue }
@@ -8030,18 +8929,30 @@ struct TVHomeView: View {
 
     private func restoreOverlayFocus(
         to target: String,
-        generation: Int
+        generation: Int,
+        isFullScreen: Bool = true
     ) {
-        TVHomeDebugTrace.log("home.restoreOverlayFocus begin target=\(target) gen=\(generation)")
+        TVHomeDebugTrace.log("home.restoreOverlayFocus begin target=\(target) gen=\(generation) isFullScreen=\(isFullScreen)")
         restoreFocusState(for: target)
         focusWork.restoringOverlayCardID = target
         focusWork.acknowledgedNativeOverlayFocusCardID = nil
 
         setFocusedCardID(target)
-        // Home and the outgoing overlay can overlap briefly during the opacity
-        // transition. Retry after the target modifier is mounted instead of
-        // depending on a single lifecycle callback ordering.
-        for delay in [0.06, 0.18, 0.35] {
+
+        // For non-fullscreen transitions (e.g. sidebar closing), if focus already rests on target,
+        // release the lock immediately so adjacent rows are not locked out from vertical navigation.
+        if !isFullScreen && currentFocusedCardID == target {
+            DispatchQueue.main.async {
+                guard overlayRestoreGeneration == generation, overlayRestoreCardID == target else { return }
+                overlayRestoreCardID = nil
+                focusWork.restoringOverlayCardID = nil
+                focusWork.acknowledgedNativeOverlayFocusCardID = nil
+            }
+            return
+        }
+
+        let retryDelays = isFullScreen ? [0.06, 0.18, 0.35] : [0.04, 0.08]
+        for delay in retryDelays {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
                     TVHomeDebugTrace.log("home.restoreOverlayFocus fire target=\(target) delay=\(delay)")
@@ -8050,12 +8961,9 @@ struct TVHomeView: View {
             }
         }
 
-        // Safety fallback if the lifecycle callback is lost. Normally the
-        // target card's focus callback clears the lock much earlier. While the
-        // lock is still held this is the only eligible card, so re-assert it
-        // rather than only filling a nil focus — a neighbouring card that won
-        // the first frame would otherwise be left holding focus.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
+        // Safety fallback if the lifecycle callback is lost.
+        let safetyTimeout: Double = isFullScreen ? 0.45 : 0.12
+        DispatchQueue.main.asyncAfter(deadline: .now() + safetyTimeout) {
             if overlayRestoreGeneration == generation,
                overlayRestoreCardID == target {
                 TVHomeDebugTrace.log("home.restoreOverlayFocus safety cleanup target=\(target)")
@@ -8448,19 +9356,38 @@ struct TVHomeView: View {
         handleBackCommand()
     }
 
+    private func targetTop(for sectionID: String) -> CGFloat? {
+        if let knownTop = focusWork.rowTops[sectionID] {
+            return knownTop
+        }
+        let sections = visibleSections
+        guard let targetIdx = sections.firstIndex(where: { $0.id == sectionID }) else { return nil }
+        var currentTop: CGFloat = TVHomeLayout.rowsTopPadding
+        if sessionNeedsReauthentication && !isBannerDismissed {
+            currentTop += 90 + TVHomeLayout.sectionSpacing
+        }
+        for i in 0..<targetIdx {
+            let sec = sections[i]
+            let height = focusWork.rowHeights[sec.id] ?? estimatedHeight(for: sec)
+            currentTop += height + TVHomeLayout.sectionSpacing
+        }
+        focusWork.rowTops[sectionID] = currentTop
+        return currentTop
+    }
+
     /// Puts row `sectionID` at the top of Home, where scrollTo(_:anchor: .top) would, with a Core
     /// Animation move of Home's UIKit scroll view (as the rows move). Home's SwiftUI scroll
     /// animation was worked out on the main thread frame by frame, and stalled with the work of
     /// the move (the hero, the rows being built). False until the row's place is known (then
     /// SwiftUI scrolls, as before).
-    private func moveHome(to sectionID: String, fast: Bool) -> Bool {
+    private func moveHome(to sectionID: String, fast: Bool, animated: Bool = true) -> Bool {
         guard let scrollView = TVHomeVerticalScroll.scrollView, scrollView.window != nil,
-              let top = focusWork.rowTops[sectionID]
+              let top = targetTop(for: sectionID)
         else { return false }
         TVScrollMove.move(
             scrollView,
             to: CGPoint(x: scrollView.contentOffset.x, y: top - scrollView.adjustedContentInset.top),
-            animated: true,
+            animated: animated,
             duration: fast ? 0.18 : 0.3
         )
         return true
@@ -8695,12 +9622,22 @@ struct TVHomeView: View {
         }
     }
 
+    private func isHomeRowMaterialized(at index: Int, id: String) -> Bool {
+        let isInBuildWindow = (index >= focusedRowIndex - min(3, max(0, rowBuildReach))
+                && index <= focusedRowIndex + min(3, rowBuildReach + 2))
+            || ((rowBuildReach >= 3 || focusWork.isStagingRowsAfterJump)
+                && abs(index - settledRowIndex) <= 4)
+        return isInBuildWindow
+            || (abs(index - focusedRowIndex) <= 8 && focusWork.rowsBuiltDuringRun.contains(id))
+    }
+
     @ViewBuilder
     private func homeSectionRow(
         index: Int,
         section: TVHomeSection,
         horizontalEdgeInset: CGFloat,
-        verticalScrollProxy: ScrollViewProxy
+        verticalScrollProxy: ScrollViewProxy,
+        showsSharedLoadingSpinner: Bool
     ) -> some View {
         if section.isLoadingPlaceholder {
             TVLoadingCatalogRow(
@@ -8710,6 +9647,7 @@ struct TVHomeView: View {
                 requestsFocus: false,
                 addonName: section.addonName,
                 showAddonName: catalogAddonNames,
+                showsSharedLoadingSpinner: showsSharedLoadingSpinner,
                 horizontalEdgeInset: horizontalEdgeInset,
                 initialScrollIndex: rowScrollStore.index(for: section.id),
                 onScrollIndexChange: { newIndex in
@@ -8746,6 +9684,7 @@ struct TVHomeView: View {
                     let cardKey = TVHomeCardIdentity.placeholderKey(rowID: section.id, index: placeholderIndex)
                     noteCardFocusEcho(cardKey)
                     store.lastFocusedCardID = cardKey
+                    store.prioritizeDeferredCatalogRow(sectionID: section.id)
                 },
             )
             .equatable()
@@ -9202,6 +10141,9 @@ struct TVHomeView: View {
         // existing first-load behavior; align later grid rows even when their
         // section is already the first item in the vertical stack.
         guard location.sectionIndex > 0 || gridRowIndex > 0 else { return }
+        if homeLayout != "Grid View", moveHome(to: location.sectionID, fast: false, animated: false) {
+            return
+        }
         var immediateTransaction = Transaction()
         immediateTransaction.animation = nil
         withTransaction(immediateTransaction) {
@@ -9209,6 +10151,9 @@ struct TVHomeView: View {
         }
         DispatchQueue.main.async {
             guard self.isActive, !self.isFullScreenOverlayPresented else { return }
+            if self.homeLayout != "Grid View", self.moveHome(to: location.sectionID, fast: false, animated: false) {
+                return
+            }
             var transaction = Transaction()
             transaction.animation = nil
             withTransaction(transaction) {
@@ -9310,6 +10255,10 @@ struct TVHomeView: View {
     }
 
     private var visibleSections: [TVHomeSection] {
+#if NUVIO_SIDEBAR_WATCHDOG
+        let operation = TVHomeDebugTrace.beginHomeOperation("home.sections.visible")
+        defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
         let showsResumePlaceholder = continueWatchingVisible
             && collectionHome == nil
             && usesRemoteProgress
@@ -9379,9 +10328,9 @@ struct TVHomeView: View {
                     return section
                 }
                 var copy = section
-                copy.items = section.items.filter {
+                copy.setPreFilteredUniqueItems(section.items.filter {
                     !ContentReleasePolicy.isUnreleased($0, today: today)
-                }
+                })
                 return copy
             }
         }
@@ -9561,6 +10510,7 @@ struct TVHomeView: View {
         for identity: TVHomeContentIdentity,
         forceReload: Bool = false
     ) async {
+        guard !Task.isCancelled else { return }
         if collectionHome != nil {
             await load(for: identity, forceReload: forceReload)
             return
@@ -9572,58 +10522,21 @@ struct TVHomeView: View {
             isLoading = false
             return
         }
-        let maximumAttempts = 3
-        for attempt in 0..<maximumAttempts {
-            await load(for: identity, forceReload: forceReload || attempt > 0)
-            guard !Task.isCancelled else { return }
-            if store.isLoaded(for: identity) {
-                // Add-on rows are best-effort, so a partial response is still
-                // useful. Keep it visible, wait briefly, then replace the tree
-                // once instead of caching the omission for the whole session.
-                guard repository.homeCatalogLoadWasPartial else { return }
-                let failure = repository.homeCatalogFailureSignature
-                // This recovery is for a transient outage. A failure set an
-                // earlier retry already failed to change is permanent -- a dead
-                // add-on URL, or a catalog its host always rejects -- and
-                // retrying it re-fetches every row from every add-on to recover
-                // nothing, on every profile entry for the rest of the session.
-                if let failure, Self.unimprovedHomeFailures.contains(failure) { return }
-                do {
-                    try await Task.sleep(nanoseconds: 2_000_000_000)
-                } catch {
-                    return
-                }
-                await load(for: identity, forceReload: true)
-                if let failure, repository.homeCatalogFailureSignature == failure {
-                    Self.unimprovedHomeFailures.insert(failure)
-                }
-                return
-            }
-            guard attempt < maximumAttempts - 1 else {
-                if isProfileFocusPending,
-                   contentIdentity == identity,
-                   !store.isLoaded(for: identity),
-                   errorMessage != nil {
-                    profileGateFailedLoadIdentity = identity
-                }
-                return
-            }
-
-            do {
-                try await Task.sleep(
-                    nanoseconds: UInt64(attempt + 1) * 1_000_000_000
-                )
-            } catch {
-                return
-            }
+        await load(for: identity, forceReload: forceReload, automaticallyRetry: true)
+        guard !Task.isCancelled, contentIdentity == identity else { return }
+        if isProfileFocusPending, !store.isLoaded(for: identity), errorMessage != nil {
+            profileGateFailedLoadIdentity = identity
         }
     }
 
     @MainActor
     private func load(
         for identity: TVHomeContentIdentity,
-        forceReload: Bool = false
+        forceReload: Bool = false,
+        automaticallyRetry: Bool = false,
+        forceEager: Bool = false
     ) async {
+        guard !Task.isCancelled else { return }
         if let collectionHome {
             guard isActive else { return }
             isLoading = true
@@ -9649,124 +10562,116 @@ struct TVHomeView: View {
         refreshContinueWatching()
         refreshWatchedTitles()
 
+        let inputSignature = repository.homeCatalogInputSignature
+        let key = TVHomeMainCatalogLoadKey(
+            identity: identity,
+            catalogInputSignature: inputSignature,
+            tmdbSettingsKey: tmdbHomeSettingsKey,
+            isGridLayout: homeLayout == "Grid View"
+        )
         // Returning from a card: the catalog is still cached in the store, so
         // skip the network round-trip. The saved card re-focuses itself via
         // `initialFocusCardKey`, which restores the row/scroll position too.
-        if !forceReload, store.isLoaded(for: identity) {
+        if !forceReload, store.isLoaded(for: key) {
+            lastLoadedInputSignature = store.loadedCatalogInputSignature
             isLoading = false
+            errorMessage = store.mainCatalogErrorMessage
             return
         }
 
-        let generation = store.beginLoad(for: identity)
-        // Captured before the first request so it describes what this load read,
-        // not what a settings change mid-flight left behind.
-        let inputSignature = repository.homeCatalogInputSignature
         lastLoadedInputSignature = inputSignature
         isLoading = true
         errorMessage = nil
+        await store.loadMainCatalog(
+            for: key,
+            forceReload: forceReload,
+            automaticallyRetry: automaticallyRetry,
+            forceEager: forceEager
+        )
+        guard !Task.isCancelled, contentIdentity == identity else { return }
+        lastLoadedInputSignature = store.loadedCatalogInputSignature
+        isLoading = store.mainCatalogIsLoading
+        errorMessage = store.mainCatalogErrorMessage
+        refreshWatchedTitles()
+    }
 
-        // Collections are already local once account sync applies them. Publish
-        // their folder rows before starting provider requests so a slow catalog
-        // host cannot hold the user's collections off Home.
-        let collectionSections = await loadCollectionSections()
-        guard store.isCurrentLoad(generation, for: identity) else { return }
-        let homeVisibility = TVHomeCatalogOrder.homeVisibilityContext()
-        let previouslyLoadedCatalogSections = store.sections.filter {
-            !$0.isCollectionRow
-                && !$0.isLoadingPlaceholder
-                && isHomeCatalogSectionFromEnabledSource($0, context: homeVisibility)
+    @MainActor
+    private func waitForHomeLoad(for identity: TVHomeContentIdentity) async {
+        while store.isLoading(for: identity) {
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, contentIdentity == identity else { return }
         }
-        let isColdStart = previouslyLoadedCatalogSections.isEmpty
-        // Seeded before the first publish so Home shows its rows'
-        // titles and spinning cards immediately, rather than assembling itself
-        // row by row under the user.
-        homeLoadingPlaceholders = homeSkeletonSections(
-            excluding: Set(previouslyLoadedCatalogSections.map(\.id))
-                .union(collectionSections.map(\.id))
-        )
-        publishHomeSections(
-            catalogSections: previouslyLoadedCatalogSections,
-            collectionSections: collectionSections,
-            resetFocusIfEmpty: isColdStart
-        )
+    }
 
-        var receivedCatalogUpdate = false
-        var receivedCatalogPublication = false
-        do {
-            var latestCatalogSections: [TVHomeSection] = []
-            for try await catalogs in repository.homeCatalogsProgressively() {
-                try Task.checkCancellation()
-                guard store.isCurrentLoad(generation, for: identity) else { return }
-                receivedCatalogPublication = true
-                let catalogSections = await Self.makeHomeCatalogSections(from: catalogs, repository: repository)
-                try Task.checkCancellation()
-                guard store.isCurrentLoad(generation, for: identity) else { return }
-                latestCatalogSections = catalogSections
-                receivedCatalogUpdate = receivedCatalogUpdate || !catalogSections.isEmpty
-                guard !catalogSections.isEmpty else { continue }
-                let loadedIds = Set(catalogSections.map(\.id))
-                let retainedPrevious = previouslyLoadedCatalogSections.filter { !loadedIds.contains($0.id) }
-                while isFastScrolling {
-                    try? await Task.sleep(nanoseconds: 80_000_000)
-                    try Task.checkCancellation()
-                    guard store.isCurrentLoad(generation, for: identity) else { return }
+    @MainActor
+    private func schedulePendingManualCatalogRefresh() -> Bool {
+        guard collectionHome == nil, isActive, !isFullScreenOverlayPresented else { return false }
+        let generation = store.manualCatalogRefreshGeneration
+        guard generation > store.handledManualCatalogRefreshGeneration else { return false }
+        guard store.manualCatalogRefreshProfileID == settingsProfileID else {
+            store.markManualCatalogRefreshHandled(generation)
+            return false
+        }
+        if scheduledManualCatalogRefreshGeneration == generation { return true }
+        scheduledManualCatalogRefreshGeneration = generation
+        homeReloadTask?.cancel()
+        let identity = contentIdentity
+        homeReloadTask = Task { @MainActor in
+            defer {
+                if self.scheduledManualCatalogRefreshGeneration == generation {
+                    self.scheduledManualCatalogRefreshGeneration = nil
                 }
-                publishHomeSections(
-                    // Keep the previous successful tree while this replacement
-                    // is still arriving, then publish the exact final result
-                    // below. Late rows append without making earlier rows flash.
-                    catalogSections: catalogSections + retainedPrevious,
-                    collectionSections: collectionSections,
-                    resetFocusIfEmpty: isColdStart
-                )
             }
-            guard receivedCatalogPublication || !collectionSections.isEmpty else {
-                throw URLError(.cannotLoadFromNetwork)
+            guard !Task.isCancelled, isActive, !isFullScreenOverlayPresented,
+                  contentIdentity == identity else { return }
+            let latestGeneration = store.manualCatalogRefreshGeneration
+            guard latestGeneration > store.handledManualCatalogRefreshGeneration else { return }
+            guard store.manualCatalogRefreshProfileID == settingsProfileID else {
+                store.markManualCatalogRefreshHandled(latestGeneration)
+                return
             }
-            guard store.isCurrentLoad(generation, for: identity) else { return }
-            while isFastScrolling {
-                try? await Task.sleep(nanoseconds: 80_000_000)
-                try Task.checkCancellation()
-                guard store.isCurrentLoad(generation, for: identity) else { return }
-            }
-            // Every row this load was going to produce has arrived; whatever is
-            // still a skeleton is never coming.
-            clearHomeLoadingPlaceholders(mutateStore: false)
-            publishHomeSections(
-                catalogSections: receivedCatalogPublication
-                    ? latestCatalogSections
-                    : previouslyLoadedCatalogSections,
-                collectionSections: collectionSections,
-                resetFocusIfEmpty: isColdStart
-            )
-            if AniListSettings.isEnabled {
-                // Settings → Integrations → AniList → Status: the rows that reached Home.
-                AniListDiagnostics.noteHomeOnScreen(rows: store.sections.filter {
-                    $0.addonId == AniListService.addonID && !$0.isLoadingPlaceholder && !$0.items.isEmpty
-                }.count)
-            }
-            store.finishLoad(generation, for: identity)
-            lastLoadedInputSignature = inputSignature
-            refreshWatchedTitles()
+            await load(for: identity, forceReload: true, forceEager: true)
+            guard !Task.isCancelled else { return }
+            store.markManualCatalogRefreshHandled(latestGeneration)
+        }
+        return true
+    }
+
+    @MainActor
+    private func refreshSettingsReturnCatalogIfNeeded() {
+        guard collectionHome == nil, isActive, !isFullScreenOverlayPresented else { return }
+        if schedulePendingManualCatalogRefresh() { return }
+        let identity = contentIdentity
+        let currentSignature = repository.homeCatalogInputSignature
+        let wasLoaded = store.isLoaded(for: identity)
+        if store.isLoaded(for: identity), store.loadedCatalogInputSignature == currentSignature {
+            lastLoadedInputSignature = currentSignature
             isLoading = false
-        } catch is CancellationError {
-            guard store.isCurrentLoad(generation, for: identity) else { return }
-            store.cancelLoad(generation, for: identity)
-            clearHomeLoadingPlaceholders()
-            isLoading = false
-        } catch {
-            guard store.isCurrentLoad(generation, for: identity) else { return }
-            clearHomeLoadingPlaceholders()
-            errorMessage = error.localizedDescription
-            // Synced collections or progressively loaded catalogs remain useful
-            // even if another provider failed after they were published.
-            if receivedCatalogUpdate || !collectionSections.isEmpty {
-                store.finishLoad(generation, for: identity)
-                lastLoadedInputSignature = inputSignature
-            } else {
-                store.cancelLoad(generation, for: identity)
+            return
+        }
+        guard !scheduledSettingsReturnRefresh else { return }
+        scheduledSettingsReturnRefresh = true
+        homeReloadTask?.cancel()
+        homeReloadTask = Task { @MainActor in
+            defer { scheduledSettingsReturnRefresh = false }
+            await waitForHomeLoad(for: identity)
+            guard !Task.isCancelled, isActive, !isFullScreenOverlayPresented,
+                  contentIdentity == identity else { return }
+            let latestSignature = repository.homeCatalogInputSignature
+            if store.isLoaded(for: identity), store.loadedCatalogInputSignature == latestSignature {
+                lastLoadedInputSignature = latestSignature
+                isLoading = false
+                return
             }
-            isLoading = false
+            await loadWithAutomaticRetry(for: identity, forceReload: true)
+            if !Task.isCancelled, !wasLoaded {
+                ContinueWatchingBuilder.scheduleRebuild(reason: "home loaded")
+                await ContinueWatchingStore.refreshMissingEpisodeDetails()
+            }
         }
     }
 
@@ -9800,7 +10705,7 @@ struct TVHomeView: View {
 
     /// Also used by the Top Shelf's background refresh, which builds the same
     /// rows without Home on screen.
-    static func makeHomeCatalogSections(
+    nonisolated static func makeHomeCatalogSections(
         from catalogs: [NuvioCatalog],
         repository: CatalogRepository
     ) async -> [TVHomeSection] {
@@ -9881,164 +10786,45 @@ struct TVHomeView: View {
     }
 
     @MainActor
-    private func publishHomeSections(
-        catalogSections: [TVHomeSection],
-        collectionSections: [TVHomeSection],
-        resetFocusIfEmpty: Bool
-    ) {
-        TVHomeDebugTrace.measure("home.publishHomeSections catalog=\(catalogSections.count) col=\(collectionSections.count)") {
-            let pinned = collectionSections.filter(\.isPinnedCollection)
-            let unpinned = collectionSections.filter { !$0.isPinnedCollection }
-            // Settings > Integrations > Surprise Me > For You rows go first.
-            let aiSections = collectionHome == nil ? AIHomeCatalogStore.shared.sections() : []
-            let composed = aiSections + homeOrderedSections(pinned + catalogSections + unpinned)
+    private func handleMainHomePublication() {
+        guard collectionHome == nil,
+              isActive,
+              !isFullScreenOverlayPresented,
+              handledMainHomePublicationRevision != store.mainHomePublicationRevision else { return }
+        handledMainHomePublicationRevision = store.mainHomePublicationRevision
 
-            // Rows this load still owes, drawn as skeletons in their saved position.
-            let published = Set(composed.map(\.id))
-            let skeletons = homeLoadingPlaceholders.filter { !published.contains($0.id) }
-            guard !composed.isEmpty || !skeletons.isEmpty else {
-                store.sections = []
-                store.hero = nil
-                return
-            }
-            let visible = skeletons.isEmpty
-                ? composed
-                : homeOrderedSections(composed + skeletons)
-
-            // "Empty" means nothing real was on screen yet — skeletons must not
-            // count, or the focus seeding below would be skipped once the first
-            // genuine row lands.
-            let wasEmpty = store.sections.allSatisfy(\.isLoadingPlaceholder)
-            let isSameSections = store.sections.count == visible.count && zip(store.sections, visible).allSatisfy { old, new in
-                old.id == new.id &&
-                old.items.count == new.items.count &&
-                old.isLoadingPlaceholder == new.isLoadingPlaceholder &&
-                zip(old.items, new.items).allSatisfy { $0.id == $1.id } &&
-                old.collectionFolders.count == new.collectionFolders.count
-            }
-            if !isSameSections {
-                TVHomeDebugTrace.log("home.publishHomeSections updating store.sections count=\(visible.count)")
-                store.sections = visible
-                // The snapshot is what the next launch seeds skeletons *from*, so only
-                // rows that actually resolved belong in it.
-                TVHomeCatalogOrder.scheduleSnapshotWrite(composed)
+        let visible = store.sections
+        if let currentSectionID = focusedSectionId,
+           let loadedSection = visible.first(where: { $0.id == currentSectionID && !$0.isLoadingPlaceholder && $0.hasContent }) {
+            let savedIndex = rowScrollStore.index(for: currentSectionID)
+            let targetCardKey: String?
+            if !loadedSection.collectionFolders.isEmpty {
+                let folderIndex = min(max(savedIndex, 0), loadedSection.collectionFolders.count - 1)
+                targetCardKey = TVHomeCardIdentity.folderKey(rowID: currentSectionID, folder: loadedSection.collectionFolders[folderIndex])
+            } else if !loadedSection.items.isEmpty {
+                let itemIndex = min(max(savedIndex, 0), loadedSection.items.count - 1)
+                targetCardKey = TVHomeCardIdentity.key(rowID: currentSectionID, item: loadedSection.items[itemIndex])
             } else {
-                TVHomeDebugTrace.log("home.publishHomeSections store.sections unchanged (\(visible.count) sections)")
+                targetCardKey = nil
             }
-            if let newHero = composed.lazy.compactMap({ $0.items.first }).first, store.hero?.id != newHero.id {
-                store.hero = newHero
+            if let targetCardKey, store.lastFocusedCardID != targetCardKey {
+                TVHomeDebugTrace.log("home.publishHomeSections maintaining focus on newly loaded section=\(currentSectionID) target=\(targetCardKey)")
+                store.lastFocusedCardID = targetCardKey
+                setFocusedCardID(targetCardKey)
             }
-
-            if let currentSectionId = focusedSectionId,
-               let loadedSection = visible.first(where: { $0.id == currentSectionId && !$0.isLoadingPlaceholder && $0.hasContent }) {
-                let savedIndex = rowScrollStore.index(for: currentSectionId)
-                let targetCardKey: String?
-                if !loadedSection.collectionFolders.isEmpty {
-                    let folderIndex = min(max(savedIndex, 0), loadedSection.collectionFolders.count - 1)
-                    targetCardKey = TVHomeCardIdentity.folderKey(rowID: currentSectionId, folder: loadedSection.collectionFolders[folderIndex])
-                } else if !loadedSection.items.isEmpty {
-                    let itemIndex = min(max(savedIndex, 0), loadedSection.items.count - 1)
-                    targetCardKey = TVHomeCardIdentity.key(rowID: currentSectionId, item: loadedSection.items[itemIndex])
-                } else {
-                    targetCardKey = nil
-                }
-                if let targetCardKey, store.lastFocusedCardID != targetCardKey {
-                    TVHomeDebugTrace.log("home.publishHomeSections maintaining focus on newly loaded section=\(currentSectionId) target=\(targetCardKey)")
-                    store.lastFocusedCardID = targetCardKey
-                    setFocusedCardID(targetCardKey)
-                }
-            }
-
-            guard wasEmpty && resetFocusIfEmpty && focusedSectionId == nil else { return }
-            store.lastFocusedCardID = nil
-            focusedMeta = store.hero
-            focusedSectionId = nil
-            focusedCollectionFolder = nil
-            focusWork.pendingFocusedMeta = focusedMeta
-            // Keep folder-hero state clear until a folder card is focused.
-            landscapeFocusedId = nil
-            focusWork.pendingLandscapeFocusedId = nil
-            didRequestInitialCardFocus = false
-            didPrepareInitialFocusViewport = false
-            pendingInitialFocusCardKey = nil
         }
-    }
 
-    /// Skeleton rows for catalogs this load has not returned yet, taken from the
-    /// last Home's snapshot so each one lands in its saved position.
-    ///
-    /// Hidden rows survive in that snapshot on purpose — Settings needs them to
-    /// offer them back — so they are filtered out here; a row the user removed
-    /// must not reappear as a spinner. Collection rows are excluded too: they
-    /// come from the local store and are already on screen before the first
-    /// catalog request goes out.
-    private func homeSkeletonSections(excluding published: Set<String>) -> [TVHomeSection] {
-        let visibility = TVHomeCatalogOrder.homeVisibilityContext()
-
-        return TVHomeCatalogOrder.snapshotRows().compactMap { row in
-            guard !published.contains(row.id),
-                  !row.id.hasPrefix(TVHomeSection.collectionIdPrefix),
-                  row.id != TVHomeSection.continueWatchingId,
-                  row.id != TVHomeSection.upcomingId,
-                  isHomeCatalogSnapshotRowFromEnabledSource(row),
-                  TVHomeCatalogOrder.isRowEnabled(row, context: visibility) else {
-                return nil
-            }
-            return TVHomeSection(
-                id: row.id,
-                title: row.title,
-                items: [],
-                contentType: row.contentType,
-                catalogId: row.catalogId,
-                addonId: row.addonId,
-                addonName: row.addonName,
-                manifestURL: row.manifestURL,
-                manifestShowInHome: row.manifestShowInHome,
-                posterShape: row.posterShape,
-                isLoadingPlaceholder: true
-            )
-        }
-    }
-
-    /// A disabled provider must not leave its previous rows or loading
-    /// placeholders visible while the replacement Home tree is being built.
-    /// Built-in rows have no `addonId`, but their persisted settings key still
-    /// carries Cinemeta's manifest id.
-    private func isHomeCatalogSectionFromEnabledSource(
-        _ section: TVHomeSection,
-        context: TVHomeCatalogOrder.HomeVisibilityContext
-    ) -> Bool {
-        TVHomeCatalogOrder.isRowEnabled(homeCatalogSnapshotRow(for: section), context: context)
-    }
-
-    private func homeCatalogSnapshotRow(for section: TVHomeSection) -> TVHomeCatalogOrder.SnapshotRow {
-        TVHomeCatalogOrder.SnapshotRow(
-            id: section.id,
-            title: section.title,
-            addonName: section.addonName,
-            addonId: section.addonId,
-            contentType: section.contentType,
-            catalogId: section.catalogId,
-            manifestURL: section.manifestURL,
-            manifestShowInHome: section.manifestShowInHome,
-            settingsKey: section.catalogSettingsKey,
-            posterShape: section.posterShape
-        )
-    }
-
-    private func isHomeCatalogSnapshotRowFromEnabledSource(
-        _ row: TVHomeCatalogOrder.SnapshotRow
-    ) -> Bool {
-        guard !CinemetaCatalogRepository.isCinemetaEnabled else { return true }
-        return !(row.settingsKey?.hasPrefix("\(CinemetaCatalogRepository.cinemetaAddonId)_") ?? false)
-    }
-
-    /// Drops every skeleton, from the pending list and from what is on screen.
-    /// A row that failed has to stop spinning, not spin until the next load.
-    private func clearHomeLoadingPlaceholders(mutateStore: Bool = true) {
-        homeLoadingPlaceholders = []
-        guard mutateStore, store.sections.contains(where: \.isLoadingPlaceholder) else { return }
-        store.sections = store.sections.filter { !$0.isLoadingPlaceholder }
+        guard store.mainHomePublicationNeedsFocusSeed,
+              focusedSectionId == nil,
+              store.lastFocusedCardID == nil else { return }
+        focusedMeta = store.hero
+        focusedCollectionFolder = nil
+        focusWork.pendingFocusedMeta = focusedMeta
+        landscapeFocusedId = nil
+        focusWork.pendingLandscapeFocusedId = nil
+        didRequestInitialCardFocus = false
+        didPrepareInitialFocusViewport = false
+        pendingInitialFocusCardKey = nil
     }
 
     /// Builds one Home row per synced collection with emoji/folder cards.
@@ -10047,39 +10833,9 @@ struct TVHomeView: View {
     /// next section (e.g. Popular) peeks under a focused collection the same
     /// way catalog rows do — without flattening folders into title posters.
     private func loadCollectionSections() async -> [TVHomeSection] {
-        let disabledCollectionIds = TVHomeCatalogOrder.disabledCollectionIds()
-        let stored = CollectionsStore.collections()
-        var sections: [TVHomeSection] = []
-        for collection in stored {
-            if disabledCollectionIds.contains(collection.id) {
-                continue
-            }
-            // Keep every folder card — including empty / TMDB / Trakt-only.
-            // Previously those were dropped, so a collection with no add-on
-            // catalogs never appeared on Home even though sync had it.
-            let folders: [TVCollectionFolderItem] = collection.folders.map { folder in
-                TVCollectionFolderItem(
-                    collectionId: collection.id,
-                    folder: folder,
-                    sources: folder.resolvedSources,
-                    viewMode: collection.viewMode,
-                    showAllTab: collection.showAllTab
-                )
-            }
-            if folders.isEmpty {
-                continue
-            }
-            sections.append(
-                TVHomeSection(
-                    id: "\(TVHomeSection.collectionIdPrefix)\(collection.id)",
-                    title: collection.title,
-                    items: [],
-                    isPinnedCollection: collection.pinToTop,
-                    collectionFolders: folders
-                )
-            )
-        }
-        return sections
+        await Task.detached {
+            TVHomeStore.loadCollectionSections()
+        }.value
     }
 
     /// Re-resolves collection rows in place after a sync pull / local edit
@@ -10177,11 +10933,21 @@ struct TVHomeView: View {
             let started = TVHomeDebugTrace.now()
             try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled else { return }
+            guard let targetSectionId,
+                  focusWork.pendingSectionId == targetSectionId else { return }
+            if hasFolderPending {
+                guard focusWork.pendingFocusedFolder?.id == targetFolderId else { return }
+            } else {
+                guard focusWork.pendingFocusedMeta?.id == targetMetaId else { return }
+            }
+            store.enqueueDeferredCatalogRows(
+                aroundSectionID: targetSectionId,
+                orderedSectionIDs: visibleSections.map(\.id)
+            )
 
             if hasFolderPending {
                 guard let folder = focusWork.pendingFocusedFolder,
                       folder.id == targetFolderId,
-                      let targetSectionId,
                       focusWork.pendingSectionId == targetSectionId else { return }
                 // The section is part of the hero state: Continue Watching can
                 // change the episode line and description for the same title.
@@ -10203,7 +10969,6 @@ struct TVHomeView: View {
 
             guard let pendingMeta = focusWork.pendingFocusedMeta,
                   pendingMeta.id == targetMetaId,
-                  let targetSectionId,
                   focusWork.pendingSectionId == targetSectionId else { return }
 
             let settledMeta = collectionHome?.preparedHero(for: pendingMeta) ?? pendingMeta
@@ -10405,19 +11170,21 @@ struct TVHomeView: View {
                 !store.sections[sectionIndex].pendingItems.isEmpty
                 || (store.sections[sectionIndex].contentType != nil && store.sections[sectionIndex].catalogId != nil)
             store.sections[sectionIndex].isLoadingMore = true
-            Task { @MainActor in
-                defer {
-                    if let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) {
-                        store.sections[latestIndex].isLoadingMore = false
-                    }
-                }
+            Task.detached {
                 let enrichedBatch = await TmdbDetailsService.localizedMetadata(for: batch)
-                guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else {
-                    return
-                }
                 let enrichedById = Dictionary(TVHomeCardIdentity.uniqueTitles(enrichedBatch).map { ($0.homeTitleIdentity, $0) }, uniquingKeysWith: { first, _ in first })
-                store.sections[latestIndex].items = store.sections[latestIndex].items.map { item in
-                    enrichedById[item.homeTitleIdentity] ?? item
+                await MainActor.run {
+                    defer {
+                        if let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) {
+                            store.sections[latestIndex].isLoadingMore = false
+                        }
+                    }
+                    guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else {
+                        return
+                    }
+                    store.sections[latestIndex].items = store.sections[latestIndex].items.map { item in
+                        enrichedById[item.homeTitleIdentity] ?? item
+                    }
                 }
             }
             return
@@ -10425,9 +11192,10 @@ struct TVHomeView: View {
 
         store.sections[sectionIndex].isLoadingMore = true
 
-        Task { @MainActor in
+        let repo = repository
+        Task.detached {
             do {
-                let page = try await repository.browseCatalog(
+                let page = try await repo.browseCatalog(
                     addonId: section.addonId,
                     manifestURL: section.manifestURL,
                     contentType: contentType,
@@ -10436,21 +11204,26 @@ struct TVHomeView: View {
                     genre: section.catalogGenre
                 )
 
-                guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
-                let existingIds = Set(store.sections[latestIndex].items.map(\.homeTitleIdentity))
-                let newItems = page.items.filter { !existingIds.contains($0.homeTitleIdentity) }
+                await MainActor.run {
+                    guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
+                    let existingIds = Set(store.sections[latestIndex].items.map(\.homeTitleIdentity))
+                    let newItems = page.items.filter { !existingIds.contains($0.homeTitleIdentity) }
 
-                store.sections[latestIndex].items.append(contentsOf: newItems)
-                store.sections[latestIndex].nextSkip = page.nextSkip ?? (requestedSkip + page.items.count)
-                store.sections[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
-                store.sections[latestIndex].isLoadingMore = false
+                    store.sections[latestIndex].items.append(contentsOf: newItems)
+                    store.sections[latestIndex].nextSkip = page.nextSkip ?? (requestedSkip + page.items.count)
+                    store.sections[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
+                    store.sections[latestIndex].isLoadingMore = false
+                }
             } catch {
-                guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
-                store.sections[latestIndex].isLoadingMore = false
+                await MainActor.run {
+                    guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
+                    store.sections[latestIndex].isLoadingMore = false
+                }
             }
         }
     }
 
+    @MainActor
     private func checkAndTriggerAutoRefresh() {
         guard isActive && !isFullScreenOverlayPresented else { return }
         if let collectionHome, collectionHome.requiresReload {
@@ -10480,13 +11253,31 @@ struct TVHomeView: View {
         // the store counts it as loaded, and the automatic retry right after the load
         // gives up when the same rows fail twice. Try again on the next return to
         // Home, whatever the auto-refresh setting says.
-        let partialRetrySeconds: TimeInterval? = repository.homeCatalogLoadWasPartial
+        let partialRetrySeconds: TimeInterval? = collectionHome != nil && repository.homeCatalogLoadWasPartial
             ? Self.partialHomeRetryInterval
             : nil
         guard let threshold = [thresholdSeconds, partialRetrySeconds].compactMap({ $0 }).min() else { return }
         let elapsed = Date().timeIntervalSince(lastLoaded)
         if elapsed >= threshold {
             TVHomeDebugTrace.log("home.autoRefresh triggered elapsed=\(Int(elapsed))s threshold=\(Int(threshold))s")
+            if collectionHome == nil {
+                let key = TVHomeMainCatalogLoadKey(
+                    identity: contentIdentity,
+                    catalogInputSignature: repository.homeCatalogInputSignature,
+                    tmdbSettingsKey: tmdbHomeSettingsKey,
+                    isGridLayout: homeLayout == "Grid View"
+                )
+                guard store.isLoaded(for: key), !store.isLoading(for: contentIdentity) else { return }
+                var protectedSectionIDs = Set<String>()
+                if let focusedSectionId { protectedSectionIDs.insert(focusedSectionId) }
+                protectedSectionIDs.formUnion(
+                    store.sections
+                        .filter { rowScrollStore.index(for: $0.id) > 0 }
+                        .map(\.id)
+                )
+                store.refreshLoadedMainCatalogRows(for: key, protectedSectionIDs: protectedSectionIDs)
+                return
+            }
             homeReloadTask?.cancel()
             let identity = contentIdentity
             homeReloadTask = Task { @MainActor in
@@ -10631,6 +11422,9 @@ struct TVHomeView: View {
             guard isActive, returnFocusAnimationGeneration == generation else { return }
             TVHomeDebugTrace.log("home.suppressReturnFocusAnimations released gen=\(generation)")
             suppressReturnFocusAnimations = false
+            if pendingInitialFocusCardKey != nil {
+                pendingInitialFocusCardKey = nil
+            }
 
             // Switching tabs leaves `focusedCardID` intact, so coming back
             // from Settings does not emit PosterCard's normal onFocus callback.
@@ -10652,6 +11446,7 @@ struct TVHomeView: View {
         if delta > 0 && delta <= 0.28 {
             if !isFastScrolling {
                 isFastScrolling = true
+                store.suspendMainHomePublicationForFastScrolling = true
                 TVHomeDebugTrace.log("⚡️ [FAST_SCROLL_ENTER] delta=\(deltaMs)ms -> isFastScrolling=true")
             }
         }
@@ -10662,6 +11457,7 @@ struct TVHomeView: View {
             guard !Task.isCancelled else { return }
             TVHomeDebugTrace.log("🏁 [FAST_SCROLL_SETTLE] 180ms rest -> isFastScrolling=false")
             self.isFastScrolling = false
+            self.store.suspendMainHomePublicationForFastScrolling = false
         }
     }
 
@@ -10695,10 +11491,16 @@ struct TVHomeView: View {
     /// Publish Continue Watching and derived lookups together, outside body.
     /// The Top Shelf's Continue Watching in the order Home shows it.
     private func writeDisplayedContinueWatchingToTopShelf() {
-        ContinueWatchingStore.writeTopShelfFeed(from: continueWatching + upcomingItems)
+        TVHomeDebugTrace.measure("home.topShelf.write") {
+            ContinueWatchingStore.writeTopShelfFeed(from: continueWatching + upcomingItems)
+        }
     }
 
     private func setContinueWatching(_ sourceItems: [ContinueWatchingItem]) {
+#if NUVIO_SIDEBAR_WATCHDOG
+        let operation = TVHomeDebugTrace.beginHomeOperation("home.cw.apply")
+        defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
         // Titles in progress on Plex join the row; see PlexContinueWatchingMerge.
         let rawItems = PlexContinueWatchingMerge.merged(into: sourceItems, displayable: shouldDisplayContinueWatchingItem)
         refreshContinueWatchingOrigins(rawItems)
@@ -10771,6 +11573,10 @@ struct TVHomeView: View {
         refreshCompletedLedgerEvidence: Bool = false,
         force: Bool = false
     ) {
+#if NUVIO_SIDEBAR_WATCHDOG
+        let operation = TVHomeDebugTrace.beginHomeOperation("home.cw.spoilerEligibility")
+        defer { TVHomeDebugTrace.endHomeOperation(operation) }
+#endif
         var ledgerEvidenceChanged = false
         if refreshCompletedLedgerEvidence || (revealNextEpisodeSpoilers && !hasCachedCompletedLedgerEvidence) {
             let latestEvidence = EpisodeSpoilerPolicy.completedLedgerEpisodeKeysByContentID()
@@ -10987,12 +11793,16 @@ struct TVHomeView: View {
 
         if usesRemoteProgress {
             if let displayed = displayedProgressSource, displayed != source {
-                ContinueWatchingStore.writeTopShelfFeed(from: [])
+                TVHomeDebugTrace.measure("home.topShelf.write") {
+                    ContinueWatchingStore.writeTopShelfFeed(from: [])
+                }
             }
             refreshContinueWatching()
         }
         guard usesRemoteProgress else {
-            ContinueWatchingStore.writeTopShelfFeed()
+            TVHomeDebugTrace.measure("home.topShelf.write") {
+                ContinueWatchingStore.writeTopShelfFeed()
+            }
             // The ledger this just read is only as fresh as the last account
             // pull. Ask for a new one; it lands via the store's change
             // notification, which already refreshes the row.
@@ -11002,7 +11812,9 @@ struct TVHomeView: View {
             }
             lastAccountRefreshRequestedAt = now
             print("[ContinueWatching][Home] refreshContinueWatchingFromSelectedSource: triggering account refresh for local ledger")
-            onRequestAccountRefresh(false)
+            TVHomeDebugTrace.measure("home.account.refresh.dispatch") {
+                onRequestAccountRefresh(false)
+            }
             return
         }
 
@@ -11060,7 +11872,9 @@ struct TVHomeView: View {
         }
         displayedProgressSource = source
         RemoteContinueWatchingRowCache.save(visibleItems, profileId: profileID, source: source.rawValue)
-        ContinueWatchingStore.writeTopShelfFeed(from: visibleItems)
+        TVHomeDebugTrace.measure("home.topShelf.write") {
+            ContinueWatchingStore.writeTopShelfFeed(from: visibleItems)
+        }
 
         // Continue Watching is visible now. Other providers own their own
         // watched snapshots; Trakt is refreshed independently above so its
@@ -11166,7 +11980,9 @@ struct TVHomeView: View {
     }
 
     private func refreshWatchedTitles() {
-        watchedTitleKeys = WatchedStore.visibleWholeTitleIdentityKeys()
+        TVHomeDebugTrace.measure("home.watched.snapshot") {
+            watchedTitleKeys = WatchedStore.visibleWholeTitleIdentityKeys()
+        }
     }
 
     @MainActor
@@ -11338,7 +12154,7 @@ private struct JellyfinHomeLibraryKey: Hashable {
     let libraryID: String
 }
 
-struct TVHomeSection: Identifiable {
+struct TVHomeSection: Identifiable, Sendable {
     static let continueWatchingId = "continue_watching"
     static let upcomingId = "upcoming"
     /// The Today row: the calendar's titles coming out today.
@@ -11358,8 +12174,13 @@ struct TVHomeSection: Identifiable {
 
     let id: String
     let title: String
+    private var _items: [NuvioMeta]
     var items: [NuvioMeta] {
-        didSet { items = TVHomeCardIdentity.uniqueTitles(items) }
+        get { _items }
+        set { _items = TVHomeCardIdentity.uniqueTitles(newValue) }
+    }
+    mutating func setPreFilteredUniqueItems(_ unique: [NuvioMeta]) {
+        _items = unique
     }
     var contentType: String? = nil
     var catalogId: String? = nil
@@ -11385,8 +12206,10 @@ struct TVHomeSection: Identifiable {
     /// Folder cards for a collection row (emoji / cover tiles). When non-empty,
     /// Home renders `TVCollectionFolderRow` with the same paging rhythm as
     /// catalog rows; catalogs stay grouped inside folders.
-    var collectionFolders: [TVCollectionFolderItem] = [] {
-        didSet { collectionFolders = TVHomeCardIdentity.uniqueFolders(collectionFolders) }
+    private var _collectionFolders: [TVCollectionFolderItem] = []
+    var collectionFolders: [TVCollectionFolderItem] {
+        get { _collectionFolders }
+        set { _collectionFolders = TVHomeCardIdentity.uniqueFolders(newValue) }
     }
 
     var tileShape: CollectionTileShape {
@@ -11409,7 +12232,7 @@ struct TVHomeSection: Identifiable {
     ) {
         self.id = id
         self.title = title
-        self.items = TVHomeCardIdentity.uniqueTitles(items)
+        self._items = TVHomeCardIdentity.uniqueTitles(items)
         self.contentType = contentType
         self.catalogId = catalogId
         self.addonId = addonId
@@ -11424,7 +12247,7 @@ struct TVHomeSection: Identifiable {
         self.isLoadingMore = isLoadingMore
         self.isLoadingPlaceholder = isLoadingPlaceholder
         self.isPinnedCollection = isPinnedCollection
-        self.collectionFolders = TVHomeCardIdentity.uniqueFolders(collectionFolders)
+        self._collectionFolders = TVHomeCardIdentity.uniqueFolders(collectionFolders)
     }
 
     var isCollectionRow: Bool { id.hasPrefix(Self.collectionIdPrefix) }
@@ -12957,6 +13780,13 @@ struct TVHomeContentIdentity: Hashable {
     var collectionScope: String? = nil
 }
 
+struct TVHomeMainCatalogLoadKey: Hashable {
+    let identity: TVHomeContentIdentity
+    let catalogInputSignature: String
+    let tmdbSettingsKey: String
+    let isGridLayout: Bool
+}
+
 enum TVProfileGateReadiness: Equatable {
     case waiting(hasFocusableContent: Bool, targetSignature: String?)
     case ready(targetSignature: String, storeLoaded: Bool)
@@ -12969,12 +13799,48 @@ enum TVProfileGateReadiness: Equatable {
 /// lets returning from a card restore the cached catalog + the focused card
 /// instead of reloading and jumping back to the top.
 final class TVHomeStore: ObservableObject {
+    @MainActor private static var unimprovedHomeFailures: Set<String> = []
+    private static let maximumConcurrentDeferredCatalogRequests = 3
+    private static let initialDeferredCatalogRequestCount = 4
+
+    private struct DeferredCatalogRequest: Sendable {
+        let section: TVHomeSection
+        let host: String
+        let token: UUID
+        let purpose: DeferredCatalogRequestPurpose
+    }
+
+    private enum DeferredCatalogRequestPurpose: Sendable {
+        case viewport
+        case automaticRefresh(generation: UInt)
+    }
+
+    private enum DeferredCatalogPreparationResult: Sendable {
+        case success(page: CatalogPage, section: TVHomeSection)
+        case empty
+        case failure
+    }
+
+    @MainActor private var pendingDeferredPublicationTask: Task<Void, Never>?
+
+    let mainCatalogRepository: CinemetaCatalogRepository
+
     @Published var sections: [TVHomeSection] = [] {
         didSet { sectionsRevision &+= 1 }
     }
     @Published var sectionsRevision: UInt = 0
     @Published var hero: NuvioMeta?
     @Published var lastLoadedAt: Date?
+    @Published private(set) var mainCatalogIsLoading = false
+    @Published private(set) var mainCatalogErrorMessage: String?
+    @Published private(set) var mainLoadingPlaceholders: [TVHomeSection] = []
+    @Published private(set) var mainHomePublicationRevision: UInt = 0
+    private(set) var mainHomePublicationNeedsFocusSeed = false
+    /// Input signature of the last successfully published main Home tree.
+    private(set) var loadedCatalogInputSignature: String?
+    @Published private(set) var manualCatalogRefreshGeneration: UInt = 0
+    private(set) var manualCatalogRefreshProfileID: String?
+    private(set) var handledManualCatalogRefreshGeneration: UInt = 0
     /// True when any last-known-good tree is available. Cache reuse additionally
     /// requires `loadedContentIdentity` to match the requested profile/revision.
     @Published private(set) var hasLoaded = false
@@ -12983,13 +13849,65 @@ final class TVHomeStore: ObservableObject {
     private var loadedContentIdentity: TVHomeContentIdentity?
     private var loadingContentIdentity: TVHomeContentIdentity?
     private var loadGeneration: UInt = 0
+    private var activeMainCatalogKey: TVHomeMainCatalogLoadKey?
+    private var currentMainCatalogKey: TVHomeMainCatalogLoadKey?
+    private var activeMainCatalogUsesEagerLoading = false
+    private var currentMainCatalogUsesEagerLoading = false
+    private var completedMainCatalogKey: TVHomeMainCatalogLoadKey?
+    private var activeMainCatalogTask: Task<Void, Never>?
+    private var mainCatalogRequestGeneration: UInt = 0
+    private var mainCatalogSections: [TVHomeSection] = []
+    private var mainCollectionSections: [TVHomeSection] = []
+    private var mainCatalogWasColdStart = false
+    private var deferredAddonRowsByID: [String: TVHomeSection] = [:]
+    private var deferredAddonRowOrder: [String] = []
+    private var deferredReadyRowsByID: [String: TVHomeSection] = [:]
+    private var deferredFailedIDs: Set<String> = []
+    private var deferredQueue: [String] = []
+    private var queuedDeferredIDs: Set<String> = []
+    private var initialDeferredIDs: Set<String> = []
+    private var automaticRefreshQueue: [String] = []
+    private var automaticRefreshQueuedIDs: Set<String> = []
+    private var automaticRefreshSectionsByID: [String: TVHomeSection] = [:]
+    private var automaticRefreshPendingIDs: Set<String> = []
+    private var automaticRefreshKey: TVHomeMainCatalogLoadKey?
+    private var automaticRefreshProtectedIDs: Set<String> = []
+    private var automaticRefreshGeneration: UInt = 0
+    private var automaticRefreshDidPublish = false
+    private var deferredViewportWantedOrder: [String] = []
+    private var deferredViewportWantedIDs: Set<String> = []
+    private var activeDeferredRequestsByID: [String: DeferredCatalogRequest] = [:]
+    private var activeDeferredTasksByID: [String: Task<Void, Never>] = [:]
+    private var activeDeferredHosts: [String: UUID] = [:]
+    private var deferredDiscoveryComplete = false
+    private var hasSeenViewportCatalogs = false
+    /// Fast scrolling only gates publication; it is deliberately not observable.
+    var suspendMainHomePublicationForFastScrolling = false
+
+    init(mainCatalogRepository: CinemetaCatalogRepository = CinemetaCatalogRepository()) {
+        self.mainCatalogRepository = mainCatalogRepository
+    }
 
     func isLoaded(for identity: TVHomeContentIdentity) -> Bool {
         hasLoaded && loadedContentIdentity == identity
     }
 
     func isLoading(for identity: TVHomeContentIdentity) -> Bool {
-        loadingContentIdentity == identity
+        loadingContentIdentity == identity || (mainCatalogIsLoading && activeMainCatalogKey?.identity == identity)
+    }
+
+    func isLoaded(for key: TVHomeMainCatalogLoadKey) -> Bool {
+        isLoaded(for: key.identity) && completedMainCatalogKey == key
+    }
+
+    func requestManualCatalogRefresh(profileID: String?) {
+        manualCatalogRefreshProfileID = profileID
+        manualCatalogRefreshGeneration &+= 1
+    }
+
+    func markManualCatalogRefreshHandled(_ generation: UInt) {
+        guard generation <= manualCatalogRefreshGeneration else { return }
+        handledManualCatalogRefreshGeneration = max(handledManualCatalogRefreshGeneration, generation)
     }
 
     @discardableResult
@@ -13001,6 +13919,10 @@ final class TVHomeStore: ObservableObject {
             hero = nil
             lastFocusedCardID = nil
             loadedContentIdentity = nil
+            loadedCatalogInputSignature = nil
+            completedMainCatalogKey = nil
+            mainCatalogErrorMessage = nil
+            mainLoadingPlaceholders = []
         }
 
         loadGeneration &+= 1
@@ -13018,13 +13940,15 @@ final class TVHomeStore: ObservableObject {
 
     func finishLoad(
         _ generation: UInt,
-        for identity: TVHomeContentIdentity
+        for identity: TVHomeContentIdentity,
+        catalogInputSignature: String? = nil
     ) {
         guard isCurrentLoad(generation, for: identity) else { return }
         loadedContentIdentity = identity
         loadingContentIdentity = nil
         hasLoaded = true
         lastLoadedAt = Date()
+        loadedCatalogInputSignature = identity.collectionScope == nil ? catalogInputSignature : nil
         // Collection tabs reuse this store; only the main Home feeds the shelf.
         if identity.collectionScope == nil {
             writeTopShelfFeed()
@@ -13073,6 +13997,1015 @@ final class TVHomeStore: ObservableObject {
     /// Settings offers this many Home catalogs for the shelf.
     static let topShelfCatalogRowLimit = 30
 
+    @MainActor
+    func loadMainCatalog(
+        for key: TVHomeMainCatalogLoadKey,
+        forceReload: Bool,
+        automaticallyRetry: Bool,
+        forceEager: Bool = false
+    ) async {
+        guard !Task.isCancelled else { return }
+        let useEagerLoading = key.isGridLayout || forceEager
+        if let task = activeMainCatalogTask, activeMainCatalogKey == key {
+            if !useEagerLoading || activeMainCatalogUsesEagerLoading {
+                await task.value
+                return
+            }
+        }
+        if !forceReload, isLoaded(for: key) { return }
+
+        activeMainCatalogTask?.cancel()
+        cancelDeferredCatalogWork(clearState: true)
+        mainCatalogRequestGeneration &+= 1
+        let requestGeneration = mainCatalogRequestGeneration
+        activeMainCatalogKey = key
+        currentMainCatalogKey = key
+        activeMainCatalogUsesEagerLoading = useEagerLoading
+        currentMainCatalogUsesEagerLoading = useEagerLoading
+        mainCatalogSections = []
+        mainCollectionSections = []
+        mainCatalogWasColdStart = false
+        mainCatalogIsLoading = true
+        mainCatalogErrorMessage = nil
+
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                if self.mainCatalogRequestGeneration == requestGeneration,
+                   self.activeMainCatalogKey == key {
+                    self.activeMainCatalogTask = nil
+                    self.activeMainCatalogKey = nil
+                    self.activeMainCatalogUsesEagerLoading = false
+                    self.mainCatalogIsLoading = false
+                }
+            }
+            await self.runMainCatalogLoad(
+                key: key,
+                requestGeneration: requestGeneration,
+                automaticallyRetry: automaticallyRetry,
+                useEagerLoading: useEagerLoading
+            )
+        }
+        activeMainCatalogTask = task
+        await task.value
+    }
+
+    @MainActor
+    @discardableResult
+    func refreshLoadedMainCatalogRows(
+        for key: TVHomeMainCatalogLoadKey,
+        protectedSectionIDs: Set<String>
+    ) -> Bool {
+        guard !mainCatalogIsLoading,
+              currentMainCatalogKey == key,
+              isLoaded(for: key),
+              automaticRefreshKey != key else { return false }
+
+        let candidates = sections.filter { section in
+            guard Self.isNetworkCatalogPosition(section),
+                  !section.isLoadingPlaceholder,
+                  !section.items.isEmpty,
+                  !section.isLoadingMore,
+                  !protectedSectionIDs.contains(section.id),
+                  activeDeferredRequestsByID[section.id] == nil,
+                  !queuedDeferredIDs.contains(section.id),
+                  !automaticRefreshQueuedIDs.contains(section.id) else { return false }
+            if let lastFocusedCardID,
+               lastFocusedCardID.hasPrefix(section.id + "\u{1}") { return false }
+            return true
+        }
+        guard !candidates.isEmpty else { return false }
+
+        automaticRefreshGeneration &+= 1
+        automaticRefreshKey = key
+        automaticRefreshProtectedIDs = protectedSectionIDs
+        automaticRefreshDidPublish = false
+        var seen = Set<String>()
+        let uniqueCandidates = candidates.filter { seen.insert($0.id).inserted }
+        automaticRefreshPendingIDs = Set(uniqueCandidates.map(\.id))
+        automaticRefreshQueue = uniqueCandidates.map(\.id)
+        automaticRefreshQueuedIDs = Set(uniqueCandidates.map(\.id))
+        automaticRefreshSectionsByID = Dictionary(
+            uniqueKeysWithValues: uniqueCandidates.map { ($0.id, $0) }
+        )
+        // Advance the TTL from dispatch so a slow provider failure is not
+        // retried again on every return to Home.
+        lastLoadedAt = Date()
+        startDeferredCatalogWorkers()
+        return true
+    }
+
+    @MainActor
+    private func runMainCatalogLoad(
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt,
+        automaticallyRetry: Bool,
+        useEagerLoading: Bool
+    ) async {
+        let maximumAttempts = automaticallyRetry ? 3 : 1
+        for attempt in 0..<maximumAttempts {
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration) else { return }
+            await performMainCatalogAttempt(
+                key: key,
+                requestGeneration: requestGeneration,
+                useEagerLoading: useEagerLoading
+            )
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration) else { return }
+
+            guard isLoaded(for: key) else {
+                guard attempt < maximumAttempts - 1 else { return }
+                do {
+                    try await Task.sleep(nanoseconds: UInt64(attempt + 1) * 1_000_000_000)
+                } catch {
+                    return
+                }
+                continue
+            }
+
+            guard automaticallyRetry, mainCatalogRepository.homeCatalogLoadWasPartial else { return }
+            let failure = mainCatalogRepository.homeCatalogFailureSignature
+            if let failure, Self.unimprovedHomeFailures.contains(failure) { return }
+            do {
+                try await Task.sleep(nanoseconds: 2_000_000_000)
+            } catch {
+                return
+            }
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration) else { return }
+            await performMainCatalogAttempt(
+                key: key,
+                requestGeneration: requestGeneration,
+                useEagerLoading: useEagerLoading
+            )
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration) else { return }
+            if let failure, mainCatalogRepository.homeCatalogFailureSignature == failure {
+                Self.unimprovedHomeFailures.insert(failure)
+            }
+            return
+        }
+    }
+
+    @MainActor
+    private func performMainCatalogAttempt(
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt,
+        useEagerLoading: Bool
+    ) async {
+        let identity = key.identity
+        let generation = beginLoad(for: identity)
+        mainCatalogIsLoading = true
+        mainCatalogErrorMessage = nil
+        deferredDiscoveryComplete = false
+        hasSeenViewportCatalogs = false
+
+        let collectionSections = await Task.detached {
+            Self.loadCollectionSections()
+        }.value
+        guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+              isCurrentLoad(generation, for: identity) else { return }
+
+        let homeVisibility = TVHomeCatalogOrder.homeVisibilityContext()
+        let previouslyLoadedCatalogSections = sections.filter {
+            !$0.isCollectionRow && !$0.isLoadingPlaceholder
+                && Self.isMainCatalogSectionFromEnabledSource($0, context: homeVisibility)
+        }
+        let isColdStart = previouslyLoadedCatalogSections.isEmpty
+        mainCatalogSections = previouslyLoadedCatalogSections
+        mainCollectionSections = collectionSections
+        mainCatalogWasColdStart = isColdStart
+        mainLoadingPlaceholders = Self.homeSkeletonSections(
+            excluding: Set(previouslyLoadedCatalogSections.map(\.id))
+                .union(collectionSections.map(\.id))
+        )
+        publishMainHomeSections(
+            catalogSections: previouslyLoadedCatalogSections,
+            collectionSections: collectionSections,
+            resetFocusIfEmpty: isColdStart
+        )
+
+        var receivedCatalogUpdate = false
+        var receivedCatalogPublication = false
+        do {
+            var latestCatalogSections: [TVHomeSection] = []
+            if useEagerLoading {
+                for try await catalogs in mainCatalogRepository.homeCatalogsProgressively() {
+                    try Task.checkCancellation()
+                    guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                          isCurrentLoad(generation, for: identity) else { return }
+                    receivedCatalogPublication = true
+                    let catalogSections = await TVHomeView.makeHomeCatalogSections(
+                        from: catalogs,
+                        repository: mainCatalogRepository
+                    )
+                    try Task.checkCancellation()
+                    guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                          isCurrentLoad(generation, for: identity) else { return }
+                    latestCatalogSections = catalogSections
+                    receivedCatalogUpdate = receivedCatalogUpdate || !catalogSections.isEmpty
+                    guard !catalogSections.isEmpty else { continue }
+                    let loadedIDs = Set(catalogSections.map(\.id))
+                    let retainedPrevious = previouslyLoadedCatalogSections.filter { !loadedIDs.contains($0.id) }
+                    mainCatalogSections = catalogSections + retainedPrevious
+                    while suspendMainHomePublicationForFastScrolling {
+                        try await Task.sleep(nanoseconds: 80_000_000)
+                        try Task.checkCancellation()
+                        guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                              isCurrentLoad(generation, for: identity) else { return }
+                    }
+                    publishMainHomeSections(
+                        catalogSections: mainCatalogSections,
+                        collectionSections: collectionSections,
+                        resetFocusIfEmpty: isColdStart
+                    )
+                }
+            } else {
+                for try await update in mainCatalogRepository.homeCatalogsForViewport() {
+                    try Task.checkCancellation()
+                    guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                          isCurrentLoad(generation, for: identity) else { return }
+                    receivedCatalogPublication = true
+                    switch update {
+                    case .catalogs(let catalogs):
+                        hasSeenViewportCatalogs = true
+                        let catalogSections = await TVHomeView.makeHomeCatalogSections(
+                            from: catalogs,
+                            repository: mainCatalogRepository
+                        )
+                        try Task.checkCancellation()
+                        guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                              isCurrentLoad(generation, for: identity) else { return }
+                        latestCatalogSections = catalogSections
+                        receivedCatalogUpdate = receivedCatalogUpdate || !catalogSections.isEmpty
+                        let loadedIDs = Set(catalogSections.map(\.id))
+                        let retainedPrevious = previouslyLoadedCatalogSections.filter { !loadedIDs.contains($0.id) }
+                        mainCatalogSections = catalogSections + retainedPrevious
+                    case .addonRows(let rows):
+                        receivedCatalogUpdate = receivedCatalogUpdate || !rows.isEmpty
+                        acceptDeferredAddonRows(rows)
+                    }
+                    guard await waitForMainCatalogPublication(
+                        key: key,
+                        requestGeneration: requestGeneration,
+                        loadGeneration: generation
+                    ) else { return }
+                    publishCurrentMainHomeSections()
+                    enqueueInitialDeferredRowsFromPublishedOrder()
+                }
+                try Task.checkCancellation()
+                guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                      isCurrentLoad(generation, for: identity) else { return }
+                deferredDiscoveryComplete = true
+                mainLoadingPlaceholders = []
+                pruneUndiscoveredSnapshotPlaceholders()
+                publishCurrentMainHomeSections()
+                enqueueInitialDeferredRowsFromPublishedOrder()
+            }
+
+            guard receivedCatalogPublication || !collectionSections.isEmpty else {
+                throw URLError(.cannotLoadFromNetwork)
+            }
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                  isCurrentLoad(generation, for: identity) else { return }
+            while suspendMainHomePublicationForFastScrolling {
+                try await Task.sleep(nanoseconds: 80_000_000)
+                try Task.checkCancellation()
+                guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                      isCurrentLoad(generation, for: identity) else { return }
+            }
+
+            mainLoadingPlaceholders = []
+            if useEagerLoading {
+                mainCatalogSections = receivedCatalogPublication ? latestCatalogSections : previouslyLoadedCatalogSections
+                publishMainHomeSections(
+                    catalogSections: mainCatalogSections,
+                    collectionSections: collectionSections,
+                    resetFocusIfEmpty: isColdStart
+                )
+            } else {
+                publishCurrentMainHomeSections()
+            }
+            if AniListSettings.isEnabled {
+                AniListDiagnostics.noteHomeOnScreen(rows: sections.filter {
+                    $0.addonId == AniListService.addonID && !$0.isLoadingPlaceholder && !$0.items.isEmpty
+                }.count)
+            }
+            finishLoad(generation, for: identity, catalogInputSignature: key.catalogInputSignature)
+            completedMainCatalogKey = key
+            mainCatalogErrorMessage = nil
+            mainCatalogIsLoading = false
+        } catch is CancellationError {
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                  isCurrentLoad(generation, for: identity) else { return }
+            cancelLoad(generation, for: identity)
+            clearMainLoadingPlaceholders()
+            mainCatalogIsLoading = false
+        } catch {
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                  isCurrentLoad(generation, for: identity) else { return }
+            clearMainLoadingPlaceholders()
+            mainCatalogErrorMessage = error.localizedDescription
+            if receivedCatalogUpdate || !collectionSections.isEmpty {
+                finishLoad(generation, for: identity, catalogInputSignature: key.catalogInputSignature)
+                completedMainCatalogKey = key
+            } else {
+                cancelLoad(generation, for: identity)
+            }
+            mainCatalogIsLoading = false
+        }
+    }
+
+    @MainActor
+    func prioritizeDeferredCatalogRow(sectionID: String) {
+        guard !currentMainCatalogUsesEagerLoading,
+              currentMainCatalogKey?.identity.collectionScope == nil else { return }
+        rememberDeferredViewportDemand([sectionID], prioritizeFirst: true)
+        enqueueDeferredCatalogRows([sectionID], prioritizeFirst: true)
+    }
+
+    @MainActor
+    func enqueueDeferredCatalogRows(aroundSectionID sectionID: String, orderedSectionIDs: [String]) {
+        guard !currentMainCatalogUsesEagerLoading,
+              currentMainCatalogKey?.identity.collectionScope == nil,
+              let index = orderedSectionIDs.firstIndex(of: sectionID) else { return }
+
+        var candidates = [sectionID]
+        for offset in 1...2 {
+            let nextIndex = index + offset
+            if orderedSectionIDs.indices.contains(nextIndex) {
+                candidates.append(orderedSectionIDs[nextIndex])
+            }
+        }
+        let previousIndex = index - 1
+        if orderedSectionIDs.indices.contains(previousIndex) {
+            candidates.append(orderedSectionIDs[previousIndex])
+        }
+        rememberDeferredViewportDemand(candidates, prioritizeFirst: true)
+        enqueueDeferredCatalogRows(candidates, prioritizeFirst: true)
+    }
+
+    @MainActor
+    private func acceptDeferredAddonRows(_ rows: [TVHomeSection]) {
+        for row in rows where Self.isEligibleDeferredCatalogRow(row) {
+            guard !deferredFailedIDs.contains(row.id) else { continue }
+            if deferredAddonRowsByID[row.id] == nil {
+                deferredAddonRowOrder.append(row.id)
+            }
+            deferredAddonRowsByID[row.id] = row
+        }
+        let pendingViewportRows = deferredViewportWantedOrder.filter { deferredAddonRowsByID[$0] != nil }
+        enqueueDeferredCatalogRows(pendingViewportRows, prioritizeFirst: true)
+    }
+
+    @MainActor
+    private func rememberDeferredViewportDemand(_ ids: [String], prioritizeFirst: Bool) {
+        let newIDs = ids.filter { deferredViewportWantedIDs.insert($0).inserted }
+        guard !newIDs.isEmpty else { return }
+        if prioritizeFirst {
+            deferredViewportWantedOrder.insert(contentsOf: newIDs, at: 0)
+        } else {
+            deferredViewportWantedOrder.append(contentsOf: newIDs)
+        }
+    }
+
+    @MainActor
+    private func enqueueInitialDeferredRowsFromPublishedOrder() {
+        guard hasSeenViewportCatalogs || deferredDiscoveryComplete else { return }
+        var initialRows: [String] = []
+        var eligiblePosition = 0
+        for section in sections where Self.isNetworkCatalogPosition(section) {
+            guard eligiblePosition < Self.initialDeferredCatalogRequestCount else { break }
+            eligiblePosition += 1
+            guard deferredAddonRowsByID[section.id] != nil,
+                  !initialDeferredIDs.contains(section.id) else { continue }
+            initialDeferredIDs.insert(section.id)
+            initialRows.append(section.id)
+        }
+        enqueueDeferredCatalogRows(initialRows, prioritizeFirst: false)
+    }
+
+    @MainActor
+    private func enqueueDeferredCatalogRows(_ ids: [String], prioritizeFirst: Bool) {
+        guard !currentMainCatalogUsesEagerLoading else { return }
+        var candidates: [String] = []
+        for id in ids {
+            guard deferredAddonRowsByID[id] != nil,
+                  deferredReadyRowsByID[id] == nil,
+                  !deferredFailedIDs.contains(id),
+                  activeDeferredRequestsByID[id] == nil else { continue }
+            if queuedDeferredIDs.contains(id) {
+                if prioritizeFirst {
+                    deferredQueue.removeAll { $0 == id }
+                    deferredQueue.insert(id, at: 0)
+                }
+                continue
+            }
+            candidates.append(id)
+        }
+        guard !candidates.isEmpty else {
+            if prioritizeFirst { startDeferredCatalogWorkers() }
+            return
+        }
+        if prioritizeFirst {
+            deferredQueue.insert(contentsOf: candidates, at: 0)
+        } else {
+            deferredQueue.append(contentsOf: candidates)
+        }
+        queuedDeferredIDs.formUnion(candidates)
+        startDeferredCatalogWorkers()
+    }
+
+    private static func isNetworkCatalogPosition(_ section: TVHomeSection) -> Bool {
+        !section.isCollectionRow
+            && section.id != TVHomeSection.continueWatchingId
+            && section.id != TVHomeSection.upcomingId
+            && section.id != TVHomeSection.calendarTodayId
+            && section.contentType != nil
+            && section.catalogId != nil
+    }
+
+    @MainActor
+    private func startDeferredCatalogWorkers() {
+        guard let key = currentMainCatalogKey,
+              key.identity.collectionScope == nil else { return }
+
+        while activeDeferredRequestsByID.count < Self.maximumConcurrentDeferredCatalogRequests {
+            let viewportIndex = currentMainCatalogUsesEagerLoading ? nil : deferredQueue.firstIndex { id in
+                guard let section = deferredAddonRowsByID[id] else { return false }
+                return activeDeferredHosts[Self.deferredHost(for: section)] == nil
+            }
+            let queueIndex = viewportIndex ?? automaticRefreshQueue.firstIndex { id in
+                guard let section = automaticRefreshSectionsByID[id] else { return false }
+                return activeDeferredHosts[Self.deferredHost(for: section)] == nil
+            }
+            guard let queueIndex else { return }
+
+            let sectionID: String
+            let section: TVHomeSection
+            let purpose: DeferredCatalogRequestPurpose
+            if let viewportIndex {
+                sectionID = deferredQueue.remove(at: viewportIndex)
+                queuedDeferredIDs.remove(sectionID)
+                guard let viewportSection = deferredAddonRowsByID[sectionID] else { continue }
+                section = viewportSection
+                purpose = .viewport
+            } else {
+                sectionID = automaticRefreshQueue.remove(at: queueIndex)
+                automaticRefreshQueuedIDs.remove(sectionID)
+                guard let refreshSection = automaticRefreshSectionsByID[sectionID] else { continue }
+                section = refreshSection
+                purpose = .automaticRefresh(generation: automaticRefreshGeneration)
+            }
+            let host = Self.deferredHost(for: section)
+            let token = UUID()
+            let request = DeferredCatalogRequest(section: section, host: host, token: token, purpose: purpose)
+            let requestGeneration = mainCatalogRequestGeneration
+            activeDeferredRequestsByID[sectionID] = request
+            activeDeferredHosts[host] = token
+
+            let repo = mainCatalogRepository
+            let previous = mainCatalogSections.first(where: { $0.id == sectionID })
+                ?? sections.first(where: { $0.id == sectionID })
+            let previousPosterShape = section.posterShape
+                ?? previous?.posterShape
+                ?? previous.flatMap { $0.tileShape == .poster ? nil : $0.tileShape.rawValue }
+
+            let task = Task.detached { [weak self] in
+                let result = await Self.prepareDeferredCatalogRow(
+                    request: request,
+                    repository: repo,
+                    previousPosterShape: previousPosterShape
+                )
+                await self?.finishDeferredCatalogWorker(
+                    result: result,
+                    request: request,
+                    key: key,
+                    requestGeneration: requestGeneration,
+                    sectionID: sectionID,
+                    host: host,
+                    token: token
+                )
+            }
+            activeDeferredTasksByID[sectionID] = task
+        }
+    }
+
+    private static func prepareDeferredCatalogRow(
+        request: DeferredCatalogRequest,
+        repository: CatalogRepository,
+        previousPosterShape: String?
+    ) async -> DeferredCatalogPreparationResult {
+        let section = request.section
+        guard isNetworkCatalogPosition(section),
+              let contentType = section.contentType,
+              let catalogId = section.catalogId else { return .failure }
+        do {
+            let page = try await repository.browseCatalog(
+                addonId: section.addonId,
+                manifestURL: section.manifestURL,
+                contentType: contentType,
+                catalogId: catalogId,
+                skip: 0,
+                genre: section.catalogGenre
+            )
+            guard !page.items.isEmpty else {
+                return .empty
+            }
+            guard isEligibleDeferredCatalogRow(section) else { return .failure }
+            let posterShape = section.posterShape ?? previousPosterShape
+            let preparedSection = TVHomeSection(
+                id: section.id,
+                title: section.title,
+                items: page.items,
+                contentType: contentType,
+                catalogId: catalogId,
+                addonId: section.addonId,
+                addonName: section.addonName,
+                catalogGenre: section.catalogGenre,
+                manifestURL: section.manifestURL,
+                manifestShowInHome: section.manifestShowInHome,
+                posterShape: posterShape,
+                nextSkip: page.nextSkip ?? page.items.count,
+                hasMore: page.hasMore
+            )
+            return .success(page: page, section: preparedSection)
+        } catch {
+            return .failure
+        }
+    }
+
+    @MainActor
+    private func finishDeferredCatalogWorker(
+        result: DeferredCatalogPreparationResult,
+        request: DeferredCatalogRequest,
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt,
+        sectionID: String,
+        host: String,
+        token: UUID
+    ) async {
+        await applyDeferredCatalogResult(
+            result,
+            for: request,
+            key: key,
+            requestGeneration: requestGeneration
+        )
+        finishDeferredCatalogRequest(sectionID: sectionID, host: host, token: token)
+    }
+
+    @MainActor
+    private func applyDeferredCatalogResult(
+        _ result: DeferredCatalogPreparationResult,
+        for request: DeferredCatalogRequest,
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt
+    ) async {
+        guard isCurrentDeferredCatalogRequest(
+            key: key,
+            requestGeneration: requestGeneration,
+            purpose: request.purpose
+        ), activeDeferredRequestsByID[request.section.id]?.token == request.token else { return }
+
+        guard await waitForDeferredCatalogRequest(
+            request,
+            key: key,
+            requestGeneration: requestGeneration
+        ) else { return }
+
+        switch result {
+        case .empty, .failure:
+            switch request.purpose {
+            case .viewport:
+                failDeferredCatalogRow(request.section.id)
+            case .automaticRefresh:
+                break
+            }
+        case .success(let page, let preparedSection):
+            switch request.purpose {
+            case .viewport:
+                deferredReadyRowsByID[request.section.id] = preparedSection
+                mainLoadingPlaceholders.removeAll { $0.id == request.section.id }
+                let isImmediate = sections.allSatisfy(\.isLoadingPlaceholder) || deferredViewportWantedIDs.contains(request.section.id)
+                scheduleDeferredPublication(immediate: isImmediate)
+            case .automaticRefresh(let generation):
+                guard automaticRefreshKey == key, automaticRefreshGeneration == generation else { return }
+                if applyAutomaticRefreshPage(
+                    page,
+                    to: request.section,
+                    protectedSectionIDs: automaticRefreshProtectedIDs
+                ) {
+                    automaticRefreshDidPublish = true
+                    scheduleDeferredPublication(immediate: false)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func scheduleDeferredPublication(immediate: Bool = false) {
+        if immediate {
+            pendingDeferredPublicationTask?.cancel()
+            pendingDeferredPublicationTask = nil
+            publishCurrentMainHomeSections()
+            return
+        }
+        guard pendingDeferredPublicationTask == nil else { return }
+        pendingDeferredPublicationTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 60_000_000)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.pendingDeferredPublicationTask = nil
+            self.publishCurrentMainHomeSections()
+        }
+    }
+
+    @MainActor
+    private func waitForDeferredCatalogRequest(
+        _ request: DeferredCatalogRequest,
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt
+    ) async -> Bool {
+        while suspendMainHomePublicationForFastScrolling {
+            do {
+                try await Task.sleep(nanoseconds: 80_000_000)
+            } catch {
+                return false
+            }
+            guard isCurrentDeferredCatalogRequest(
+                key: key,
+                requestGeneration: requestGeneration,
+                purpose: request.purpose
+            ), activeDeferredRequestsByID[request.section.id]?.token == request.token else { return false }
+        }
+        return isCurrentDeferredCatalogRequest(
+            key: key,
+            requestGeneration: requestGeneration,
+            purpose: request.purpose
+        ) && activeDeferredRequestsByID[request.section.id]?.token == request.token
+    }
+
+    @MainActor
+    private func applyAutomaticRefreshPage(
+        _ page: CatalogPage,
+        to requestedSection: TVHomeSection,
+        protectedSectionIDs: Set<String>
+    ) -> Bool {
+        let sectionID = requestedSection.id
+        guard !protectedSectionIDs.contains(sectionID),
+              let index = sections.firstIndex(where: { $0.id == sectionID }) else { return false }
+        let current = sections[index]
+        guard !current.isLoadingPlaceholder,
+              !current.items.isEmpty,
+              !current.isLoadingMore,
+              !protectedSectionIDs.contains(sectionID) else { return false }
+        if let lastFocusedCardID,
+           lastFocusedCardID.hasPrefix(sectionID + "\u{1}") { return false }
+
+        let freshItems = TVHomeCardIdentity.uniqueTitles(page.items)
+        guard !freshItems.isEmpty else { return false }
+        let currentIDs = current.items.map(\.homeTitleIdentity)
+        let freshIDs = freshItems.map(\.homeTitleIdentity)
+        let requestIDs = requestedSection.items.map(\.homeTitleIdentity)
+        let changedSinceRequest = currentIDs != requestIDs || current.nextSkip != requestedSection.nextSkip
+        if freshIDs.count <= currentIDs.count,
+           Array(currentIDs.prefix(freshIDs.count)) == freshIDs {
+            return false
+        }
+
+        var refreshed = current
+        let existingShape = current.tileShape
+        let currentIDSet = Set(currentIDs)
+        if let oldHead = currentIDs.first,
+           let overlapIndex = freshIDs.firstIndex(of: oldHead),
+           overlapIndex > 0,
+           Array(freshIDs.dropFirst(overlapIndex)) == Array(currentIDs.prefix(freshIDs.count - overlapIndex)),
+           Set(freshIDs.prefix(overlapIndex)).isDisjoint(with: currentIDSet) {
+            let additions = Array(freshItems.prefix(overlapIndex))
+            refreshed.items = additions + current.items
+            refreshed.pendingItems = current.pendingItems
+            refreshed.nextSkip = (current.nextSkip ?? current.items.count) + additions.count
+            refreshed.hasMore = current.hasMore || page.hasMore
+        } else {
+            guard !changedSinceRequest else { return false }
+            refreshed.items = freshItems
+            refreshed.pendingItems = []
+            refreshed.nextSkip = page.nextSkip ?? freshItems.count
+            refreshed.hasMore = page.hasMore
+        }
+        if current.posterShape == nil, refreshed.tileShape != existingShape {
+            refreshed.posterShape = existingShape.rawValue
+        }
+
+        sections[index] = refreshed
+        if let baseIndex = mainCatalogSections.firstIndex(where: { $0.id == sectionID }) {
+            mainCatalogSections[baseIndex] = refreshed
+        }
+        if deferredReadyRowsByID[sectionID] != nil {
+            deferredReadyRowsByID[sectionID] = refreshed
+        }
+        return true
+    }
+
+    @MainActor
+    private func failDeferredCatalogRow(_ sectionID: String) {
+        deferredFailedIDs.insert(sectionID)
+        deferredAddonRowsByID.removeValue(forKey: sectionID)
+        deferredAddonRowOrder.removeAll { $0 == sectionID }
+        deferredQueue.removeAll { $0 == sectionID }
+        queuedDeferredIDs.remove(sectionID)
+        mainLoadingPlaceholders.removeAll { $0.id == sectionID }
+        publishCurrentMainHomeSections()
+    }
+
+    @MainActor
+    private func finishDeferredCatalogRequest(sectionID: String, host: String, token: UUID) {
+        guard let request = activeDeferredRequestsByID[sectionID],
+              request.token == token else { return }
+        activeDeferredRequestsByID[sectionID] = nil
+        activeDeferredTasksByID[sectionID] = nil
+        if activeDeferredHosts[host] == token { activeDeferredHosts[host] = nil }
+        if case .automaticRefresh(let generation) = request.purpose,
+           generation == automaticRefreshGeneration,
+           automaticRefreshKey == currentMainCatalogKey {
+            automaticRefreshPendingIDs.remove(sectionID)
+            automaticRefreshSectionsByID.removeValue(forKey: sectionID)
+            if automaticRefreshPendingIDs.isEmpty {
+                automaticRefreshKey = nil
+                automaticRefreshProtectedIDs = []
+                automaticRefreshQueue.removeAll()
+                automaticRefreshQueuedIDs.removeAll()
+                if automaticRefreshDidPublish { writeTopShelfFeed() }
+                automaticRefreshDidPublish = false
+            }
+        }
+        startDeferredCatalogWorkers()
+    }
+
+    @MainActor
+    private func isCurrentDeferredCatalogRequest(
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt,
+        purpose: DeferredCatalogRequestPurpose
+    ) -> Bool {
+        guard !Task.isCancelled,
+              currentMainCatalogKey == key,
+              mainCatalogRequestGeneration == requestGeneration else { return false }
+        switch purpose {
+        case .viewport:
+            return !currentMainCatalogUsesEagerLoading
+        case .automaticRefresh(let generation):
+            return automaticRefreshKey == key && automaticRefreshGeneration == generation
+        }
+    }
+
+    @MainActor
+    private func waitForMainCatalogPublication(
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt,
+        loadGeneration: UInt
+    ) async -> Bool {
+        while suspendMainHomePublicationForFastScrolling {
+            do {
+                try await Task.sleep(nanoseconds: 80_000_000)
+            } catch {
+                return false
+            }
+            guard isCurrentMainCatalogRequest(key: key, requestGeneration: requestGeneration),
+                  isCurrentLoad(loadGeneration, for: key.identity) else { return false }
+        }
+        return true
+    }
+
+    @MainActor
+    private func pruneUndiscoveredSnapshotPlaceholders() {
+        let resolvedIDs = Set(mainCatalogSections.map(\.id)).union(deferredAddonRowsByID.keys)
+        mainLoadingPlaceholders.removeAll { !resolvedIDs.contains($0.id) }
+    }
+
+    @MainActor
+    private func cancelDeferredCatalogWork(clearState: Bool) {
+        pendingDeferredPublicationTask?.cancel()
+        pendingDeferredPublicationTask = nil
+        activeDeferredTasksByID.values.forEach { $0.cancel() }
+        activeDeferredTasksByID.removeAll()
+        activeDeferredRequestsByID.removeAll()
+        activeDeferredHosts.removeAll()
+        deferredQueue.removeAll()
+        queuedDeferredIDs.removeAll()
+        automaticRefreshQueue.removeAll()
+        automaticRefreshQueuedIDs.removeAll()
+        automaticRefreshSectionsByID.removeAll()
+        automaticRefreshPendingIDs.removeAll()
+        automaticRefreshKey = nil
+        automaticRefreshProtectedIDs = []
+        automaticRefreshGeneration &+= 1
+        automaticRefreshDidPublish = false
+        if clearState {
+            deferredAddonRowsByID.removeAll()
+            deferredAddonRowOrder.removeAll()
+            deferredReadyRowsByID.removeAll()
+            deferredFailedIDs.removeAll()
+            initialDeferredIDs.removeAll()
+            deferredViewportWantedOrder.removeAll()
+            deferredViewportWantedIDs.removeAll()
+            deferredDiscoveryComplete = false
+            hasSeenViewportCatalogs = false
+        }
+    }
+
+    private static func isEligibleDeferredCatalogRow(_ section: TVHomeSection) -> Bool {
+        guard !section.isCollectionRow,
+              section.id != TVHomeSection.continueWatchingId,
+              section.id != TVHomeSection.upcomingId,
+              section.id != TVHomeSection.calendarTodayId,
+              let addonId = section.addonId, !addonId.isEmpty,
+              let manifestURL = section.manifestURL, URL(string: manifestURL)?.host != nil,
+              let contentType = section.contentType, !contentType.isEmpty,
+              let catalogId = section.catalogId, !catalogId.isEmpty else { return false }
+        return true
+    }
+
+    private static func deferredHost(for section: TVHomeSection) -> String {
+        if let manifestURL = section.manifestURL,
+           let host = URL(string: manifestURL)?.host?.lowercased(),
+           !host.isEmpty {
+            return host
+        }
+        return section.manifestURL?.lowercased()
+            ?? section.addonId?.lowercased()
+            ?? "builtin-catalogs"
+    }
+
+    @MainActor
+    private func isCurrentMainCatalogRequest(
+        key: TVHomeMainCatalogLoadKey,
+        requestGeneration: UInt
+    ) -> Bool {
+        !Task.isCancelled
+            && mainCatalogRequestGeneration == requestGeneration
+            && activeMainCatalogKey == key
+    }
+
+    @MainActor
+    private func clearMainLoadingPlaceholders() {
+        mainLoadingPlaceholders = []
+        if currentMainCatalogUsesEagerLoading {
+            guard sections.contains(where: \.isLoadingPlaceholder) else { return }
+            sections = sections.filter { !$0.isLoadingPlaceholder }
+            return
+        }
+        deferredDiscoveryComplete = true
+        pruneUndiscoveredSnapshotPlaceholders()
+        publishCurrentMainHomeSections()
+    }
+
+    @MainActor
+    private func publishMainHomeSections(
+        catalogSections: [TVHomeSection],
+        collectionSections: [TVHomeSection],
+        resetFocusIfEmpty: Bool
+    ) {
+        pendingDeferredPublicationTask?.cancel()
+        pendingDeferredPublicationTask = nil
+        let pinned = collectionSections.filter(\.isPinnedCollection)
+        let unpinned = collectionSections.filter { !$0.isPinnedCollection }
+        let aiSections = AIHomeCatalogStore.shared.sections()
+        let catalogRows = mergeDeferredRows(into: catalogSections)
+        let composed = aiSections + Self.orderedMainHomeSections(pinned + catalogRows + unpinned)
+        let published = Set(composed.map(\.id))
+        let skeletons = mainLoadingPlaceholders.filter { !published.contains($0.id) }
+        guard !composed.isEmpty || !skeletons.isEmpty else {
+            sections = []
+            hero = nil
+            mainHomePublicationNeedsFocusSeed = false
+            mainHomePublicationRevision &+= 1
+            return
+        }
+
+        let visible = skeletons.isEmpty ? composed : Self.orderedMainHomeSections(composed + skeletons)
+        let wasEmpty = sections.allSatisfy(\.isLoadingPlaceholder)
+        let unchanged = sections.count == visible.count && zip(sections, visible).allSatisfy { old, new in
+            old.id == new.id && old.items.count == new.items.count
+                && old.isLoadingPlaceholder == new.isLoadingPlaceholder
+                && zip(old.items, new.items).allSatisfy { $0.id == $1.id }
+                && old.collectionFolders.count == new.collectionFolders.count
+        }
+        if !unchanged {
+            sections = visible
+            TVHomeCatalogOrder.scheduleSnapshotWrite(composed)
+        }
+        if let newHero = composed.lazy.compactMap({ $0.items.first }).first, hero?.id != newHero.id {
+            hero = newHero
+        }
+        mainHomePublicationNeedsFocusSeed = wasEmpty && resetFocusIfEmpty
+        mainHomePublicationRevision &+= 1
+    }
+
+    @MainActor
+    private func publishCurrentMainHomeSections() {
+        publishMainHomeSections(
+            catalogSections: mainCatalogSections,
+            collectionSections: mainCollectionSections,
+            resetFocusIfEmpty: mainCatalogWasColdStart
+        )
+    }
+
+    private func mergeDeferredRows(into catalogSections: [TVHomeSection]) -> [TVHomeSection] {
+        var rows = catalogSections
+        for id in deferredAddonRowOrder {
+            guard let descriptor = deferredAddonRowsByID[id] else { continue }
+            let replacement = deferredReadyRowsByID[id] ?? descriptor
+            if let existingIndex = rows.firstIndex(where: { $0.id == id }) {
+                let existing = rows[existingIndex]
+                if let ready = deferredReadyRowsByID[id] {
+                    rows[existingIndex] = ready
+                } else if existing.items.isEmpty {
+                    rows[existingIndex] = descriptor
+                }
+            } else {
+                rows.append(replacement)
+            }
+        }
+        var seen = Set<String>()
+        return rows.filter { seen.insert($0.id).inserted }
+    }
+
+    private static func orderedMainHomeSections(_ sections: [TVHomeSection]) -> [TVHomeSection] {
+        TVHomeCatalogOrder.applyKeepingPinnedCollectionsFirst(to: sections)
+    }
+
+    private static func isMainCatalogSectionFromEnabledSource(
+        _ section: TVHomeSection,
+        context: TVHomeCatalogOrder.HomeVisibilityContext
+    ) -> Bool {
+        TVHomeCatalogOrder.isRowEnabled(homeCatalogSnapshotRow(for: section), context: context)
+    }
+
+    private static func homeCatalogSnapshotRow(for section: TVHomeSection) -> TVHomeCatalogOrder.SnapshotRow {
+        TVHomeCatalogOrder.SnapshotRow(
+            id: section.id,
+            title: section.title,
+            addonName: section.addonName,
+            addonId: section.addonId,
+            contentType: section.contentType,
+            catalogId: section.catalogId,
+            manifestURL: section.manifestURL,
+            manifestShowInHome: section.manifestShowInHome,
+            settingsKey: section.catalogSettingsKey,
+            posterShape: section.posterShape
+        )
+    }
+
+    private static func homeSkeletonSections(excluding published: Set<String>) -> [TVHomeSection] {
+        let visibility = TVHomeCatalogOrder.homeVisibilityContext()
+        return TVHomeCatalogOrder.snapshotRows().compactMap { row in
+            guard !published.contains(row.id),
+                  !row.id.hasPrefix(TVHomeSection.collectionIdPrefix),
+                  row.id != TVHomeSection.continueWatchingId,
+                  row.id != TVHomeSection.upcomingId,
+                  CinemetaCatalogRepository.isCinemetaEnabled
+                    || !(row.settingsKey?.hasPrefix("\(CinemetaCatalogRepository.cinemetaAddonId)_") ?? false),
+                  TVHomeCatalogOrder.isRowEnabled(row, context: visibility) else { return nil }
+            return TVHomeSection(
+                id: row.id,
+                title: row.title,
+                items: [],
+                contentType: row.contentType,
+                catalogId: row.catalogId,
+                addonId: row.addonId,
+                addonName: row.addonName,
+                manifestURL: row.manifestURL,
+                manifestShowInHome: row.manifestShowInHome,
+                posterShape: row.posterShape,
+                isLoadingPlaceholder: true
+            )
+        }
+    }
+
+    nonisolated static func loadCollectionSections() -> [TVHomeSection] {
+        let disabledCollectionIDs = TVHomeCatalogOrder.disabledCollectionIds()
+        return CollectionsStore.collections().compactMap { collection in
+            guard !disabledCollectionIDs.contains(collection.id), !collection.folders.isEmpty else { return nil }
+            let folders = collection.folders.map { folder in
+                TVCollectionFolderItem(
+                    collectionId: collection.id,
+                    folder: folder,
+                    sources: folder.resolvedSources,
+                    viewMode: collection.viewMode,
+                    showAllTab: collection.showAllTab
+                )
+            }
+            return TVHomeSection(
+                id: "\(TVHomeSection.collectionIdPrefix)\(collection.id)",
+                title: collection.title,
+                items: [],
+                isPinnedCollection: collection.pinToTop,
+                collectionFolders: folders
+            )
+        }
+    }
+
     func cancelLoad(
         _ generation: UInt,
         for identity: TVHomeContentIdentity
@@ -13082,7 +15015,22 @@ final class TVHomeStore: ObservableObject {
         hasLoaded = loadedContentIdentity != nil
     }
 
+    @MainActor
     func reset() {
+        activeMainCatalogTask?.cancel()
+        activeMainCatalogTask = nil
+        cancelDeferredCatalogWork(clearState: true)
+        activeMainCatalogKey = nil
+        currentMainCatalogKey = nil
+        activeMainCatalogUsesEagerLoading = false
+        currentMainCatalogUsesEagerLoading = false
+        mainCatalogRequestGeneration &+= 1
+        completedMainCatalogKey = nil
+        mainCatalogIsLoading = false
+        mainCatalogErrorMessage = nil
+        mainLoadingPlaceholders = []
+        mainHomePublicationNeedsFocusSeed = false
+        suspendMainHomePublicationForFastScrolling = false
         loadGeneration &+= 1
         sections = []
         hero = nil
@@ -13091,6 +15039,7 @@ final class TVHomeStore: ObservableObject {
         lastFocusedCardID = nil
         loadedContentIdentity = nil
         loadingContentIdentity = nil
+        loadedCatalogInputSignature = nil
     }
 }
 

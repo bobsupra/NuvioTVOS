@@ -95,8 +95,8 @@ let debugSettings: SettingsDictionary = [
     // Keep Swift's global `DEBUG` undefined, as in the hand-maintained
     // project: enabling it turns on 21 existing blocks across 7 files and
     // currently fails to build at TVCatalogRow.swift:259. The dedicated
-    // watchdog condition enables only this diagnostic code in Debug.
-    "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "$(inherited) NUVIO_MPV_MEMORY_WATCHDOG",
+    // watchdog conditions enable only their diagnostic code in Debug.
+    "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "$(inherited) NUVIO_MPV_MEMORY_WATCHDOG NUVIO_SIDEBAR_WATCHDOG",
 ]
 
 let releaseSettings: SettingsDictionary = [
