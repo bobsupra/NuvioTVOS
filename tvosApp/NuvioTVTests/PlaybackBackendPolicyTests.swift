@@ -413,6 +413,14 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         )
     }
 
+    func testMPVBufferedBarEndsWhereTheCacheReaches() {
+        // 16:01 played, cache up to 16:05: the bar ends at 16:05, not at 32:06.
+        XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 961_000, cacheEndMs: 965_500), 965_500)
+        // During a seek mpv has no cache end yet, or still the old one: the playhead.
+        XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 993_000, cacheEndMs: nil), 993_000)
+        XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 993_000, cacheEndMs: 965_500), 993_000)
+    }
+
     func testMPVLifecycleRestoreWaitsForActiveAppAndSettledDisplay() {
         XCTAssertFalse(MPVPlaybackLifecyclePolicy.canIssueRestore(
             pending: true,
@@ -2489,6 +2497,108 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             "2"
         )
         XCTAssertNil(PlayerViewModel.matchingPreferredFullSubtitle(in: [forced], language: "English"))
+    }
+
+    @MainActor
+    func testAddonSubtitleOfAHigherRankedLanguageReplacesAnAutomaticChoice() {
+        let languages = ["Czech", "English"]
+        let fileEnglish = SubtitleTrack(id: "2", name: "English", language: "eng", isSelected: true)
+        let fileCzech = SubtitleTrack(id: "3", name: "Czech", language: "cze", isSelected: true)
+        let english = NuvioSubtitle(url: "https://example.test/en.srt", language: "eng", label: "English")
+        let czech = NuvioSubtitle(url: "https://example.test/cs.srt", language: "cze", label: "Czech")
+        let czechToo = NuvioSubtitle(url: "https://example.test/cs-2.srt", language: "ces", label: "Czech")
+        let forcedCzech = NuvioSubtitle(url: "https://example.test/cs-forced.srt", language: "cze", label: "Czech Forced")
+        let addonEnglish = SubtitleTrack(
+            id: "4", name: "English", language: "eng", isSelected: true, externalFilename: english.url
+        )
+
+        XCTAssertEqual(PlayerViewModel.preferredSubtitleRank(of: fileEnglish, in: languages), 1)
+        XCTAssertEqual(PlayerViewModel.preferredSubtitleRank(of: czech, in: languages), 0)
+        XCTAssertNil(PlayerViewModel.preferredSubtitleRank(of: forcedCzech, in: languages))
+        XCTAssertNil(PlayerViewModel.preferredSubtitleRank(
+            of: SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true), in: languages
+        ))
+
+        // The file's English, picked at load, gives way to Czech from an add-on; so does an
+        // add-on's English that came first.
+        for selected in [fileEnglish, addonEnglish] {
+            XCTAssertEqual(PlayerViewModel.betterRankedAddonSubtitle(
+                selected: selected, available: [english, czech, czechToo], onTheirWay: [], preferredLanguages: languages
+            )?.url, czech.url)
+        }
+        // Nothing preferred selected: the best one there is.
+        XCTAssertEqual(PlayerViewModel.betterRankedAddonSubtitle(
+            selected: nil, available: [english], onTheirWay: [], preferredLanguages: languages
+        )?.url, english.url)
+        // Czech stays; English, a forced Czech or a Czech already on its way don't replace anything.
+        XCTAssertNil(PlayerViewModel.betterRankedAddonSubtitle(
+            selected: fileCzech, available: [english, czech], onTheirWay: [], preferredLanguages: languages
+        ))
+        XCTAssertNil(PlayerViewModel.betterRankedAddonSubtitle(
+            selected: fileEnglish, available: [english, forcedCzech], onTheirWay: [], preferredLanguages: languages
+        ))
+        XCTAssertNil(PlayerViewModel.betterRankedAddonSubtitle(
+            selected: fileEnglish, available: [czech, czechToo], onTheirWay: [czechToo], preferredLanguages: languages
+        ))
+    }
+
+    @MainActor
+    func testLateAddonCzechReplacesTheFilesEnglishButNotAManualChoice() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+        }
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["Czech", "English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(true, forKey: SettingsKey.forcedSubtitles)
+
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/late-addon-subtitles.mkv")!))
+        model.activeMeta = NuvioMeta(id: "tt-late-addon-subtitles", name: "Late add-on subtitles", type: "series")
+        model.audioTracks = [AudioTrack(id: "1", name: "Japanese", language: "jpn", isSelected: true)]
+        let fileEnglish = SubtitleTrack(id: "2", name: "English", language: "eng", isSelected: true)
+        model.subtitles = [SubtitleTrack(id: "off", name: "Off", language: "", isSelected: false), fileEnglish]
+
+        let english = NuvioSubtitle(url: "https://example.test/late-en.srt", language: "eng", label: "English")
+        model.mergeExternalSubtitles([english])
+        XCTAssertFalse(model.hasSelectedExternalSubtitle, "an add-on's English leaves the file's English")
+
+        let czech = NuvioSubtitle(url: "https://example.test/late-cs.srt", language: "cze", label: "Czech")
+        model.mergeExternalSubtitles([czech])
+        XCTAssertTrue(model.isExternalSubtitleSelected(czech), "Czech, ranked first, replaces the file's English")
+        XCTAssertTrue(model.pendingExternalSubtitles.contains { $0.url == czech.url })
+
+        model.selectSubtitle(fileEnglish)
+        let laterCzech = NuvioSubtitle(url: "https://example.test/late-cs-2.srt", language: "cze", label: "Czech")
+        model.mergeExternalSubtitles([laterCzech])
+        XCTAssertFalse(model.isExternalSubtitleSelected(laterCzech), "a manual choice stays")
     }
 
     @MainActor

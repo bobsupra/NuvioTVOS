@@ -111,6 +111,56 @@ enum UsenetSettings {
         store.set(profile.rawValue, forKey: profileKey)
     }
 
+    /// Read Ahead on Disk: on by default; off keeps the read-ahead in memory only (the
+    /// performance profile's size).
+    static let diskReadAheadKey = "nuvio.tv.settings.integrations.usenetDiskReadAhead"
+    static let diskReadAheadSizeKey = "nuvio.tv.settings.integrations.usenetDiskReadAheadSize"
+    /// How much of the disk a stream may use, in MB: most of it for reading ahead, the rest
+    /// for what was played. The choices, or any size in the range typed in.
+    static let diskReadAheadSizeOptions = [512, 1024, 2048, 4096, 8192]
+    static let diskReadAheadSizeRangeMB = 256...65_536
+    static let defaultDiskReadAheadSizeMB = 1024
+
+    static func diskReadAhead(store: UserDefaults = ProfileSettings.current) -> Bool {
+        store.object(forKey: diskReadAheadKey) == nil ? true : store.bool(forKey: diskReadAheadKey)
+    }
+
+    static func setDiskReadAhead(_ value: Bool, store: UserDefaults = ProfileSettings.current) {
+        store.set(value, forKey: diskReadAheadKey)
+    }
+
+    static func diskReadAheadSizeMB(store: UserDefaults = ProfileSettings.current) -> Int {
+        let value = store.integer(forKey: diskReadAheadSizeKey)
+        return diskReadAheadSizeRangeMB.contains(value) ? value : defaultDiskReadAheadSizeMB
+    }
+
+    static func setDiskReadAheadSizeMB(_ value: Int, store: UserDefaults = ProfileSettings.current) {
+        store.set(diskReadAheadSizeRangeMB.contains(value) ? value : defaultDiskReadAheadSizeMB, forKey: diskReadAheadSizeKey)
+    }
+
+    /// A size typed in GB ("3", "2.5", "2,5") in MB, within the range; nil when it isn't a number.
+    static func diskReadAheadSizeMB(typedGB text: String) -> Int? {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(of: ",", with: ".")
+            .replacingOccurrences(of: "GB", with: "", options: .caseInsensitive)
+            .trimmingCharacters(in: .whitespaces)
+        guard let gigabytes = Double(cleaned), gigabytes.isFinite, gigabytes > 0 else { return nil }
+        let megabytes = Int((gigabytes * 1024).rounded())
+        return min(max(megabytes, diskReadAheadSizeRangeMB.lowerBound), diskReadAheadSizeRangeMB.upperBound)
+    }
+
+    /// A size in MB as GB for the field ("2.5").
+    static func diskReadAheadGBText(_ megabytes: Int) -> String {
+        let gigabytes = Double(megabytes) / 1024
+        let rounded = (gigabytes * 100).rounded() / 100
+        return rounded == rounded.rounded() ? String(Int(rounded)) : String(rounded)
+    }
+
+    /// The disk a stream may use, nil with Read Ahead on Disk off.
+    static func diskReadAheadBytes(store: UserDefaults = ProfileSettings.current) -> Int64? {
+        diskReadAhead(store: store) ? Int64(diskReadAheadSizeMB(store: store)) << 20 : nil
+    }
+
     /// When on, your own servers are used even if the add-on sends its own.
     static func prefersOwnServers(store: UserDefaults = ProfileSettings.current) -> Bool {
         store.bool(forKey: preferOwnServersKey)

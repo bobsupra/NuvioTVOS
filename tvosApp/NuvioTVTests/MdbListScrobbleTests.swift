@@ -676,6 +676,28 @@ final class MdbListScrobbleTests: XCTestCase {
         XCTAssertEqual(resolved.writer, ["Writer A"], "Writer credits must be preserved when raw has nil")
     }
 
+    func testPreservingEnrichmentKeepsShownRatingsBesideTheTitlesOwnScore() {
+        // An AniList title's details carry only its AniList score; the ratings Details already
+        // showed (MDBList's) stay beside it, and its own score replaces the shown one.
+        func meta(_ ratings: [NuvioExternalRating]?) -> NuvioMeta {
+            NuvioMeta(id: "anilist:101922", name: "Demon Slayer", type: "series", externalRatings: ratings)
+        }
+        let shown = meta([
+            NuvioExternalRating(source: "anilist", value: 80),
+            NuvioExternalRating(source: "imdb", value: 8.6),
+            NuvioExternalRating(source: "mal", value: 8.5),
+        ])
+        let resolved = meta([NuvioExternalRating(source: "anilist", value: 84)]).preservingEnrichment(from: shown)
+        XCTAssertEqual(resolved.externalRatings?.map(\.source), ["anilist", "imdb", "mal"])
+        XCTAssertEqual(resolved.externalRatings?.first?.value, 84, "the title's own score is the new one")
+
+        let ownMAL = meta([NuvioExternalRating(source: "myanimelist", value: 8.62)]).preservingEnrichment(from: shown)
+        XCTAssertEqual(ownMAL.externalRatings?.map(\.source), ["myanimelist", "anilist", "imdb"], "a title's own score replaces another's copy of its source (\"mal\" is MyAnimeList)")
+
+        let nothingShown = meta([NuvioExternalRating(source: "anilist", value: 84)]).preservingEnrichment(from: meta(nil))
+        XCTAssertEqual(nothingShown.externalRatings?.map(\.source), ["anilist"])
+    }
+
     func testPreservingEnrichmentIgnoresDifferentID() {
         let ratings = [NuvioExternalRating(source: "imdb", value: 8.4)]
         let itemA = NuvioMeta(

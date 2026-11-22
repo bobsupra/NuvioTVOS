@@ -489,7 +489,11 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     func preservingEnrichment(from existing: NuvioMeta?) -> NuvioMeta {
         guard let existing, matches(id: existing.id) || existing.matches(id: id) else { return self }
         var resolved = self
-        if resolved.externalRatings == nil, let existingRatings = existing.externalRatings {
+        if let existingRatings = existing.externalRatings, !existingRatings.isEmpty {
+            // The ratings already shown (MDBList's, the add-ons') stay when the full title brings
+            // only its own, as an AniList title does with its AniList score.
+            resolved = resolved.addingRatings(existingRatings)
+        } else if resolved.externalRatings == nil, let existingRatings = existing.externalRatings {
             resolved = resolved.withExternalRatings(existingRatings)
         }
         let castToUse = (resolved.cast == nil || resolved.cast?.isEmpty == true) ? existing.cast : resolved.cast
@@ -632,6 +636,16 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             isFromAddon: isFromAddon,
             landscapePosterUrl: landscapePosterUrl
         )
+    }
+
+    /// This title's ratings, then `others` of the sources it has none of: its own score replaces
+    /// another's copy of it.
+    func addingRatings(_ others: [NuvioExternalRating]) -> NuvioMeta {
+        let own = externalRatings ?? []
+        let ownSources = Set(own.map { AddonRatingsService.normalizedSourceKey($0.source) })
+        let added = others.filter { !ownSources.contains(AddonRatingsService.normalizedSourceKey($0.source)) }
+        guard !added.isEmpty else { return self }
+        return withExternalRatings(own + added)
     }
 
     func withExternalRatings(_ ratings: [NuvioExternalRating]) -> NuvioMeta {
