@@ -336,6 +336,7 @@ struct TVLoadingCatalogRow: View {
     var requestsFocus: Bool = false
     var addonName: String? = nil
     var showAddonName: Bool = true
+    var showsSharedLoadingSpinner: Bool = false
     var horizontalEdgeInset: CGFloat = 0
     var initialScrollIndex: Int = 0
     var onScrollIndexChange: ((Int) -> Void)? = nil
@@ -359,6 +360,7 @@ struct TVLoadingCatalogRow: View {
         requestsFocus: Bool = false,
         addonName: String? = nil,
         showAddonName: Bool = true,
+        showsSharedLoadingSpinner: Bool = false,
         horizontalEdgeInset: CGFloat = 0,
         initialScrollIndex: Int = 0,
         onScrollIndexChange: ((Int) -> Void)? = nil,
@@ -372,6 +374,7 @@ struct TVLoadingCatalogRow: View {
         self.requestsFocus = requestsFocus
         self.addonName = addonName
         self.showAddonName = showAddonName
+        self.showsSharedLoadingSpinner = showsSharedLoadingSpinner
         self.horizontalEdgeInset = horizontalEdgeInset
         self.initialScrollIndex = initialScrollIndex
         self.onScrollIndexChange = onScrollIndexChange
@@ -416,6 +419,18 @@ struct TVLoadingCatalogRow: View {
             .padding(.leading, TVLayout.rowLeading)
             .offset(y: 8)
             .frame(maxWidth: .infinity, alignment: .leading)
+            .overlay(alignment: .trailing) {
+                if showsSharedLoadingSpinner {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .controlSize(.small)
+                        .tint(.white.opacity(0.65))
+                        .frame(width: 22, height: 22)
+                        .padding(.trailing, 10)
+                        .allowsHitTesting(false)
+                        .accessibilityHidden(true)
+                }
+            }
             .zIndex(1)
 
             let stripWidth = max(1920, UIScreen.main.bounds.width + horizontalEdgeInset * 2)
@@ -496,6 +511,7 @@ extension TVLoadingCatalogRow: Equatable {
             && lhs.requestsFocus == rhs.requestsFocus
             && lhs.addonName == rhs.addonName
             && lhs.showAddonName == rhs.showAddonName
+            && lhs.showsSharedLoadingSpinner == rhs.showsSharedLoadingSpinner
             && lhs.horizontalEdgeInset == rhs.horizontalEdgeInset
             && lhs.initialScrollIndex == rhs.initialScrollIndex
     }

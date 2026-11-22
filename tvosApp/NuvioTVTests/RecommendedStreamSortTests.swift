@@ -41,6 +41,75 @@ final class RecommendedStreamSortTests: XCTestCase {
         XCTAssertEqual(picks.map { $0.stream.id }, [high.id, standard.id, low.id])
     }
 
+    func testEpisodeTargetRanksConfirmedBeforeUnknownAndDropsExplicitMismatchesAutomatically() {
+        let target = StreamEpisodeTarget(season: 1, episode: 2)
+        let wrongUHD = NuvioStream(url: "https://example.test/wrong", name: "Show S01E06 2160p", description: nil, addonName: "A")
+        let unknown = NuvioStream(url: "https://example.test/unknown", name: "2160p WEB-DL", description: nil, addonName: "B")
+        let confirmedHD = NuvioStream(url: "https://example.test/right", name: "Show S01E02 720p", description: nil, addonName: "C")
+        let confirmedFHD = NuvioStream(url: "https://example.test/right2", name: "Show 1x02 1080p", description: nil, addonName: "D")
+
+        let sorted = StreamPickerListBuilder.automaticStreams(
+            streams: [wrongUHD, unknown, confirmedHD, confirmedFHD],
+            sortOption: .recommended, includeDebrid: false, cachedOnly: false,
+            preserveAddonStreams: false, episodeTarget: target
+        )
+        XCTAssertEqual(sorted.map(\.id), [confirmedFHD.id, confirmedHD.id, unknown.id])
+
+        let manual = StreamPickerListBuilder.displayedStreams(
+            streams: [wrongUHD, confirmedHD], groups: [], selectedAddonId: nil,
+            sortOption: .recommended, includeDebrid: false,
+            selectionMode: .manual, episodeTarget: target
+        )
+        XCTAssertEqual(manual.map(\.id), [confirmedHD.id, wrongUHD.id])
+
+        let onlyWrong = StreamPickerListBuilder.automaticStreams(
+            streams: [wrongUHD], sortOption: .recommended, includeDebrid: false,
+            cachedOnly: false, preserveAddonStreams: false, episodeTarget: target
+        )
+        XCTAssertTrue(onlyWrong.isEmpty)
+    }
+
+    func testEpisodeTargetParsesBoundedLabelsAndRejectsAmbiguousEvidence() {
+        let target = StreamEpisodeTarget(season: 1, episode: 2)
+        func stream(_ name: String, description: String? = nil) -> NuvioStream {
+            NuvioStream(url: "https://example.test/item", name: name, description: description, addonName: "A")
+        }
+        XCTAssertEqual(target.match(for: stream("Show S01E02 1080p")), .confirmed)
+        XCTAssertEqual(target.match(for: stream("Show 1x02 1080p")), .confirmed)
+        XCTAssertEqual(target.match(for: stream("Season 1 Episode 2")), .confirmed)
+        XCTAssertEqual(target.match(for: stream("Show S01E020")), .mismatch, "Episode 20 must not match episode 2 by prefix")
+        XCTAssertEqual(target.match(for: stream("Show S01E20 S01E02")), .unknown, "Adjacent labels must both be detected")
+        XCTAssertEqual(target.match(for: stream("Show S01E02", description: "Show S01E03")), .unknown)
+        XCTAssertEqual(target.match(for: stream("Show S01E01-E03")), .unknown)
+        XCTAssertEqual(target.match(for: stream("Show 1x01-1x03")), .unknown)
+        XCTAssertEqual(target.match(filename: "Show_S01E01-E03_1080p.mkv"), .unknown)
+        XCTAssertEqual(target.match(filename: "Show_1x01-1x03_1080p.mkv"), .unknown)
+        XCTAssertEqual(target.match(for: stream("Show Season 1 Pack S01E02")), .unknown)
+        XCTAssertEqual(target.match(for: stream("2160p UHD")), .unknown, "Quality labels carry no episode evidence")
+    }
+
+    func testEpisodeTargetURLUsesRecognizablePathFilenameAndIgnoresQueries() {
+        let target = StreamEpisodeTarget(season: 1, episode: 2)
+        XCTAssertEqual(target.match(url: URL(string: "https://cdn.test/Show.S01E02.mkv?token=S01E06")!), .confirmed)
+        XCTAssertEqual(target.match(url: URL(string: "https://cdn.test/opaque/ab1234567890abcdefabcdef?episode=S01E02")!), .unknown)
+        XCTAssertEqual(target.match(url: URL(string: "https://cdn.test/Show.S01E06.mkv")!), .mismatch)
+        XCTAssertEqual(target.match(url: URL(string: "https://cdn.test/watch/S01E06?token=abc")!), .unknown)
+    }
+
+    func testEpisodeTargetCanKeepAlternateNumberingUnknown() {
+        let target = StreamEpisodeTarget(season: 1, episode: 2, allowsMismatch: false)
+        let alternateNumbering = NuvioStream(
+            url: "https://example.test/alternate", name: "Show S01E03 1080p",
+            description: nil, addonName: "A"
+        )
+        XCTAssertEqual(target.match(for: alternateNumbering), .unknown)
+        XCTAssertEqual(target.match(for: NuvioStream(
+            url: nil, name: "Show S01E02", description: nil, addonName: "A"
+        )), .confirmed)
+        XCTAssertNotEqual(StreamEpisodeTarget(season: 1, episode: 2), target,
+                          "Picker cache identity includes the mismatch policy")
+    }
+
     func testLastPlayedPromotionPreservesOtherOrderAndRejectsDuplicateIDs() {
         let first = NuvioStream(url: "https://example.test/first", name: "1080p", description: nil, addonName: "A")
         let played = NuvioStream(url: "https://example.test/played", name: "2160p", description: nil, addonName: "B")

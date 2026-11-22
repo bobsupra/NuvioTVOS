@@ -8,6 +8,11 @@
 import Foundation
 import OSLog
 
+enum HomeCatalogViewportUpdate: @unchecked Sendable {
+    case catalogs([NuvioCatalog])
+    case addonRows([TVHomeSection])
+}
+
 enum CatalogSearchReason: Equatable {
     case noActiveAddons
     case noSearchCatalogs
@@ -555,6 +560,38 @@ struct StreamAddonPreference: Codable, Equatable {
 
 /// Live Cinemeta-backed catalog and metadata repository for the tvOS app.
 final class CinemetaCatalogRepository: CatalogRepository {
+    private struct AddonHomeProviderPlan: @unchecked Sendable {
+        let index: Int
+        let manifestURL: URL
+        let addonID: String
+        let displayName: String
+        let declaredCatalogCount: Int
+        let eligible: [AddonManifestCatalog]
+        let showType: Bool
+        let customTitles: [String: String]
+    }
+
+    private struct AddonHomeProviderResult: @unchecked Sendable {
+        let plan: AddonHomeProviderPlan
+        var catalogs: [NuvioCatalog]
+        var missing: [AddonManifestCatalog]
+    }
+    private struct AddonHomeCatalogProgress: @unchecked Sendable {
+        let providerIndex: Int
+        let rowIndex: Int
+        let catalog: NuvioCatalog
+    }
+    private struct AddonManifestDiscoveryEvent: @unchecked Sendable {
+        let index: Int
+        let manifestURL: URL
+        let manifest: AddonManifest?
+    }
+    private struct AddonHomeLoadResult: @unchecked Sendable {
+        let catalogs: [NuvioCatalog]
+        let hadFailures: Bool
+        let diagnostic: String
+    }
+
     static private(set) var homeAddonFetchDiagnostic = "not started"
     private(set) var homeCatalogLoadWasPartial = false
     private(set) var homeCatalogFailureSignature: String?
@@ -786,6 +823,53 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    func homeCatalogsForViewport() -> AsyncThrowingStream<HomeCatalogViewportUpdate, Error> {
+        AsyncThrowingStream(bufferingPolicy: .unbounded) { continuation in
+            let task = Task {
+                let activeProfileID = ProfileSettings.activeProfileID
+                let discoveryTask = Task {
+                    await self.discoverAddonHomeRows { rows in
+                        guard !Task.isCancelled else { return }
+                        continuation.yield(.addonRows(rows))
+                    }
+                }
+                do {
+                    let catalogs = try await self.loadHomeCatalogs(includeAddonRows: false) { update in
+                        guard !Task.isCancelled else { return }
+                        continuation.yield(.catalogs(update))
+                    }
+                    let discovery = await withTaskCancellationHandler {
+                        await discoveryTask.value
+                    } onCancel: {
+                        discoveryTask.cancel()
+                    }
+                    try Task.checkCancellation()
+                    guard ProfileSettings.activeProfileID == activeProfileID else { throw CancellationError() }
+                    let builtinPartial = self.homeCatalogLoadWasPartial
+                    let builtinFailure = self.homeCatalogFailureSignature
+                    self.homeCatalogLoadWasPartial = builtinPartial || discovery.hadFailures
+                    Self.homeAddonFetchDiagnostic = discovery.diagnostic
+                    if self.homeCatalogLoadWasPartial {
+                        let builtinPart = builtinFailure?.components(separatedBy: " addons:").first ?? "builtin:[]"
+                        let addonPart = discovery.hadFailures ? discovery.diagnostic : ""
+                        self.homeCatalogFailureSignature = "\(builtinPart) addons:[\(addonPart)]"
+                    } else {
+                        self.homeCatalogFailureSignature = nil
+                    }
+                    guard !catalogs.isEmpty || !discovery.sections.isEmpty || !self.homeCatalogLoadWasPartial else {
+                        throw URLError(.cannotLoadFromNetwork)
+                    }
+                    continuation.finish()
+                } catch {
+                    discoveryTask.cancel()
+                    _ = await discoveryTask.value
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// Home placement is separate from enabling an add-on for streams or
     /// collection pages. Match the provider-level filters used by Home's UI.
     private static func isAddonVisibleOnHome(id: String, name: String) -> Bool {
@@ -813,6 +897,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func loadHomeCatalogs(
+        includeAddonRows: Bool = true,
         onUpdate: (([NuvioCatalog]) -> Void)? = nil
     ) async throws -> [NuvioCatalog] {
         let metadataContext = Self.metadataCacheContext
@@ -896,12 +981,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return result
         }
 
-        // Publish the base rows now. Add-on catalogs can be slow or numerous;
-        // they must not hold already-loaded rows off Home.
+        // Publish Cinemeta before optional Simkl rows so its ready pages are not
+        // held behind an independent account request.
         var catalogs = builtInCatalogs()
+        if !catalogs.isEmpty { onUpdate?(catalogs) }
         let simklCatalogs = await simklPlanToWatchCatalogs()
-        catalogs.append(contentsOf: simklCatalogs)
-        if !catalogs.isEmpty {
+        if !simklCatalogs.isEmpty {
+            catalogs.append(contentsOf: simklCatalogs)
             onUpdate?(catalogs)
         }
 
@@ -920,58 +1006,32 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // remain usable and are never discarded because a sibling host request
         // failed.
         let missing = pages.indices.filter { eligibleBuiltInIndices.contains($0) && pages[$0] == nil }
-        if !missing.isEmpty {
-            try await Task.sleep(nanoseconds: 600_000_000)
-            try Task.checkCancellation()
-            await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
-                for index in missing {
-                    let spec = specs[index]
-                    group.addTask {
-                        let page = try? await self.fetchCatalog(
-                            type: spec.type,
-                            catalogId: spec.catalogId,
-                            skip: nil,
-                            search: nil,
-                            genre: nil
-                        )
-                        return (index, page?.isEmpty == false ? page : nil)
-                    }
-                }
-                for await (index, page) in group where page != nil {
-                    pages[index] = page
-                }
-            }
-            try Task.checkCancellation()
-        }
+        async let retriedPages = retryMissingBuiltInPages(missing, specs: specs)
 
-        let retriedBuiltIns = builtInCatalogs() + (await simklPlanToWatchCatalogs()) + aniListCatalogs
-        if retriedBuiltIns.count != catalogs.count {
-            catalogs = retriedBuiltIns
-            onUpdate?(catalogs)
-        }
-
-        // Each successful add-on row is accumulated immediately, but Home is
-        // updated at most once per short interval. Add-on manifests can expose
-        // dozens of catalogs; publishing every serial response makes SwiftUI
-        // diff and lay out the entire vertical tree once per catalog.
+        // Start add-on hosts before optional built-in retries finish. A slow retry
+        // should not keep independent providers waiting behind it.
         var progressiveAddonCatalogs: [NuvioCatalog] = []
-        var lastProgressiveUpdateAt: UInt64?
         var lastProgressiveUpdateCount = 0
-        let progressiveUpdateIntervalNanoseconds: UInt64 = 1_500_000_000
-        let addonResult = await addonHomeCatalogs { [weak self] catalog in
-            guard let self else { return }
-            progressiveAddonCatalogs.append(catalog)
-            let now = DispatchTime.now().uptimeNanoseconds
-            guard lastProgressiveUpdateAt == nil
-                || now - (lastProgressiveUpdateAt ?? 0) >= progressiveUpdateIntervalNanoseconds else {
-                return
+        let initialBaseCatalogCount = catalogs.count
+        var addonResult: (catalogs: [NuvioCatalog], hadFailures: Bool) = ([], false)
+        if includeAddonRows {
+            addonResult = await addonHomeCatalogs { [weak self] updatedCatalogs in
+                guard let self, !Task.isCancelled else { return }
+                progressiveAddonCatalogs = updatedCatalogs
+                lastProgressiveUpdateCount = progressiveAddonCatalogs.count
+                onUpdate?(catalogs + self.orderedAddonCatalogs(progressiveAddonCatalogs))
             }
-            lastProgressiveUpdateAt = now
-            lastProgressiveUpdateCount = progressiveAddonCatalogs.count
-            onUpdate?(catalogs + self.orderedAddonCatalogs(progressiveAddonCatalogs))
         }
         try Task.checkCancellation()
-        catalogs.append(contentsOf: addonResult.catalogs)
+        for (index, page) in await retriedPages where page != nil {
+            pages[index] = page
+        }
+        try Task.checkCancellation()
+
+        let retriedBuiltIns = builtInCatalogs() + simklCatalogs + aniListCatalogs
+        let baseCatalogsChanged = retriedBuiltIns.count != initialBaseCatalogCount
+        catalogs = retriedBuiltIns + addonResult.catalogs
+        if baseCatalogsChanged { onUpdate?(catalogs) }
         // Always publish the complete final tree when the last response fell
         // inside the throttle window. This also makes the next Home snapshot
         // reflect every catalog, not just the last timed update.
@@ -995,18 +1055,46 @@ final class CinemetaCatalogRepository: CatalogRepository {
             .sorted()
             .map(String.init)
             .joined(separator: ",")
-        homeCatalogLoadWasPartial = !missingBuiltIns.isEmpty || addonResult.hadFailures
+        homeCatalogLoadWasPartial = !missingBuiltIns.isEmpty || (includeAddonRows && addonResult.hadFailures)
+        let addonFailureSummary = includeAddonRows ? Self.homeAddonFetchDiagnostic : ""
         // Built from the same per-add-on report the diagnostic uses, so the
         // signature changes whenever any row's outcome changes -- and only then.
         homeCatalogFailureSignature = homeCatalogLoadWasPartial
-            ? "builtin:[\(missingBuiltIns)] addons:[\(Self.homeAddonFetchDiagnostic)]"
+            ? "builtin:[\(missingBuiltIns)] addons:[\(addonFailureSummary)]"
             : nil
         if catalogs.isEmpty {
-            guard !homeCatalogLoadWasPartial else { throw URLError(.cannotLoadFromNetwork) }
+            guard !includeAddonRows || !homeCatalogLoadWasPartial else { throw URLError(.cannotLoadFromNetwork) }
             onUpdate?([])
             return []
         }
         return catalogs
+    }
+
+    private func retryMissingBuiltInPages(
+        _ missing: [Int],
+        specs: [(id: String, name: String, type: String, catalogId: String)]
+    ) async -> [(Int, [NuvioMeta]?)] {
+        guard !missing.isEmpty else { return [] }
+        try? await Task.sleep(nanoseconds: 600_000_000)
+        guard !Task.isCancelled else { return [] }
+        return await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
+            for index in missing {
+                let spec = specs[index]
+                group.addTask {
+                    let page = try? await self.fetchCatalog(
+                        type: spec.type,
+                        catalogId: spec.catalogId,
+                        skip: nil,
+                        search: nil,
+                        genre: nil
+                    )
+                    return (index, page?.isEmpty == false ? page : nil)
+                }
+            }
+            var results: [(Int, [NuvioMeta]?)] = []
+            for await result in group { results.append(result) }
+            return results
+        }
     }
 
     private func simklPlanToWatchCatalogs() async -> [NuvioCatalog] {
@@ -1095,189 +1183,544 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return result
     }
 
-    /// Home rows from the configured add-ons' manifest catalogs, mirroring the
-    /// Android app: user-configured add-ons (MDBList, AIOStreams, …) expose
-    /// custom catalogs — Marvel, actors, lists — that belong on Home. Search-
-    /// only catalogs and ones needing unsupported extras are skipped; a
-    /// required genre is satisfied with the catalog's first declared option.
+    /// Home rows from configured add-ons. Providers are fetched concurrently by host, but
+    /// each host's catalogs remain serial to preserve provider rate limits and manifest order.
     private func addonHomeCatalogs(
-        onCatalogLoaded: ((NuvioCatalog) -> Void)? = nil
+        onCatalogsUpdated: (([NuvioCatalog]) -> Void)? = nil
     ) async -> (catalogs: [NuvioCatalog], hadFailures: Bool) {
         let activeProfileID = ProfileSettings.activeProfileID
+        let manifestURLs = Self.configuredStreamAddonManifestURLs
+        let manifestHostGroups = Self.hostGroups(for: manifestURLs)
+        let showType = ProfileSettings.current.object(forKey: SettingsKey.homeCatalogShowType) as? Bool ?? true
+        let customTitles = TVHomeCatalogOrder.customCatalogTitles()
         let homeVisibility = TVHomeCatalogOrder.homeVisibilityContext()
-        var catalogs: [NuvioCatalog] = []
-        var reports: [String] = []
-        var hadFailures = false
+        let deletedCatalogKeys = TVHomeCatalogOrder.deletedCatalogKeys()
+        var manifests = Array<AddonManifest?>(repeating: nil, count: manifestURLs.count)
+        var reportsByManifest = Array<String?>(repeating: nil, count: manifestURLs.count)
         Self.homeAddonFetchDiagnostic = "loading"
 
-        for manifestURL in Self.configuredStreamAddonManifestURLs {
-            guard !Task.isCancelled else { break }
-            let resolvedManifest = await manifest(for: manifestURL)
-            guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else { break }
-            guard let manifest = resolvedManifest else {
-                hadFailures = true
-                reports.append("\(manifestURL.host ?? "unknown"): manifest failed")
+        // Resolve manifests from at most three distinct hosts at once. Manifests on one host
+        // stay serial, so providers that share a rate limit never receive a burst.
+        await withTaskGroup(of: [(Int, AddonManifest?)].self) { group in
+            var nextGroup = 0
+            for _ in 0..<min(3, manifestHostGroups.count) {
+                let indices = manifestHostGroups[nextGroup]
+                nextGroup += 1
+                group.addTask {
+                    var loaded: [(Int, AddonManifest?)] = []
+                    for index in indices {
+                        guard !Task.isCancelled else { break }
+                        loaded.append((index, await self.manifest(for: manifestURLs[index])))
+                    }
+                    return loaded
+                }
+            }
+            while let hostManifests = await group.next() {
+                for (index, manifest) in hostManifests { manifests[index] = manifest }
+                guard nextGroup < manifestHostGroups.count else { continue }
+                let indices = manifestHostGroups[nextGroup]
+                nextGroup += 1
+                group.addTask {
+                    var loaded: [(Int, AddonManifest?)] = []
+                    for index in indices {
+                        guard !Task.isCancelled else { break }
+                        loaded.append((index, await self.manifest(for: manifestURLs[index])))
+                    }
+                    return loaded
+                }
+            }
+        }
+        guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else {
+            return ([], false)
+        }
+
+        // Apply discovery/order snapshots on the parent task in configured manifest order.
+        var plans: [AddonHomeProviderPlan] = []
+        for (manifestIndex, manifestURL) in manifestURLs.enumerated() {
+            guard let manifest = manifests[manifestIndex] else {
+                reportsByManifest[manifestIndex] = "\(manifestURL.host ?? "unknown"): manifest failed"
                 continue
             }
-            guard manifest.id != Self.cinemetaAddonId else { continue }
-
-            let base = manifestURL.deletingLastPathComponent()
-            let addonDisplayName = Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName)
-            let deletedCatalogKeys = TVHomeCatalogOrder.deletedCatalogKeys()
-            let manifestEligible = (manifest.catalogs ?? []).filter { catalog in
-                let settingsKey = TVHomeCatalogOrder.catalogSettingsKey(
-                    addonId: manifest.id,
-                    contentType: catalog.type,
-                    catalogId: catalog.id
-                )
-                let rowId = "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)"
-                if deletedCatalogKeys.contains(settingsKey) || deletedCatalogKeys.contains(rowId) {
-                    return false
-                }
-                return catalog.eligibleForHome
-                    && (!catalog.requiresGenre || catalog.firstGenreOption != nil)
+            if let plan = makeAddonHomeProviderPlan(
+                manifestIndex: manifestIndex,
+                manifestURL: manifestURL,
+                manifest: manifest,
+                showType: showType,
+                customTitles: customTitles,
+                deletedCatalogKeys: deletedCatalogKeys,
+                homeVisibility: homeVisibility
+            ) {
+                plans.append(plan)
             }
-            let registeredRows = manifestEligible.map { catalog in
-                let settingsKey = TVHomeCatalogOrder.catalogSettingsKey(
-                    addonId: manifest.id,
-                    contentType: catalog.type,
-                    catalogId: catalog.id
-                )
-                return TVHomeCatalogOrder.SnapshotRow(
-                    id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
-                    title: TVHomeCatalogOrder.catalogDisplayTitle(
-                        catalog.name ?? catalog.id,
-                        contentType: catalog.type,
-                        showType: ProfileSettings.current.object(forKey: SettingsKey.homeCatalogShowType) as? Bool ?? true,
-                        addonName: addonDisplayName,
-                        customTitle: TVHomeCatalogOrder.customTitle(forCatalogKey: settingsKey)
-                    ),
-                    addonName: addonDisplayName,
-                    addonId: manifest.id,
-                    contentType: catalog.type,
-                    catalogId: catalog.id,
-                    manifestURL: manifestURL.absoluteString,
-                    manifestShowInHome: catalog.showInHome,
-                    settingsKey: settingsKey,
-                    posterShape: catalog.posterShape
-                )
-            }
-            TVHomeCatalogOrder.replaceSnapshotRows(
-                forAddonID: manifest.id,
-                addonName: addonDisplayName,
-                with: registeredRows
-            )
+        }
 
-            // Keep discovery rows available in Settings, but do not fetch
-            // catalog contents for a provider hidden from Home as a group.
-            guard Self.isAddonVisibleOnHome(id: manifest.id, name: addonDisplayName) else {
-                continue
-            }
+        let providerHostGroups = Self.hostGroups(for: plans.map(\.manifestURL)).map { indices in
+            indices.map { plans[$0] }
+        }
+        var progressiveRows = Array(repeating: [NuvioCatalog?](), count: manifestURLs.count)
+        for plan in plans {
+            progressiveRows[plan.index] = Array(repeating: nil, count: plan.eligible.count)
+        }
+        let initialReportsByManifest = reportsByManifest
 
-            let eligible = manifestEligible.filter { catalog in
-                CatalogHomeVisibilityResolver.shouldInclude(
-                    addonID: manifest.id,
-                    contentType: catalog.type,
-                    catalogID: catalog.id,
-                    collectionSources: homeVisibility.collectionSources,
-                    manifestURL: manifestURL,
-                    explicitHomeKeys: homeVisibility.explicitHomeKeys,
-                    manifestShowInHome: catalog.showInHome,
-                    disabledHomeKeys: homeVisibility.disabledCatalogKeys
-                )
-            }
-
-            func load(_ catalog: AddonManifestCatalog) async -> NuvioCatalog? {
-                let metadataContext = Self.metadataCacheContext
-                do {
-                    let catalogGenre = catalog.requiresGenre ? catalog.firstGenreOption : nil
-                    let url = try StremioCatalogURLBuilder.url(
-                        baseURL: base,
-                        type: catalog.type,
-                        catalogId: catalog.id,
-                        genre: catalogGenre
-                    )
-                    let response: CinemetaCatalogResponse = try await fetch(
-                        url
-                    )
-                    let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
-                    guard !items.isEmpty else { return nil }
-                    cacheMetadata(items, context: metadataContext)
-                    let catalogKey = TVHomeCatalogOrder.catalogSettingsKey(
-                        addonId: manifest.id,
-                        contentType: catalog.type,
-                        catalogId: catalog.id
-                    )
-                    let customTitle = TVHomeCatalogOrder.customTitle(forCatalogKey: catalogKey)
-                    let catalogName = TVHomeCatalogOrder.catalogDisplayTitle(
-                        catalog.name ?? catalog.id,
-                        contentType: catalog.type,
-                        showType: ProfileSettings.current.object(forKey: SettingsKey.homeCatalogShowType) as? Bool ?? true,
-                        addonName: addonDisplayName,
-                        customTitle: customTitle
-                    )
-                    return NuvioCatalog(
-                        id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
-                        name: catalogName,
-                        description: catalogName,
-                        itemIds: items.map(\.id),
-                        items: items,
-                        contentType: catalog.type,
-                        catalogId: catalog.id,
-                        addonId: manifest.id,
-                        addonName: addonDisplayName,
-                        catalogGenre: catalogGenre,
-                        manifestURL: manifestURL.absoluteString,
-                        manifestShowInHome: catalog.showInHome,
-                        posterShape: catalog.posterShape ?? items.first(where: { $0.posterShape != nil })?.posterShape
-                    )
-                } catch {
-                    return nil
-                }
-            }
-
-            // BetterPosters rejects/limits a burst of all 13 catalog requests
-            // on some Apple TV networks, so keep requests ordered and serial.
-            // Publish each success, then retry only this manifest's missing rows.
-            var loadedForManifest = 0
-            var missingForManifest: [AddonManifestCatalog] = []
-            for catalog in eligible {
-                guard !Task.isCancelled else { break }
-                if let loaded = await load(catalog) {
-                    catalogs.append(loaded)
-                    loadedForManifest += 1
-                    onCatalogLoaded?(loaded)
-                } else if !Task.isCancelled {
-                    missingForManifest.append(catalog)
-                }
-            }
-
-            if !missingForManifest.isEmpty, !Task.isCancelled {
-                try? await Task.sleep(nanoseconds: 600_000_000)
-                var stillMissing: [AddonManifestCatalog] = []
-                for catalog in missingForManifest {
-                    guard !Task.isCancelled else { break }
-                    if let loaded = await load(catalog) {
-                        catalogs.append(loaded)
-                        loadedForManifest += 1
-                        onCatalogLoaded?(loaded)
-                    } else if !Task.isCancelled {
-                        stillMissing.append(catalog)
+        let (progressStream, progressContinuation) = AsyncStream.makeStream(of: AddonHomeCatalogProgress.self)
+        let workTask = Task { () -> AddonHomeLoadResult in
+            defer { progressContinuation.finish() }
+            var finalReportsByManifest = initialReportsByManifest
+            var firstPass = Array<AddonHomeProviderResult?>(repeating: nil, count: manifestURLs.count)
+            await withTaskGroup(of: [AddonHomeProviderResult].self) { group in
+                var nextGroup = 0
+                for _ in 0..<min(3, providerHostGroups.count) {
+                    let providers = providerHostGroups[nextGroup]
+                    nextGroup += 1
+                    group.addTask {
+                        await self.loadAddonHostFirstPass(
+                            providers,
+                            activeProfileID: activeProfileID,
+                            progress: progressContinuation
+                        )
                     }
                 }
-                missingForManifest = stillMissing
+                while let providerResults = await group.next() {
+                    for result in providerResults { firstPass[result.plan.index] = result }
+                    guard nextGroup < providerHostGroups.count else { continue }
+                    let providers = providerHostGroups[nextGroup]
+                    nextGroup += 1
+                    group.addTask {
+                        await self.loadAddonHostFirstPass(
+                            providers,
+                            activeProfileID: activeProfileID,
+                            progress: progressContinuation
+                        )
+                    }
+                }
+            }
+            guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else {
+                return AddonHomeLoadResult(catalogs: [], hadFailures: false, diagnostic: "")
             }
 
-            hadFailures = hadFailures || !missingForManifest.isEmpty
-            reports.append(
-                "\(manifest.id): \(loadedForManifest)/\(eligible.count) loaded"
-                    + ", \((manifest.catalogs ?? []).count) declared"
-                    + ", failed \(missingForManifest.count)"
+            // Retry only missing rows, after all independent hosts complete their first pass.
+            let retryCandidates = firstPass.compactMap { $0 }.filter { !$0.missing.isEmpty }
+            let retryHostGroups = Self.hostGroups(for: retryCandidates.map { $0.plan.manifestURL }).map { indices in
+                indices.map { retryCandidates[$0] }
+            }
+            await withTaskGroup(of: [AddonHomeProviderResult].self) { group in
+                var nextGroup = 0
+                for _ in 0..<min(3, retryHostGroups.count) {
+                    let providers = retryHostGroups[nextGroup]
+                    nextGroup += 1
+                    group.addTask {
+                        await self.retryAddonHostMissingRows(
+                            providers,
+                            activeProfileID: activeProfileID,
+                            progress: progressContinuation
+                        )
+                    }
+                }
+                while let retryResults = await group.next() {
+                    for result in retryResults { firstPass[result.plan.index] = result }
+                    guard nextGroup < retryHostGroups.count else { continue }
+                    let providers = retryHostGroups[nextGroup]
+                    nextGroup += 1
+                    group.addTask {
+                        await self.retryAddonHostMissingRows(
+                            providers,
+                            activeProfileID: activeProfileID,
+                            progress: progressContinuation
+                        )
+                    }
+                }
+            }
+
+            let finalResults = firstPass.compactMap { $0 }
+            var catalogs: [NuvioCatalog] = []
+            var hadFailures = initialReportsByManifest.contains(where: { $0 != nil })
+            for result in finalResults {
+                catalogs.append(contentsOf: result.catalogs)
+                hadFailures = hadFailures || !result.missing.isEmpty
+                finalReportsByManifest[result.plan.index] =
+                    "\(result.plan.addonID): \(result.catalogs.count)/\(result.plan.eligible.count) loaded"
+                        + ", \(result.plan.declaredCatalogCount) declared"
+                        + ", failed \(result.missing.count)"
+            }
+            let reports = finalReportsByManifest.compactMap { $0 }
+            let diagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
+            return AddonHomeLoadResult(
+                catalogs: orderedAddonCatalogs(catalogs),
+                hadFailures: hadFailures,
+                diagnostic: diagnostic
             )
         }
 
-        Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
-        return (orderedAddonCatalogs(catalogs), hadFailures)
+        let addonResult = await withTaskCancellationHandler {
+            var progressiveCount = 0
+            var lastPublishedCount = 0
+            var lastPublishedAt: UInt64?
+            for await event in progressStream {
+                guard progressiveRows.indices.contains(event.providerIndex),
+                      progressiveRows[event.providerIndex].indices.contains(event.rowIndex) else { continue }
+                progressiveRows[event.providerIndex][event.rowIndex] = event.catalog
+                progressiveCount += 1
+                let now = DispatchTime.now().uptimeNanoseconds
+                guard lastPublishedAt == nil || now - (lastPublishedAt ?? 0) >= 1_500_000_000 else { continue }
+                lastPublishedAt = now
+                lastPublishedCount = progressiveCount
+                onCatalogsUpdated?(progressiveRows.flatMap { $0.compactMap { $0 } })
+            }
+            let result = await workTask.value
+            if progressiveCount != lastPublishedCount {
+                onCatalogsUpdated?(progressiveRows.flatMap { $0.compactMap { $0 } })
+            }
+            return result
+        } onCancel: {
+            workTask.cancel()
+            progressContinuation.finish()
+        }
+        Self.homeAddonFetchDiagnostic = addonResult.diagnostic
+        return (addonResult.catalogs, addonResult.hadFailures)
+    }
+
+    private static func hostGroups(for urls: [URL]) -> [[Int]] {
+        var hostOrder: [String] = []
+        var grouped: [String: [Int]] = [:]
+        for (index, url) in urls.enumerated() {
+            let host = url.host?.lowercased() ?? url.absoluteString
+            if grouped[host] == nil { hostOrder.append(host) }
+            grouped[host, default: []].append(index)
+        }
+        return hostOrder.compactMap { grouped[$0] }
+    }
+
+    private func makeAddonHomeProviderPlan(
+        manifestIndex: Int,
+        manifestURL: URL,
+        manifest: AddonManifest,
+        showType: Bool,
+        customTitles: [String: String],
+        deletedCatalogKeys: Set<String>,
+        homeVisibility: TVHomeCatalogOrder.HomeVisibilityContext
+    ) -> AddonHomeProviderPlan? {
+        guard manifest.id != Self.cinemetaAddonId else { return nil }
+        let addonDisplayName = Self.streamAddonDisplayName(for: manifestURL, manifestName: manifest.displayName)
+        let manifestEligible = (manifest.catalogs ?? []).filter { catalog in
+            let settingsKey = TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: manifest.id,
+                contentType: catalog.type,
+                catalogId: catalog.id
+            )
+            let rowId = "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)"
+            return !deletedCatalogKeys.contains(settingsKey)
+                && !deletedCatalogKeys.contains(rowId)
+                && catalog.eligibleForHome
+                && (!catalog.requiresGenre || catalog.firstGenreOption != nil)
+        }
+        let registeredRows = manifestEligible.map { catalog in
+            let settingsKey = TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: manifest.id,
+                contentType: catalog.type,
+                catalogId: catalog.id
+            )
+            return TVHomeCatalogOrder.SnapshotRow(
+                id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
+                title: TVHomeCatalogOrder.catalogDisplayTitle(
+                    catalog.name ?? catalog.id,
+                    contentType: catalog.type,
+                    showType: showType,
+                    addonName: addonDisplayName,
+                    customTitle: customTitles[settingsKey]
+                ),
+                addonName: addonDisplayName,
+                addonId: manifest.id,
+                contentType: catalog.type,
+                catalogId: catalog.id,
+                manifestURL: manifestURL.absoluteString,
+                manifestShowInHome: catalog.showInHome,
+                settingsKey: settingsKey,
+                posterShape: catalog.posterShape
+            )
+        }
+        TVHomeCatalogOrder.replaceSnapshotRows(
+            forAddonID: manifest.id,
+            addonName: addonDisplayName,
+            with: registeredRows
+        )
+        guard Self.isAddonVisibleOnHome(id: manifest.id, name: addonDisplayName) else { return nil }
+
+        let eligible = manifestEligible.filter { catalog in
+            CatalogHomeVisibilityResolver.shouldInclude(
+                addonID: manifest.id,
+                contentType: catalog.type,
+                catalogID: catalog.id,
+                collectionSources: homeVisibility.collectionSources,
+                manifestURL: manifestURL,
+                explicitHomeKeys: homeVisibility.explicitHomeKeys,
+                manifestShowInHome: catalog.showInHome,
+                disabledHomeKeys: homeVisibility.disabledCatalogKeys
+            )
+        }
+        return AddonHomeProviderPlan(
+            index: manifestIndex,
+            manifestURL: manifestURL,
+            addonID: manifest.id,
+            displayName: addonDisplayName,
+            declaredCatalogCount: (manifest.catalogs ?? []).count,
+            eligible: eligible,
+            showType: showType,
+            customTitles: customTitles
+        )
+    }
+
+    private func discoverAddonHomeRows(
+        onUpdate: @escaping ([TVHomeSection]) -> Void
+    ) async -> (sections: [TVHomeSection], hadFailures: Bool, diagnostic: String) {
+        let activeProfileID = ProfileSettings.activeProfileID
+        let manifestURLs = Self.configuredStreamAddonManifestURLs
+        let hostGroups = Self.hostGroups(for: manifestURLs)
+        let showType = ProfileSettings.current.object(forKey: SettingsKey.homeCatalogShowType) as? Bool ?? true
+        let customTitles = TVHomeCatalogOrder.customCatalogTitles()
+        let deletedCatalogKeys = TVHomeCatalogOrder.deletedCatalogKeys()
+        let homeVisibility = TVHomeCatalogOrder.homeVisibilityContext()
+        var sectionsByManifest = Array<[TVHomeSection]?>(repeating: nil, count: manifestURLs.count)
+        var failures = Array<String?>(repeating: nil, count: manifestURLs.count)
+        var didPublish = false
+
+        let (events, continuation) = AsyncStream.makeStream(of: AddonManifestDiscoveryEvent.self)
+        let manifestTask = Task {
+            defer { continuation.finish() }
+            await withTaskGroup(of: Void.self) { group in
+                var nextGroup = 0
+                for _ in 0..<min(3, hostGroups.count) {
+                    let indices = hostGroups[nextGroup]
+                    nextGroup += 1
+                    group.addTask {
+                        for index in indices {
+                            guard !Task.isCancelled else { break }
+                            let url = manifestURLs[index]
+                            continuation.yield(AddonManifestDiscoveryEvent(
+                                index: index,
+                                manifestURL: url,
+                                manifest: await self.manifest(for: url)
+                            ))
+                        }
+                    }
+                }
+                while await group.next() != nil {
+                    guard nextGroup < hostGroups.count else { continue }
+                    let indices = hostGroups[nextGroup]
+                    nextGroup += 1
+                    group.addTask {
+                        for index in indices {
+                            guard !Task.isCancelled else { break }
+                            let url = manifestURLs[index]
+                            continuation.yield(AddonManifestDiscoveryEvent(
+                                index: index,
+                                manifestURL: url,
+                                manifest: await self.manifest(for: url)
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+
+        await withTaskCancellationHandler {
+            for await event in events {
+                guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else {
+                    manifestTask.cancel()
+                    break
+                }
+                guard let manifest = event.manifest else {
+                    failures[event.index] = "\(event.manifestURL.host ?? "unknown"): manifest failed"
+                    continue
+                }
+                guard let plan = makeAddonHomeProviderPlan(
+                    manifestIndex: event.index,
+                    manifestURL: event.manifestURL,
+                    manifest: manifest,
+                    showType: showType,
+                    customTitles: customTitles,
+                    deletedCatalogKeys: deletedCatalogKeys,
+                    homeVisibility: homeVisibility
+                ) else { continue }
+                sectionsByManifest[event.index] = addonHomeRowSections(for: plan)
+                didPublish = true
+                onUpdate(orderedAddonHomeRows(sectionsByManifest.compactMap { $0 }.flatMap { $0 }))
+            }
+        } onCancel: {
+            manifestTask.cancel()
+            continuation.finish()
+        }
+        await manifestTask.value
+
+        let sections = orderedAddonHomeRows(sectionsByManifest.compactMap { $0 }.flatMap { $0 })
+        if !didPublish { onUpdate(sections) }
+        let reports = failures.compactMap { $0 }
+        return (sections, !reports.isEmpty, reports.isEmpty ? "viewport descriptors ready" : reports.joined(separator: "; "))
+    }
+
+    private func addonHomeRowSections(for plan: AddonHomeProviderPlan) -> [TVHomeSection] {
+        let rows = plan.eligible.map { catalog -> TVHomeSection in
+            let settingsKey = TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: plan.addonID,
+                contentType: catalog.type,
+                catalogId: catalog.id
+            )
+            let title = TVHomeCatalogOrder.catalogDisplayTitle(
+                catalog.name ?? catalog.id,
+                contentType: catalog.type,
+                showType: plan.showType,
+                addonName: plan.displayName,
+                customTitle: plan.customTitles[settingsKey]
+            )
+            return TVHomeSection(
+                id: "addon_\(plan.addonID)_\(catalog.type)_\(catalog.id)",
+                title: title,
+                items: [],
+                contentType: catalog.type,
+                catalogId: catalog.id,
+                addonId: plan.addonID,
+                addonName: plan.displayName,
+                catalogGenre: catalog.requiresGenre ? catalog.firstGenreOption : nil,
+                manifestURL: plan.manifestURL.absoluteString,
+                manifestShowInHome: catalog.showInHome,
+                posterShape: catalog.posterShape,
+                isLoadingPlaceholder: true
+            )
+        }
+        return orderedAddonHomeRows(rows)
+    }
+
+    private func orderedAddonHomeRows(_ rows: [TVHomeSection]) -> [TVHomeSection] {
+        var sectionsByID: [String: TVHomeSection] = [:]
+        let catalogs = rows.map { row -> NuvioCatalog in
+            sectionsByID[row.id] = row
+            return NuvioCatalog(
+                id: row.id,
+                name: row.title,
+                description: row.title,
+                itemIds: [],
+                items: [],
+                contentType: row.contentType,
+                catalogId: row.catalogId,
+                addonId: row.addonId,
+                addonName: row.addonName,
+                catalogGenre: row.catalogGenre,
+                manifestURL: row.manifestURL,
+                manifestShowInHome: row.manifestShowInHome,
+                posterShape: row.posterShape
+            )
+        }
+        return orderedAddonCatalogs(catalogs).compactMap { sectionsByID[$0.id] }
+    }
+
+    private func loadAddonHostFirstPass(
+        _ providers: [AddonHomeProviderPlan],
+        activeProfileID: String?,
+        progress: AsyncStream<AddonHomeCatalogProgress>.Continuation
+    ) async -> [AddonHomeProviderResult] {
+        var results: [AddonHomeProviderResult] = []
+        for plan in providers {
+            guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else { break }
+            var loaded: [NuvioCatalog] = []
+            var missing: [AddonManifestCatalog] = []
+            for (rowIndex, catalog) in plan.eligible.enumerated() {
+                guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else { break }
+                if let row = await loadAddonHomeCatalog(catalog, provider: plan) {
+                    loaded.append(row)
+                    progress.yield(AddonHomeCatalogProgress(providerIndex: plan.index, rowIndex: rowIndex, catalog: row))
+                } else if !Task.isCancelled {
+                    missing.append(catalog)
+                }
+            }
+            results.append(AddonHomeProviderResult(plan: plan, catalogs: loaded, missing: missing))
+        }
+        return results
+    }
+
+    private func retryAddonHostMissingRows(
+        _ providers: [AddonHomeProviderResult],
+        activeProfileID: String?,
+        progress: AsyncStream<AddonHomeCatalogProgress>.Continuation
+    ) async -> [AddonHomeProviderResult] {
+        var results: [AddonHomeProviderResult] = []
+        for var provider in providers {
+            guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else { break }
+            var rowRank: [String: Int] = [:]
+            for (index, catalog) in provider.plan.eligible.enumerated() {
+                let key = "\(catalog.type)\u{1F}\(catalog.id)"
+                if rowRank[key] == nil { rowRank[key] = index }
+            }
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            var stillMissing: [AddonManifestCatalog] = []
+            for catalog in provider.missing {
+                guard !Task.isCancelled, ProfileSettings.activeProfileID == activeProfileID else { break }
+                if let row = await loadAddonHomeCatalog(catalog, provider: provider.plan) {
+                    provider.catalogs.append(row)
+                    if let rowIndex = rowRank["\(catalog.type)\u{1F}\(catalog.id)"] {
+                        progress.yield(AddonHomeCatalogProgress(providerIndex: provider.plan.index, rowIndex: rowIndex, catalog: row))
+                    }
+                } else if !Task.isCancelled {
+                    stillMissing.append(catalog)
+                }
+            }
+            provider.missing = stillMissing
+            provider.catalogs.sort { lhs, rhs in
+                let lhsIndex = rowRank["\(lhs.contentType ?? "")\u{1F}\(lhs.catalogId ?? "")"] ?? Int.max
+                let rhsIndex = rowRank["\(rhs.contentType ?? "")\u{1F}\(rhs.catalogId ?? "")"] ?? Int.max
+                return lhsIndex < rhsIndex
+            }
+            results.append(provider)
+        }
+        return results
+    }
+
+    private func loadAddonHomeCatalog(
+        _ catalog: AddonManifestCatalog,
+        provider: AddonHomeProviderPlan
+    ) async -> NuvioCatalog? {
+        let metadataContext = Self.metadataCacheContext
+        do {
+            let genre = catalog.requiresGenre ? catalog.firstGenreOption : nil
+            let url = try StremioCatalogURLBuilder.url(
+                baseURL: provider.manifestURL.deletingLastPathComponent(),
+                type: catalog.type,
+                catalogId: catalog.id,
+                genre: genre
+            )
+            let response: CinemetaCatalogResponse = try await fetch(url)
+            let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
+            guard !items.isEmpty else { return nil }
+            cacheMetadata(items, context: metadataContext)
+            let key = TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: provider.addonID,
+                contentType: catalog.type,
+                catalogId: catalog.id
+            )
+            let title = TVHomeCatalogOrder.catalogDisplayTitle(
+                catalog.name ?? catalog.id,
+                contentType: catalog.type,
+                showType: provider.showType,
+                addonName: provider.displayName,
+                customTitle: provider.customTitles[key]
+            )
+            return NuvioCatalog(
+                id: "addon_\(provider.addonID)_\(catalog.type)_\(catalog.id)",
+                name: title,
+                description: title,
+                itemIds: items.map(\.id),
+                items: items,
+                contentType: catalog.type,
+                catalogId: catalog.id,
+                addonId: provider.addonID,
+                addonName: provider.displayName,
+                catalogGenre: genre,
+                manifestURL: provider.manifestURL.absoluteString,
+                manifestShowInHome: catalog.showInHome,
+                posterShape: catalog.posterShape ?? items.first(where: { $0.posterShape != nil })?.posterShape
+            )
+        } catch {
+            return nil
+        }
     }
 
     private func orderedAddonCatalogs(_ catalogs: [NuvioCatalog]) -> [NuvioCatalog] {
@@ -3257,7 +3700,7 @@ struct CinemetaCatalogResponse: Decodable {
 /// The slice of a Stremio manifest the home screen needs: identity plus the
 /// catalog list (user-configured add-ons like MDBList expose their custom
 /// catalogs — Marvel, actors, lists — here).
-private struct AddonManifest: Decodable {
+private struct AddonManifest: Decodable, @unchecked Sendable {
     let id: String
     let name: String?
     let types: [String]?

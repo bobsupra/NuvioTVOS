@@ -2289,6 +2289,130 @@ enum EpisodeTagResolver {
     }
 }
 
+/// Evidence that a stream points at the requested episode. Only explicit,
+/// unambiguous single-episode labels count as a match or mismatch.
+struct StreamEpisodeTarget: Equatable, Hashable, Sendable {
+    let season: Int
+    let episode: Int
+    let allowsMismatch: Bool
+
+    init(season: Int, episode: Int, allowsMismatch: Bool = true) {
+        self.season = season
+        self.episode = episode
+        self.allowsMismatch = allowsMismatch
+    }
+
+    enum Match: String, CaseIterable, Sendable {
+        case confirmed
+        case unknown
+        case mismatch
+    }
+
+    func match(for stream: NuvioStream) -> Match {
+        // A dedicated filename is the strongest signal when it names one file.
+        if let filename = stream.filename {
+            switch Self.evidence(in: (filename as NSString).lastPathComponent) {
+            case .episode(let tag): return match(tag: tag)
+            case .ambiguous: return .unknown
+            case .none: break
+            }
+        }
+
+        let labels = [stream.name, stream.description].compactMap { $0 }
+        let evidence = labels.map { Self.evidence(in: $0) }
+        if evidence.contains(where: {
+            if case .ambiguous = $0 { return true }
+            return false
+        }) { return .unknown }
+        let parsed = evidence.compactMap { item -> StreamEpisodeTarget? in
+            if case .episode(let tag) = item { return tag }
+            return nil
+        }
+        if !parsed.isEmpty {
+            let distinct = Set(parsed)
+            guard distinct.count == 1 else { return .unknown }
+            return match(tag: parsed[0])
+        }
+
+        if let rawURL = stream.url, let url = URL(string: rawURL) {
+            return match(url: url)
+        }
+        return .unknown
+    }
+
+    func match(filename: String) -> Match {
+        let basename = (filename as NSString).lastPathComponent
+        guard case .episode(let tag) = Self.evidence(in: basename) else { return .unknown }
+        return match(tag: tag)
+    }
+
+    func match(url: URL) -> Match {
+        // Ignore query parameters: providers often place opaque IDs or tokens there.
+        guard let component = url.pathComponents.last,
+              component != "/", !component.isEmpty,
+              Self.isStructuredFilename(component),
+              let result = match(label: component) else { return .unknown }
+        return result
+    }
+
+    private func match(label: String) -> Match? {
+        guard case .episode(let tag) = Self.evidence(in: label) else { return nil }
+        return match(tag: tag)
+    }
+
+    private func match(tag: StreamEpisodeTarget) -> Match {
+        if tag.season == season && tag.episode == episode { return .confirmed }
+        return allowsMismatch ? .mismatch : .unknown
+    }
+
+    private static func isStructuredFilename(_ value: String) -> Bool {
+        let lower = value.lowercased()
+        return [".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".webm", ".m3u8", ".mpd"].contains { lower.hasSuffix($0) }
+    }
+
+    private static let episodeTagPatterns: [NSRegularExpression] = [
+        #"(?i)(?<![A-Za-z0-9])S(\d{1,2})[\s._-]*E(\d{1,3})(?![A-Za-z0-9])"#,
+        #"(?i)(?<![A-Za-z0-9])(\d{1,2})x(\d{1,3})(?![A-Za-z0-9])"#,
+        #"(?i)\bseason[\s._-]*(\d{1,2})[\s._-]*(?:episode|ep)[\s._-]*(\d{1,3})(?!\d)"#,
+        #"(?i)(?<![A-Za-z0-9])tt\d+:(\d{1,2}):(\d{1,3})(?![A-Za-z0-9])"#
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
+    private enum EpisodeEvidence {
+        case none
+        case ambiguous
+        case episode(StreamEpisodeTarget)
+    }
+
+    private static let ambiguousPatterns: [NSRegularExpression] = [
+        #"(?i)(?<![A-Za-z0-9])(?:complete\s+)?(?:series|season)\s*(?:\d+\s*)?(?:pack|collection)(?![A-Za-z0-9])"#,
+        #"(?i)(?<![A-Za-z0-9])(?:episodes?|eps?)\s*\d+\s*[-–&,+]\s*\d+(?![A-Za-z0-9])"#,
+        #"(?i)(?<![A-Za-z0-9])S\d{1,2}\s*[-–]\s*S?\d{1,2}(?![A-Za-z0-9])"#,
+        #"(?i)(?<![A-Za-z0-9])S\d{1,2}E\d{1,3}\s*[-–]\s*E?\d{1,3}(?![A-Za-z0-9])"#,
+        #"(?i)(?<![A-Za-z0-9])S\d{1,2}E\d{1,3}(?:\s*[,/+&]\s*E?\d{1,3})+(?![A-Za-z0-9])"#,
+        #"(?i)(?<![A-Za-z0-9])\d{1,2}x\d{1,3}\s*[-–]\s*(?:\d{1,2}x)?\d{1,3}(?![A-Za-z0-9])"#
+    ].compactMap { try? NSRegularExpression(pattern: $0) }
+
+    private static func evidence(in text: String) -> EpisodeEvidence {
+        // A label that advertises a pack, episode set, or range cannot safely
+        // identify the one file represented by the stream.
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        if ambiguousPatterns.contains(where: { !$0.matches(in: text, range: range).isEmpty }) { return .ambiguous }
+
+        var values: Set<StreamEpisodeTarget> = []
+        for regex in episodeTagPatterns {
+            for result in regex.matches(in: text, range: range) {
+                guard result.numberOfRanges >= 3,
+                      let seasonRange = Range(result.range(at: 1), in: text),
+                      let episodeRange = Range(result.range(at: 2), in: text),
+                      let s = Int(text[seasonRange]), let e = Int(text[episodeRange]) else { continue }
+                values.insert(StreamEpisodeTarget(season: s, episode: e))
+            }
+        }
+        guard values.count == 1 else { return values.isEmpty ? .none : .ambiguous }
+        return .episode(values.first!)
+    }
+}
+
 struct TrailerPlaybackSource {
     let videoUrl: String
     let audioUrl: String?
@@ -5846,7 +5970,7 @@ struct NuvioCollectionCatalogSource: Codable, Equatable {
 /// One folder card inside a Home collection row (Android-style grouping).
 /// Selecting it opens the folder's resolved catalog sources, rather than
 /// flattening those catalogs into top-level Home rows.
-struct TVCollectionFolderItem: Identifiable, Hashable {
+struct TVCollectionFolderItem: Identifiable, Hashable, Sendable {
     let id: String
     let collectionId: String
     let folderId: String

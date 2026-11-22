@@ -133,6 +133,40 @@ final class DetailsPrimaryMetadataReadinessTests: XCTestCase {
         viewModel.cancelAllTasks()
     }
 
+    func testCanonicalMetadataUpgradePreservesExplicitEpisodeRequest() async {
+        let episode = NuvioVideo(
+            id: "tmdb:12345:2:4",
+            title: "Episode",
+            season: 2,
+            episode: 4
+        )
+        let meta = NuvioMeta(
+            id: "tmdb:12345",
+            name: "Series",
+            imdbId: "tt1234567",
+            tmdbId: 12345,
+            type: "series",
+            videos: [episode]
+        )
+        let repository = PrimaryPlaybackCatalogRepository(metadata: meta)
+        let viewModel = DetailsViewModel(
+            repository: repository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: { throw CancellationError() },
+            enrichmentStarter: { _, _ in }
+        )
+
+        viewModel.prepareStreams(forId: episode.id, type: "series", episode: episode)
+        await viewModel.loadDetails(id: meta.id, type: meta.type).value
+
+        XCTAssertEqual(viewModel.requestedStreamId, "tt1234567:2:4")
+        XCTAssertEqual(viewModel.requestedStreamEpisode, episode)
+        viewModel.triggerStreamPreFetch(for: meta)
+        XCTAssertEqual(viewModel.requestedStreamId, "tt1234567:2:4")
+
+        viewModel.cancelAllTasks()
+    }
+
     func testMoreLikeThisPrefetchRejectsNonCanonicalIdAndPrefetchesResolvedCanonicalId() {
         let nonCanonicalMeta = NuvioMeta(id: "tmdb:12345", name: "TMDB Movie", type: "movie")
         let repository = PrimaryPlaybackCatalogRepository(metadata: nonCanonicalMeta)

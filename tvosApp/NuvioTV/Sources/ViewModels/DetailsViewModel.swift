@@ -46,6 +46,7 @@ enum DetailsSavedPlaybackTargetResolver {
         profileID: String?,
         reuseEnabled: Bool,
         manualPicker: Bool,
+        allowsEpisodeMismatch: Bool = true,
         lookup: Lookup
     ) -> DetailsSavedPlaybackTarget? {
         guard reuseEnabled, !manualPicker,
@@ -54,6 +55,14 @@ enum DetailsSavedPlaybackTargetResolver {
               let scheme = url.scheme?.lowercased(), !scheme.isEmpty else { return nil }
         if scheme == "http" || scheme == "https" {
             guard url.host != nil else { return nil }
+        }
+        if let episode,
+           StreamEpisodeTarget(
+                season: episode.season,
+                episode: episode.episode,
+                allowsMismatch: allowsEpisodeMismatch
+           ).match(url: url) == .mismatch {
+            return nil
         }
         return DetailsSavedPlaybackTarget(url: url, httpHeaders: saved.httpHeaders)
     }
@@ -454,6 +463,8 @@ class DetailsViewModel: ObservableObject {
     /// The stream id of what the viewer chose to play on this title. Once set,
     /// pre-fetch may not load another episode's streams over it.
     private(set) var chosenStreamId: String?
+    private(set) var requestedStreamEpisode: NuvioVideo?
+    private var requestedStreamIsBackgroundPrefetch = false
 
     private let repository: CatalogRepository
     private let streamDiscoveryMode: DetailsStreamDiscoveryMode
@@ -520,12 +531,24 @@ class DetailsViewModel: ObservableObject {
         prefetchStartTime = nil
         chosenStreamId = nil
         if let requested = requestedStreamId {
-            let isSameTarget = requested == id
-                || (requested.hasPrefix("tmdb:") && id.hasPrefix("tmdb:"))
-                || (requested.hasPrefix("tt") && id.hasPrefix("tt"))
+            let isSameTarget: Bool
+            if requestedStreamEpisode != nil {
+                isSameTarget = requested == id
+                    || requested.hasPrefix(id + ":")
+                    || uiState.meta?.matches(id: id) == true
+            } else {
+                isSameTarget = requested == id
+                    || (requested.hasPrefix("tmdb:") && id.hasPrefix("tmdb:"))
+                    || (requested.hasPrefix("tt") && id.hasPrefix("tt"))
+            }
             if !isSameTarget {
                 requestedStreamId = nil
+                requestedStreamEpisode = nil
+                requestedStreamIsBackgroundPrefetch = false
             }
+        } else if requestedStreamEpisode != nil {
+            requestedStreamEpisode = nil
+            requestedStreamIsBackgroundPrefetch = false
         }
         detailsRequestGeneration &+= 1
         let requestGeneration = detailsRequestGeneration
@@ -605,7 +628,19 @@ class DetailsViewModel: ObservableObject {
 
                 // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
                 // reload them immediately with the resolved canonical stream id.
-                if let requested = self.requestedStreamId {
+                if let episode = self.requestedStreamEpisode {
+                    let episodeStreamId = resolvedMeta.canonicalEpisodeStreamId(for: episode)
+                    if self.requestedStreamId != episodeStreamId {
+                        if self.chosenStreamId == self.requestedStreamId { self.chosenStreamId = episodeStreamId }
+                        self.prepareStreams(
+                            forId: episodeStreamId,
+                            type: "series",
+                            forceRefresh: true,
+                            episode: episode,
+                            isBackgroundPrefetch: self.requestedStreamIsBackgroundPrefetch
+                        )
+                    }
+                } else if let requested = self.requestedStreamId {
                     let canonical = Self.streamIdAfterMetadataLoad(requested: requested, metaStreamId: resolvedMeta.streamId)
                     if canonical != requested {
                         if self.chosenStreamId == requested { self.chosenStreamId = canonical }
@@ -684,6 +719,8 @@ class DetailsViewModel: ObservableObject {
         prefetchStartTime = nil
         chosenStreamId = nil
         requestedStreamId = nil
+        requestedStreamEpisode = nil
+        requestedStreamIsBackgroundPrefetch = false
     }
 
     func resolveDefaultPlayTarget(for meta: NuvioMeta) -> (streamId: String, episode: NuvioVideo?)? {
@@ -747,6 +784,7 @@ class DetailsViewModel: ObservableObject {
     }
 
     func triggerStreamPreFetch(for meta: NuvioMeta) {
+        guard requestedStreamEpisode == nil || requestedStreamIsBackgroundPrefetch else { return }
         let prefetchEnabled = (ProfileSettings.current.object(forKey: SettingsKey.backgroundStreamPreFetch) as? Bool) ?? true
         guard prefetchEnabled else { return }
 
@@ -768,7 +806,12 @@ class DetailsViewModel: ObservableObject {
         } else {
             print("[PreFetch] 🚀 Started background stream pre-fetch for \"\(meta.name)\" (streamId: \(targetStreamId))")
         }
-        prepareStreams(forId: targetStreamId, type: contentType)
+        prepareStreams(
+            forId: targetStreamId,
+            type: contentType,
+            episode: targetEpisode,
+            isBackgroundPrefetch: true
+        )
     }
 
     /// AniList's score first (an AniList title's own, or a Cinemeta anime's), then MDBList and the
@@ -1214,10 +1257,23 @@ class DetailsViewModel: ObservableObject {
     ///   cancel the shared search
     ///
     /// `forceRefresh` restarts discovery for the same key (explicit refresh).
-    func prepareStreams(forId streamId: String, type: String, forceRefresh: Bool = false) {
+    func prepareStreams(
+        forId streamId: String,
+        type: String,
+        forceRefresh: Bool = false,
+        episode: NuvioVideo? = nil,
+        isBackgroundPrefetch: Bool = false
+    ) {
         streamObserveTask?.cancel()
 
         let targetId: String = {
+            if let episode {
+                if let currentMeta = uiState.meta, currentMeta.matches(id: streamId) {
+                    return currentMeta.canonicalEpisodeStreamId(for: episode)
+                }
+                return streamId
+            }
+
             if !Self.isNonCanonicalStreamId(streamId) { return streamId }
             if let currentMeta = uiState.meta, currentMeta.matches(id: streamId), !Self.isNonCanonicalStreamId(currentMeta.streamId) {
                 return currentMeta.streamId
@@ -1233,16 +1289,19 @@ class DetailsViewModel: ObservableObject {
             return streamId
         }()
         requestedStreamId = targetId
+        requestedStreamEpisode = episode
+        requestedStreamIsBackgroundPrefetch = isBackgroundPrefetch
 
         if streamDiscoveryMode == .shared {
-            prepareSharedStreams(forId: targetId, type: type, forceRefresh: forceRefresh)
+            prepareSharedStreams(forId: targetId, type: type, forceRefresh: forceRefresh, episode: episode)
         } else {
             prepareRepositoryStreams(forId: targetId, type: type)
         }
     }
 
-    private func prepareSharedStreams(forId streamId: String, type: String, forceRefresh: Bool) {
-        let se = StreamsRepository.seasonEpisode(fromVideoId: streamId)
+    private func prepareSharedStreams(forId streamId: String, type: String, forceRefresh: Bool, episode: NuvioVideo?) {
+        let se: (season: Int?, episode: Int?) = episode.map { ($0.season, $0.episode) }
+            ?? StreamsRepository.seasonEpisode(fromVideoId: streamId)
         let key = StreamsRepository.requestKey(
             type: type,
             videoId: streamId,

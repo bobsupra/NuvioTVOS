@@ -2089,10 +2089,8 @@ extension View {
 
 /// A card standing in for one whose row has no data yet.
 ///
-/// This is the one place a spinner still belongs: the row's catalog request is
-/// genuinely outstanding and will either answer or fail, unlike a single poster
-/// URL that can hang forever with nothing left to report. Uses the same
-/// lightweight card modifier as loaded posters so loading rows remain cheap.
+/// Keeps focusable geometry for a catalog that is still loading. The shared
+/// row-level spinner lives in `TVLoadingCatalogRow`; placeholder cards stay inert.
 struct LoadingPosterCard: View {
     let width: CGFloat
     let height: CGFloat
@@ -2105,13 +2103,7 @@ struct LoadingPosterCard: View {
     }
 
     var body: some View {
-        ZStack {
-            Color.clear
-
-            ProgressView()
-                .progressViewStyle(.circular)
-                .tint(.white.opacity(0.55))
-        }
+        Color.clear
         .frame(width: width, height: height)
         .background {
             if !isLiquidGlassEnabled {
