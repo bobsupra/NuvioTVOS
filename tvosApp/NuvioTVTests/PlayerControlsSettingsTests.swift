@@ -196,11 +196,11 @@ final class ActionPlaybackSessionTests: XCTestCase {
         ProfileSettings.setActiveProfile(profileID, isPrimary: false)
         WatchedStore.setActiveProfile(profileID)
         ContinueWatchingStore.setActiveProfile(profileID)
-        LastPlaybackStreamStore.save(metaId: meta.id, url: savedURL, season: 1, episode: 1)
+        LastPlaybackStreamStore.save(metaId: meta.id, url: savedURL, season: 1, episode: 1, profileId: profileID)
     }
 
     override func tearDown() {
-        LastPlaybackStreamStore.remove(metaId: meta.id, season: 1, episode: 1)
+        LastPlaybackStreamStore.remove(metaId: meta.id, season: 1, episode: 1, profileId: profileID)
         ContinueWatchingStore.eraseProfile(profileID)
         WatchedStore.eraseProfile(profileID)
         WatchedStore.setActiveProfile(previousWatchedID)
@@ -258,7 +258,7 @@ final class ActionPlaybackSessionTests: XCTestCase {
         XCTAssertNil(ContinueWatchingStore.item(for: meta.id), file: file, line: line)
         XCTAssertFalse(WatchedStore.contains(meta: meta), file: file, line: line)
         XCTAssertFalse(WatchedStore.containsEpisode(meta: meta, season: 1, episode: 1), file: file, line: line)
-        XCTAssertEqual(LastPlaybackStreamStore.load(metaId: meta.id, season: 1, episode: 1)?.url, savedURL, file: file, line: line)
+        XCTAssertEqual(LastPlaybackStreamStore.load(metaId: meta.id, season: 1, episode: 1, profileId: profileID)?.url, savedURL, file: file, line: line)
     }
 
     @MainActor

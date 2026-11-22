@@ -4077,7 +4077,8 @@ class PlayerViewModel: ObservableObject {
             }
         }
 
-        let isPresentingFrames = (hasPresentedCurrentLoad || c.isPlayerPlaying || hasRenderedFirstFrame || time.current > 0.5)
+        let isPresentingFrames = sessionCoordinator.hasDispatchedCurrentLoad(generation: sampledLoadGeneration)
+            && (hasPresentedCurrentLoad || c.isPlayerPlaying || hasRenderedFirstFrame || time.current > 0.5)
             && (c.hasFirstFrameReadyForDisplay || (c.isPlayerPlaying && !c.isPlayerLoading && (c.videoFrameSize != .zero || c.durationMs > 0)))
         if isPresentingFrames {
             if !hasRenderedFirstFrame {
@@ -4126,7 +4127,9 @@ class PlayerViewModel: ObservableObject {
             || (engineStatus == .paused && time.duration > 0 && !c.isPlayerLoading)
             || hasRenderedFirstFrame
             || time.current > 0.5
-        if (hasPresentedCurrentLoad || hasRenderedFirstFrame || engineStatus == .playing || time.current > 0.5) && engineHasStarted {
+        if sessionCoordinator.hasDispatchedCurrentLoad(generation: sampledLoadGeneration)
+            && (hasPresentedCurrentLoad || hasRenderedFirstFrame || engineStatus == .playing || time.current > 0.5)
+            && engineHasStarted {
             isAwaitingStreamStart = false
             hasRenderedFirstFrame = true
             markLoadStarted()
@@ -4136,12 +4139,14 @@ class PlayerViewModel: ObservableObject {
         // idle pipeline reads as paused. Keep reporting `.buffering` until it
         // really starts, so a source/episode switch shows the spinner over the
         // black frame instead of parked transport controls.
+        let isStartingPlayback = engineStatus == .paused || engineStatus == .playing
         let isAwaitingCurrentLoadDispatch = !sessionCoordinator.hasDispatchedCurrentLoad(
             generation: sampledLoadGeneration
         )
         let isAwaitingAetherPresentation = sampledEngineKind == .aether && !hasPresentedCurrentLoad && !hasRenderedFirstFrame
         let latestStatus = (isAwaitingStreamStart
             && !hasRenderedFirstFrame
+            && isStartingPlayback
             && (engineStatus == .paused || isAwaitingCurrentLoadDispatch || isAwaitingAetherPresentation))
             ? .buffering
             : engineStatus
