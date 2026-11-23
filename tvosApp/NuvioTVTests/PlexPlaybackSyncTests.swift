@@ -21,7 +21,7 @@ final class PlexPlaybackSyncTests: XCTestCase {
             premiereDate: nil, durationMs: nil, imdbId: nil, tmdbId: nil, thumb: nil, art: nil, cast: nil, directors: nil,
             items: [item]
         )
-        try PlexLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
+        try await PlexLibraryIndex.shared.replace(titles: [title], forServerID: serverID)
         PlexLibraryIndex.shared.setWatchStates(["101": PlexWatchState(viewOffsetMs: 120_000)], forServerID: serverID, merging: false)
         sent = []
         sync = PlexPlaybackSync()
@@ -94,7 +94,7 @@ final class PlexPlaybackSyncTests: XCTestCase {
         XCTAssertTrue(sent.isEmpty)
     }
 
-    func testInProgressTakesEachTitlesLatestEpisodeWithinSixteenWeeks() throws {
+    func testInProgressTakesEachTitlesLatestEpisodeWithinSixteenWeeks() async throws {
         let now = Date(timeIntervalSince1970: 1_700_000_000)
         func episode(_ key: String, _ number: Int) -> PlexIndexedItem {
             PlexIndexedItem(ratingKey: key, partKey: "/library/parts/\(key)/1/file.mkv", container: nil, size: nil, durationMs: 600_000, season: 1, episode: number)
@@ -107,7 +107,7 @@ final class PlexPlaybackSyncTests: XCTestCase {
                 items: items
             )
         }
-        try PlexLibraryIndex.shared.replace(titles: [
+        try await PlexLibraryIndex.shared.replace(titles: [
             show("A", [episode("a1", 1), episode("a2", 2)]),
             show("B", [episode("b1", 1)]),
             show("C", [episode("c1", 1)])

@@ -24,8 +24,8 @@ struct PlexServerConfig: Codable, Identifiable, Equatable {
     /// count from here too, so a sync that fails waits the usual interval
     /// instead of running again on the next stream list.
     var lastSyncAttemptDate: Date?
-    /// Libraries too large to sync (more than `PlexClient.syncItemLimit`
-    /// items) by id, with the item count the server reported, or 0 when it
+    /// Libraries too large to sync (past what was left of the server's
+    /// `PlexClient.syncItemLimit`) by id, with the item count the server reported, or 0 when it
     /// didn't say. A stream list asks the server about its title instead.
     var oversizedLibraries: [String: Int]?
 

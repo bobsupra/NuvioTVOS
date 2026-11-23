@@ -258,6 +258,120 @@ final class PlexLargeLibraryTests: XCTestCase {
         XCTAssertEqual(outcome.states["9"]?.viewOffsetMs, 60_000)
     }
 
+    func testLibrariesShareTheLimitSoTheOneThatWouldPassItIsFoundPerTitle() async throws {
+        PlexLargeLibraryMockURLProtocol.requestHandler = { request in
+            let start = Int(self.query(request)["X-Plex-Container-Start"] ?? "0") ?? 0
+            let movies = (start..<min(start + 500, 600)).map { self.item("m\($0)", type: "movie", title: "Movie \($0)") }
+            return self.respond(request, json: self.container(movies, totalSize: 600))
+        }
+        let outcome = try await PlexSessionManager.syncLibraries(
+            [
+                PlexLibrary(id: "1", name: "Movies", type: "movie", changeMarker: "m1"),
+                PlexLibrary(id: "2", name: "Movies 4K", type: "movie", changeMarker: "u1")
+            ],
+            client: client, serverID: "srv",
+            previousTitles: [], previousMarkers: [:], knownOversized: [:], force: false,
+            budget: 1_000
+        )
+        XCTAssertEqual(outcome.titles.count, 600)
+        XCTAssertEqual(outcome.oversized, ["2": 600])
+        XCTAssertEqual(outcome.markers, ["1": "m1"])
+        XCTAssertEqual(outcome.syncedLibraries, 1)
+    }
+
+    func testAnUnchangedLibraryUsesUpTheLimitToo() async throws {
+        var requests = 0
+        PlexLargeLibraryMockURLProtocol.requestHandler = { request in
+            requests += 1
+            return self.respond(request, json: self.container([self.item("9", type: "movie", title: "Up")], totalSize: 1))
+        }
+        let movies = PlexLibrary(id: "1", name: "Movies", type: "movie", changeMarker: "m1")
+        // Listed with their file formats, so an unchanged library is kept.
+        let synced = [media("Old", year: 2000), media("Older", year: 1990)].map { movie -> PlexMediaItem in
+            var movie = movie
+            movie.files = [PlexFile(partKey: "/p/1", container: nil, sizeBytes: nil, label: nil, details: PlexFileDetails())]
+            return movie
+        }
+        let kept = PlexLibraryResolver.resolve(movies: synced, shows: [], episodes: [], serverID: "srv", library: movies)
+        let outcome = try await PlexSessionManager.syncLibraries(
+            [movies, PlexLibrary(id: "2", name: "Kids", type: "movie", changeMarker: "k1")],
+            client: client, serverID: "srv",
+            previousTitles: kept, previousMarkers: ["1": "m1"], knownOversized: [:], force: false,
+            budget: 2
+        )
+        // Movies is kept without a request and fills the limit, so Kids is too large.
+        XCTAssertEqual(outcome.titles.map(\.name), ["Old", "Older"])
+        XCTAssertEqual(outcome.oversized, ["2": 1])
+        XCTAssertEqual(requests, 1)
+    }
+
+    func testAFailedLibrarysOldTitlesUseUpTheLimitToo() async throws {
+        PlexLargeLibraryMockURLProtocol.requestHandler = { request in
+            if request.url?.path == "/library/sections/1/all" { return self.respond(request, json: "{}", status: 500) }
+            return self.respond(request, json: self.container([self.item("9", type: "movie", title: "Up")], totalSize: 1))
+        }
+        let movies = PlexLibrary(id: "1", name: "Movies", type: "movie", changeMarker: "m2")
+        let kept = PlexLibraryResolver.resolve(movies: [media("Old", year: 2000)], shows: [], episodes: [], serverID: "srv", library: movies)
+        let outcome = try await PlexSessionManager.syncLibraries(
+            [movies, PlexLibrary(id: "2", name: "Kids", type: "movie", changeMarker: "k1")],
+            client: client, serverID: "srv",
+            previousTitles: kept, previousMarkers: ["1": "m1"], knownOversized: [:], force: false,
+            budget: 1
+        )
+        XCTAssertEqual(outcome.titles.map(\.name), ["Old"])
+        XCTAssertEqual(outcome.failures.map(\.name), ["Movies"])
+        XCTAssertEqual(outcome.oversized, ["2": 1])
+    }
+
+    func testShowsPastTheLimitCountTheirEpisodesToo() async throws {
+        PlexLargeLibraryMockURLProtocol.requestHandler = { request in
+            if self.query(request)["type"] == "4" {
+                return self.respond(request, json: self.container(
+                    [self.item("e1", type: "episode", title: "Pilot", show: "s1", season: 1, episode: 1)], totalSize: 1
+                ))
+            }
+            return self.respond(request, json: self.container([self.item("s1", type: "show", title: "Show", withFile: false)], totalSize: 2))
+        }
+        let outcome = try await PlexSessionManager.syncLibraries(
+            [PlexLibrary(id: "3", name: "TV", type: "show", changeMarker: "t1")],
+            client: client, serverID: "srv",
+            previousTitles: [], previousMarkers: [:], knownOversized: [:], force: false,
+            budget: 2
+        )
+        XCTAssertTrue(outcome.titles.isEmpty)
+        XCTAssertEqual(outcome.oversized, ["3": 3])
+    }
+
+    func testAPageThatTimesOutIsAskedForAgain() async throws {
+        var requests = 0
+        PlexLargeLibraryMockURLProtocol.requestHandler = { request in
+            requests += 1
+            if requests == 1 { throw URLError(.timedOut) }
+            return self.respond(request, json: self.container([self.item("9", type: "movie", title: "Up")], totalSize: 1))
+        }
+        let items = try await client.items(libraryID: "1", type: .movie)
+        XCTAssertEqual(items.map(\.ratingKey), ["9"])
+        XCTAssertEqual(requests, 2)
+    }
+
+    @MainActor
+    func testEachLibraryIsSavedAndReadBackInOrder() async throws {
+        let index = PlexLibraryIndex.shared
+        let serverID = "per-library-save-test-server"
+        let movies = PlexLibrary(id: "1", name: "Movies", type: "movie")
+        let kids = PlexLibrary(id: "2", name: "Kids", type: "movie")
+        let inMovies = PlexLibraryResolver.resolve(movies: [media("Up", year: 2009)], shows: [], episodes: [], serverID: serverID, library: movies)
+        let inKids = PlexLibraryResolver.resolve(movies: [media("Cars", year: 2006)], shows: [], episodes: [], serverID: serverID, library: kids)
+        try await index.replace(titles: inKids + inMovies, forServerID: serverID)
+        index.reload()
+        XCTAssertEqual(index.titlesByServerID[serverID], inKids + inMovies)
+
+        try await index.replace(titles: inMovies, forServerID: serverID)
+        index.reload()
+        XCTAssertEqual(index.titlesByServerID[serverID], inMovies)
+        index.removeAll(forServerID: serverID)
+    }
+
     func testServerSavedBeforeTheseFieldsStillLoads() throws {
         let json = #"{"id":"a","displayName":"Friend","baseURLString":"","isOwned":false,"selectedLibraryIDs":["1"],"syncAutomatically":true}"#
         let server = try JSONDecoder().decode(PlexServerConfig.self, from: Data(json.utf8))
