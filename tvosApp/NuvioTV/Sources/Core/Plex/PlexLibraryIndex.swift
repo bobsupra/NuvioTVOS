@@ -197,6 +197,14 @@ final class PlexLibraryIndex: ObservableObject {
     /// replayed link is recognised from here. Saved, newest last, at most
     /// `rememberedLimit`.
     private var rememberedItems: [PlexRememberedItem] = []
+
+    /// Libraries known to be on disk exactly as they are in memory, by
+    /// server: read from their files or written by `replace`. Anything else
+    /// is written by the next `replace`, changed or not.
+    private var savedLibraryIDs: [String: Set<String>] = [:]
+    /// Bumped by `removeAll`, so a `replace` that was writing when its
+    /// server was removed doesn't put the titles back.
+    private var removals: [String: Int] = [:]
     nonisolated static let rememberedLimit = 200
 
     enum IndexError: LocalizedError {
@@ -205,14 +213,14 @@ final class PlexLibraryIndex: ObservableObject {
     }
 
     private init() {
-        titlesByServerID = Self.load()
+        (titlesByServerID, savedLibraryIDs) = Self.loadTitles()
         watchStatesByServerID = Self.loadWatchStates()
         rememberedItems = Self.loadRememberedItems()
         PlexWatched.rebuild(titles: titlesByServerID, states: watchStatesByServerID)
     }
 
     func reload() {
-        titlesByServerID = Self.load()
+        (titlesByServerID, savedLibraryIDs) = Self.loadTitles()
         watchStatesByServerID = Self.loadWatchStates()
         rememberedItems = Self.loadRememberedItems()
         lookedUpTitles = [:]
@@ -479,10 +487,32 @@ final class PlexLibraryIndex: ObservableObject {
         return minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m"
     }
 
-    func replace(titles: [PlexIndexedTitle], forServerID serverID: String) throws {
+    /// Saves each library of the server that changed to its own file, off
+    /// the main actor, then shows the new titles. One file per library keeps
+    /// the memory a save needs to that of the largest library, and the main
+    /// actor stays free while a large library is written.
+    func replace(titles: [PlexIndexedTitle], forServerID serverID: String) async throws {
+        let previous = Dictionary(grouping: titlesByServerID[serverID] ?? [], by: \.libraryID)
+        let onDisk = savedLibraryIDs[serverID] ?? []
+        let libraries = Self.groupedByLibrary(titles)
+        let changed = libraries.filter { !onDisk.contains($0.libraryID) || previous[$0.libraryID] != $0.titles }
+        let order = libraries.map(\.libraryID)
+        let prefix = Self.storagePrefix
+        let removal = removals[serverID, default: 0]
+        let saved = await Self.onWriteQueue {
+            Self.writeServer(serverID, changed: changed, order: order, prefix: prefix)
+        }
+        // The server was removed or the profile changed while this was
+        // written: `removeAll`'s delete is queued after the write, and the
+        // titles stay out of memory.
+        guard removals[serverID, default: 0] == removal, Self.storagePrefix == prefix else { throw CancellationError() }
+        guard saved else {
+            savedLibraryIDs[serverID] = nil
+            throw IndexError.persistenceFailed
+        }
+        savedLibraryIDs[serverID] = Set(order)
         var updated = titlesByServerID
         updated[serverID] = titles
-        guard persist(updated) else { throw IndexError.persistenceFailed }
         titlesByServerID = updated
         PlexWatched.rebuild(titles: updated, states: watchStatesByServerID)
         NotificationCenter.default.post(name: Self.changedNotification, object: nil)
@@ -507,17 +537,150 @@ final class PlexLibraryIndex: ObservableObject {
                 _ = LargePayloadStore.write(data, key: Self.watchStateKey, directory: Self.storageDirectoryName)
             }
         }
+        // Deleted from disk even when nothing is in memory: a sync may be
+        // writing the server's first titles right now.
+        removals[serverID, default: 0] += 1
+        savedLibraryIDs[serverID] = nil
+        let prefix = Self.storagePrefix
+        Self.writeQueue.async { _ = Self.writeServer(serverID, changed: [], order: [], prefix: prefix) }
         var updated = titlesByServerID
         guard updated.removeValue(forKey: serverID) != nil else { return }
-        guard persist(updated) else { return }
         titlesByServerID = updated
         PlexWatched.rebuild(titles: updated, states: watchStatesByServerID)
         NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     }
 
-    private static let storageDirectoryName = "plexLibraryIndex"
-    private static var storageKey: String {
+    nonisolated private static let storageDirectoryName = "plexLibraryIndex"
+    /// Where every server's titles were saved as one file, before each
+    /// library got its own.
+    static var legacyStorageKey: String {
         "plexLibraryIndex.\(ProfileSettings.activeProfileID ?? "default")"
+    }
+    /// What the active profile's keys start with. Not the legacy key plus a
+    /// suffix, so no profile id can make one look like the other.
+    private static var storagePrefix: String {
+        "plexLibraryIndex.v2|\(ProfileSettings.activeProfileID ?? "default")|"
+    }
+    /// A saved index larger than this is from a library past today's limit:
+    /// reading it again could take more memory than tvOS allows. About
+    /// 190,000 items.
+    nonisolated static let legacyByteLimit = 150 * 1_048_576
+
+    /// Waits for the saves already asked for.
+    nonisolated static func waitForPendingWrites() { writeQueue.sync {} }
+    /// The library ids saved for each server, in their order.
+    nonisolated private static func manifestKey(prefix: String) -> String { prefix + "servers" }
+    nonisolated private static func libraryKey(prefix: String, serverID: String, libraryID: String) -> String {
+        prefix + "library|\(serverID)|\(libraryID)"
+    }
+
+    /// Saves are written one after another, in the order they were asked for.
+    nonisolated private static let writeQueue = DispatchQueue(label: "nuvio.tv.plex.libraryIndex.write", qos: .utility)
+
+    /// Main-actor isolated on purpose: the work is queued before the caller
+    /// suspends, so it keeps its place ahead of anything the main actor
+    /// queues next (a `removeAll`'s delete).
+    private static func onWriteQueue<T>(_ work: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            writeQueue.async { continuation.resume(returning: work()) }
+        }
+    }
+
+    /// A server's titles by library, in the order the libraries come.
+    nonisolated static func groupedByLibrary(_ titles: [PlexIndexedTitle]) -> [(libraryID: String, titles: [PlexIndexedTitle])] {
+        var order: [String] = []
+        var byLibrary: [String: [PlexIndexedTitle]] = [:]
+        for title in titles {
+            if byLibrary[title.libraryID] == nil { order.append(title.libraryID) }
+            byLibrary[title.libraryID, default: []].append(title)
+        }
+        return order.map { ($0, byLibrary[$0] ?? []) }
+    }
+
+    /// Writes the changed libraries, then the server's library list, then
+    /// deletes the files of libraries no longer listed. An empty `order`
+    /// removes the server. Runs on `writeQueue`.
+    nonisolated private static func writeServer(
+        _ serverID: String,
+        changed: [(libraryID: String, titles: [PlexIndexedTitle])],
+        order: [String],
+        prefix: String
+    ) -> Bool {
+        let encoder = JSONEncoder()
+        for library in changed {
+            // One library's data at a time: it's released before the next.
+            guard let data = try? encoder.encode(library.titles),
+                  LargePayloadStore.write(data, key: libraryKey(prefix: prefix, serverID: serverID, libraryID: library.libraryID), directory: storageDirectoryName)
+            else { return false }
+        }
+        var manifest = readManifest(prefix: prefix) ?? [:]
+        let previous = manifest[serverID] ?? []
+        manifest[serverID] = order.isEmpty ? nil : order
+        guard let data = try? encoder.encode(manifest),
+              LargePayloadStore.write(data, key: manifestKey(prefix: prefix), directory: storageDirectoryName) else { return false }
+        for libraryID in previous where !order.contains(libraryID) {
+            LargePayloadStore.remove(key: libraryKey(prefix: prefix, serverID: serverID, libraryID: libraryID), directory: storageDirectoryName)
+        }
+        return true
+    }
+
+    nonisolated private static func readManifest(prefix: String) -> [String: [String]]? {
+        guard let data = LargePayloadStore.read(key: manifestKey(prefix: prefix), directory: storageDirectoryName) else { return nil }
+        return try? JSONDecoder().decode([String: [String]].self, from: data)
+    }
+
+    /// The active profile's titles, library by library. Titles saved in the
+    /// single file of earlier versions are read once and saved again a
+    /// library at a time.
+    /// A library whose file is missing is left out, and a sync lists it
+    /// again: it is neither in memory nor among the saved libraries.
+    private static func loadTitles() -> (titles: [String: [PlexIndexedTitle]], saved: [String: Set<String>]) {
+        // A save still queued for this profile would otherwise be missed.
+        waitForPendingWrites()
+        let prefix = storagePrefix
+        if let manifest = readManifest(prefix: prefix) {
+            var result: [String: [PlexIndexedTitle]] = [:]
+            var saved: [String: Set<String>] = [:]
+            let decoder = JSONDecoder()
+            for (serverID, libraryIDs) in manifest {
+                var titles: [PlexIndexedTitle] = []
+                for libraryID in libraryIDs {
+                    guard let data = LargePayloadStore.read(key: libraryKey(prefix: prefix, serverID: serverID, libraryID: libraryID), directory: storageDirectoryName),
+                          let decoded = try? decoder.decode([PlexIndexedTitle].self, from: data) else { continue }
+                    titles += decoded
+                    saved[serverID, default: []].insert(libraryID)
+                }
+                if !titles.isEmpty { result[serverID] = titles }
+            }
+            return (result, saved)
+        }
+        let legacyKey = legacyStorageKey
+        guard let data = LargePayloadStore.read(key: legacyKey, directory: storageDirectoryName) else { return ([:], [:]) }
+        guard data.count <= legacyByteLimit,
+              let decoded = try? JSONDecoder().decode([String: [PlexIndexedTitle]].self, from: data) else {
+            // Too large to read safely, or unreadable: the next sync lists
+            // the libraries again under the shared limit.
+            LargePayloadStore.remove(key: legacyKey, directory: storageDirectoryName)
+            return ([:], [:])
+        }
+        // Every library first, then one manifest: until all of them are on
+        // disk, the legacy file stays the one that is read.
+        let servers = decoded.mapValues(groupedByLibrary)
+        writeQueue.async {
+            let encoder = JSONEncoder()
+            for (serverID, libraries) in servers {
+                for library in libraries {
+                    guard let data = try? encoder.encode(library.titles),
+                          LargePayloadStore.write(data, key: libraryKey(prefix: prefix, serverID: serverID, libraryID: library.libraryID), directory: storageDirectoryName)
+                    else { return }
+                }
+            }
+            guard let manifest = try? encoder.encode(servers.mapValues { $0.map(\.libraryID) }),
+                  LargePayloadStore.write(manifest, key: manifestKey(prefix: prefix), directory: storageDirectoryName) else { return }
+            LargePayloadStore.remove(key: legacyKey, directory: storageDirectoryName)
+        }
+        // Not marked saved: a sync before the migration finishes writes them too.
+        return (decoded, [:])
     }
 
     private static var watchStateKey: String {
@@ -546,14 +709,4 @@ final class PlexLibraryIndex: ObservableObject {
         }
     }
 
-    private func persist(_ titles: [String: [PlexIndexedTitle]]) -> Bool {
-        guard let data = try? JSONEncoder().encode(titles) else { return false }
-        return LargePayloadStore.write(data, key: Self.storageKey, directory: Self.storageDirectoryName)
-    }
-
-    private static func load() -> [String: [PlexIndexedTitle]] {
-        guard let data = LargePayloadStore.read(key: storageKey, directory: storageDirectoryName),
-              let decoded = try? JSONDecoder().decode([String: [PlexIndexedTitle]].self, from: data) else { return [:] }
-        return decoded
-    }
 }

@@ -460,7 +460,11 @@ final class PlexSessionManager: ObservableObject {
                 }
                 let titles = outcome.titles
                 if titles != previousTitles {
-                    try PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
+                    try await PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
+                    // Saving can take seconds: a disconnect, a Plex Home
+                    // switch or a profile switch may have come in meanwhile.
+                    try Task.checkCancellation()
+                    guard self.activeProfileID == profileID else { return }
                 }
                 // Kept, failed and oversized libraries keep their states; what
                 // was played in them since the last read arrives through
@@ -496,6 +500,11 @@ final class PlexSessionManager: ObservableObject {
     /// as they were. A library whose listing fails keeps its titles and
     /// marker from the last sync; one too large to sync is skipped, and one
     /// already known to be too large isn't asked again unless `force`.
+    ///
+    /// `budget` is shared by every library: each one listed or kept uses up
+    /// its items, and a library that would pass what is left is too large to
+    /// sync. A per-library limit let several libraries just under it add up to
+    /// more than the Apple TV could hold.
     /// Throws only for cancellation and a refused token.
     nonisolated static func syncLibraries(
         _ libraries: [PlexLibrary],
@@ -505,23 +514,37 @@ final class PlexSessionManager: ObservableObject {
         previousMarkers: [String: String],
         knownOversized: [String: Int],
         force: Bool,
+        budget: Int = PlexClient.syncItemLimit,
         onProgress: @escaping (_ found: Int, _ library: String) -> Void = { _, _ in }
     ) async throws -> PlexLibrarySyncOutcome {
         var outcome = PlexLibrarySyncOutcome()
         var found = 0
+        var remaining = budget
+        func markOversized(_ library: PlexLibrary, itemCount: Int) {
+            outcome.oversized[library.id] = itemCount
+            outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: itemCount))
+        }
         for library in libraries {
             try Task.checkCancellation()
             // Only the Sync button checks again: a library past the limit
             // rarely drops under it, and each check downloads a page of it.
             if !force, let count = knownOversized[library.id] {
-                outcome.oversized[library.id] = count
-                outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: count))
+                markOversized(library, itemCount: count)
                 continue
             }
             let kept = previousTitles.filter { $0.libraryID == library.id }
-            // Titles synced before file formats were kept are listed once more.
-            let hasFileDetails = kept.isEmpty || kept.contains { $0.items.contains { $0.details != nil } }
+            // Titles synced before file formats were kept are listed once more,
+            // and so is a library with nothing kept: its titles may be missing
+            // from disk, and an empty library costs one request.
+            let hasFileDetails = kept.contains { $0.items.contains { $0.details != nil } }
+            // About as a listing counts it: each show and each playable item.
+            let keptItems = kept.reduce(0) { $0 + $1.items.count + ($1.type == "series" ? 1 : 0) }
             if !force, hasFileDetails, let marker = library.changeMarker, previousMarkers[library.id] == marker {
+                if keptItems > remaining {
+                    markOversized(library, itemCount: keptItems)
+                    continue
+                }
+                remaining -= keptItems
                 outcome.markers[library.id] = marker
                 outcome.titles += kept
                 found += kept.reduce(0) { $0 + $1.items.count }
@@ -531,21 +554,27 @@ final class PlexSessionManager: ObservableObject {
             }
             let foundBefore = found
             let progress: (Int, Int?) -> Void = { count, _ in onProgress(foundBefore + count, library.name) }
+            // Episodes listed before the shows turned out too many.
+            var listedEpisodes = 0
             do {
                 if library.type == "movie" {
-                    let movies = try await client.items(libraryID: library.id, type: .movie, onPageFetched: progress)
+                    let movies = try await client.items(libraryID: library.id, type: .movie, maxItems: remaining, onPageFetched: progress)
+                    remaining -= movies.count
                     found += movies.count
                     for movie in movies { outcome.states[movie.ratingKey] = PlexWatchState(movie) }
                     outcome.titles += PlexLibraryResolver.resolve(movies: movies, shows: [], episodes: [], serverID: serverID, library: library)
                 } else {
                     // Episodes first: in a library too large to sync they are
                     // what passes the limit, and the first page says so.
-                    let episodes = try await client.items(libraryID: library.id, type: .episode, onPageFetched: progress)
+                    let episodes = try await client.items(libraryID: library.id, type: .episode, maxItems: remaining, onPageFetched: progress)
+                    listedEpisodes = episodes.count
                     let shows = try await client.items(
                         libraryID: library.id,
                         type: .show,
+                        maxItems: remaining - episodes.count,
                         onPageFetched: { count, total in progress(episodes.count + count, total) }
                     )
+                    remaining -= episodes.count + shows.count
                     found += episodes.count + shows.count
                     for episode in episodes { outcome.states[episode.ratingKey] = PlexWatchState(episode) }
                     outcome.titles += PlexLibraryResolver.resolve(movies: [], shows: shows, episodes: episodes, serverID: serverID, library: library)
@@ -557,17 +586,20 @@ final class PlexSessionManager: ObservableObject {
             } catch let error as PlexClient.ClientError where error.isUnauthorized {
                 throw error
             } catch let error as PlexClient.ClientError where error.isLibraryTooLarge {
-                outcome.oversized[library.id] = error.itemCount ?? 0
-                outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: error.itemCount ?? 0))
+                markOversized(library, itemCount: error.itemCount.map { $0 + listedEpisodes } ?? 0)
             } catch {
                 if let count = knownOversized[library.id] {
                     // The Sync button couldn't check it again: still too large.
-                    outcome.oversized[library.id] = count
-                    outcome.oversizedLibraries.append(PlexSyncReport.OversizedLibrary(name: library.name, itemCount: count))
+                    markOversized(library, itemCount: count)
                     continue
                 }
-                outcome.titles += kept
-                if let marker = previousMarkers[library.id] { outcome.markers[library.id] = marker }
+                // Its titles from the last sync use up the limit like any others;
+                // past it they go, and the next sync lists the library again.
+                if keptItems <= remaining {
+                    remaining -= keptItems
+                    outcome.titles += kept
+                    if let marker = previousMarkers[library.id] { outcome.markers[library.id] = marker }
+                }
                 outcome.failures.append(PlexSyncReport.LibraryFailure(name: library.name, reason: error.localizedDescription))
                 outcome.firstFailure = outcome.firstFailure ?? error
                 outcome.listedEverything = false

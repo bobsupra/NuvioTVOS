@@ -117,8 +117,8 @@ struct PlexClient {
         let message: String
         /// The token was refused: the user has to sign in again.
         var isUnauthorized = false
-        /// The library holds more items than one listing reads
-        /// (`syncItemLimit`).
+        /// The library holds more items than the listing may read: past
+        /// what is left of the server's `syncItemLimit`.
         var isLibraryTooLarge = false
         /// How many items the server said the library holds, when it said.
         var itemCount: Int? = nil
@@ -441,10 +441,12 @@ struct PlexClient {
         case episode = 4
     }
 
-    /// The most items one listing reads. A library with more is too large to
-    /// keep on the Apple TV, so its titles are looked up one at a time
-    /// (`search`) when a stream list opens.
-    static let syncItemLimit = 500_000
+    /// The most items one server's sync keeps, all its libraries together
+    /// (movies, shows and episodes). A library that would pass it is too
+    /// large to keep on the Apple TV, so its titles are looked up one at a
+    /// time (`search`) when a stream list opens. Saving 637,000 items took
+    /// about 3 GB of memory, more than tvOS lets an app use.
+    static let syncItemLimit = 150_000
 
     /// Every item of one type in a section. A single request per page covers a
     /// whole library (episodes included), so syncs need no per-show requests.
@@ -460,6 +462,7 @@ struct PlexClient {
         maxItems: Int = PlexClient.syncItemLimit,
         onPageFetched: ((Int, Int?) -> Void)? = nil
     ) async throws -> [PlexMediaItem] {
+        let maxItems = max(0, maxItems)
         var all: [PlexMediaItem] = []
         var start = 0
         let pageSize = 500
@@ -891,8 +894,19 @@ struct PlexClient {
         request.timeoutInterval = 30
         Self.apply(Self.identityHeaders(token: token), to: &request)
         var attempt = 0
+        var transientFailures = 0
         while true {
-            let (data, response) = try await session.data(for: request)
+            let data: Data
+            let response: URLResponse
+            do {
+                (data, response) = try await session.data(for: request)
+            } catch let error as URLError where Self.isTransient(error) && transientFailures < Self.transientRetries {
+                // A large library's later pages can take the server a while;
+                // one slow page shouldn't end the sync.
+                try await Task.sleep(nanoseconds: UInt64(Self.retryDelay(retryAfter: nil, attempt: transientFailures) * 1_000_000_000))
+                transientFailures += 1
+                continue
+            }
             if let http = response as? HTTPURLResponse,
                http.statusCode == 429 || http.statusCode == 503,
                attempt < 5 {
@@ -904,6 +918,13 @@ struct PlexClient {
             try Self.validate(response)
             return data
         }
+    }
+
+    /// How many times a request that timed out or lost its connection is sent again.
+    static let transientRetries = 2
+
+    static func isTransient(_ error: URLError) -> Bool {
+        error.code == .timedOut || error.code == .networkConnectionLost
     }
 
     /// The server's `Retry-After` when it sends one, otherwise 1, 2, 4, 8, 16 s, capped at 30 s.
