@@ -14,6 +14,22 @@ struct MdbListUserRating: Equatable, Hashable {
     var identity: String { contentID }
 }
 
+/// Settings → Tracking → Ratings source: where the viewer's own ratings are
+/// saved and shown from. Off, the default, shows no rate button, as before
+/// the setting existed. Simkl ratings are not offered on the Apple TV.
+enum TrackingRatingSource {
+    static let off = "Off"
+    static let mdbList = "MDBList"
+    static let options = [off, mdbList]
+
+    /// MDBList is chosen and its account is connected.
+    @MainActor
+    static func usesMdbList(in settings: UserDefaults) -> Bool {
+        settings.string(forKey: SettingsKey.ratingSource) == mdbList
+            && MdbListRuntimeSession.isAuthenticated(in: settings)
+    }
+}
+
 @MainActor
 enum MdbListRatingsService {
     static let changedNotification = Notification.Name("nuvio.tv.mdblist.ratings.changed")

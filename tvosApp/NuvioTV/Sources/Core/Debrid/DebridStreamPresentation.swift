@@ -64,6 +64,15 @@ struct DebridStreamPresentation {
         }
     }
 
+    /// True for a result `present` renamed after the debrid service confirmed
+    /// it: a torrent marked cached whose name ends as `formattedDebridStream`
+    /// writes it for this provider.
+    static func isFormattedResult(_ stream: NuvioStream, provider: DebridProviderKind) -> Bool {
+        guard stream.isCached == true, stream.isDebridResolvable, let name = stream.name else { return false }
+        let shortName = provider.shortName.isEmpty ? "Debrid" : provider.shortName
+        return name == "\(shortName) Instant" || name.hasSuffix(" \(shortName) Instant")
+    }
+
     private func formattedDebridStream(
         _ stream: NuvioStream,
         provider: DebridProviderKind,
@@ -107,5 +116,93 @@ struct DebridStreamPresentation {
             isCached: true,
             httpHeaders: stream.httpHeaders
         )
+    }
+}
+
+/// Settings → Connected Services → Result Management: Result rules, Max
+/// results, Per resolution limit, Per quality limit and Size range. The
+/// rules reorder and filter the debrid results in the source lists a viewer
+/// picks from, and the limits trim what is left. Other sources are never
+/// hidden or moved, and auto-select and the reload after a failed link rank
+/// every source.
+struct DebridResultLimits {
+    static let maxResultChoices = [0, 5, 10, 20, 50]
+    static let perGroupChoices = [0, 1, 2, 3, 5]
+    /// "min-max" in GB, 0 for no bound, as the other apps offer them.
+    static let anySize = "Any"
+    static let sizeRanges = [anySize, "0-5", "0-10", "5-20", "10-50", "20-100"]
+
+    let isDebridEnabled: Bool
+    let maxResults: Int
+    let maxPerResolution: Int
+    let maxPerQuality: Int
+    let sizeMinGB: Int
+    let sizeMaxGB: Int
+    /// The preferred, required and excluded values (see `DebridResultRules`).
+    let rules: DebridResultRules
+
+    init(settings: UserDefaults) {
+        isDebridEnabled = DebridResolver(store: settings).isEnabled
+        maxResults = max(settings.integer(forKey: SettingsKey.debridMaxResults), 0)
+        maxPerResolution = max(settings.integer(forKey: SettingsKey.debridMaxPerResolution), 0)
+        maxPerQuality = max(settings.integer(forKey: SettingsKey.debridMaxPerQuality), 0)
+        let range = settings.string(forKey: SettingsKey.debridSizeRange) ?? Self.anySize
+        let bounds = Self.sizeRanges.contains(range) ? range.split(separator: "-").compactMap { Int($0) } : []
+        sizeMinGB = bounds.count == 2 ? bounds[0] : 0
+        sizeMaxGB = bounds.count == 2 ? bounds[1] : 0
+        rules = DebridResultRules.load(settings: settings)
+    }
+
+    /// False with the defaults, when every result is shown.
+    var isActive: Bool {
+        isDebridEnabled
+            && (maxResults > 0 || maxPerResolution > 0 || maxPerQuality > 0 || sizeMinGB > 0 || sizeMaxGB > 0
+                || !rules.isEmpty)
+    }
+
+    /// A torrent the debrid service resolves, or a link marked as cached there.
+    static func isDebridResult(_ stream: NuvioStream) -> Bool {
+        guard !stream.isNotPlayable else { return false }
+        return stream.isDebridResolvable
+            || stream.isCached == true
+            || StreamQualityTags.parse(stream: stream).isCached
+    }
+
+    /// `sorted` with the debrid results that have a preferred value moved
+    /// ahead of the other debrid results, and without the ones the rules
+    /// hide or the limits cut. Should that leave nothing to play, `sorted`
+    /// is returned as it came.
+    func applied(to sorted: [NuvioStream]) -> [NuvioStream] {
+        guard isActive else { return sorted }
+        let ordered = rules.preferredFirst(sorted, isRuled: Self.isDebridResult)
+        let filtersByRule = rules.hasFilters
+        let bytesPerGB: Int64 = 1_073_741_824
+        var shown = 0
+        var perResolution: [Int: Int] = [:]
+        var perQuality: [DebridStreamQuality: Int] = [:]
+        let limited = ordered.filter { stream in
+            guard Self.isDebridResult(stream) else { return true }
+            if filtersByRule, !rules.matches(DebridStreamFacts.facts(for: stream)) { return false }
+            // A result of unknown size passes the size range.
+            let size = StreamPickerListBuilder.sizeBytes(for: stream)
+            if size > 0 {
+                if sizeMinGB > 0, size < Int64(sizeMinGB) * bytesPerGB { return false }
+                if sizeMaxGB > 0, size > Int64(sizeMaxGB) * bytesPerGB { return false }
+            }
+            if maxResults > 0, shown >= maxResults { return false }
+            let resolution = StreamPickerListBuilder.resolution(for: stream)
+            let quality = StreamPickerListBuilder.streamQuality(for: stream)
+            if maxPerResolution > 0, perResolution[resolution, default: 0] >= maxPerResolution { return false }
+            if maxPerQuality > 0, perQuality[quality, default: 0] >= maxPerQuality { return false }
+            shown += 1
+            perResolution[resolution, default: 0] += 1
+            perQuality[quality, default: 0] += 1
+            return true
+        }
+        let isPlayable: (NuvioStream) -> Bool = { !$0.isNotPlayable && $0.unavailabilityReason == nil }
+        if !limited.contains(where: isPlayable), sorted.contains(where: isPlayable) {
+            return sorted
+        }
+        return limited
     }
 }

@@ -303,6 +303,8 @@ final class ICloudSettingsSyncManager: ObservableObject {
             guard !SettingsKey.deviceLocal.contains(key),
                   !SettingsKey.syncedViaAddonRPC.contains(key) else { continue }
             if let value = defaults.object(forKey: key) {
+                // A custom accent stays on this Apple TV; see exportSettings.
+                if key == SettingsKey.theme, SettingsAccent.isCustomStorageValue(value) { continue }
                 // Only encode plist-compatible types supported by NSUbiquitousKeyValueStore
                 if let str = value as? String {
                     payload[key] = str
@@ -327,6 +329,16 @@ final class ICloudSettingsSyncManager: ObservableObject {
             guard SettingsKey.all.contains(key),
                   !SettingsKey.deviceLocal.contains(key),
                   !SettingsKey.syncedViaAddonRPC.contains(key) else { continue }
+            // A countdown copied from the other apps' add-on wait is not brought back.
+            if key == SettingsKey.autoPlayNextCountdown,
+               !ProfileSettings.isNextEpisodeCountdownRowValue(value) {
+                continue
+            }
+            // The stored theme does not replace a custom accent chosen here.
+            if key == SettingsKey.theme,
+               SettingsAccent.isCustomStorageValue(defaults.object(forKey: key)) {
+                continue
+            }
             // Don't overwrite if identical
             let currentVal = defaults.object(forKey: key)
             if let strVal = value as? String, (currentVal as? String) != strVal {

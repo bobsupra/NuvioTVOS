@@ -797,6 +797,7 @@ struct ProductionBrowseCard: View {
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+    @Environment(\.cardAppearance) private var cardAppearance
 
     private var cardCornerRadius: CGFloat {
         AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
@@ -861,6 +862,8 @@ struct ProductionBrowseCard: View {
                         coveredByArtwork: true
                     )
                 )
+                // Settings → Poster Card Style → Card depth effect.
+                .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .posters, shape: shape))
                 .overlay(
                     shape.stroke(
                         isFocused ? AppFocusOutline.color : .clear,

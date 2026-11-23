@@ -218,6 +218,18 @@ enum PlaybackChapters {
         settings.object(forKey: SettingsKey.timelineSegmentsEnabled) as? Bool ?? false
     }
 
+    /// Whether chapters are marked on the progress bar (on by default).
+    static func showsChapters(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.showChapters) as? Bool ?? true
+    }
+
+    /// Whether the current chapter's name is shown by the time (on by default).
+    /// There is no name without the chapter marks.
+    static func showsChapterTitle(in settings: UserDefaults) -> Bool {
+        showsChapters(in: settings)
+            && (settings.object(forKey: SettingsKey.showChapterTitle) as? Bool ?? true)
+    }
+
     /// Seeking snap is always enabled; ignore the legacy profile preference.
     static func snapsWhileSeeking(in _: UserDefaults) -> Bool {
         true

@@ -349,12 +349,21 @@ final class StreamsRepository: ObservableObject {
 
     /// One-shot collect for player source switching / next-episode resolve.
     /// Reuses an in-flight or completed request for the same key.
+    ///
+    /// `waitRule` is Settings → Stream Selection → Stream Selection Timeout
+    /// for a caller that auto-selects. `sourceFilter` is that caller's
+    /// Auto-play Source Scope: only streams it may pick count as playable
+    /// while waiting. `isPickable` narrows them further to what the caller's
+    /// other rules would pick. Every stream is still returned.
     func collectStreams(
         type: String,
         videoId: String,
         season: Int? = nil,
         episode: Int? = nil,
-        forceRefresh: Bool = false
+        forceRefresh: Bool = false,
+        waitRule: StreamSelectionTimeout.Rule = .automatic,
+        sourceFilter: StreamAutoPlaySources.Filter? = nil,
+        isPickable: ((NuvioStream) -> Bool)? = nil
     ) async -> [NuvioStream] {
         let se = (season == nil && episode == nil)
             ? Self.seasonEpisode(fromVideoId: videoId)
@@ -365,7 +374,14 @@ final class StreamsRepository: ObservableObject {
 
         var firstPlayableTime: Date?
         let playableGracePeriod: TimeInterval = 2.5
-        let maxWaitTimeout: TimeInterval = 12.0
+        let maxWaitTimeout: TimeInterval
+        switch waitRule {
+        case .automatic: maxWaitTimeout = 12.0
+        // A longer chosen wait is honoured while nothing playable has come.
+        case .seconds(let seconds): maxWaitTimeout = max(12.0, Double(seconds))
+        // Every add-on, with the hard stop the other apps use.
+        case .unlimited: maxWaitTimeout = 60.0
+        }
         let startTime = Date()
 
         // Wait until this key is no longer loading (or a newer key took over).
@@ -376,13 +392,32 @@ final class StreamsRepository: ObservableObject {
                     return snapshot.allStreams
                 }
 
-                let hasPlayable = snapshot.allStreams.contains { !$0.isNotPlayable && ($0.url != nil || $0.infoHash != nil) }
+                var pickable: [NuvioStream]
+                if let sourceFilter, sourceFilter.isActive {
+                    pickable = sourceFilter.candidates(from: snapshot.allStreams, groups: snapshot.groups)
+                } else {
+                    pickable = snapshot.allStreams
+                }
+                if let isPickable {
+                    pickable = pickable.filter(isPickable)
+                }
+                let hasPlayable = pickable.contains { !$0.isNotPlayable && ($0.url != nil || $0.infoHash != nil) }
                 if hasPlayable {
-                    if firstPlayableTime == nil {
-                        firstPlayableTime = Date()
-                    } else if let first = firstPlayableTime, Date().timeIntervalSince(first) >= playableGracePeriod {
-                        print("[StreamsRepo] Early return for key=\(key) with \(snapshot.allStreams.count) streams (grace period elapsed, avoiding hung providers).")
-                        return snapshot.allStreams
+                    switch waitRule {
+                    case .automatic:
+                        if firstPlayableTime == nil {
+                            firstPlayableTime = Date()
+                        } else if let first = firstPlayableTime, Date().timeIntervalSince(first) >= playableGracePeriod {
+                            print("[StreamsRepo] Early return for key=\(key) with \(snapshot.allStreams.count) streams (grace period elapsed, avoiding hung providers).")
+                            return snapshot.allStreams
+                        }
+                    case .seconds(let seconds):
+                        // The chosen wait is over: pick from what has arrived.
+                        if Date().timeIntervalSince(startTime) >= Double(seconds) {
+                            return snapshot.allStreams
+                        }
+                    case .unlimited:
+                        break
                     }
                 }
             }
@@ -490,6 +525,9 @@ final class StreamsRepository: ObservableObject {
         let pluginVideoId = await Self.pluginVideoId(for: videoId)
         guard !Task.isCancelled else { return }
         let pluginTargets = PluginStreamDiscovery.targets(type: type, videoID: pluginVideoId)
+        // One group per scraper, or per repository with Settings → Plugins →
+        // Group plugin providers by repository.
+        let pluginGroups = PluginStreamDiscovery.providerGroups(for: pluginTargets)
 
         guard !enabledURLs.isEmpty || !pluginTargets.isEmpty || startingAIO else {
             state = StreamsDiscoveryState(
@@ -570,7 +608,7 @@ final class StreamsRepository: ObservableObject {
                 isLoading: true,
                 error: nil
             )
-        } + pluginTargets.map {
+        } + pluginGroups.map {
             AddonStreamGroup(addonId: $0.groupID, displayName: $0.displayName, streams: [], isLoading: true, error: nil)
         } + (startingAIO
             ? [AddonStreamGroup(addonId: Self.startingAIOGroupID, displayName: "AIOStreams", streams: [], isLoading: true, error: nil)]
@@ -599,10 +637,10 @@ final class StreamsRepository: ObservableObject {
                     }
                 }
             }
-            for target in pluginTargets {
+            for target in pluginGroups {
                 group.addTask { [weak self] in
                     let result = await PluginStreamDiscovery.fetchGroup(
-                        target: target,
+                        target,
                         type: type,
                         videoID: pluginVideoId,
                         onPartial: { [weak self] partial in
@@ -1026,6 +1064,23 @@ final class StreamsRepository: ObservableObject {
             guard let stream = raw.toNuvioStream(addonName: addonName) else { return nil }
             return logo.map { stream.withAddonLogoURL($0) } ?? stream
         }
+    }
+
+    /// The enabled add-ons that offer streams, by the name their streams
+    /// carry, in the configured order. Plugins are not included. For
+    /// Settings → Stream Selection → Allowed Addons.
+    static func streamAddonDisplayNames() async -> [String] {
+        let urls = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+            .filter { !PluginAddonRegistry.isVirtualAddon($0) }
+        let manifests = await loadManifestsConcurrently(urls: urls)
+        var names: [String] = []
+        for url in urls {
+            guard let manifest = manifests[url],
+                  (manifest.resources ?? []).contains(where: { $0.name.caseInsensitiveCompare("stream") == .orderedSame }) else { continue }
+            let name = CinemetaCatalogRepository.streamAddonDisplayName(for: url, manifestName: manifest.displayName)
+            if !names.contains(name) { names.append(name) }
+        }
+        return names
     }
 
     // MARK: - Manifest cache

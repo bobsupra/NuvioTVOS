@@ -250,6 +250,13 @@ actor AniListOfflineMaps {
         }
     }
 
+    /// Waits for the tables when they are being downloaded for the first
+    /// time, for a lookup that can wait. Returns at once when they are there.
+    func waitForFirstTables() async {
+        guard await ready() == nil else { return }
+        await refreshing?.value
+    }
+
     /// Waits for a download running now, for Settings' "Update".
     func refreshNow() async {
         if index == nil, !triedDisk { _ = await ready() }

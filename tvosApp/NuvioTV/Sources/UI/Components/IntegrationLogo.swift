@@ -72,8 +72,50 @@ struct IntegrationStatusRow: View {
     let logo: IntegrationLogo
     let title: String
     let subtitle: String
+    @Environment(\.settingsInCard) private var inCard
 
     var body: some View {
+        if inCard {
+            // In a Settings section card it matches the other rows: their
+            // inset, a page row's 50 pt logo tile, and the row fonts.
+            HStack(spacing: 16) {
+                IntegrationLogoView(logo: logo, size: 36)
+                    .frame(width: 50, height: 50)
+                    .background(
+                        RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            .fill(Color.white.opacity(0.10))
+                    )
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title)
+                        .font(.appFont(size: 22, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.82)
+
+                    Text(subtitle)
+                        .font(.appFont(size: 17, weight: .medium))
+                        .foregroundColor(.white.opacity(0.56))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 16)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+            .frame(minHeight: 74)
+            .overlay(alignment: .bottom) {
+                Rectangle()
+                    .fill(Color.white.opacity(0.07))
+                    .frame(height: 1)
+                    .padding(.horizontal, 20)
+            }
+        } else {
+            plate
+        }
+    }
+
+    private var plate: some View {
         HStack(alignment: .top, spacing: 18) {
             IntegrationLogoView(logo: logo, size: 62)
 

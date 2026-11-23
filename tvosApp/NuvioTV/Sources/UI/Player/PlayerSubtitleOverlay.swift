@@ -16,6 +16,8 @@ struct PlayerSubtitleOverlay: View {
     let aspectMode: PlayerAspectMode
     let style: SubtitleStyle
     let controlsVisible: Bool
+    /// Settings → Subtitles → Strip SDH Subtitles.
+    private let stripsSDH = ProfileSettings.current.object(forKey: SettingsKey.subtitleStripSDH) as? Bool ?? false
 
     private var textSize: CGFloat {
         min(max(CGFloat(style.textSize) / 100 * 55, 2), 125)
@@ -94,8 +96,9 @@ struct PlayerSubtitleOverlay: View {
                     VStack(spacing: 10) {
                         ForEach(activeTextCues) { cue in
                             if let raw = cue.text,
-                               let plain = ASSPlainTextFallback.text(from: raw) {
-                                outlinedText(plain, alignment: .center)
+                               let plain = ASSPlainTextFallback.text(from: raw),
+                               let shown = stripsSDH ? SubtitleSDHFilter.stripped(plain) : plain {
+                                outlinedText(shown, alignment: .center)
                             }
                         }
                     }
@@ -170,12 +173,29 @@ struct PlayerSubtitleOverlay: View {
     private func textBody(_ cue: SubtitleCue, alignment: TextAlignment = .center) -> some View {
         switch cue.body {
         case .text(let string):
-            outlinedText(translation.translatedText(for: cue) ?? string, alignment: alignment)
+            if let translated = translation.translatedText(for: cue) {
+                outlinedText(translated, alignment: alignment)
+            } else if !stripsSDH {
+                outlinedText(string, alignment: alignment)
+            } else if let shown = SubtitleSDHFilter.stripped(string) {
+                // A cue that was only a description draws nothing.
+                outlinedText(shown, alignment: alignment)
+            }
         case .richText(let runs):
             if let translated = translation.translatedText(for: cue) {
                 outlinedText(translated, alignment: alignment)
-            } else {
+            } else if !stripsSDH {
                 outlinedRichText(runs, alignment: alignment)
+            } else {
+                // A styled cue with nothing to remove keeps its styling. One
+                // that loses a description is drawn as plain text.
+                let whole = runs.map(\.text).joined()
+                let shown = SubtitleSDHFilter.stripped(whole)
+                if shown == whole {
+                    outlinedRichText(runs, alignment: alignment)
+                } else if let shown {
+                    outlinedText(shown, alignment: alignment)
+                }
             }
         case .image:
             EmptyView()
@@ -263,6 +283,39 @@ struct PlayerSubtitleOverlay: View {
                 return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
             }
         }
+    }
+}
+
+/// Settings → Subtitles → Strip SDH Subtitles, for text the app draws
+/// itself (AetherEngine's text subtitles). MPVKit uses mpv's own filter.
+enum SubtitleSDHFilter {
+    private static let bracketed = try! NSRegularExpression(pattern: #"\[[^\]]*\]"#)
+    private static let parenthesised = try! NSRegularExpression(pattern: #"\([^)]*\)"#)
+    /// A speaker label in capitals at the start of a line ("MAN:", "- DR. LEE:"). A clock
+    /// time ("AT 10:30") is not one.
+    private static let speakerLabel = try! NSRegularExpression(
+        // At least two capital letters and at most three words, so "I:" and
+        // a shouted sentence that happens to hold a colon are left alone.
+        pattern: #"^(\s*-?\s*)(?=[^:\n]*[A-Z][^:\n]*[A-Z])[A-Z0-9.'#&-]{1,20}(?: [A-Z0-9.'#&-]{1,20}){0,2}:(?!\d)[ \t]*"#,
+        options: [.anchorsMatchLines]
+    )
+
+    /// The text without sound descriptions and speaker labels, or nil when
+    /// nothing is left of it.
+    static func stripped(_ text: String) -> String? {
+        var result = text
+        for (expression, template) in [(bracketed, ""), (parenthesised, ""), (speakerLabel, "$1")] {
+            result = expression.stringByReplacingMatches(
+                in: result, range: NSRange(result.startIndex..., in: result), withTemplate: template
+            )
+        }
+        guard result != text else { return text }
+        let lines = result.components(separatedBy: "\n")
+            .map { $0.replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
+                .trimmingCharacters(in: .whitespaces) }
+            // A line left with only a dash or music notes had nothing but a description.
+            .filter { !$0.trimmingCharacters(in: CharacterSet(charactersIn: "-\u{2013}\u{2014}♪♫ ")).isEmpty }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 }
 
@@ -431,7 +484,7 @@ private struct SubtitleBackgroundModifier: ViewModifier {
                 .background(
                     Color(hex: style.backgroundColorHex)
                         .opacity(Double(min(max(style.backgroundOpacity, 0), 100)) / 100),
-                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    in: RoundedRectangle(cornerRadius: style.resolvedBackgroundRadius, style: .continuous)
                 )
         } else {
             content
@@ -439,9 +492,32 @@ private struct SubtitleBackgroundModifier: ViewModifier {
     }
 }
 
+/// Subtitle Style → Drop shadow: black, at the shadow's opacity times the
+/// text's, offset down and to the right by its size and softened by it.
+private struct SubtitleShadowModifier: ViewModifier {
+    let style: SubtitleStyle
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if style.hasShadow {
+            let size = CGFloat(style.resolvedShadowSize)
+            content.shadow(
+                color: .black.opacity(style.resolvedShadowOpacity * Double(min(max(style.textOpacity, 0), 100)) / 100),
+                radius: size,
+                x: size,
+                y: size
+            )
+        } else {
+            content
+        }
+    }
+}
+
 private extension View {
+    /// The text's drop shadow, then the backdrop behind both.
     func subtitleBackground(style: SubtitleStyle) -> some View {
-        modifier(SubtitleBackgroundModifier(style: style))
+        modifier(SubtitleShadowModifier(style: style))
+            .modifier(SubtitleBackgroundModifier(style: style))
     }
 }
 

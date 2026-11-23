@@ -423,3 +423,208 @@ private extension IntroDBSegment {
         return SkipInterval(startTime: start, endTime: end, type: type, provider: "introdb")
     }
 }
+
+// MARK: - Anime Skip
+
+/// Settings → Skip Segments → Anime Skip and AnimeSkip Client ID.
+enum AnimeSkipSettings {
+    /// The client ID as typed, trimmed. Empty until the user enters one:
+    /// the app ships none.
+    static func clientID(in settings: UserDefaults = ProfileSettings.current) -> String {
+        (settings.string(forKey: SettingsKey.animeSkipClientID) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// On, and a client ID is entered. Without both nothing is asked.
+    static func isActive(in settings: UserDefaults = ProfileSettings.current) -> Bool {
+        (settings.object(forKey: SettingsKey.animeSkipEnabled) as? Bool ?? false) && !clientID(in: settings).isEmpty
+    }
+}
+
+/// Skip timestamps from anime-skip.com for one episode of an AniList entry.
+/// Every failure (no network, a refused client ID, an unknown show) is an
+/// empty answer. The client ID goes only into the request's header.
+final class AnimeSkipService: @unchecked Sendable {
+    static let shared = AnimeSkipService()
+
+    private static let endpoint = URL(string: "https://api.anime-skip.com/graphql")!
+    private static let requestTimeout: TimeInterval = 10
+
+    private struct Response: Decodable {
+        let data: Payload?
+    }
+
+    private struct Payload: Decodable {
+        let findShowsByExternalId: [Show]?
+        let findEpisodesByShowId: [Episode]?
+    }
+
+    private struct Show: Decodable {
+        let id: String
+    }
+
+    struct Episode: Decodable {
+        let season: String?
+        let number: String?
+        let baseDuration: Double?
+        let timestamps: [Timestamp]?
+    }
+
+    struct Timestamp: Decodable {
+        struct Kind: Decodable {
+            let name: String
+        }
+        let at: Double
+        let type: Kind
+    }
+
+    private let session: URLSession
+    private let stateLock = NSLock()
+    /// The anime-skip show ids of an AniList entry, once asked.
+    private var knownShowIDs: [Int: [String]] = [:]
+    /// A show's episodes, once fetched.
+    private var knownEpisodes: [String: [Episode]] = [:]
+
+    init(session: URLSession? = nil) {
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.timeoutIntervalForRequest = Self.requestTimeout
+            configuration.timeoutIntervalForResource = Self.requestTimeout * 2
+            configuration.waitsForConnectivity = false
+            self.session = URLSession(configuration: configuration)
+        }
+    }
+
+    /// The segments of episode `episode` of AniList entry `aniListID`.
+    /// `duration` is the playing file's length when known: an ending with no
+    /// marked end runs to it.
+    func intervals(aniListID: Int, episode: Int, duration: Double?, clientID: String) async -> [SkipInterval] {
+        guard aniListID > 0, episode > 0, !clientID.isEmpty else { return [] }
+        for showID in await showIDs(aniListID: aniListID, clientID: clientID) {
+            guard let list = await episodes(showID: showID, clientID: clientID) else { continue }
+            let matching = list.filter { $0.number.flatMap { Int($0.trimmingCharacters(in: .whitespaces)) } == episode }
+            let result = Self.bestIntervals(matching, duration: duration)
+            if !result.isEmpty { return result }
+        }
+        return []
+    }
+
+    private func showIDs(aniListID: Int, clientID: String) async -> [String] {
+        if let known = stateLock.withLock({ knownShowIDs[aniListID] }) { return known }
+        let query = "{ findShowsByExternalId(service: ANILIST, serviceId: \"\(aniListID)\") { id } }"
+        guard let payload = await send(query, clientID: clientID) else { return [] }
+        // Ids go back into a query, so anything but a plain id is dropped.
+        let ids = (payload.findShowsByExternalId ?? []).map(\.id).filter(Self.isPlainID)
+        stateLock.withLock { knownShowIDs[aniListID] = ids }
+        return ids
+    }
+
+    private func episodes(showID: String, clientID: String) async -> [Episode]? {
+        if let known = stateLock.withLock({ knownEpisodes[showID] }) { return known }
+        let query = "{ findEpisodesByShowId(showId: \"\(showID)\") { season number baseDuration timestamps { at type { name } } } }"
+        guard let list = await send(query, clientID: clientID)?.findEpisodesByShowId else { return nil }
+        stateLock.withLock {
+            // A few shows at most are kept.
+            if knownEpisodes.count >= 6 { knownEpisodes.removeAll() }
+            knownEpisodes[showID] = list
+        }
+        return list
+    }
+
+    private static func isPlainID(_ id: String) -> Bool {
+        !id.isEmpty && id.count <= 64 && id.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber || $0 == "-" || $0 == "_") }
+    }
+
+    private func send(_ query: String, clientID: String) async -> Payload? {
+        guard let body = try? JSONSerialization.data(withJSONObject: ["query": query]) else { return nil }
+        var request = URLRequest(url: Self.endpoint)
+        request.httpMethod = "POST"
+        request.timeoutInterval = Self.requestTimeout
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(clientID, forHTTPHeaderField: "X-Client-ID")
+        request.httpBody = body
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
+        return (try? JSONDecoder().decode(Response.self, from: data))?.data
+    }
+
+    // MARK: Timestamps to segments
+
+    /// "opening", "ending" or "recap" for the types that are one of them.
+    static func category(of interval: SkipInterval) -> String? {
+        if interval.isIntro { return "opening" }
+        if interval.isEnding { return "ending" }
+        if interval.isRecap { return "recap" }
+        return nil
+    }
+
+    /// A show can hold several entries for the same episode number, some of
+    /// them incomplete: the one covering the most kinds of segment is used,
+    /// then the one with the most segments. On a tie the earlier entry wins.
+    static func bestIntervals(_ episodes: [Episode], duration: Double?) -> [SkipInterval] {
+        var best: [SkipInterval] = []
+        var bestKinds = 0
+        for episode in episodes {
+            let intervals = self.intervals(from: episode.timestamps ?? [], baseDuration: episode.baseDuration, duration: duration)
+            guard !intervals.isEmpty else { continue }
+            let kinds = Set(intervals.compactMap(category(of:))).count
+            if kinds > bestKinds || (kinds == bestKinds && intervals.count > best.count) {
+                best = intervals
+                bestKinds = kinds
+            }
+        }
+        return best
+    }
+
+    /// A timestamp only marks where a segment starts: it ends where the next
+    /// one begins. The last one has no known end. Only an ending may run to
+    /// the end of the episode, and only when it starts in its second half.
+    /// An open-ended opening or recap is dropped, as stretching it would skip
+    /// the whole episode.
+    static func intervals(from timestamps: [Timestamp], baseDuration: Double?, duration: Double?) -> [SkipInterval] {
+        let sorted = timestamps.filter { $0.at.isFinite && $0.at >= 0 }.sorted { $0.at < $1.at }
+        let length = [duration, baseDuration].compactMap { $0 }.first { $0.isFinite && $0 > 0 }
+        var result: [SkipInterval] = []
+        for (index, timestamp) in sorted.enumerated() {
+            let type: String
+            switch timestamp.type.name.lowercased() {
+            case "intro", "new intro": type = "op"
+            case "credits", "new credits": type = "ed"
+            case "mixed intro": type = "mixed-op"
+            case "mixed credits": type = "mixed-ed"
+            case "recap": type = "recap"
+            default: continue
+            }
+            let end: Double
+            if index + 1 < sorted.count {
+                end = sorted[index + 1].at
+            } else if type == "ed" || type == "mixed-ed", let length, timestamp.at >= length / 2 {
+                end = length
+            } else {
+                continue
+            }
+            guard end > timestamp.at else { continue }
+            result.append(SkipInterval(startTime: timestamp.at, endTime: end, type: type, provider: "animeskip"))
+        }
+        return result
+    }
+
+    /// IntroDB's segments with anime-skip's added for the kinds IntroDB has
+    /// no exact segment of, as on the other apps. A segment IntroDB only
+    /// guessed from the rest of the season gives way to anime-skip's.
+    static func merging(introDB: [SkipInterval], animeSkip: [SkipInterval]) -> [SkipInterval] {
+        guard !animeSkip.isEmpty else { return introDB }
+        let exactKinds = Set(introDB.filter { $0.provider != "introdb-season" }.compactMap(category(of:)))
+        let added = animeSkip.filter { interval in
+            category(of: interval).map { !exactKinds.contains($0) } ?? false
+        }
+        let addedKinds = Set(added.compactMap(category(of:)))
+        let kept = introDB.filter { interval in
+            guard interval.provider == "introdb-season", let kind = category(of: interval) else { return true }
+            return !addedKinds.contains(kind)
+        }
+        return (kept + added).sorted { $0.startTime < $1.startTime }
+    }
+}

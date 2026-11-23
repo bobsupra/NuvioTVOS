@@ -356,6 +356,12 @@ class NetflixSearchViewModel: ObservableObject {
             resetIfProfileChanged()
             return
         }
+        // Recent Searches may have been switched back on since this list was
+        // loaded as empty. Start from the stored list, or saving would
+        // replace it with this one term.
+        if recentSearches.isEmpty, SearchHistoryStore.isEnabled() {
+            recentSearches = SearchHistoryStore.load()
+        }
         let (updated, newSession) = SearchHistoryStore.commit(
             term,
             current: recentSearches,

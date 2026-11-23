@@ -577,7 +577,8 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertTrue(localKeys.contains(SettingsKey.subtitleLanguageSecondary))
         XCTAssertTrue(localKeys.contains(SettingsKey.forcedSubtitles))
         XCTAssertTrue(localKeys.contains(SettingsKey.autoPlayNext))
-        XCTAssertTrue(localKeys.contains(SettingsKey.autoPlayNextCountdown))
+        // The Next Episode countdown is not the other apps' add-on wait.
+        XCTAssertFalse(localKeys.contains(SettingsKey.autoPlayNextCountdown))
         XCTAssertTrue(localKeys.contains(SettingsKey.cachedOnlyStreams))
         XCTAssertTrue(localKeys.contains(SettingsKey.preserveAddonStreamOrder))
         XCTAssertTrue(localKeys.contains(SettingsKey.streamSortOption))
@@ -603,7 +604,7 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertTrue(remoteKeys.contains("secondary_preferred_subtitle_language"))
         XCTAssertTrue(remoteKeys.contains("subtitle_use_forced_subtitles"))
         XCTAssertTrue(remoteKeys.contains("stream_auto_play_next_episode_enabled"))
-        XCTAssertTrue(remoteKeys.contains("stream_auto_play_timeout_seconds"))
+        XCTAssertFalse(remoteKeys.contains("stream_auto_play_timeout_seconds"))
         XCTAssertTrue(remoteKeys.contains("stream_auto_play_prefer_binge_group"))
         XCTAssertTrue(remoteKeys.contains("stream_auto_play_reuse_binge_group"))
         XCTAssertTrue(remoteKeys.contains("stream_cached_only"))

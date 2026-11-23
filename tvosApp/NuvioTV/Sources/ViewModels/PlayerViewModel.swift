@@ -369,9 +369,13 @@ class PlayerViewModel: ObservableObject {
     /// Session-only override used when AI Subtitle auto-select is disabled.
     @Published private(set) var isAISubtitleTranslationManuallyEnabled = false
     /// Current audio delay in milliseconds. Persisted across sessions when `isAudioDelayPersistEnabled` is true.
-    @Published var audioDelayMs: Int = ProfileSettings.current.bool(forKey: SettingsKey.audioDelayPersistEnabled)
-        ? ProfileSettings.current.integer(forKey: SettingsKey.persistentAudioDelayMs)
-        : 0
+    @Published var audioDelayMs: Int = AudioDelayMemory.remembered(
+        in: ProfileSettings.current,
+        outputKey: AudioDelayMemory.currentOutputKey()
+    )
+    /// The audio output the delay was last read for (Settings → Audio →
+    /// Remember Audio Delay per Device).
+    private var audioDelayOutputKey: String? = AudioDelayMemory.currentOutputKey()
     /// PCM amplification in whole dB (0…10), applied as mpv software volume.
     /// Per-session, not persisted.
     @Published var audioAmplificationDb: Int = 0
@@ -502,8 +506,11 @@ class PlayerViewModel: ObservableObject {
     private var autoPlayNextCountdownSeconds = 10
     /// Fallback when IntroDB has no ending marker: show the Next Episode card
     /// this many seconds before the end. When an ending skip exists, the card
-    /// arms at the same moment as Skip Ending instead.
-    private static let nextCardLeadSeconds: Double = 120
+    /// arms at the same moment as Skip Ending instead. Set in Settings → Up Next;
+    /// the default is two minutes.
+    private var nextCardLeadSeconds: Double {
+        NextEpisodeThreshold.leadSeconds(duration: time.duration, in: ProfileSettings.current)
+    }
     private static let nextEpisodeAutoHideSeconds = 10
     /// Same lead-in used by skip-segment detection so both cards arm together.
     private static let skipSegmentStartLead: Double = 0.35
@@ -595,6 +602,13 @@ class PlayerViewModel: ObservableObject {
     private var activeAddonName: String?
     private var activeProviderName: String?
     private var activeFilename: String?
+    /// The playing file's name, for Settings → Streams → Show in player.
+    /// Nil for a trailer and when the source gave no file name.
+    var playerBadgeFilename: String? {
+        guard !isTrailerPlaybackSession else { return nil }
+        let name = activeFilename?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return name.isEmpty ? nil : name
+    }
     private var activeCacheFileIdentity: PlaybackCacheFileIdentity?
     private var activeVideoSize: Int64?
     private var activeVideoHash: String?
@@ -657,9 +671,14 @@ class PlayerViewModel: ObservableObject {
     /// aligned to the chapter they line up with). The IntroDB season template
     /// keeps learning from `skipIntervals` alone.
     private var effectiveSkipIntervals: [SkipInterval] {
-        PlexSkipMarkers.merged(
+        guard skipSegmentsEnabled else { return [] }
+        return PlexSkipMarkers.merged(
             plex: plexSkipIntervals,
-            others: PlaybackChapters.merged(introDB: skipIntervals, chapters: chapterSkipIntervals, chapterList: chapters)
+            others: PlaybackChapters.merged(
+                introDB: AnimeSkipService.merging(introDB: skipIntervals, animeSkip: animeSkipIntervals),
+                chapters: chapterSkipIntervals,
+                chapterList: chapters
+            )
         )
     }
     /// Plex's intro and credits markers for a Plex file: measured on the file,
@@ -668,6 +687,15 @@ class PlayerViewModel: ObservableObject {
         didSet { publishSkipSegments() }
     }
     private var plexSkipIntervalLoadTask: Task<Void, Never>?
+    /// Segments from anime-skip.com (Settings → Skip Segments → Anime Skip).
+    /// Empty unless it is on with a client ID and knows the episode.
+    private var animeSkipIntervals: [SkipInterval] = [] {
+        didSet { publishSkipSegments() }
+    }
+    private var animeSkipLoadTask: Task<Void, Never>?
+    /// Settings → Skip Segments → Skip Intro, read when an item starts. Off
+    /// looks nothing up and offers no segment from any source.
+    private var skipSegmentsEnabled = true
     /// The same segments for the views: the opening and the ending colored on
     /// the timeline, their badges in the chapter list.
     @Published private(set) var skipSegments: [SkipInterval] = []
@@ -778,6 +806,16 @@ class PlayerViewModel: ObservableObject {
     private var gcButtonAPressedStartTime: Date?
     private var gcButtonAPressX: Double?
     private var gcDidHandlePressAsSeek = false
+    /// Settings → Player Interface → Hold To Speed. The wait before a held
+    /// Select speeds playback up, and the check that ends it.
+    private var holdSpeedArmTask: Task<Void, Never>?
+    private var holdSpeedWatchTask: Task<Void, Never>?
+    /// True while a held Select is playing faster.
+    private var isHoldingSpeed = false
+    /// The chosen speed when the hold began, restored on release.
+    private var speedBeforeHold: PlaybackSpeed?
+    /// This press sped playback up, so its release must not toggle pause.
+    private var holdSpeedUsedThisPress = false
     private var gcHoldSeekTimer: Timer?
     private var controllerConnectObserver: NSObjectProtocol?
     private var peekTask: Task<Void, Never>?
@@ -819,7 +857,21 @@ class PlayerViewModel: ObservableObject {
     ) async -> PreparedNextStream?)?
     private var reloadAttempts = 0
     @Published private(set) var isReloadingStream = false
-    private static let maxReloadAttempts = 3
+    /// Other sources tried after a failure. Settings → Stream Selection →
+    /// Sources to try on failure.
+    private var maxReloadAttempts: Int {
+        let stored = ProfileSettings.current.object(forKey: SettingsKey.sourceFallbackMaxSources) as? Int ?? 3
+        return min(max(stored, 1), 10)
+    }
+    /// Settings → Stream Selection → Fallback to next matching source on
+    /// failure. Off leaves a source that fails before anything has played on
+    /// its error screen. A title that was already playing and a live stream
+    /// still recover, as do an expired link and a damaged Usenet release,
+    /// which do not ask here.
+    private var allowsAutomaticFailover: Bool {
+        if lastStablePlaybackTime != nil || isLiveStream || activeMeta?.isSports == true { return true }
+        return ProfileSettings.current.object(forKey: SettingsKey.sourceFallbackOnFailure) as? Bool ?? true
+    }
 
     // MARK: Load watchdog + source failover
 
@@ -855,7 +907,11 @@ class PlayerViewModel: ObservableObject {
     private var loadWatchdogGeneration: UInt64?
     private var loadWatchdogGraceGranted = false
     /// A source that hasn't started within this long is treated as dead.
-    private let loadTimeoutSeconds: UInt64 = 30
+    /// Settings → Stream Selection → Time for a source to start.
+    private var loadTimeoutSeconds: UInt64 {
+        let stored = ProfileSettings.current.object(forKey: SettingsKey.sourceStartupTimeoutSeconds) as? Int ?? 30
+        return UInt64(min(max(stored, 5), 45))
+    }
 
     init(
         sessionCoordinator suppliedCoordinator: PlaybackSessionCoordinator? = nil,
@@ -1066,7 +1122,8 @@ class PlayerViewModel: ObservableObject {
             if !isEngineUnavailable,
                !isStandalonePlaybackSession,
                reloadCurrentStream != nil,
-               reloadAttempts < Self.maxReloadAttempts,
+               reloadAttempts < maxReloadAttempts,
+               allowsAutomaticFailover,
                !isFailingOver,
                !didShutdown {
                 if let url = activeStreamURL { failedStreamURLs.insert(url) }
@@ -1092,7 +1149,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     var currentErrorDiagnostic: PlaybackErrorDiagnostic? {
-        if isFailingOver || isReloadingStream || isSwitchingSource || (!hasRenderedFirstFrame && reloadCurrentStream != nil && reloadAttempts < Self.maxReloadAttempts) {
+        if isFailingOver || isReloadingStream || isSwitchingSource || (!hasRenderedFirstFrame && reloadCurrentStream != nil && reloadAttempts < maxReloadAttempts && allowsAutomaticFailover) {
             return nil
         }
         if let startupError = playbackStartupError {
@@ -1535,8 +1592,19 @@ class PlayerViewModel: ObservableObject {
         print("[Player] Engine policy: \(sessionCoordinator.lastPolicyReason)")
     }
 
+    /// The preferred audio language, then Settings → Audio → Secondary
+    /// Audio Language when one is set.
     private func preferredAudioLanguageCodes() -> [String] {
-        SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta).map { [$0] } ?? []
+        var languages = SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta).map { [$0] } ?? []
+        // The secondary language only backs up a preferred one. With none
+        // (Original or System with no known language) the file's default
+        // track plays, as before.
+        if !languages.isEmpty,
+           let secondary = SubtitleLanguagePreferences.secondaryAudioLanguage(meta: activeMeta),
+           !languages.contains(secondary) {
+            languages.append(secondary)
+        }
+        return languages
     }
 
     private func preferredSubtitleLanguageCodes() -> [String] {
@@ -1804,12 +1872,19 @@ class PlayerViewModel: ObservableObject {
         self.hasClearedDismissalsForCurrentPlaybackSession = false
         if !preserveSessionPreferences {
             self.subtitleDelayMs = 0
-            self.audioDelayMs = isAudioDelayPersistEnabled ? persistentAudioDelayMs : 0
+            self.audioDelayOutputKey = AudioDelayMemory.currentOutputKey()
+            self.audioDelayMs = AudioDelayMemory.remembered(
+                in: ProfileSettings.current,
+                outputKey: self.audioDelayOutputKey
+            )
             self.audioAmplificationDb = 0
         }
+        self.skipSegmentsEnabled = ProfileSettings.current.object(forKey: SettingsKey.skipIntroEnabled) as? Bool ?? true
         self.skipIntervals = []
         self.chapterSkipIntervals = []
         self.plexSkipIntervals = []
+        self.animeSkipLoadTask?.cancel()
+        self.animeSkipIntervals = []
         self.didSeedIntroDBSeasonTemplate = false
         self.didRefreshIntroDBForKnownDuration = false
         self.activeSkipInterval = nil
@@ -1833,6 +1908,7 @@ class PlayerViewModel: ObservableObject {
         self.sceneSessionID = UUID()
         loadSkipIntervalsIfNeeded(meta: meta, isStandalonePlaybackSession: isStandalonePlaybackSession)
         loadPlexSkipIntervals(meta: meta)
+        loadAnimeSkipIntervals(meta: meta)
     }
 
     private var effectiveFilename: String? {
@@ -2032,7 +2108,10 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func reconcileContentWarningsForCurrentItem() {
-        guard !didShutdown, let meta = activeMeta else {
+        // Off in Settings → Player Interface clears the state the same way,
+        // before anything is fetched.
+        let isEnabled = ProfileSettings.current.object(forKey: SettingsKey.contentWarningsEnabled) as? Bool ?? true
+        guard !didShutdown, isEnabled, let meta = activeMeta else {
             contentWarningsGeneration &+= 1
             contentWarningsTask?.cancel()
             contentWarningsTask = nil
@@ -2505,13 +2584,15 @@ class PlayerViewModel: ObservableObject {
               !isAwaitingStreamStart,
               time.duration >= 60,
               time.remaining > 0,
-              time.current / time.duration >= 0.5 else {
+              time.current / time.duration >= 0.5,
+              // Settings → Up Next → Preload Next Episode Sources.
+              ProfileSettings.current.object(forKey: SettingsKey.preloadNextEpisodeSources) as? Bool ?? true else {
             return false
         }
         if let ending = skipIntervals.first(where: \.isEnding) {
             return time.current >= max(ending.startTime - Self.skipSegmentStartLead - Self.nextEpisodePreResolveLeadSeconds, 0)
         }
-        return time.remaining <= (Self.nextCardLeadSeconds + Self.nextEpisodePreResolveLeadSeconds)
+        return time.remaining <= (nextCardLeadSeconds + Self.nextEpisodePreResolveLeadSeconds)
     }
 
     /// Prefer IntroDB ending start so Next Episode and Skip Ending appear together.
@@ -2534,7 +2615,7 @@ class PlayerViewModel: ObservableObject {
         if let ending = effectiveSkipIntervals.first(where: \.isEnding) {
             return time.current >= max(ending.startTime - Self.skipSegmentStartLead, 0)
         }
-        return time.remaining <= Self.nextCardLeadSeconds
+        return time.remaining <= nextCardLeadSeconds
     }
 
     private func clearNextEpisodeCard() {
@@ -2574,7 +2655,11 @@ class PlayerViewModel: ObservableObject {
 
         preResolvedNextEpisodeTask = Task { @MainActor [weak self] in
             guard let self else { return nil }
-            let prepared = await resolver(next, nil)
+            // Marks this as the player's own advance for Settings → Up Next →
+            // Fallback when binge group fails.
+            let prepared = await NextEpisodeResolution.$isAutoAdvance.withValue(true) {
+                await resolver(next, nil)
+            }
             guard !Task.isCancelled,
                   self.preResolvedNextEpisodeId == episodeId,
                   self.nextEpisode?.id == episodeId else {
@@ -2639,7 +2724,7 @@ class PlayerViewModel: ObservableObject {
     // MARK: - IntroDB skip segments
 
     private func loadSkipIntervalsIfNeeded(meta: NuvioMeta, isStandalonePlaybackSession: Bool) {
-        guard !isStandalonePlaybackSession else { return }
+        guard !isStandalonePlaybackSession, skipSegmentsEnabled else { return }
 
         let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
         let expectedMetaId = meta.id
@@ -2680,9 +2765,52 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    /// Settings → Skip Segments → Anime Skip. Runs beside playback and never
+    /// holds it up: anything that fails leaves no segments. Asked again once
+    /// the file's length is known, for an ending that has no marked end.
+    private func loadAnimeSkipIntervals(meta: NuvioMeta) {
+        animeSkipLoadTask?.cancel()
+        guard !isStandalonePlaybackSession, skipSegmentsEnabled, !isLiveStream,
+              AnimeSkipSettings.isActive(),
+              let numbers = activeEpisodeNumbers, numbers.episode > 0 else { return }
+        let clientID = AnimeSkipSettings.clientID()
+        let expectedMetaId = meta.id
+        let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
+        let tmdbId = meta.tmdbId
+        let ownAniListID = AniListMetaBuilder.aniListID(from: meta.id)
+        let duration = time.duration > 0 ? time.duration : nil
+        animeSkipLoadTask = Task { [weak self] in
+            // An AniList title is its own entry. Any other is looked up in
+            // the offline tables by its IMDb or TMDB id, season and episode.
+            let entry: (aniListID: Int, episode: Int)?
+            if let ownAniListID {
+                entry = (ownAniListID, numbers.episode)
+            } else {
+                await AniListOfflineMaps.shared.waitForFirstTables()
+                entry = await AniListOfflineMaps.shared.aniListEpisode(
+                    imdb: imdbId, tmdbTV: tmdbId, season: numbers.season, episode: numbers.episode
+                )
+            }
+            guard let entry, !Task.isCancelled else { return }
+            let intervals = await AnimeSkipService.shared.intervals(
+                aniListID: entry.aniListID, episode: entry.episode, duration: duration, clientID: clientID
+            )
+            await MainActor.run {
+                guard let self,
+                      !Task.isCancelled,
+                      self.activeMeta?.id == expectedMetaId,
+                      self.activeEpisodeNumbers?.season == numbers.season,
+                      self.activeEpisodeNumbers?.episode == numbers.episode,
+                      self.animeSkipIntervals != intervals else { return }
+                self.animeSkipIntervals = intervals
+                self.updateSkipIntervalState()
+            }
+        }
+    }
+
     private func loadPlexSkipIntervals(meta: NuvioMeta) {
         plexSkipIntervalLoadTask?.cancel()
-        guard !isStandalonePlaybackSession else { return }
+        guard !isStandalonePlaybackSession, skipSegmentsEnabled else { return }
         let streamURL = activeStreamURL
         let isMovie = !meta.isSeries && activeEpisodeNumbers == nil
         plexSkipIntervalLoadTask = Task { [weak self] in
@@ -2728,12 +2856,14 @@ class PlayerViewModel: ObservableObject {
 
     private func updateSkipIntervalState() {
         if !didRefreshIntroDBForKnownDuration,
+           skipSegmentsEnabled,
            time.duration > 0,
            let meta = activeMeta {
             let numbers = activeEpisodeNumbers
             let isMovie = !meta.isSeries && numbers == nil
             if numbers != nil || isMovie {
                 didRefreshIntroDBForKnownDuration = true
+                loadAnimeSkipIntervals(meta: meta)
                 let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
                 let expectedMetaId = meta.id
                 let duration = time.duration
@@ -2901,6 +3031,8 @@ class PlayerViewModel: ObservableObject {
 
     var canShowPauseOverlay: Bool {
         status == .paused
+            // Settings → Player Interface → Pause Overlay.
+            && (ProfileSettings.current.object(forKey: SettingsKey.pauseOverlayEnabled) as? Bool ?? true)
             && !isAwaitingStreamStart
             && !isAdvancingEpisode
             && pendingAdvanceResolutionGeneration == nil
@@ -2999,10 +3131,14 @@ class PlayerViewModel: ObservableObject {
                 if let resolved = await inFlightResolution.value {
                     prepared = resolved
                 } else {
-                    prepared = await resolver(next, startupToken)
+                    prepared = await NextEpisodeResolution.$isAutoAdvance.withValue(true) {
+                        await resolver(next, startupToken)
+                    }
                 }
             } else {
-                prepared = await resolver(next, startupToken)
+                prepared = await NextEpisodeResolution.$isAutoAdvance.withValue(true) {
+                    await resolver(next, startupToken)
+                }
             }
             guard !Task.isCancelled,
                   self.advanceGeneration == gen,
@@ -3249,6 +3385,13 @@ class PlayerViewModel: ObservableObject {
                 self.status = .error("The stream did not start within \(elapsedTimeout) seconds.")
                 return
             }
+            guard self.allowsAutomaticFailover else {
+                // Fallback is off in Settings: stop here, keeping an error the
+                // engine already reported.
+                if case .error = self.status { return }
+                self.status = .error("The stream did not start within \(elapsedTimeout) seconds.")
+                return
+            }
             if let url = self.activeStreamURL {
                 self.failedStreamURLs.insert(url)
             }
@@ -3331,7 +3474,7 @@ class PlayerViewModel: ObservableObject {
             status = .error(reason)
             return
         }
-        guard reloadAttempts < Self.maxReloadAttempts else {
+        guard reloadAttempts < maxReloadAttempts else {
             isReloadingStream = false
             isFailingOver = false
             isSwitchingSource = false
@@ -3413,7 +3556,7 @@ class PlayerViewModel: ObservableObject {
                 self.isReloadingStream = false
                 self.isSwitchingSource = false
                 self.isAwaitingStreamStart = false
-                self.reloadAttempts = Self.maxReloadAttempts
+                self.reloadAttempts = maxReloadAttempts
                 self.status = .error(reason)
                 return
             }
@@ -3859,7 +4002,8 @@ class PlayerViewModel: ObservableObject {
                 if !isEngineUnavailable,
                    !isStandalonePlaybackSession,
                    reloadCurrentStream != nil,
-                   reloadAttempts < Self.maxReloadAttempts,
+                   reloadAttempts < maxReloadAttempts,
+                   allowsAutomaticFailover,
                    !didShutdown {
                     if let url = activeStreamURL { failedStreamURLs.insert(url) }
                     if let meta = activeMeta {
@@ -4063,7 +4207,8 @@ class PlayerViewModel: ObservableObject {
            !isRecoverableAetherLoading,
            !isFailingOver,
            !isReloadingStream {
-            if isStandalonePlaybackSession {
+            // A trailer, or Fallback off in Settings: show the error as it is.
+            if isStandalonePlaybackSession || !allowsAutomaticFailover {
                 status = .error(c.currentErrorMessage)
                 return
             }
@@ -4129,7 +4274,7 @@ class PlayerViewModel: ObservableObject {
             engineStatus = .buffering
         } else if !c.currentErrorMessage.isEmpty, !isRecoverableAetherLoading {
             let isEngineUnavailable = c.currentErrorMessage.contains("unavailable on this device") || c.currentErrorMessage.contains("AetherEngine is unavailable")
-            if !isEngineUnavailable, reloadCurrentStream != nil, reloadAttempts < Self.maxReloadAttempts {
+            if !isEngineUnavailable, reloadCurrentStream != nil, reloadAttempts < maxReloadAttempts, allowsAutomaticFailover {
                 engineStatus = .buffering
             } else {
                 engineStatus = .error(c.currentErrorMessage)
@@ -4360,7 +4505,9 @@ class PlayerViewModel: ObservableObject {
         }
 
         let displayedRate = watchPartyPlayerBridge == nil ? c.currentSpeed : watchPartyControls?.canonicalRate
-        if let displayedRate, let latestSpeed = PlaybackSpeed(rawValue: displayedRate),
+        // Not during Hold To Speed: the engine then runs at the hold speed,
+        // and copying it here would make that the chosen speed.
+        if !isHoldingSpeed, let displayedRate, let latestSpeed = PlaybackSpeed(rawValue: displayedRate),
            latestSpeed.rawValue != playbackSpeed.rawValue {
             playbackSpeed = latestSpeed
         }
@@ -4957,6 +5104,7 @@ class PlayerViewModel: ObservableObject {
         controlsHideTimer?.invalidate()
         controlsHideTimer = nil
         stopRepeatingSkip()
+        endHoldToSpeed()
         cancelScrub()
         hidePeek()
         diskCachePollTask?.cancel()
@@ -4991,6 +5139,8 @@ class PlayerViewModel: ObservableObject {
         isLoadingExternalSubtitles = false
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = nil
+        animeSkipLoadTask?.cancel()
+        animeSkipLoadTask = nil
         playerController.pausePlayback()
         saveProgress(force: true, eventAction: .pause)
         isAwaitingStreamStart = false
@@ -6344,11 +6494,14 @@ class PlayerViewModel: ObservableObject {
                 }
                 RunLoop.main.add(timer, forMode: .common)
                 gcHoldSeekTimer = timer
+            } else {
+                armHoldToSpeed()
             }
         } else {
             gcButtonAPressed = false
             gcHoldSeekTimer?.invalidate()
             gcHoldSeekTimer = nil
+            releaseHoldToSpeed()
 
             if isHoldingSeek, !isGestureCaptureActive {
                 stopRepeatingSkip()
@@ -6375,6 +6528,111 @@ class PlayerViewModel: ObservableObject {
                     self.gcDidHandlePressAsSeek = false
                 }
             }
+        }
+    }
+
+    // MARK: Hold To Speed
+
+    /// Whether a held Select may speed playback up: the video is playing
+    /// with nothing else on screen. Not in a Watch Party, where the room
+    /// sets the speed, and not on a live stream.
+    private var canHoldToSpeed: Bool {
+        PlayerGestureCaptureStatus.keepsCapture(status)
+            && hasStartedPlayback
+            && !didShutdown
+            && !isLiveStream
+            && watchPartyPlayerBridge == nil
+            && !isScrubbing
+            && !isHoldingSeek
+            && !showControls
+            && !showPauseOverlay
+            && !showSettingsPanel
+            && !showScenePanel
+            && !isSceneDetailVisible
+            && sidePanel == nil
+            && !postPlayState.isVisible
+            && !showNextEpisodeCard
+            && !showSkipSegmentCard
+            && currentErrorDiagnostic == nil
+            && UIApplication.shared.applicationState == .active
+    }
+
+    /// Select went down. If it is still down after the wait, playback
+    /// speeds up. A short press is over before that and does what it did.
+    private func armHoldToSpeed() {
+        holdSpeedArmTask?.cancel()
+        holdSpeedArmTask = nil
+        guard HoldToSpeed.isEnabled(in: ProfileSettings.current), status == .playing, canHoldToSpeed else { return }
+        // A long press of Select bound in the Gestures tab keeps its action.
+        if isGestureCaptureActive,
+           PlayerGestureSettings.activeBindings().action(for: .click(.select, .long)) != nil {
+            return
+        }
+        holdSpeedArmTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: HoldToSpeed.holdDelayNanoseconds)
+            guard let self, !Task.isCancelled else { return }
+            self.beginHoldToSpeed()
+        }
+    }
+
+    private func beginHoldToSpeed() {
+        guard !isHoldingSpeed, gcButtonAPressed, status == .playing, canHoldToSpeed else { return }
+        isHoldingSpeed = true
+        speedBeforeHold = playbackSpeed
+        holdSpeedUsedThisPress = true
+        // The release of this press is not a click.
+        gcDidHandlePressAsSeek = true
+        hidePeek()
+        var speed = HoldToSpeed.speed(in: ProfileSettings.current)
+        // AetherEngine plays video no faster than its own limit (2x).
+        if activeEngineKind == .aether, let limit = aetherController?.engine.maxSupportedRate, limit > 0 {
+            speed = min(speed, limit)
+        }
+        // The engine alone is changed: the chosen speed stays the one shown
+        // in the player and the one a reload starts with.
+        engine.setSpeed(speed)
+        showPlayerToast("Speed \(String(format: "%g", speed))x", durationSeconds: 600)
+        // Ends it when Select is released, and also when anything takes the
+        // screen or playback stops while it is still held.
+        holdSpeedWatchTask?.cancel()
+        holdSpeedWatchTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                guard let self, !Task.isCancelled else { return }
+                if !self.gcButtonAPressed || !self.canHoldToSpeed {
+                    self.endHoldToSpeed()
+                    return
+                }
+            }
+        }
+    }
+
+    /// Back to the speed chosen in the player. Safe to call at any time.
+    private func endHoldToSpeed() {
+        holdSpeedArmTask?.cancel()
+        holdSpeedArmTask = nil
+        holdSpeedWatchTask?.cancel()
+        holdSpeedWatchTask = nil
+        guard isHoldingSpeed else { return }
+        isHoldingSpeed = false
+        // The speed from before the hold, not whatever is current now.
+        if let speedBeforeHold { playbackSpeed = speedBeforeHold }
+        speedBeforeHold = nil
+        guard !didShutdown else { return }
+        engine.setSpeed(playbackSpeed.rawValue)
+        showPlayerToast("Speed \(playbackSpeed.label)")
+    }
+
+    /// Select came up.
+    private func releaseHoldToSpeed() {
+        endHoldToSpeed()
+        guard holdSpeedUsedThisPress else { return }
+        holdSpeedUsedThisPress = false
+        // The click that follows the release is dropped, as after a hold seek.
+        gcDidHandlePressAsSeek = true
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            self.gcDidHandlePressAsSeek = false
         }
     }
 
@@ -6652,9 +6910,9 @@ class PlayerViewModel: ObservableObject {
     func setAudioDelayMs(_ ms: Int) {
         let clamped = min(max(ms, -3_000), 3_000)
         audioDelayMs = clamped
-        if isAudioDelayPersistEnabled {
-            ProfileSettings.current.set(clamped, forKey: SettingsKey.persistentAudioDelayMs)
-        }
+        // Saved for this audio output, or as the one delay for every output.
+        audioDelayOutputKey = AudioDelayMemory.currentOutputKey()
+        AudioDelayMemory.store(clamped, in: ProfileSettings.current, outputKey: audioDelayOutputKey)
         sessionCoordinator.updateAudioDelay(Double(clamped) / 1_000)
         engine.setAudioDelay(Double(clamped) / 1000.0)
     }
@@ -7136,11 +7394,17 @@ class PlayerViewModel: ObservableObject {
 
     private func applyAudioPreferenceIfNeeded() {
         guard !didApplyAudioPreference, !didApplySavedAudioSelection, pendingTrackSelection?.audio == nil else { return }
-        guard let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta) else {
+        let languages = preferredAudioLanguageCodes()
+        guard !languages.isEmpty else {
             didApplyAudioPreference = true
             return
         }
-        guard let matchingTrack = audioTracks.first(where: { audioTrack($0, matches: preferred) }) else { return }
+        // The first language with a track wins: the preferred one, then the
+        // secondary one.
+        let match = languages.lazy.compactMap { language in
+            self.audioTracks.first(where: { self.audioTrack($0, matches: language) })
+        }.first
+        guard let matchingTrack = match else { return }
         didApplyAudioPreference = true
         let wasDifferent = audioTracks.first(where: { $0.isSelected })?.id != matchingTrack.id
         selectAudio(matchingTrack, persist: false)
@@ -9516,7 +9780,23 @@ class PlayerViewModel: ObservableObject {
     @objc private func handleAudioRouteChange(_ notification: Notification) {
         Task { @MainActor [weak self] in
             self?.currentAudioRouteDescription = PlaybackSystemMonitor.currentAudioOutputTitle()
+            self?.restoreAudioDelayForCurrentOutput()
         }
+    }
+
+    /// Settings → Audio → Remember Audio Delay per Device: when the audio
+    /// moves to another output, the delay saved for that output is applied.
+    private func restoreAudioDelayForCurrentOutput() {
+        let settings = ProfileSettings.current
+        guard AudioDelayMemory.isPerDevice(in: settings) else { return }
+        let outputKey = AudioDelayMemory.currentOutputKey()
+        guard outputKey != audioDelayOutputKey else { return }
+        audioDelayOutputKey = outputKey
+        let remembered = AudioDelayMemory.remembered(in: settings, outputKey: outputKey)
+        guard remembered != audioDelayMs else { return }
+        audioDelayMs = remembered
+        sessionCoordinator.updateAudioDelay(Double(remembered) / 1_000)
+        engine.setAudioDelay(Double(remembered) / 1000.0)
     }
 }
 

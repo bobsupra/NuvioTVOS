@@ -729,3 +729,455 @@ struct PlayerTime: Equatable {
         }
     }
 }
+
+/// Settings → Up Next: when the Next Episode card shows on an episode with no
+/// ending marker. Values are stored as the strings the rows list.
+enum NextEpisodeThreshold {
+    static let modePercentage = "Percentage"
+    static let modeMinutes = "Minutes before end"
+    static let modes = [modePercentage, modeMinutes]
+    /// Two minutes before the end is the lead the player always used.
+    static let defaultMode = modeMinutes
+    static let percentChoices = ["97", "97.5", "98", "98.5", "99", "99.5", "100"]
+    static let defaultPercent = "99"
+    static let minuteChoices = ["0", "0.5", "1", "1.5", "2", "2.5", "3", "3.5"]
+    static let defaultMinutes = "2"
+
+    /// Seconds before the end at which the card shows.
+    static func leadSeconds(duration: Double, in settings: UserDefaults) -> Double {
+        let mode = settings.string(forKey: SettingsKey.nextEpisodeThresholdMode) ?? defaultMode
+        if mode == modePercentage {
+            let stored = settings.string(forKey: SettingsKey.nextEpisodeThresholdPercent).flatMap(Double.init) ?? 99
+            let percent = min(max(stored, 97), 100)
+            return max(duration, 0) * (1 - percent / 100)
+        }
+        let stored = settings.string(forKey: SettingsKey.nextEpisodeThresholdMinutes).flatMap(Double.init) ?? 2
+        return min(max(stored, 0), 3.5) * 60
+    }
+}
+
+/// Settings → Continue Watching → Resume prompt on launch. Remembers, per
+/// profile and only on this Apple TV, the title the player was showing, until
+/// the player is left in the normal way. A value still there at launch means
+/// the app was closed from the player.
+enum ResumePromptStore {
+    private static let metaIDKey = "nuvio.tv.resumePrompt.metaID"
+
+    static func markPlayerEntered(metaID: String, in store: UserDefaults = ProfileSettings.current) {
+        guard store.string(forKey: metaIDKey) != metaID else { return }
+        store.set(metaID, forKey: metaIDKey)
+    }
+
+    static func markPlayerExitedNormally(in store: UserDefaults = ProfileSettings.current) {
+        guard store.object(forKey: metaIDKey) != nil else { return }
+        store.removeObject(forKey: metaIDKey)
+    }
+
+    /// The title the app was closed on, read once.
+    static func consume(in store: UserDefaults = ProfileSettings.current) -> String? {
+        guard let metaID = store.string(forKey: metaIDKey) else { return nil }
+        store.removeObject(forKey: metaIDKey)
+        return metaID.isEmpty ? nil : metaID
+    }
+}
+
+/// Settings → Continue Watching → On Select.
+enum ContinueWatchingClickAction {
+    static let stream = "Open Stream"
+    static let details = "Open Details"
+    static let detailsForUpcoming = "Details for Upcoming Only"
+    static let options = [stream, details, detailsForUpcoming]
+    /// Home has always opened details for an episode that has not aired and
+    /// played everything else.
+    static let defaultOption = detailsForUpcoming
+
+    /// Whether Select on this card opens its details page instead of playing.
+    static func opensDetails(for item: ContinueWatchingItem, in settings: UserDefaults) -> Bool {
+        switch settings.string(forKey: SettingsKey.continueWatchingClickAction) ?? defaultOption {
+        case details: return true
+        case stream: return false
+        default: return ContinueWatchingSortPolicy.isUpcomingItem(item)
+        }
+    }
+}
+
+/// Settings → Stream Selection → Stream Selection Timeout: how long Auto
+/// Select Stream waits for add-ons before it picks from what has arrived.
+/// Stored as the strings the row lists.
+enum StreamSelectionTimeout {
+    /// The rule the app always had: play a link that already meets the
+    /// quality target, otherwise wait for every add-on.
+    static let automatic = "Automatic"
+    static let instant = "0"
+    static let unlimited = "Unlimited"
+    static let options = [automatic, instant, "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "15", "20", "25", "30", unlimited]
+    static let defaultOption = automatic
+
+    enum Rule: Equatable, Sendable {
+        case automatic
+        /// Pick from what has arrived once this many seconds have passed.
+        case seconds(Int)
+        /// Wait for every add-on to answer.
+        case unlimited
+
+        /// Whether a link may be picked while add-ons are still answering.
+        /// Nil leaves it to the app's own checks.
+        func allowsEarlyPick(elapsed: TimeInterval) -> Bool? {
+            switch self {
+            case .automatic: return nil
+            case .seconds(let seconds): return elapsed >= Double(seconds)
+            case .unlimited: return false
+            }
+        }
+    }
+
+    static func rule(in settings: UserDefaults) -> Rule {
+        let stored = settings.string(forKey: SettingsKey.streamSelectionTimeout) ?? defaultOption
+        if stored == unlimited { return .unlimited }
+        guard stored != automatic, let seconds = Int(stored) else { return .automatic }
+        return .seconds(min(max(seconds, 0), 30))
+    }
+
+    static func label(for option: String) -> String {
+        switch option {
+        case automatic: return L10n.string("tvos_settings_stream_timeout_automatic", fallback: "Automatic")
+        case instant: return L10n.string("settings_playback_timeout_instant", fallback: "Instant")
+        case unlimited: return L10n.string("settings_playback_timeout_unlimited", fallback: "Unlimited")
+        default: return option + "s"
+        }
+    }
+}
+
+/// Settings → Stream Selection → Auto-play Source Scope, Allowed Addons and
+/// Allowed Plugins: which sources Auto Select Stream may pick from. The
+/// stream picker always lists every source.
+enum StreamAutoPlaySources {
+    static let allSources = "All sources"
+    static let addonsOnly = "Installed addons only"
+    static let pluginsOnly = "Enabled plugins only"
+    static let scopes = [allSources, addonsOnly, pluginsOnly]
+    static let defaultScope = allSources
+
+    /// An allow-list is stored as the sources' names, one per line. Empty
+    /// allows every source.
+    static func names(from stored: String?) -> Set<String> {
+        Set((stored ?? "").split(separator: "\n").map(String.init).filter { !$0.isEmpty })
+    }
+
+    static func stored(_ names: [String]) -> String {
+        names.joined(separator: "\n")
+    }
+
+    struct Filter: Sendable {
+        let scope: String
+        let allowedAddons: Set<String>
+        let allowedPlugins: Set<String>
+
+        init(settings: UserDefaults) {
+            let stored = settings.string(forKey: SettingsKey.streamAutoPlaySourceScope) ?? defaultScope
+            scope = scopes.contains(stored) ? stored : defaultScope
+            allowedAddons = names(from: settings.string(forKey: SettingsKey.streamAutoPlayAllowedAddons))
+            allowedPlugins = names(from: settings.string(forKey: SettingsKey.streamAutoPlayAllowedPlugins))
+        }
+
+        /// False with the defaults, when every stream passes.
+        var isActive: Bool {
+            scope != defaultScope || !allowedAddons.isEmpty || !allowedPlugins.isEmpty
+        }
+
+        /// The streams auto-select may pick from. Each stream is judged by
+        /// the group it came in: a plugin's, a media server's (Plex,
+        /// Jellyfin, a network share), or an add-on's. Media server streams
+        /// always pass, as on the other apps. A stream in no group passes.
+        func candidates(from streams: [NuvioStream], groups: [AddonStreamGroup]) -> [NuvioStream] {
+            guard isActive else { return streams }
+            var known = Set<String>()
+            var allowed = Set<String>()
+            for group in groups {
+                known.formUnion(group.streams.map(\.id))
+                allowed.formUnion(allowedStreams(in: group).map(\.id))
+            }
+            return streams.filter { stream in
+                let id = stream.id
+                return allowed.contains(id) || !known.contains(id)
+            }
+        }
+
+        /// The groups auto-select may pick from. The stream list builder
+        /// reads streams from the groups when it is given any, so they have
+        /// to be filtered along with the streams.
+        func candidateGroups(from groups: [AddonStreamGroup]) -> [AddonStreamGroup] {
+            guard isActive else { return groups }
+            return groups.filter(allows).map { group in
+                var copy = group
+                copy.streams = allowedStreams(in: group)
+                return copy
+            }
+        }
+
+        /// The streams of a group auto-select may pick. A repository's group
+        /// (Group plugin providers by repository) holds several plugins'
+        /// streams, so each stream is judged by the plugin it names.
+        private func allowedStreams(in group: AddonStreamGroup) -> [NuvioStream] {
+            guard allows(group) else { return [] }
+            guard group.addonId.hasPrefix(PluginStreamDiscovery.repositoryGroupPrefix),
+                  !allowedPlugins.isEmpty else { return group.streams }
+            return group.streams.filter { allowedPlugins.contains($0.addonName ?? "") }
+        }
+
+        private func allows(_ group: AddonStreamGroup) -> Bool {
+            if group.addonId.hasPrefix(PluginStreamDiscovery.repositoryGroupPrefix) {
+                return scope != addonsOnly
+            }
+            if group.addonId.hasPrefix("plugin:") {
+                guard scope != addonsOnly else { return false }
+                return allowedPlugins.isEmpty || allowedPlugins.contains(group.displayName)
+            }
+            if group.addonId.hasPrefix("local.") { return true }
+            guard scope != pluginsOnly else { return false }
+            return allowedAddons.isEmpty || allowedAddons.contains(group.displayName)
+        }
+    }
+}
+
+/// Settings → Player Interface → Hold To Speed and Hold Speed: holding
+/// Select on the remote plays faster until it is released.
+enum HoldToSpeed {
+    static let choices = ["1.25", "1.5", "1.75", "2", "2.5", "3"]
+    static let defaultChoice = "2"
+    /// How long Select is held before playback speeds up.
+    static let holdDelayNanoseconds: UInt64 = 500_000_000
+
+    /// Off unless switched on: Select has always only paused on the Apple TV.
+    static func isEnabled(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.holdToSpeedEnabled) as? Bool ?? false
+    }
+
+    static func speed(in settings: UserDefaults) -> Float {
+        let stored = settings.string(forKey: SettingsKey.holdToSpeedValue) ?? defaultChoice
+        return Float(choices.contains(stored) ? stored : defaultChoice) ?? 2
+    }
+}
+
+/// Settings → Stream Selection → Auto-play regex match and Regex Pattern:
+/// Auto Select Stream plays the first source whose text matches the pattern.
+/// A pattern that is empty, does not compile or has no letter or digit
+/// switches the mode off, and auto-select works as without it.
+enum StreamAutoPlayRegex {
+    /// The other apps' presets, by their label.
+    static let presets: [(key: String, label: String, pattern: String)] = [
+        ("settings_playback_regex_preset_any_1080p", "Any 1080p+", "(2160p|4k|1080p)"),
+        ("settings_playback_regex_preset_quality_4k_remux", "4K / Remux", "(2160p|4k|remux)"),
+        ("settings_playback_regex_preset_quality_1080p_standard", "1080p Standard", "(1080p|full\\s*hd)"),
+        ("settings_playback_regex_preset_quality_720p_smaller", "720p / Smaller", "(720p|webrip|web-dl)"),
+        ("settings_playback_regex_preset_web_sources", "WEB Sources", "(web[-\\s]?dl|webrip)"),
+        ("settings_playback_regex_preset_bluray_quality", "BluRay Quality", "(bluray|b[dr]rip|remux)"),
+        ("settings_playback_regex_preset_hevc_x265", "HEVC / x265", "(hevc|x265|h\\.265)"),
+        ("settings_playback_regex_preset_avc_x264", "AVC / x264", "(x264|h\\.264|avc)"),
+        ("settings_playback_regex_preset_hdr_dolby_vision", "HDR / Dolby Vision", "(hdr|hdr10\\+?|dv|dolby\\s*vision)"),
+        ("settings_playback_regex_preset_dolby_atmos_dts", "Dolby Atmos / DTS", "(atmos|truehd|dts[-\\s]?hd|dtsx?)"),
+        ("settings_playback_regex_preset_english", "English", "(\\beng\\b|english)"),
+        ("settings_playback_regex_preset_no_cam_ts", "No CAM/TS", "^(?!.*\\b(cam|hdcam|ts|telesync)\\b).*$"),
+        ("settings_playback_regex_preset_no_remux_hdr", "No REMUX/HDR", "(?is)^(?!.*\\b(hdr|hdr10|dv|dolby|vision|hevc|remux|2160p)\\b).+$")
+    ]
+
+    /// Longer patterns are not used: nothing typed on a remote gets there.
+    static let maxPatternLength = 300
+    /// A stream's text is cut to this many characters before it is matched.
+    private static let maxTextLength = 2_000
+    /// How long one stream may take to match, and all streams of one pick
+    /// together. A pattern that runs over matches nothing more, so a slow
+    /// pattern cannot hold up stream selection.
+    private static let matchBudget: TimeInterval = 0.05
+    private static let totalBudget: TimeInterval = 0.5
+
+    static func compiled(_ pattern: String) -> NSRegularExpression? {
+        let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed.count <= maxPatternLength,
+              trimmed.contains(where: { $0.isLetter || $0.isNumber }) else { return nil }
+        return try? NSRegularExpression(pattern: trimmed, options: [.caseInsensitive])
+    }
+
+    /// Whether the mode would use this pattern.
+    static func isUsable(_ pattern: String) -> Bool {
+        compiled(pattern) != nil
+    }
+
+    static func isEnabled(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.streamAutoPlayRegexEnabled) as? Bool ?? false
+    }
+
+    /// Time spent matching by one `Matcher`, shared by its copies.
+    private final class Budget: @unchecked Sendable {
+        private let lock = NSLock()
+        private var spent: TimeInterval = 0
+
+        var isSpent: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return spent >= StreamAutoPlayRegex.totalBudget
+        }
+
+        func add(_ time: TimeInterval) {
+            lock.lock()
+            spent += time
+            lock.unlock()
+        }
+    }
+
+    struct Matcher: @unchecked Sendable {
+        private let regex: NSRegularExpression
+        /// Words inside the pattern's negative lookaheads, as whole words:
+        /// a stream that has one never matches, as on the other apps.
+        private let exclusion: NSRegularExpression?
+        private let budget = Budget()
+
+        /// Nil when the mode is off or the pattern cannot be used.
+        init?(settings: UserDefaults) {
+            guard StreamAutoPlayRegex.isEnabled(in: settings) else { return nil }
+            // The rows are part of Auto Select Stream and grey out with it,
+            // so the pattern does nothing while that is off.
+            guard settings.object(forKey: SettingsKey.smartStreamSelection) as? Bool ?? false else { return nil }
+            self.init(pattern: settings.string(forKey: SettingsKey.streamAutoPlayRegex) ?? "")
+        }
+
+        init?(pattern: String) {
+            guard let regex = StreamAutoPlayRegex.compiled(pattern) else { return nil }
+            self.regex = regex
+            let trimmed = pattern.trimmingCharacters(in: .whitespacesAndNewlines)
+            var words: [String] = []
+            if let lookahead = try? NSRegularExpression(pattern: "\\(\\?![^)]*?\\(([^)]+)\\)") {
+                let range = NSRange(trimmed.startIndex..., in: trimmed)
+                for match in lookahead.matches(in: trimmed, range: range) where match.numberOfRanges > 1 {
+                    guard let wordsRange = Range(match.range(at: 1), in: trimmed) else { continue }
+                    words += trimmed[wordsRange].split(separator: "|")
+                        .map { $0.trimmingCharacters(in: .whitespaces) }
+                        .filter { !$0.isEmpty }
+                }
+            }
+            if words.isEmpty {
+                exclusion = nil
+            } else {
+                let escaped = words.map(NSRegularExpression.escapedPattern(for:)).joined(separator: "|")
+                exclusion = try? NSRegularExpression(pattern: "\\b(\(escaped))\\b", options: [.caseInsensitive])
+            }
+        }
+
+        /// The add-on's name, the stream's name and description, and its
+        /// address, as the other apps match them.
+        func matches(_ stream: NuvioStream) -> Bool {
+            let text = String(
+                [stream.addonName ?? "", stream.name ?? "", stream.description ?? "", stream.directURL ?? ""]
+                    .joined(separator: " ")
+                    // One line: add-on descriptions hold line breaks, which
+                    // "." and "$" in a pattern would otherwise stop at.
+                    .replacingOccurrences(of: "\r\n", with: " ")
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .replacingOccurrences(of: "\r", with: " ")
+                    .prefix(StreamAutoPlayRegex.maxTextLength)
+            )
+            guard found(regex, in: text) else { return false }
+            if let exclusion, found(exclusion, in: text) { return false }
+            return true
+        }
+
+        func candidates(from streams: [NuvioStream]) -> [NuvioStream] {
+            streams.filter(matches)
+        }
+
+        /// The stream list builder reads streams from the groups when it is
+        /// given any, so they are filtered along with the streams.
+        func candidateGroups(from groups: [AddonStreamGroup]) -> [AddonStreamGroup] {
+            groups.map { group in
+                var copy = group
+                copy.streams = group.streams.filter(matches)
+                return copy
+            }
+        }
+
+        private func found(_ expression: NSRegularExpression, in text: String) -> Bool {
+            guard !budget.isSpent else { return false }
+            let started = Date()
+            let deadline = started.addingTimeInterval(StreamAutoPlayRegex.matchBudget)
+            var matched = false
+            expression.enumerateMatches(
+                in: text,
+                options: [.reportProgress],
+                range: NSRange(text.startIndex..., in: text)
+            ) { result, _, stop in
+                if result != nil {
+                    matched = true
+                    stop.pointee = true
+                } else if Date() > deadline {
+                    stop.pointee = true
+                }
+            }
+            budget.add(Date().timeIntervalSince(started))
+            return matched
+        }
+    }
+}
+
+/// Which of the two binge group options a stream pick follows.
+enum StreamBingeUse {
+    /// A title started from Details, Continue Watching or a recommendation:
+    /// Settings → Up Next → Reuse Binge Group.
+    case freshStart
+    /// The next episode inside the player: Prefer Binge Group (Next Episode).
+    case nextEpisode
+    /// A new link for what is playing: either option, as before they were split.
+    case reload
+}
+
+/// Settings → Up Next → Fallback when binge group fails.
+enum NextEpisodeResolution {
+    /// True while the player resolves the episode it advances to by itself
+    /// or from the Next Episode card. An episode picked from the player's
+    /// episode list is not one.
+    @TaskLocal static var isAutoAdvance = false
+
+    /// On unless switched off: the next episode has always fallen back to
+    /// the best other source.
+    static func fallsBack(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.nextEpisodeBingeFallback) as? Bool ?? true
+    }
+}
+
+/// Settings → Audio → Downmix: surround audio is mixed down to fewer channels.
+enum AudioDownmix {
+    static let stereo = "2.0"
+    static let surround = "5.1"
+    /// The layouts both player engines can be asked for. AetherEngine takes
+    /// a channel count, so the other apps' in-between layouts are left out.
+    static let layouts = [stereo, surround]
+    static let defaultLayout = stereo
+
+    static func isEnabled(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.downmixEnabled) as? Bool ?? false
+    }
+
+    static func layout(in settings: UserDefaults) -> String {
+        let stored = settings.string(forKey: SettingsKey.downmixChannels) ?? defaultLayout
+        return layouts.contains(stored) ? stored : defaultLayout
+    }
+
+    /// AetherEngine's ceiling on output channels, or nil with Downmix off.
+    static func maxChannels(in settings: UserDefaults) -> Int? {
+        guard isEnabled(in: settings) else { return nil }
+        return layout(in: settings) == surround ? 6 : 2
+    }
+
+    /// mpv's `audio-channels`, or nil with Downmix off. The narrower layouts
+    /// are listed too, so a source with fewer channels is not mixed up.
+    static func mpvChannels(in settings: UserDefaults) -> String? {
+        guard isEnabled(in: settings) else { return nil }
+        return layout(in: settings) == surround ? "5.1,stereo,mono" : "stereo,mono"
+    }
+
+    /// mpv's `audio-normalize-downmix`: on when Maintain Original Audio on
+    /// Downmix is switched off. Nil with Downmix off.
+    static func mpvNormalizesDownmix(in settings: UserDefaults) -> Bool? {
+        guard isEnabled(in: settings) else { return nil }
+        return (settings.object(forKey: SettingsKey.downmixMaintainOriginal) as? Bool ?? true) == false
+    }
+}

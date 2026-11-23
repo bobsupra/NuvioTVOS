@@ -512,11 +512,15 @@ private struct DiscoverCard: View {
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @AppStorage(SettingsKey.customPosterScreensChosenHere) private var customPosterScreensChosenHere = false
+    @Environment(\.cardAppearance) private var cardAppearance
 
     private var customPosterArtworkURL: String? {
-        let screens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? customPosterEnabledScreens
-            : "all"
+        let screens = CustomPosterScreen.effectiveStorageValue(
+            stored: customPosterEnabledScreens,
+            pattern: customPosterURLPattern,
+            chosenHere: customPosterScreensChosenHere
+        )
         return CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: meta,
@@ -566,6 +570,8 @@ private struct DiscoverCard: View {
                         coveredByArtwork: true
                     )
                 )
+                // Settings → Poster Card Style → Card depth effect.
+                .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .posters, shape: shape))
                 .overlay(alignment: .topTrailing) {
                     WatchedCheckmarkBadge(meta: meta)
                 }

@@ -608,8 +608,10 @@ public class LibraryViewModel: ObservableObject {
                     return
                 }
                 self.mdbListLists = lists ?? []
+                // A list switched off in Settings → Tracking → Library lists
+                // is no longer offered, so it cannot stay selected.
                 if let selectedMdbListListID = self.selectedMdbListListID,
-                   self.mdbListLists.contains(where: { $0.id == selectedMdbListListID }) {
+                   self.visibleMdbListLists.contains(where: { $0.id == selectedMdbListListID }) {
                     await self.loadMdbListListItems(
                         selectedMdbListListID,
                         generation: generation,
@@ -687,6 +689,12 @@ public class LibraryViewModel: ObservableObject {
             && watchedContext.isCurrentScope
             && source != .local
             && SelectedLibraryService.isSelectedAndAuthenticated
+    }
+
+    /// The MDBList lists the Library offers: the account's lists without
+    /// those switched off in Settings → Tracking → Library lists.
+    var visibleMdbListLists: [MdbListUserList] {
+        MdbListLibraryLists.visible(mdbListLists, in: ProfileSettings.current)
     }
 
     public func selectMdbListList(_ listID: Int?) async {

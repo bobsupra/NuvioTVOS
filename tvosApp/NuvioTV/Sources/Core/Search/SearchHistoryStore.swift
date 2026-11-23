@@ -9,6 +9,12 @@ enum SearchHistoryStore {
     static let maxRecentSearches = 8
     static let minQueryLength = 2
 
+    /// Settings → Content & Discovery → Recent Searches. Off keeps the stored
+    /// list but neither shows it nor adds to it.
+    static func isEnabled(in defaults: UserDefaults = ProfileSettings.current) -> Bool {
+        defaults.object(forKey: SettingsKey.recentSearchesEnabled) as? Bool ?? true
+    }
+
     /// Sanitizes an array of queries by trimming whitespace, discarding entries shorter than `minQueryLength`,
     /// deduplicating case-insensitively, and removing any query that is a substring/prefix of a longer query
     /// in the list.
@@ -47,6 +53,7 @@ enum SearchHistoryStore {
 
     /// Loads and sanitizes the active profile's recent searches.
     static func load(defaults: UserDefaults = ProfileSettings.current) -> [String] {
+        guard isEnabled(in: defaults) else { return [] }
         let stored = defaults.stringArray(forKey: storageKey) ?? []
         let sanitized = sanitize(stored)
         if sanitized != stored {
@@ -71,7 +78,7 @@ enum SearchHistoryStore {
         maxCount: Int = maxRecentSearches
     ) -> (updated: [String], newSessionQuery: String?) {
         let trimmed = term.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard trimmed.count >= minQueryLength else {
+        guard isEnabled(), trimmed.count >= minQueryLength else {
             return (current, sessionQuery)
         }
 

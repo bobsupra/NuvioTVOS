@@ -346,6 +346,40 @@ public enum PlaybackOrigin {
     case liveTV
 }
 
+/// The launch prompt of Settings → Continue Watching → Resume prompt on
+/// launch. It draws nothing itself: it waits for the profile's Home to be
+/// ready and presents the prompt.
+struct ResumePromptHost: View {
+    @Binding var item: ContinueWatchingItem?
+    let isPreparingProfile: Bool
+    let onProfileReady: () -> Void
+    let onResume: (ContinueWatchingItem) -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .allowsHitTesting(false)
+            .onChange(of: isPreparingProfile) { _, _ in
+                onProfileReady()
+            }
+            .alert(
+                L10n.string("tvos_resume_prompt_title", fallback: "Continue watching?"),
+                isPresented: Binding(
+                    get: { item != nil },
+                    set: { if !$0 { item = nil } }
+                ),
+                presenting: item
+            ) { item in
+                Button(L10n.string("resume_prompt_action", fallback: "Resume")) {
+                    onResume(item)
+                }
+                Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+            } message: { item in
+                Text([item.meta.name, item.episodeLabel].compactMap { $0 }.joined(separator: " · "))
+            }
+    }
+}
+
 private enum DetailsReturnDestination {
     case main
     case collectionFolder(TVCollectionFolderItem, collectionTitle: String)
@@ -665,6 +699,9 @@ struct ContentView: View {
     /// client instead holds a full-screen loader and reveals a finished Home,
     /// which is both calmer and easier to reason about.
     @State private var isPreparingProfile = false
+    /// Settings → Continue Watching → Resume prompt on launch.
+    @State private var didCheckResumePrompt = false
+    @State private var resumePromptItem: ContinueWatchingItem?
     @State private var profileGateTask: Task<Void, Never>?
     @State private var profileGateLiftTask: Task<Void, Never>?
     @State private var profileGateStartedAt: Date?
@@ -768,6 +805,16 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             ProfileScopedRootBackground()
+
+            // Settings → Continue Watching → Resume prompt on launch. Kept
+            // out of the modifier chain below, which is as long as the
+            // compiler will check.
+            ResumePromptHost(
+                item: $resumePromptItem,
+                isPreparingProfile: isPreparingProfile,
+                onProfileReady: checkResumePromptOnLaunch,
+                onResume: { resumePlayback($0) }
+            )
 
             switch activeScreen {
             case .login:
@@ -939,6 +986,7 @@ struct ContentView: View {
             if oldScreen != newScreen, !newScreen.isPlayer, partyLaunchTask != nil {
                 partyLaunchID = UUID(); partyLaunchTask?.cancel(); partyLaunchTask = nil
             }
+            noteResumePromptScreenChange(from: oldScreen, to: newScreen)
         }
         .onChange(of: visibleAppNotice?.id) { _, noticeID in
             if noticeID != nil { appNoticeFocusRequestGeneration &+= 1 }
@@ -1968,6 +2016,40 @@ struct ContentView: View {
     ///
     /// `startFromBeginning` plays the same episode with no resume point, for the
     /// card menu's "Start from beginning".
+    /// Settings → Continue Watching → Resume prompt on launch: keeps
+    /// `ResumePromptStore` in step with the player being on screen.
+    private func noteResumePromptScreenChange(from oldScreen: TVScreen, to newScreen: TVScreen) {
+        if case .player(_, let meta, let subtitle, _, _, _) = newScreen {
+            // Once something has played, this run of the app is past its launch.
+            didCheckResumePrompt = true
+            let resumable = subtitle != PlaybackMarkers.trailerSubtitle
+                && !playbackIsActionPlaybackSession
+                && playbackPartyID == nil
+                && playbackOrigin != .liveTV
+            if resumable {
+                ResumePromptStore.markPlayerEntered(metaID: meta.id)
+            } else {
+                ResumePromptStore.markPlayerExitedNormally()
+            }
+        } else if oldScreen.isPlayer {
+            ResumePromptStore.markPlayerExitedNormally()
+        }
+        checkResumePromptOnLaunch()
+    }
+
+    /// Once per launch, when Home is first shown for the chosen profile:
+    /// offers to resume the title the app was closed on.
+    private func checkResumePromptOnLaunch() {
+        guard !didCheckResumePrompt, activeScreen == .main, !isPreparingProfile,
+              profileViewModel.activeProfile != nil else { return }
+        didCheckResumePrompt = true
+        let store = ProfileSettings.current
+        // Read even with the option off, so an old mark cannot show up later.
+        guard let metaID = ResumePromptStore.consume(in: store),
+              store.bool(forKey: SettingsKey.resumePromptOnLaunch) else { return }
+        resumePromptItem = ContinueWatchingStore.item(for: metaID)
+    }
+
     private func resumePlayback(_ item: ContinueWatchingItem, startFromBeginning: Bool = false) {
         continueWatchingPlaybackTask?.cancel()
         continueWatchingPlaybackTask = nil
@@ -3171,7 +3253,9 @@ struct ContentView: View {
                     message: continueWatchingLoadingMessage,
                     onDismiss: {
                         dismissOverlay()
-                    }
+                    },
+                    // Settings → Player Interface → Loading Overlay.
+                    spinnerOnly: ProfileSettings.current.object(forKey: SettingsKey.showLoadingOverlay) as? Bool == false
                 )
                 .transition(.leavingScreen)
                 .onDisappear {
@@ -3657,7 +3741,8 @@ struct ContentView: View {
         episode: NuvioVideo,
         seriesMeta: NuvioMeta,
         profileId: String?,
-        startupToken: UUID? = nil
+        startupToken: UUID? = nil,
+        bingeUse: StreamBingeUse = .freshStart
     ) async -> PreparedNextStream? {
         let streamId = seriesMeta.canonicalEpisodeStreamId(for: episode)
         return await resolveStream(
@@ -3667,7 +3752,8 @@ struct ContentView: View {
             profileId: profileId,
             seriesMetaId: seriesMeta.id,
             episodeTarget: StreamEpisodeTarget(season: episode.season, episode: episode.episode, allowsMismatch: !seriesMeta.isAnime),
-            startupToken: startupToken
+            startupToken: startupToken,
+            bingeUse: bingeUse
         )
     }
 
@@ -3684,7 +3770,8 @@ struct ContentView: View {
         seriesMetaId: String? = nil,
         episodeTarget: StreamEpisodeTarget? = nil,
         forceRefresh: Bool = false,
-        startupToken: UUID? = nil
+        startupToken: UUID? = nil,
+        bingeUse: StreamBingeUse = .freshStart
     ) async -> PreparedNextStream? {
         let resolvedEpisodeTarget: StreamEpisodeTarget? = episodeTarget ?? {
             guard NuvioMeta.isSeriesType(type) else { return nil }
@@ -3696,16 +3783,93 @@ struct ContentView: View {
                 allowsMismatch: Self.allowsEpisodeMismatch(type: type, contentId: contentId)
             )
         }()
-        let streams = await StreamsRepository.shared.collectStreams(
+        let store = ProfileSettings.store(for: profileId)
+        // Settings → Stream Selection: how long to wait for add-ons, and
+        // which sources may be picked. With the defaults both change nothing.
+        let sourceFilter = StreamAutoPlaySources.Filter(settings: store)
+        // Settings → Stream Selection → Auto-play regex match: only sources
+        // matching the pattern are picked, the first in the list's order.
+        // Nil when the mode is off or the pattern cannot be used. A reload
+        // after a failed link keeps every source and tries matching ones first.
+        let regexMatcher = StreamAutoPlayRegex.Matcher(settings: store)
+        let isReload = !excludingURLs.isEmpty
+        // Prefer the exact series meta id when resolving an episode stream.
+        let resolvedSeriesId = seriesMetaId ?? StreamQualityTags.seriesId(fromContentId: contentId)
+        let metaIdForTags = resolvedSeriesId.isEmpty ? contentId : resolvedSeriesId
+        let preferredTags = LastStreamQualityStore.load(metaId: metaIdForTags, profileId: profileId)
+            ?? LastStreamQualityStore.load(metaId: contentId, profileId: profileId)
+        let preferBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
+        let reuseBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
+        let matchesPreferredBingeGroup: (NuvioStream, StreamQualityTags) -> Bool = { candidate, preferred in
+            let tags = StreamQualityTags.parse(stream: candidate)
+            if let pbg = preferred.bingeGroup, let sbg = tags.bingeGroup,
+               pbg.compare(sbg, options: .caseInsensitive) == .orderedSame {
+                return true
+            }
+            if let pfp = preferred.releaseFingerprint, let sfp = tags.releaseFingerprint,
+               pfp.compare(sfp, options: .caseInsensitive) == .orderedSame {
+                return true
+            }
+            return false
+        }
+        // Settings → Up Next → Fallback when binge group fails, switched off:
+        // an episode the player advances to plays only a source of the same
+        // binge group or release. With none, nothing is picked and the player
+        // ends the episode as it does when no source is found. A title with
+        // no remembered group has nothing to fail, so it is picked as usual.
+        let bingeOnlyTags: StreamQualityTags? = {
+            guard bingeUse == .nextEpisode,
+                  NextEpisodeResolution.isAutoAdvance,
+                  preferBingeGroup,
+                  !NextEpisodeResolution.fallsBack(in: store),
+                  let preferredTags,
+                  preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil else { return nil }
+            return preferredTags
+        }()
+        // While add-ons still answer, only a source these two rules would
+        // pick counts as found, so the wait is not cut short by another one.
+        var isPickable: ((NuvioStream) -> Bool)?
+        if (regexMatcher != nil && !isReload) || bingeOnlyTags != nil {
+            // Asked again on every poll, so each stream is judged once.
+            var verdicts: [String: Bool] = [:]
+            isPickable = { stream in
+                let key = "\(stream.id)|\(stream.addonName ?? "")|\(stream.name ?? "")"
+                if let known = verdicts[key] { return known }
+                var verdict = true
+                if let regexMatcher, !isReload, !regexMatcher.matches(stream) { verdict = false }
+                if verdict, let bingeOnlyTags, !matchesPreferredBingeGroup(stream, bingeOnlyTags) { verdict = false }
+                verdicts[key] = verdict
+                return verdict
+            }
+        }
+        let collected = await StreamsRepository.shared.collectStreams(
             type: type,
             videoId: contentId,
             season: resolvedEpisodeTarget?.season,
             episode: resolvedEpisodeTarget?.episode,
-            forceRefresh: forceRefresh || !excludingURLs.isEmpty
+            forceRefresh: forceRefresh || !excludingURLs.isEmpty,
+            waitRule: StreamSelectionTimeout.rule(in: store),
+            sourceFilter: sourceFilter,
+            isPickable: isPickable
         )
+        var streams: [NuvioStream]
+        if sourceFilter.isActive {
+            let groups = await StreamsRepository.shared.state.groups
+            streams = sourceFilter.candidates(from: collected, groups: groups)
+            // A reload after a failed link is recovery, not auto-play. When
+            // the allowed sources have nothing left, any source may be used,
+            // as before the filter existed.
+            if streams.isEmpty, !excludingURLs.isEmpty {
+                streams = collected
+            }
+        } else {
+            streams = collected
+        }
+        if let regexMatcher, !isReload {
+            streams = regexMatcher.candidates(from: streams)
+        }
         guard !streams.isEmpty else { return nil }
 
-        let store = ProfileSettings.store(for: profileId)
         let matchSubtitles = store.object(forKey: SettingsKey.smartSubtitleMatching) as? Bool ?? true
         let languages = SubtitleLanguagePreferences.orderedFromDefaults(defaults: store)
         let cachedOnlyPreference = (store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
@@ -3713,31 +3877,37 @@ struct ContentView: View {
             cachedOnlyPreference,
             contentType: type
         )
-        // Prefer the exact series meta id when resolving an episode stream.
-        let resolvedSeriesId = seriesMetaId ?? StreamQualityTags.seriesId(fromContentId: contentId)
-        let metaIdForTags = resolvedSeriesId.isEmpty ? contentId : resolvedSeriesId
 
         let debrid = DebridResolver(store: store)
         let useTopResult = (store.object(forKey: SettingsKey.smartStreamUseTopResult) as? Bool) ?? false
         let preserveAddonOrder = (store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
-        let preferBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
-        let reuseBingeGroup = (store.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
+        // Settings → Up Next: Prefer Binge Group covers the next episode in
+        // the player, Reuse Binge Group a title started afresh. With both on,
+        // as by default, this is the single option they used to be.
+        let wantsBingeGroup: Bool
+        switch bingeUse {
+        case .nextEpisode: wantsBingeGroup = preferBingeGroup
+        case .freshStart: wantsBingeGroup = reuseBingeGroup
+        case .reload: wantsBingeGroup = preferBingeGroup || reuseBingeGroup
+        }
         let includeDebridOrTorrent = debrid.isEnabled || TorrentSettings.isEnabled()
-        let preferredTags = (preferBingeGroup || reuseBingeGroup)
-            ? LastStreamQualityStore.load(metaId: metaIdForTags, profileId: profileId)
-                ?? LastStreamQualityStore.load(metaId: contentId, profileId: profileId)
-            : nil
         let subtitleLanguages = matchSubtitles && !useTopResult && !preserveAddonOrder ? languages : []
-        let ranked = StreamPickerListBuilder.automaticStreams(
+        var ranked = StreamPickerListBuilder.automaticStreams(
             streams: streams,
             sortOption: StreamSortOption.configured(in: store),
             includeDebrid: includeDebridOrTorrent,
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonOrder,
             episodeTarget: resolvedEpisodeTarget,
-            preferredTags: preferredTags,
+            preferredTags: wantsBingeGroup ? preferredTags : nil,
             subtitleLanguages: subtitleLanguages
         )
+        if let regexMatcher, isReload {
+            ranked = ranked.filter(regexMatcher.matches) + ranked.filter { !regexMatcher.matches($0) }
+        }
+        if let bingeOnlyTags {
+            ranked = ranked.filter { matchesPreferredBingeGroup($0, bingeOnlyTags) }
+        }
         guard !ranked.isEmpty else { return nil }
 
         for candidate in ranked {
@@ -4170,7 +4340,8 @@ struct ContentView: View {
                     episode: episode,
                     seriesMeta: meta,
                     profileId: profileViewModel.activeProfile?.id,
-                    startupToken: startupToken
+                    startupToken: startupToken,
+                    bingeUse: .nextEpisode
                 )
             },
             reloadCurrentStream: (isStandalonePlaybackSession || party != nil) ? nil : { currentEpisode, excludedURLs in
@@ -4191,7 +4362,8 @@ struct ContentView: View {
                             allowsMismatch: !meta.isAnime
                         ),
                         forceRefresh: true,
-                        startupToken: nil
+                        startupToken: nil,
+                        bingeUse: .reload
                     )
                 }
                 return await Self.resolveStream(
@@ -4202,7 +4374,8 @@ struct ContentView: View {
                     excludingURLs: excluded,
                     seriesMetaId: meta.isSeries ? meta.id : nil,
                     forceRefresh: true,
-                    startupToken: nil
+                    startupToken: nil,
+                    bingeUse: .reload
                 )
             },
             fetchPlaybackSources: isStandalonePlaybackSession ? nil : { contentId, type, episodeTarget in
@@ -5605,7 +5778,11 @@ private struct TVMainTabView: View {
             onSwitchProfile: {
                 syncManager.flushPendingPushes()
                 onSwitchProfile()
-            }
+            },
+            // The lobby is drawn only while its tab is shown.
+            onOpenWatchParty: WatchPartyConfiguration.isEnabled && showWatchPartyTab
+                ? { selectedTab = .party }
+                : nil
         )
     }
 
@@ -8967,7 +9144,7 @@ struct TVHomeView: View {
                                     if isCalendarToday {
                                         openCalendarTodayCard(meta, restoreCardID: cardKey)
                                     } else if let item = continueWatchingByMetaId[meta.id] {
-                                        if item.isUpNextEntry && !item.hasAired && !item.isAiringToday {
+                                        if ContinueWatchingClickAction.opensDetails(for: item, in: ProfileSettings.current) {
                                             navigateToDetailsFromHome(
                                                 id: meta.id,
                                                 type: meta.type,
@@ -10552,7 +10729,7 @@ struct TVHomeView: View {
                     } else if (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId),
                         let item = continueWatchingByMetaId[meta.id]
                     {
-                        if item.isUpNextEntry && !item.hasAired && !item.isAiringToday {
+                        if ContinueWatchingClickAction.opensDetails(for: item, in: ProfileSettings.current) {
                             navigateToDetailsFromHome(
                                 id: meta.id,
                                 type: meta.type,
@@ -13765,6 +13942,50 @@ enum TVHomeCatalogOrder {
         let storageKey = snapshotStorageKey(for: ProfileSettings.current)
         LargePayloadStore.remove(key: storageKey, directory: snapshotDirectoryName)
         invalidateSnapshotCache(for: storageKey)
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+        NotificationCenter.default.post(name: snapshotChangedNotification, object: nil)
+    }
+
+    /// Settings → Home Catalogs → Reset to Default. Shows hidden catalog and
+    /// collection rows again, brings back deleted rows and drops the row
+    /// order saved on this Apple TV. Add-ons, collections, the account's own
+    /// order and custom names are kept.
+    static func resetToDefaults() {
+        // Collections go through the pending journal, so an account pull
+        // that lands before the push cannot hide them again.
+        for id in disabledCollectionIds() {
+            setCollectionEnabled(id, isEnabled: true)
+        }
+        // Rows turned on by hand stay on: the reset only shows rows.
+        HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogDisabled)
+        HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogDeleted)
+        HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogOrder)
+
+        let accountOrder = syncedCatalogOrderIndex()
+        if accountOrder.isEmpty {
+            // No account order to fall back to: Home records its rows again
+            // in their natural order.
+            let storageKey = snapshotStorageKey(for: ProfileSettings.current)
+            LargePayloadStore.remove(key: storageKey, directory: snapshotDirectoryName)
+            invalidateSnapshotCache(for: storageKey)
+        } else {
+            // The catalog push sends the recorded rows in their recorded
+            // order. Put the rows the account knows back in the account's
+            // order first, or the push would send the dropped order to it.
+            let rows = snapshotRows()
+            func accountIndex(_ row: SnapshotRow) -> Int? {
+                accountOrder[row.settingsKey ?? sectionOrderKey(row.id)]
+            }
+            var known = rows.filter { accountIndex($0) != nil }
+                .sorted { (accountIndex($0) ?? 0) < (accountIndex($1) ?? 0) }
+                .makeIterator()
+            let reordered = rows.map { row in
+                accountIndex(row) == nil ? row : (known.next() ?? row)
+            }
+            if reordered != rows {
+                writeSnapshotRows(reordered)
+            }
+        }
         NotificationCenter.default.post(name: changedNotification, object: nil)
         NotificationCenter.default.post(name: snapshotChangedNotification, object: nil)
     }

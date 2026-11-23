@@ -89,13 +89,38 @@ private final class PlaybackDiagnosticHistoryModel: ObservableObject {
 struct PlaybackDiagnosticHistoryView: View {
     let accentColor: Color
     @Environment(\.dismiss) private var dismiss
+    /// Drawn as a Settings page: the page has the title, scrolling and back.
+    @Environment(\.settingsSheetAsPage) private var asPage
     @StateObject private var model = PlaybackDiagnosticHistoryModel()
     @State private var confirmDelete = false
 
     var body: some View {
-        ScrollView {
+        Group {
+            if asPage {
+                history
+            } else {
+                ScrollView {
+                    history
+                        .padding(64)
+                }
+                .background(Color.black.ignoresSafeArea())
+            }
+        }
+        .onAppear { model.refresh() }
+        .onDisappear { model.stopExport() }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in model.stopExport() }
+        .onExitCommand(perform: asPage ? nil : { dismiss() })
+        .confirmationDialog(L10n.string("diagnostic_history_delete_confirm", fallback: "Delete diagnostic history from this Apple TV?"), isPresented: $confirmDelete) {
+            Button(L10n.string("diagnostic_history_delete", fallback: "Delete History"), role: .destructive) { model.clearHistory() }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        }
+    }
+
+    private var history: some View {
             LazyVStack(alignment: .leading, spacing: 24) {
-                Text(L10n.string("diagnostic_history_title", fallback: "Playback Diagnostic History")).font(.largeTitle.bold())
+                if !asPage {
+                    Text(L10n.string("diagnostic_history_title", fallback: "Playback Diagnostic History")).font(.largeTitle.bold())
+                }
                 Text(L10n.string("diagnostic_history_subtitle", fallback: "Recent playback actions saved on this Apple TV. A previous session without a recorded ending is not proof of a crash. Recent events may be missing after a sudden exit."))
                     .font(.system(size: 23)).foregroundStyle(.secondary)
                 HStack(spacing: 24) {
@@ -103,7 +128,9 @@ struct PlaybackDiagnosticHistoryView: View {
                     Button(L10n.string("diagnostic_history_export", fallback: "Export History")) { model.exportHistory() }
                         .disabled(model.snapshot?.timeline.sessions.isEmpty != false)
                     Button(L10n.string("diagnostic_history_delete", fallback: "Delete History"), role: .destructive) { confirmDelete = true }
-                    Button(L10n.string("tvos_common_done", fallback: "Done")) { dismiss() }
+                    if !asPage {
+                        Button(L10n.string("tvos_common_done", fallback: "Done")) { dismiss() }
+                    }
                 }
                 .buttonStyle(.bordered)
                 .tint(accentColor)
@@ -156,17 +183,6 @@ struct PlaybackDiagnosticHistoryView: View {
                     }
                 }
             }
-            .padding(64)
-        }
-        .background(Color.black.ignoresSafeArea())
-        .onAppear { model.refresh() }
-        .onDisappear { model.stopExport() }
-        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in model.stopExport() }
-        .onExitCommand { dismiss() }
-        .confirmationDialog(L10n.string("diagnostic_history_delete_confirm", fallback: "Delete diagnostic history from this Apple TV?"), isPresented: $confirmDelete) {
-            Button(L10n.string("diagnostic_history_delete", fallback: "Delete History"), role: .destructive) { model.clearHistory() }
-            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
-        }
     }
 }
 #endif

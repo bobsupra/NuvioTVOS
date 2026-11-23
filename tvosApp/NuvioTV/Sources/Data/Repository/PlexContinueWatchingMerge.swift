@@ -81,12 +81,22 @@ enum PlexContinueWatchingMerge {
         lock.unlock()
     }
 
+    /// Settings → Media Servers → Plex → Import watch progress. Off leaves
+    /// the row as it is stored: nothing is added and nothing is removed.
+    static var isEnabled: Bool {
+        ProfileSettings.current.object(forKey: SettingsKey.plexImportWatchProgress) as? Bool ?? true
+    }
+
     /// Home's row with Plex's titles merged in.
     @MainActor
     static func merged(
         into items: [ContinueWatchingItem],
         displayable: (ContinueWatchingItem) -> Bool
     ) -> [ContinueWatchingItem] {
+        guard isEnabled else {
+            reset()
+            return items
+        }
         let prepared = prepareMerge(into: items, input: captureMergeInput(), displayable: displayable)
         commitLatestSnapshot(prepared.snapshot)
         return prepared.merged
@@ -97,7 +107,8 @@ enum PlexContinueWatchingMerge {
     /// merged.
     @MainActor
     static func mergedNow(into items: [ContinueWatchingItem]) -> [ContinueWatchingItem] {
-        merged(
+        guard isEnabled else { return items }
+        return merged(
             into: items,
             snapshot: currentSnapshot(from: captureMergeInput()),
             dismissedKeys: ContinueWatchingDismissStore.keys()
@@ -107,6 +118,7 @@ enum PlexContinueWatchingMerge {
     /// `items` merged with the Plex cards Home used last, or unchanged before
     /// Home has merged. Safe off the main actor.
     static func mergedWithLatest(into items: [ContinueWatchingItem]) -> [ContinueWatchingItem] {
+        guard isEnabled else { return items }
         lock.lock()
         let snapshot = latest
         lock.unlock()

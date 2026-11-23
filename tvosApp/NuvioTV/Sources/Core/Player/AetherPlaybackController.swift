@@ -5785,7 +5785,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let preserveSubwooferBass = ProfileSettings.current.bool(forKey: SettingsKey.preserveSubwooferBassInStereo)
         let lfeMixDB: Double? = preserveSubwooferBass ? 0.0 : nil
-        let maxChannels: Int? = preserveSubwooferBass ? 2 : nil
+        // Preserve Subwoofer Bass in Stereo already folds to two channels.
+        // Otherwise Settings → Audio → Downmix sets the ceiling, when it is on.
+        let maxChannels: Int? = preserveSubwooferBass ? 2 : AudioDownmix.maxChannels(in: ProfileSettings.current)
 
         var dialogueGainDB: Double = 0
         switch activeDialogue {

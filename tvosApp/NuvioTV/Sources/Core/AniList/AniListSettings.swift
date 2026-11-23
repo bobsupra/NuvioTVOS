@@ -104,6 +104,8 @@ enum AniListSettings {
     /// The offline tables are needed: for AniList's or MAL's titles, or only for their scores.
     static var needsOfflineTables: Bool {
         opensTitles || showsScore || KitsuSettings.showsScore || MALSettings.usesOwnScore || MALSettings.showsEpisodeRatings
+            // Anime Skip finds an episode's AniList entry in them.
+            || AnimeSkipSettings.isActive()
     }
 
     /// AniList titles open, play and convert their ids: with AniList on, or MyAnimeList on (its

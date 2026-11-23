@@ -1184,6 +1184,8 @@ struct CollectionFolderResultCard: View {
                         coveredByArtwork: true
                     )
                 )
+                // Settings → Poster Card Style → Card depth effect.
+                .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .posters, shape: shape))
                 .overlay(alignment: .topTrailing) {
                     WatchedCheckmarkBadge(meta: meta)
                 }

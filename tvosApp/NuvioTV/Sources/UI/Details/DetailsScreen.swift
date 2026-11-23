@@ -69,6 +69,10 @@ struct DetailsScreen: View {
     @State private var isStreamPickerPresented = false
     @State private var pendingStreamPickerResumePosition: Double? = nil
     @State private var isSmartPlaybackPending = false
+    /// When the add-ons began answering for the stream being auto-selected,
+    /// and the timer of Settings → Stream Selection → Stream Selection Timeout.
+    @State private var streamSelectionWaitStart: Date?
+    @State private var streamSelectionTimeoutTask: Task<Void, Never>?
     @State private var isPreparingPlayback = false
     @State private var isPreparingInitialPlayback = false
     @State private var startupBenchmarkToken: UUID?
@@ -85,6 +89,8 @@ struct DetailsScreen: View {
     @State private var didHandleInitialStreamPicker = false
     @State private var expandedComment: TraktCommentReview?
     @State private var showingMdbListRating = false
+    /// Settings → Tracking → Ratings source is MDBList and the account is connected.
+    @State private var ratingSourceIsMdbList = false
     /// Set while an episode card's context menu is up. tvOS hands the Menu press
     /// that dismisses the menu to this screen as well, and without this the
     /// screen would treat it as Back and return to Home.
@@ -111,6 +117,13 @@ struct DetailsScreen: View {
     @State private var preResolvedEpisodeSubtitle: String = ""
     @State private var preFetchDebridTask: Task<Void, Never>? = nil
     @State private var backgroundPreResolutionTask: Task<Void, Never>? = nil
+    /// Settings → Connected Services → Prepare links: links resolved ahead
+    /// for the first debrid results of one movie or episode, by stream id,
+    /// the results tried so far, and the movie or episode they belong to.
+    @State private var preparedDebridLinks: [String: PreparedDebridLink] = [:]
+    @State private var preparedDebridLinkAttempts: Set<String> = []
+    @State private var preparedDebridLinksStreamID: String?
+    @State private var prepareDebridLinksTask: Task<Void, Never>?
     @State private var preResolvedDuration: TimeInterval? = nil
     @State private var streamDiscoveryDuration: TimeInterval? = nil
     @State private var playbackPrewarmer: DetailsPlaybackPrewarmer
@@ -380,7 +393,8 @@ struct DetailsScreen: View {
                     onWatchlistClick: { viewModel.toggleWatchlist() },
                     onWatchedClick: { viewModel.toggleWatched(libraryContext: libraryWatchedContext) },
                     mdbListUserRating: viewModel.uiState.mdbListUserRating,
-                    showMdbListRating: false,
+                    // Settings → Tracking → Ratings source. Off hides the button.
+                    showMdbListRating: ratingSourceIsMdbList,
                     onRateClick: { showingMdbListRating = true },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onTrailerClick: { resumeFrom in openTrailer(for: viewModel.uiState.meta!, resumeFrom: resumeFrom) },
@@ -436,6 +450,9 @@ struct DetailsScreen: View {
             #endif
         }
         .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
+        .task(id: viewModel.uiState.meta?.id) {
+            await loadOwnRating()
+        }
         .confirmationDialog(
             viewModel.uiState.meta.map { "Rate \($0.name)" } ?? "Rate on MDBList",
             isPresented: $showingMdbListRating,
@@ -524,10 +541,12 @@ struct DetailsScreen: View {
                 finishSmartPlaybackIfPossible()
             }
             performBackgroundAutoSelectionAndPreResolution()
+            prepareDebridLinksIfNeeded()
         }
         .onChange(of: viewModel.uiState.streamsRevision) { _, _ in
             finishSmartPlaybackIfPossible()
             performBackgroundAutoSelectionAndPreResolution()
+            prepareDebridLinksIfNeeded()
         }
         .onChange(of: backgroundStreamPreFetch) { _, isEnabled in
             if isEnabled {
@@ -713,6 +732,18 @@ struct DetailsScreen: View {
         onInitialPlaybackRequestConsumed?(requestID)
     }
 
+    /// Settings → Tracking → Ratings source. With MDBList chosen, shows the
+    /// rate button and reads the viewer's rating for this title. Nothing is
+    /// sent: a rating is saved only when the viewer picks one.
+    private func loadOwnRating() async {
+        let usesMdbList = TrackingRatingSource.usesMdbList(in: ProfileSettings.current)
+        ratingSourceIsMdbList = usesMdbList
+        guard usesMdbList, let meta = viewModel.uiState.meta else { return }
+        let rating = await MdbListRatingsService.fetchRating(for: meta)
+        guard !Task.isCancelled, viewModel.uiState.meta?.id == meta.id else { return }
+        viewModel.setMdbListUserRating(rating)
+    }
+
     private func submitMdbListRating(_ rating: Int?) {
         guard let meta = viewModel.uiState.meta else { return }
         Task { @MainActor in
@@ -846,6 +877,9 @@ struct DetailsScreen: View {
     ) {
         isDetailsPlaybackContextActive = false
         didHandOffPlayback = true
+        // Playback is starting: no more links are prepared for this page.
+        prepareDebridLinksTask?.cancel()
+        prepareDebridLinksTask = nil
         _ = playbackPrewarmer.handOff(
             urlString: streamUrl,
             headers: httpHeaders,
@@ -1019,15 +1053,46 @@ struct DetailsScreen: View {
         } else if let episode = pendingEpisode {
             viewModel.prepareStreams(forId: targetStreamId, type: targetType, episode: episode)
         }
+        startStreamSelectionWait(reloaded: reload)
         finishSmartPlaybackIfPossible(meta: meta)
+    }
+
+    /// Settings → Stream Selection → Stream Selection Timeout. Notes when the
+    /// add-ons began answering and, for a wait in seconds, picks from what
+    /// has arrived once it is over. Automatic and Unlimited need no timer.
+    private func startStreamSelectionWait(reloaded: Bool) {
+        streamSelectionTimeoutTask?.cancel()
+        streamSelectionTimeoutTask = nil
+        let now = Date()
+        // Streams fetched ahead by the details page have been arriving
+        // since then, not since Play was pressed.
+        if !reloaded,
+           let fetchStart = viewModel.prefetchStartTime,
+           viewModel.prefetchedStreamId != nil,
+           viewModel.prefetchedStreamId == viewModel.requestedStreamId {
+            streamSelectionWaitStart = min(fetchStart, now)
+        } else {
+            streamSelectionWaitStart = now
+        }
+        guard case .seconds(let seconds) = StreamSelectionTimeout.rule(in: ProfileSettings.current) else { return }
+        let remaining = Double(seconds) - now.timeIntervalSince(streamSelectionWaitStart ?? now)
+        guard remaining > 0 else { return }
+        streamSelectionTimeoutTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+            guard !Task.isCancelled else { return }
+            self.finishSmartPlaybackIfPossible()
+        }
     }
 
     private func finishSmartPlaybackIfPossible(meta explicitMeta: NuvioMeta? = nil) {
         guard isSmartPlaybackPending else { return }
         let meta = explicitMeta ?? viewModel.uiState.meta
         guard let meta else { return }
-        // Wait for the configured sort to see the complete discovery result.
-        guard !viewModel.uiState.isLoadingStreams else { return }
+        // Wait for the configured sort to see the complete discovery result, unless the
+        // wait chosen in Settings → Stream Selection has run out.
+        let earlyPickAllowed = StreamSelectionTimeout.rule(in: ProfileSettings.current)
+            .allowsEarlyPick(elapsed: Date().timeIntervalSince(streamSelectionWaitStart ?? Date()))
+        guard !viewModel.uiState.isLoadingStreams || earlyPickAllowed == true else { return }
 
         let unavailableReason: String? = {
             let streams = viewModel.uiState.streams
@@ -1070,7 +1135,132 @@ struct DetailsScreen: View {
         backgroundPreResolutionTask?.cancel()
         backgroundPreResolutionTask = nil
         resetPreResolutionCandidate()
+        resetPreparedDebridLinks()
         streamDiscoveryDuration = nil
+    }
+
+    /// Stops preparing links and forgets the prepared ones.
+    private func resetPreparedDebridLinks() {
+        prepareDebridLinksTask?.cancel()
+        prepareDebridLinksTask = nil
+        preparedDebridLinks = [:]
+        preparedDebridLinkAttempts = []
+        preparedDebridLinksStreamID = nil
+    }
+
+    /// Settings → Connected Services → Prepare links. Once the sources of the
+    /// movie or episode on screen have all arrived, resolves the first cached
+    /// debrid results of the list, up to "Links to prepare", so picking one
+    /// of them starts at once. Off by default. It runs only while "Resolve
+    /// playable links" is on, counts the link Background Pre-fetch resolves,
+    /// stops when the viewer leaves the page or playback starts, and keeps
+    /// within `DebridLinkPreparation`'s budget.
+    private func prepareDebridLinksIfNeeded() {
+        let settings = ProfileSettings.current
+        let limit = DebridLinkPreparation.limit(in: settings)
+        guard limit > 0 else {
+            if preparedDebridLinksStreamID != nil { resetPreparedDebridLinks() }
+            return
+        }
+        guard isDetailsPlaybackContextActive, !didHandOffPlayback,
+              let meta = viewModel.uiState.meta,
+              let streamID = viewModel.requestedStreamId else { return }
+        if preparedDebridLinksStreamID != streamID {
+            resetPreparedDebridLinks()
+            preparedDebridLinksStreamID = streamID
+        }
+        // A complete list, so the first results are the ones the viewer sees.
+        guard !viewModel.uiState.isLoadingStreams,
+              viewModel.hasLoadedStreams(for: streamID),
+              prepareDebridLinksTask == nil else { return }
+        let resolver = DebridResolver(store: settings)
+        guard resolver.isEnabled else { return }
+
+        let episode: NuvioVideo?
+        if streamID == viewModel.prefetchedStreamId {
+            episode = viewModel.prefetchedEpisode
+        } else if let pending = pendingEpisode, canonicalEpisodeStreamId(for: pending, meta: meta) == streamID {
+            episode = pending
+        } else if streamID == meta.streamId {
+            episode = nil
+        } else {
+            return
+        }
+
+        let cachedOnlyPreference = (settings.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
+        let sortRaw = settings.string(forKey: SettingsKey.streamSortOption)
+        let displayed = StreamPickerListBuilder.displayedStreams(
+            streams: viewModel.uiState.streams,
+            groups: viewModel.uiState.streamGroups,
+            selectedAddonId: nil,
+            sortOption: sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality,
+            includeDebrid: true,
+            cachedOnly: SmartPlaybackSelector.effectiveCachedOnly(cachedOnlyPreference, contentType: meta.type),
+            preserveAddonStreams: preserveAddonOrder,
+            includeUnknownCacheStatus: true,
+            // Auto Select Stream ranks every source, and the count below
+            // leaves its top pick alone, so this list is ranked the same way.
+            applyingResultRules: false
+        )
+        // The link Background Pre-fetch resolves for Auto Select Stream is
+        // one of the count. Until its pick is known, one place is kept for it.
+        var alreadyCounted = preparedDebridLinkAttempts
+        var keptForAutoSelect = 0
+        if let autoSelected = preResolutionIdentity?.candidate {
+            if autoSelected.isDebridResolvable { alreadyCounted.insert(autoSelected.id) }
+        } else if backgroundStreamPreFetch, smartStreamSelection {
+            keptForAutoSelect = 1
+        }
+        let remaining = limit - alreadyCounted.count - keptForAutoSelect
+        guard remaining > 0 else { return }
+        // While Auto Select Stream's pick is not known, the top candidate is
+        // left for it: it is the likeliest pick, and preparing it here would
+        // resolve the same link twice.
+        let eligible = DebridLinkPreparation.candidates(
+            from: displayed.filter { !alreadyCounted.contains($0.id) },
+            limit: remaining + keptForAutoSelect
+        )
+        let targets = Array(eligible.dropFirst(keptForAutoSelect))
+        guard !targets.isEmpty else { return }
+        // Counted before the first request, so a later pass cannot start more.
+        preparedDebridLinkAttempts.formUnion(targets.map(\.id))
+
+        prepareDebridLinksTask = Task { @MainActor in
+            for stream in targets {
+                guard !Task.isCancelled,
+                      self.isDetailsPlaybackContextActive,
+                      !self.didHandOffPlayback,
+                      self.preparedDebridLinksStreamID == streamID,
+                      DebridLinkPreparation.consumeBudget() else { break }
+                let result = await resolver.resolvedURL(for: stream, season: episode?.season, episode: episode?.episode)
+                guard !Task.isCancelled, self.preparedDebridLinksStreamID == streamID else { return }
+                if case let .success(url, filename, videoSize)? = result {
+                    self.preparedDebridLinks[stream.id] = PreparedDebridLink(
+                        url: url,
+                        filename: filename,
+                        videoSize: videoSize,
+                        preparedAt: Date()
+                    )
+                } else if case .rateLimited? = result {
+                    DebridLinkPreparation.noteRateLimited()
+                    break
+                }
+            }
+            if !Task.isCancelled, self.preparedDebridLinksStreamID == streamID {
+                self.prepareDebridLinksTask = nil
+            }
+        }
+    }
+
+    /// The link prepared ahead for `stream`, when it belongs to the movie or
+    /// episode being played and is recent enough to still work.
+    private func preparedDebridLink(for stream: NuvioStream, meta: NuvioMeta) -> PreparedDebridLink? {
+        let selectedEpisode = pendingEpisode ?? viewModel.prefetchedEpisode
+        let selectedStreamID = selectedEpisode.map { canonicalEpisodeStreamId(for: $0, meta: meta) } ?? meta.streamId
+        guard preparedDebridLinksStreamID == selectedStreamID,
+              let link = preparedDebridLinks[stream.id],
+              Date().timeIntervalSince(link.preparedAt) < DebridLinkPreparation.linkLifetime else { return nil }
+        return link
     }
 
     private func resetPreResolutionCandidate() {
@@ -1109,7 +1299,9 @@ struct DetailsScreen: View {
                     if let requestID = pendingInitialPlaybackRequestID {
                         finishInitialPlaybackRequest(requestID)
                     }
-                }
+                },
+                // Settings → Player Interface → Loading Overlay.
+                spinnerOnly: ProfileSettings.current.object(forKey: SettingsKey.showLoadingOverlay) as? Bool == false
             )
             .transition(.opacity)
             .zIndex(25)
@@ -1177,7 +1369,6 @@ struct DetailsScreen: View {
         let store = ProfileSettings.current
         let preserveAddonOrder = store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool ?? false
         let sortOption = StreamSortOption.configured(in: store)
-        let preferBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
         let reuseBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
         let subtitleLanguagePreferences = self.subtitleLanguagePreferences
         let smartSubtitleMatching = self.smartSubtitleMatching
@@ -1186,10 +1377,14 @@ struct DetailsScreen: View {
         let streamGroups = viewModel.uiState.streamGroups
         let isLoadingStreams = viewModel.uiState.isLoadingStreams
         let episodeTarget = streamEpisodeTarget(for: currentEpisode, meta: meta)
-        let automaticPreferredTags = (preferBingeGroup || reuseBingeGroup) ? preferredTags : nil
+        let automaticPreferredTags = reuseBingeGroup ? preferredTags : nil
         let automaticSubtitleLanguages = smartSubtitleMatching && !smartStreamUseTopResult && !preserveAddonOrder
             ? subtitleLanguagePreferences : []
         let resolutionGeneration = self.preResolutionGeneration
+        // Settings → Stream Selection, as in `finishSmartPlaybackIfPossible`.
+        // The wait counts from when these streams began to be fetched.
+        let sourceFilter = StreamAutoPlaySources.Filter(settings: ProfileSettings.current)
+        let regexMatcher = StreamAutoPlayRegex.Matcher(settings: ProfileSettings.current)
 
         backgroundPreResolutionTask?.cancel()
         backgroundPreResolutionTask = Task { @MainActor in
@@ -1199,10 +1394,11 @@ struct DetailsScreen: View {
                     cachedOnlyPreference,
                     contentType: meta.type
                 )
-
+                let allowedStreams = sourceFilter.candidates(from: streams, groups: streamGroups)
+                let allowedGroups = sourceFilter.candidateGroups(from: streamGroups)
                 let candidate = StreamPickerListBuilder.automaticStreams(
-                    streams: streams,
-                    groups: streamGroups,
+                    streams: regexMatcher.map { $0.candidates(from: allowedStreams) } ?? allowedStreams,
+                    groups: regexMatcher.map { $0.candidateGroups(from: allowedGroups) } ?? allowedGroups,
                     sortOption: sortOption,
                     includeDebrid: debridIsEnabled || torrentIsEnabled,
                     cachedOnly: cachedOnly,
@@ -1551,21 +1747,31 @@ struct DetailsScreen: View {
         let cachedOnlyPreference = store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool ?? false
         let cachedOnly = SmartPlaybackSelector.effectiveCachedOnly(cachedOnlyPreference, contentType: meta.type)
         let preserveAddonOrder = store.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool ?? false
-        let preferBingeGroup = store.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool ?? true
+        // Settings → Up Next → Reuse Binge Group: a title started from here
+        // tries the last source profile first.
         let reuseBingeGroup = store.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool ?? true
         let preferredTags = LastStreamQualityStore.load(metaId: meta.id, profileId: ProfileSettings.activeProfileID)
         let subtitleLanguages = smartSubtitleMatching && !smartStreamUseTopResult && !preserveAddonOrder
             ? subtitleLanguagePreferences : []
+        // Settings → Stream Selection: the sources auto-select may pick from
+        // (every stream with the defaults).
+        let sourceFilter = StreamAutoPlaySources.Filter(settings: store)
+        let allowedStreams = sourceFilter.candidates(from: viewModel.uiState.streams, groups: viewModel.uiState.streamGroups)
+        let allowedGroups = sourceFilter.candidateGroups(from: viewModel.uiState.streamGroups)
+        // Settings → Stream Selection → Auto-play regex match: only sources
+        // matching the pattern. Nil when the mode is off or the pattern cannot
+        // be used. With no match nothing is picked and the stream picker opens.
+        let regexMatcher = StreamAutoPlayRegex.Matcher(settings: store)
         return StreamPickerListBuilder.automaticStreams(
-            streams: viewModel.uiState.streams,
-            groups: viewModel.uiState.streamGroups,
+            streams: regexMatcher.map { $0.candidates(from: allowedStreams) } ?? allowedStreams,
+            groups: regexMatcher.map { $0.candidateGroups(from: allowedGroups) } ?? allowedGroups,
             sortOption: StreamSortOption.configured(in: store),
             includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
             cachedOnly: cachedOnly,
             preserveAddonStreams: preserveAddonOrder,
             includeUnknownCacheStatus: true,
             episodeTarget: streamEpisodeTarget(for: episode, meta: meta),
-            preferredTags: (preferBingeGroup || reuseBingeGroup) ? preferredTags : nil,
+            preferredTags: reuseBingeGroup ? preferredTags : nil,
             subtitleLanguages: subtitleLanguages
         )
     }
@@ -1729,6 +1935,40 @@ struct DetailsScreen: View {
                 PlaybackCacheFileIdentity(infoHash: stream.effectiveInfoHash, fileIndex: stream.effectiveFileIdx),
                 preResolvedFilename ?? stream.filename,
                 preResolvedVideoSize ?? stream.videoSize,
+                stream.videoHash,
+                resumePos,
+                startupToken,
+                stream.id,
+                stream.isNotPlayable
+            )
+            return
+        }
+
+        // A link resolved ahead by Settings → Connected Services → Prepare links.
+        if stream.isDebridResolvable, !isResolvingDebrid,
+           let prepared = preparedDebridLink(for: stream, meta: meta) {
+            PlaybackStartupTiming.markDebridResolved(token: startupToken)
+            isStreamPickerPresented = false
+            isPreparingPlayback = true
+            isSmartPlaybackPending = false
+            if !stream.isNotPlayable { armExternalPlayerTimeoutIfNeeded(player: player) }
+            if self.startupBenchmarkToken == startupToken {
+                self.startupBenchmarkToken = nil
+            }
+            let resumePos = pendingStreamPickerResumePosition
+            pendingStreamPickerResumePosition = nil
+            dispatchPlayback(
+                prepared.url.absoluteString,
+                stream.httpHeaders ?? [:],
+                meta,
+                pendingEpisodeSubtitle,
+                stream.subtitles,
+                pendingEpisode,
+                orderedEpisodes(for: meta),
+                player,
+                nil,
+                prepared.filename ?? stream.filename,
+                prepared.videoSize ?? stream.videoSize,
                 stream.videoHash,
                 resumePos,
                 startupToken,
@@ -4080,6 +4320,14 @@ enum StreamSortOption: String, CaseIterable, Identifiable, Sendable {
 /// Pure stream-list derivation for the tvOS stream picker. Kept free of view
 /// state so focus movement cannot re-filter/sort, and unit tests can assert
 /// caching/identity behavior without mounting SwiftUI.
+/// A debrid link the details page resolved before the result was picked.
+struct PreparedDebridLink {
+    let url: URL
+    let filename: String?
+    let videoSize: Int64?
+    let preparedAt: Date
+}
+
 enum StreamPickerListBuilder {
     enum SelectionMode {
         case manual
@@ -4264,10 +4512,11 @@ enum StreamPickerListBuilder {
         preserveAddonStreams: Bool = false,
         includeUnknownCacheStatus: Bool = false,
         selectionMode: SelectionMode = .manual,
-        episodeTarget: StreamEpisodeTarget? = nil
+        episodeTarget: StreamEpisodeTarget? = nil,
+        applyingResultRules: Bool = true
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
-        return displayedStreams(
+        let ordered = displayedStreams(
             tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: selectionMode,
                                 ownedLibraries: ownedLibraryNames(in: groups)),
             sortOption: sortOption,
@@ -4278,6 +4527,11 @@ enum StreamPickerListBuilder {
             selectionMode: selectionMode,
             subtitleLanguages: []
         )
+        // Settings → Connected Services → Result Management trims the lists
+        // a viewer picks from. Auto-select ranks every source.
+        // Link Preparation passes false: it is not a list a viewer sees.
+        guard selectionMode == .manual, applyingResultRules else { return ordered }
+        return DebridResultLimits(settings: ProfileSettings.current).applied(to: ordered)
     }
 
     private static func displayedStreams(
@@ -5277,6 +5531,8 @@ struct TvDetailsContent: View {
                 cancelFocusRestoration()
                 onWatchedClick()
             },
+            mdbListUserRating: mdbListUserRating,
+            showMdbListRating: showMdbListRating,
             onRateClick: onRateClick != nil ? {
                 cancelFocusRestoration()
                 stopBackgroundTrailer(manual: false)
@@ -7072,11 +7328,18 @@ private struct TvDetailsScrollOffsetKey: PreferenceKey {
 
 private struct TvDetailsScrolledBackdropDimmer: View {
     var isScrolledDown: Bool = false
+    @AppStorage(SettingsKey.detailsBackgroundMode) private var backgroundMode = DetailsBackgroundMode.cinematic
+
+    /// The dimming is for the blurred backdrop. The plain backgrounds of
+    /// Background Mode → Normal and Dominant Color are shown as they are.
+    private var dimsBackdrop: Bool {
+        backgroundMode != DetailsBackgroundMode.normal && backgroundMode != DetailsBackgroundMode.dominantColor
+    }
 
     var body: some View {
         ZStack {
             Color.black
-                .opacity(isScrolledDown ? 0.45 : 0)
+                .opacity(isScrolledDown && dimsBackdrop ? 0.45 : 0)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
@@ -7118,6 +7381,9 @@ private struct TvDetailsBackdrop: View {
     var onTrailerReadyForDisplay: (() -> Void)? = nil
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.detailsBackgroundMode) private var backgroundMode = DetailsBackgroundMode.cinematic
+    /// The backdrop's main colour, worked out only for Background Mode → Dominant Color.
+    @State private var dominantColor: Color?
 
     @State private var backdropImage: UIImage?
     /// Where `backdropImage` came from. The details open with the card's picture (an AniList
@@ -7221,6 +7487,16 @@ private struct TvDetailsBackdrop: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             }
 
+            // Settings → Detail Page → Background Mode. Cinematic keeps the
+            // blurred backdrop above. The other two cover it with a plain
+            // colour once the page is scrolled, which is when the blur shows.
+            if let scrolledFill = scrolledFillColor(appBackground: backdropColor) {
+                scrolledFill
+                    .opacity(blurRadius > 0 ? 1 : 0)
+                    .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                    .ignoresSafeArea()
+                    .allowsHitTesting(false)
+            }
         }
         .task(id: targetArtworkURL) {
             guard let url = targetArtworkURL else {
@@ -7250,7 +7526,35 @@ private struct TvDetailsBackdrop: View {
             guard !Task.isCancelled else { return }
             blurredBackdrop = blurred
         }
+        .task(id: DominantColorRequest(url: backdropImageURL, isWanted: backgroundMode == DetailsBackgroundMode.dominantColor)) {
+            guard backgroundMode == DetailsBackgroundMode.dominantColor,
+                  let url = backdropImageURL, let backdropImage else {
+                if dominantColor != nil { dominantColor = nil }
+                return
+            }
+            let color = await TvDetailsDominantColor.color(for: url, from: backdropImage)
+            guard !Task.isCancelled else { return }
+            dominantColor = color
+        }
         .ignoresSafeArea()
+    }
+
+    private struct DominantColorRequest: Equatable {
+        let url: URL?
+        let isWanted: Bool
+    }
+
+    /// The colour behind the scrolled page, or nil for the blurred backdrop.
+    private func scrolledFillColor(appBackground: Color) -> Color? {
+        switch backgroundMode {
+        case DetailsBackgroundMode.normal:
+            return appBackground
+        case DetailsBackgroundMode.dominantColor:
+            // AMOLED Mode keeps its black background.
+            return amoled ? appBackground : (dominantColor ?? appBackground)
+        default:
+            return nil
+        }
     }
 
     /// `image` filling the frame it is given, top first, without setting that frame's size.
@@ -7262,6 +7566,74 @@ private struct TvDetailsBackdrop: View {
                     .scaledToFill()
             }
             .clipped()
+    }
+}
+
+/// Settings → Detail Page → Background Mode. Cinematic is what the Apple TV
+/// has always drawn, so it is the default here.
+enum DetailsBackgroundMode {
+    static let normal = "Normal"
+    static let cinematic = "Cinematic"
+    static let dominantColor = "Dominant Color"
+    static let options = [normal, cinematic, dominantColor]
+}
+
+/// The main colour of a Details backdrop, darkened so the page's white text
+/// stays readable over it. Worked out once per picture, off the main thread,
+/// from the picture already loaded.
+enum TvDetailsDominantColor {
+    private final class Box {
+        let color: Color
+        init(_ color: Color) { self.color = color }
+    }
+
+    private static let cache: NSCache<NSURL, Box> = {
+        let cache = NSCache<NSURL, Box>()
+        cache.countLimit = 24
+        return cache
+    }()
+    private static let context = CIContext(options: [.cacheIntermediates: false, .workingColorSpace: NSNull()])
+
+    static func color(for url: URL, from image: UIImage) async -> Color? {
+        if let cached = cache.object(forKey: url as NSURL) { return cached.color }
+        let color = await Task.detached(priority: .userInitiated) {
+            TvDetailsDominantColor.average(of: image)
+        }.value
+        if let color { cache.setObject(Box(color), forKey: url as NSURL) }
+        return color
+    }
+
+    static func average(of image: UIImage) -> Color? {
+        guard let cgImage = image.cgImage, cgImage.width > 0, cgImage.height > 0 else { return nil }
+        let input = CIImage(cgImage: cgImage)
+        guard let filter = CIFilter(name: "CIAreaAverage") else { return nil }
+        filter.setValue(input, forKey: kCIInputImageKey)
+        filter.setValue(CIVector(cgRect: input.extent), forKey: kCIInputExtentKey)
+        guard let output = filter.outputImage else { return nil }
+        var pixel = [UInt8](repeating: 0, count: 4)
+        context.render(
+            output,
+            toBitmap: &pixel,
+            rowBytes: 4,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBA8,
+            colorSpace: nil
+        )
+        var hue: CGFloat = 0
+        var saturation: CGFloat = 0
+        var brightness: CGFloat = 0
+        var alpha: CGFloat = 0
+        let average = UIColor(
+            red: CGFloat(pixel[0]) / 255,
+            green: CGFloat(pixel[1]) / 255,
+            blue: CGFloat(pixel[2]) / 255,
+            alpha: 1
+        )
+        guard average.getHue(&hue, saturation: &saturation, brightness: &brightness, alpha: &alpha) else {
+            return nil
+        }
+        // Dark enough for white text, with enough colour left to tell titles apart.
+        return Color(hue: Double(hue), saturation: Double(min(saturation * 1.15, 0.85)), brightness: Double(min(brightness, 0.26)))
     }
 }
 
@@ -9932,6 +10304,7 @@ private struct TvDetailsPersonCard: View {
     @FocusState private var isFocused: Bool
     @State private var profileImage: UIImage?
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @Environment(\.cardAppearance) private var cardAppearance
 
     private var showsFocusedAppearance: Bool {
         isFocused || externalFocus?.wrappedValue == person.id
@@ -9960,6 +10333,8 @@ private struct TvDetailsPersonCard: View {
                                 .foregroundColor(showsFocusedAppearance ? .black : .white)
                         }
                     }
+                    // Settings → Poster Card Style → Card depth effect.
+                    .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .cast, shape: Circle()))
                     // The focus outline of the other cards (More Like This), round: a photo
                     // covers the filled circle, so focus showed only as the card's scale.
                     .overlay {
@@ -11566,6 +11941,7 @@ private struct TvEpisodeCard: View {
     private var hideUnwatchedEpisodeDescriptions: Bool { cardAppearance.hideUnwatchedEpisodeDescriptions }
     private var hideUnwatchedEpisodeTitles: Bool { cardAppearance.hideUnwatchedEpisodeTitles }
     @AppStorage(SettingsKey.revealNextEpisodeSpoilers) private var revealNextEpisodeSpoilers = false
+    @AppStorage(SettingsKey.episodeRatingsHideUnwatched) private var episodeRatingsHideUnwatched = false
 
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
     /// The card's own focus. It used to be read from the strip's shared focus binding, which made
@@ -11720,6 +12096,8 @@ private struct TvEpisodeCard: View {
                         coveredByArtwork: true
                     )
                 )
+                // Settings → Poster Card Style → Card depth effect.
+                .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .episodes, shape: shape))
                 .overlay(alignment: .topTrailing) {
                     if watchCount > 0 {
                         WatchedCheckmarkIcon(watchCount: watchCount)
@@ -11916,6 +12294,9 @@ private struct TvEpisodeCard: View {
     }
 
     private var episodeRatingItems: [TvEpisodeRatingItem] {
+        // Settings → Detail Page → Hide Unwatched Episode Ratings.
+        if episodeRatingsHideUnwatched && !isWatched { return [] }
+
         var items: [TvEpisodeRatingItem] = []
 
         for rating in episodeRatings {
@@ -13831,8 +14212,12 @@ private struct TvStreamCard: View {
         self.externalFocus = externalFocus
         self.action = action
         self.onSelectPlayer = onSelectPlayer
+        // Settings → Connected Services → Formatting. Nil with the defaults
+        // and for every stream that is not a confirmed debrid result.
+        let formatted = DebridStreamFormatting().display(for: stream)
         let lines = Self.nameLines(
             for: stream,
+            name: formatted?.name,
             hidingFileSize: style.hideFileSize,
             hidingAddonName: style.hideAddonName
         )
@@ -13842,7 +14227,7 @@ private struct TvStreamCard: View {
         if style.hideDescription {
             self.descriptionText = nil
         } else {
-            self.descriptionText = stream.description.map {
+            self.descriptionText = (formatted?.description ?? stream.description).map {
                 StreamListStyle.displayText($0, hidingFileSize: style.hideFileSize)
             }
         }
@@ -14000,12 +14385,14 @@ private struct TvStreamCard: View {
         }
     }
 
+    /// `name` is drawn in place of the stream's own name when given.
     static func nameLines(
         for stream: NuvioStream,
+        name: String? = nil,
         hidingFileSize: Bool = false,
         hidingAddonName: Bool = false
     ) -> [String] {
-        var displayedName = StreamListStyle.displayText(stream.name ?? "", hidingFileSize: hidingFileSize)
+        var displayedName = StreamListStyle.displayText(name ?? stream.name ?? "", hidingFileSize: hidingFileSize)
         if hidingAddonName, let addon = stream.addonName, !addon.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             displayedName = StreamListStyle.displayText(
                 displayedName,
@@ -14264,6 +14651,56 @@ private struct TvStreamImportedBadge: View {
             blue = Double(number & 0xff) / 255
         }
         return Color(red: red, green: green, blue: blue, opacity: alpha)
+    }
+}
+
+/// Settings → Streams → Show in player: the badges of the playing file,
+/// under the player's title. They are matched once per file, from its name,
+/// with the rules the stream list uses.
+struct PlayerStreamBadgeStrip: View {
+    let filename: String
+
+    @AppStorage(SettingsKey.streamPlayerBadgeSource) private var badgeSource = ""
+    @State private var badges = Badges()
+
+    struct Badges: Equatable {
+        var nuvio: [NuvioStreamBadge] = []
+        var imported: [StreamBadgeFilter] = []
+    }
+
+    /// The transport buttons share the row, so the strip is kept short.
+    private static let limit = 6
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(badges.nuvio, id: \.self) { badge in
+                NuvioStreamBadgeView(badge: badge, scale: 0.9)
+            }
+            ForEach(Array(badges.imported.enumerated()), id: \.offset) { _, badge in
+                TvStreamImportedBadge(badge: badge, scale: 0.9, flatArtwork: false)
+            }
+        }
+        .task(id: "\(filename)\u{1f}\(badgeSource)") {
+            badges = Self.badges(filename: filename, source: badgeSource)
+        }
+    }
+
+    static func badges(filename: String, source: String) -> Badges {
+        let settings = StreamBadgeSettingsStore.snapshot
+        let stream = NuvioStream(url: nil, name: nil, description: nil, addonName: nil, filename: filename)
+        let chosen = source.trimmingCharacters(in: .whitespacesAndNewlines)
+        let hasChosenPack = !chosen.isEmpty && settings.rules.imports.contains {
+            $0.sourceUrl.caseInsensitiveCompare(chosen) == .orderedSame
+        }
+        if hasChosenPack {
+            let rules = settings.rules.settingActive(sourceUrl: chosen)
+            return Badges(imported: Array(StreamBadgeMatcher.matchedBadges(for: stream, rules: rules).prefix(limit)))
+        }
+        // Same as stream badges, also when the chosen pack has been removed.
+        if settings.useNuvioBadges {
+            return Badges(nuvio: Array(NuvioStreamBadge.badges(for: stream).prefix(limit)))
+        }
+        return Badges(imported: Array(StreamBadgeMatcher.matchedBadges(for: stream, rules: settings.rules).prefix(limit)))
     }
 }
 #endif

@@ -7,6 +7,31 @@ struct MdbListUserList: Identifiable, Equatable {
     let itemCount: Int
 }
 
+/// Settings → Tracking → MDBList → Library lists: which of the account's
+/// lists the Library offers. Only what is shown changes: no list is edited
+/// or deleted. The watchlist, shown as "Library", is always there.
+enum MdbListLibraryLists {
+    /// The ids of the lists left out, stored separated by commas. Empty
+    /// shows every list, as before the setting existed.
+    static func hiddenIDs(in settings: UserDefaults) -> Set<Int> {
+        hiddenIDs(from: settings.string(forKey: SettingsKey.mdbListHiddenLibraryLists))
+    }
+
+    static func hiddenIDs(from stored: String?) -> Set<Int> {
+        Set((stored ?? "").split(separator: ",").compactMap { Int($0) })
+    }
+
+    static func stored(_ ids: Set<Int>) -> String {
+        ids.sorted().map(String.init).joined(separator: ",")
+    }
+
+    static func visible(_ lists: [MdbListUserList], in settings: UserDefaults) -> [MdbListUserList] {
+        let hidden = hiddenIDs(in: settings)
+        guard !hidden.isEmpty else { return lists }
+        return lists.filter { !hidden.contains($0.id) }
+    }
+}
+
 struct MdbListListItem: Equatable {
     let meta: NuvioMeta
     let addedAt: Date
