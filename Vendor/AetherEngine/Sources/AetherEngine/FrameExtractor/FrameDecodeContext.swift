@@ -226,12 +226,30 @@ final class FrameDecodeContext: @unchecked Sendable {
     /// context fully closed (no partial state to leak).
     func ensureOpen(control: ProbeControl? = nil) throws {
         guard !isOpen else { return }
+        if let permanentOpenFailure { throw permanentOpenFailure }
         do {
             try openInternal(control: control)
             isOpen = true
         } catch {
             close()
+            if Self.isPermanentOpenFailure(error), let failure = error as? FrameDecodeError {
+                permanentOpenFailure = failure
+            }
             throw error
+        }
+    }
+
+    /// An open failure no retry can fix, kept for the life of the context: no video stream, no
+    /// codec parameters, or no decoder for the codec (including the 4K HEVC software refusal in
+    /// `makeCodecContext`). Every open reads the source's header again, so a seek-preview lane that
+    /// asked again on every request re-read a remote source about 1.6 times a second during playback.
+    private var permanentOpenFailure: FrameDecodeError?
+
+    /// Whether an open that failed with `error` can only fail the same way again on this source.
+    static func isPermanentOpenFailure(_ error: any Error) -> Bool {
+        switch error as? FrameDecodeError {
+        case .noVideoStream, .noCodecParameters, .unsupportedCodec: true
+        case .allocationFailed, .decoderOpenFailed, nil: false
         }
     }
 
