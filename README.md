@@ -50,23 +50,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.5.2** is the latest tvOS release.
+**Beta 3.5.3** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.2/NuvioTV-3.5.2-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.2) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.5.3/NuvioTV-3.5.3-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.5.3) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.5.2
+### New in Beta 3.5.3
 
-- **Plex Media Server Integration:** Connect your Plex Media Server directly to Apple TV with multi-user Plex Home support, intro/credits skip markers, Plex stream labels, and Top Shelf/Continue Watching sync.
-- **Unified Library "Servers" Tab:** Dedicated Servers tab inside Library aggregating Plex, Jellyfin, and SMB shares into one unified browsing interface.
-- **AI "Surprise Me" & "For You" Catalogs:** AI-curated discovery across Trakt, Simkl, AniList, and MAL watch history with customizable AI engines (Gemini Flash, OpenRouter, DeepSeek, Qwen).
-- **Episode Shuffle Play:** Shuffle TV show episodes effortlessly from the series Details view or in-player Episodes shelf.
-- **AIOStreams & JS Plugins:** Direct integration for AIOStreams scraper configurations and local execution of JavaScript add-on plugins.
-- **Ambient Mode Screen Saver:** Full-bleed cinematic backdrop screensaver with metadata highlights when idle.
-- **Estimated Finish Time & Stream Recommendations:** Real-time clock completion time in HUD, best stream badges, and stream name keyword filtering.
-- **Navigation, Stream Resolution & Stability Polish:** Canonical IMDb stream ID resolution from TMDB, source picker focus retention, Jellyfin rate-limit recovery, and Keychain isolation.
+- **Native IPTV & Programme Guide (EPG):** Full browsable live TV guide grid, multi-feed XMLTV merging, and per-source channel preferences.
+- **Plex Multi-Library Scalability:** Shared 150k-item server limit preventing high memory usage, isolated per-library saves on serial background queues, and connection timeout retries.
+- **Anime & Metadata Discovery (AniList, MAL & Kitsu):** User reviews in anime details, long-press card menu ("Find on AniList / MAL / Kitsu"), native metadata for Kitsu and MAL, voice actor pages, and clean season chains.
+- **Core Animation Smoothness:** Details, catalog rows, Home rows, and episode strips migrated to Core Animation with locked title alignment; focus outline restoration and tab switch memory leak fix.
+- **Playback, Usenet & Subtitles:** Usenet read-ahead disk cache for zero-stall forward skipping, dynamic add-on subtitle upgrade, MPVKit cache-accurate bar and Siri/Control Center overlay retention, and official stream badges.
+- **AIOStreams & Plugins (r2):** Removed 15-addon limit, preserved plugin Usenet streams, configurable Node.js memory limits, and ARMv8.0 V8 snapshot.
+- **Authentication & Profiles:** Sign in with short device code, sign-out confirmation dialog, restored sidebar profile switcher, and diagnostic URL redaction.
 
 ### Built-in Player
 
@@ -81,7 +80,7 @@ For supported 48 kHz TrueHD Atmos and DTS:X VOD, **Settings → Playback → Pla
 
 ### Supported Media Servers & Sources
 
-[Plex](https://plex.tv) · [Jellyfin](https://jellyfin.org) · SMB (NAS / Network Shares) · [Usenet (NNTP)](https://en.wikipedia.org/wiki/Usenet) · [AIOStreams](https://github.com/Viren070/AIOStreams) · [Stremio Add-ons](https://stremio.com)
+[Plex](https://plex.tv) · [Jellyfin](https://jellyfin.org) · Live TV (IPTV / M3U) · SMB (NAS / Network Shares) · [Usenet (NNTP)](https://en.wikipedia.org/wiki/Usenet) · [AIOStreams](https://github.com/Viren070/AIOStreams) · [Stremio Add-ons](https://stremio.com)
 
 ### Supported Tracking Services
 
