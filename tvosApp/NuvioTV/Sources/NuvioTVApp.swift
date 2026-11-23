@@ -32,7 +32,7 @@ struct NuvioTVApp: App {
         // Before launch finishes, as BGTaskScheduler requires.
         TopShelfBackgroundRefresh.register()
         // A deleted profile's IPTV sources that Keychain refused to delete earlier.
-        Task(priority: .utility) { IPTVSourceStore.retryPendingRemovals() }
+        Task.detached(priority: .utility) { IPTVSourceStore.retryPendingRemovals() }
         let payloadMigrationKey = "nuvio.tv.migrations.largePayloadPreferences.v1"
         if !UserDefaults.standard.bool(forKey: payloadMigrationKey) {
             Task.detached(priority: .utility) {
@@ -7920,7 +7920,9 @@ struct TVHomeView: View {
                 pendingContinueWatchingDebounceTask?.cancel()
                 pendingContinueWatchingDebounceTask = nil
                 continueWatchingRefreshGeneration &+= 1
-                didRemoteContinueWatchingAnswer = true
+                if !continueWatching.isEmpty {
+                    didRemoteContinueWatchingAnswer = true
+                }
             }
         }
     }

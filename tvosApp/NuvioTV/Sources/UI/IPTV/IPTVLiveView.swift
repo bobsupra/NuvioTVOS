@@ -62,6 +62,8 @@ struct IPTVLiveView: View {
     let loadedCache: LoadedCache
     let onPlay: (URL, NuvioMeta, [String: String]) -> Void
     @Environment(\.scenePhase) private var scenePhase
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @State private var inlinePreviewPlayer: AVPlayer?
     @State private var inlinePreviewIsReady = false
     @State private var inlinePreviewChannelID: String?
@@ -70,7 +72,6 @@ struct IPTVLiveView: View {
     @State private var fullscreenReturnChannelID: String?
     @FocusState private var isPreviewButtonFocused: Bool
     @FocusState private var isChannelSearchFocused: Bool
-    @FocusState private var isCategoryNameFocused: Bool
     @FocusState private var focusedCategoryRowID: String?
     @FocusState private var guideFocusTarget: GuideFocusTarget?
     @FocusState private var focusedChannelRowID: String?
@@ -78,12 +79,15 @@ struct IPTVLiveView: View {
     @State private var favoritesFocusRequestID = UUID()
     @State private var favoritesFocusTargetID: String?
 
+    private static let allCategoriesID = "Alle"
+
     // MARK: - Navigation & Filters
     @State private var activeSidebarItem: IPTVNavTab = .liveTV
-    @State private var selectedCategory: String = "Alle"
+    @State private var selectedCategory: String = allCategoriesID
     @State private var showingHiddenCategories = false
     @State private var renamingCategoryID: String?
     @State private var categoryNameDraft = ""
+    @State private var isCategoryNameEditing = false
     @State private var categoryPreferences = IPTVCategoryPreferences.empty
     @State private var showingCredentialsModal = false
 
@@ -112,6 +116,7 @@ struct IPTVLiveView: View {
     @State private var errorMessage: String?
     @State private var loading = false
     @State private var loadTask: Task<Void, Never>?
+    @State private var stalkerPlayTask: Task<Void, Never>?
     @State private var requestID = UUID()
     @State private var guideTask: Task<Void, Never>?
     @State private var guideByChannel: [String: [IPTVProgramme]] = [:]
@@ -131,6 +136,7 @@ struct IPTVLiveView: View {
     @State private var guideTimeFormatter: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "HH:mm"
+        formatter.locale = AppLocaleManager.shared.locale
         return formatter
     }()
 
@@ -355,7 +361,7 @@ struct IPTVLiveView: View {
             HStack(alignment: .top, spacing: 28) {
                 // MARK: 1. Left Sidebar Navigation
                 sidebarView
-                    .frame(width: 260)
+                    .frame(width: 280)
                     .frame(maxHeight: .infinity)
 
                 // MARK: 2. Main Content Area
@@ -405,7 +411,7 @@ struct IPTVLiveView: View {
             restoreSources()
         }
         .onChange(of: selectedID) { _, sourceID in
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
             showingHiddenCategories = false
             cancelCategoryRename()
             loadCategoryPreferences(for: sourceID)
@@ -464,15 +470,29 @@ struct IPTVLiveView: View {
 
     // MARK: - Navigation Tabs
     enum IPTVNavTab: String, CaseIterable {
-        case search = "Søk"
-        case liveTV = "Live TV"
-        case sportsNow = "Sport nå"
-        case guide = "TV-guide"
-        case channels = "Kanalliste"
-        case favorites = "Favoritter"
-        case categories = "Kategorier"
-        case recent = "Nylig sett"
-        case settings = "Innstillinger"
+        case search
+        case liveTV
+        case sportsNow
+        case guide
+        case channels
+        case favorites
+        case categories
+        case recent
+        case settings
+
+        var title: String {
+            switch self {
+            case .search: return L10n.string("nav_search", fallback: "Search")
+            case .liveTV: return L10n.string("nav_live_tv", fallback: "Live TV")
+            case .sportsNow: return L10n.string("iptv_nav_sports_now", fallback: "Sports now")
+            case .guide: return L10n.string("iptv_nav_guide", fallback: "TV guide")
+            case .channels: return L10n.string("iptv_nav_channels", fallback: "Channel list")
+            case .favorites: return L10n.string("iptv_nav_favorites", fallback: "Favorites")
+            case .categories: return L10n.string("iptv_nav_categories", fallback: "Categories")
+            case .recent: return L10n.string("iptv_nav_recent", fallback: "Recently watched")
+            case .settings: return L10n.string("nav_settings", fallback: "Settings")
+            }
+        }
 
         var icon: String {
             switch self {
@@ -492,9 +512,11 @@ struct IPTVLiveView: View {
     // MARK: - Sidebar View
     private var sidebarView: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Live TV")
+            Text(L10n.string("nav_live_tv", fallback: "Live TV"))
                 .font(.system(size: 38, weight: .bold))
                 .foregroundColor(.white)
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
                 .padding(.bottom, 22)
                 .padding(.leading, 10)
 
@@ -506,11 +528,11 @@ struct IPTVLiveView: View {
                         Image(systemName: tab.icon)
                             .font(.system(size: 23, weight: .semibold))
                             .frame(width: 24)
-                        Text(tab.rawValue)
+                        Text(tab.title)
                             .font(.system(size: 22, weight: activeSidebarItem == tab ? .semibold : .medium))
                             .lineLimit(1)
-                            .fixedSize(horizontal: true, vertical: false)
-                        Spacer()
+                            .minimumScaleFactor(0.72)
+                        Spacer(minLength: 0)
                     }
                     .foregroundColor(activeSidebarItem == tab ? .white : Color.white.opacity(0.65))
                     .padding(.horizontal, 16)
@@ -530,7 +552,7 @@ struct IPTVLiveView: View {
             if loading {
                 HStack(spacing: 10) {
                     ProgressView()
-                    Text("Laster kilde...")
+                    Text(L10n.string("iptv_loading_source", fallback: "Loading source…"))
                         .font(.caption)
                         .foregroundColor(.secondary)
                 }
@@ -546,14 +568,14 @@ struct IPTVLiveView: View {
         cancelCategoryRename()
         switch tab {
         case .search:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
             DispatchQueue.main.async { isChannelSearchFocused = true }
         case .liveTV:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
         case .sportsNow:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
         case .guide:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
             guidePageStartOverride = nil
             selectedGuideProgramme = nil
             selectedGuideChannelID = nil
@@ -563,14 +585,14 @@ struct IPTVLiveView: View {
                 guideFocusTarget = .control(.now)
             }
         case .channels:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
         case .favorites:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
             focusFavoriteChannelAfterSidebarSelection()
         case .categories:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
         case .recent:
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
         case .settings:
             showingCredentialsModal = true
         }
@@ -595,7 +617,7 @@ struct IPTVLiveView: View {
                     Button {
                         selectedCategory = category
                     } label: {
-                        Text(category == "Alle" ? "Alle" : categoryDisplayName(category))
+                        Text(category == Self.allCategoriesID ? L10n.string("action_all", fallback: "All") : categoryDisplayName(category))
                             .font(.system(size: 20, weight: selectedCategory == category ? .bold : .medium))
                             .foregroundColor(selectedCategory == category ? .black : .white)
                             .padding(.horizontal, 22)
@@ -618,7 +640,7 @@ struct IPTVLiveView: View {
     }
 
     private var allCategories: [String] {
-        ["Alle"] + orderedCategoryGroups
+        [Self.allCategoriesID] + orderedCategoryGroups
     }
 
     private var orderedCategoryGroups: [String] {
@@ -629,7 +651,7 @@ struct IPTVLiveView: View {
     }
 
     private var baseCategoryGroups: [String] {
-        availableGroups.filter { $0 != "Alle" }
+        availableGroups.filter { $0 != Self.allCategoriesID }
     }
 
     private func categoryDisplayName(_ groupID: String) -> String {
@@ -745,10 +767,10 @@ struct IPTVLiveView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 18) {
                     VStack(alignment: .leading, spacing: 4) {
-                        Text("TV-guide")
+                        Text(L10n.string("iptv_nav_guide", fallback: "TV guide"))
                             .font(.system(size: 30, weight: .bold))
                             .foregroundColor(.white)
-                        Text("\(guideDateRange(start: pageStart, end: pageEnd))  •  \(formatTimeRange(start: pageStart, end: pageEnd))  •  \(rows.count) kanaler")
+                        Text("\(guideDateRange(start: pageStart, end: pageEnd))  •  \(formatTimeRange(start: pageStart, end: pageEnd))  •  \(L10n.format("iptv_channels_count", fallback: "%d channels", rows.count))")
                             .font(.system(size: 18, weight: .medium))
                             .foregroundColor(.white.opacity(0.62))
                             .lineLimit(1)
@@ -756,13 +778,13 @@ struct IPTVLiveView: View {
                     }
 
                     Spacer(minLength: 12)
-                    guidePageButton("Tidligere", icon: "chevron.left", enabled: canBrowseGuideEarlier, focusTarget: .control(.earlier)) {
+                    guidePageButton(L10n.string("iptv_guide_earlier", fallback: "Earlier"), icon: "chevron.left", enabled: canBrowseGuideEarlier, focusTarget: .control(.earlier)) {
                         moveGuidePage(by: -guidePageDuration)
                     }
-                    guidePageButton("Nå", icon: "dot.circle", enabled: true, focusTarget: .control(.now)) {
+                    guidePageButton(L10n.string("iptv_guide_now", fallback: "Now"), icon: "dot.circle", enabled: true, focusTarget: .control(.now)) {
                         guidePageStartOverride = nil
                     }
-                    guidePageButton("Senere", icon: "chevron.right", enabled: canBrowseGuideLater, focusTarget: .control(.later)) {
+                    guidePageButton(L10n.string("iptv_guide_later", fallback: "Later"), icon: "chevron.right", enabled: canBrowseGuideLater, focusTarget: .control(.later)) {
                         moveGuidePage(by: guidePageDuration)
                     }
                 }
@@ -770,16 +792,16 @@ struct IPTVLiveView: View {
                 if guideTask != nil {
                     HStack(spacing: 10) {
                         ProgressView()
-                        Text("Laster programguide…")
+                        Text(L10n.string("iptv_guide_loading", fallback: "Loading program guide…"))
                             .font(.system(size: 18, weight: .medium))
                             .foregroundColor(.white.opacity(0.72))
                     }
                 } else if guideFailures > 0 {
                     HStack(spacing: 14) {
-                        Text("Noen programguide-feeder kunne ikke lastes.")
+                        Text(L10n.string("iptv_guide_partial_error", fallback: "Some program guide feeds could not be loaded."))
                             .font(.system(size: 18, weight: .medium))
                             .foregroundColor(.white.opacity(0.72))
-                        guidePageButton("Prøv igjen", icon: "arrow.clockwise", enabled: !selectedGuideURLs.isEmpty, focusTarget: .control(.retrySummary)) {
+                        guidePageButton(L10n.string("action_retry", fallback: "Retry"), icon: "arrow.clockwise", enabled: !selectedGuideURLs.isEmpty, focusTarget: .control(.retrySummary)) {
                             retryGuide()
                             guideFocusTarget = .control(.now)
                         }
@@ -791,26 +813,26 @@ struct IPTVLiveView: View {
                 }
 
                 if selectedGuideURLs.isEmpty {
-                    guideEmptyState("Ingen TV-guide er konfigurert for denne kilden.", icon: "calendar.badge.exclamationmark")
+                    guideEmptyState(L10n.string("iptv_guide_not_configured", fallback: "No TV guide is configured for this source."), icon: "calendar.badge.exclamationmark")
                 } else if !hasGuideIDs {
-                    guideEmptyState("Kilden har ingen kanaler med EPG-ID.", icon: "tv.slash")
+                    guideEmptyState(L10n.string("iptv_guide_no_epg_ids", fallback: "This source has no channels with an EPG ID."), icon: "tv.slash")
                 } else {
                     VStack(spacing: 6) {
                         guideTimeAxis(start: pageStart, width: timelineWidth, channelColumnWidth: channelColumnWidth)
 
                         if rows.isEmpty {
                             if guideTask != nil {
-                                guideEmptyState("Venter på programdata…", icon: "clock")
+                                guideEmptyState(L10n.string("iptv_guide_waiting", fallback: "Waiting for program data…"), icon: "clock")
                             } else if guideUnavailable {
                                 HStack(spacing: 14) {
-                                    guideEmptyState("Programguiden er utilgjengelig.", icon: "wifi.slash")
-                                        guidePageButton("Prøv igjen", icon: "arrow.clockwise", enabled: true, focusTarget: .control(.retryEmpty)) {
+                                    guideEmptyState(L10n.string("iptv_guide_unavailable", fallback: "Program guide unavailable."), icon: "wifi.slash")
+                                        guidePageButton(L10n.string("action_retry", fallback: "Retry"), icon: "arrow.clockwise", enabled: true, focusTarget: .control(.retryEmpty)) {
                                         retryGuide()
                                             guideFocusTarget = .control(.now)
                                     }
                                 }
                             } else {
-                                guideEmptyState("Ingen programinformasjon i dette tidsrommet.", icon: "calendar")
+                                guideEmptyState(L10n.string("iptv_guide_empty_window", fallback: "No program information in this time range."), icon: "calendar")
                             }
                         } else {
                             ScrollView(.vertical, showsIndicators: false) {
@@ -900,12 +922,12 @@ struct IPTVLiveView: View {
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($guideFocusTarget, equals: focusTarget)
-        .accessibilityHint(enabled ? "" : "Ikke tilgjengelig")
+        .accessibilityHint(enabled ? "" : L10n.string("iptv_not_available", fallback: "Not available"))
     }
 
     private func guideTimeAxis(start: Date, width: CGFloat, channelColumnWidth: CGFloat) -> some View {
         HStack(spacing: 0) {
-            Text("Kanal")
+            Text(L10n.string("iptv_channel_column", fallback: "Channel"))
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundColor(.white.opacity(0.74))
                 .padding(.trailing, 10)
@@ -1038,7 +1060,7 @@ struct IPTVLiveView: View {
         let pageStart = guidePageStart
         let pageEnd = guidePageEnd
         guard let channel = channels.first(where: { $0.id == channelID }),
-              selectedCategory == "Alle" || channel.group == selectedCategory,
+              selectedCategory == Self.allCategoriesID || channel.group == selectedCategory,
               !isCategoryHidden(channel.group),
               let guideID = channel.guideID,
               let programmes = guideByChannel[guideID] else { return false }
@@ -1062,7 +1084,7 @@ struct IPTVLiveView: View {
                 }
             }
             Spacer()
-            guidePageButton("Lukk", icon: "xmark", enabled: true, focusTarget: .control(.detailsClose)) {
+            guidePageButton(L10n.string("action_close", fallback: "Close"), icon: "xmark", enabled: true, focusTarget: .control(.detailsClose)) {
                 let channelID = selectedGuideChannelID
                 let programmeStart = selectedGuideProgramme?.start
                 selectedGuideProgramme = nil
@@ -1139,6 +1161,7 @@ struct IPTVLiveView: View {
 
     private func guideDateRange(start: Date, end: Date) -> String {
         let formatter = DateFormatter()
+        formatter.locale = AppLocaleManager.shared.locale
         formatter.dateStyle = .medium
         formatter.timeStyle = .none
         let startDate = formatter.string(from: start)
@@ -1146,7 +1169,7 @@ struct IPTVLiveView: View {
         return startDate == endDate ? startDate : "\(startDate) – \(endDate)"
     }
 
-    // MARK: - Left Column: Channel List Card ("Alle kanaler")
+    // MARK: - Left Column: Channel List Card
     private func channelListCard(channels visibleChannels: [IPTVDisplayChannel]) -> some View {
         VStack(alignment: .leading, spacing: 14) {
             // Card Header
@@ -1155,13 +1178,17 @@ struct IPTVLiveView: View {
                     Text(sectionTitle)
                         .font(.system(size: 23, weight: .bold))
                         .foregroundColor(.white)
-                    Text(isChoosingCategory ? "\(categoryChooserGroups.count) kategorier" : "\(visibleChannels.count) kanaler")
+                    Text(isChoosingCategory
+                        ? L10n.format("iptv_categories_count", fallback: "%d categories", categoryChooserGroups.count)
+                        : L10n.format("iptv_channels_count", fallback: "%d channels", visibleChannels.count))
                         .font(.system(size: 16))
                         .foregroundColor(Color.white.opacity(0.5))
                 }
                 Spacer()
                 if isChoosingCategory && hasHiddenCategoryGroups {
-                    Button(showingHiddenCategories ? "Skjul skjulte" : "Vis skjulte") {
+                    Button(showingHiddenCategories
+                        ? L10n.string("iptv_hide_hidden_categories", fallback: "Hide hidden")
+                        : L10n.string("iptv_show_hidden_categories", fallback: "Show hidden")) {
                         showingHiddenCategories.toggle()
                     }
                     .font(.system(size: 17, weight: .semibold))
@@ -1177,24 +1204,26 @@ struct IPTVLiveView: View {
             .padding(.top, 18)
 
             if activeSidebarItem == .search {
-                HStack(spacing: 12) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundColor(.white.opacity(0.55))
-                    TextField("Søk etter kanal eller program", text: $searchText)
-                        .font(.system(size: 20))
-                        .foregroundColor(.white)
-                        .focused($isChannelSearchFocused)
-                        .submitLabel(.search)
-                }
-                .padding(.horizontal, 16)
-                .frame(height: 56)
-                .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.08)))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .strokeBorder(isChannelSearchFocused ? AppFocusOutline.color : .clear, lineWidth: AppFocusOutline.width)
+                IPTVGlassSearchField(
+                    text: $searchText,
+                    placeholder: L10n.string("iptv_search_placeholder", fallback: "Search for channel or program"),
+                    isFocused: $isChannelSearchFocused
                 )
                 .padding(.horizontal, 14)
                 .onAppear { DispatchQueue.main.async { isChannelSearchFocused = true } }
+            }
+
+            if isChoosingCategory {
+                HiddenIPTVTextField(
+                    text: $categoryNameDraft,
+                    isEditing: $isCategoryNameEditing,
+                    placeholder: L10n.string("iptv_category_new_name", fallback: "New name"),
+                    autocapitalizationType: .words,
+                    onCommit: commitCategoryRename
+                )
+                .frame(width: 1, height: 1)
+                .offset(x: -4_000)
+                .allowsHitTesting(false)
             }
 
             // Channels List
@@ -1203,28 +1232,27 @@ struct IPTVLiveView: View {
                 LazyVStack(spacing: 6) {
                     if isChoosingCategory {
                         ForEach(Array(categoryChooserGroups.enumerated()), id: \.element) { index, group in
-                            if renamingCategoryID == group {
+                            Button {
+                                if isCategoryHidden(group) {
+                                    setCategoryHidden(false, groupID: group)
+                                } else {
+                                    selectedCategory = group
+                                }
+                            } label: {
                                 HStack {
-                                    TextField("Nytt navn", text: $categoryNameDraft)
-                                        .font(.system(size: 18, weight: .medium))
-                                        .foregroundColor(.white)
-                                        .focused($isCategoryNameFocused)
-                                        .submitLabel(.done)
-                                        .onSubmit { saveCategoryRename(for: group) }
-                                    Button {
-                                        saveCategoryRename(for: group)
-                                    } label: {
-                                        Image(systemName: "checkmark")
-                                            .frame(width: 38, height: 42)
+                                    Text(renamingCategoryID == group && !categoryNameDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                        ? categoryNameDraft
+                                        : categoryDisplayName(group))
+                                        .lineLimit(1)
+                                    Spacer()
+                                    if isCategoryHidden(group) {
+                                        Label(L10n.string("iptv_category_hidden", fallback: "Hidden"), systemImage: "eye.slash")
+                                            .font(.system(size: 14, weight: .medium))
+                                            .foregroundColor(.white.opacity(0.55))
+                                    } else {
+                                        Image(systemName: "chevron.right")
+                                            .font(.system(size: 14, weight: .semibold))
                                     }
-                                    .buttonStyle(PosterCardButtonStyle())
-                                    Button {
-                                        cancelCategoryRename(restoreFocus: true)
-                                    } label: {
-                                        Image(systemName: "xmark")
-                                            .frame(width: 38, height: 42)
-                                    }
-                                    .buttonStyle(PosterCardButtonStyle())
                                 }
                                 .font(.system(size: 19, weight: .medium))
                                 .foregroundColor(.white.opacity(0.88))
@@ -1232,57 +1260,34 @@ struct IPTVLiveView: View {
                                 .frame(maxWidth: .infinity, minHeight: 66, alignment: .leading)
                                 .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.055)))
                                 .overlay(IPTVFocusOutline(shape: RoundedRectangle(cornerRadius: 12)))
-                            } else {
-                                Button {
-                                    if isCategoryHidden(group) {
-                                        setCategoryHidden(false, groupID: group)
-                                    } else {
-                                        selectedCategory = group
-                                    }
-                                } label: {
-                                    HStack {
-                                        Text(categoryDisplayName(group)).lineLimit(1)
-                                        Spacer()
-                                        if isCategoryHidden(group) {
-                                            Label("Skjult", systemImage: "eye.slash")
-                                                .font(.system(size: 14, weight: .medium))
-                                                .foregroundColor(.white.opacity(0.55))
-                                        } else {
-                                            Image(systemName: "chevron.right")
-                                                .font(.system(size: 14, weight: .semibold))
-                                        }
-                                    }
-                                    .font(.system(size: 19, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.88))
-                                    .padding(.horizontal, 16)
-                                    .frame(maxWidth: .infinity, minHeight: 66, alignment: .leading)
-                                    .background(RoundedRectangle(cornerRadius: 12).fill(Color.white.opacity(0.055)))
-                                    .overlay(IPTVFocusOutline(shape: RoundedRectangle(cornerRadius: 12)))
+                            }
+                            .buttonStyle(PosterCardButtonStyle())
+                            .focused($focusedCategoryRowID, equals: group)
+                            .accessibilityHint(isCategoryHidden(group)
+                                ? L10n.string("iptv_category_unhide_hint", fallback: "Shows the category again")
+                                : L10n.string("iptv_category_open_hint", fallback: "Opens the category"))
+                            .contextMenu {
+                                Button(L10n.string("iptv_move_up", fallback: "Move up"), systemImage: "arrow.up") {
+                                    moveCategory(group, by: -1)
                                 }
-                                .buttonStyle(PosterCardButtonStyle())
-                                .focused($focusedCategoryRowID, equals: group)
-                                .accessibilityHint(isCategoryHidden(group) ? "Viser kategorien igjen" : "Åpner kategorien")
-                                .contextMenu {
-                                    Button("Flytt opp", systemImage: "arrow.up") {
-                                        moveCategory(group, by: -1)
-                                    }
-                                    .disabled(index == 0)
+                                .disabled(index == 0)
 
-                                    Button("Flytt ned", systemImage: "arrow.down") {
-                                        moveCategory(group, by: 1)
-                                    }
-                                    .disabled(index >= categoryChooserGroups.count - 1)
+                                Button(L10n.string("iptv_move_down", fallback: "Move down"), systemImage: "arrow.down") {
+                                    moveCategory(group, by: 1)
+                                }
+                                .disabled(index >= categoryChooserGroups.count - 1)
 
-                                    Button(
-                                        isCategoryHidden(group) ? "Vis kategori" : "Skjul kategori",
-                                        systemImage: isCategoryHidden(group) ? "eye" : "eye.slash"
-                                    ) {
-                                        setCategoryHidden(!isCategoryHidden(group), groupID: group)
-                                    }
+                                Button(
+                                    isCategoryHidden(group)
+                                        ? L10n.string("iptv_show_category", fallback: "Show category")
+                                        : L10n.string("iptv_hide_category", fallback: "Hide category"),
+                                    systemImage: isCategoryHidden(group) ? "eye" : "eye.slash"
+                                ) {
+                                    setCategoryHidden(!isCategoryHidden(group), groupID: group)
+                                }
 
-                                    Button("Gi nytt navn", systemImage: "pencil") {
-                                        beginCategoryRename(group)
-                                    }
+                                Button(L10n.string("iptv_rename", fallback: "Rename"), systemImage: "pencil") {
+                                    beginCategoryRename(group)
                                 }
                             }
                         }
@@ -1411,16 +1416,18 @@ struct IPTVLiveView: View {
             if channel.streamURL != nil {
                 let isFavorite = isFavorite(channelID: channel.id)
                 Button(
-                    isFavorite ? "Fjern fra favoritter" : "Legg til favoritter",
+                    isFavorite
+                        ? L10n.string("iptv_remove_favorite", fallback: "Remove favorite")
+                        : L10n.string("iptv_add_favorite", fallback: "Add favorite"),
                     systemImage: isFavorite ? "star.slash" : "star"
                 ) {
                     toggleFavorite(channelID: channel.id)
                 }
             }
             if activeSidebarItem == .favorites {
-                Button("Flytt opp", systemImage: "arrow.up") { moveFavorite(channelID: channel.id, direction: -1) }
+                Button(L10n.string("iptv_move_up", fallback: "Move up"), systemImage: "arrow.up") { moveFavorite(channelID: channel.id, direction: -1) }
                     .disabled(index == 0)
-                Button("Flytt ned", systemImage: "arrow.down") { moveFavorite(channelID: channel.id, direction: 1) }
+                Button(L10n.string("iptv_move_down", fallback: "Move down"), systemImage: "arrow.down") { moveFavorite(channelID: channel.id, direction: 1) }
                     .disabled(index >= visibleCount - 1)
             }
         }
@@ -1476,17 +1483,17 @@ struct IPTVLiveView: View {
                     }
                 }
 
-                // Top Bar Overlay (Logo on left, Direkte badge on right)
+                // Top Bar Overlay (Logo on left, Live badge on right)
                 VStack {
                     HStack {
                         channelBadgeView(channel: active, size: CGSize(width: 72, height: 48))
                         Spacer()
-                        // "• Direkte" badge
+                        // "• Live" badge
                         HStack(spacing: 6) {
                             Circle()
                                 .fill(Color(red: 0.75, green: 0.35, blue: 0.95))
                                 .frame(width: 8, height: 8)
-                            Text("Direkte")
+                            Text(L10n.string("iptv_live_badge", fallback: "Live"))
                                 .font(.system(size: 16, weight: .semibold))
                                 .foregroundColor(.white)
                         }
@@ -1521,7 +1528,7 @@ struct IPTVLiveView: View {
                     HStack(spacing: 10) {
                         Image(systemName: "arrow.up.left.and.arrow.down.right")
                             .font(.system(size: 19, weight: .semibold))
-                        Text("Fullskjerm")
+                        Text(L10n.string("iptv_fullscreen", fallback: "Fullscreen"))
                             .font(.system(size: 19, weight: .semibold))
                     }
                     .foregroundColor(.white)
@@ -1551,7 +1558,7 @@ struct IPTVLiveView: View {
             VStack(spacing: 16) {
                 if loading {
                     ProgressView()
-                    Text("Laster kanaler...")
+                    Text(L10n.string("iptv_loading_channels", fallback: "Loading channels…"))
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.72))
                 } else {
@@ -1559,13 +1566,15 @@ struct IPTVLiveView: View {
                         .font(.system(size: 44, weight: .semibold))
                         .foregroundColor(.white.opacity(0.55))
 
-                    Text(sources.isEmpty ? "Ingen IPTV-kilde konfigurert" : "Ingen kanaler tilgjengelig")
+                    Text(sources.isEmpty
+                        ? L10n.string("iptv_no_source_configured", fallback: "No IPTV source configured")
+                        : L10n.string("iptv_no_channels_available", fallback: "No channels available"))
                         .font(.system(size: 26, weight: .bold))
                         .foregroundColor(.white)
 
                     Text(errorMessage ?? (sources.isEmpty
-                        ? "Legg til en M3U-spilleliste, Xtream Codes eller Stalker-portal for å se direkte-TV."
-                        : "Kontroller eller endre IPTV-kilden i innstillingene."))
+                        ? L10n.string("iptv_no_source_subtitle", fallback: "Add an M3U playlist, Xtream Codes, or Stalker portal to watch live TV.")
+                        : L10n.string("iptv_no_channels_subtitle", fallback: "Check or change the IPTV source in settings.")))
                         .font(.system(size: 18, weight: .medium))
                         .foregroundColor(.white.opacity(0.68))
                         .multilineTextAlignment(.center)
@@ -1575,7 +1584,9 @@ struct IPTVLiveView: View {
                         if sources.isEmpty { editingID = nil }
                         showingCredentialsModal = true
                     } label: {
-                        Text(sources.isEmpty ? "Legg til IPTV-kilde" : "Administrer kilder")
+                        Text(sources.isEmpty
+                            ? L10n.string("iptv_add_iptv_source", fallback: "Add IPTV source")
+                            : L10n.string("iptv_manage_sources", fallback: "Manage sources"))
                             .font(.system(size: 19, weight: .semibold))
                             .foregroundColor(.white)
                             .padding(.horizontal, 24)
@@ -1597,7 +1608,7 @@ struct IPTVLiveView: View {
         )
     }
 
-    // MARK: - Right Column: Card 2 - EPG / Program Schedule ("Nå og neste")
+    // MARK: - Right Column: Card 2 - EPG / Program Schedule ("Now & Next")
     private var scheduleEPGCard: some View {
         let active = activeSelectedChannel
         let hasCurrentProgramme = active?.programProgress != nil
@@ -1609,7 +1620,8 @@ struct IPTVLiveView: View {
         } ?? []
 
         return VStack(alignment: .leading, spacing: 10) {
-            Text(active.map { "\($0.name) – Nå og neste" } ?? "Nå og neste")
+            Text(active.map { L10n.format("iptv_now_and_next_for_channel", fallback: "%@ – Now & Next", $0.name) }
+                ?? L10n.string("iptv_now_and_next", fallback: "Now & Next"))
                 .font(.system(size: 23, weight: .bold))
                 .foregroundColor(.white)
 
@@ -1624,7 +1636,7 @@ struct IPTVLiveView: View {
 
             if upcomingPrograms.isEmpty {
                 if !hasCurrentProgramme {
-                    Text("Ingen programinformasjon")
+                    Text(L10n.string("iptv_no_program_info", fallback: "No program information"))
                         .font(.system(size: 16))
                         .foregroundColor(Color.white.opacity(0.65))
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1687,7 +1699,7 @@ struct IPTVLiveView: View {
                     .frame(width: 120, height: 4)
                 }
 
-                Text("Direkte")
+                Text(L10n.string("iptv_live_badge", fallback: "Live"))
                     .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(Color(red: 0.88, green: 0.72, blue: 1.0))
                     .padding(.horizontal, 12)
@@ -1744,68 +1756,160 @@ struct IPTVLiveView: View {
 
     // MARK: - Credentials & Source Configuration Sheet
     private var credentialsModalView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                Text(editingID == nil ? "Legg til IPTV-kilde" : "Rediger IPTV-kilde")
-                    .font(.largeTitle.bold())
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
 
-                Text("Legg inn din M3U spilleliste eller Xtream Codes legitimasjon for å se direkte-TV.")
-                    .foregroundColor(.secondary)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(editingID == nil
+                        ? L10n.string("iptv_add_iptv_source", fallback: "Add IPTV source")
+                        : L10n.string("iptv_edit_iptv_source", fallback: "Edit IPTV source"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
 
-                Picker("Kildetype", selection: $sourceKind) {
-                    Text("Xtream Codes").tag(IPTVSource.Kind.xtream)
-                    Text("M3U Spilleliste").tag(IPTVSource.Kind.m3u)
-                    Text("Stalker Portal").tag(IPTVSource.Kind.stalker)
-                }
+                    IPTVSettingsGroup(
+                        title: L10n.string("iptv_settings_title", fallback: "Live TV"),
+                        subtitle: L10n.string("iptv_credentials_subtitle", fallback: "Enter your M3U playlist, Xtream Codes, or Stalker Portal details to watch live TV.")
+                    ) {
+                        IPTVChoiceRow(
+                            title: L10n.string("iptv_source_type", fallback: "Source type"),
+                            selection: sourceKindSelection,
+                            options: IPTVSource.Kind.allCases.map { sourceKindLabel($0) }
+                        )
 
-                TextField("Navn på kilde (f.eks. Min IPTV)", text: $sourceName)
+                        IPTVFormTextFieldRow(
+                            title: L10n.string("iptv_source_name", fallback: "Source name"),
+                            placeholder: L10n.string("iptv_source_name_placeholder", fallback: "Source name (e.g. My IPTV)"),
+                            text: $sourceName,
+                            autocapitalizationType: .words
+                        )
 
-                SecureField(
-                    sourceKind == .m3u ? "M3U URL (f.eks. https://.../playlist.m3u)" :
-                    (sourceKind == .stalker ? "Portal URL" : "Serveradresse (f.eks. http://server.com:8080)"),
-                    text: $sourceURL
-                )
-
-                if sourceKind == .xtream {
-                    TextField("Brukernavn", text: $username)
-                    SecureField("Passord", text: $password)
-                    Picker("Format", selection: $xtreamOutput) {
-                        Text("MPEG-TS").tag(IPTVXtreamOutput.mpegTS)
-                        Text("HLS").tag(IPTVXtreamOutput.hls)
+                        IPTVFormTextFieldRow(
+                            title: sourceKind == .m3u
+                                ? L10n.string("iptv_source_url", fallback: "Playlist URL")
+                                : (sourceKind == .stalker
+                                    ? L10n.string("iptv_portal_endpoint", fallback: "Portal endpoint URL")
+                                    : L10n.string("iptv_server_url", fallback: "Server URL")),
+                            placeholder: sourceKind == .m3u ? L10n.string("iptv_m3u_url_placeholder", fallback: "M3U URL (e.g. https://.../playlist.m3u)") :
+                                (sourceKind == .stalker
+                                    ? L10n.string("iptv_portal_url_placeholder", fallback: "Portal URL")
+                                    : L10n.string("iptv_server_url_placeholder", fallback: "Server URL (e.g. http://server.com:8080)")),
+                            text: $sourceURL,
+                            isSecure: true,
+                            keyboardType: .URL
+                        )
                     }
-                }
 
-                if sourceKind == .stalker {
-                    TextField("MAC-adresse (f.eks. 00:1A:79:...)", text: $mac)
-                }
+                    if sourceKind == .xtream || sourceKind == .stalker {
+                        IPTVSettingsGroup(
+                            title: L10n.string("smb_authentication", fallback: "Authentication"),
+                            subtitle: L10n.string("tvos_settings_stored_locally_on_this_apple_tv", fallback: "Stored locally on this Apple TV")
+                        ) {
+                            if sourceKind == .xtream {
+                                IPTVFormTextFieldRow(
+                                    title: L10n.string("iptv_username", fallback: "Username"),
+                                    placeholder: L10n.string("iptv_username", fallback: "Username"),
+                                    text: $username
+                                )
+                                IPTVFormTextFieldRow(
+                                    title: L10n.string("iptv_password", fallback: "Password"),
+                                    placeholder: L10n.string("iptv_password", fallback: "Password"),
+                                    text: $password,
+                                    isSecure: true
+                                )
+                                IPTVChoiceRow(
+                                    title: L10n.string("iptv_xtream_format", fallback: "Stream format"),
+                                    selection: xtreamOutputSelection,
+                                    options: IPTVXtreamOutput.allCases.map { xtreamOutputLabel($0) }
+                                )
+                            }
 
-                HStack(spacing: 16) {
-                    Button(editingID == nil ? "Lagre og last inn kilde" : "Lagre endringer") {
-                        addSource()
-                        showingCredentialsModal = false
+                            if sourceKind == .stalker {
+                                IPTVFormTextFieldRow(
+                                    title: L10n.string("iptv_stalker_mac", fallback: "MAC address"),
+                                    placeholder: L10n.string("iptv_mac_placeholder", fallback: "MAC address (e.g. 00:1A:79:...)"),
+                                    text: $mac
+                                )
+                            }
+                        }
                     }
-                    .disabled(sourceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sourceURL.isEmpty)
 
-                    Button("Lukk") {
-                        showingCredentialsModal = false
+                    HStack {
+                        IPTVDialogButton(
+                            title: L10n.string("action_close", fallback: "Close"),
+                            isPrimary: false
+                        ) {
+                            showingCredentialsModal = false
+                        }
+
+                        Spacer()
+
+                        IPTVDialogButton(
+                            title: editingID == nil
+                                ? L10n.string("iptv_save_and_load_source", fallback: "Save & load source")
+                                : L10n.string("iptv_save_changes", fallback: "Save changes"),
+                            isPrimary: true,
+                            enabled: !sourceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !sourceURL.isEmpty
+                        ) {
+                            addSource()
+                            showingCredentialsModal = false
+                        }
                     }
-                }
+                    .focusSection()
 
-                if !sources.isEmpty {
-                    Divider()
-                    Text("Konfigurerte kilder").font(.headline)
-                    ForEach(sources) { src in
-                        HStack {
-                            Text(src.name).bold()
-                            Spacer()
-                            Button("Rediger") { edit(src) }
-                            Button("Slett", role: .destructive) { remove(src) }
+                    if !sources.isEmpty {
+                        IPTVSettingsGroup(
+                            title: L10n.string("iptv_configured_sources", fallback: "Configured sources"),
+                            subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")
+                        ) {
+                            ForEach(sources) { src in
+                                IPTVConfiguredSourceRow(
+                                    source: src,
+                                    kindLabel: sourceKindLabel(src.kind),
+                                    isActiveSource: src.id == selectedID,
+                                    onEdit: { edit(src) },
+                                    onDelete: { remove(src) }
+                                )
+                            }
                         }
                     }
                 }
+                .padding(40)
             }
-            .padding(40)
         }
+    }
+
+    private func sourceKindLabel(_ kind: IPTVSource.Kind) -> String {
+        switch kind {
+        case .xtream: return "Xtream Codes"
+        case .m3u: return L10n.string("iptv_source_type_m3u", fallback: "M3U Playlist")
+        case .stalker: return "Stalker Portal"
+        }
+    }
+
+    private func xtreamOutputLabel(_ output: IPTVXtreamOutput) -> String {
+        switch output {
+        case .mpegTS: return "MPEG-TS"
+        case .hls: return "HLS"
+        }
+    }
+
+    private var sourceKindSelection: Binding<String> {
+        Binding(
+            get: { sourceKindLabel(sourceKind) },
+            set: { label in
+                sourceKind = IPTVSource.Kind.allCases.first { sourceKindLabel($0) == label } ?? .xtream
+            }
+        )
+    }
+
+    private var xtreamOutputSelection: Binding<String> {
+        Binding(
+            get: { xtreamOutputLabel(xtreamOutput) },
+            set: { label in
+                xtreamOutput = IPTVXtreamOutput.allCases.first { xtreamOutputLabel($0) == label } ?? .mpegTS
+            }
+        )
     }
 
     // MARK: - Display Model & Data Mapping
@@ -1840,17 +1944,19 @@ struct IPTVLiveView: View {
 
     private var sectionTitle: String {
         switch activeSidebarItem {
-        case .search: return "Søk"
-        case .sportsNow: return "Sport nå"
-        case .favorites: return "Favoritter"
-        case .recent: return "Nylig sett"
-        case .categories where selectedCategory == "Alle": return "Kategorier"
-        default: return selectedCategory == "Alle" ? "Alle kanaler" : categoryDisplayName(selectedCategory)
+        case .search: return L10n.string("nav_search", fallback: "Search")
+        case .sportsNow: return L10n.string("iptv_nav_sports_now", fallback: "Sports now")
+        case .favorites: return L10n.string("iptv_nav_favorites", fallback: "Favorites")
+        case .recent: return L10n.string("iptv_nav_recent", fallback: "Recently watched")
+        case .categories where selectedCategory == Self.allCategoriesID: return L10n.string("iptv_nav_categories", fallback: "Categories")
+        default: return selectedCategory == Self.allCategoriesID
+            ? L10n.string("iptv_all_channels", fallback: "All channels")
+            : categoryDisplayName(selectedCategory)
         }
     }
 
     private var isChoosingCategory: Bool {
-        activeSidebarItem == .categories && selectedCategory == "Alle"
+        activeSidebarItem == .categories && selectedCategory == Self.allCategoriesID
     }
 
     private var categoryChooserGroups: [String] {
@@ -1888,34 +1994,46 @@ struct IPTVLiveView: View {
         )
         loadCategoryPreferences(for: selectedID)
         if hidden && selectedCategory == groupID {
-            selectedCategory = "Alle"
+            selectedCategory = Self.allCategoriesID
         }
     }
 
     private func beginCategoryRename(_ groupID: String) {
         renamingCategoryID = groupID
         categoryNameDraft = categoryDisplayName(groupID)
-        DispatchQueue.main.async { isCategoryNameFocused = true }
+        isCategoryNameEditing = true
     }
 
-    private func saveCategoryRename(for groupID: String) {
+    private func commitCategoryRename() {
+        guard let groupID = renamingCategoryID else {
+            isCategoryNameEditing = false
+            return
+        }
+        if !saveCategoryRename(for: groupID) {
+            cancelCategoryRename(restoreFocus: true)
+        }
+    }
+
+    @discardableResult
+    private func saveCategoryRename(for groupID: String) -> Bool {
         guard let selectedID,
               IPTVCategoryPreferencesStore.rename(
                 categoryNameDraft,
                 for: groupID,
                 defaults: ProfileSettings.store(for: profileID),
                 sourceID: selectedID
-              ) else { return }
+              ) else { return false }
         loadCategoryPreferences(for: selectedID)
         cancelCategoryRename(restoreFocus: true)
+        return true
     }
 
     private func cancelCategoryRename(restoreFocus: Bool = false) {
         let groupID = renamingCategoryID
         let sourceID = selectedID
+        isCategoryNameEditing = false
         renamingCategoryID = nil
         categoryNameDraft = ""
-        isCategoryNameFocused = false
         guard restoreFocus, let groupID else { return }
         Task { @MainActor in
             await Task.yield()
@@ -1928,12 +2046,18 @@ struct IPTVLiveView: View {
 
     private var emptySectionMessage: String {
         switch activeSidebarItem {
-        case .search: return channelSearchQuery.isEmpty ? "Skriv inn kanal eller program" : "Ingen treff"
-        case .sportsNow: return "Ingen sportsprogrammer pågår nå"
-        case .favorites: return "Ingen favorittkanaler"
-        case .recent: return "Ingen nylig sette kanaler"
-        case .categories where selectedCategory == "Alle": return "Velg en kategori"
-        default: return sources.isEmpty ? "Ingen IPTV-kilder lagt til" : "Ingen kanaler i denne kategorien"
+        case .search:
+            return channelSearchQuery.isEmpty
+                ? L10n.string("iptv_search_empty_prompt", fallback: "Enter channel or program")
+                : L10n.string("iptv_no_matches", fallback: "No matching channels.")
+        case .sportsNow: return L10n.string("iptv_empty_sports_now", fallback: "No sports programs on now")
+        case .favorites: return L10n.string("iptv_empty_favorites", fallback: "No favorite channels")
+        case .recent: return L10n.string("iptv_empty_recent", fallback: "No recently watched channels")
+        case .categories where selectedCategory == Self.allCategoriesID: return L10n.string("iptv_choose_category", fallback: "Choose a category")
+        default:
+            return sources.isEmpty
+                ? L10n.string("iptv_no_sources_added", fallback: "No IPTV sources added")
+                : L10n.string("iptv_empty_category", fallback: "No channels in this category")
         }
     }
 
@@ -1959,7 +2083,7 @@ struct IPTVLiveView: View {
         }
 
         // Filter by category
-        if selectedCategory != "Alle" {
+        if selectedCategory != Self.allCategoriesID {
             result = result.filter { $0.group == selectedCategory }
         }
 
@@ -2006,6 +2130,11 @@ struct IPTVLiveView: View {
     }
 
     private var displayChannels: [IPTVDisplayChannel] {
+        let liveBadge = L10n.string("iptv_live_badge", fallback: "Live")
+        let nextProgramTitle = L10n.string("iptv_next_program", fallback: "Next program")
+        let followingProgramTitle = L10n.string("iptv_following_program", fallback: "Following program")
+        let miscCategory = L10n.string("iptv_category_misc", fallback: "Other")
+
         let regular: [IPTVDisplayChannel] = channels.map { ch in
             let prog = currentProgramme(for: ch)
             let upcoming = upcomingProgrammes(for: ch)
@@ -2016,14 +2145,14 @@ struct IPTVLiveView: View {
                 id: ch.id,
                 name: ch.name,
                 logoURL: ch.logoURL,
-                group: ch.group ?? "Diverse",
-                category: ch.group ?? "Direkte",
+                group: ch.group ?? "",
+                category: ch.group ?? liveBadge,
                 programTitle: prog?.title ?? ch.name,
-                programTime: prog != nil ? formatTimeRange(start: prog!.start, end: prog!.end) : "Direkte",
+                programTime: prog != nil ? formatTimeRange(start: prog!.start, end: prog!.end) : liveBadge,
                 programProgress: prog.map { calculateProgress(start: $0.start, end: $0.end) },
-                nextShow1Title: next1?.title ?? "Neste program",
+                nextShow1Title: next1?.title ?? nextProgramTitle,
                 nextShow1Time: next1 != nil ? formatTimeRange(start: next1!.start, end: next1!.end) : "--:--",
-                nextShow2Title: next2?.title ?? "Følgende program",
+                nextShow2Title: next2?.title ?? followingProgramTitle,
                 nextShow2Time: next2 != nil ? formatTimeRange(start: next2!.start, end: next2!.end) : "--:--",
                 brandColor: colorForName(ch.name),
                 logoText: String(ch.name.prefix(3)).uppercased(),
@@ -2032,19 +2161,18 @@ struct IPTVLiveView: View {
         }
         guard !stalkerChannels.isEmpty else { return regular }
         let stalker: [IPTVDisplayChannel] = stalkerChannels.map { stk in
-            let group = stk.categoryName ?? "Diverse"
             return IPTVDisplayChannel(
                 id: stk.id,
                 name: stk.name,
                 logoURL: stk.logo.flatMap(URL.init(string:)),
-                group: group,
-                category: group,
+                group: stk.categoryName ?? "",
+                category: stk.categoryName ?? miscCategory,
                 programTitle: stk.name,
-                programTime: "Direkte",
+                programTime: liveBadge,
                 programProgress: nil,
-                nextShow1Title: "Neste program",
+                nextShow1Title: nextProgramTitle,
                 nextShow1Time: "--:--",
-                nextShow2Title: "Følgende program",
+                nextShow2Title: followingProgramTitle,
                 nextShow2Time: "--:--",
                 brandColor: colorForName(stk.name),
                 logoText: String(stk.name.prefix(3)).uppercased(),
@@ -2070,6 +2198,8 @@ struct IPTVLiveView: View {
         if presentInlinePreviewFullscreen(for: channel) { return }
         inlinePreviewChannelID = nil
         stopInlinePreview()
+        stalkerPlayTask?.cancel()
+        stalkerPlayTask = nil
         if let streamURL = channel.streamURL, streamURL.scheme != "stalker" {
             selectedChannelID = channel.id
             recordRecent(channelID: channel.id)
@@ -2078,11 +2208,25 @@ struct IPTVLiveView: View {
         }
         guard let stalker = stalkerChannels.first(where: { $0.id == channel.id }),
               let client = stalkerClient else { return }
-        selectedChannelID = channel.id
-        recordRecent(channelID: channel.id)
-        Task { @MainActor in
-            guard let playback = try? await client.resolve(stalker) else { return }
-            play(url: playback.url, id: channel.id, name: channel.name, logo: stalker.logo, headers: playback.headers)
+        let targetChannelID = channel.id
+        selectedChannelID = targetChannelID
+        stalkerPlayTask = Task { @MainActor in
+            defer {
+                if selectedChannelID == targetChannelID {
+                    stalkerPlayTask = nil
+                }
+            }
+            do {
+                let playback = try await client.resolve(stalker)
+                guard !Task.isCancelled, isActive, selectedChannelID == targetChannelID else { return }
+                recordRecent(channelID: targetChannelID)
+                play(url: playback.url, id: targetChannelID, name: channel.name, logo: stalker.logo, headers: playback.headers)
+            } catch is CancellationError {
+                return
+            } catch {
+                guard !Task.isCancelled, isActive, selectedChannelID == targetChannelID else { return }
+                errorMessage = L10n.string("iptv_play_error", fallback: "Could not open this channel. Try loading the source again.")
+            }
         }
     }
 
@@ -2340,6 +2484,8 @@ struct IPTVLiveView: View {
     }
 
     private func clearLoadedContent() {
+        stalkerPlayTask?.cancel()
+        stalkerPlayTask = nil
         successfullyLoadedSource = nil
         successfullyLoadedAt = nil
         channels = []
@@ -2392,6 +2538,8 @@ struct IPTVLiveView: View {
         requestID = UUID()
         loadTask?.cancel()
         loadTask = nil
+        stalkerPlayTask?.cancel()
+        stalkerPlayTask = nil
         loadingSource = nil
         loading = false
         if guideTask != nil { guideNextRefresh = nil }
@@ -2404,7 +2552,7 @@ struct IPTVLiveView: View {
         let name = sourceName.trimmingCharacters(in: .whitespacesAndNewlines)
         let rawURL = sourceURL.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let url = URL(string: rawURL) else {
-            errorMessage = "Ugyldig URL"
+            errorMessage = L10n.string("iptv_invalid_url", fallback: "Enter a valid playlist URL.")
             return
         }
         let source = IPTVSource(
@@ -2510,10 +2658,17 @@ struct IPTVLiveView: View {
                 selectedGuideChannelID = nil
                 selectedID = source.id
                 var keys: [String: String] = [:]
-                for channel in loaded { keys[channel.id] = IPTVFavoritesStore.key(sourceID: source.id, channelID: channel.id) }
+                let orderedIDs: [String]
+                if !loaded.isEmpty {
+                    for channel in loaded { keys[channel.id] = IPTVFavoritesStore.key(sourceID: source.id, channelID: channel.id) }
+                    orderedIDs = loaded.map { keys[$0.id] ?? $0.id }
+                } else {
+                    for channel in stalkerChannels { keys[channel.id] = IPTVFavoritesStore.key(sourceID: source.id, channelID: channel.id) }
+                    orderedIDs = stalkerChannels.map { keys[$0.id] ?? $0.id }
+                }
                 favoriteKeys = keys
                 let favoriteStore = IPTVFavoritesStore(defaults: ProfileSettings.store(for: profileID))
-                favoriteOrder = favoriteStore.reconciledOrder(favoriteOrder, playlistOrder: loaded.map { keys[$0.id] ?? $0.id }, favorites: favorites)
+                favoriteOrder = favoriteStore.reconciledOrder(favoriteOrder, playlistOrder: orderedIDs, favorites: favorites)
                 favoriteStore.saveOrder(favoriteOrder)
                 searchText = ""
                 storeLoadedCache()
@@ -2525,7 +2680,7 @@ struct IPTVLiveView: View {
                 }
             } catch {
                 guard !Task.isCancelled, requestID == token else { return }
-                errorMessage = "Kunne ikke laste inn kilden."
+                errorMessage = L10n.string("iptv_load_error", fallback: "Could not load this source. Please try again.")
 #if NUVIO_SIDEBAR_WATCHDOG
                 Self.sidebarLogger.warning("playlist load failed kind=\(source.kind.rawValue, privacy: .public) durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))")
 #endif
@@ -2566,7 +2721,7 @@ struct IPTVLiveView: View {
                 }
             }
         } catch {
-            errorMessage = "Kunne ikke slette kilden."
+            errorMessage = L10n.string("iptv_delete_error", fallback: "Could not delete this source.")
         }
     }
 
@@ -2830,4 +2985,500 @@ struct IPTVVideoSurface: UIViewRepresentable {
             observedPlayer = nil
         }
     }
+}
+
+private struct IPTVGlassSearchField: View {
+    @Binding var text: String
+    let placeholder: String
+    var isFocused: FocusState<Bool>.Binding
+
+    @State private var isEditing = false
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            HiddenIPTVTextField(
+                text: $text,
+                isEditing: $isEditing,
+                placeholder: placeholder,
+                returnKeyType: .search
+            )
+            .frame(width: 1, height: 1)
+            .offset(x: -4_000)
+            .allowsHitTesting(false)
+
+            Button {
+                isFocused.wrappedValue = true
+                isEditing = true
+            } label: {
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 56)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused(isFocused)
+            .focusEffectDisabledIfAvailable()
+
+            HStack(spacing: 12) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.7))
+
+                Text(text.isEmpty ? placeholder : text)
+                    .font(.system(size: 19, weight: .regular))
+                    .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                    .allowsHitTesting(false)
+
+                Spacer(minLength: 0)
+
+                if !text.isEmpty {
+                    Button {
+                        text = ""
+                        isFocused.wrappedValue = true
+                        isEditing = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 20))
+                            .foregroundColor(.white.opacity(0.55))
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focusEffectDisabledIfAvailable()
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .frame(height: 56)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(GlassCapsule(focused: isFocused.wrappedValue || isEditing))
+    }
+}
+
+private struct IPTVSettingsGroup<Content: View>: View {
+    let title: String
+    let subtitle: String
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.appFont(size: 28, weight: .bold))
+                    .foregroundColor(.white)
+
+                Text(subtitle)
+                    .font(.appFont(size: 18, weight: .medium))
+                    .foregroundColor(.white.opacity(0.56))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            VStack(spacing: 12) {
+                content
+            }
+        }
+        .padding(24)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .iptvSettingsGlass(shape: RoundedRectangle(cornerRadius: 32, style: .continuous), isProminent: false)
+        .overlay(
+            RoundedRectangle(cornerRadius: 32, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+        )
+    }
+}
+
+private struct IPTVRowShell<Content: View>: View {
+    let isFocused: Bool
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        HStack(spacing: 16) {
+            content
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .frame(minHeight: 74)
+        .iptvSettingsGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous), isProminent: false)
+        .overlay(
+            RoundedRectangle(cornerRadius: 24, style: .continuous)
+                .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(0.10), lineWidth: isFocused ? AppFocusOutline.width : 1)
+        )
+        .animation(.easeOut(duration: 0.18), value: isFocused)
+    }
+}
+
+private struct IPTVChoiceRow: View {
+    let title: String
+    @Binding var selection: String
+    let options: [String]
+
+    @FocusState private var isFocused: Bool
+    @State private var showOptions = false
+
+    var body: some View {
+        Button { showOptions = true } label: {
+            IPTVRowShell(isFocused: isFocused) {
+                Text(title)
+                    .font(.appFont(size: 22, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+
+                Spacer(minLength: 24)
+
+                HStack(spacing: 10) {
+                    Text(selection)
+                        .font(.appFont(size: 19, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.76)
+
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 17, weight: .bold))
+                        .foregroundColor(.white)
+                }
+                .frame(maxWidth: 280, alignment: .trailing)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .confirmationDialog(title, isPresented: $showOptions, titleVisibility: .visible) {
+            ForEach(options, id: \.self) { option in
+                Button(option) { selection = option }
+            }
+        }
+    }
+}
+
+private struct IPTVDialogButton: View {
+    let title: String
+    let isPrimary: Bool
+    var enabled: Bool = true
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 21, weight: .bold))
+                .foregroundColor(isPrimary ? .black : .white)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 14)
+                .background(Capsule().fill(backgroundColor))
+                .overlay(
+                    Capsule().strokeBorder(isFocused ? AppFocusOutline.color : Color.clear, lineWidth: 2)
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .disabled(isPrimary && !enabled)
+    }
+
+    private var backgroundColor: Color {
+        guard isPrimary else { return Color.white.opacity(0.12) }
+        guard enabled else { return Color.white.opacity(0.3) }
+        return Color.white.opacity(isFocused ? 0.9 : 0.75)
+    }
+}
+
+private struct IPTVConfiguredSourceRow: View {
+    let source: IPTVSource
+    let kindLabel: String
+    let isActiveSource: Bool
+    let onEdit: () -> Void
+    let onDelete: () -> Void
+
+    @FocusState private var isRowFocused: Bool
+    @FocusState private var isDeleteFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button(action: onEdit) {
+                IPTVRowShell(isFocused: isRowFocused) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(source.name)
+                            .font(.appFont(size: 22, weight: .semibold))
+                            .foregroundColor(.white)
+                            .lineLimit(1)
+
+                        Text(kindLabel)
+                            .font(.appFont(size: 17, weight: .medium))
+                            .foregroundColor(.white.opacity(0.56))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 24)
+
+                    HStack(spacing: 10) {
+                        if isActiveSource {
+                            Circle()
+                                .fill(Color.green)
+                                .frame(width: 10, height: 10)
+                        }
+                        Text(L10n.string("iptv_edit", fallback: "Edit"))
+                            .font(.appFont(size: 19, weight: .bold))
+                            .foregroundColor(.white)
+                        Image(systemName: "chevron.right")
+                            .font(.system(size: 17, weight: .bold))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isRowFocused)
+            .focusEffectDisabledIfAvailable()
+
+            Button(role: .destructive, action: onDelete) {
+                Image(systemName: isDeleteFocused ? "trash.circle.fill" : "trash.circle")
+                    .font(.system(size: 32))
+                    .foregroundColor(isDeleteFocused ? .red : .white.opacity(0.6))
+                    .frame(width: 60, height: 60)
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isDeleteFocused)
+            .focusEffectDisabledIfAvailable()
+        }
+    }
+}
+
+private extension View {
+    @ViewBuilder
+    func iptvSettingsGlass<S: InsettableShape>(shape: S, isProminent: Bool) -> some View {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
+            self
+                .background(isProminent ? Color.white.opacity(0.13) : Color.white.opacity(0.045), in: shape)
+                .glassEffect(.regular, in: shape)
+        } else {
+            self.background(
+                (isProminent ? Color.white.opacity(0.18) : Color.white.opacity(0.07)),
+                in: shape
+            )
+        }
+    }
+}
+
+private struct IPTVFormTextFieldRow: View {
+    let title: String
+    let placeholder: String
+    @Binding var text: String
+    var isSecure: Bool = false
+    var keyboardType: UIKeyboardType = .default
+    var autocapitalizationType: UITextAutocapitalizationType = .none
+
+    @FocusState private var isFocused: Bool
+    @State private var isEditing = false
+
+    var body: some View {
+        Button {
+            isEditing = true
+        } label: {
+            IPTVRowShell(isFocused: isFocused || isEditing) {
+                Text(title)
+                    .font(.appFont(size: 22, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+
+                Spacer(minLength: 24)
+
+                ZStack(alignment: .leading) {
+                    HiddenIPTVTextField(
+                        text: $text,
+                        isEditing: $isEditing,
+                        placeholder: placeholder,
+                        isSecure: isSecure,
+                        keyboardType: keyboardType,
+                        autocapitalizationType: autocapitalizationType
+                    )
+                    .frame(width: 1, height: 1)
+                    .offset(x: -4_000)
+                    .allowsHitTesting(false)
+
+                    Text(displayText)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                        .frame(maxWidth: .infinity, alignment: text.isEmpty ? .center : .leading)
+                        .padding(.horizontal, text.isEmpty ? 8 : 16)
+                        .allowsHitTesting(false)
+                }
+                .frame(width: 480, height: 48)
+                .modifier(GlassCapsule(focused: isFocused || isEditing))
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+    }
+
+    private var displayText: String {
+        guard !text.isEmpty else { return placeholder }
+        return isSecure ? String(repeating: "•", count: text.count) : text
+    }
+}
+
+private struct HiddenIPTVTextField: UIViewRepresentable {
+    @Binding var text: String
+    @Binding var isEditing: Bool
+    var placeholder: String = ""
+    var isSecure: Bool = false
+    var keyboardType: UIKeyboardType = .default
+    var returnKeyType: UIReturnKeyType = .done
+    var autocapitalizationType: UITextAutocapitalizationType = .none
+    var onCommit: () -> Void = {}
+
+    func makeUIView(context: Context) -> HiddenIPTVUITextField {
+        let textField = HiddenIPTVUITextField(frame: .zero)
+        textField.delegate = context.coordinator
+        textField.backgroundColor = .clear
+        textField.textColor = .clear
+        textField.tintColor = .clear
+        textField.keyboardAppearance = .dark
+        textField.autocorrectionType = .no
+        textField.placeholder = placeholder
+        textField.isSecureTextEntry = isSecure
+        textField.keyboardType = keyboardType
+        textField.returnKeyType = returnKeyType
+        textField.autocapitalizationType = autocapitalizationType
+        textField.addTarget(
+            context.coordinator,
+            action: #selector(Coordinator.textDidChange(_:)),
+            for: .editingChanged
+        )
+        return textField
+    }
+
+    func updateUIView(_ uiView: HiddenIPTVUITextField, context: Context) {
+        context.coordinator.update(text: $text, isEditing: $isEditing, onCommit: onCommit)
+        if !uiView.isFirstResponder {
+            if uiView.text != text {
+                uiView.text = text
+            }
+            if uiView.placeholder != placeholder {
+                uiView.placeholder = placeholder
+            }
+            if uiView.isSecureTextEntry != isSecure {
+                uiView.isSecureTextEntry = isSecure
+            }
+            if uiView.keyboardType != keyboardType {
+                uiView.keyboardType = keyboardType
+            }
+            if uiView.returnKeyType != returnKeyType {
+                uiView.returnKeyType = returnKeyType
+            }
+            if uiView.autocapitalizationType != autocapitalizationType {
+                uiView.autocapitalizationType = autocapitalizationType
+            }
+        }
+
+        if isEditing && !uiView.isFirstResponder {
+            context.coordinator.activateIfNeeded(uiView)
+        } else if !isEditing {
+            context.coordinator.cancelPendingActivation()
+            if uiView.isFirstResponder {
+                uiView.resignFirstResponder()
+            }
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(text: $text, isEditing: $isEditing, onCommit: onCommit)
+    }
+
+    final class Coordinator: NSObject, UITextFieldDelegate {
+        private var text: Binding<String>
+        private var isEditing: Binding<Bool>
+        private var onCommit: () -> Void
+        private var committedCurrentEditingSession = false
+        private var isActivating = false
+        private var pendingActivationGeneration: UInt = 0
+
+        init(text: Binding<String>, isEditing: Binding<Bool>, onCommit: @escaping () -> Void) {
+            self.text = text
+            self.isEditing = isEditing
+            self.onCommit = onCommit
+        }
+
+        func update(text: Binding<String>, isEditing: Binding<Bool>, onCommit: @escaping () -> Void) {
+            self.text = text
+            self.isEditing = isEditing
+            self.onCommit = onCommit
+        }
+
+        func activateIfNeeded(_ textField: UITextField, attempt: Int = 0) {
+            guard isEditing.wrappedValue, !textField.isFirstResponder else {
+                cancelPendingActivation()
+                return
+            }
+            if attempt == 0 {
+                guard !isActivating else { return }
+                isActivating = true
+                pendingActivationGeneration &+= 1
+            }
+            let generation = pendingActivationGeneration
+            let delay: TimeInterval = attempt == 0 ? 0.02 : 0.08
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, weak textField] in
+                guard let self, let textField,
+                      self.pendingActivationGeneration == generation,
+                      self.isEditing.wrappedValue else {
+                    self?.isActivating = false
+                    return
+                }
+                if textField.isFirstResponder {
+                    self.isActivating = false
+                    return
+                }
+                if textField.window != nil, textField.becomeFirstResponder() {
+                    self.isActivating = false
+                    return
+                }
+                if attempt < 10 {
+                    self.activateIfNeeded(textField, attempt: attempt + 1)
+                } else {
+                    self.isActivating = false
+                    self.isEditing.wrappedValue = false
+                }
+            }
+        }
+
+        func cancelPendingActivation() {
+            guard isActivating else { return }
+            isActivating = false
+            pendingActivationGeneration &+= 1
+        }
+
+        @objc func textDidChange(_ sender: UITextField) {
+            text.wrappedValue = sender.text ?? ""
+        }
+
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            isActivating = false
+            committedCurrentEditingSession = false
+        }
+
+        func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+            commit(textField)
+            textField.resignFirstResponder()
+            return true
+        }
+
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            commit(textField)
+        }
+
+        private func commit(_ textField: UITextField) {
+            cancelPendingActivation()
+            text.wrappedValue = textField.text ?? ""
+            isEditing.wrappedValue = false
+            guard !committedCurrentEditingSession else { return }
+            committedCurrentEditingSession = true
+            onCommit()
+        }
+    }
+}
+
+private final class HiddenIPTVUITextField: UITextField {
+    override var canBecomeFocused: Bool { false }
 }

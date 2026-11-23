@@ -220,4 +220,72 @@ final class AppLanguageTests: XCTestCase {
         // Reset to system
         L10n.reload(languageTag: nil)
     }
+
+    func testLiveTVTranslationsInEnglishAndNorwegian() {
+        defer { L10n.reload(languageTag: nil) }
+
+        L10n.reload(languageTag: "en")
+        XCTAssertEqual(L10n.string("nav_search", fallback: ""), "Search")
+        XCTAssertEqual(L10n.string("iptv_nav_sports_now", fallback: ""), "Sports now")
+        XCTAssertEqual(L10n.string("iptv_nav_guide", fallback: ""), "TV guide")
+        XCTAssertEqual(L10n.string("iptv_nav_channels", fallback: ""), "Channel list")
+        XCTAssertEqual(L10n.string("iptv_nav_favorites", fallback: ""), "Favorites")
+        XCTAssertEqual(L10n.string("iptv_nav_categories", fallback: ""), "Categories")
+        XCTAssertEqual(L10n.string("iptv_nav_recent", fallback: ""), "Recently watched")
+        XCTAssertEqual(L10n.string("nav_settings", fallback: ""), "Settings")
+        XCTAssertEqual(L10n.string("iptv_no_channels_available", fallback: ""), "No channels available")
+        XCTAssertEqual(L10n.string("iptv_load_error", fallback: ""), "Could not load this source. Please try again.")
+        XCTAssertEqual(L10n.string("iptv_live_badge", fallback: ""), "Live")
+        XCTAssertEqual(L10n.format("iptv_channels_count", fallback: "", 12), "12 channels")
+        XCTAssertEqual(L10n.format("iptv_now_and_next_for_channel", fallback: "", "BBC One"), "BBC One – Now & Next")
+
+        L10n.reload(languageTag: "no")
+        XCTAssertEqual(L10n.string("nav_search", fallback: ""), "Søk")
+        XCTAssertEqual(L10n.string("iptv_nav_sports_now", fallback: ""), "Sport nå")
+        XCTAssertEqual(L10n.string("iptv_nav_guide", fallback: ""), "TV-guide")
+        XCTAssertEqual(L10n.string("iptv_nav_channels", fallback: ""), "Kanalliste")
+        XCTAssertEqual(L10n.string("iptv_nav_favorites", fallback: ""), "Favoritter")
+        XCTAssertEqual(L10n.string("iptv_nav_categories", fallback: ""), "Kategorier")
+        XCTAssertEqual(L10n.string("iptv_nav_recent", fallback: ""), "Nylig sett")
+        XCTAssertEqual(L10n.string("nav_settings", fallback: ""), "Innstillinger")
+        XCTAssertEqual(L10n.string("iptv_no_channels_available", fallback: ""), "Ingen kanaler tilgjengelig")
+        XCTAssertEqual(L10n.string("iptv_live_badge", fallback: ""), "Direkte")
+        XCTAssertEqual(L10n.format("iptv_channels_count", fallback: "", 12), "12 kanaler")
+        XCTAssertEqual(L10n.format("iptv_now_and_next_for_channel", fallback: "", "NRK1"), "NRK1 – Nå og neste")
+    }
+
+    func testLiveTVKeysPresentAndNonEnglishForAllLanguages() {
+        defer { L10n.reload(languageTag: nil) }
+
+        let keys = [
+            "iptv_nav_sports_now",
+            "iptv_nav_guide",
+            "iptv_nav_channels",
+            "iptv_nav_favorites",
+            "iptv_nav_categories",
+            "iptv_nav_recent",
+            "iptv_no_channels_available",
+            "iptv_no_source_configured",
+            "iptv_live_badge",
+            "iptv_fullscreen",
+            "iptv_now_and_next",
+            "iptv_channels_count",
+            "iptv_categories_count",
+            "iptv_now_and_next_for_channel"
+        ]
+
+        for language in AppLanguage.allCases where language != .system {
+            L10n.reload(languageTag: language.tag)
+            for key in keys {
+                let value = L10n.string(key, fallback: "")
+                XCTAssertFalse(value.isEmpty, "\(language.tag).\(key) should not be empty")
+                XCTAssertFalse(value.contains("\\("), "\(language.tag).\(key) leaked Swift interpolation")
+            }
+            XCTAssertFalse(L10n.format("iptv_channels_count", fallback: "", 5).isEmpty)
+            XCTAssertTrue(
+                L10n.format("iptv_now_and_next_for_channel", fallback: "", "CNN").contains("CNN"),
+                "\(language.tag) should include formatted channel name"
+            )
+        }
+    }
 }

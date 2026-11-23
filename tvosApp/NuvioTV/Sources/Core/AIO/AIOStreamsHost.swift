@@ -425,9 +425,24 @@ final class AIOStreamsHost: ObservableObject {
         AIOSettingsSync.setSyncChoice(enabled)
     }
 
-    /// The configuration page from a computer on the same network.
+    /// The configuration page from a computer or phone on the same network:
+    /// the active configuration's own `/stremio/<uuid>/<encrypted>/configure`
+    /// URL when one is already saved (so scanning opens it to edit instead of
+    /// starting a new configuration), else `/stremio/configure`.
     var configurationPageURL: String? {
         guard let host = Self.localIPv4Address() else { return nil }
+        return Self.configurationPageURL(host: host, manifestURL: manifestURL)
+    }
+
+    nonisolated static func configurationPageURL(host: String, manifestURL: String?) -> String {
+        if let manifestURL,
+           let components = URLComponents(string: manifestURL) {
+            let path = components.percentEncodedPath
+            if path.hasPrefix("/stremio/"), path.hasSuffix("/manifest.json") {
+                let configurePath = String(path.dropLast("/manifest.json".count)) + "/configure"
+                return "http://\(host):\(Self.lanPort)\(configurePath)"
+            }
+        }
         return "http://\(host):\(Self.lanPort)/stremio/configure"
     }
 

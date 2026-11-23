@@ -2724,25 +2724,26 @@ actor MdbListRatingsStore {
     /// can't be had right now.
     func ratings(imdbID: String, mediaType: String, apiKey: String,
                  request: (@Sendable () async -> MdbListDetailsService.TitleResult)? = nil) async -> [String: Double]? {
-        let key = "\(mediaType):\(imdbID)"
+        let cacheKey = "\(mediaType):\(imdbID)"
+        let inflightKey = "\(cacheKey):\(apiKey)"
         loadIfNeeded()
         let now = Date()
-        let stored = entries?[key]
+        let stored = entries?[cacheKey]
         if let stored, Self.isFresh(stored, now: now) { return stored.ratings }
         if let pausedUntil, pausedUntil > now { return stored?.ratings }
 
         let task: Task<MdbListDetailsService.TitleResult, Never>
-        if let running = inflight[key] {
+        if let running = inflight[inflightKey] {
             task = running
         } else if let request {
             task = Task { await request() }
-            inflight[key] = task
+            inflight[inflightKey] = task
         } else {
-            task = enqueueCoalescedTask(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey, key: key)
+            task = enqueueCoalescedTask(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey, inflightKey: inflightKey)
         }
         let result = await task.value
-        if inflight[key] == task { inflight[key] = nil }
-        return applyTitleResult(result, for: key, fallbackStored: stored?.ratings)
+        if inflight[inflightKey] == task { inflight[inflightKey] = nil }
+        return applyTitleResult(result, for: cacheKey, fallbackStored: stored?.ratings)
     }
 
     /// Batch-prefetches uncached MDBList titles grouped by media type (up to 200
@@ -2758,10 +2759,11 @@ actor MdbListRatingsStore {
         var byMediaType: [String: [String]] = [:]
         var seenKeys = Set<String>()
         for (imdbID, mediaType) in titles {
-            let key = "\(mediaType):\(imdbID)"
-            guard seenKeys.insert(key).inserted else { continue }
-            if let stored = entries?[key], Self.isFresh(stored, now: now) { continue }
-            if inflight[key] != nil { continue }
+            let cacheKey = "\(mediaType):\(imdbID)"
+            let inflightKey = "\(cacheKey):\(apiKey)"
+            guard seenKeys.insert(cacheKey).inserted else { continue }
+            if let stored = entries?[cacheKey], Self.isFresh(stored, now: now) { continue }
+            if inflight[inflightKey] != nil { continue }
             let groupKey = BatchGroupKey(mediaType: mediaType, apiKey: apiKey)
             if pendingCoalesceIDs[groupKey]?.contains(imdbID) == true { continue }
             byMediaType[mediaType, default: []].append(imdbID)
@@ -2787,24 +2789,25 @@ actor MdbListRatingsStore {
                         batchRequest: batchFetcher
                     )
                 }
-                var registeredTasks: [(imdbID: String, key: String, task: Task<MdbListDetailsService.TitleResult, Never>)] = []
+                var registeredTasks: [(imdbID: String, cacheKey: String, inflightKey: String, task: Task<MdbListDetailsService.TitleResult, Never>)] = []
                 registeredTasks.reserveCapacity(chunk.count)
                 for imdbID in chunk {
-                    let key = "\(mediaType):\(imdbID)"
+                    let cacheKey = "\(mediaType):\(imdbID)"
+                    let inflightKey = "\(cacheKey):\(apiKey)"
                     let perKeyTask = Task<MdbListDetailsService.TitleResult, Never> {
                         let map = await chunkTask.value
                         return map[imdbID] ?? .failed
                     }
-                    inflight[key] = perKeyTask
-                    registeredTasks.append((imdbID, key, perKeyTask))
+                    inflight[inflightKey] = perKeyTask
+                    registeredTasks.append((imdbID, cacheKey, inflightKey, perKeyTask))
                 }
                 let results = await chunkTask.value
-                for (imdbID, key, perKeyTask) in registeredTasks {
-                    if inflight[key] == perKeyTask { inflight[key] = nil }
+                for (imdbID, cacheKey, inflightKey, perKeyTask) in registeredTasks {
+                    if inflight[inflightKey] == perKeyTask { inflight[inflightKey] = nil }
                     _ = applyTitleResult(
                         results[imdbID] ?? .failed,
-                        for: key,
-                        fallbackStored: entries?[key]?.ratings
+                        for: cacheKey,
+                        fallbackStored: entries?[cacheKey]?.ratings
                     )
                 }
             }
@@ -2815,7 +2818,7 @@ actor MdbListRatingsStore {
         imdbID: String,
         mediaType: String,
         apiKey: String,
-        key: String
+        inflightKey: String
     ) -> Task<MdbListDetailsService.TitleResult, Never> {
         let groupKey = BatchGroupKey(mediaType: mediaType, apiKey: apiKey)
         var ids = pendingCoalesceIDs[groupKey] ?? []
@@ -2845,7 +2848,7 @@ actor MdbListRatingsStore {
             let map = await groupTask.value
             return map[imdbID] ?? .failed
         }
-        inflight[key] = perKeyTask
+        inflight[inflightKey] = perKeyTask
         return perKeyTask
     }
 

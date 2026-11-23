@@ -1104,28 +1104,42 @@ private enum SimklSyncLoader {
 
         if shouldBootstrap {
             result = SimklAllItemsResponse()
-            let types = ["shows", "movies", "anime"]
-            let responses = await withTaskGroup(of: SimklAllItemsResponse?.self, returning: [SimklAllItemsResponse]?.self) { group in
-                for type in types {
+            // Fetch shows first so an expired token triggers a single 401 refresh
+            // before fanning out movies and anime concurrently.
+            guard service.isCurrentAuthorization(),
+                  TraktSettingsStore.librarySourceMode(in: store) == sourceAtStart,
+                  let showsResponse = await service.getOptional(
+                      SimklAllItemsResponse.self,
+                      path: "sync/all-items/shows",
+                      noContentValue: SimklAllItemsResponse()
+                  ) else {
+                return nil
+            }
+            result.merge(showsResponse)
+
+            let remainingTypes = ["movies", "anime"]
+            let remainingResponses = await withTaskGroup(of: (Int, SimklAllItemsResponse?).self, returning: [SimklAllItemsResponse]?.self) { group in
+                for (index, type) in remainingTypes.enumerated() {
                     group.addTask {
                         guard service.isCurrentAuthorization(),
-                              TraktSettingsStore.librarySourceMode(in: store) == sourceAtStart else { return nil }
-                        return await service.getOptional(
+                              TraktSettingsStore.librarySourceMode(in: store) == sourceAtStart else { return (index, nil) }
+                        let response = await service.getOptional(
                             SimklAllItemsResponse.self,
                             path: "sync/all-items/\(type)",
                             noContentValue: SimklAllItemsResponse()
                         )
+                        return (index, response)
                     }
                 }
-                var collected: [SimklAllItemsResponse] = []
-                for await response in group {
+                var ordered = Array<SimklAllItemsResponse?>(repeating: nil, count: remainingTypes.count)
+                for await (index, response) in group {
                     guard let response else { return nil }
-                    collected.append(response)
+                    ordered[index] = response
                 }
-                return collected
+                return ordered.compactMap { $0 }
             }
-            guard let responses else { return nil }
-            for response in responses {
+            guard let remainingResponses else { return nil }
+            for response in remainingResponses {
                 result.merge(response)
             }
         } else if let watermark = previousWatermark {

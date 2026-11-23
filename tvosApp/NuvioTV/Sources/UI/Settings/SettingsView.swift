@@ -5692,7 +5692,8 @@ private struct IntegrationSettingsView: View {
     @AppStorage private var p2pConsentAccepted: Bool
     @AppStorage private var p2pHideTorrentStats: Bool
     @AppStorage private var p2pCacheLimitGB: Int
-    @State private var currentCacheSizeText: String = TorrentSettings.cacheSizeFormatted()
+    @State private var currentCacheSizeText: String?
+    @State private var isRefreshingTorrentCache = false
     @State private var debridAccountToConnect: DebridAccountProvider?
     @State private var showingTraktLogin = false
     @State private var showingTraktSettings = false
@@ -6251,12 +6252,13 @@ private struct IntegrationSettingsView: View {
                     SettingsActionRow(
                         title: L10n.string("tvos_settings_p2p_clear_cache_title", fallback: "Clear Torrent Cache"),
                         subtitle: L10n.string("tvos_settings_p2p_clear_cache_subtitle", fallback: "Delete cached torrent chunks from disk."),
-                        value: currentCacheSizeText,
+                        value: currentCacheSizeText ?? "—",
                         accentColor: accentColor
                     ) {
-                        TorrentSettings.clearCache()
-                        currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
+                        Task { await refreshTorrentCacheSize(clearing: true) }
                     }
+                    .disabled(isRefreshingTorrentCache)
+                    .task { await refreshTorrentCacheSize() }
                 }
             }
 
@@ -6268,7 +6270,6 @@ private struct IntegrationSettingsView: View {
             PlexSettingsSection(accentColor: accentColor)
         }
         .onAppear {
-            currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
             refreshAddonSummaryCount()
             RemoteTrackingState.normalizeWatchProgressSource()
             RemoteTrackingState.normalizeLibrarySource()
@@ -6523,6 +6524,20 @@ private struct IntegrationSettingsView: View {
 
     private var p2pIsEnabled: Bool {
         p2pEnabled && p2pConsentAccepted
+    }
+
+    @MainActor
+    private func refreshTorrentCacheSize(clearing: Bool = false) async {
+        guard (clearing || (p2pIsEnabled && currentCacheSizeText == nil)), !isRefreshingTorrentCache else { return }
+        isRefreshingTorrentCache = true
+        let sizeText = await Task.detached(priority: .utility) {
+            if clearing {
+                TorrentSettings.clearCache()
+            }
+            return TorrentSettings.cacheSizeFormatted()
+        }.value
+        currentCacheSizeText = sizeText
+        isRefreshingTorrentCache = false
     }
 
     private var p2pToggleBinding: Binding<Bool> {
@@ -24358,7 +24373,7 @@ private struct UsenetDiskReadAheadRows: View {
     @State private var isOn = UsenetSettings.diskReadAhead()
     @State private var size = Self.option(for: UsenetSettings.diskReadAheadSizeMB())
     @State private var customGB = UsenetSettings.diskReadAheadGBText(UsenetSettings.diskReadAheadSizeMB())
-    @State private var freeSpace = UsenetDiskStore.reportedFreeSpace()
+    @State private var freeSpace: Int64 = -1
 
     private static func option(for megabytes: Int) -> String {
         UsenetSettings.diskReadAheadSizeOptions.contains(megabytes) ? String(megabytes) : customOption
@@ -24389,7 +24404,6 @@ private struct UsenetDiskReadAheadRows: View {
         .onChange(of: isOn) { _, value in
             UsenetSettings.setDiskReadAhead(value)
         }
-        .onAppear { freeSpace = UsenetDiskStore.reportedFreeSpace() }
 
         if isOn {
             SettingsChoiceRow(
@@ -24430,6 +24444,13 @@ private struct UsenetDiskReadAheadRows: View {
                 title: L10n.string("usenet_disk_free_title", fallback: "Free on This Apple TV (as tvOS reports it)"),
                 value: freeSpaceText
             )
+            .task {
+                let reportedFreeSpace = await Task.detached(priority: .utility) {
+                    UsenetDiskStore.reportedFreeSpace()
+                }.value
+                guard !Task.isCancelled else { return }
+                freeSpace = reportedFreeSpace
+            }
         }
     }
 
@@ -24863,15 +24884,17 @@ private struct AIOStreamsHostSheet: View {
                             .font(.system(size: 26, weight: .bold))
                             .foregroundColor(statusColor)
                         if let page = aio.configurationPageURL, aio.phase == .running {
-                            Text("Configuration page — open it in a browser on your computer (it is not an add-on address):")
+                            Text(aio.manifestURL == nil
+                                ? "Configuration page — open it in a browser on your computer (it is not an add-on address):"
+                                : "Configuration page — scan or open in a browser to edit your configuration (it is not an add-on address):")
                                 .font(.system(size: 18, weight: .medium))
                                 .foregroundColor(.white.opacity(0.65))
                                 .fixedSize(horizontal: false, vertical: true)
                             Text(page)
                                 .font(.system(size: 24, weight: .semibold, design: .monospaced))
                                 .foregroundColor(.white)
-                                .lineLimit(2)
-                                .minimumScaleFactor(0.6)
+                                .lineLimit(5)
+                                .minimumScaleFactor(0.5)
                         }
                         Text(details)
                             .font(.system(size: 19, weight: .medium))

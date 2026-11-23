@@ -2842,7 +2842,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 preferredSubtitleLanguages: ["Spanish"],
                 allowForcedSubtitles: false
             ),
-            .off
+            .preferredLanguages(["Spanish"])
         )
         XCTAssertEqual(
             PlayerViewModel.automaticSubtitlePolicy(
@@ -2860,7 +2860,28 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 preferredSubtitleLanguages: ["English", "Arabic"],
                 allowForcedSubtitles: false
             ),
-            .off
+            .preferredLanguages(["English", "Arabic"])
+        )
+        XCTAssertEqual(
+            PlayerViewModel.automaticSubtitlePolicy(
+                selectedAudio: englishAudio,
+                preferredAudioLanguage: "English",
+                preferredSubtitleLanguages: ["Dutch", "English"],
+                allowForcedSubtitles: true
+            ),
+            .preferredLanguages(["Dutch", "English"])
+        )
+        XCTAssertTrue(MPVPlayerViewController.isLavfiFilterSupported("dialoguenhance"))
+        XCTAssertTrue(MPVPlayerViewController.isLavfiFilterSupported("acompressor"))
+        XCTAssertTrue(MPVPlayerViewController.isLavfiFilterSupported("alimiter"))
+        XCTAssertTrue(MPVPlayerViewController.isLavfiFilterSupported("pan"))
+        XCTAssertFalse(MPVPlayerViewController.isLavfiFilterSupported("dynaudnorm"))
+        let enhanceFilter = MPVPlayerViewController.audioFilterString(dialogue: .enhance, reduceLoud: true)
+        XCTAssertTrue(enhanceFilter.contains("dialoguenhance"))
+        XCTAssertTrue(enhanceFilter.contains("acompressor"))
+        XCTAssertEqual(
+            MPVPlayerViewController.audioFilterString(dialogue: .boost, reduceLoud: false) { _ in false },
+            ""
         )
         XCTAssertEqual(
             PlayerViewModel.automaticSubtitlePolicy(

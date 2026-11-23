@@ -1604,6 +1604,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             // Preserve an explicit user pause across app switching and screensaver.
             screensaverDebugLog("[ScreensaverDebug][MPVController] restorePlayback preserving pause")
             pausePlayback()
+            if !isPlayerEnded {
+                needsPostWakePlaybackVerification = true
+            }
         }
         wasPlayingBeforeBackground = false
         if startupDisplayGateActive,
@@ -2462,41 +2465,45 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private static var supportedFiltersCache: [String: Bool] = [:]
     private static let supportedFiltersLock = NSLock()
 
-    private func isAudioFilterSupported(_ filterName: String) -> Bool {
-        Self.supportedFiltersLock.lock()
-        if let cached = Self.supportedFiltersCache[filterName] {
-            Self.supportedFiltersLock.unlock()
+    static func isLavfiFilterSupported(_ filterName: String) -> Bool {
+        supportedFiltersLock.lock()
+        if let cached = supportedFiltersCache[filterName] {
+            supportedFiltersLock.unlock()
             return cached
         }
-        Self.supportedFiltersLock.unlock()
+        supportedFiltersLock.unlock()
 
-        typealias GetLavfiFilters = @convention(c) () -> UnsafeMutablePointer<UnsafePointer<CChar>?>?
+        typealias AvfilterGetByName = @convention(c) (UnsafePointer<CChar>) -> UnsafeRawPointer?
         var isSupported = false
-        if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "mp_get_lavfi_filters") {
-            let fn = unsafeBitCast(sym, to: GetLavfiFilters.self)
-            if let list = fn() {
-                var index = 0
-                while let ptr = list[index] {
-                    if String(cString: ptr) == filterName {
-                        isSupported = true
-                        break
-                    }
-                    index += 1
-                }
-            }
+        if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "avfilter_get_by_name") {
+            let fn = unsafeBitCast(sym, to: AvfilterGetByName.self)
+            isSupported = filterName.withCString { fn($0) != nil }
         }
 
-        Self.supportedFiltersLock.lock()
-        Self.supportedFiltersCache[filterName] = isSupported
-        Self.supportedFiltersLock.unlock()
+        supportedFiltersLock.lock()
+        supportedFiltersCache[filterName] = isSupported
+        supportedFiltersLock.unlock()
         return isSupported
     }
 
-    func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {
-        guard let mpv else { return }
+    private func isAudioFilterSupported(_ filterName: String) -> Bool {
+        Self.isLavfiFilterSupported(filterName)
+    }
+
+    static func audioFilterString(
+        dialogue: EnhanceDialogueMode,
+        reduceLoud: Bool,
+        isFilterSupported: (String) -> Bool = isLavfiFilterSupported
+    ) -> String {
         var filters: [String] = []
-        let hasDynAudNorm = isAudioFilterSupported("dynaudnorm")
-        let hasACompressor = isAudioFilterSupported("acompressor")
+        let hasDynAudNorm = isFilterSupported("dynaudnorm")
+        let hasEqualizer = isFilterSupported("equalizer")
+        let hasVolume = isFilterSupported("volume")
+        let hasDialogueEnhance = isFilterSupported("dialoguenhance")
+            && isFilterSupported("pan")
+            && isFilterSupported("aformat")
+        let hasACompressor = isFilterSupported("acompressor")
+        let hasALimiter = isFilterSupported("alimiter")
 
         switch dialogue {
         case .off:
@@ -2504,28 +2511,43 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         case .enhance:
             if hasDynAudNorm {
                 filters.append("lavfi=[dynaudnorm=f=150:g=15:m=10.0]")
-            } else {
+            } else if hasDialogueEnhance {
+                let limiterStage = hasALimiter ? ",alimiter=limit=0.891251:attack=5:release=50:level=0:latency=1" : ""
+                filters.append("lavfi=[aformat=channel_layouts=stereo,dialoguenhance=original=1:enhance=1:voice=2,pan=stereo|c0=c0+1.0*c2|c1=c1+1.0*c2\(limiterStage)]")
+            } else if hasEqualizer {
                 filters.append("equalizer=f=1500:width_type=o:width=1.5:g=6")
             }
         case .boost:
             if hasDynAudNorm {
-                filters.append("lavfi=[dynaudnorm=f=100:g=21:m=20.0],equalizer=f=1500:width_type=o:width=1.5:g=8")
-            } else {
-                filters.append("equalizer=f=1500:width_type=o:width=1.5:g=8,volume=volume=2dB")
+                let eq = hasEqualizer ? ",equalizer=f=1500:width_type=o:width=1.5:g=8" : ""
+                filters.append("lavfi=[dynaudnorm=f=100:g=21:m=20.0]\(eq)")
+            } else if hasDialogueEnhance {
+                let limiterStage = hasALimiter ? ",alimiter=limit=0.891251:attack=5:release=50:level=0:latency=1" : ""
+                filters.append("lavfi=[aformat=channel_layouts=stereo,dialoguenhance=original=1:enhance=1:voice=2,pan=stereo|c0=c0+2.0*c2|c1=c1+2.0*c2\(limiterStage)]")
+            } else if hasEqualizer {
+                let vol = hasVolume ? ",volume=volume=2dB" : ""
+                filters.append("equalizer=f=1500:width_type=o:width=1.5:g=8\(vol)")
             }
         }
         if reduceLoud {
             if hasACompressor {
                 filters.append("lavfi=[acompressor=threshold=-20dB:ratio=4:attack=50:release=1000]")
-            } else {
+            } else if hasVolume {
                 filters.append("volume=volume=-3dB")
             }
         }
-        let filterString = filters.joined(separator: ",")
+        return filters.joined(separator: ",")
+    }
+
+    func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {
+        guard let mpv else { return }
+        let filterString = Self.audioFilterString(dialogue: dialogue, reduceLoud: reduceLoud)
         if !filterString.isEmpty {
             let status = mpv_set_property_string(mpv, "af", filterString)
             if status < 0 {
-                let fallback = dialogue == .off ? "" : "equalizer=f=1500:width_type=o:width=1.5:g=6"
+                let fallback = reduceLoud && isAudioFilterSupported("acompressor")
+                    ? "lavfi=[acompressor=threshold=-20dB:ratio=4:attack=50:release=1000]"
+                    : ""
                 mpv_set_property_string(mpv, "af", fallback)
             }
         } else {

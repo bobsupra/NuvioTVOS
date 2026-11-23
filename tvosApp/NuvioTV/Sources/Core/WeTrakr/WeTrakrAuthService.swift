@@ -316,7 +316,9 @@ enum WeTrakrAuthStore {
         }
         defaults.set(true, forKey: Key.hasAccessToken)
         defaults.set(clientID, forKey: Key.credentialClientID)
-        NotificationCenter.default.post(name: changedNotification, object: nil)
+        if isNewLogin {
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+        }
     }
 
     static func saveUser(

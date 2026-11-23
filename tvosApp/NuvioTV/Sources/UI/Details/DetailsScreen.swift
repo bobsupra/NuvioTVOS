@@ -5033,7 +5033,11 @@ struct TvDetailsContent: View {
                 toleranceAfter: .zero
             )
         }
-        guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
+        guard !Task.isCancelled else { return }
+        if requireBackgroundAllowed || !isFullscreenTrailerPresented,
+           !isBackgroundTrailerAllowed(hasHandoff: hasHandoff) {
+            return
+        }
         applySoundPreference(soundEnabled)
         isTrailerPlaying = true
         trailerPlayer.play()

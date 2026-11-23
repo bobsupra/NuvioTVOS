@@ -173,6 +173,24 @@ final class AIOStreamsHostTests: XCTestCase {
         XCTAssertFalse(AIOStreamsHost.isAIOAddon(URL(string: "http://127.0.0.1:\(AIOStreamsHost.aioPort)/api/v1/health")!))
     }
 
+    func testConfigurationPageURLUsesExistingConfigWhenPresent() {
+        XCTAssertEqual(
+            AIOStreamsHost.configurationPageURL(host: "192.168.1.50", manifestURL: nil),
+            "http://192.168.1.50:\(AIOStreamsHost.lanPort)/stremio/configure"
+        )
+        XCTAssertEqual(
+            AIOStreamsHost.configurationPageURL(
+                host: "192.168.1.50",
+                manifestURL: "http://127.0.0.1:\(AIOStreamsHost.aioPort)/stremio/12345678-1234-1234-1234-1234567890ab/enc%2Bpass%3D/manifest.json"
+            ),
+            "http://192.168.1.50:\(AIOStreamsHost.lanPort)/stremio/12345678-1234-1234-1234-1234567890ab/enc%2Bpass%3D/configure"
+        )
+        XCTAssertEqual(
+            AIOStreamsHost.configurationPageURL(host: "192.168.1.50", manifestURL: "https://example.com/other.json"),
+            "http://192.168.1.50:\(AIOStreamsHost.lanPort)/stremio/configure"
+        )
+    }
+
     /// Two answers merged: what the second repeats is left out, nothing of the first.
     func testMergingTwoAnswersKeepsEachStreamOnce() {
         let hash = "abcdef0123456789abcdef0123456789abcdef01"

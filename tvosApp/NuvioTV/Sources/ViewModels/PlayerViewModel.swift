@@ -7151,19 +7151,16 @@ class PlayerViewModel: ObservableObject {
         let nativeAudioMatchesPreferred = audioToMatch != nil && preferredAudioLanguage != nil && selectedAudioTrack(audioToMatch!, matches: preferredAudioLanguage!)
 
         if !preferredSubtitleLanguages.isEmpty {
-            if let selectedAudio,
-               allowForcedSubtitles,
-               let matchingLanguage = preferredSubtitleLanguages.first(where: { selectedAudioTrack(selectedAudio, matches: $0) }) {
-                return .forced(language: matchingLanguage)
-            }
-            if selectedAudio == nil,
-               allowForcedSubtitles,
-               let prefAudio = preferredAudioLanguage,
-               let matchingLanguage = preferredSubtitleLanguages.first(where: { SubtitleLanguagePreferences.matches(prefAudio, target: $0) }) {
-                return .forced(language: matchingLanguage)
-            }
-            if nativeAudioMatchesPreferred && !allowForcedSubtitles {
-                return .off
+            if allowForcedSubtitles,
+               let primaryLanguage = preferredSubtitleLanguages.first {
+                if let selectedAudio, selectedAudioTrack(selectedAudio, matches: primaryLanguage) {
+                    return .forced(language: primaryLanguage)
+                }
+                if selectedAudio == nil,
+                   let prefAudio = preferredAudioLanguage,
+                   SubtitleLanguagePreferences.matches(prefAudio, target: primaryLanguage) {
+                    return .forced(language: primaryLanguage)
+                }
             }
             return .preferredLanguages(preferredSubtitleLanguages)
         }
