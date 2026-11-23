@@ -1103,19 +1103,65 @@ enum AddonRatingsService {
         }
     }
 
-    static func prefetchHeroRatings(for metas: [NuvioMeta], defaults: UserDefaults = ProfileSettings.current) {
-        guard isHomeHeroRatingsEnabled(defaults: defaults) else { return }
+    @discardableResult
+    static func prefetchHeroRatings(
+        for metas: [NuvioMeta],
+        defaults: UserDefaults = ProfileSettings.current,
+        maxConcurrent: Int = 2
+    ) -> Task<Void, Never>? {
+        guard isHomeHeroRatingsEnabled(defaults: defaults) else { return nil }
         let originatingProfileID = ProfileSettings.activeProfileID
         let defaultsStore = SendableDefaultsStore(value: defaults)
-        for meta in metas where cachedHeroRatings(for: meta, defaults: defaults) == nil {
-            Task.detached(priority: .utility) {
-                guard ProfileSettings.activeProfileID == originatingProfileID else { return }
-                _ = await fetchHeroRatings(
-                    for: meta,
-                    defaults: defaultsStore.value,
-                    expectedProfileID: originatingProfileID
-                )
+        var seen = Set<String>()
+        let uncached = metas.filter { meta in
+            let key = homeHeroRatingsKey(for: meta)
+            return seen.insert(key).inserted
+                && cachedHeroRatings(for: meta, defaults: defaults) == nil
+        }
+        guard !uncached.isEmpty else { return nil }
+        let concurrencyLimit = max(1, maxConcurrent)
+        return Task.detached(priority: .utility) {
+            await withTaskGroup(of: Void.self) { group in
+                var iterator = uncached.makeIterator()
+                func enqueueNext() {
+                    guard !Task.isCancelled,
+                          ProfileSettings.activeProfileID == originatingProfileID,
+                          let meta = iterator.next() else { return }
+                    group.addTask {
+                        _ = await fetchHeroRatings(
+                            for: meta,
+                            defaults: defaultsStore.value,
+                            expectedProfileID: originatingProfileID
+                        )
+                    }
+                }
+                for _ in 0..<min(concurrencyLimit, uncached.count) {
+                    enqueueNext()
+                }
+                while await group.next() != nil {
+                    enqueueNext()
+                }
             }
+        }
+    }
+
+    /// Prefetches row-level MDBList ratings via batched HTTP POST requests without
+    /// querying per-title Stremio rating add-ons across entire rows.
+    @discardableResult
+    static func prefetchMDBListRowBatch(
+        for metas: [NuvioMeta],
+        defaults: UserDefaults = ProfileSettings.current
+    ) -> Task<Void, Never>? {
+        guard isHomeHeroRatingsEnabled(defaults: defaults), !metas.isEmpty else { return nil }
+        let originatingProfileID = ProfileSettings.activeProfileID
+        let defaultsStore = SendableDefaultsStore(value: defaults)
+        return Task.detached(priority: .utility) {
+            guard !Task.isCancelled,
+                  ProfileSettings.activeProfileID == originatingProfileID else { return }
+            await MdbListDetailsService.prefetchBatchRatings(
+                for: metas,
+                defaults: defaultsStore.value
+            )
         }
     }
 

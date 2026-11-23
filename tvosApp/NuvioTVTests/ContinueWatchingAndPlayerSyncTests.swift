@@ -527,6 +527,28 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertTrue(ContinueWatchingDismissStore.keys(profileId: dismissalTestProfileId).isEmpty)
     }
 
+    func testClearWithoutMatchingLocalDismissalDoesNotPostChangedNotification() {
+        ContinueWatchingDismissStore.dismiss(contentId: "tt-unrelated-dismissal")
+        var notifications = 0
+        let token = NotificationCenter.default.addObserver(
+            forName: ContinueWatchingDismissStore.changedNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            notifications += 1
+        }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        // Repeating clear for an active playback title that has no local dismissal must not
+        // spam ContinueWatchingDismissStore.changedNotification (which triggers settings sync pushes).
+        ContinueWatchingDismissStore.clear(contentId: "tt-active-playback")
+        XCTAssertEqual(notifications, 0)
+
+        // Clearing a title that actually had a local dismissal still notifies immediately.
+        ContinueWatchingDismissStore.clear(contentId: "tt-unrelated-dismissal")
+        XCTAssertEqual(notifications, 1)
+    }
+
     // MARK: - Player Settings Sync Tests
 
     func testPlayerSettingsMergeIsMobileFirstAndPreservesUnknownKeys() {

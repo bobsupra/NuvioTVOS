@@ -64,8 +64,8 @@ struct AIHomeCatalogSuggestion: Equatable, Sendable {
     let isFilm: Bool
 }
 
-struct AIHomeCatalogCache: Codable, Equatable {
-    struct Row: Codable, Equatable {
+struct AIHomeCatalogCache: Codable, Equatable, Sendable {
+    struct Row: Codable, Equatable, Sendable {
         let kind: AIHomeCatalogKind
         let items: [NuvioMeta]
     }
@@ -281,15 +281,32 @@ final class AIHomeCatalogStore: ObservableObject {
     /// once it ends.
     private var pendingRefresh: Bool?
 
-    /// Home rows to show now, from the cache.
-    func sections() -> [TVHomeSection] {
+    struct SectionsSnapshotInput: Sendable {
+        let cache: AIHomeCatalogCache?
+        let kinds: [AIHomeCatalogKind]
+    }
+
+    /// Captures the AI catalog cache and enabled kinds on the main actor so
+    /// filtering against viewer history can run off the main actor.
+    func sectionsSnapshotInput() -> SectionsSnapshotInput? {
         reloadIfProfileChanged()
         let kinds = AIHomeCatalogs.enabledKinds()
-        guard !kinds.isEmpty, SurpriseMeAIConfiguration.current().isUsable else { return [] }
-        let history = Self.currentHistory()
-        return AIHomeCatalogs.sections(from: cache, kinds: kinds) { meta in
+        guard !kinds.isEmpty, SurpriseMeAIConfiguration.current().isUsable else { return nil }
+        return SectionsSnapshotInput(cache: cache, kinds: kinds)
+    }
+
+    /// Computes For You rows from a pre-captured snapshot. Safe off the main actor.
+    nonisolated static func sections(from input: SectionsSnapshotInput?) -> [TVHomeSection] {
+        guard let input else { return [] }
+        let history = currentHistory()
+        return AIHomeCatalogs.sections(from: input.cache, kinds: input.kinds) { meta in
             history.contains(meta) || WatchedStore.contains(meta: meta)
         }
+    }
+
+    /// Home rows to show now, from the cache.
+    func sections() -> [TVHomeSection] {
+        Self.sections(from: sectionsSnapshotInput())
     }
 
     /// Rebuilds the rows in the background when they are missing, a day old,
@@ -395,7 +412,7 @@ final class AIHomeCatalogStore: ObservableObject {
         refreshIfNeeded(force: pending)
     }
 
-    private static func currentHistory() -> SurpriseMeHistory {
+    nonisolated private static func currentHistory() -> SurpriseMeHistory {
         SurpriseMeHistory(
             watched: WatchedStore.items().map(\.meta),
             library: SurpriseMeLibraries.allItems(),

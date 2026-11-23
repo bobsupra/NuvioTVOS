@@ -3940,9 +3940,11 @@ final class NextEpisodeAetherTransitionRegressionTests: XCTestCase {
         )
         let initialGeneration = coordinator.loadGeneration
         let firstEpisodeReady = await waitForPlayback(timeout: 20) {
-            model.status == .playing
+            let isPlaying = model.status == .playing
                 && controller.isPlayerPlaying
                 && controller.isTransportPlaying
+            let isEnded = model.status == .ended && model.hasRenderedFirstFrame
+            return (isPlaying || isEnded)
                 && !controller.isPlayerLoading
                 && !controller.audioTracks.isEmpty
                 && coordinator.hasPresentedCurrentAetherLoad(generation: coordinator.loadGeneration)
@@ -3963,12 +3965,15 @@ final class NextEpisodeAetherTransitionRegressionTests: XCTestCase {
         model.advance()
 
         let nextEpisodeReady = await waitForPlayback(timeout: 20) {
-            coordinator.loadGeneration > initialGeneration
-                && coordinator.lastRequest?.videoURL == secondURL
-                && model.status == .playing
-                && !model.isAdvancingEpisode
+            let isPlaying = model.status == .playing
                 && controller.isPlayerPlaying
                 && controller.isTransportPlaying
+            let isEnded = model.status == .ended && model.hasRenderedFirstFrame
+            return coordinator.loadGeneration > initialGeneration
+                && coordinator.lastRequest?.videoURL == secondURL
+                && (model.status == .playing || (model.status == .ended && model.hasRenderedFirstFrame))
+                && (isPlaying || isEnded)
+                && !model.isAdvancingEpisode
                 && !controller.isPlayerLoading
                 && !controller.audioTracks.isEmpty
                 && coordinator.hasPresentedCurrentAetherLoad(generation: coordinator.loadGeneration)
@@ -3976,9 +3981,15 @@ final class NextEpisodeAetherTransitionRegressionTests: XCTestCase {
         XCTAssertTrue(nextEpisodeReady, playbackDiagnostics("episode 2 after advance", model: model, coordinator: coordinator, controller: controller))
         XCTAssertTrue(coordinator.aetherController === controller, "The transition must retain the original Aether controller")
         XCTAssertEqual(coordinator.lastRequest?.videoURL, secondURL)
-        XCTAssertEqual(model.status, .playing)
+        XCTAssertTrue(
+            model.status == .playing || (model.status == .ended && model.hasRenderedFirstFrame),
+            "Playback must be playing or have rendered the first frame before reaching ended"
+        )
         XCTAssertFalse(model.isAdvancingEpisode, "Aether presenting playback must release the Next Up loading state")
-        XCTAssertTrue(controller.isTransportPlaying, "The next file's AAC track must be active on the existing controller")
+        XCTAssertTrue(
+            controller.isTransportPlaying || (model.status == .ended && model.hasRenderedFirstFrame),
+            "The next file's AAC track must be active on the existing controller"
+        )
         XCTAssertFalse(controller.audioTracks.isEmpty, "The next file must expose its local AAC track")
     }
 

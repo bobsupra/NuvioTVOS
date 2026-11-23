@@ -18,6 +18,8 @@ protocol ScrubThumbnailProviding: AnyObject {
     func pendingScrubThumbnailDelay() -> TimeInterval?
     /// A chapter's still for the Chapters panel, without retiring a seek preview request.
     func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage?
+    /// True once still extraction permanently failed for the current stream (e.g. 4K HEVC).
+    var chapterThumbnailsUnavailableForCurrentSource: Bool { get }
 }
 
 extension ScrubThumbnailProviding {
@@ -29,6 +31,7 @@ extension ScrubThumbnailProviding {
         if let cached = await cachedScrubThumbnail(atSeconds: seconds, duration: duration) { return cached }
         return await scrubThumbnail(atSeconds: seconds, maxWidth: 320, precise: false)
     }
+    var chapterThumbnailsUnavailableForCurrentSource: Bool { false }
 }
 
 struct LiveStreamFailoverPolicy {
@@ -530,6 +533,8 @@ class PlayerViewModel: ObservableObject {
     @Published private(set) var isPlaybackDebugEnabled = false
     @Published private(set) var trailerDiagnostics: String?
     @Published private(set) var trailerQualityLabel: String?
+    private var trailerProviderKind: TrailerProviderKind?
+    private var trailerYouTubeId: String?
     @Published private(set) var hasRenderedFirstFrame = false {
         didSet {
             if hasRenderedFirstFrame && !oldValue {
@@ -1298,12 +1303,12 @@ class PlayerViewModel: ObservableObject {
             trailerResolveTask?.cancel()
             trailerResolveTask = Task { [weak self] in
                 var resolvedUrl = await resolver.resolve(for: meta)
-                if resolvedUrl == nil {
+                if resolvedUrl == nil, TrailerSettings.sourceMode().allowsYouTubeFallback {
                     resolvedUrl = await resolver.resolve(
                         youtubeVideoId: youtubeId,
                         title: title,
                         year: year
-                    )
+                    )?.withYouTubeMetadata(videoId: youtubeId)
                 }
 
                 guard !Task.isCancelled else { return }
@@ -1315,6 +1320,11 @@ class PlayerViewModel: ObservableObject {
                         : self.startupBenchmarkToken == startupToken
                             && PlaybackStartupTiming.isActive(token: startupToken)
                     guard stillOwnsStartup else { return }
+                    let diagToken = TrailerPlaybackDiagnostics.shared.recordResolution(
+                        meta: meta,
+                        context: "Fullscreen Player",
+                        source: resolvedUrl
+                    )
                     guard let playbackSource = resolvedUrl else {
                         self.status = .error("No playable trailer stream was found for this title.")
                         return
@@ -1323,6 +1333,9 @@ class PlayerViewModel: ObservableObject {
                     self.activeHTTPHeaders = playbackSource.requestHeaders
                     self.trailerQualityLabel = playbackSource.qualityLabel
                     self.trailerDiagnostics = playbackSource.diagnostics
+                    self.trailerProviderKind = playbackSource.providerKind
+                    self.trailerYouTubeId = playbackSource.youtubeVideoId
+                    TrailerPlaybackDiagnostics.shared.recordPlaybackReady(token: diagToken, resolution: playbackSource.qualityLabel)
                     print("[TrailerPlayback] Resolved \(playbackSource.qualityLabel ?? "stream"): \(playbackSource.diagnostics ?? "")")
                     // Trailers with optional separate audio URL require MPV.
                     guard let videoURL = URL(string: playbackSource.videoUrl) else {
@@ -3396,8 +3409,11 @@ class PlayerViewModel: ObservableObject {
             }
             guard let prepared = result else {
                 self.cancelStartupBenchmark(token: startupToken)
+                self.isFailingOver = false
                 self.isReloadingStream = false
                 self.isSwitchingSource = false
+                self.isAwaitingStreamStart = false
+                self.reloadAttempts = Self.maxReloadAttempts
                 self.status = .error(reason)
                 return
             }
@@ -3536,10 +3552,19 @@ class PlayerViewModel: ObservableObject {
 
     private func enrichDebugInfoWithSource(_ info: inout PlaybackDebugInfo) {
         if isTrailerPlaybackSession {
-            info.addon = "YouTube Trailer"
-            info.provider = trailerQualityLabel.map { "YouTube (\($0))" } ?? "YouTube"
-            info.server = "Google Video CDN"
-            info.fileExtension = "HLS"
+            let snapshot = TrailerPlaybackDiagnostics.shared.currentSnapshot
+            let kind = trailerProviderKind ?? snapshot?.providerKind
+            let ytId = trailerYouTubeId ?? snapshot?.youtubeVideoId
+            let detail = trailerQualityLabel ?? snapshot?.providerDetail
+            info.addon = kind?.rawValue ?? "Trailer"
+            if let ytId, !ytId.isEmpty {
+                info.provider = detail.map { "\($0) (yt:\(ytId))" } ?? "yt:\(ytId)"
+            } else {
+                info.provider = detail ?? kind?.rawValue ?? "Trailer"
+            }
+            info.server = Self.detectServerHost(url: activeStreamURL)
+            let (ext, _) = Self.detectFileInfo(filename: activeFilename, url: activeStreamURL, title: title)
+            info.fileExtension = ext
             info.fileName = "\(activeMeta?.name ?? title) (Preview)"
             if let diag = trailerDiagnostics, !diag.isEmpty {
                 if !info.diagnostics.contains(diag) {
@@ -5068,6 +5093,10 @@ class PlayerViewModel: ObservableObject {
                 guard !Task.isCancelled, let self, let provider,
                       PlaybackChapters.isSameList(self.chapters, chapters),
                       self.scrubThumbnailProvider === provider, self.canShowChapterThumbnails else { return }
+                if provider.chapterThumbnailsUnavailableForCurrentSource {
+                    self.publishChapterThumbnailStatus("unavailable")
+                    return
+                }
                 guard !self.isChaptersTabHidden else {
                     // Chapters switched off in Settings meanwhile: stop, and start again on
                     // their own if they are switched back on.
@@ -5111,6 +5140,9 @@ class PlayerViewModel: ObservableObject {
                     store.set(image, for: chapter.id)
                     retryAfter[index] = nil
                     consecutiveMisses = 0
+                } else if provider.chapterThumbnailsUnavailableForCurrentSource {
+                    self.publishChapterThumbnailStatus("unavailable")
+                    return
                 } else {
                     // Back off further while nothing comes at all (no network for a while).
                     consecutiveMisses += 1
@@ -7115,6 +7147,9 @@ class PlayerViewModel: ObservableObject {
         preferredSubtitleLanguages: [String],
         allowForcedSubtitles: Bool
     ) -> AutomaticSubtitlePolicy? {
+        let audioToMatch = selectedAudio ?? preferredAudioLanguage.map { AudioTrack(id: "", name: $0, language: $0, isSelected: true) }
+        let nativeAudioMatchesPreferred = audioToMatch != nil && preferredAudioLanguage != nil && selectedAudioTrack(audioToMatch!, matches: preferredAudioLanguage!)
+
         if !preferredSubtitleLanguages.isEmpty {
             if let selectedAudio,
                allowForcedSubtitles,
@@ -7127,15 +7162,15 @@ class PlayerViewModel: ObservableObject {
                let matchingLanguage = preferredSubtitleLanguages.first(where: { SubtitleLanguagePreferences.matches(prefAudio, target: $0) }) {
                 return .forced(language: matchingLanguage)
             }
+            if nativeAudioMatchesPreferred && !allowForcedSubtitles {
+                return .off
+            }
             return .preferredLanguages(preferredSubtitleLanguages)
         }
 
-        let audioToMatch = selectedAudio ?? preferredAudioLanguage.map { AudioTrack(id: "", name: $0, language: $0, isSelected: true) }
-        if let audioToMatch,
-           let preferredAudioLanguage,
-           selectedAudioTrack(audioToMatch, matches: preferredAudioLanguage) {
+        if nativeAudioMatchesPreferred {
             if allowForcedSubtitles {
-                return .forced(language: preferredAudioLanguage)
+                return .forced(language: preferredAudioLanguage!)
             }
             return .off
         }
@@ -7228,6 +7263,8 @@ class PlayerViewModel: ObservableObject {
                 addPendingExternalSubtitlesIfNeeded()
                 return
             }
+
+            guard subtitles.contains(where: { $0.id != "off" }) else { return }
 
             guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
             pendingSelectedExternalSubtitleURL = nil
@@ -9424,39 +9461,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private static func youtubeVideoId(from url: URL) -> String? {
-        let host = (url.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
-
-        if host == "youtu.be" {
-            let id = url.pathComponents.dropFirst().first ?? ""
-            return isYouTubeVideoId(id) ? id : nil
-        }
-
-        guard host == "youtube.com" || host.hasSuffix(".youtube.com") else {
-            return nil
-        }
-
-        if let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
-            .queryItems?
-            .first(where: { $0.name == "v" })?
-            .value,
-           isYouTubeVideoId(id) {
-            return id
-        }
-
-        let components = url.pathComponents.filter { $0 != "/" }
-        guard components.count >= 2,
-              ["embed", "shorts", "live"].contains(components[0]),
-              isYouTubeVideoId(components[1]) else {
-            return nil
-        }
-
-        return components[1]
-    }
-
-    private static func isYouTubeVideoId(_ value: String) -> Bool {
-        value.count == 11 && value.allSatisfy { char in
-            char.isLetter || char.isNumber || char == "_" || char == "-"
-        }
+        YouTubeTrailerResolver.youtubeVideoId(from: url)
     }
 
     // MARK: - Picture in Picture Methods

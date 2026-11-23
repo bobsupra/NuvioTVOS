@@ -7,6 +7,7 @@
 
 import AVFoundation
 import Foundation
+import os
 
 // MARK: - Catalog Models
 
@@ -116,6 +117,40 @@ struct NuvioExternalRating: Codable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// Direct playable trailer stream provided by a metadata add-on (`meta.trailerStreams`).
+struct NuvioTrailerStream: Codable, Equatable, Hashable, Sendable {
+    let url: String
+    let title: String?
+    let name: String?
+    let requestHeaders: [String: String]?
+
+    init(
+        url: String,
+        title: String? = nil,
+        name: String? = nil,
+        requestHeaders: [String: String]? = nil
+    ) {
+        self.url = url
+        self.title = title
+        self.name = name
+        self.requestHeaders = requestHeaders
+    }
+
+    var displayLabel: String {
+        let parts = [name, title]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return parts.isEmpty ? "Addon Stream" : parts.joined(separator: " · ")
+    }
+
+    var scoreLabel: String {
+        [name, title]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+}
+
 /// Content metadata
 struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     let id: String
@@ -145,6 +180,8 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
     let videos: [NuvioVideo]?
     /// YouTube trailer ids from Cinemeta `trailers` / `trailerStreams`.
     let trailerYtIds: [String]?
+    /// Direct playable trailer URLs from add-on `trailerStreams` (when provided).
+    let trailerStreams: [NuvioTrailerStream]?
     /// Optional ratings fetched from the user's enabled MDBList providers.
     /// This is transient enrichment and is intentionally omitted from compact
     /// library/watch-state snapshots.
@@ -230,6 +267,43 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             }
         }
         return false
+    }
+
+    /// True when this metadata represents a live TV channel, live sports stream,
+    /// collection leaf, or cloud file rather than a VOD title with trailers/episodes.
+    var isLiveOrChannelContent: Bool {
+        if CinemetaCatalogRepository.isLiveContentType(type) { return true }
+        let normalizedId = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let typeLower = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if typeLower == "tv" && normalizedId.contains("sport") { return true }
+        if normalizedId.hasPrefix("leaf:")
+            || normalizedId.hasPrefix("streamed:")
+            || normalizedId.hasPrefix("iptv:")
+            || normalizedId.hasPrefix("live:")
+            || normalizedId.hasPrefix("channel:")
+            || normalizedId.hasPrefix("stream:")
+            || normalizedId.hasPrefix("pp-live:")
+            || normalizedId.hasPrefix("folder:")
+            || normalizedId.hasPrefix("file:")
+            || normalizedId.contains("cdnlive")
+            || normalizedId.contains("daddylive")
+            || normalizedId.contains("streamed.pk")
+            || normalizedId.contains("nuvio_sport") {
+            return true
+        }
+        var normalizedName = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        while let first = normalizedName.first, !first.isLetter && !first.isNumber && first != "[" && first != "(" {
+            normalizedName.removeFirst()
+            normalizedName = normalizedName.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return normalizedName.hasPrefix("now:")
+            || normalizedName.hasPrefix("live:")
+            || normalizedName.hasPrefix("[live]")
+            || normalizedName.hasPrefix("(live)")
+    }
+
+    var supportsTrailerLookup: Bool {
+        !isLiveOrChannelContent
     }
 
     /// Identifies anime streams by release groups, file naming conventions, or stream description tags.
@@ -336,6 +410,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: nil,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: nil,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -420,6 +495,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: resolvedStatus,
             videos: (videos?.isEmpty == false ? videos : nil) ?? fullMeta.videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: (trailerStreams?.isEmpty == false ? trailerStreams : nil) ?? fullMeta.trailerStreams,
             externalRatings: externalRatings ?? fullMeta.externalRatings,
             posterShape: posterShape ?? fullMeta.posterShape,
             isFromAddon: isFromAddon ?? fullMeta.isFromAddon,
@@ -476,6 +552,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             // after background enrichment, without another metadata fetch.
             videos: videos ?? fullMeta.videos,
             trailerYtIds: trailerYtIds ?? fullMeta.trailerYtIds,
+            trailerStreams: (trailerStreams?.isEmpty == false ? trailerStreams : nil) ?? fullMeta.trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape ?? fullMeta.posterShape,
             isFromAddon: isFromAddon ?? fullMeta.isFromAddon,
@@ -501,8 +578,9 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
         let writerToUse = (resolved.writer == nil || resolved.writer?.isEmpty == true) ? existing.writer : resolved.writer
         let certToUse = (resolved.certification == nil || resolved.certification?.isEmpty == true) ? existing.certification : resolved.certification
         let genresToUse = (resolved.genres == nil || resolved.genres?.isEmpty == true) ? existing.genres : resolved.genres
+        let trailerStreamsToUse = (resolved.trailerStreams?.isEmpty == false) ? resolved.trailerStreams : existing.trailerStreams
 
-        if castToUse != resolved.cast || directorToUse != resolved.director || writerToUse != resolved.writer || certToUse != resolved.certification || genresToUse != resolved.genres {
+        if castToUse != resolved.cast || directorToUse != resolved.director || writerToUse != resolved.writer || certToUse != resolved.certification || genresToUse != resolved.genres || trailerStreamsToUse != resolved.trailerStreams {
             resolved = NuvioMeta(
                 id: resolved.id,
                 name: resolved.name,
@@ -528,6 +606,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
                 status: resolved.status,
                 videos: resolved.videos,
                 trailerYtIds: resolved.trailerYtIds,
+                trailerStreams: trailerStreamsToUse,
                 externalRatings: resolved.externalRatings,
                 posterShape: resolved.posterShape,
                 isFromAddon: resolved.isFromAddon ?? existing.isFromAddon,
@@ -564,6 +643,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -598,6 +678,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -631,6 +712,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -674,6 +756,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: ratings.isEmpty ? nil : ratings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -710,6 +793,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: videosToUse,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -742,6 +826,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
         status: String? = nil,
         videos: [NuvioVideo]? = nil,
         trailerYtIds: [String]? = nil,
+        trailerStreams: [NuvioTrailerStream]? = nil,
         externalRatings: [NuvioExternalRating]? = nil,
         posterShape: String? = nil,
         isFromAddon: Bool? = nil,
@@ -771,6 +856,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
         self.status = status
         self.videos = videos
         self.trailerYtIds = trailerYtIds
+        self.trailerStreams = trailerStreams
         self.externalRatings = externalRatings
         self.posterShape = posterShape
         self.isFromAddon = isFromAddon
@@ -803,6 +889,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
             status: status,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,
@@ -827,7 +914,7 @@ final class LastValueMemo<Input: Equatable, Output>: @unchecked Sendable {
     }
 }
 
-enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable {
+enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable, Sendable {
     case home
     case continueWatching = "continue_watching"
     case collections
@@ -2427,36 +2514,211 @@ struct StreamEpisodeTarget: Equatable, Hashable, Sendable {
     }
 }
 
+enum TrailerSourceMode: String, CaseIterable, Sendable {
+    case auto
+    case trailerioOnly
+    case directOnly
+    case youtubeOnly
+
+    static func fromStored(_ raw: String?) -> TrailerSourceMode {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              let mode = TrailerSourceMode(rawValue: trimmed) else {
+            return .auto
+        }
+        return mode
+    }
+
+    var allowsYouTubeFallback: Bool {
+        switch self {
+        case .auto, .youtubeOnly: return true
+        case .trailerioOnly, .directOnly: return false
+        }
+    }
+
+    var displayTitle: String {
+        switch self {
+        case .auto:
+            return L10n.string("tvos_settings_option_auto", fallback: "Auto")
+        case .trailerioOnly:
+            return L10n.string("tvos_settings_trailer_source_trailerio_only", fallback: "Trailerio Only")
+        case .directOnly:
+            return L10n.string("tvos_settings_trailer_source_direct_only", fallback: "Direct Streams Only")
+        case .youtubeOnly:
+            return L10n.string("tvos_settings_trailer_source_youtube_only", fallback: "YouTube / TMDB")
+        }
+    }
+}
+
+enum TrailerLanguagePreference {
+    static let autoValue = "auto"
+    static let followAppValue = "app"
+
+    enum Mode: Equatable, Sendable {
+        case auto
+        case followApp
+        case explicit(String)
+    }
+
+    static func mode(in store: UserDefaults) -> Mode {
+        let raw = store.string(forKey: SettingsKey.trailerLanguage)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if raw.isEmpty || raw.caseInsensitiveCompare(autoValue) == .orderedSame {
+            return .auto
+        }
+        if raw.caseInsensitiveCompare(followAppValue) == .orderedSame {
+            return .followApp
+        }
+        return .explicit(TmdbMetadataLanguage.normalized(raw))
+    }
+
+    static func resolvedAppLanguage(
+        in store: UserDefaults,
+        systemLanguage: String = Locale.preferredLanguages.first ?? "en"
+    ) -> String {
+        let raw = store.string(forKey: SettingsKey.language)
+            ?? UserDefaults.standard.string(forKey: SettingsKey.language)
+        let appLanguage = AppLanguage.fromStored(raw)
+        guard appLanguage == .system else {
+            return TmdbMetadataLanguage.normalized(appLanguage.tag)
+        }
+        let exact = AppLanguage.fromStored(systemLanguage)
+        if exact != .system {
+            return TmdbMetadataLanguage.normalized(exact.tag)
+        }
+        let base = systemLanguage.replacingOccurrences(of: "_", with: "-")
+            .split(separator: "-").first.map(String.init) ?? "en"
+        let supported = AppLanguage.fromStored(base)
+        return TmdbMetadataLanguage.normalized(supported == .system ? "en" : supported.tag)
+    }
+
+    static func isTmdbTrailerIntegrationActive(in store: UserDefaults) -> Bool {
+        let tmdbEnabled = (store.object(forKey: SettingsKey.tmdbEnabled) as? Bool) ?? false
+        let tmdbUseTrailers = (store.object(forKey: SettingsKey.tmdbUseTrailers) as? Bool) ?? true
+        let apiKey = store.string(forKey: SettingsKey.tmdbApiKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return tmdbEnabled && tmdbUseTrailers && !apiKey.isEmpty
+    }
+
+    /// Resolves the language used for trailer source selection independently of TMDB
+    /// metadata/artwork localization. When set to `auto`, TMDB's language is used only
+    /// while TMDB trailer integration is active; otherwise it defaults to English (`en`)
+    /// so direct HD sources (addon `trailerStreams`, Trailerio, IMDb) are not bypassed
+    /// for untagged or localized YouTube entries.
+    static func resolvedLanguage(
+        in store: UserDefaults,
+        systemLanguage: String = Locale.preferredLanguages.first ?? "en"
+    ) -> String {
+        switch mode(in: store) {
+        case .auto:
+            guard isTmdbTrailerIntegrationActive(in: store) else {
+                return "en"
+            }
+            return TmdbMetadataLanguage.resolvedLanguage(in: store, systemLanguage: systemLanguage)
+        case .followApp:
+            return resolvedAppLanguage(in: store, systemLanguage: systemLanguage)
+        case .explicit(let tag):
+            return tag
+        }
+    }
+}
+
+enum TrailerSettings {
+    static func sourceMode(in store: UserDefaults = ProfileSettings.current) -> TrailerSourceMode {
+        TrailerSourceMode.fromStored(store.string(forKey: SettingsKey.trailerSource))
+    }
+
+    static func resolvedLanguage(
+        in store: UserDefaults = ProfileSettings.current,
+        systemLanguage: String = Locale.preferredLanguages.first ?? "en"
+    ) -> String {
+        TrailerLanguagePreference.resolvedLanguage(in: store, systemLanguage: systemLanguage)
+    }
+
+    static func resolutionIdentity(in store: UserDefaults = ProfileSettings.current) -> String {
+        let mode = sourceMode(in: store).rawValue
+        let lang = resolvedLanguage(in: store)
+        return "\(mode)|\(lang)"
+    }
+}
+
+enum TrailerProviderKind: String, Sendable {
+    case addonTrailerStreams = "Addon trailerStreams"
+    case trailerio = "Trailerio"
+    case imdb = "IMDb"
+    case youtube = "YouTube"
+    case backendProxy = "Trailer Proxy"
+
+    var timelineResolvedEvent: PlaybackDiagnosticTimeline.EventName {
+        switch self {
+        case .addonTrailerStreams: return .trailerResolvedAddonStreams
+        case .trailerio: return .trailerResolvedTrailerio
+        case .imdb: return .trailerResolvedImdb
+        case .youtube: return .trailerResolvedYouTube
+        case .backendProxy: return .trailerResolvedProxy
+        }
+    }
+}
+
 struct TrailerPlaybackSource {
     let videoUrl: String
     let audioUrl: String?
     let requestHeaders: [String: String]
     let qualityLabel: String?
     let diagnostics: String?
+    let providerKind: TrailerProviderKind?
+    let providerName: String?
+    let youtubeVideoId: String?
 
     init(
         videoUrl: String,
         audioUrl: String? = nil,
         requestHeaders: [String: String] = [:],
         qualityLabel: String? = nil,
-        diagnostics: String? = nil
+        diagnostics: String? = nil,
+        providerKind: TrailerProviderKind? = nil,
+        providerName: String? = nil,
+        youtubeVideoId: String? = nil
     ) {
         self.videoUrl = videoUrl
         self.audioUrl = audioUrl
         self.requestHeaders = requestHeaders
         self.qualityLabel = qualityLabel
         self.diagnostics = diagnostics
+        self.providerKind = providerKind
+        self.providerName = providerName
+        self.youtubeVideoId = youtubeVideoId
+    }
+
+    func withYouTubeMetadata(videoId: String) -> TrailerPlaybackSource {
+        TrailerPlaybackSource(
+            videoUrl: videoUrl,
+            audioUrl: audioUrl,
+            requestHeaders: requestHeaders,
+            qualityLabel: qualityLabel,
+            diagnostics: diagnostics,
+            providerKind: providerKind ?? .youtube,
+            providerName: providerName ?? qualityLabel ?? "YouTube",
+            youtubeVideoId: youtubeVideoId ?? videoId
+        )
     }
 
     /// Creates an AVPlayerItem for the trailer stream.
     func makePlayerItem(preferredForwardBufferDuration: TimeInterval? = nil) -> AVPlayerItem? {
         guard let url = URL(string: videoUrl) else { return nil }
-        let videoAsset: AVURLAsset
+        var options: [String: Any] = [:]
         if let userAgent = requestHeaders["User-Agent"], !userAgent.isEmpty {
-            videoAsset = AVURLAsset(url: url, options: [AVURLAssetHTTPUserAgentKey: userAgent])
-        } else {
-            videoAsset = AVURLAsset(url: url)
+            options[AVURLAssetHTTPUserAgentKey] = userAgent
         }
+        let extraHeaders = requestHeaders.filter { key, value in
+            key.caseInsensitiveCompare("User-Agent") != .orderedSame && !value.isEmpty
+        }
+        if !extraHeaders.isEmpty {
+            options["AVURLAssetHTTPHeaderFieldsKey"] = extraHeaders
+        }
+        let videoAsset = options.isEmpty
+            ? AVURLAsset(url: url)
+            : AVURLAsset(url: url, options: options)
 
         let item = AVPlayerItem(asset: videoAsset)
         if let preferredForwardBufferDuration {
@@ -2465,6 +2727,299 @@ struct TrailerPlaybackSource {
         item.preferredPeakBitRate = 0
         item.preferredMaximumResolution = .zero
         return item
+    }
+}
+
+final class TrailerPlaybackDiagnostics: @unchecked Sendable {
+    static let shared = TrailerPlaybackDiagnostics()
+    static let didUpdateNotification = Notification.Name("nuvio.tv.trailer.diagnostics.updated")
+
+    struct Snapshot: Equatable, Sendable {
+        let token: UUID
+        let metaId: String
+        let metaTitle: String
+        let context: String
+        let sourceMode: TrailerSourceMode
+        let resolvedLanguage: String
+        let tmdbEnabled: Bool
+        let providerKind: TrailerProviderKind?
+        let providerDetail: String?
+        let youtubeVideoId: String?
+        var observedResolution: String?
+        var playbackError: String?
+        var updatedAt: Date
+
+        var formattedSummary: String {
+            var parts: [String] = []
+            if let providerKind {
+                parts.append(providerKind.rawValue)
+            } else {
+                parts.append("None")
+            }
+            if let providerDetail, !providerDetail.isEmpty {
+                parts.append(providerDetail)
+            }
+            if let youtubeVideoId, !youtubeVideoId.isEmpty {
+                parts.append("yt:\(youtubeVideoId)")
+            }
+            if let observedResolution, !observedResolution.isEmpty {
+                parts.append(observedResolution)
+            } else if let playbackError, !playbackError.isEmpty {
+                parts.append("Failed: \(playbackError)")
+            }
+            parts.append("\(sourceMode.displayTitle) · \(resolvedLanguage)")
+            if !context.isEmpty {
+                parts.append(context)
+            }
+            return parts.joined(separator: " · ")
+        }
+    }
+
+    private let lock = NSLock()
+    private var latestSnapshot: Snapshot?
+
+    var currentSnapshot: Snapshot? {
+        lock.lock()
+        defer { lock.unlock() }
+        return latestSnapshot
+    }
+
+    var settingsSummary: String {
+        currentSnapshot?.formattedSummary
+            ?? L10n.string("tvos_settings_trailer_diagnostic_none", fallback: "None recorded yet")
+    }
+
+    @discardableResult
+    func recordResolution(
+        meta: NuvioMeta,
+        context: String,
+        source: TrailerPlaybackSource?,
+        store: UserDefaults = ProfileSettings.current
+    ) -> UUID {
+        recordResolution(
+            meta: meta,
+            context: context,
+            sourceMode: TrailerSettings.sourceMode(in: store),
+            resolvedLanguage: TrailerSettings.resolvedLanguage(in: store),
+            tmdbEnabled: TrailerLanguagePreference.isTmdbTrailerIntegrationActive(in: store),
+            source: source
+        )
+    }
+
+    @discardableResult
+    func recordResolution(
+        meta: NuvioMeta,
+        context: String,
+        sourceMode: TrailerSourceMode,
+        resolvedLanguage: String,
+        tmdbEnabled: Bool,
+        source: TrailerPlaybackSource?
+    ) -> UUID {
+        let token = UUID()
+        let detail = source?.providerName ?? source?.qualityLabel
+        let snapshot = Snapshot(
+            token: token,
+            metaId: meta.id,
+            metaTitle: meta.name,
+            context: context,
+            sourceMode: sourceMode,
+            resolvedLanguage: resolvedLanguage,
+            tmdbEnabled: tmdbEnabled,
+            providerKind: source?.providerKind,
+            providerDetail: detail,
+            youtubeVideoId: source?.youtubeVideoId,
+            observedResolution: nil,
+            playbackError: source == nil ? "No trailer source resolved" : nil,
+            updatedAt: Date()
+        )
+        lock.lock()
+        latestSnapshot = snapshot
+        lock.unlock()
+
+        let providerLabel = source?.providerKind?.rawValue ?? "none"
+        let detailLabel = detail ?? "none"
+        let ytLabel = source?.youtubeVideoId ?? "-"
+        PlaybackDiagnosticLogStore.shared.append(
+            source: "Trailer",
+            message: "Resolved [\(context)] id=\(meta.id) mode=\(sourceMode.rawValue) lang=\(resolvedLanguage) tmdb=\(tmdbEnabled) provider=\(providerLabel) detail=\"\(detailLabel)\" ytId=\(ytLabel)",
+            systemLogLevel: source == nil ? .warning : .notice
+        )
+
+        let event: PlaybackDiagnosticTimeline.EventName = source?.providerKind?.timelineResolvedEvent ?? .trailerResolutionFailed
+        postUpdateAndTimeline(event)
+        return token
+    }
+
+    func recordPlaybackReady(token: UUID, resolution: String?) {
+        lock.lock()
+        guard var current = latestSnapshot, current.token == token else {
+            lock.unlock()
+            return
+        }
+        let changed = resolution != nil && current.observedResolution != resolution
+        if let resolution, !resolution.isEmpty {
+            current.observedResolution = resolution
+        }
+        current.playbackError = nil
+        current.updatedAt = Date()
+        latestSnapshot = current
+        lock.unlock()
+
+        if changed {
+            let providerLabel = current.providerKind?.rawValue ?? "unknown"
+            let ytLabel = current.youtubeVideoId ?? "-"
+            PlaybackDiagnosticLogStore.shared.append(
+                source: "Trailer",
+                message: "Playback ready [\(current.context)] id=\(current.metaId) provider=\(providerLabel) ytId=\(ytLabel) resolution=\(resolution ?? "unknown")",
+                systemLogLevel: .notice
+            )
+            postUpdateAndTimeline(.trailerPlaybackStarted)
+        } else {
+            postUpdateOnly()
+        }
+    }
+
+    func recordPlaybackFailed(token: UUID, errorDescription: String) {
+        lock.lock()
+        guard var current = latestSnapshot, current.token == token else {
+            lock.unlock()
+            return
+        }
+        current.playbackError = errorDescription
+        current.updatedAt = Date()
+        latestSnapshot = current
+        lock.unlock()
+
+        let providerLabel = current.providerKind?.rawValue ?? "unknown"
+        let ytLabel = current.youtubeVideoId ?? "-"
+        PlaybackDiagnosticLogStore.shared.append(
+            source: "Trailer",
+            message: "Playback failed [\(current.context)] id=\(current.metaId) provider=\(providerLabel) ytId=\(ytLabel) error=\"\(errorDescription)\"",
+            systemLogLevel: .warning
+        )
+        postUpdateAndTimeline(.trailerPlaybackFailed)
+    }
+
+    private func postUpdateOnly() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.didUpdateNotification, object: nil)
+        }
+    }
+
+    private func postUpdateAndTimeline(_ event: PlaybackDiagnosticTimeline.EventName) {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: Self.didUpdateNotification, object: nil)
+            PlaybackTimelineRecorder.record(event)
+        }
+    }
+}
+
+/// Observes an `AVPlayerItem`'s actual decoded video dimensions and failure state
+/// for trailer diagnostics without retaining the item strongly.
+final class TrailerAVPlayerDiagnosticObserver {
+    private let token: UUID
+    private var statusObserver: NSKeyValueObservation?
+    private var sizeObserver: NSKeyValueObservation?
+    private var failedObserver: NSObjectProtocol?
+    private var lock = os_unfair_lock_s()
+    private var didReportStarted = false
+    private var lastReportedResolution: String?
+
+    init(item: AVPlayerItem, token: UUID) {
+        self.token = token
+        statusObserver = item.observe(\.status, options: [.initial, .new]) { [weak self] observedItem, _ in
+            self?.handleUpdate(for: observedItem)
+        }
+        sizeObserver = item.observe(\.presentationSize, options: [.initial, .new]) { [weak self] observedItem, _ in
+            self?.handleUpdate(for: observedItem)
+        }
+        failedObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemFailedToPlayToEndTime,
+            object: item,
+            queue: .main
+        ) { [weak self] notification in
+            guard let self else { return }
+            let error = (notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError)?.localizedDescription
+                ?? "Failed to play to end"
+            TrailerPlaybackDiagnostics.shared.recordPlaybackFailed(token: self.token, errorDescription: error)
+        }
+    }
+
+    private func handleUpdate(for item: AVPlayerItem) {
+        if item.status == .failed {
+            let description = item.error?.localizedDescription ?? "AVPlayerItem failed"
+            TrailerPlaybackDiagnostics.shared.recordPlaybackFailed(token: token, errorDescription: description)
+            return
+        }
+        if let resolution = Self.formattedResolution(for: item) {
+            reportResolutionIfChanged(resolution)
+            return
+        }
+        if item.status == .readyToPlay {
+            var shouldReport = false
+            os_unfair_lock_lock(&lock)
+            if !didReportStarted {
+                didReportStarted = true
+                shouldReport = true
+            }
+            os_unfair_lock_unlock(&lock)
+            if shouldReport {
+                TrailerPlaybackDiagnostics.shared.recordPlaybackReady(token: token, resolution: nil)
+            }
+            let tracks = item.tracks.compactMap(\.assetTrack).filter { $0.mediaType == .video }
+            guard !tracks.isEmpty else { return }
+            Task { [weak self] in
+                guard let self else { return }
+                for track in tracks {
+                    if let (natural, transform) = try? await track.load(.naturalSize, .preferredTransform) {
+                        let transformed = natural.applying(transform)
+                        let w = Int(abs(transformed.width).rounded())
+                        let h = Int(abs(transformed.height).rounded())
+                        if w > 0, h > 0 {
+                            self.reportResolutionIfChanged("\(w)×\(h)")
+                            return
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func reportResolutionIfChanged(_ resolution: String) {
+        var shouldReport = false
+        os_unfair_lock_lock(&lock)
+        if resolution != lastReportedResolution {
+            lastReportedResolution = resolution
+            didReportStarted = true
+            shouldReport = true
+        }
+        os_unfair_lock_unlock(&lock)
+        if shouldReport {
+            TrailerPlaybackDiagnostics.shared.recordPlaybackReady(token: token, resolution: resolution)
+        }
+    }
+
+    static func formattedResolution(for item: AVPlayerItem) -> String? {
+        let presentation = item.presentationSize
+        if presentation.width > 0, presentation.height > 0 {
+            return "\(Int(presentation.width.rounded()))×\(Int(presentation.height.rounded()))"
+        }
+        return nil
+    }
+
+    func invalidate() {
+        statusObserver?.invalidate()
+        statusObserver = nil
+        sizeObserver?.invalidate()
+        sizeObserver = nil
+        if let failedObserver {
+            NotificationCenter.default.removeObserver(failedObserver)
+            self.failedObserver = nil
+        }
+    }
+
+    deinit {
+        invalidate()
     }
 }
 
@@ -3238,12 +3793,16 @@ enum ContinueWatchingStore {
     /// Point the store at a profile. Call on launch and on every profile switch
     /// so reads/writes land in that profile's bucket.
     static func setActiveProfile(_ profileId: String?) {
-        guard activeProfileId != profileId else { return }
-        activeProfileId = profileId
-        // The key check in `items()` already separates profiles; this also covers
-        // re-selecting the same profile after the file changed underneath us (a
-        // sync pull, or the legacy migration below).
-        invalidateCache()
+        let changed = cacheLock.withLock { () -> Bool in
+            guard activeProfileId != profileId else { return false }
+            activeProfileId = profileId
+            cachedItems = nil
+            cachedKey = nil
+            cachedData = nil
+            writeGeneration &+= 1
+            return true
+        }
+        guard changed else { return }
         // The raw ledger is profile-scoped too; it must move first so anything
         // reading progress during this switch sees the new profile's rows.
         WatchProgressLedger.setActiveProfile(profileId)
@@ -3279,13 +3838,18 @@ enum ContinueWatchingStore {
     }
 
     static func items() -> [ContinueWatchingItem] {
-        let key = storageKey
-        if let items = cacheLock.withLock({ cachedKey == key ? cachedItems : nil }) {
-            return items
+        let (key, profileId, generation, cached) = cacheLock.withLock { () -> (String, String?, UInt64, [ContinueWatchingItem]?) in
+            let key = storageKey
+            let items = cachedKey == key ? cachedItems : nil
+            return (key, activeProfileId, writeGeneration, items)
+        }
+        if let cached {
+            return cached
         }
 
         guard let data = data(for: key) else {
             cacheLock.withLock {
+                guard activeProfileId == profileId, writeGeneration == generation else { return }
                 cachedItems = []
                 cachedKey = key
                 cachedData = nil
@@ -3300,7 +3864,9 @@ enum ContinueWatchingStore {
             // corruption instead of turning it into an unexplained missing file.
             // Deliberately uncached: a sync pull may rewrite this file moments
             // later, and caching the empty result would hide the recovery.
-            persistenceDiagnostic = "decode failed: \(diagnosticText(for: error))"
+            cacheLock.withLock {
+                persistenceDiagnostic = "decode failed: \(diagnosticText(for: error))"
+            }
             return []
         }
 
@@ -3311,6 +3877,7 @@ enum ContinueWatchingStore {
                 return $0.recencySortDate > $1.recencySortDate
             }
         cacheLock.withLock {
+            guard activeProfileId == profileId, writeGeneration == generation else { return }
             cachedItems = kept
             cachedKey = key
             cachedData = data
@@ -3891,6 +4458,7 @@ enum ContinueWatchingStore {
             if $0.recencySortDate == $1.recencySortDate { return $0.meta.id < $1.meta.id }
             return $0.recencySortDate > $1.recencySortDate
         }.prefix(maxItems))
+        guard ordered != current else { return }
         let newIds = Set(ordered.map(\.meta.id))
         let dropped = current.filter { !newIds.contains($0.meta.id) }
         if !dropped.isEmpty {
@@ -4733,7 +5301,8 @@ enum ContinueWatchingDismissStore {
             setResumedContentIDsLocked(resumedIDs, for: markerKey)
         }
         cacheLock.unlock()
-        guard remaining != current || remainingPending != currentPending || markerInserted else { return }
+        let dismissalsChanged = remaining != current || remainingPending != currentPending
+        guard dismissalsChanged else { return }
         print("[ContinueWatchingDismissStore] clear: cleared dismissals for \(contentId) (from \(current.count) -> \(remaining.count) keys)")
         postChangedNotification()
     }

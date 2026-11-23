@@ -135,7 +135,7 @@ struct IPTVLiveView: View {
     }()
 
     // Channel Selection & Favorites
-    @State private var selectedChannelID: String = "sample-nrk1"
+    @State private var selectedChannelID: String?
     @State private var favorites: Set<String> = []
     @State private var favoriteOrder: [String] = []
     @State private var favoriteKeys: [String: String] = [:]
@@ -343,12 +343,9 @@ struct IPTVLiveView: View {
         var id: Date { programme.start }
     }
 
-    // Standard category tabs
-    private let defaultCategories = ["Alle", "Norge", "Sport", "Film", "Serier", "Barn", "Nyheter"]
-
     var body: some View {
         let visibleChannels = filteredDisplayChannels
-        let previewURL = eligibleInlinePreviewURL(for: activeSelectedChannel)
+        let previewURL = activeSelectedChannel.flatMap { eligibleInlinePreviewURL(for: $0) }
 
         return ZStack {
             // Background
@@ -621,10 +618,7 @@ struct IPTVLiveView: View {
     }
 
     private var allCategories: [String] {
-        if channels.isEmpty {
-            return defaultCategories
-        }
-        return ["Alle"] + orderedCategoryGroups
+        ["Alle"] + orderedCategoryGroups
     }
 
     private var orderedCategoryGroups: [String] {
@@ -635,12 +629,7 @@ struct IPTVLiveView: View {
     }
 
     private var baseCategoryGroups: [String] {
-        if !channels.isEmpty || !stalkerChannels.isEmpty {
-            return availableGroups.filter { $0 != "Alle" }
-        }
-        return Array(Set(sampleChannels.map(\.group)))
-            .filter { $0 != "Alle" }
-            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        availableGroups.filter { $0 != "Alle" }
     }
 
     private func categoryDisplayName(_ groupID: String) -> String {
@@ -1368,7 +1357,7 @@ struct IPTVLiveView: View {
                         .foregroundColor(.white)
                         .lineLimit(1)
 
-                    if !channels.isEmpty && channel.programTitle.localizedCaseInsensitiveCompare(channel.name) != .orderedSame {
+                    if channel.programTitle.localizedCaseInsensitiveCompare(channel.name) != .orderedSame {
                         Text(channel.programTitle)
                             .font(.system(size: 17))
                             .foregroundColor(Color.white.opacity(0.6))
@@ -1441,33 +1430,31 @@ struct IPTVLiveView: View {
     }
 
     // MARK: - Right Column: Card 1 - Live Player Preview Card
+    @ViewBuilder
     private var livePlayerPreviewCard: some View {
-        let active = activeSelectedChannel
-        let hasCurrentProgramme = !channels.isEmpty && active.programProgress != nil
+        if let active = activeSelectedChannel {
+            activeLivePlayerPreviewCard(for: active)
+        } else {
+            emptyLivePlayerPreviewCard
+        }
+    }
+
+    private func activeLivePlayerPreviewCard(for active: IPTVDisplayChannel) -> some View {
+        let hasCurrentProgramme = active.programProgress != nil
         return Button {
             playChannel(active)
         } label: {
             ZStack(alignment: .bottomLeading) {
-                // Background image / preview
+                // Background / preview
                 GeometryReader { geo in
                     ZStack {
-                        if active.id.contains("nrk1") || active.id == "sample-nrk1" {
-                            Image("iptv_preview_nrk1_full")
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: geo.size.width, height: geo.size.height)
-                                .clipped()
-                        } else {
-                            ZStack {
-                                Color(red: 0.12, green: 0.12, blue: 0.16)
-                                active.brandColor.opacity(0.25)
-                                VStack {
-                                    channelBadgeView(channel: active, size: CGSize(width: 80, height: 60))
-                                    Text(active.name)
-                                        .font(.title2.bold())
-                                        .foregroundColor(.white)
-                                }
-                            }
+                        Color(red: 0.12, green: 0.12, blue: 0.16)
+                        active.brandColor.opacity(0.25)
+                        VStack {
+                            channelBadgeView(channel: active, size: CGSize(width: 80, height: 60))
+                            Text(active.name)
+                                .font(.title2.bold())
+                                .foregroundColor(.white)
                         }
 
                         if !isFullscreenPreviewTransitionActive, let player = inlinePreviewPlayer {
@@ -1558,21 +1545,75 @@ struct IPTVLiveView: View {
         .disabled(active.streamURL == nil)
     }
 
+    private var emptyLivePlayerPreviewCard: some View {
+        ZStack {
+            Color(red: 0.10, green: 0.10, blue: 0.14)
+            VStack(spacing: 16) {
+                if loading {
+                    ProgressView()
+                    Text("Laster kanaler...")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.72))
+                } else {
+                    Image(systemName: "tv")
+                        .font(.system(size: 44, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.55))
+
+                    Text(sources.isEmpty ? "Ingen IPTV-kilde konfigurert" : "Ingen kanaler tilgjengelig")
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text(errorMessage ?? (sources.isEmpty
+                        ? "Legg til en M3U-spilleliste, Xtream Codes eller Stalker-portal for å se direkte-TV."
+                        : "Kontroller eller endre IPTV-kilden i innstillingene."))
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.68))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 540)
+
+                    Button {
+                        if sources.isEmpty { editingID = nil }
+                        showingCredentialsModal = true
+                    } label: {
+                        Text(sources.isEmpty ? "Legg til IPTV-kilde" : "Administrer kilder")
+                            .font(.system(size: 19, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 24)
+                            .frame(height: 54)
+                            .background(Capsule().fill(Color.white.opacity(0.16)))
+                            .overlay(IPTVFocusOutline(shape: Capsule()))
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($isPreviewButtonFocused)
+                }
+            }
+            .padding(32)
+        }
+        .frame(maxWidth: .infinity, minHeight: 310, maxHeight: .infinity)
+        .clipShape(RoundedRectangle(cornerRadius: 20))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+    }
+
     // MARK: - Right Column: Card 2 - EPG / Program Schedule ("Nå og neste")
     private var scheduleEPGCard: some View {
         let active = activeSelectedChannel
-        let hasCurrentProgramme = !channels.isEmpty && active.programProgress != nil
-        let upcomingPrograms: [(title: String, time: String)] = channels.isEmpty ? [] : [
-            (title: active.nextShow1Title, time: active.nextShow1Time),
-            (title: active.nextShow2Title, time: active.nextShow2Time)
-        ].filter { $0.time != "--:--" && !$0.title.isEmpty }
+        let hasCurrentProgramme = active?.programProgress != nil
+        let upcomingPrograms: [(title: String, time: String)] = active.map { active in
+            [
+                (title: active.nextShow1Title, time: active.nextShow1Time),
+                (title: active.nextShow2Title, time: active.nextShow2Time)
+            ].filter { $0.time != "--:--" && !$0.title.isEmpty }
+        } ?? []
 
         return VStack(alignment: .leading, spacing: 10) {
-            Text("\(active.name) – Nå og neste")
+            Text(active.map { "\($0.name) – Nå og neste" } ?? "Nå og neste")
                 .font(.system(size: 23, weight: .bold))
                 .foregroundColor(.white)
 
-            if hasCurrentProgramme {
+            if let active, hasCurrentProgramme {
                 guideProgramRow(
                     title: active.programTitle,
                     time: active.programTime,
@@ -1670,23 +1711,7 @@ struct IPTVLiveView: View {
     @ViewBuilder
     private func channelBadgeView(channel: IPTVDisplayChannel, size: CGSize) -> some View {
         ZStack {
-            if channel.id == "sample-tv2nyhet" {
-                ZStack {
-                    Color(red: 0.84, green: 0.16, blue: 0.16)
-                    Image("iptv_logo_tv2")
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .padding(5)
-                }
-                .frame(width: size.width, height: size.height)
-                .clipShape(RoundedRectangle(cornerRadius: 10))
-            } else if let asset = channel.logoAsset {
-                Image(asset)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: size.width, height: size.height)
-                    .clipShape(RoundedRectangle(cornerRadius: 10))
-            } else if let url = channel.logoURL {
+            if let url = channel.logoURL {
                 AsyncImage(url: url) { phase in
                     switch phase {
                     case .success(let image):
@@ -1761,11 +1786,6 @@ struct IPTVLiveView: View {
                     }
                     .disabled(sourceName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || sourceURL.isEmpty)
 
-                    Button("Last inn demokanaler (Norge)") {
-                        loadSampleNorwegianLineup()
-                        showingCredentialsModal = false
-                    }
-
                     Button("Lukk") {
                         showingCredentialsModal = false
                     }
@@ -1792,7 +1812,6 @@ struct IPTVLiveView: View {
     struct IPTVDisplayChannel: Identifiable {
         let id: String
         let name: String
-        let logoAsset: String?
         let logoURL: URL?
         let group: String
         let category: String
@@ -1814,11 +1833,9 @@ struct IPTVLiveView: View {
         var id: String { channel.id }
     }
 
-    private var activeSelectedChannel: IPTVDisplayChannel {
+    private var activeSelectedChannel: IPTVDisplayChannel? {
         let channels = displayChannels
-        return channels.first(where: { $0.id == selectedChannelID }) ??
-        channels.first ??
-        sampleChannels[0]
+        return channels.first(where: { $0.id == selectedChannelID }) ?? channels.first
     }
 
     private var sectionTitle: String {
@@ -1916,7 +1933,7 @@ struct IPTVLiveView: View {
         case .favorites: return "Ingen favorittkanaler"
         case .recent: return "Ingen nylig sette kanaler"
         case .categories where selectedCategory == "Alle": return "Velg en kategori"
-        default: return "Ingen kanaler i denne kategorien"
+        default: return sources.isEmpty ? "Ingen IPTV-kilder lagt til" : "Ingen kanaler i denne kategorien"
         }
     }
 
@@ -1989,228 +2006,52 @@ struct IPTVLiveView: View {
     }
 
     private var displayChannels: [IPTVDisplayChannel] {
-        if !channels.isEmpty {
-            // Map real channels to display channels
-            return channels.enumerated().map { index, ch in
-                let prog = currentProgramme(for: ch)
-                let upcoming = upcomingProgrammes(for: ch)
-                let next1 = upcoming.first
-                let next2 = upcoming.count > 1 ? upcoming[1] : nil
+        let regular: [IPTVDisplayChannel] = channels.map { ch in
+            let prog = currentProgramme(for: ch)
+            let upcoming = upcomingProgrammes(for: ch)
+            let next1 = upcoming.first
+            let next2 = upcoming.count > 1 ? upcoming[1] : nil
 
-                return IPTVDisplayChannel(
-                    id: ch.id,
-                    name: ch.name,
-                    logoAsset: nil,
-                    logoURL: ch.logoURL,
-                    group: ch.group ?? "Diverse",
-                    category: ch.group ?? "Direkte",
-                    programTitle: prog?.title ?? ch.name,
-                    programTime: prog != nil ? formatTimeRange(start: prog!.start, end: prog!.end) : "Direkte",
-                    programProgress: prog.map { calculateProgress(start: $0.start, end: $0.end) },
-                    nextShow1Title: next1?.title ?? "Neste program",
-                    nextShow1Time: next1 != nil ? formatTimeRange(start: next1!.start, end: next1!.end) : "--:--",
-                    nextShow2Title: next2?.title ?? "Følgende program",
-                    nextShow2Time: next2 != nil ? formatTimeRange(start: next2!.start, end: next2!.end) : "--:--",
-                    brandColor: colorForName(ch.name),
-                    logoText: String(ch.name.prefix(3)).uppercased(),
-                    streamURL: ch.streamURL
-                )
-            }
-        }
-        // Fallback to sample Norwegian lineup matching user mockup
-        return sampleChannels
-    }
-
-    // MARK: - Sample Norwegian Channels (Matches user mockup)
-    private var sampleChannels: [IPTVDisplayChannel] {
-        [
-            IPTVDisplayChannel(
-                id: "sample-nrk1",
-                name: "NRK1",
-                logoAsset: "iptv_logo_nrk1",
-                logoURL: nil,
-                group: "Norge",
-                category: "Nyheter",
-                programTitle: "Dagsrevyen",
-                programTime: "17:00 – 17:30",
-                programProgress: nil,
-                nextShow1Title: "Været",
-                nextShow1Time: "17:30 – 17:40",
-                nextShow2Title: "Norge i dag",
-                nextShow2Time: "17:40 – 18:30",
-                brandColor: Color(red: 0.10, green: 0.35, blue: 0.75),
-                logoText: "NRK 1",
-                streamURL: nil
-            ),
-            IPTVDisplayChannel(
-                id: "sample-nrk2",
-                name: "NRK2",
-                logoAsset: "iptv_logo_nrk2",
-                logoURL: nil,
-                group: "Norge",
-                category: "Serier",
-                programTitle: "Der Ingen Skulle Tru",
-                programTime: "17:00 – 17:50",
-                programProgress: nil,
-                nextShow1Title: "Folk: Min historie",
-                nextShow1Time: "17:50 – 18:20",
-                nextShow2Title: "Dagsnytt 18",
-                nextShow2Time: "18:20 – 19:00",
-                brandColor: Color(red: 0.85, green: 0.12, blue: 0.36),
-                logoText: "NRK 2",
-                streamURL: nil
-            ),
-            IPTVDisplayChannel(
-                id: "sample-tv2",
-                name: "TV 2 Direkte",
-                logoAsset: "iptv_logo_tv2",
-                logoURL: nil,
-                group: "Norge",
-                category: "Underholdning",
-                programTitle: "God Morgen Norge",
-                programTime: "16:45 – 17:35",
-                programProgress: nil,
-                nextShow1Title: "Nyhetene",
-                nextShow1Time: "17:35 – 18:00",
-                nextShow2Title: "Farmen",
-                nextShow2Time: "18:00 – 19:00",
-                brandColor: Color(red: 0.12, green: 0.12, blue: 0.15),
-                logoText: "2",
-                streamURL: nil
-            ),
-            IPTVDisplayChannel(
-                id: "sample-tv2nyhet",
-                name: "TV 2 Nyhetskanalen",
-                logoAsset: "iptv_logo_tv2",
-                logoURL: nil,
-                group: "Norge",
-                category: "Nyheter",
-                programTitle: "Nyhetene",
-                programTime: "17:00 – 17:30",
-                programProgress: nil,
-                nextShow1Title: "Økonominyhetene",
-                nextShow1Time: "17:30 – 17:45",
-                nextShow2Title: "18-Nyhetene",
-                nextShow2Time: "17:45 – 18:30",
-                brandColor: Color(red: 0.84, green: 0.16, blue: 0.16),
-                logoText: "2",
-                streamURL: URL(string: "https://example.com/tv2nyheter.m3u8")
-            ),
-            IPTVDisplayChannel(
-                id: "sample-tvnorge",
-                name: "TV Norge",
-                logoAsset: "iptv_logo_tvnorge",
-                logoURL: nil,
-                group: "Norge",
-                category: "Underholdning",
-                programTitle: "Sofa",
-                programTime: "17:15 – 18:00",
-                programProgress: nil,
-                nextShow1Title: "71 grader nord",
-                nextShow1Time: "18:00 – 19:30",
-                nextShow2Title: "Neste sommer",
-                nextShow2Time: "19:30 – 20:00",
-                brandColor: Color(red: 0.78, green: 0.11, blue: 0.15),
-                logoText: "N",
-                streamURL: URL(string: "https://example.com/tvnorge.m3u8")
-            ),
-            IPTVDisplayChannel(
-                id: "sample-max",
-                name: "MAX",
-                logoAsset: "iptv_logo_max",
-                logoURL: nil,
-                group: "Film",
-                category: "Film",
-                programTitle: "MythBusters",
-                programTime: "16:30 – 17:30",
-                programProgress: nil,
-                nextShow1Title: "Top Gear",
-                nextShow1Time: "17:30 – 18:30",
-                nextShow2Title: "Storage Hunters",
-                nextShow2Time: "18:30 – 19:00",
-                brandColor: Color(red: 0.0, green: 0.62, blue: 0.29),
-                logoText: "MAX",
-                streamURL: URL(string: "https://example.com/max.m3u8")
-            ),
-            IPTVDisplayChannel(
-                id: "sample-discovery",
-                name: "Discovery",
-                logoAsset: "iptv_logo_discovery",
-                logoURL: nil,
-                group: "Film",
-                category: "Serier",
-                programTitle: "Gold Rush",
-                programTime: "17:00 – 18:00",
-                programProgress: nil,
-                nextShow1Title: "Deadliest Catch",
-                nextShow1Time: "18:00 – 19:00",
-                nextShow2Title: "Wheeler Dealers",
-                nextShow2Time: "19:00 – 20:00",
-                brandColor: Color(red: 0.11, green: 0.11, blue: 0.12),
-                logoText: "D",
-                streamURL: URL(string: "https://example.com/discovery.m3u8")
-            ),
-            IPTVDisplayChannel(
-                id: "sample-viasat",
-                name: "Viasat Sport 1",
-                logoAsset: "iptv_logo_viasat",
-                logoURL: nil,
-                group: "Sport",
-                category: "Sport",
-                programTitle: "Premier League",
-                programTime: "16:00 – 18:00",
-                programProgress: nil,
-                nextShow1Title: "Fotball Xtra",
-                nextShow1Time: "18:00 – 19:00",
-                nextShow2Title: "Match of the Day",
-                nextShow2Time: "19:00 – 20:30",
-                brandColor: Color(red: 0.10, green: 0.35, blue: 0.65),
-                logoText: "V",
-                streamURL: URL(string: "https://example.com/viasat.m3u8")
-            ),
-            IPTVDisplayChannel(
-                id: "sample-skysport",
-                name: "Sky Sport",
-                logoAsset: "iptv_logo_skysport",
-                logoURL: nil,
-                group: "Sport",
-                category: "Sport",
-                programTitle: "Live Football",
-                programTime: "17:00 – 19:00",
-                programProgress: nil,
-                nextShow1Title: "Super Sunday Preview",
-                nextShow1Time: "19:00 – 19:30",
-                nextShow2Title: "Premier League Highlights",
-                nextShow2Time: "19:30 – 20:30",
-                brandColor: Color(red: 0.72, green: 0.0, blue: 0.0),
-                logoText: "sky",
-                streamURL: nil
+            return IPTVDisplayChannel(
+                id: ch.id,
+                name: ch.name,
+                logoURL: ch.logoURL,
+                group: ch.group ?? "Diverse",
+                category: ch.group ?? "Direkte",
+                programTitle: prog?.title ?? ch.name,
+                programTime: prog != nil ? formatTimeRange(start: prog!.start, end: prog!.end) : "Direkte",
+                programProgress: prog.map { calculateProgress(start: $0.start, end: $0.end) },
+                nextShow1Title: next1?.title ?? "Neste program",
+                nextShow1Time: next1 != nil ? formatTimeRange(start: next1!.start, end: next1!.end) : "--:--",
+                nextShow2Title: next2?.title ?? "Følgende program",
+                nextShow2Time: next2 != nil ? formatTimeRange(start: next2!.start, end: next2!.end) : "--:--",
+                brandColor: colorForName(ch.name),
+                logoText: String(ch.name.prefix(3)).uppercased(),
+                streamURL: ch.streamURL
             )
-        ]
-    }
-
-    private func loadSampleNorwegianLineup() {
-        cancelSourceAndGuideWork()
-        loadedCache.clear()
-        clearLoadedContent()
-        selectedGuideProgramme = nil
-        selectedGuideChannelID = nil
-        inlinePreviewChannelID = nil
-        stopInlinePreview()
-        // Pre-populates the demo source
-        let demoSource = IPTVSource(
-            id: UUID(),
-            name: "Norge Premium TV",
-            playlistURL: "https://demo.nuvio.tv/norway.m3u",
-            kind: .xtream,
-            username: "demo_user",
-            password: "••••••••",
-            mac: nil,
-            xtreamOutput: .mpegTS
-        )
-        sources = [demoSource]
-        selectedID = demoSource.id
-        selectedChannelID = "sample-nrk1"
+        }
+        guard !stalkerChannels.isEmpty else { return regular }
+        let stalker: [IPTVDisplayChannel] = stalkerChannels.map { stk in
+            let group = stk.categoryName ?? "Diverse"
+            return IPTVDisplayChannel(
+                id: stk.id,
+                name: stk.name,
+                logoURL: stk.logo.flatMap(URL.init(string:)),
+                group: group,
+                category: group,
+                programTitle: stk.name,
+                programTime: "Direkte",
+                programProgress: nil,
+                nextShow1Title: "Neste program",
+                nextShow1Time: "--:--",
+                nextShow2Title: "Følgende program",
+                nextShow2Time: "--:--",
+                brandColor: colorForName(stk.name),
+                logoText: String(stk.name.prefix(3)).uppercased(),
+                streamURL: URL(string: "stalker://channel/\(stk.id)")
+            )
+        }
+        return regular + stalker
     }
 
     // MARK: - Playback Execution
@@ -2229,10 +2070,20 @@ struct IPTVLiveView: View {
         if presentInlinePreviewFullscreen(for: channel) { return }
         inlinePreviewChannelID = nil
         stopInlinePreview()
-        guard let streamURL = channel.streamURL else { return }
+        if let streamURL = channel.streamURL, streamURL.scheme != "stalker" {
+            selectedChannelID = channel.id
+            recordRecent(channelID: channel.id)
+            play(url: streamURL, id: channel.id, name: channel.name, logo: nil)
+            return
+        }
+        guard let stalker = stalkerChannels.first(where: { $0.id == channel.id }),
+              let client = stalkerClient else { return }
         selectedChannelID = channel.id
         recordRecent(channelID: channel.id)
-        play(url: streamURL, id: channel.id, name: channel.name, logo: nil)
+        Task { @MainActor in
+            guard let playback = try? await client.resolve(stalker) else { return }
+            play(url: playback.url, id: channel.id, name: channel.name, logo: stalker.logo, headers: playback.headers)
+        }
     }
 
     private func eligibleInlinePreviewURL(for channel: IPTVDisplayChannel) -> URL? {
@@ -2454,8 +2305,9 @@ struct IPTVLiveView: View {
                     guideUnavailable = cached.guideUnavailable
                     successfullyLoadedSource = source
                     successfullyLoadedAt = cached.loadedAt
-                    if !channels.contains(where: { $0.id == selectedChannelID }) {
-                        selectedChannelID = channels.first?.id ?? stalkerChannels.first?.id ?? selectedChannelID
+                    if !channels.contains(where: { $0.id == selectedChannelID })
+                        && !stalkerChannels.contains(where: { $0.id == selectedChannelID }) {
+                        selectedChannelID = channels.first?.id ?? stalkerChannels.first?.id
                     }
                     guideNow = now
 #if NUVIO_SIDEBAR_WATCHDOG
@@ -2468,13 +2320,23 @@ struct IPTVLiveView: View {
                     load(source)
                 }
             } else {
-                // If no sources exist yet, load the mockup lineup by default so the user immediately sees the gorgeous UI!
-                loadSampleNorwegianLineup()
+                resetLoadedStateForEmptySources()
             }
         } catch {
             sourcesLoaded = false
-            loadSampleNorwegianLineup()
+            resetLoadedStateForEmptySources()
         }
+    }
+
+    private func resetLoadedStateForEmptySources() {
+        cancelSourceAndGuideWork()
+        loadedCache.clear()
+        clearLoadedContent()
+        inlinePreviewChannelID = nil
+        stopInlinePreview()
+        selectedID = nil
+        selectedChannelID = nil
+        loadCategoryPreferences(for: nil)
     }
 
     private func clearLoadedContent() {
@@ -2492,6 +2354,7 @@ struct IPTVLiveView: View {
         selectedGuideNeedsSameOrigin = false
         selectedGuideProgramme = nil
         selectedGuideChannelID = nil
+        selectedChannelID = nil
     }
 
     private func storeLoadedCache() {
@@ -2633,9 +2496,7 @@ struct IPTVLiveView: View {
                 successfullyLoadedAt = Date()
                 inlinePreviewChannelID = nil
                 stopInlinePreview()
-                if !loaded.isEmpty {
-                    selectedChannelID = loaded[0].id
-                }
+                selectedChannelID = loaded.first?.id ?? loadedStalkerChannels?.first?.id
                 guideTask?.cancel()
                 guideTask = nil
                 guideRequestID = nil
@@ -2697,7 +2558,12 @@ struct IPTVLiveView: View {
             recent.removeIfOwned(by: source.id)
             recentChannelKeys = recent.loadAll()
             if selectedID == source.id {
-                loadSampleNorwegianLineup()
+                resetLoadedStateForEmptySources()
+                if let nextSource = updated.first {
+                    selectedID = nextSource.id
+                    loadCategoryPreferences(for: nextSource.id)
+                    load(nextSource)
+                }
             }
         } catch {
             errorMessage = "Kunne ikke slette kilden."

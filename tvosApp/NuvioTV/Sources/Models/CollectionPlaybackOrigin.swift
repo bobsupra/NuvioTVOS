@@ -1,12 +1,12 @@
 import Foundation
 
 /// Navigation provenance only; never changes metadata or watch-progress keys.
-struct CollectionOriginReference: Codable, Equatable, Hashable {
+struct CollectionOriginReference: Codable, Equatable, Hashable, Sendable {
     let collectionID: String
     let folderID: String
 }
 
-struct CollectionOriginPresentation: Equatable, Hashable {
+struct CollectionOriginPresentation: Equatable, Hashable, Sendable {
     let reference: CollectionOriginReference
     let title: String
     let imageURLs: [String]

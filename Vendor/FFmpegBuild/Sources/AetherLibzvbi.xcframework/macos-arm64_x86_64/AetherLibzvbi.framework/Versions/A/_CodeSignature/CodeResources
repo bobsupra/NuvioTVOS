@@ -8,6 +8,10 @@
 		<data>
 		LG/OjqXQ6rfAMKttAHeHF2hapWU=
 		</data>
+		<key>Resources/PrivacyInfo.xcprivacy</key>
+		<data>
+		KOw6Qocvj5hCgGtcWRNmQtI9IJs=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -30,6 +34,13 @@
 			<key>hash2</key>
 			<data>
 			2I/d6aibVmX2IvSh9NwPP2oUv0l14mmdHZAoRUOXrw8=
+			</data>
+		</dict>
+		<key>Resources/PrivacyInfo.xcprivacy</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			cz+xMpaK7wBYgn8wle0BN8SqaBC06fmYTR0y1gTKx00=
 			</data>
 		</dict>
 	</dict>

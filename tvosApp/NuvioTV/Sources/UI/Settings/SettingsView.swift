@@ -382,6 +382,8 @@ enum SettingsKey {
     static let trailerPreviewSound = "nuvio.tv.settings.playback.trailerPreviewSound"
     static let trailerSound = "nuvio.tv.settings.playback.trailerSound"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
+    static let trailerSource = "nuvio.tv.settings.playback.trailerSource"
+    static let trailerLanguage = "nuvio.tv.settings.playback.trailerLanguage"
     static let focusedPosterBackdropEnabled = "nuvio.tv.settings.playback.focusedPosterBackdropEnabled"
     static let focusedPosterBackdropDelay = "nuvio.tv.settings.playback.focusedPosterBackdropDelay"
     static let audioLanguage = "nuvio.tv.settings.playback.audioLanguage"
@@ -507,7 +509,7 @@ enum SettingsKey {
         streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
         streamListHideAddonName, streamListHideDescription, streamListSymbolIcons,
         streamListDetailSize, streamListBadgeSize, streamListLogoSize, streamListSpacing, streamListHeight,
-        autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerSound, trailerDelay,
+        autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerSound, trailerDelay, trailerSource, trailerLanguage,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
@@ -5855,6 +5857,10 @@ private struct IntegrationSettingsView: View {
                     accentColor: accentColor
                 )
 
+                if watchProgressSource.usesContinueWatchingWindow {
+                    ContinueWatchingWindowChoiceRow(viewModel: traktViewModel, accentColor: accentColor)
+                }
+
                 if watchProgressSource != .nuvioSync {
                     SettingsToggleRow(
                         title: L10n.string("tvos_settings_nuvio_sync_scrobble", fallback: "Nuvio Sync"),
@@ -10099,8 +10105,6 @@ private struct TraktConnectedSettingsSheet: View {
     @State private var now = Date()
     @State private var showingDisconnectConfirmation = false
 
-    private let continueWatchingOptions = [14, 30, 60, 90, 180, 365, TraktDefaults.continueWatchingDaysCapAll]
-
     var body: some View {
         ZStack {
             Color.nuvioBackground(amoled: amoled, body: bodyColor)
@@ -10204,13 +10208,7 @@ private struct TraktConnectedSettingsSheet: View {
                                 accentColor: accentColor
                             )
 
-                            SettingsChoiceRow(
-                                title: L10n.string("trakt_continue_watching_window", fallback: "Continue Watching Window"),
-                                subtitle: L10n.string("tvos_settings_trakt_continue_watching_window_subtitle", fallback: "Choose how much Trakt activity appears in Continue Watching"),
-                                selection: continueWatchingSelection,
-                                options: continueWatchingOptions.map(continueWatchingLabel),
-                                accentColor: accentColor
-                            )
+                            ContinueWatchingWindowChoiceRow(viewModel: viewModel, accentColor: accentColor)
 
                             SettingsChoiceRow(
                                 title: L10n.string("trakt_comments_dialog_title", fallback: "Comments"),
@@ -10336,16 +10334,6 @@ private struct TraktConnectedSettingsSheet: View {
         )
     }
 
-    private var continueWatchingSelection: Binding<String> {
-        Binding(
-            get: { continueWatchingLabel(viewModel.continueWatchingDaysCap) },
-            set: { label in
-                guard let days = continueWatchingOptions.first(where: { continueWatchingLabel($0) == label }) else { return }
-                viewModel.setContinueWatchingDaysCap(days)
-            }
-        )
-    }
-
     private var commentsSelection: Binding<String> {
         Binding(
             get: { viewModel.showMetaComments ? onLabel : offLabel },
@@ -10367,7 +10355,30 @@ private struct TraktConnectedSettingsSheet: View {
     private var onLabel: String { L10n.string("subtitle_on", fallback: "On") }
     private var offLabel: String { L10n.string("playback_afr_off", fallback: "Off") }
 
-    private func continueWatchingLabel(_ days: Int) -> String {
+}
+
+private struct ContinueWatchingWindowChoiceRow: View {
+    @ObservedObject var viewModel: TraktSettingsViewModel
+    let accentColor: Color
+    private let options = [14, 30, 60, 90, 180, 365, TraktDefaults.continueWatchingDaysCapAll]
+
+    var body: some View {
+        SettingsChoiceRow(
+            title: L10n.string("trakt_continue_watching_window", fallback: "Continue Watching Window"),
+            subtitle: L10n.string("tvos_settings_continue_watching_window_subtitle", fallback: "Choose how much activity appears in Continue Watching"),
+            selection: Binding(
+                get: { label(viewModel.continueWatchingDaysCap) },
+                set: { selected in
+                    guard let days = options.first(where: { label($0) == selected }) else { return }
+                    viewModel.setContinueWatchingDaysCap(days)
+                }
+            ),
+            options: options.map(label),
+            accentColor: accentColor
+        )
+    }
+
+    private func label(_ days: Int) -> String {
         days == TraktDefaults.continueWatchingDaysCapAll ? "All history" : "\(days) days"
     }
 }
@@ -12292,6 +12303,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @AppStorage(SettingsKey.trailerSource) private var trailerSource = TrailerSourceMode.auto.rawValue
+    @AppStorage(SettingsKey.trailerLanguage) private var trailerLanguage = TrailerLanguagePreference.autoValue
     @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
     @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
     @AppStorage(SettingsKey.subtitleLanguage) private var subtitleLanguage = "System"
@@ -12792,6 +12805,32 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
+
+                SettingsChoiceRow(
+                    title: L10n.string("tvos_settings_trailer_source", fallback: "Trailer Source"),
+                    subtitle: L10n.string(
+                        "tvos_settings_trailer_source_subtitle",
+                        fallback: "Auto prefers direct add-on trailerStreams, then Trailerio, IMDb, or YouTube by language. Trailerio Only disables IMDb and YouTube fallback."
+                    ),
+                    selection: $trailerSource,
+                    options: trailerSourceOptions,
+                    optionLabels: trailerSourceLabels,
+                    accentColor: accentColor
+                )
+
+                SettingsChoiceRow(
+                    title: L10n.string("tvos_settings_trailer_language", fallback: "Trailer Language"),
+                    subtitle: L10n.string(
+                        "tvos_settings_trailer_language_subtitle",
+                        fallback: "Independent of TMDB metadata and artwork language. Auto uses English when TMDB trailers are inactive."
+                    ),
+                    selection: trailerLanguageSelection,
+                    options: trailerLanguageOptions,
+                    optionLabels: trailerLanguageLabels,
+                    accentColor: accentColor
+                )
+                .opacity(TrailerSourceMode.fromStored(trailerSource) == .trailerioOnly ? 0.46 : 1)
+                .disabled(TrailerSourceMode.fromStored(trailerSource) == .trailerioOnly)
             }
 
             SettingsGroup(
@@ -13077,6 +13116,58 @@ private struct PlaybackSettingsView: View {
         SubtitleLanguagePreferences.audioSettingsOptions.contains(audioLanguage)
             ? audioLanguage
             : "System"
+    }
+
+    private var trailerSourceOptions: [String] {
+        TrailerSourceMode.allCases.map(\.rawValue)
+    }
+
+    private var trailerSourceLabels: [String: String] {
+        Dictionary(uniqueKeysWithValues: TrailerSourceMode.allCases.map { ($0.rawValue, $0.displayTitle) })
+    }
+
+    private var trailerLanguageOptions: [String] {
+        [TrailerLanguagePreference.autoValue, TrailerLanguagePreference.followAppValue]
+            + AppLanguage.pickerLanguages.filter { $0 != .system }.map(\.tag)
+    }
+
+    private var trailerLanguageLabels: [String: String] {
+        var labels: [String: String] = [
+            TrailerLanguagePreference.autoValue: L10n.string("tvos_settings_option_auto", fallback: "Auto"),
+            TrailerLanguagePreference.followAppValue: L10n.string("appearance_language", fallback: "App Language")
+        ]
+        for language in AppLanguage.pickerLanguages where language != .system {
+            labels[language.tag] = language.nativeDisplayName
+        }
+        return labels
+    }
+
+    private var trailerLanguageSelection: Binding<String> {
+        Binding(
+            get: {
+                let trimmed = trailerLanguage.trimmingCharacters(in: .whitespacesAndNewlines)
+                if trimmed.isEmpty || trimmed.caseInsensitiveCompare(TrailerLanguagePreference.autoValue) == .orderedSame {
+                    return TrailerLanguagePreference.autoValue
+                }
+                if trimmed.caseInsensitiveCompare(TrailerLanguagePreference.followAppValue) == .orderedSame {
+                    return TrailerLanguagePreference.followAppValue
+                }
+                let matched = AppLanguage.fromStored(trimmed)
+                if matched != .system {
+                    return matched.tag
+                }
+                if let base = trimmed.replacingOccurrences(of: "_", with: "-").split(separator: "-").first.map(String.init) {
+                    let baseMatch = AppLanguage.fromStored(base)
+                    if baseMatch != .system {
+                        return baseMatch.tag
+                    }
+                }
+                return TrailerLanguagePreference.autoValue
+            },
+            set: { newValue in
+                trailerLanguage = newValue
+            }
+        )
     }
 
     private var subtitleLanguageSummary: String {
@@ -14709,6 +14800,7 @@ private struct AdvancedSettingsView: View {
     @State private var clearedCacheStatus: String?
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
     @State private var continueWatchingRowDiagnostic: String?
+    @State private var lastTrailerDiagnostic: String = TrailerPlaybackDiagnostics.shared.settingsSummary
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -14821,6 +14913,18 @@ private struct AdvancedSettingsView: View {
                     // Read once as the row appears, away from the main thread: read in the
                     // body, every Continue Watching entry was decoded on each redraw.
                     continueWatchingRowDiagnostic = await ContinueWatchingStore.rowDiagnosticInBackground()
+                }
+
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_last_trailer_diagnostic", fallback: "Last Trailer"),
+                    value: lastTrailerDiagnostic,
+                    isDiagnostic: true
+                )
+                .onAppear {
+                    lastTrailerDiagnostic = TrailerPlaybackDiagnostics.shared.settingsSummary
+                }
+                .onReceive(NotificationCenter.default.publisher(for: TrailerPlaybackDiagnostics.didUpdateNotification).receive(on: RunLoop.main)) { _ in
+                    lastTrailerDiagnostic = TrailerPlaybackDiagnostics.shared.settingsSummary
                 }
             }
 

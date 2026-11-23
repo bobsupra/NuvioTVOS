@@ -2071,8 +2071,11 @@ struct WeTrakrProgressService {
         var plans: [PlaybackPlan] = []
         var seenIdentities = Set<String>()
         var seenTitleKeys = Set<String>()
+        let cutoff = TraktSettingsStore.continueWatchingCutoff(in: store)
 
         for item in rawItems {
+            let lastWatchedAt = item.resolvedLastWatchedAt
+            if let cutoff, lastWatchedAt < cutoff { continue }
             let media = item.resolvedMedia
             guard media.id != nil || media.ids?.hasUsableIdentifier == true else { continue }
             guard let progress = item.resolvedProgressPercent,
@@ -2102,7 +2105,7 @@ struct WeTrakrProgressService {
                     episodeTitle: item.resolvedEpisodeTitle,
                     progressPercent: progress,
                     runtimeSeconds: item.resolvedRuntimeSeconds,
-                    lastWatchedAt: item.resolvedLastWatchedAt,
+                    lastWatchedAt: lastWatchedAt,
                     identity: identity
                 )
             )
@@ -2172,6 +2175,7 @@ struct WeTrakrProgressService {
                                 status: result.status ?? plan.placeholder.status,
                                 videos: result.videos ?? plan.placeholder.videos,
                                 trailerYtIds: result.trailerYtIds ?? plan.placeholder.trailerYtIds,
+                                trailerStreams: result.trailerStreams ?? plan.placeholder.trailerStreams,
                                 externalRatings: result.externalRatings ?? plan.placeholder.externalRatings,
                                 posterShape: result.posterShape ?? plan.placeholder.posterShape
                             )
@@ -2202,6 +2206,7 @@ struct WeTrakrProgressService {
                                 status: result.status,
                                 videos: result.videos,
                                 trailerYtIds: result.trailerYtIds,
+                                trailerStreams: result.trailerStreams,
                                 externalRatings: result.externalRatings,
                                 posterShape: result.posterShape
                             )

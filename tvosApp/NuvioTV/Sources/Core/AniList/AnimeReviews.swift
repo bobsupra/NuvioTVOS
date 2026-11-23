@@ -57,13 +57,17 @@ enum AnimeReviews {
         let wantsMAL = showsMAL
         guard wantsAniList || wantsMAL else { return Found() }
         let aniListID = await aniListEntry(for: meta)
-        var malID: Int?
+        let malID: Int?
         if wantsMAL {
             if let own = AnimeSource.entry(from: meta.id), own.source == .mal {
                 malID = own.id
             } else if let aniListID, let mal = await AniListOfflineMaps.shared.entry(aniListID: aniListID)?.mal, mal > 0 {
                 malID = mal
+            } else {
+                malID = nil
             }
+        } else {
+            malID = nil
         }
         async let fromAniList = aniListReviews(entry: wantsAniList ? aniListID : nil)
         async let fromMAL = malReviews(entry: malID)

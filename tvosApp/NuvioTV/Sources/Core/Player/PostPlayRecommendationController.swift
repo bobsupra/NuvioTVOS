@@ -357,8 +357,14 @@ final class PostPlayRecommendationController: ObservableObject {
         guard trailerResolutionTasks[index] == nil else { return }
         trailerResolutionTasks[index] = Task {
             let meta = recommendation.asMeta
-            if let previewSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta) {
-                guard !Task.isCancelled else { return }
+            let previewSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
+            guard !Task.isCancelled else { return }
+            _ = TrailerPlaybackDiagnostics.shared.recordResolution(
+                meta: meta,
+                context: "Post-Play",
+                source: previewSource
+            )
+            if let previewSource {
                 var updated = recommendation
                 updated.trailerVideoUrl = previewSource.videoUrl
                 updated.trailerAudioUrl = previewSource.audioUrl

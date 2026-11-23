@@ -1910,15 +1910,40 @@ struct DetailsScreen: View {
 
     private func openTrailer(for meta: NuvioMeta, resumeFrom: Double? = nil) {
         Task {
+            let sourceMode = TrailerSettings.sourceMode()
             if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
+                _ = TrailerPlaybackDiagnostics.shared.recordResolution(
+                    meta: meta,
+                    context: "Fullscreen Player",
+                    source: source
+                )
                 await MainActor.run {
                     dispatchPlayback(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom, nil, nil, false)
                 }
-            } else if let ytId = await preferredTrailerYouTubeId(for: meta) {
+            } else if sourceMode.allowsYouTubeFallback,
+                      let ytId = await preferredTrailerYouTubeId(for: meta) {
                 let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
+                let fallbackSource = TrailerPlaybackSource(
+                    videoUrl: youtubeUrl,
+                    qualityLabel: "YouTube",
+                    providerKind: .youtube,
+                    providerName: "YouTube (Watch URL)",
+                    youtubeVideoId: ytId
+                )
+                _ = TrailerPlaybackDiagnostics.shared.recordResolution(
+                    meta: meta,
+                    context: "Fullscreen Player",
+                    source: fallbackSource
+                )
                 await MainActor.run {
                     dispatchPlayback(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom, nil, nil, false)
                 }
+            } else {
+                _ = TrailerPlaybackDiagnostics.shared.recordResolution(
+                    meta: meta,
+                    context: "Fullscreen Player",
+                    source: nil
+                )
             }
         }
     }
@@ -1936,6 +1961,7 @@ actor YouTubeTrailerResolver {
     private var imdbTrailerCache: [String: TrailerPlaybackSource] = [:]
     private var imdbTrailerFailureDates: [String: Date] = [:]
 
+    private let sourceModeProvider: () -> TrailerSourceMode
     private let preferredLanguageProvider: () -> String
     private let configurationIdentityProvider: () -> String
     private let trailerYouTubeIdProvider: ((NuvioMeta) async -> String?)?
@@ -1946,7 +1972,8 @@ actor YouTubeTrailerResolver {
     private let aniListIMDbIDProvider: ((NuvioMeta) async -> String?)?
 
     init(
-        preferredLanguageProvider: @escaping () -> String = { TmdbDetailsService.preferredLanguage },
+        sourceModeProvider: @escaping () -> TrailerSourceMode = { TrailerSettings.sourceMode() },
+        preferredLanguageProvider: @escaping () -> String = { TrailerSettings.resolvedLanguage() },
         configurationIdentityProvider: @escaping () -> String = { TmdbDetailsService.trailerResolutionConfigurationIdentity },
         trailerYouTubeIdProvider: ((NuvioMeta) async -> String?)? = nil,
         refreshedTrailerIdsProvider: ((NuvioMeta) async -> [String]?)? = nil,
@@ -1955,6 +1982,7 @@ actor YouTubeTrailerResolver {
         youtubeSourceProvider: ((String, String?, String?, Bool) async -> TrailerPlaybackSource?)? = nil,
         aniListIMDbIDProvider: ((NuvioMeta) async -> String?)? = nil
     ) {
+        self.sourceModeProvider = sourceModeProvider
         self.preferredLanguageProvider = preferredLanguageProvider
         self.configurationIdentityProvider = configurationIdentityProvider
         self.trailerYouTubeIdProvider = trailerYouTubeIdProvider
@@ -1979,6 +2007,7 @@ actor YouTubeTrailerResolver {
 
     private func scoreTrailerioLink(_ provider: String, url: String) -> Int {
         let p = provider.lowercased()
+        let words = Set(p.split { !$0.isLetter && !$0.isNumber }.map(String.init))
         var score = 0
         if p.contains("rotten tomatoes") || p.contains("fandango") {
             score += 1200
@@ -1992,26 +2021,65 @@ actor YouTubeTrailerResolver {
             score += 500
         }
 
-        if p.contains("4k") || p.contains("2160p") {
-            score += 500
-        } else if p.contains("1080p") {
+        if words.contains("4k") || words.contains("uhd") || p.contains("2160") {
+            score += 800
+        } else if p.contains("1440") || words.contains("2k") {
+            score += 600
+        } else if p.contains("1080") || words.contains("fhd") {
             score += 400
-        } else if p.contains("720p") {
+        } else if p.contains("720") {
             score += 200
         }
 
-        if p.contains("atmos") || p.contains("5.1") {
+        if words.contains("dv") || p.contains("dolby vision") {
+            score += 80
+        } else if words.contains(where: { $0.hasPrefix("hdr") }) {
+            score += 40
+        }
+
+        if words.contains("atmos") || p.contains("5.1") || p.contains("7.1") {
             score += 50
         }
 
-        let u = url.lowercased()
-        if u.contains(".mp4") {
+        let u = (URL(string: url)?.path ?? url).lowercased()
+        if u.contains(".mp4") || u.contains(".m4v") {
             score += 200
         } else if u.contains(".m3u8") {
             score += 100
         }
 
         return score
+    }
+
+    func resolveAddonTrailerStreams(for meta: NuvioMeta) -> TrailerPlaybackSource? {
+        guard let streams = meta.trailerStreams, !streams.isEmpty else { return nil }
+        let valid = streams.enumerated().compactMap { index, stream -> (index: Int, stream: NuvioTrailerStream, score: Int)? in
+            let rawUrl = stream.url.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let parsed = URL(string: rawUrl),
+                  let scheme = parsed.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  !Self.isYouTubePageURL(parsed) else {
+                return nil
+            }
+            return (index: index, stream: stream, score: scoreTrailerioLink(stream.scoreLabel, url: rawUrl))
+        }
+        guard let best = valid.sorted(by: { lhs, rhs in
+            if lhs.score != rhs.score { return lhs.score > rhs.score }
+            return lhs.index < rhs.index
+        }).first else {
+            return nil
+        }
+
+        let label = best.stream.displayLabel
+        return TrailerPlaybackSource(
+            videoUrl: best.stream.url.trimmingCharacters(in: .whitespacesAndNewlines),
+            audioUrl: nil,
+            requestHeaders: best.stream.requestHeaders ?? [:],
+            qualityLabel: label,
+            diagnostics: "TRAILER: \(label) [Addon trailerStreams]",
+            providerKind: .addonTrailerStreams,
+            providerName: label
+        )
     }
 
     func resolveTrailerio(imdbId: String, isSeries: Bool) async -> TrailerPlaybackSource? {
@@ -2038,18 +2106,23 @@ actor YouTubeTrailerResolver {
             return nil
         }
 
-        let validLinks = links.compactMap { link -> (url: String, provider: String)? in
+        let validLinks = links.enumerated().compactMap { index, link -> (index: Int, url: String, provider: String)? in
             guard let rawUrl = link.trailers?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !rawUrl.isEmpty,
                   rawUrl.hasPrefix("http://") || rawUrl.hasPrefix("https://") else {
                 return nil
             }
-            return (url: rawUrl, provider: link.provider ?? "1080p")
+            return (index: index, url: rawUrl, provider: link.provider ?? "1080p")
         }
 
         guard !validLinks.isEmpty else { return nil }
 
-        let sorted = validLinks.sorted { scoreTrailerioLink($0.provider, url: $0.url) > scoreTrailerioLink($1.provider, url: $1.url) }
+        let sorted = validLinks.sorted {
+            let lhsScore = scoreTrailerioLink($0.provider, url: $0.url)
+            let rhsScore = scoreTrailerioLink($1.provider, url: $1.url)
+            if lhsScore != rhsScore { return lhsScore > rhsScore }
+            return $0.index < $1.index
+        }
         guard let best = sorted.first else { return nil }
 
         let source = TrailerPlaybackSource(
@@ -2057,7 +2130,9 @@ actor YouTubeTrailerResolver {
             audioUrl: nil,
             requestHeaders: [:],
             qualityLabel: best.provider,
-            diagnostics: "TRAILER: \(best.provider) [Trailerio 1080p]"
+            diagnostics: "TRAILER: \(best.provider) [Trailerio 1080p]",
+            providerKind: .trailerio,
+            providerName: best.provider
         )
         trailerioCache[cleanImdb] = source
         return source
@@ -2334,7 +2409,9 @@ actor YouTubeTrailerResolver {
             audioUrl: nil,
             requestHeaders: ["User-Agent": Self.defaultUserAgent],
             qualityLabel: label,
-            diagnostics: diag
+            diagnostics: diag,
+            providerKind: .imdb,
+            providerName: "\(label) · \(trailerName)"
         )
 
         imdbTrailerCache[cacheKey] = source
@@ -2375,6 +2452,7 @@ actor YouTubeTrailerResolver {
     }
 
     private func preferredTrailerYouTubeIdInCurrentContext(for meta: NuvioMeta) async -> String? {
+        guard meta.supportsTrailerLookup else { return nil }
         let mediaType = meta.isSeries ? "tv" : "movie"
         let language = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
         let cacheKey = [
@@ -2402,7 +2480,7 @@ actor YouTubeTrailerResolver {
         if let trailerYouTubeIdProvider {
             tmdbTrailerId = await trailerYouTubeIdProvider(meta)
         } else {
-            tmdbTrailerId = await TmdbDetailsService.fetchTrailerYouTubeId(for: meta)
+            tmdbTrailerId = await TmdbDetailsService.fetchTrailerYouTubeId(for: meta, language: language)
         }
         if let ytId = tmdbTrailerId,
            Self.isYouTubeVideoId(ytId.trimmingCharacters(in: .whitespacesAndNewlines)) {
@@ -2446,47 +2524,95 @@ actor YouTubeTrailerResolver {
         _ meta: NuvioMeta,
         preview: Bool
     ) async -> TrailerPlaybackSource? {
-        if AnimeSource.isAnimeTitleID(meta.id) {
-            return await resolveAniListTrailer(meta, preview: preview)
+        guard meta.supportsTrailerLookup else { return nil }
+        let mode = sourceModeProvider()
+
+        switch mode {
+        case .trailerioOnly:
+            if AnimeSource.isAnimeTitleID(meta.id) {
+                return await resolveAniListDirectTrailer(meta, includeIMDb: false)
+            }
+            return await resolveTrailerio(for: meta)
+
+        case .directOnly:
+            if let source = resolveAddonTrailerStreams(for: meta) {
+                return source
+            }
+            if AnimeSource.isAnimeTitleID(meta.id) {
+                return await resolveAniListDirectTrailer(meta, includeIMDb: true)
+            }
+            if let source = await resolveTrailerio(for: meta) {
+                return source
+            }
+            return await resolveImdbTrailer(for: meta)
+
+        case .youtubeOnly:
+            if AnimeSource.isAnimeTitleID(meta.id) {
+                if let ytId = meta.trailerYtIds?
+                    .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+                    .first(where: { Self.isYouTubeVideoId($0) }),
+                   let source = await youtubeSource(ytId, meta: meta, preview: preview) {
+                    return source
+                }
+                return nil
+            }
+            if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta),
+               let source = await youtubeSource(ytId, meta: meta, preview: preview) {
+                return source
+            }
+            return nil
+
+        case .auto:
+            // Prefer explicit direct trailerStreams supplied by the configured metadata addon
+            // (e.g. AIOMetadata + Trailerio) over untagged or localized YouTube fallbacks.
+            if let source = resolveAddonTrailerStreams(for: meta) {
+                return source
+            }
+
+            if AnimeSource.isAnimeTitleID(meta.id) {
+                return await resolveAniListTrailer(meta, preview: preview)
+            }
+
+            let isEnglish = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
+                .split(separator: "-").first?.lowercased() == "en"
+
+            // 1. Try Trailerio if English (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
+            if isEnglish, let source = await resolveTrailerio(for: meta) {
+                return source
+            }
+
+            // 2. Keep the English IMDb fast path; non-English previews should try localized TMDB / YouTube first.
+            if isEnglish, let source = await resolveImdbTrailer(for: meta) {
+                return source
+            }
+
+            // 3. Fall back to TMDB / YouTube (allows localized trailers for non-English fullscreen playback)
+            if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta),
+               let source = await youtubeSource(ytId, meta: meta, preview: preview) {
+                return source
+            }
+
+            // 4. Fallback for non-English if YouTube failed: try IMDb high-res, then Trailerio
+            if let source = await resolveImdbTrailer(for: meta) {
+                return source
+            }
+
+            // The YouTube ID may be present while its stream is unavailable. Keep
+            // Trailerio as a fallback for both language paths in that case.
+            return isEnglish ? nil : await resolveTrailerio(for: meta)
         }
-
-        let isEnglish = TmdbMetadataLanguage.normalized(preferredLanguageProvider())
-            .split(separator: "-").first?.lowercased() == "en"
-
-        // 1. Try Trailerio if English (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
-        if isEnglish, let source = await resolveTrailerio(for: meta) {
-            return source
-        }
-
-        // 2. Keep the English IMDb fast path; non-English previews should try localized TMDB / YouTube first.
-        if isEnglish, let source = await resolveImdbTrailer(for: meta) {
-            return source
-        }
-
-        // 3. Fall back to TMDB / YouTube (allows localized trailers for non-English fullscreen playback)
-        if let ytId = await preferredTrailerYouTubeIdInCurrentContext(for: meta),
-           let source = await youtubeSource(ytId, meta: meta, preview: preview) {
-            return source
-        }
-
-        // 4. Fallback for non-English if YouTube failed: try IMDb high-res, then Trailerio
-        if let source = await resolveImdbTrailer(for: meta) {
-            return source
-        }
-
-        // The YouTube ID may be present while its stream is unavailable. Keep
-        // Trailerio as a fallback for both language paths in that case.
-        return isEnglish ? nil : await resolveTrailerio(for: meta)
     }
 
     private func youtubeSource(_ ytId: String, meta: NuvioMeta, preview: Bool) async -> TrailerPlaybackSource? {
+        let source: TrailerPlaybackSource?
         if let youtubeSourceProvider {
-            return await youtubeSourceProvider(ytId, meta.name, meta.year.map(String.init), preview)
+            source = await youtubeSourceProvider(ytId, meta.name, meta.year.map(String.init), preview)
+        } else if preview {
+            source = await resolvePreview(youtubeVideoId: ytId, title: meta.name, year: meta.year.map(String.init))
+        } else {
+            source = await resolve(youtubeVideoId: ytId, title: meta.name, year: meta.year.map(String.init))
         }
-        if preview {
-            return await resolvePreview(youtubeVideoId: ytId, title: meta.name, year: meta.year.map(String.init))
-        }
-        return await resolve(youtubeVideoId: ytId, title: meta.name, year: meta.year.map(String.init))
+        return source?.withYouTubeMetadata(videoId: ytId)
     }
 
     /// An AniList title: its own trailer on YouTube first, in any language, as it is the
@@ -2502,6 +2628,10 @@ actor YouTubeTrailerResolver {
             return source
         }
         guard !Task.isCancelled else { return nil }
+        return await resolveAniListDirectTrailer(meta, includeIMDb: true)
+    }
+
+    private func resolveAniListDirectTrailer(_ meta: NuvioMeta, includeIMDb: Bool) async -> TrailerPlaybackSource? {
         let imdbID: String?
         if let aniListIMDbIDProvider {
             imdbID = await aniListIMDbIDProvider(meta)
@@ -2516,7 +2646,7 @@ actor YouTubeTrailerResolver {
             trailerio = await resolveTrailerio(imdbId: imdbID, isSeries: meta.isSeries)
         }
         if let trailerio { return trailerio }
-        guard !Task.isCancelled else { return nil }
+        guard includeIMDb, !Task.isCancelled else { return nil }
         if let imdbTrailerProvider {
             return await imdbTrailerProvider(imdbID)
         }
@@ -2681,11 +2811,11 @@ actor YouTubeTrailerResolver {
             return source
         }
 
-        // Full player supports integrated streams with audio (HLS as well as progressive)
+        // Full player supports adaptive streams (1080p and 720p)
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: false,
-            preferIntegratedStream: true
+            preferIntegratedStream: false
         ) {
             return source
         }
@@ -2697,7 +2827,7 @@ actor YouTubeTrailerResolver {
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: true,
-            preferIntegratedStream: true
+            preferIntegratedStream: false
         ) {
             return source
         }
@@ -2889,20 +3019,35 @@ actor YouTubeTrailerResolver {
         let unthrottledAdaptiveVideo = sortedAdaptiveVideo
         let unthrottledAdaptiveAudio = sortedAdaptiveAudio
 
+        func makeYouTubeSource(
+            videoUrl: String,
+            audioUrl: String? = nil,
+            clientKey: String,
+            label: String,
+            diag: String
+        ) -> TrailerPlaybackSource {
+            TrailerPlaybackSource(
+                videoUrl: videoUrl,
+                audioUrl: audioUrl,
+                requestHeaders: requestHeaders(for: clientKey, includeReferer: false),
+                qualityLabel: label,
+                diagnostics: diag,
+                providerKind: .youtube,
+                providerName: "\(label) [\(clientKey)]",
+                youtubeVideoId: videoId
+            )
+        }
+
         // 1. Prioritize HD HLS master manifest (1080p / 720p).
         // HLS contains video+audio natively, decoded by AetherEngine / AVPlayer in full 1080p HD with zero 403 errors.
         if let bestHls = sortedHLS.first, bestHls.height >= 720 {
             let label = "\(bestHls.height)p (HLS)"
             let diag = "TRAILER: \(label) [\(bestHls.clientKey)] | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: bestHls.manifestUrl,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: bestHls.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: bestHls.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -2913,15 +3058,11 @@ actor YouTubeTrailerResolver {
         ) {
             let label = "\(bestProg.height)p (MP4)"
             let diag = "TRAILER: \(label) [\(bestProg.clientKey)] | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: bestProg.url,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: bestProg.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: bestProg.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -2934,15 +3075,12 @@ actor YouTubeTrailerResolver {
            ) {
             let label = "\(pair.video.height)p (Adaptive)"
             let diag = "TRAILER: \(label) [\(pair.video.clientKey)] | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: pair.video.url,
                 audioUrl: pair.audio.url,
-                requestHeaders: requestHeaders(
-                    for: pair.video.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: pair.video.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -2955,15 +3093,12 @@ actor YouTubeTrailerResolver {
            ) {
             let label = "\(pair.video.height)p (Adaptive)"
             let diag = "TRAILER: \(label) [\(pair.video.clientKey)] | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: pair.video.url,
                 audioUrl: pair.audio.url,
-                requestHeaders: requestHeaders(
-                    for: pair.video.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: pair.video.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -2971,15 +3106,11 @@ actor YouTubeTrailerResolver {
         if let bestHls = sortedHLS.first {
             let label = "\(bestHls.height > 0 ? "\(bestHls.height)p" : "Adaptive") (HLS)"
             let diag = "TRAILER: \(label) [\(bestHls.clientKey)] | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: bestHls.manifestUrl,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: bestHls.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: bestHls.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -2991,15 +3122,11 @@ actor YouTubeTrailerResolver {
         ) {
             let label = "\(bestAdaptive.height)p (Adaptive Video)"
             let diag = "TRAILER: \(label) [\(bestAdaptive.clientKey)] video-only | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: bestAdaptive.url,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: bestAdaptive.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: bestAdaptive.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -3010,15 +3137,11 @@ actor YouTubeTrailerResolver {
         ) {
             let label = "\(progressiveMatch.height)p (MP4)"
             let diag = "TRAILER: \(label) [\(progressiveMatch.clientKey)] fallback | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: progressiveMatch.url,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: progressiveMatch.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: progressiveMatch.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -3031,15 +3154,12 @@ actor YouTubeTrailerResolver {
            ) {
             let label = "\(pair.video.height)p (Adaptive)"
             let diag = "TRAILER: \(label) [\(pair.video.clientKey)] fallback | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: pair.video.url,
                 audioUrl: pair.audio.url,
-                requestHeaders: requestHeaders(
-                    for: pair.video.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: pair.video.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -3050,15 +3170,11 @@ actor YouTubeTrailerResolver {
         ) {
             let label = "\(bestAdaptive.height)p (Adaptive Video)"
             let diag = "TRAILER: \(label) [\(bestAdaptive.clientKey)] fallback | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
+            return makeYouTubeSource(
                 videoUrl: bestAdaptive.url,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: bestAdaptive.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
+                clientKey: bestAdaptive.clientKey,
+                label: label,
+                diag: diag
             )
         }
 
@@ -3242,7 +3358,10 @@ actor YouTubeTrailerResolver {
                 videoUrl: resolved,
                 audioUrl: nil,
                 qualityLabel: label,
-                diagnostics: diag
+                diagnostics: diag,
+                providerKind: .backendProxy,
+                providerName: label,
+                youtubeVideoId: videoId
             )
         } catch {
             return nil
@@ -3545,6 +3664,48 @@ actor YouTubeTrailerResolver {
         value.count == 11 && value.allSatisfy { char in
             char.isLetter || char.isNumber || char == "_" || char == "-"
         }
+    }
+
+    static func isYouTubePageURL(_ url: URL) -> Bool {
+        let host = (url.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
+        return host == "youtu.be"
+            || host == "youtube.com"
+            || host.hasSuffix(".youtube.com")
+            || host == "youtube-nocookie.com"
+            || host.hasSuffix(".youtube-nocookie.com")
+    }
+
+    static func youtubeVideoId(from url: URL) -> String? {
+        let host = (url.host ?? "").lowercased().replacingOccurrences(of: "www.", with: "")
+
+        if host == "youtu.be" {
+            let id = url.pathComponents.dropFirst().first ?? ""
+            return isYouTubeVideoId(id) ? id : nil
+        }
+
+        guard host == "youtube.com"
+                || host.hasSuffix(".youtube.com")
+                || host == "youtube-nocookie.com"
+                || host.hasSuffix(".youtube-nocookie.com") else {
+            return nil
+        }
+
+        if let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+            .queryItems?
+            .first(where: { $0.name == "v" })?
+            .value,
+           isYouTubeVideoId(id) {
+            return id
+        }
+
+        let components = url.pathComponents.filter { $0 != "/" }
+        guard components.count >= 2,
+              ["embed", "shorts", "live"].contains(components[0]),
+              isYouTubeVideoId(components[1]) else {
+            return nil
+        }
+
+        return components[1]
     }
 }
 
@@ -4664,6 +4825,8 @@ struct TvDetailsContent: View {
     @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = true
     @AppStorage(SettingsKey.trailerSound) private var trailerSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @AppStorage(SettingsKey.trailerSource) private var trailerSourceRaw = TrailerSourceMode.auto.rawValue
+    @AppStorage(SettingsKey.trailerLanguage) private var trailerLanguageRaw = TrailerLanguagePreference.autoValue
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
     /// The sections below the first screen (episodes, cast, more like this…) are built a moment
     /// after Details opens, once its transition is over: the top part fills the first screen,
@@ -4726,7 +4889,8 @@ struct TvDetailsContent: View {
         return true
     }
 
-    private func scheduleBackgroundTrailer(for meta: NuvioMeta) {
+    private func scheduleBackgroundTrailer(for meta: NuvioMeta, skipDelay: Bool = false) {
+        trailerPlayerHolder.latestMeta = meta
         trailerTask?.cancel()
         let handoff = TrailerPlaybackHandoff.shared.takeHandoff(for: meta.id)
         let hasHandoff = handoff != nil
@@ -4734,43 +4898,43 @@ struct TvDetailsContent: View {
             stopBackgroundTrailer(manual: false)
             return
         }
+        trailerPlayerHolder.delayCompleted = skipDelay || hasHandoff
 
         trailerTask = Task { @MainActor in
-            if !hasHandoff {
+            if !skipDelay && !hasHandoff {
                 let delaySeconds = max(0, trailerDelay)
                 if delaySeconds > 0 {
                     try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
                 }
             }
+            trailerPlayerHolder.delayCompleted = true
             guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
 
+            let targetMeta = trailerPlayerHolder.latestMeta ?? meta
             let playbackSource: TrailerPlaybackSource?
             if let source = handoff?.playbackSource {
                 playbackSource = source
             } else {
-                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
+                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: targetMeta)
             }
 
-            guard let playbackSource,
-                  !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else {
-                return
-            }
-
-            guard let item = playbackSource.makePlayerItem() else { return }
             guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
 
-            trailerPlayer.replaceCurrentItem(with: item)
+            let diagToken = TrailerPlaybackDiagnostics.shared.recordResolution(
+                meta: targetMeta,
+                context: "Details Background",
+                source: playbackSource
+            )
+            guard let playbackSource else { return }
 
-            if let handoffTime = handoff?.time, handoffTime > 0.1 {
-                await trailerPlayer.seek(
-                    to: CMTime(seconds: handoffTime, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                )
-            }
-            applySoundPreference(trailerSound)
-            isTrailerPlaying = true
-            trailerPlayer.play()
+            await startResolvedTrailerSource(
+                playbackSource,
+                token: diagToken,
+                handoffTime: handoff?.time,
+                soundEnabled: trailerSound,
+                requireBackgroundAllowed: true,
+                hasHandoff: hasHandoff
+            )
         }
     }
 
@@ -4805,44 +4969,89 @@ struct TvDetailsContent: View {
     }
 
     private func startFullscreenTrailer(for meta: NuvioMeta) {
+        trailerPlayerHolder.latestMeta = meta
         trailerTask?.cancel()
         let handoff = TrailerPlaybackHandoff.shared.takeHandoff(for: meta.id)
         trailerTask = Task { @MainActor in
+            let targetMeta = trailerPlayerHolder.latestMeta ?? meta
             let playbackSource: TrailerPlaybackSource?
             if let source = handoff?.playbackSource {
                 playbackSource = source
-            } else if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
+            } else if let source = await YouTubeTrailerResolver.shared.resolve(for: targetMeta) {
                 playbackSource = source
             } else {
-                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
+                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: targetMeta)
             }
 
-            guard let playbackSource,
-                  !Task.isCancelled else {
-                return
-            }
-
-            guard let item = playbackSource.makePlayerItem() else { return }
             guard !Task.isCancelled else { return }
 
-            trailerPlayer.replaceCurrentItem(with: item)
+            let diagToken = TrailerPlaybackDiagnostics.shared.recordResolution(
+                meta: targetMeta,
+                context: "Details Fullscreen",
+                source: playbackSource
+            )
+            guard let playbackSource else { return }
 
-            if let handoffTime = handoff?.time, handoffTime > 0.1 {
-                await trailerPlayer.seek(
-                    to: CMTime(seconds: handoffTime, preferredTimescale: 600),
-                    toleranceBefore: .zero,
-                    toleranceAfter: .zero
-                )
-            }
-            applySoundPreference(true)
-            isTrailerPlaying = true
-            trailerPlayer.play()
+            await startResolvedTrailerSource(
+                playbackSource,
+                token: diagToken,
+                handoffTime: handoff?.time,
+                soundEnabled: true,
+                requireBackgroundAllowed: false,
+                hasHandoff: handoff != nil
+            )
         }
+    }
+
+    @MainActor
+    private func startResolvedTrailerSource(
+        _ playbackSource: TrailerPlaybackSource,
+        token: UUID,
+        handoffTime: Double?,
+        soundEnabled: Bool,
+        requireBackgroundAllowed: Bool,
+        hasHandoff: Bool
+    ) async {
+        guard let item = playbackSource.makePlayerItem() else {
+            TrailerPlaybackDiagnostics.shared.recordPlaybackFailed(token: token, errorDescription: "Invalid trailer URL")
+            return
+        }
+        guard !Task.isCancelled else { return }
+        if requireBackgroundAllowed, !isBackgroundTrailerAllowed(hasHandoff: hasHandoff) {
+            return
+        }
+
+        trailerPlayerHolder.diagnosticObserver?.invalidate()
+        trailerPlayerHolder.diagnosticObserver = TrailerAVPlayerDiagnosticObserver(item: item, token: token)
+        trailerPlayerHolder.activeSource = playbackSource
+        trailerPlayer.replaceCurrentItem(with: item)
+
+        if let handoffTime, handoffTime > 0.1 {
+            await trailerPlayer.seek(
+                to: CMTime(seconds: handoffTime, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            )
+        }
+        guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
+        applySoundPreference(soundEnabled)
+        isTrailerPlaying = true
+        trailerPlayer.play()
+    }
+
+    private func trailerMetadataIdentity(for meta: NuvioMeta) -> String {
+        let streams = meta.trailerStreams?.map(\.url).joined(separator: ",") ?? ""
+        let ytIds = meta.trailerYtIds?.joined(separator: ",") ?? ""
+        return "\(meta.id)\u{1f}\(meta.imdbId ?? "")\u{1f}\(streams)\u{1f}\(ytIds)"
     }
 
     private func stopBackgroundTrailer(manual: Bool) {
         trailerTask?.cancel()
         trailerTask = nil
+        trailerPlayerHolder.delayCompleted = false
+        trailerPlayerHolder.diagnosticObserver?.invalidate()
+        trailerPlayerHolder.diagnosticObserver = nil
+        trailerPlayerHolder.activeSource = nil
         if manual {
             didStopTrailerManually = true
         }
@@ -5798,6 +6007,7 @@ struct TvDetailsContent: View {
                         keepAskingForPlay()
                     }
                 }
+                trailerPlayerHolder.latestMeta = meta
                 scheduleBackgroundTrailer(for: meta)
             }
             .onReceive(NotificationCenter.default.publisher(for: TVDetailsSectionOrder.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -5830,8 +6040,35 @@ struct TvDetailsContent: View {
                 }
                 stopBackgroundTrailer(manual: false)
             }
+            .onChange(of: meta) { _, updated in
+                trailerPlayerHolder.latestMeta = updated
+            }
             .onChange(of: meta.id) { _, _ in
                 didStopTrailerManually = false
+                stopBackgroundTrailer(manual: false)
+                trailerPlayerHolder.latestMeta = meta
+                scheduleBackgroundTrailer(for: meta)
+            }
+            .onChange(of: trailerMetadataIdentity(for: meta)) { _, _ in
+                trailerPlayerHolder.latestMeta = meta
+                guard isBackgroundTrailerAllowed() else { return }
+                // If delay is still counting down, the pending task will read `latestMeta`.
+                if !trailerPlayerHolder.delayCompleted && trailerTask != nil {
+                    return
+                }
+                let mode = TrailerSettings.sourceMode()
+                let hasNewAddonStreams = !(meta.trailerStreams?.isEmpty ?? true)
+                    && (mode == .auto || mode == .directOnly)
+                    && trailerPlayerHolder.activeSource?.providerKind != .addonTrailerStreams
+                if !isTrailerPlaying || hasNewAddonStreams {
+                    scheduleBackgroundTrailer(for: meta, skipDelay: true)
+                }
+            }
+            .onChange(of: trailerSourceRaw) { _, _ in
+                stopBackgroundTrailer(manual: false)
+                scheduleBackgroundTrailer(for: meta)
+            }
+            .onChange(of: trailerLanguageRaw) { _, _ in
                 stopBackgroundTrailer(manual: false)
                 scheduleBackgroundTrailer(for: meta)
             }
@@ -6759,6 +6996,10 @@ private struct TvDetailsSeasonSnapshot: Equatable {
 /// Holds Details' background trailer player for the life of the screen.
 private final class TvDetailsTrailerPlayerHolder: ObservableObject {
     let player = AVPlayer()
+    var latestMeta: NuvioMeta?
+    var delayCompleted = false
+    var activeSource: TrailerPlaybackSource?
+    var diagnosticObserver: TrailerAVPlayerDiagnosticObserver?
 }
 
 /// When focus last moved anywhere, for Details' lower sections (built while it rests).

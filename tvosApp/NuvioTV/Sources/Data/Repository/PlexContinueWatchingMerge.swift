@@ -16,7 +16,7 @@ import Foundation
 /// Shelf feed, written off the main actor, shows the same row.
 enum PlexContinueWatchingMerge {
     /// One Plex title in progress, with its card at Plex's position.
-    struct Candidate {
+    struct Candidate: Sendable {
         /// Ids the title answers to: its Plex content id, IMDb id, and TMDB id.
         let ids: Set<String>
         let card: ContinueWatchingItem
@@ -25,15 +25,61 @@ enum PlexContinueWatchingMerge {
     }
 
     /// What Plex has in progress, as Home last merged it.
-    struct Snapshot {
+    struct Snapshot: Sendable {
         /// Every title Plex has in progress, including ones without a card.
         let inProgressIDs: Set<String>
         let candidates: [Candidate]
     }
 
+    struct MergeInput: Sendable {
+        let inProgress: [PlexLibraryIndex.InProgress]
+        let serverAccessByID: [String: PlexServerAccess]
+        let episodeTitleTemplate: String
+        let locale: Locale
+    }
+
     private static let lock = NSLock()
     /// Nil until Home has merged for the active profile.
     private static var latest: Snapshot?
+
+    @MainActor
+    static func captureMergeInput() -> MergeInput {
+        let index = PlexLibraryIndex.shared
+        let inProgress = index.inProgress()
+        let serverIDs = Set(inProgress.map(\.title.serverID))
+        return MergeInput(
+            inProgress: inProgress,
+            serverAccessByID: serverIDs.isEmpty ? [:] : index.serverAccessSnapshot(for: serverIDs),
+            episodeTitleTemplate: L10n.resolvedFormatTemplate("jellyfin_episode_fallback_title", fallback: "Episode %d"),
+            locale: AppLocaleManager.shared.locale
+        )
+    }
+
+    /// Computes Home's Plex-merged Continue Watching list and snapshot off the
+    /// main actor from pre-captured index/server inputs.
+    nonisolated static func prepareMerge(
+        into items: [ContinueWatchingItem],
+        input: MergeInput,
+        displayable: (ContinueWatchingItem) -> Bool
+    ) -> (merged: [ContinueWatchingItem], snapshot: Snapshot) {
+        let current = currentSnapshot(from: input)
+        let snapshot = Snapshot(
+            inProgressIDs: current.inProgressIDs,
+            candidates: current.candidates.filter { displayable($0.card) }
+        )
+        let mergedItems = merged(
+            into: items,
+            snapshot: snapshot,
+            dismissedKeys: ContinueWatchingDismissStore.keys()
+        )
+        return (mergedItems, snapshot)
+    }
+
+    nonisolated static func commitLatestSnapshot(_ snapshot: Snapshot) {
+        lock.lock()
+        latest = snapshot
+        lock.unlock()
+    }
 
     /// Home's row with Plex's titles merged in.
     @MainActor
@@ -41,15 +87,9 @@ enum PlexContinueWatchingMerge {
         into items: [ContinueWatchingItem],
         displayable: (ContinueWatchingItem) -> Bool
     ) -> [ContinueWatchingItem] {
-        let current = currentSnapshot()
-        let snapshot = Snapshot(
-            inProgressIDs: current.inProgressIDs,
-            candidates: current.candidates.filter { displayable($0.card) }
-        )
-        lock.lock()
-        latest = snapshot
-        lock.unlock()
-        return merged(into: items, snapshot: snapshot, dismissedKeys: ContinueWatchingDismissStore.keys())
+        let prepared = prepareMerge(into: items, input: captureMergeInput(), displayable: displayable)
+        commitLatestSnapshot(prepared.snapshot)
+        return prepared.merged
     }
 
     /// `items` merged with Plex's state as it is now, without changing what
@@ -57,7 +97,11 @@ enum PlexContinueWatchingMerge {
     /// merged.
     @MainActor
     static func mergedNow(into items: [ContinueWatchingItem]) -> [ContinueWatchingItem] {
-        merged(into: items, snapshot: currentSnapshot(), dismissedKeys: ContinueWatchingDismissStore.keys())
+        merged(
+            into: items,
+            snapshot: currentSnapshot(from: captureMergeInput()),
+            dismissedKeys: ContinueWatchingDismissStore.keys()
+        )
     }
 
     /// `items` merged with the Plex cards Home used last, or unchanged before
@@ -104,23 +148,27 @@ enum PlexContinueWatchingMerge {
     }
 
     /// Plex's titles in progress, with a card for each one Nuvio can play.
-    @MainActor
-    private static func currentSnapshot() -> Snapshot {
-        let index = PlexLibraryIndex.shared
-        let inProgress = index.inProgress()
-        let candidates = inProgress.compactMap { candidate -> Candidate? in
-            guard let meta = index.meta(for: candidate.title),
-                  let card = card(for: candidate, meta: meta) else { return nil }
+    nonisolated private static func currentSnapshot(from input: MergeInput) -> Snapshot {
+        let candidates = input.inProgress.compactMap { candidate -> Candidate? in
+            guard let meta = PlexLibraryIndex.meta(
+                for: candidate.title,
+                serverAccessByID: input.serverAccessByID,
+                episodeTitleTemplate: input.episodeTitleTemplate,
+                locale: input.locale
+            ),
+            let card = card(for: candidate, meta: meta, serverAccessByID: input.serverAccessByID) else { return nil }
             return Candidate(ids: identifiers(of: candidate.title), card: card)
         }
-        return Snapshot(inProgressIDs: Set(inProgress.map(\.title.contentId)), candidates: candidates)
+        return Snapshot(inProgressIDs: Set(input.inProgress.map(\.title.contentId)), candidates: candidates)
     }
 
-    @MainActor
-    private static func card(for candidate: PlexLibraryIndex.InProgress, meta: NuvioMeta) -> ContinueWatchingItem? {
-        guard let server = PlexServerStore.shared.server(id: candidate.title.serverID),
-              let baseURL = server.baseURL,
-              let stream = PlexClient.streamURL(baseURL: baseURL, partKey: candidate.item.partKey) else { return nil }
+    nonisolated private static func card(
+        for candidate: PlexLibraryIndex.InProgress,
+        meta: NuvioMeta,
+        serverAccessByID: [String: PlexServerAccess]
+    ) -> ContinueWatchingItem? {
+        guard let access = serverAccessByID[candidate.title.serverID],
+              let stream = PlexClient.streamURL(baseURL: access.baseURL, partKey: candidate.item.partKey) else { return nil }
         let durationMs = candidate.item.durationMs ?? candidate.title.durationMs ?? 0
         guard durationMs > 0 else { return nil }
         return ContinueWatchingItem(

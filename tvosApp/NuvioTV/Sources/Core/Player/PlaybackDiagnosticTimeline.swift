@@ -19,6 +19,9 @@ struct PlaybackDiagnosticTimeline: Codable, Sendable, Equatable {
         case partyBindingDeferredSample, partyBindingDeferredBehind, partyBindingDeferredBusy
         case partyRemotePauseStarted, partyRemotePlayStarted
         case partyRemoteTransportIssued, partyRemoteEffectFailed
+        case trailerResolvedAddonStreams, trailerResolvedTrailerio, trailerResolvedImdb
+        case trailerResolvedYouTube, trailerResolvedProxy, trailerResolutionFailed
+        case trailerPlaybackStarted, trailerPlaybackFailed
     }
 
     enum Engine: String, Codable, Sendable { case aether, mpv }

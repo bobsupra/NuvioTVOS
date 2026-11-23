@@ -1184,6 +1184,7 @@ extension NuvioMeta {
             status: status,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            trailerStreams: trailerStreams,
             externalRatings: externalRatings,
             posterShape: posterShape,
             isFromAddon: isFromAddon,

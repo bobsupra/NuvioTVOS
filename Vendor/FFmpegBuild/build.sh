@@ -594,13 +594,29 @@ COMMON_FLAGS=(
     --enable-filter=format --enable-filter=scale
     --enable-filter=zscale --enable-filter=tonemap
     --enable-filter=colorspace
-    # Deinterlacers for AetherEngine's software-decode path. Interlaced
+    # Audio shaping for AetherEngine (AE#923): the graph runs between the decoder's
+    # resampler and the renderer or the bridge encoder. dialoguenhance pulls the
+    # dialogue out of a stereo mix (3.0 out) and pan folds it back into the pair,
+    # acompressor is night mode, alimiter the lookahead limiter that keeps every
+    # lift from clipping. All LGPL. abuffer / abuffersink / aformat are the graph's
+    # audio ends and its format pin, aresample the converter libavfilter inserts
+    # between filters that work in different sample formats (alimiter and
+    # acompressor take interleaved double, dialoguenhance planar float).
+    --enable-filter=abuffer --enable-filter=abuffersink --enable-filter=aformat --enable-filter=aresample
+    --enable-filter=dialoguenhance --enable-filter=pan
+    --enable-filter=acompressor --enable-filter=alimiter
     # Deinterlacers for AetherEngine's software-decode path: interlaced
     # MPEG-2 / VC-1 / MPEG-4 (DVD rips, SD broadcast) plus interlaced H.264
     # (AetherEngine #107: AVPlayer does not deinterlace, so 1080i/576i H.264
     # routes software too). Without these it all renders with combing. bwdif
     # is the CPU primary (better quality), yadif the fallback.
     --enable-filter=bwdif --enable-filter=yadif
+    # Inverse telecine (AetherEngine#853): idet tells telecined film from true
+    # interlace, fieldmatch rebuilds the progressive frames from the field pairs
+    # and decimate drops the duplicate one in five, so 3:2 film plays at 23.976
+    # instead of being deinterlaced to 29.97 with judder. All LGPL (mpdecimate
+    # would be GPL and is not needed).
+    --enable-filter=idet --enable-filter=fieldmatch --enable-filter=decimate
     # Hardware deinterlacer: yadif_videotoolbox runs the yadif kernel as a
     # Metal compute shader over AV_PIX_FMT_VIDEOTOOLBOX frames (no
     # bwdif_videotoolbox exists upstream). hwupload bridges software-decoded
@@ -758,6 +774,16 @@ COMMON_FLAGS=(
     --enable-decoder=mp3float --enable-decoder=opus --enable-decoder=vorbis
     --enable-decoder=truehd --enable-decoder=mlp --enable-decoder=dca --enable-decoder=alac
     --enable-decoder=pcm_s16le --enable-decoder=pcm_s24le --enable-decoder=pcm_f32le
+    # The other integer and float PCM shapes the enabled demuxers can hand over: 24-bit
+    # big-endian is what camera MOVs record as `in24`, 32-bit integer comes in WAV
+    # (s32le) and MOV (`in32`, s32be), big-endian float in MOV (`fl32`, `fl64`), 64-bit
+    # little-endian float in WAV and Matroska, and signed 8-bit in MOV (`twos` at 8 bits).
+    # Without them such a track plays SILENT, the same failure the WMA note above
+    # describes. All of them live in the one pcm.c, so the cost is a few table entries,
+    # not code.
+    --enable-decoder=pcm_s24be --enable-decoder=pcm_s32le --enable-decoder=pcm_s32be
+    --enable-decoder=pcm_f32be --enable-decoder=pcm_f64le --enable-decoder=pcm_f64be
+    --enable-decoder=pcm_s8
     # Flash Video audio, the whole tail, all-or-nothing for the same reason the WMA
     # family above is: a decoder missing here is a file that plays as a silent film
     # rather than failing honestly, because the bridge has nothing to open. Nellymoser Asao and ADPCM-SWF are what the
@@ -777,6 +803,9 @@ COMMON_FLAGS=(
     # still carry MP2. Not legal in fMP4 so AetherEngine's AudioBridge
     # decodes to PCM and re-encodes as FLAC. ~5 KB binary cost.
     --enable-decoder=mp2
+    # MP1 (MPEG-1 Layer I), the oldest member of the same family, for the rare file that
+    # still carries it. It shares mpegaudiodec with mp2, its patents expired long ago.
+    --enable-decoder=mp1
     --enable-decoder=ass --enable-decoder=srt --enable-decoder=subrip
     --enable-decoder=movtext --enable-decoder=dvdsub --enable-decoder=dvbsub
     --enable-decoder=pgssub --enable-decoder=webvtt
@@ -1012,6 +1041,47 @@ make_dsym() {
 EOF
 }
 
+# Apple's required-reason APIs (ITMS-91053) are declared by the framework that
+# calls them, so an app embedding these does not declare them on our behalf
+# (FFmpegBuild#10). The manifest follows the symbols the binary actually imports,
+# so an upstream update that starts or stops calling one changes it too.
+write_privacy_manifest() {
+    local FW_DIR="$1" BINARY="$2"
+    local -a IMPORTS
+    IMPORTS=(${(f)"$(nm -u "${BINARY}" 2>/dev/null | sed -E 's/^[[:space:]]*_//; s/\$INODE64$//' | sort -u)"})
+    local FILE_TS=0 DISK=0 BOOT=0 SYM
+    for SYM in "${IMPORTS[@]}"; do
+        case "${SYM}" in
+            stat|fstat|lstat|fstatat|getattrlist|fgetattrlist|getattrlistat|getattrlistbulk) FILE_TS=1 ;;
+            statfs|fstatfs|statvfs|fstatvfs) DISK=1 ;;
+            mach_absolute_time) BOOT=1 ;;
+        esac
+    done
+    (( FILE_TS + DISK + BOOT )) || return 0
+
+    # C617.1: the host's own temp and cache files; 3B52.1: media the user opened.
+    # E174.1: checking for room before writing; 35F9.1: elapsed time.
+    local ENTRIES=""
+    (( FILE_TS )) && ENTRIES+="<dict><key>NSPrivacyAccessedAPIType</key><string>NSPrivacyAccessedAPICategoryFileTimestamp</string><key>NSPrivacyAccessedAPITypeReasons</key><array><string>C617.1</string><string>3B52.1</string></array></dict>
+"
+    (( DISK )) && ENTRIES+="<dict><key>NSPrivacyAccessedAPIType</key><string>NSPrivacyAccessedAPICategoryDiskSpace</string><key>NSPrivacyAccessedAPITypeReasons</key><array><string>E174.1</string></array></dict>
+"
+    (( BOOT )) && ENTRIES+="<dict><key>NSPrivacyAccessedAPIType</key><string>NSPrivacyAccessedAPICategorySystemBootTime</string><key>NSPrivacyAccessedAPITypeReasons</key><array><string>35F9.1</string></array></dict>
+"
+    cat > "${FW_DIR}/PrivacyInfo.xcprivacy" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>NSPrivacyTracking</key><false/>
+<key>NSPrivacyTrackingDomains</key><array/>
+<key>NSPrivacyCollectedDataTypes</key><array/>
+<key>NSPrivacyAccessedAPITypes</key><array>
+${ENTRIES}</array>
+</dict></plist>
+EOF
+    plutil -lint -s "${FW_DIR}/PrivacyInfo.xcprivacy" || { echo "ERROR: ${FW_DIR:t} privacy manifest does not parse"; exit 1; }
+}
+
 make_framework() {
     local LIB="$1" FW="$2" PLATFORM="$3"
     shift 3
@@ -1135,6 +1205,8 @@ EOF
 </dict></plist>
 EOF
 
+    write_privacy_manifest "${FW_DIR}" "${FW_DIR}/${FW}"
+
     # macOS requires the versioned ("deep") framework bundle layout, with the
     # binary/Headers/Modules under Versions/A and Info.plist in
     # Versions/A/Resources. iOS/tvOS use shallow bundles (everything at the
@@ -1150,6 +1222,7 @@ EOF
         mv "${FW_DIR}/Headers"    "${V}/Headers"
         mv "${FW_DIR}/Modules"    "${V}/Modules"
         mv "${FW_DIR}/Info.plist" "${V}/Resources/Info.plist"
+        [[ -f "${FW_DIR}/PrivacyInfo.xcprivacy" ]] && mv "${FW_DIR}/PrivacyInfo.xcprivacy" "${V}/Resources/PrivacyInfo.xcprivacy"
         ln -s "A"                          "${FW_DIR}/Versions/Current"
         ln -s "Versions/Current/${FW}"     "${FW_DIR}/${FW}"
         ln -s "Versions/Current/Headers"   "${FW_DIR}/Headers"
@@ -1294,8 +1367,11 @@ write_build_info() {
         fi
         echo ""
         echo "## FFmpeg configure line per slice (repo root shown as <repo>)"
+        # Matched on the build tree rather than on SCRIPT_DIR: the compile and a later
+        # repackage can reach this checkout through different paths (~/Dev is a symlink),
+        # and the line keeps whichever one the compile saw.
         for C in "${BUILD_DIR}"/work/*/config.h(N); do
-            echo "${C:h:t}: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"$/\1/p' "${C}" | sed "s#${SCRIPT_DIR}#<repo>#g")"
+            echo "${C:h:t}: $(sed -n 's/^#define FFMPEG_CONFIGURATION "\(.*\)"$/\1/p' "${C}" | sed -E "s#/[^ =']*(/build/(thin|dav1d-thin|zimg-thin|zvbi-thin)/)#<repo>\1#g")"
         done
         echo ""
         echo "## Shipped binaries (sha256)"
@@ -1449,18 +1525,81 @@ patch_ffmpeg_dca_x_heights() {
     # DTS:X heights without LibDTSX (AetherEngine #798). The standard presentation of DTS:X
     # carries its four height channels in a regular XLL channel set at the end of every XLL
     # frame, which upstream recognises (it sets the "DTS-HD MA + DTS:X" profile) but skips.
-    # The patch decodes that set with the existing channel set code, adds a decoder option
-    # "x_heights" (off by default) that outputs 7.1.4, and removes the -3 dB fold of each
-    # height from the bed speaker under it. Without the option the output is unchanged
-    # byte for byte. It lives in patches/ rather than inline: at this size a perl
+    # The patch decodes that set with the existing channel set code and adds a decoder option
+    # "x_heights" (off by default) that outputs 7.1.4: the bed as coded, with the heights
+    # still folded into it at -3 dB, next to the four heights. Nothing is taken out of the
+    # bed. Without the option the output is unchanged byte for byte. The same option decodes
+    # the four fixed heights of the alternate presentations (FFmpeg's "DTS:X IMAX" among
+    # them) and leaves their object channels in the bed. It lives in patches/ rather than inline: at this size a perl
     # substitution would be unreadable. The patch header explains the format.
     local P="${SCRIPT_DIR}/patches/dca-xll-x-heights.patch"
-    if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+    local -a files=(libavcodec/dca_xll.c libavcodec/dca_xll.h libavcodec/dcadec.c libavcodec/dcadec.h)
+    if grep -q '"x_presentation"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
         return
     fi
-    echo "→ Patching FFmpeg: decode the DTS:X standard presentation's height channels (AetherEngine #798)"
+    # A source tree patched by an earlier version of this patch: start over
+    if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+        git -C "${FFMPEG_SRC}" checkout -- "${files[@]}"
+    fi
+    echo "→ Patching FFmpeg: decode the DTS:X height channels, standard and alternate presentations (AetherEngine #798)"
     git -C "${FFMPEG_SRC}" apply "${P}" || {
         echo "ERROR: DTS:X height patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_av1_delayed_rap() {
+    # AetherEngine #931 (FFmpeg PR 25607). A forward key frame encode opens each GOP with a
+    # Temporal Unit holding a Sequence Header and a HIDDEN Key Frame (show_frame = 0). When
+    # that frame refreshes all eight reference slots, decoding can start right there, but
+    # upstream calls it an inter frame twice: av1_parser only reports a shown Key Frame,
+    # and for Matroska video that verdict replaces the block flag; muxers leave the flag
+    # off too, so matroskadec builds no index and every seek fails. The reporting file
+    # reached the engine without a single keyframe. The patch adds
+    # ff_av1_is_random_access_point() (reads the frame header up to refresh_frame_flags),
+    # and both matroskadec and av1_parser use the full-refresh case. libaom's forward key
+    # frames refresh one slot and stay inter frames. It lives in patches/ because it spans
+    # five files.
+    local P="${SCRIPT_DIR}/patches/av1-delayed-rap.patch"
+    if grep -q "ff_av1_is_random_access_point" "${FFMPEG_SRC}/libavformat/av1.h"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: AV1 full-refresh Delayed Random Access Points are keyframes (AetherEngine #931)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: AV1 delayed random access patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_matroska_skip_attachments() {
+    # AetherEngine #956. Matroska attachments (in practice the fonts of ASS subtitles, tens of
+    # megabytes on anime releases) are read in full while the file opens, before the first
+    # packet. The patch adds a matroska demuxer option "skip_attachments" (off by default)
+    # that passes over the Attachments element and the SeekHead entry pointing at it, for a
+    # host that does not use the fonts. Without the option the demuxer is unchanged.
+    local P="${SCRIPT_DIR}/patches/matroska-skip-attachments.patch"
+    if grep -q '"skip_attachments"' "${FFMPEG_SRC}/libavformat/matroskadec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: matroska skip_attachments option (AetherEngine #956)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: matroska skip_attachments patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_matroska_byte_seek_done() {
+    # AetherEngine #944. matroskadec latches end of stream in its private "done" flag and only
+    # its own read_seek clears it, so after a byte seek (or the generic fallback a failed index
+    # seek takes) every read returned EOF once the file had been read to its end or a read had
+    # failed. The patch makes read_packet honour io_repositioned, like oggdec and av1dec.
+    local P="${SCRIPT_DIR}/patches/matroska-byte-seek-done.patch"
+    if grep -q "end of stream reached before it" "${FFMPEG_SRC}/libavformat/matroskadec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: matroska forgets end of stream after a byte seek (AetherEngine #944)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: matroska byte seek patch did not apply (upstream source changed?)"
         exit 1
     }
 }
@@ -1482,6 +1621,9 @@ patch_ffmpeg_mpegts_mpeg1_probe
 patch_ffmpeg_eac3_dec3
 patch_ffmpeg_movenc_fragment_end
 patch_ffmpeg_dca_x_heights
+patch_ffmpeg_av1_delayed_rap
+patch_ffmpeg_matroska_skip_attachments
+patch_ffmpeg_matroska_byte_seek_done
 fetch_dav1d
 fetch_zimg
 fetch_zvbi

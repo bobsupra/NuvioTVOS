@@ -107,6 +107,16 @@ struct DecoderAvailabilityTests {
         }
     }
 
+    /// Every integer and float PCM shape the mov, wav and matroska demuxers can hand over, and
+    /// MPEG-1 Layer I. Camera MOVs record 24-bit big-endian (`in24`); one shape left out is a
+    /// track that plays silent in AetherEngine, because its bridge finds no decoder.
+    @Test("every PCM shape and MP1 decode")
+    func pcmShapesAndMP1() {
+        for name in ["pcm_s8", "pcm_s24be", "pcm_s32le", "pcm_s32be", "pcm_f32be", "pcm_f64le", "pcm_f64be", "mp1"] {
+            #expect(avcodec_find_decoder_by_name(name) != nil, "\(name) missing: such tracks play silent")
+        }
+    }
+
     /// A feature phone's 3GP is H.263 with AMR speech; .ogv is Theora; a DVD rip's subtitles
     /// are VobSub, an .idx beside a .sub.
     @Test("3GP, Theora and VobSub open and decode")

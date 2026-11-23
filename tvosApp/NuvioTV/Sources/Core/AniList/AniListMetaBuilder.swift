@@ -185,6 +185,7 @@ enum AniListMetaBuilder {
             status: card.status,
             videos: card.videos,
             trailerYtIds: card.trailerYtIds,
+            trailerStreams: card.trailerStreams,
             externalRatings: card.externalRatings,
             posterShape: card.posterShape,
             isFromAddon: card.isFromAddon,

@@ -1104,16 +1104,28 @@ private enum SimklSyncLoader {
 
         if shouldBootstrap {
             result = SimklAllItemsResponse()
-            for type in ["shows", "movies", "anime"] {
-                guard service.isCurrentAuthorization(),
-                      TraktSettingsStore.librarySourceMode(in: store) == sourceAtStart else { return nil }
-                guard let response = await service.getOptional(
-                    SimklAllItemsResponse.self,
-                    path: "sync/all-items/\(type)",
-                    noContentValue: SimklAllItemsResponse()
-                ) else {
-                    return nil
+            let types = ["shows", "movies", "anime"]
+            let responses = await withTaskGroup(of: SimklAllItemsResponse?.self, returning: [SimklAllItemsResponse]?.self) { group in
+                for type in types {
+                    group.addTask {
+                        guard service.isCurrentAuthorization(),
+                              TraktSettingsStore.librarySourceMode(in: store) == sourceAtStart else { return nil }
+                        return await service.getOptional(
+                            SimklAllItemsResponse.self,
+                            path: "sync/all-items/\(type)",
+                            noContentValue: SimklAllItemsResponse()
+                        )
+                    }
                 }
+                var collected: [SimklAllItemsResponse] = []
+                for await response in group {
+                    guard let response else { return nil }
+                    collected.append(response)
+                }
+                return collected
+            }
+            guard let responses else { return nil }
+            for response in responses {
                 result.merge(response)
             }
         } else if let watermark = previousWatermark {
@@ -2432,6 +2444,7 @@ enum LibraryMetadataHydrator {
             status: metadata.status ?? seed.status,
             videos: metadata.videos ?? seed.videos,
             trailerYtIds: metadata.trailerYtIds ?? seed.trailerYtIds,
+            trailerStreams: metadata.trailerStreams ?? seed.trailerStreams,
             externalRatings: metadata.externalRatings ?? seed.externalRatings,
             posterShape: metadata.posterShape ?? seed.posterShape,
             isFromAddon: metadata.isFromAddon ?? seed.isFromAddon,
@@ -2827,8 +2840,12 @@ struct SimklProgressService {
                 [SimklPlaybackDTO].self,
                 path: "sync/playback"
             )
-            playbacks = fetched ?? []
-            SimklSyncCache.savePlaybacks(playbacks, watermark: watermark, store: store)
+            if let fetched {
+                playbacks = fetched
+                SimklSyncCache.savePlaybacks(playbacks, watermark: watermark, store: store)
+            } else {
+                playbacks = playbackSnapshot?.playbacks ?? []
+            }
         }
 
         // Simkl has no separate "next up" playback feed. Build the same

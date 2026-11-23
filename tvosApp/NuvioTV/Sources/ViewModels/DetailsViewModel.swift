@@ -613,7 +613,7 @@ class DetailsViewModel: ObservableObject {
             do {
                 // The viewer waits on it: AniList asks go ahead of Home rows and lists.
                 let meta = try await AniListClient.$isInteractive.withValue(true) {
-                    try await repository.getMetadata(id: id, type: type)
+                    try await self.repository.getMetadata(id: id, type: type)
                 }
                 guard !Task.isCancelled,
                       self.detailsRequestGeneration == requestGeneration else { return }
@@ -947,8 +947,9 @@ class DetailsViewModel: ObservableObject {
                 // A MyAnimeList title's Related row: the pictures MAL's relations lack.
                 self.fillMALRelatedPictures(for: meta, generation: generation)
                 await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
+                    guard let self else { return }
                     await MainActor.run {
-                        self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
+                        self.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
                     }
                 }
                 // In the selected library under the IMDb/TMDB ids it maps to.
@@ -1021,10 +1022,11 @@ class DetailsViewModel: ObservableObject {
                 }
 
                 // 4. External Ratings (MDBList & Add-ons, and an anime's AniList score)
-                group.addTask {
+                group.addTask { [weak self] in
                     await Self.progressiveRatings(for: meta) { [weak self] ratings, complete in
+                        guard let self else { return }
                         await MainActor.run {
-                            self?.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
+                            self.applyRatings(ratings, complete: complete, for: meta.id, generation: generation)
                         }
                     }
                 }

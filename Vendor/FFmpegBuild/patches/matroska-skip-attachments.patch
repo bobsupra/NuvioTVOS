@@ -1,0 +1,89 @@
+matroskadec: option to skip the attached files while opening
+
+A Matroska file can carry attached files, in practice the fonts its ASS
+subtitles are styled with. Anime releases attach tens of megabytes of
+them, and the demuxer reads every byte while it opens the file, whether
+the Attachments element sits before the first Cluster (where mkvmerge
+and lavf write it) or behind the Clusters, reached through the SeekHead
+(where mkvpropedit appends it). Over a network origin the open
+waits on that whole transfer before the first packet (AetherEngine
+issue 956: about 23 MB, about 11 s on a WAN address).
+
+skip_attachments (off by default) skips the element instead: inline it
+is passed over like any element without a syntax, and the SeekHead
+entry pointing at it is not followed. The file opens without attachment
+streams, and Tags that target an attachment are dropped without the
+"non-existent attachment" warning, since their target was skipped on
+purpose. Track streams are created before attachment streams, so stream
+indices and the packet stream are unchanged; measured on 26 MB files
+with 24 MB of fonts in both layouts: about 25.2 MB read to open without
+the option, 0.13 to 0.16 MB with it, identical packets and seeks either
+way.
+
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -439,6 +439,9 @@
+ 
+     /* Bandwidth value for WebM DASH Manifest */
+     int bandwidth;
++
++    /* Skip the Attachments element instead of reading it */
++    int skip_attachments;
+ } MatroskaDemuxContext;
+ 
+ #define CHILD_OF(parent) { .def = { .n = parent } }
+@@ -1475,6 +1478,9 @@
+         }
+ 
+         if (!data && length != EBML_UNKNOWN_LENGTH)
++            goto skip;
++        if (id == MATROSKA_ID_ATTACHMENTS && matroska->skip_attachments &&
++            length != EBML_UNKNOWN_LENGTH)
+             goto skip;
+     }
+ 
+@@ -1871,7 +1877,7 @@
+                     found = 1;
+                 }
+             }
+-            if (!found) {
++            if (!found && !matroska->skip_attachments) {
+                 av_log(s, AV_LOG_WARNING,
+                        "The tags at index %d refer to a "
+                        "non-existent attachment %"PRId64".\n",
+@@ -1982,6 +1988,9 @@
+ 
+         // defer cues parsing until we actually need cue data.
+         if (id == MATROSKA_ID_CUES)
++            continue;
++
++        if (id == MATROSKA_ID_ATTACHMENTS && matroska->skip_attachments)
+             continue;
+ 
+         if (matroska_parse_seekhead_entry(matroska, pos) < 0) {
+@@ -4897,12 +4906,25 @@
+     .read_close     = matroska_read_close,
+ };
+ #endif
++
++static const AVOption matroska_options[] = {
++    { "skip_attachments", "skip the attached files instead of reading them while opening", offsetof(MatroskaDemuxContext, skip_attachments), AV_OPT_TYPE_BOOL, {.i64 = 0}, 0, 1, AV_OPT_FLAG_DECODING_PARAM },
++    { NULL },
++};
+ 
++static const AVClass matroska_class = {
++    .class_name = "matroska,webm demuxer",
++    .item_name  = av_default_item_name,
++    .option     = matroska_options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
+ const FFInputFormat ff_matroska_demuxer = {
+     .p.name         = "matroska,webm",
+     .p.long_name    = NULL_IF_CONFIG_SMALL("Matroska / WebM"),
+     .p.extensions   = "mkv,mk3d,mka,mks,webm",
+     .p.mime_type    = "audio/webm,audio/x-matroska,video/webm,video/x-matroska",
++    .p.priv_class   = &matroska_class,
+     .priv_data_size = sizeof(MatroskaDemuxContext),
+     .flags_internal = FF_INFMT_FLAG_INIT_CLEANUP,
+     .read_probe     = matroska_probe,

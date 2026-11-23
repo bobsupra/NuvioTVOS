@@ -9,6 +9,7 @@ import Metal
 import QuartzCore
 import Combine
 import AetherEngine
+import Darwin
 
 struct MPVHTTPHeaderOptions: Equatable {
     let userAgent: String
@@ -71,9 +72,49 @@ enum MPVBufferedPosition {
 
 enum MPVPlaybackLifecyclePolicy {
     static let restoreFailureMessage = "Playback could not resume after returning to Nuvio."
+    static let pausedInactiveRestoreThreshold: TimeInterval = 15
 
     static func canIssueRestore(pending: Bool, applicationIsActive: Bool, displayIsSafe: Bool) -> Bool {
         pending && applicationIsActive && displayIsSafe
+    }
+
+    static func isPausedWhenResigningActive(
+        hasMPV: Bool,
+        isPlayerPlaying: Bool,
+        mpvIsPaused: Bool,
+        isPlayerEnded: Bool
+    ) -> Bool {
+        hasMPV && !isPlayerEnded && (mpvIsPaused || !isPlayerPlaying)
+    }
+
+    static func shouldRestoreAfterInactiveResign(
+        hasMPV: Bool,
+        isApplicationBackgrounded: Bool,
+        lifecycleRestorePending: Bool,
+        sawMediaServicesReset: Bool,
+        sawInactivePlaybackFailure: Bool,
+        isPlayerEnded: Bool,
+        wasPausedAtResign: Bool,
+        inactiveDuration: TimeInterval?,
+        thresholdSeconds: TimeInterval = pausedInactiveRestoreThreshold
+    ) -> Bool {
+        guard hasMPV, !isPlayerEnded else { return false }
+        if isApplicationBackgrounded || lifecycleRestorePending || sawMediaServicesReset || sawInactivePlaybackFailure {
+            return true
+        }
+        if wasPausedAtResign, let inactiveDuration, inactiveDuration >= thresholdSeconds {
+            return true
+        }
+        return false
+    }
+
+    static func shouldReloadStreamInsteadOfSeek(
+        sawMediaServicesReset: Bool,
+        hasError: Bool,
+        reachedUnexpectedEOF: Bool,
+        isLiveStream: Bool = false
+    ) -> Bool {
+        sawMediaServicesReset || hasError || reachedUnexpectedEOF || isLiveStream
     }
 
     static func updatingSavedPlayIntent(
@@ -885,6 +926,10 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
     }
 
+    var chapterThumbnailsUnavailableForCurrentSource: Bool {
+        externalTrickplayProvider == nil && seekPreviewLaneHost.current?.isDecodeDisabled == true
+    }
+
     /// A chapter's still for the Chapters panel: the external storyboard's (the add-on's
     /// trickplay, the trickplay server or Seekr), else one held near it, else the preview
     /// lane's keyframe; sources the lane does not serve keep the ordinary preview path.
@@ -1173,6 +1218,13 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var wasPlayingBeforeBackground = false
     private var lifecyclePositionMs: Int64?
     private var lifecycleDurationMs: Int64?
+    private var resignedActiveAt: Date?
+    private var wasPausedAtResign = false
+    private var sawMediaServicesReset = false
+    private var needsPostWakePlaybackVerification = false
+    private var didAttemptLifecycleReloadRecovery = false
+    private var lastSubmittedLoadRequest: PlaybackLoadRequest?
+    private var postWakePlayVerifyWorkItem: DispatchWorkItem?
     /// Independent of the UI-facing position, which MPV can overwrite with the
     /// final frame just before tvOS delivers didEnterBackground.
     private var lastVerifiedPositionMs: Int64?
@@ -1422,6 +1474,12 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                                                name: UIApplication.willEnterForegroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
                                                name: UIApplication.didBecomeActiveNotification, object: nil)
+#if os(tvOS) || os(iOS)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleMediaServicesReset),
+                                               name: AVAudioSession.mediaServicesWereResetNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleMediaServicesReset),
+                                               name: AVAudioSession.mediaServicesWereLostNotification, object: nil)
+#endif
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         NotificationCenter.default.addObserver(self, selector: #selector(handleMemoryWarning),
                                                name: UIApplication.didReceiveMemoryWarningNotification, object: nil)
@@ -1431,6 +1489,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private func suspendPlaybackForBackgroundOrInactive() {
         guard mpv != nil else { return }
         guard !isApplicationBackgrounded else { return }
+        resignedActiveAt = nil
+        wasPausedAtResign = false
+        needsPostWakePlaybackVerification = false
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
         let pendingRestoreResumeIntent = lifecycleRestorePending && wasPlayingBeforeBackground
 
         onWillSuspendPlayback?()
@@ -1458,8 +1521,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
         wasPlayingBeforeBackground = pendingRestoreResumeIntent
             || ((mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)) && (lastVerifiedWasPlaying || isPlayerPlaying))
-        lifecyclePositionMs = safePositionMs
-        lifecycleDurationMs = max(referenceDurationMs, durationMs)
+        let isLive = lastSubmittedLoadRequest?.isLiveStream == true
+        lifecyclePositionMs = isLive ? nil : safePositionMs
+        lifecycleDurationMs = isLive ? nil : max(referenceDurationMs, durationMs)
         foregroundRestoreTargetMs = nil
         foregroundRestoreDeadline = nil
         lifecycleRestoreFailed = false
@@ -1493,6 +1557,24 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         // Consume the pending transition before issuing commands so repeated
         // lifecycle notifications cannot restart its seek watchdog.
         lifecycleRestorePending = false
+        let unexpectedEOF = getFlag("eof-reached") && !didReachCleanEndOfFile
+        let hasInactiveError = !currentErrorMessage.isEmpty && !isPlayerEnded
+        let targetForPlan = lifecyclePositionMs
+            ?? lastVerifiedPositionMs
+            ?? milliseconds(from: readDoubleProperty("time-pos"))
+        let isLive = lastSubmittedLoadRequest?.isLiveStream == true
+        if MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+            sawMediaServicesReset: sawMediaServicesReset,
+            hasError: hasInactiveError,
+            reachedUnexpectedEOF: unexpectedEOF,
+            isLiveStream: isLive
+        ), lastSubmittedLoadRequest != nil {
+            let resume = wasPlayingBeforeBackground && watchPartyRemoteIntent == nil
+            wasPlayingBeforeBackground = false
+            reloadLastSubmittedRequest(atMs: isLive ? nil : targetForPlan, resumePlaying: resume)
+            onDidRestorePlayback?()
+            return
+        }
         setStringProperty("vid", "auto")
         clearCleanEndState()
 
@@ -1532,11 +1614,54 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         onDidRestorePlayback?()
     }
 
+    private func reloadLastSubmittedRequest(atMs targetMs: Int64?, resumePlaying: Bool) {
+        guard mpv != nil, var request = lastSubmittedLoadRequest else { return }
+        if !request.isLiveStream, let targetMs {
+            request.resumePositionSeconds = Double(max(targetMs, 0)) / 1000.0
+        }
+        request.playbackRate = currentSpeed
+        request.aspectMode = currentAspectMode
+        request.autoplay = resumePlaying && watchPartyRemoteIntent == nil
+        foregroundRestoreTargetMs = nil
+        foregroundRestoreDeadline = nil
+        lifecycleRestoreFailed = false
+        lifecycleRestorePending = false
+        sawMediaServicesReset = false
+        needsPostWakePlaybackVerification = false
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
+        clearPlaybackError()
+        screensaverDebugLog("[ScreensaverDebug][MPVController] reloadLastSubmittedRequest: targetMs=\(String(describing: targetMs)), autoplay=\(request.autoplay)")
+        load(request)
+    }
+
     @objc private func appWillResignActive() {
-        screensaverDebugLog("[ScreensaverDebug][MPVController] appWillResignActive")
+        if resignedActiveAt == nil {
+            resignedActiveAt = Date()
+            wasPausedAtResign = MPVPlaybackLifecyclePolicy.isPausedWhenResigningActive(
+                hasMPV: mpv != nil,
+                isPlayerPlaying: isPlayerPlaying,
+                mpvIsPaused: getFlag("pause"),
+                isPlayerEnded: isPlayerEnded
+            )
+        }
+        screensaverDebugLog("[ScreensaverDebug][MPVController] appWillResignActive: wasPaused=\(wasPausedAtResign)")
         // Control Center, Siri and system alerts make the app inactive without
         // leaving it. Keep playing, as the Aether path and the Apple TV app do;
-        // only didEnterBackground (Home, another app, sleep) suspends playback.
+        // only didEnterBackground (Home, another app, sleep) or prolonged paused
+        // inactivity / media reset (screensaver) recovers on foreground return.
+    }
+
+    @objc private func handleMediaServicesReset() {
+        sawMediaServicesReset = true
+        screensaverDebugLog("[ScreensaverDebug][MPVController] mediaServicesWereReset received: appState=\(UIApplication.shared.applicationState.rawValue)")
+        guard mpv != nil,
+              UIApplication.shared.applicationState == .active,
+              !isPlayerEnded,
+              lastSubmittedLoadRequest != nil else { return }
+        let targetMs = lastVerifiedPositionMs ?? milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
+        let resume = isPlayerPlaying || !getFlag("pause")
+        reloadLastSubmittedRequest(atMs: targetMs, resumePlaying: resume)
     }
 
     @objc private func enterBackground() {
@@ -1550,7 +1675,52 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     @objc private func appDidBecomeActive() {
-        screensaverDebugLog("[ScreensaverDebug][MPVController] appDidBecomeActive")
+        let inactiveDuration = resignedActiveAt.map { Date().timeIntervalSince($0) }
+        let pausedAcrossResign = wasPausedAtResign
+        screensaverDebugLog("[ScreensaverDebug][MPVController] appDidBecomeActive: pausedAtResign=\(pausedAcrossResign), inactiveDuration=\(inactiveDuration.map { String(format: "%.1fs", $0) } ?? "nil"), mediaReset=\(sawMediaServicesReset), bg=\(isApplicationBackgrounded), pendingRestore=\(lifecycleRestorePending)")
+        guard UIApplication.shared.applicationState == .active else { return }
+        resignedActiveAt = nil
+        wasPausedAtResign = false
+
+        if !isApplicationBackgrounded && !lifecycleRestorePending {
+            let unexpectedEOF = mpv != nil && getFlag("eof-reached") && !didReachCleanEndOfFile
+            let hasInactiveError = !currentErrorMessage.isEmpty && !isPlayerEnded
+            let sawInactiveFailure = unexpectedEOF || hasInactiveError
+            if MPVPlaybackLifecyclePolicy.shouldRestoreAfterInactiveResign(
+                hasMPV: mpv != nil,
+                isApplicationBackgrounded: isApplicationBackgrounded,
+                lifecycleRestorePending: lifecycleRestorePending,
+                sawMediaServicesReset: sawMediaServicesReset,
+                sawInactivePlaybackFailure: sawInactiveFailure,
+                isPlayerEnded: isPlayerEnded,
+                wasPausedAtResign: pausedAcrossResign,
+                inactiveDuration: inactiveDuration
+            ) {
+                let isLive = lastSubmittedLoadRequest?.isLiveStream == true
+                if MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+                    sawMediaServicesReset: sawMediaServicesReset,
+                    hasError: hasInactiveError,
+                    reachedUnexpectedEOF: unexpectedEOF,
+                    isLiveStream: isLive
+                ), lastSubmittedLoadRequest != nil {
+                    let targetMs = lastVerifiedPositionMs ?? milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
+                    let resume = !pausedAcrossResign && lastVerifiedWasPlaying
+                    reloadLastSubmittedRequest(atMs: isLive ? nil : targetMs, resumePlaying: resume)
+                    return
+                }
+                if let sampledDuration = milliseconds(from: readDoubleProperty("duration")) ?? (durationMs > 0 ? durationMs : nil) {
+                    lifecycleDurationMs = max(sampledDuration, lastVerifiedDurationMs ?? 0)
+                }
+                lifecyclePositionMs = lastVerifiedPositionMs ?? milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
+                wasPlayingBeforeBackground = !pausedAcrossResign && lastVerifiedWasPlaying
+                lifecycleRestorePending = true
+                setStringProperty("vid", "no")
+                beginPendingLifecycleRestoreWhenDisplaySafe()
+                return
+            } else if pausedAcrossResign && mpv != nil && !isPlayerEnded {
+                needsPostWakePlaybackVerification = true
+            }
+        }
         restorePlaybackFromBackgroundOrInactive()
     }
 
@@ -1632,6 +1802,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func load(_ request: PlaybackLoadRequest) {
+        lastSubmittedLoadRequest = request
+        resignedActiveAt = nil
+        wasPausedAtResign = false
+        sawMediaServicesReset = false
+        needsPostWakePlaybackVerification = false
+        didAttemptLifecycleReloadRecovery = false
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
         loadfileOpenWitness.reset()
         resetStartupDisplayGateState(clearAnchor: true)
         firstFrameReadiness.reset()
@@ -1801,8 +1979,24 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     func playPlayback() {
         cancelScrubThumbnailWork()
         seekPreviewLaneHost.revokeNetwork()
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
         guard mpv != nil else { return }
         screensaverDebugLog("[ScreensaverDebug][MPVController] playPlayback() called: pos=\(positionMs)ms")
+        let unexpectedEOF = getFlag("eof-reached") && !didReachCleanEndOfFile
+        let hasError = !currentErrorMessage.isEmpty && !isPlayerEnded
+        let isLive = lastSubmittedLoadRequest?.isLiveStream == true
+        if !lifecycleRestorePending,
+           MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+               sawMediaServicesReset: sawMediaServicesReset,
+               hasError: hasError,
+               reachedUnexpectedEOF: unexpectedEOF,
+               isLiveStream: isLive
+           ), lastSubmittedLoadRequest != nil {
+            let targetMs = lastVerifiedPositionMs ?? milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
+            reloadLastSubmittedRequest(atMs: isLive ? nil : targetMs, resumePlaying: true)
+            return
+        }
         wasPlayingBeforeBackground = MPVPlaybackLifecyclePolicy.updatingSavedPlayIntent(
             currentIntent: wasPlayingBeforeBackground,
             restoreIsPending: lifecycleRestorePending,
@@ -1810,10 +2004,35 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         )
         lastVerifiedWasPlaying = true
         setFlag("pause", false)
+        if needsPostWakePlaybackVerification, lastSubmittedLoadRequest != nil {
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let mpv = self.mpv else { return }
+                _ = mpv
+                self.postWakePlayVerifyWorkItem = nil
+                guard self.needsPostWakePlaybackVerification,
+                      !self.isPlayerEnded,
+                      !self.isPlayerPlaying,
+                      !self.getFlag("pause"),
+                      UIApplication.shared.applicationState == .active else { return }
+                let eof = self.getFlag("eof-reached") && !self.didReachCleanEndOfFile
+                let errored = !self.currentErrorMessage.isEmpty
+                let stalledIdle = self.getFlag("core-idle")
+                    && !self.getFlag("paused-for-cache")
+                    && !self.getFlag("seeking")
+                guard self.sawMediaServicesReset || eof || errored || stalledIdle else { return }
+                let targetMs = self.lastVerifiedPositionMs ?? self.milliseconds(from: self.readDoubleProperty("time-pos")) ?? self.positionMs
+                self.reloadLastSubmittedRequest(atMs: targetMs, resumePlaying: true)
+            }
+            postWakePlayVerifyWorkItem = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8, execute: work)
+        }
     }
 
     func pausePlayback() {
         guard mpv != nil else { return }
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
+        needsPostWakePlaybackVerification = false
         screensaverDebugLog("[ScreensaverDebug][MPVController] pausePlayback() called: pos=\(positionMs)ms")
         wasPlayingBeforeBackground = MPVPlaybackLifecyclePolicy.updatingSavedPlayIntent(
             currentIntent: wasPlayingBeforeBackground,
@@ -1838,6 +2057,25 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func seekToMs(_ ms: Int64, exact: Bool) {
         guard mpv != nil else { return }
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
+        let targetMs = max(0, ms)
+        if lifecycleRestorePending {
+            lifecyclePositionMs = targetMs
+        }
+        let unexpectedEOF = getFlag("eof-reached") && !didReachCleanEndOfFile
+        let hasError = !currentErrorMessage.isEmpty && !isPlayerEnded
+        if !lifecycleRestorePending,
+           MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+               sawMediaServicesReset: sawMediaServicesReset,
+               hasError: hasError,
+               reachedUnexpectedEOF: unexpectedEOF
+           ), lastSubmittedLoadRequest != nil {
+            let resume = isPlayerPlaying || !getFlag("pause")
+            rememberExplicitSeek(to: targetMs)
+            reloadLastSubmittedRequest(atMs: targetMs, resumePlaying: resume)
+            return
+        }
 #if NUVIO_MPV_MEMORY_WATCHDOG && os(tvOS)
         memoryWatchdog.record(event: "seek")
 #endif
@@ -1846,15 +2084,15 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let now = CFAbsoluteTimeGetCurrent()
         activeSeekWatchdog = ActiveSeekWatchdog(
             id: seekId,
-            targetMs: ms,
+            targetMs: targetMs,
             initialPositionMs: positionMs,
             startTime: now
         )
-        screensaverDebugLog("[ScreensaverDebug][MPVController] seekToMs(\(ms)) called: currentPos=\(positionMs)ms")
-        seekWatchdogLog("[SeekWatchdog][#\(seekId)] ⏩ Seek started -> target: \(ms)ms (current: \(positionMs)ms, duration: \(durationMs)ms, isLocalCache: \(isLocalOrDiskCacheStream))")
+        screensaverDebugLog("[ScreensaverDebug][MPVController] seekToMs(\(targetMs)) called: currentPos=\(positionMs)ms")
+        seekWatchdogLog("[SeekWatchdog][#\(seekId)] ⏩ Seek started -> target: \(targetMs)ms (current: \(positionMs)ms, duration: \(durationMs)ms, isLocalCache: \(isLocalOrDiskCacheStream))")
         subtitleTranslationState.cancelPendingTranslations()
-        rememberExplicitSeek(to: ms)
-        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), exact ? "absolute+exact" : "absolute+keyframes"])
+        rememberExplicitSeek(to: targetMs)
+        command("seek", args: [String(format: "%.3f", Double(targetMs) / 1000.0), exact ? "absolute+exact" : "absolute+keyframes"])
     }
 
     func seekByMs(_ ms: Int64) {
@@ -2221,22 +2459,78 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         mpv_set_property(mpv, "volume", MPV_FORMAT_DOUBLE, &value)
     }
 
+    private static var supportedFiltersCache: [String: Bool] = [:]
+    private static let supportedFiltersLock = NSLock()
+
+    private func isAudioFilterSupported(_ filterName: String) -> Bool {
+        Self.supportedFiltersLock.lock()
+        if let cached = Self.supportedFiltersCache[filterName] {
+            Self.supportedFiltersLock.unlock()
+            return cached
+        }
+        Self.supportedFiltersLock.unlock()
+
+        typealias GetLavfiFilters = @convention(c) () -> UnsafeMutablePointer<UnsafePointer<CChar>?>?
+        var isSupported = false
+        if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "mp_get_lavfi_filters") {
+            let fn = unsafeBitCast(sym, to: GetLavfiFilters.self)
+            if let list = fn() {
+                var index = 0
+                while let ptr = list[index] {
+                    if String(cString: ptr) == filterName {
+                        isSupported = true
+                        break
+                    }
+                    index += 1
+                }
+            }
+        }
+
+        Self.supportedFiltersLock.lock()
+        Self.supportedFiltersCache[filterName] = isSupported
+        Self.supportedFiltersLock.unlock()
+        return isSupported
+    }
+
     func setAudioProcessing(dialogue: EnhanceDialogueMode, reduceLoud: Bool) {
         guard let mpv else { return }
         var filters: [String] = []
+        let hasDynAudNorm = isAudioFilterSupported("dynaudnorm")
+        let hasACompressor = isAudioFilterSupported("acompressor")
+
         switch dialogue {
         case .off:
             break
         case .enhance:
-            filters.append("lavfi=[dynaudnorm=f=150:g=15:m=10.0]")
+            if hasDynAudNorm {
+                filters.append("lavfi=[dynaudnorm=f=150:g=15:m=10.0]")
+            } else {
+                filters.append("equalizer=f=1500:width_type=o:width=1.5:g=6")
+            }
         case .boost:
-            filters.append("lavfi=[dynaudnorm=f=100:g=21:m=20.0],equalizer=f=1500:width_type=o:width=1.5:g=8")
+            if hasDynAudNorm {
+                filters.append("lavfi=[dynaudnorm=f=100:g=21:m=20.0],equalizer=f=1500:width_type=o:width=1.5:g=8")
+            } else {
+                filters.append("equalizer=f=1500:width_type=o:width=1.5:g=8,volume=volume=2dB")
+            }
         }
         if reduceLoud {
-            filters.append("lavfi=[acompressor=threshold=-20dB:ratio=4:attack=50:release=1000]")
+            if hasACompressor {
+                filters.append("lavfi=[acompressor=threshold=-20dB:ratio=4:attack=50:release=1000]")
+            } else {
+                filters.append("volume=volume=-3dB")
+            }
         }
         let filterString = filters.joined(separator: ",")
-        mpv_set_property_string(mpv, "af", filterString)
+        if !filterString.isEmpty {
+            let status = mpv_set_property_string(mpv, "af", filterString)
+            if status < 0 {
+                let fallback = dialogue == .off ? "" : "equalizer=f=1500:width_type=o:width=1.5:g=6"
+                mpv_set_property_string(mpv, "af", fallback)
+            }
+        } else {
+            mpv_set_property_string(mpv, "af", "")
+        }
     }
 
     // MARK: - Track selection
@@ -2392,6 +2686,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     func destroyPlayer() {
+        lastSubmittedLoadRequest = nil
+        resignedActiveAt = nil
+        wasPausedAtResign = false
+        sawMediaServicesReset = false
+        needsPostWakePlaybackVerification = false
+        didAttemptLifecycleReloadRecovery = false
+        postWakePlayVerifyWorkItem?.cancel()
+        postWakePlayVerifyWorkItem = nil
         loadfileOpenWitness.reset()
         chapters = []
         chapterListKey = ""
@@ -2493,6 +2795,15 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             )
 
             if !restored {
+                if !didAttemptLifecycleReloadRecovery,
+                   lastSubmittedLoadRequest != nil,
+                   let deadline = foregroundRestoreDeadline,
+                   Date() >= deadline {
+                    didAttemptLifecycleReloadRecovery = true
+                    let resume = lastVerifiedWasPlaying || !getFlag("pause")
+                    reloadLastSubmittedRequest(atMs: target, resumePlaying: resume)
+                    return
+                }
                 if !lifecycleRestoreFailed,
                    let deadline = foregroundRestoreDeadline,
                    Date() >= deadline {
@@ -2505,6 +2816,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                 return
             }
 
+            didAttemptLifecycleReloadRecovery = false
             lifecycleRestoreFailed = false
             clearLifecycleRestoreFailure()
             foregroundRestoreTargetMs = nil
@@ -2520,6 +2832,12 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             || seeking
             || bufferingCache
         isPlayerPlaying = !paused && !idle && !eofReached
+        if isPlayerPlaying && !isPlayerLoading {
+            needsPostWakePlaybackVerification = false
+            didAttemptLifecycleReloadRecovery = false
+            postWakePlayVerifyWorkItem?.cancel()
+            postWakePlayVerifyWorkItem = nil
+        }
         // Accept completion only after MPV's END_FILE event explicitly reports
         // EOF. The eof-reached property can race ahead of an END_FILE error.
         isPlayerEnded = eofReached

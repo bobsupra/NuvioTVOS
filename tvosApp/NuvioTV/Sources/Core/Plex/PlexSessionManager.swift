@@ -445,7 +445,7 @@ final class PlexSessionManager: ObservableObject {
                     previousMarkers: server.libraryChangeMarkers ?? [:],
                     knownOversized: server.oversizedLibraries ?? [:],
                     force: force,
-                    onProgress: { found, libraryName in
+                    onProgress: { [weak self] found, libraryName in
                         Task { @MainActor [weak self] in
                             guard let self, case .syncing = self.syncStates[serverID] else { return }
                             self.syncStates[serverID] = .syncing(found: found, library: libraryName)

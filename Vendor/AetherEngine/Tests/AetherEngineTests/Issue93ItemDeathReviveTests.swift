@@ -169,5 +169,52 @@ struct ItemDeathRecoveryTransportTests {
         #expect(body.contains("if host.transportIntentIsPlaying { host.play() }"))
         #expect(!body.contains("\n        host.play()\n"))
     }
+
+    @Test("Held inactive recovery, media reset, or failed item signals foreground session recovery")
+    func inactiveRecoverySignalsForegroundSessionRecovery() throws {
+        let engine = try AetherEngine()
+        #expect(!engine.needsForegroundSessionRecovery)
+
+        #expect(AetherEngine.shouldRecoverSessionOnForeground(
+            needsForegroundVideoRestore: false,
+            pendingInactiveRecovery: true,
+            hasLoadedSession: false,
+            mediaServicesResetPending: false,
+            isErrorState: false,
+            nativeItemFailed: false
+        ))
+        #expect(AetherEngine.shouldRecoverSessionOnForeground(
+            needsForegroundVideoRestore: false,
+            pendingInactiveRecovery: false,
+            hasLoadedSession: true,
+            mediaServicesResetPending: true,
+            isErrorState: false,
+            nativeItemFailed: false
+        ))
+        #expect(AetherEngine.shouldRecoverSessionOnForeground(
+            needsForegroundVideoRestore: false,
+            pendingInactiveRecovery: false,
+            hasLoadedSession: true,
+            mediaServicesResetPending: false,
+            isErrorState: true,
+            nativeItemFailed: false
+        ))
+        #expect(AetherEngine.shouldRecoverSessionOnForeground(
+            needsForegroundVideoRestore: false,
+            pendingInactiveRecovery: false,
+            hasLoadedSession: true,
+            mediaServicesResetPending: false,
+            isErrorState: false,
+            nativeItemFailed: true
+        ))
+        #expect(!AetherEngine.shouldRecoverSessionOnForeground(
+            needsForegroundVideoRestore: false,
+            pendingInactiveRecovery: false,
+            hasLoadedSession: false,
+            mediaServicesResetPending: true,
+            isErrorState: true,
+            nativeItemFailed: true
+        ))
+    }
 }
 

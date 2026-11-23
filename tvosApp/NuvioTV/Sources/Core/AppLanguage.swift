@@ -326,6 +326,11 @@ enum L10n {
         String(format: formatTemplate(key, fallback: fallback), locale: AppLocaleManager.shared.locale, arguments: args)
     }
 
+    /// Returns a resolved Objective-C/Foundation format string suitable for formatting off the main thread.
+    static func resolvedFormatTemplate(_ key: String, fallback: String) -> String {
+        formatTemplate(key, fallback: fallback)
+    }
+
     /// Converted templates by key, for the active table. Cards format their labels ("12m left")
     /// every time they redraw; the nine replacements per call showed up in main-thread samples
     /// on an Apple TV.

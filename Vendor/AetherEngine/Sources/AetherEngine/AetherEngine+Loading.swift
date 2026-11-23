@@ -1937,6 +1937,7 @@ extension AetherEngine {
                           host.endFailureCount == count else { return }
                     #if os(iOS) || os(tvOS)
                     if UIApplication.shared.applicationState != .active || self.isBackgrounded {
+                        self.pendingInactiveRecovery = true
                         EngineLog.emit(
                             "[AetherEngine] #93 item death (failedToPlayToEndTime) held because application is inactive/backgrounded",
                             category: .engine)

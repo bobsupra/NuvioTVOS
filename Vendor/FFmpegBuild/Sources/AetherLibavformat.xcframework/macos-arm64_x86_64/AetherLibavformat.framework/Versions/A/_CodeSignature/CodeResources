@@ -8,6 +8,10 @@
 		<data>
 		ZTz+zKUyhOUjrLJ2WtRErDhX8WM=
 		</data>
+		<key>Resources/PrivacyInfo.xcprivacy</key>
+		<data>
+		KOw6Qocvj5hCgGtcWRNmQtI9IJs=
+		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
@@ -51,6 +55,13 @@
 			<key>hash2</key>
 			<data>
 			y99I0xujfHWca9fCh5U5T1nrDDEjEn6cUn/VsoaCepQ=
+			</data>
+		</dict>
+		<key>Resources/PrivacyInfo.xcprivacy</key>
+		<dict>
+			<key>hash2</key>
+			<data>
+			cz+xMpaK7wBYgn8wle0BN8SqaBC06fmYTR0y1gTKx00=
 			</data>
 		</dict>
 	</dict>

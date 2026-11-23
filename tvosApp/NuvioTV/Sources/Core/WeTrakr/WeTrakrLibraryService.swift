@@ -35,8 +35,9 @@ enum WeTrakrLibraryService {
         requireSuccessfulResponses: Bool = false,
         tokenStorage: WeTrakrTokenStorage = WeTrakrKeychainTokenStorage(),
         profileScope: String? = nil,
-        client: WeTrakrAPIClient = WeTrakrLibraryService.client
+        client: WeTrakrAPIClient? = nil
     ) async -> [LibraryStoreItem]? {
+        let client = client ?? Self.client
         guard let token = WeTrakrRuntimeSession.authenticatedState(
             store: store, tokenStorage: tokenStorage, profileScope: profileScope
         )?.accessToken,
@@ -106,8 +107,9 @@ enum WeTrakrLibraryService {
         store: UserDefaults = ProfileSettings.current,
         profileScope: String? = nil,
         tokenStorage: WeTrakrTokenStorage = WeTrakrKeychainTokenStorage(),
-        client: WeTrakrAPIClient = WeTrakrLibraryService.client
+        client: WeTrakrAPIClient? = nil
     ) async -> Bool {
+        let client = client ?? Self.client
         guard let token = WeTrakrRuntimeSession.authenticatedState(
             store: store, tokenStorage: tokenStorage, profileScope: profileScope
         )?.accessToken,

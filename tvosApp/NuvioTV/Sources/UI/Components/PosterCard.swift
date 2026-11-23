@@ -428,7 +428,7 @@ struct PosterCard: View {
             )
             waited = 0.35
         }
-        guard effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
+        guard effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard, meta.supportsTrailerLookup else { return }
         // The trailer's delay counts from when this task started (focus landing, or the card
         // turning landscape), as before.
         let delay = max(0, Double(min(15, max(0, trailerDelay))) - waited)
@@ -437,7 +437,7 @@ struct PosterCard: View {
         } catch {
             return
         }
-        guard !Task.isCancelled, isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
+        guard !Task.isCancelled, isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard, meta.supportsTrailerLookup else { return }
         isTrailerPreviewActive = true
     }
     #endif
@@ -485,7 +485,7 @@ struct PosterCard: View {
             .overlay {
                 // Prepare during the delay, but keep playback and visibility
                 // gated by isTrailerPreviewActive until the timer completes.
-                if isFocused && effectiveLandscape && trailersEnabled
+                if isFocused && effectiveLandscape && trailersEnabled && meta.supportsTrailerLookup
                     && !isContinueOrUpcomingCard && !didFinishTrailerPreview {
                     TrailerPreviewPlayer(
                         meta: meta,
@@ -946,6 +946,72 @@ struct PosterCard: View {
         )
     }
 
+    static func preferredArtworkRequest(
+        meta: NuvioMeta,
+        tileShape: CollectionTileShape,
+        homeLayout: String,
+        isContinueOrUpcomingCard: Bool = false,
+        continueEpisodeText: String? = nil,
+        continueEpisodeArtworkURL: String? = nil,
+        customPosterURLPattern: String = "",
+        customPosterScreen: CustomPosterScreen = .home,
+        customPosterEnabledScreens: String = "all",
+        displayScale: CGFloat = 2.0
+    ) -> PosterArtworkCache.PrefetchRequest? {
+        let effectiveLayout = homeLayout == "Classic" ? "Modern" : homeLayout
+        let cardHeight: CGFloat = effectiveLayout == "Compact" ? 255 : 315
+        let isAlwaysLandscape = tileShape == .landscape
+        let width: CGFloat
+        let rawURL: String?
+
+        if isAlwaysLandscape {
+            width = effectiveLayout == "Compact" ? 454 : 560
+            if continueEpisodeText != nil,
+               let continueEpisodeArtworkURL, !continueEpisodeArtworkURL.isEmpty {
+                rawURL = continueEpisodeArtworkURL
+            } else {
+                rawURL = CustomPosterURLResolver.resolve(
+                    pattern: customPosterURLPattern,
+                    meta: meta,
+                    screen: customPosterScreen,
+                    enabledScreens: customPosterEnabledScreens,
+                    shape: "landscape"
+                ) ?? resolvedLandscapeArtworkURL(
+                    meta: meta,
+                    isEffectivelyAlwaysLandscape: true,
+                    continueEpisodeText: continueEpisodeText,
+                    continueEpisodeArtworkURL: continueEpisodeArtworkURL
+                )
+            }
+        } else if tileShape == .square || meta.tileShape == .square {
+            width = cardHeight
+            rawURL = CustomPosterURLResolver.resolve(
+                pattern: customPosterURLPattern,
+                meta: meta,
+                screen: customPosterScreen,
+                enabledScreens: customPosterEnabledScreens,
+                shape: "square"
+            ) ?? meta.posterUrl
+        } else {
+            width = effectiveLayout == "Compact" ? 170 : 210
+            rawURL = CustomPosterURLResolver.resolve(
+                pattern: customPosterURLPattern,
+                meta: meta,
+                screen: customPosterScreen,
+                enabledScreens: customPosterEnabledScreens,
+                shape: "poster"
+            ) ?? meta.posterUrl
+        }
+
+        guard let trimmed = rawURL?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !trimmed.isEmpty,
+              let url = URL(string: trimmed) else {
+            return nil
+        }
+        let maxPixelSize = max(160, Int(ceil(max(width, cardHeight) * displayScale)))
+        return PosterArtworkCache.PrefetchRequest(url: url, maxPixelSize: maxPixelSize)
+    }
+
     static func resolvedLandscapeArtworkURL(
         meta: NuvioMeta,
         isEffectivelyAlwaysLandscape: Bool,
@@ -1175,6 +1241,7 @@ extension PosterCard: Equatable {
             && lhs.meta.tmdbId == rhs.meta.tmdbId
             && lhs.meta.type == rhs.meta.type
             && lhs.meta.trailerYtIds == rhs.meta.trailerYtIds
+            && lhs.meta.trailerStreams == rhs.meta.trailerStreams
             && lhs.isLandscape == rhs.isLandscape
             && lhs.isAlwaysLandscape == rhs.isAlwaysLandscape
             && lhs.tileShape == rhs.tileShape
@@ -1372,6 +1439,7 @@ struct TrailerPreviewPlayer: View {
     @State private var player = AVPlayer()
     @State private var isRenderReady = false
     @State private var currentPlaybackSource: TrailerPlaybackSource?
+    @State private var diagnosticObserver: TrailerAVPlayerDiagnosticObserver?
     @State private var timeObserverToken: Any?
     @State private var itemStatusObserver: NSKeyValueObservation?
     @State private var failedToEndObserver: NSObjectProtocol?
@@ -1426,6 +1494,8 @@ struct TrailerPreviewPlayer: View {
         .onDisappear {
             playbackActiveOverride = false
             isRenderReady = false
+            diagnosticObserver?.invalidate()
+            diagnosticObserver = nil
             cleanupTimeObserver()
             cleanupFailureObservers()
             let seconds = player.currentTime().seconds
@@ -1442,7 +1512,8 @@ struct TrailerPreviewPlayer: View {
     }
 
     private var previewIdentity: String {
-        "\(meta.id)\u{1f}\(meta.trailerYtIds?.joined(separator: ",") ?? "")"
+        let streams = meta.trailerStreams?.map(\.url).joined(separator: ",") ?? ""
+        return "\(meta.id)\u{1f}\(meta.trailerYtIds?.joined(separator: ",") ?? "")\u{1f}\(streams)\u{1f}\(TrailerSettings.resolutionIdentity())"
     }
 
     private var isVisible: Bool {
@@ -1458,23 +1529,32 @@ struct TrailerPreviewPlayer: View {
         isRenderReady = false
         didReportUnavailable = false
         isPlaybackUnavailable = false
+        diagnosticObserver?.invalidate()
+        diagnosticObserver = nil
 
-        guard let playbackSource = await resolver.resolvePreview(for: meta) else {
-            guard !Task.isCancelled else { return }
+        let playbackSource = await resolver.resolvePreview(for: meta)
+        guard !Task.isCancelled else { return }
+        let diagToken = TrailerPlaybackDiagnostics.shared.recordResolution(
+            meta: meta,
+            context: "Card Preview",
+            source: playbackSource
+        )
+        guard let playbackSource else {
             reportPlaybackUnavailable()
             return
         }
-        guard !Task.isCancelled else { return }
 
         currentPlaybackSource = playbackSource
 
         guard let item = playbackSource.makePlayerItem(preferredForwardBufferDuration: 2.0) else {
+            TrailerPlaybackDiagnostics.shared.recordPlaybackFailed(token: diagToken, errorDescription: "Invalid trailer URL")
             guard !Task.isCancelled else { return }
             reportPlaybackUnavailable()
             return
         }
         guard !Task.isCancelled else { return }
 
+        diagnosticObserver = TrailerAVPlayerDiagnosticObserver(item: item, token: diagToken)
         player.replaceCurrentItem(with: item)
         observePlaybackFailure(for: item)
         applySoundPreference(soundEnabled)
@@ -2247,7 +2327,7 @@ struct CachedPosterArtwork<Placeholder: View>: View {
     var body: some View {
         if singleTask {
             artwork
-                .task(id: "\(cacheKey)\u{1}\(preloadCacheKey)") {
+                .task(id: "\(cacheKey)\u{1}\(preloadCacheKey ?? "")") {
                     await load()
                     await preload()
                 }
@@ -2545,6 +2625,43 @@ actor PosterArtworkCache {
         let cost = image.decodedByteCost
         cache.setObject(image, forKey: key, cost: cost)
         Self.tracker.recordInsertion(cost: cost)
+    }
+
+    struct PrefetchRequest: Hashable, Sendable {
+        let url: URL
+        let maxPixelSize: Int
+    }
+
+    /// Pre-warms memory/disk caches for upcoming Home posters while keeping
+    /// concurrent work bounded and deduplicated through `image(for:maxPixelSize:)`.
+    func prefetch(_ requests: [PrefetchRequest], maxConcurrent: Int = 3) async {
+        guard !requests.isEmpty, !Task.isCancelled else { return }
+        var unique: [PrefetchRequest] = []
+        unique.reserveCapacity(requests.count)
+        var seen = Set<String>()
+        for request in requests {
+            let key = Self.memoryKey(for: request.url, maxPixelSize: request.maxPixelSize) as String
+            if seen.insert(key).inserted,
+               cachedImage(for: request.url, maxPixelSize: request.maxPixelSize) == nil {
+                unique.append(request)
+            }
+        }
+        guard !unique.isEmpty, !Task.isCancelled else { return }
+
+        await withTaskGroup(of: Void.self) { group in
+            var iterator = unique.makeIterator()
+            func enqueueNext() {
+                guard !Task.isCancelled, let request = iterator.next() else { return }
+                group.addTask(priority: .background) {
+                    _ = await self.image(for: request.url, maxPixelSize: request.maxPixelSize)
+                }
+            }
+            let limit = max(1, min(maxConcurrent, unique.count))
+            for _ in 0..<limit { enqueueNext() }
+            while await group.next() != nil {
+                enqueueNext()
+            }
+        }
     }
 
     func image(for url: URL, maxPixelSize: Int) async -> UIImage? {

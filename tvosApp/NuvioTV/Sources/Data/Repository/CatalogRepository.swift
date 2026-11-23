@@ -728,7 +728,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if meta.isSeries {
             return meta.videos?.isEmpty == false
         } else {
-            return (meta.tmdbId != nil && meta.tmdbId! > 0) || (meta.director != nil && !meta.director!.isEmpty) || (meta.trailerYtIds != nil && !meta.trailerYtIds!.isEmpty)
+            return (meta.tmdbId != nil && meta.tmdbId! > 0)
+                || (meta.director != nil && !meta.director!.isEmpty)
+                || (meta.trailerYtIds != nil && !meta.trailerYtIds!.isEmpty)
+                || (meta.trailerStreams != nil && !meta.trailerStreams!.isEmpty)
         }
     }
 
@@ -2927,6 +2930,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         status: existing.status ?? item.status,
                         videos: existing.videos ?? item.videos,
                         trailerYtIds: existing.trailerYtIds ?? item.trailerYtIds,
+                        trailerStreams: existing.trailerStreams ?? item.trailerStreams,
                         externalRatings: existing.externalRatings ?? item.externalRatings,
                         posterShape: resolvedPosterShape,
                         isFromAddon: resolvedIsFromAddon,
@@ -4154,6 +4158,7 @@ struct CinemetaMeta: Decodable {
             status: status,
             videos: videos?.compactMap { $0.toVideo() },
             trailerYtIds: trailerYtIds,
+            trailerStreams: directTrailerStreams,
             externalRatings: nil,
             posterShape: posterShape,
             isFromAddon: nil,
@@ -4173,9 +4178,45 @@ struct CinemetaMeta: Decodable {
 
     private var trailerYtIds: [String] {
         var seen: Set<String> = []
-        return ((trailers?.compactMap { $0.youtubeId } ?? []) +
-                (trailerStreams?.compactMap { $0.ytId?.trimmedNonEmpty } ?? []))
+        let trailerIds = trailers?.compactMap { $0.youtubeId } ?? []
+        let streamYtIds = trailerStreams?.compactMap { stream -> String? in
+            if let directYt = stream.ytId?.trimmedNonEmpty {
+                return directYt
+            }
+            if let rawUrl = stream.url?.trimmedNonEmpty,
+               let parsedUrl = URL(string: rawUrl) {
+                return YouTubeTrailerResolver.youtubeVideoId(from: parsedUrl)
+            }
+            return nil
+        } ?? []
+        return (trailerIds + streamYtIds)
             .filter { YouTubeTrailerResolver.isYouTubeVideoId($0) && seen.insert($0).inserted }
+    }
+
+    private var directTrailerStreams: [NuvioTrailerStream]? {
+        guard let trailerStreams, !trailerStreams.isEmpty else { return nil }
+        var seen: Set<String> = []
+        let resolved = trailerStreams.compactMap { stream -> NuvioTrailerStream? in
+            guard let rawUrl = stream.url?.trimmedNonEmpty,
+                  let parsedUrl = URL(string: rawUrl),
+                  let scheme = parsedUrl.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  !YouTubeTrailerResolver.isYouTubePageURL(parsedUrl),
+                  seen.insert(rawUrl).inserted else {
+                return nil
+            }
+            let headers = stream.behaviorHints?.proxyHeaders?.request?.filter {
+                !$0.key.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    && !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            return NuvioTrailerStream(
+                url: rawUrl,
+                title: stream.title?.trimmedNonEmpty,
+                name: stream.name?.trimmedNonEmpty,
+                requestHeaders: headers?.isEmpty == false ? headers : nil
+            )
+        }
+        return resolved.isEmpty ? nil : resolved
     }
 
     private var parsedYear: Int? {
@@ -4239,6 +4280,23 @@ struct CinemetaTrailer: Decodable {
 
 struct CinemetaTrailerStream: Decodable {
     let ytId: String?
+    let url: String?
+    let title: String?
+    let name: String?
+    let behaviorHints: StreamAddonBehaviorHints?
+
+    enum CodingKeys: String, CodingKey {
+        case ytId, url, title, name, behaviorHints
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        ytId = try? container.decodeIfPresent(String.self, forKey: .ytId)
+        url = try? container.decodeIfPresent(String.self, forKey: .url)
+        title = try? container.decodeIfPresent(String.self, forKey: .title)
+        name = try? container.decodeIfPresent(String.self, forKey: .name)
+        behaviorHints = try? container.decodeIfPresent(StreamAddonBehaviorHints.self, forKey: .behaviorHints)
+    }
 }
 
 struct CinemetaVideo: Decodable {

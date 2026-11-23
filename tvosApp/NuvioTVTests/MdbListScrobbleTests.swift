@@ -168,6 +168,7 @@ final class MdbListScrobbleTests: XCTestCase {
     }
 
     func testPlaybackSnapshotMapsMovieAndEpisodeAndUsesRuntime() async throws {
+        defaults.set(TraktDefaults.continueWatchingDaysCapAll, forKey: SettingsKey.traktContinueWatchingDaysCap)
         MdbListURLProtocolStub.handler = { request in
             XCTAssertEqual(request.url?.path, "/sync/playback")
             return Self.response(
@@ -956,6 +957,16 @@ final class MdbListScrobbleTests: XCTestCase {
         let repo = MdbListCatalogRepository()
         repo.customMeta["tt0903747"] = showMeta
 
+        let oldHistory = await MdbListProgressService.fetchContinueWatching(
+            repository: repo,
+            store: defaults,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        XCTAssertEqual(oldHistory?.count, 0)
+
+        defaults.set(TraktDefaults.continueWatchingDaysCapAll, forKey: SettingsKey.traktContinueWatchingDaysCap)
         let cw = await MdbListProgressService.fetchContinueWatching(
             repository: repo,
             store: defaults,

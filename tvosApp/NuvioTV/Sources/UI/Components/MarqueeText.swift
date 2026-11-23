@@ -28,7 +28,18 @@ struct MarqueeText: View {
     static let edgeFade: CGFloat = 14
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var activeSince: Date?
+    @State private var isScrolledPhase = false
+    @State private var scrollOffset: CGFloat = 0
+    @State private var isLeadingEdgeFaded = false
+
+    private struct ScrollTaskKey: Equatable {
+        let moving: Bool
+        let overflow: CGFloat
+        let text: String
+        let size: CGFloat
+        let weightValue: CGFloat
+        let minimumScaleFactor: CGFloat
+    }
 
     init(
         _ text: String,
@@ -53,25 +64,104 @@ struct MarqueeText: View {
         GeometryReader { box in
             let overflow = Self.overflow(fullWidth: lineWidth, boxWidth: box.size.width, scale: minimumScaleFactor)
             let moving = isActive && overflow > 0 && !reduceMotion
-            TimelineView(.animation(minimumInterval: nil, paused: !moving)) { context in
-                let elapsed = activeSince.map { context.date.timeIntervalSince($0) } ?? 0
-                let scrolled = moving && elapsed >= Self.startDelay
-                line(
-                    boxWidth: box.size.width,
-                    scrolled: scrolled,
-                    offset: scrolled ? Self.position(elapsed: elapsed, distance: overflow + Self.edgeFade) : 0
-                )
+            let scrolled = moving && isScrolledPhase
+            let taskKey = ScrollTaskKey(
+                moving: moving,
+                overflow: overflow,
+                text: text,
+                size: size,
+                weightValue: Self.uiWeight(weight).rawValue,
+                minimumScaleFactor: minimumScaleFactor
+            )
+            line(
+                boxWidth: box.size.width,
+                scrolled: scrolled,
+                offset: scrolled ? scrollOffset : 0,
+                leadingFadeWidth: scrolled && isLeadingEdgeFaded ? Self.edgeFade : 0
+            )
+            .task(id: taskKey) {
+                await runScrollLoop(moving: moving, overflow: overflow)
+            }
+            .onChange(of: moving) { _, isMoving in
+                guard !isMoving else { return }
+                var reset = Transaction(animation: nil)
+                reset.disablesAnimations = true
+                withTransaction(reset) {
+                    isScrolledPhase = false
+                    scrollOffset = 0
+                    isLeadingEdgeFaded = false
+                }
             }
         }
         .frame(height: Self.lineHeight(size: size, weight: weight))
-        .onChange(of: isActive, initial: true) { _, active in
-            activeSince = active ? Date() : nil
+    }
+
+    @MainActor
+    private func runScrollLoop(moving: Bool, overflow: CGFloat) async {
+        var reset = Transaction(animation: nil)
+        reset.disablesAnimations = true
+        withTransaction(reset) {
+            isScrolledPhase = false
+            scrollOffset = 0
+            isLeadingEdgeFaded = false
+        }
+        guard moving, overflow > 0 else { return }
+
+        do {
+            try await Task.sleep(nanoseconds: UInt64(Self.startDelay * 1_000_000_000))
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+
+        withTransaction(reset) {
+            isScrolledPhase = true
+            scrollOffset = 0
+            isLeadingEdgeFaded = false
+        }
+        // Let SwiftUI install the un-offset fixed-width text before animating on Core Animation.
+        do {
+            try await Task.sleep(nanoseconds: 16_000_000)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled else { return }
+
+        let distance = overflow + Self.edgeFade
+        let outDuration = Double(distance / Self.pointsPerSecond)
+
+        while !Task.isCancelled {
+            withAnimation(.linear(duration: outDuration)) {
+                scrollOffset = distance
+                isLeadingEdgeFaded = true
+            }
+            do {
+                try await Task.sleep(nanoseconds: UInt64((outDuration + Self.restAtEnds) * 1_000_000_000))
+            } catch {
+                break
+            }
+            guard !Task.isCancelled else { break }
+
+            withAnimation(.easeInOut(duration: Self.returnDuration)) {
+                scrollOffset = 0
+                isLeadingEdgeFaded = false
+            }
+            do {
+                try await Task.sleep(nanoseconds: UInt64((Self.returnDuration + Self.restAtEnds) * 1_000_000_000))
+            } catch {
+                break
+            }
         }
     }
 
     @ViewBuilder
-    private func line(boxWidth: CGFloat, scrolled: Bool, offset: CGFloat) -> some View {
-        ZStack(alignment: scrolled ? .leading : alignment) {
+    private func line(
+        boxWidth: CGFloat,
+        scrolled: Bool,
+        offset: CGFloat,
+        leadingFadeWidth: CGFloat
+    ) -> some View {
+        let textContent = ZStack(alignment: scrolled ? .leading : alignment) {
             if scrolled {
                 Text(text)
                     .font(.system(size: size, weight: weight))
@@ -90,18 +180,19 @@ struct MarqueeText: View {
         }
         .frame(width: boxWidth, alignment: scrolled ? .leading : alignment)
         .clipped()
-        .mask {
-            if scrolled {
+
+        if scrolled {
+            textContent.mask {
                 HStack(spacing: 0) {
                     LinearGradient(colors: [.clear, .black], startPoint: .leading, endPoint: .trailing)
-                        .frame(width: offset > 0 ? Self.edgeFade : 0)
+                        .frame(width: leadingFadeWidth)
                     Rectangle()
                     LinearGradient(colors: [.black, .clear], startPoint: .leading, endPoint: .trailing)
                         .frame(width: Self.edgeFade)
                 }
-            } else {
-                Rectangle()
             }
+        } else {
+            textContent
         }
     }
 
@@ -131,10 +222,23 @@ struct MarqueeText: View {
         return 0
     }
 
+    private static let widthCache: NSCache<NSString, NSNumber> = {
+        let cache = NSCache<NSString, NSNumber>()
+        cache.countLimit = 512
+        return cache
+    }()
+
     /// The width of `text` on one line in the system font, as SwiftUI draws `.system(size:weight:)`.
     static func width(of text: String, size: CGFloat, weight: Font.Weight) -> CGFloat {
-        let font = UIFont.systemFont(ofSize: size, weight: uiWeight(weight))
-        return ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        let resolvedWeight = uiWeight(weight)
+        let cacheKey = "\(Int((size * 10).rounded()))|\(resolvedWeight.rawValue)|\(text)" as NSString
+        if let cached = widthCache.object(forKey: cacheKey) {
+            return CGFloat(cached.doubleValue)
+        }
+        let font = UIFont.systemFont(ofSize: size, weight: resolvedWeight)
+        let measured = ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        widthCache.setObject(NSNumber(value: Double(measured)), forKey: cacheKey)
+        return measured
     }
 
     static func lineHeight(size: CGFloat, weight: Font.Weight) -> CGFloat {

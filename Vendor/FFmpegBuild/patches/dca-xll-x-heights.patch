@@ -11,28 +11,50 @@ bed speaker below it (L, R, Lsr, Rsr) at -3 dB, gain code 23170/32768, so the
 7.1 bed plays them on players that ignore the extension.
 
 With the new "x_heights" option the decoder parses that channel set with the
-existing channel set code, outputs 7.1.4 (TFL, TFR, TBL, TBR), and removes
-the fold from the bed at output resolution. The option is off by default;
-without it, and for every stream without the extension, the output is
-unchanged. A frame whose extension does not decode keeps the 7.1.4 layout
-with silent heights and the bed as coded, and the frame still ends where it
-did before. The alternate presentations, which carry objects behind
-DCA_SYNCWORD_XLL_X_IMAX, are not touched.
+existing channel set code and outputs 7.1.4 (TFL, TFR, TBL, TBR): the bed as
+coded, the heights still folded into it, next to the four height channels.
+Nothing is taken out of the bed; how a player separates the heights from it
+is up to the player. The option is off by default; without it, and for every
+stream without the extension, the output is unchanged. A frame whose
+extension does not decode keeps the 7.1.4 layout with silent heights, and the
+frame still ends where it did before.
 
-The format facts (header size, channel order, the fold) come from the public
-analysis in harletty-bridge's dca crate and kristofferR's SpatialAudioBridge;
+The alternate presentations (DCA_SYNCWORD_XLL_X_IMAX and its siblings
+0xF14000D1, D3 and D4; FFmpeg labels the first two "DTS:X IMAX") carry the
+same four fixed heights after one to five object channels. Their extension
+starts with a CRC-protected prefix ended by a marker (a byte naming the
+channel sets that follow, then 34 38 8c 4f 00) and a seven- or eight-byte
+control block, then the object channel set, then the height channel set, whose
+own control block ends right in front of its header with 02 34 38 8c 4f 00.
+The outer control block states the height header's position in two-byte
+units and both control blocks carry a segment geometry (log2 segments, log2
+segment samples, NAVI entry width) for 512 samples. With "x_heights" the
+decoder locates the height channel set this way, checking every header and
+NAVI table against its CRC, decodes it with that geometry (no LSB split, two
+bits where the standard header has its mapping flag) and outputs it like the
+standard presentation's heights. The profiles fold their heights into the
+bed at different gains (D0 at unity, D1 and D3 at -3 dB, measured in the dca
+crate's analysis), so the read-only, exported option "x_presentation" tells a
+player which presentation the last decoded heights came from: 1 for the
+standard one, else the low byte of the alternate syncword. The prefix is only checked against its CRC
+and the object channels are never decoded: they stay where the encoder folded
+them, in the 7.1 bed. A stream whose alternate frames do not carry heights
+keeps its 7.1.
+
+The format facts (header size, channel order, the fold, the alternate layout)
+come from the public analysis in harletty-bridge's dca crate and kristofferR's
+SpatialAudioBridge;
 this is an implementation on FFmpeg's own XLL code, not a translation.
 
 diff --git a/libavcodec/dca_xll.c b/libavcodec/dca_xll.c
-index 6eedad7eb8..f0b0c55fe0 100644
+index 6eedad7..24b971d 100644
 --- a/libavcodec/dca_xll.c
 +++ b/libavcodec/dca_xll.c
-@@ -28,6 +28,15 @@
+@@ -28,6 +28,14 @@
  #include "decode.h"
  #include "unary.h"
  
 +#define DCA_XLL_X_HEADER_SIZE   22
-+#define DCA_XLL_X_HEIGHT_FOLD   23170
 +#define DCA_XLL_X_HEIGHT_MASK   (DCA_SPEAKER_MASK_Lh  | DCA_SPEAKER_MASK_Rh | \
 +                                 DCA_SPEAKER_MASK_Lhr | DCA_SPEAKER_MASK_Rhr)
 +
@@ -43,7 +65,7 @@ index 6eedad7eb8..f0b0c55fe0 100644
  static int get_linear(GetBitContext *gb, int n)
  {
      unsigned int v = get_bits_long(gb, n);
-@@ -142,6 +151,10 @@ static int chs_parse_header(DCAXllDecoder *s, DCAXllChSet *c, DCAExssAsset *asse
+@@ -142,6 +150,10 @@ static int chs_parse_header(DCAXllDecoder *s, DCAXllChSet *c, DCAExssAsset *asse
          avpriv_request_sample(s->avctx, "%d XLL channels", c->nchannels);
          return AVERROR_PATCHWELCOME;
      }
@@ -54,7 +76,7 @@ index 6eedad7eb8..f0b0c55fe0 100644
  
      // Residual type
      c->residual_encode = get_bits(&s->gb, c->nchannels);
-@@ -180,7 +193,21 @@ static int chs_parse_header(DCAXllDecoder *s, DCAXllChSet *c, DCAExssAsset *asse
+@@ -180,7 +192,24 @@ static int chs_parse_header(DCAXllDecoder *s, DCAXllChSet *c, DCAExssAsset *asse
          return AVERROR_PATCHWELCOME;
      }
  
@@ -62,7 +84,10 @@ index 6eedad7eb8..f0b0c55fe0 100644
 +    if (c == &s->x_chset) {
 +        // The height channel set of the DTS:X standard presentation carries
 +        // no speaker mask: its channels are the front and rear height pairs.
-+        if (get_bits1(&s->gb)) {
++        // In an alternate presentation two bits stand in for the flag.
++        if (s->x_alt)
++            skip_bits(&s->gb, 2);
++        else if (get_bits1(&s->gb)) {
 +            avpriv_request_sample(s->avctx, "DTS:X height channel set with mapping coefficients");
 +            return AVERROR_PATCHWELCOME;
 +        }
@@ -77,7 +102,7 @@ index 6eedad7eb8..f0b0c55fe0 100644
          // Primary channel set flag
          c->primary_chset = get_bits1(&s->gb);
          if (c->primary_chset != (c == p)) {
-@@ -264,8 +291,10 @@ static int chs_parse_header(DCAXllDecoder *s, DCAXllChSet *c, DCAExssAsset *asse
+@@ -264,8 +293,10 @@ static int chs_parse_header(DCAXllDecoder *s, DCAXllChSet *c, DCAExssAsset *asse
      c->freq >>= c->nfreqbands - 1;
  
      // Verify that all channel sets have the same audio characteristics
@@ -89,7 +114,7 @@ index 6eedad7eb8..f0b0c55fe0 100644
                     || c->storage_bit_res != p->storage_bit_res)) {
          avpriv_request_sample(s->avctx, "Different XLL audio characteristics");
          return AVERROR_PATCHWELCOME;
-@@ -1050,8 +1079,77 @@ static int parse_band_data(DCAXllDecoder *s)
+@@ -1050,8 +1081,312 @@ static int parse_band_data(DCAXllDecoder *s)
      return 0;
  }
  
@@ -97,18 +122,254 @@ index 6eedad7eb8..f0b0c55fe0 100644
 +// 22-byte header followed by a regular XLL channel set with its own NAVI table,
 +// segmented like the frame's channel sets. Its four channels are the front and
 +// rear height pairs; each is also folded into the 7.1 bed speaker below it at
-+// -3 dB, which ff_dca_xll_filter_frame() removes.
++// -3 dB, and the bed is output as coded.
++static int parse_x_chset(DCAXllDecoder *s, DCAExssAsset *asset, int max_tail_bytes);
++
 +static int parse_x_heights(DCAXllDecoder *s, DCAExssAsset *asset)
 +{
-+    DCAXllChSet *c = &s->x_chset;
-+    int ret, seg, navi_pos, band_pos, navi[1024];
-+
 +    if (s->nfreqbands != 1)
 +        return AVERROR_PATCHWELCOME;
 +
 +    skip_bits_long(&s->gb, DCA_XLL_X_HEADER_SIZE * 8);
 +    if (get_bits_left(&s->gb) < 0)
 +        return AVERROR_INVALIDDATA;
++
++    // A two-byte trailer and up to three bytes of dword padding follow
++    return parse_x_chset(s, asset, 5);
++}
++
++// The alternate presentations (IMAX-labelled streams among them) put one to
++// five object channels and then the same four fixed heights as the standard
++// presentation behind their own syncwords, after a CRC-protected prefix and a
++// control block. Only the height channel set is located and decoded here: the
++// prefix is only checked against its CRC and the object channels are skipped.
++// The heights carry their own segment geometry, read from the control block
++// in front of their header. The layout follows the public analysis in
++// harletty-bridge's dca crate.
++#define DCA_XLL_X_ALT_FRAME_SAMPLES     512
++#define DCA_XLL_X_ALT_MAX_PREFIX        96
++#define DCA_XLL_X_ALT_MIN_PREFIX        16
++#define DCA_XLL_X_ALT_MAX_INTERSTITIAL  20
++
++static const uint8_t x_alt_marker_tail[5] = { 0x34, 0x38, 0x8c, 0x4f, 0x00 };
++
++typedef struct DCAXllXAltGeometry {
++    int nframesegs_log2;
++    int nsegsamples_log2;
++    int seg_size_nbits;
++} DCAXllXAltGeometry;
++
++static int x_alt_crc_ok(const uint8_t *buf, int size)
++{
++    return !av_crc(av_crc_get_table(AV_CRC_16_CCITT), 0xffff, buf, size);
++}
++
++static int x_alt_geometry_at(const uint8_t *ctl, int size, int bit, DCAXllXAltGeometry *g)
++{
++    GetBitContext gb;
++
++    if (bit + 13 > size * 8 || init_get_bits8(&gb, ctl, size) < 0)
++        return 0;
++    skip_bits_long(&gb, bit);
++    g->nframesegs_log2  = get_bits(&gb, 4);
++    g->nsegsamples_log2 = get_bits(&gb, 4);
++    g->seg_size_nbits   = get_bits(&gb, 5) + 1;
++    return g->nframesegs_log2 <= 3 &&
++           g->nframesegs_log2 + g->nsegsamples_log2 == 9 &&
++           g->seg_size_nbits >= 4 && g->seg_size_nbits <= 20;
++}
++
++// The one bit offset in [first, last] that reads as a valid geometry
++static int x_alt_unique_geometry(const uint8_t *ctl, int size, int first, int last,
++                                 DCAXllXAltGeometry *g)
++{
++    DCAXllXAltGeometry tmp;
++    int bit, found = -1;
++
++    for (bit = first; bit <= last; bit++) {
++        if (!x_alt_geometry_at(ctl, size, bit, &tmp))
++            continue;
++        if (found >= 0)
++            return AVERROR_INVALIDDATA;
++        found = bit;
++        *g = tmp;
++    }
++    return found >= 0 ? found : AVERROR_INVALIDDATA;
++}
++
++// Channel count of a CRC-valid channel set header at offset, or 0
++static int x_alt_header_at(const uint8_t *buf, int size, int offset)
++{
++    GetBitContext gb;
++    int header_size, nchannels, pcm_bit_res, storage_bit_res, freq_index;
++
++    if (offset < 0 || offset + 4 > size || init_get_bits8(&gb, buf + offset, size - offset) < 0)
++        return 0;
++    header_size = get_bits(&gb, 10) + 1;
++    nchannels   = get_bits(&gb, 4) + 1;
++    if (nchannels > DCA_XLL_CHANNELS_MAX)
++        return 0;
++    skip_bits(&gb, nchannels);
++    pcm_bit_res     = get_bits(&gb, 5) + 1;
++    storage_bit_res = get_bits(&gb, 5) + 1;
++    freq_index      = get_bits(&gb, 4);
++    if (header_size > size - offset || pcm_bit_res > storage_bit_res ||
++        (storage_bit_res != 16 && storage_bit_res != 20 && storage_bit_res != 24) ||
++        freq_index != 12 || get_bits(&gb, 2) || get_bits(&gb, 2) ||
++        !x_alt_crc_ok(buf + offset, header_size))
++        return 0;
++    return nchannels;
++}
++
++// Offset of the height channel set in an alternate payload and its geometry
++static int x_alt_locate_heights(const uint8_t *buf, int size, DCAXllXAltGeometry *g)
++{
++    static const uint8_t inner_suffix[6] = { 0x02, 0x34, 0x38, 0x8c, 0x4f, 0x00 };
++    DCAXllXAltGeometry first_geometry;
++    GetBitContext gb;
++    const uint8_t *ctl;
++    int profile = buf[3] & 0x0f, prefix = -1, set_mask = 0, ctl_start, ctl_size;
++    int geometry_end, common_bit, first_channels, field_width, nominal;
++    int i, offset, found, window, suffix;
++
++    switch (profile) {
++    case 0x0: geometry_end = 25; break;
++    case 0x1: geometry_end = 25; break;
++    case 0x3: geometry_end = 31; break;
++    case 0x4: geometry_end = 26; break;
++    default:  return AVERROR_PATCHWELCOME;
++    }
++
++    // CRC-protected prefix, ended by a mask of the sets that follow and a marker
++    for (i = DCA_XLL_X_ALT_MIN_PREFIX; i < FFMIN(size, DCA_XLL_X_ALT_MAX_PREFIX); i++) {
++        if (i + 6 > size)
++            break;
++        if (memcmp(buf + i + 1, x_alt_marker_tail, 5) || (buf[i] & ~3) || !(buf[i] & 1) ||
++            !x_alt_crc_ok(buf, i))
++            continue;
++        if (prefix >= 0)
++            return AVERROR_INVALIDDATA;
++        prefix   = i;
++        set_mask = buf[i];
++    }
++    if (prefix < 0)
++        return AVERROR_INVALIDDATA;
++    // The object-only variant carries no heights
++    if (!(set_mask & 2))
++        return AVERROR_PATCHWELCOME;
++
++    ctl_start = prefix + 6;
++    if (ctl_start >= size)
++        return AVERROR_INVALIDDATA;
++    if (buf[ctl_start] == 0xb2)
++        ctl_size = 7;
++    else if (buf[ctl_start] >= 0xc2 && buf[ctl_start] <= 0xc6)
++        ctl_size = 8;
++    else
++        return AVERROR_INVALIDDATA;
++    if (ctl_start + ctl_size > size)
++        return AVERROR_INVALIDDATA;
++    ctl = buf + ctl_start;
++
++    common_bit = x_alt_unique_geometry(ctl, ctl_size, 18, geometry_end, &first_geometry);
++    if (common_bit < 0)
++        return common_bit;
++
++    // The object channel set: one to five channels by profile
++    first_channels = x_alt_header_at(buf, size, ctl_start + ctl_size);
++    if (!((profile == 0x0 && (first_channels == 1 || first_channels == 3)) ||
++          (profile == 0x1 && first_channels == 2) ||
++          (profile == 0x3 && first_channels == 4) ||
++          (profile == 0x4 && first_channels == 5)))
++        return AVERROR_INVALIDDATA;
++
++    // The control block states where the height header sits, in two-byte units
++    field_width = common_bit - 14;
++    if (field_width < 1 || init_get_bits8(&gb, ctl, ctl_size) < 0)
++        return AVERROR_INVALIDDATA;
++    skip_bits(&gb, 9);
++    nominal = get_bits_long(&gb, field_width) * 2 + ctl_start + 12;
++    offset = -1;
++    for (i = 0; i < 2; i++) {
++        if (x_alt_header_at(buf, size, nominal - i) != 4)
++            continue;
++        if (offset >= 0)
++            return AVERROR_INVALIDDATA;
++        offset = nominal - i;
++    }
++    if (offset < 0)
++        return AVERROR_INVALIDDATA;
++
++    // The heights' own control block ends right in front of their header
++    window = FFMAX(offset - 24, 0);
++    suffix = -1;
++    for (i = window; i + 6 <= offset; i++)
++        if (!memcmp(buf + i, inner_suffix, 6))
++            suffix = i;
++    if (suffix < 0 || offset - (suffix + 6) < 8 || offset - (suffix + 6) > 9)
++        return AVERROR_INVALIDDATA;
++    found = x_alt_unique_geometry(buf + suffix + 6, offset - (suffix + 6),
++                                  profile == 0x0 ? 18 : 19, 26, g);
++    if (found < 0)
++        return found;
++
++    return offset;
++}
++
++static int parse_x_alt_heights(DCAXllDecoder *s, DCAExssAsset *asset)
++{
++    int x_byte = get_bits_count(&s->gb) / 8;
++    const uint8_t *buf = s->gb.buffer + x_byte;
++    int size = s->frame_size - x_byte;
++    int nframesegs, nsegsamples, nsegsamples_log2, seg_size_nbits;
++    int band_crc_present, scalable_lsbs, fixed_lsb_width, nchsets;
++    DCAXllXAltGeometry g;
++    int offset, ret;
++
++    if (s->nfreqbands != 1 || s->nframesamples != DCA_XLL_X_ALT_FRAME_SAMPLES || size < 8)
++        return AVERROR_PATCHWELCOME;
++    if ((offset = x_alt_locate_heights(buf, size, &g)) < 0)
++        return offset;
++
++    nframesegs       = s->nframesegs;
++    nsegsamples      = s->nsegsamples;
++    nsegsamples_log2 = s->nsegsamples_log2;
++    seg_size_nbits   = s->seg_size_nbits;
++    band_crc_present = s->band_crc_present;
++    scalable_lsbs    = s->scalable_lsbs;
++    fixed_lsb_width  = s->fixed_lsb_width;
++    nchsets          = s->nchsets;
++
++    s->nframesegs       = 1 << g.nframesegs_log2;
++    s->nsegsamples_log2 = g.nsegsamples_log2;
++    s->nsegsamples      = 1 << g.nsegsamples_log2;
++    s->seg_size_nbits   = g.seg_size_nbits;
++    s->band_crc_present = 0;
++    s->scalable_lsbs    = 0;
++    s->fixed_lsb_width  = 0;
++    s->nchsets          = 1;
++    s->x_alt            = 1;
++
++    skip_bits_long(&s->gb, offset * 8);
++    ret = parse_x_chset(s, asset, DCA_XLL_X_ALT_MAX_INTERSTITIAL);
++
++    s->nframesegs       = nframesegs;
++    s->nsegsamples      = nsegsamples;
++    s->nsegsamples_log2 = nsegsamples_log2;
++    s->seg_size_nbits   = seg_size_nbits;
++    s->band_crc_present = band_crc_present;
++    s->scalable_lsbs    = scalable_lsbs;
++    s->fixed_lsb_width  = fixed_lsb_width;
++    s->nchsets          = nchsets;
++    s->x_alt            = 0;
++    return ret;
++}
++
++// The height channel set from its header on: its NAVI table and its segments
++static int parse_x_chset(DCAXllDecoder *s, DCAExssAsset *asset, int max_tail_bytes)
++{
++    DCAXllChSet *c = &s->x_chset;
++    int ret, seg, navi_pos, band_pos, navi[1024];
 +
 +    c->hier_ofs = 0;
 +    if ((ret = chs_parse_header(s, c, asset)) < 0)
@@ -151,8 +412,7 @@ index 6eedad7eb8..f0b0c55fe0 100644
 +        skip_bits_long(&s->gb, band_pos - get_bits_count(&s->gb));
 +    }
 +
-+    // A two-byte trailer and up to three bytes of dword padding follow
-+    if (s->frame_size * 8 - band_pos > 5 * 8) {
++    if (s->frame_size * 8 - band_pos > max_tail_bytes * 8) {
 +        av_log(s->avctx, AV_LOG_ERROR, "DTS:X height channel set ends %d bytes before its frame\n",
 +               s->frame_size - band_pos / 8);
 +        return AVERROR_INVALIDDATA;
@@ -167,18 +427,42 @@ index 6eedad7eb8..f0b0c55fe0 100644
      int ret;
  
      if ((ret = init_get_bits8(&s->gb, data, size)) < 0)
-@@ -1065,6 +1163,7 @@ static int parse_frame(DCAXllDecoder *s, const uint8_t *data, int size, DCAExssA
+@@ -1065,6 +1400,8 @@ static int parse_frame(DCAXllDecoder *s, const uint8_t *data, int size, DCAExssA
      if ((ret = parse_band_data(s)) < 0)
          return ret;
  
 +    s->x_heights_decoded = 0;
++    s->x_alt_decoded = 0;
       if (s->frame_size * 8 > FFALIGN(get_bits_count(&s->gb), 32)) {
          unsigned int extradata_syncword;
  
-@@ -1075,6 +1174,20 @@ static int parse_frame(DCAXllDecoder *s, const uint8_t *data, int size, DCAExssA
+@@ -1073,10 +1410,41 @@ static int parse_frame(DCAXllDecoder *s, const uint8_t *data, int size, DCAExssA
  
-         if (extradata_syncword == DCA_SYNCWORD_XLL_X) {
-             s->x_syncword_present = 1;
+         extradata_syncword = show_bits_long(&s->gb, 32);
+ 
+-        if (extradata_syncword == DCA_SYNCWORD_XLL_X) {
+-            s->x_syncword_present = 1;
+-        } else if ((extradata_syncword >> 1) == (DCA_SYNCWORD_XLL_X_IMAX >> 1)) {
++        if ((extradata_syncword >> 1) == (DCA_SYNCWORD_XLL_X_IMAX >> 1))
+             s->x_imax_syncword_present = 1;
++
++        if (dca->x_heights && (extradata_syncword & ~0xfU) == (DCA_SYNCWORD_XLL_X_IMAX & ~0xfU)) {
++            int x_pos = get_bits_count(&s->gb);
++            int err = parse_x_alt_heights(s, asset);
++            skip_bits_long(&s->gb, x_pos - get_bits_count(&s->gb));
++            if (err >= 0) {
++                s->x_heights = 1;
++                s->x_heights_decoded = 1;
++                s->x_alt_decoded = 1;
++                // The profiles fold their heights into the bed at different gains
++                dca->x_presentation = extradata_syncword & 0xff;
++            } else if (s->x_heights) {
++                if (s->avctx->err_recognition & AV_EF_EXPLODE)
++                    return err;
++                av_log(s->avctx, AV_LOG_WARNING, "DTS:X height channels not decoded, output silent heights\n");
++            }
++        } else if (extradata_syncword == DCA_SYNCWORD_XLL_X) {
++            s->x_syncword_present = 1;
 +            if (dca->x_heights) {
 +                int x_pos = get_bits_count(&s->gb);
 +                int err = parse_x_heights(s, asset);
@@ -191,12 +475,13 @@ index 6eedad7eb8..f0b0c55fe0 100644
 +                    av_log(s->avctx, AV_LOG_WARNING, "DTS:X height channels not decoded, output silent heights\n");
 +                } else {
 +                    s->x_heights_decoded = 1;
++                    dca->x_presentation = 1;
 +                }
 +            }
-         } else if ((extradata_syncword >> 1) == (DCA_SYNCWORD_XLL_X_IMAX >> 1)) {
-             s->x_imax_syncword_present = 1;
          }
-@@ -1195,6 +1308,7 @@ int ff_dca_xll_parse(DCAXllDecoder *s, const uint8_t *data, DCAExssAsset *asset)
+     }
+ 
+@@ -1195,6 +1563,7 @@ int ff_dca_xll_parse(DCAXllDecoder *s, const uint8_t *data, DCAExssAsset *asset)
      if (s->hd_stream_id != asset->hd_stream_id) {
          clear_pbr(s);
          s->hd_stream_id = asset->hd_stream_id;
@@ -204,24 +489,11 @@ index 6eedad7eb8..f0b0c55fe0 100644
      }
  
      if (s->pbr_length)
-@@ -1356,8 +1470,11 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
-     DCAExssAsset *asset = &dca->exss.assets[0];
-     DCAXllChSet *p = &s->chset[0], *c;
-     enum AVMatrixEncoding matrix_encoding = AV_MATRIX_ENCODING_NONE;
--    int i, j, k, ret, shift, nsamples, request_mask;
-+    int i, j, k, ret, shift, nsamples, request_mask, x_fold = 0;
-     int ch_remap[DCA_SPEAKER_COUNT];
-+    static const uint8_t fold_spkr[4] = {
-+        DCA_SPEAKER_L, DCA_SPEAKER_R, DCA_SPEAKER_Lsr, DCA_SPEAKER_Rsr
-+    };
- 
-     // Force lossy downmixed output during recovery
-     if (dca->packet & DCA_PACKET_RECOVERY) {
-@@ -1417,6 +1534,43 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
+@@ -1417,6 +1786,43 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
                  return ret;
      }
  
-+    // Heights of the DTS:X standard presentation, removed from the 7.1 bed
++    // Heights of the DTS:X standard presentation, next to the 7.1 bed as coded
 +    if (s->x_heights && !dca->request_channel_layout && s->nfreqbands == 1 &&
 +        (s->output_mask & ~(DCA_SPEAKER_MASK_Ls | DCA_SPEAKER_MASK_Rs |
 +                            DCA_SPEAKER_MASK_Lss | DCA_SPEAKER_MASK_Rss)) ==
@@ -234,7 +506,8 @@ index 6eedad7eb8..f0b0c55fe0 100644
 +            int adj = p->pcm_bit_res - x->pcm_bit_res;
 +
 +            chs_filter_band_data(s, x, 0);
-+            if (s->scalable_lsbs)
++            // An alternate presentation's heights carry no LSB split
++            if (s->scalable_lsbs && !s->x_alt_decoded)
 +                chs_assemble_msbs_lsbs(s, x, 0);
 +
 +            if (adj) {
@@ -244,7 +517,6 @@ index 6eedad7eb8..f0b0c55fe0 100644
 +                        height[k] *= (SUINT)(1 << adj);
 +                }
 +            }
-+            x_fold = 1;
 +        } else {
 +            av_fast_malloc(&s->x_silence, &s->x_silence_size,
 +                           s->nframesamples * sizeof(*s->x_silence));
@@ -261,50 +533,7 @@ index 6eedad7eb8..f0b0c55fe0 100644
      // Normalize to regular 5.1 layout if downmixing
      if (dca->request_channel_layout) {
          if (s->output_mask & DCA_SPEAKER_MASK_Lss) {
-@@ -1456,6 +1610,21 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
-         return AVERROR(EINVAL);
-     }
- 
-+    // Remove the heights from the bed at output resolution: the bed may be
-+    // coded at fewer bits, and rounding the fold to those would cost up to
-+    // half of its least significant bit.
-+    if (x_fold) {
-+        for (i = 0; i < 4; i++) {
-+            int32_t *height = s->output_samples[x_height_spkr[i]];
-+            int32_t *bed = s->output_samples[fold_spkr[i]];
-+            for (k = 0; k < s->nframesamples; k++) {
-+                height[k] *= (SUINT)(1 << shift);
-+                bed[k] = bed[k] * (SUINT)(1 << shift) -
-+                         (SUINT)mul15(height[k], DCA_XLL_X_HEIGHT_FOLD);
-+            }
-+        }
-+    }
-+
-     if (s->x_imax_syncword_present) {
-         avctx->profile = AV_PROFILE_DTS_HD_MA_X_IMAX;
-     } else if (s->x_syncword_present) {
-@@ -1480,14 +1649,18 @@ int ff_dca_xll_filter_frame(DCAXllDecoder *s, AVFrame *frame)
- 
-     for (i = 0; i < avctx->ch_layout.nb_channels; i++) {
-         int32_t *samples = s->output_samples[ch_remap[i]];
-+        int ch_shift = shift;
-+        if (x_fold && ((DCA_XLL_X_HEIGHT_MASK | DCA_SPEAKER_MASK_L | DCA_SPEAKER_MASK_R |
-+                        DCA_SPEAKER_MASK_Lsr | DCA_SPEAKER_MASK_Rsr) & (1U << ch_remap[i])))
-+            ch_shift = 0;
-         if (frame->format == AV_SAMPLE_FMT_S16P) {
-             int16_t *plane = (int16_t *)frame->extended_data[i];
-             for (k = 0; k < nsamples; k++)
--                plane[k] = av_clip_int16(samples[k] * (SUINT)(1 << shift));
-+                plane[k] = av_clip_int16(samples[k] * (SUINT)(1 << ch_shift));
-         } else {
-             int32_t *plane = (int32_t *)frame->extended_data[i];
-             for (k = 0; k < nsamples; k++)
--                plane[k] = clip23(samples[k] * (SUINT)(1 << shift)) * (1 << 8);
-+                plane[k] = clip23(samples[k] * (SUINT)(1 << ch_shift)) * (1 << 8);
-         }
-     }
- 
-@@ -1522,6 +1695,13 @@ av_cold void ff_dca_xll_close(DCAXllDecoder *s)
+@@ -1522,6 +1928,13 @@ av_cold void ff_dca_xll_close(DCAXllDecoder *s)
          }
      }
  
@@ -319,16 +548,18 @@ index 6eedad7eb8..f0b0c55fe0 100644
      s->navi_size = 0;
  
 diff --git a/libavcodec/dca_xll.h b/libavcodec/dca_xll.h
-index a22bbb8d77..fa26b38b51 100644
+index a22bbb8..3e8640b 100644
 --- a/libavcodec/dca_xll.h
 +++ b/libavcodec/dca_xll.h
-@@ -138,6 +138,12 @@ typedef struct DCAXllDecoder {
+@@ -138,6 +138,14 @@ typedef struct DCAXllDecoder {
      int    x_syncword_present;        ///< Syncword for extension data at end of frame (DTS:X) is present
      int    x_imax_syncword_present;   ///< Syncword for extension data at end of frame (DTS:X IMAX) is present
  
 +    DCAXllChSet x_chset;        ///< Height channel set of the DTS:X standard presentation
 +    int     x_heights;          ///< Output carries the four heights (sticky once seen)
 +    int     x_heights_decoded;  ///< Heights of the current frame decoded
++    int     x_alt;              ///< Parsing the heights of an alternate presentation
++    int     x_alt_decoded;      ///< The current frame's heights came from an alternate presentation
 +    int32_t *x_silence;         ///< Silent heights for a frame whose heights did not decode
 +    unsigned int x_silence_size;
 +
@@ -336,28 +567,33 @@ index a22bbb8d77..fa26b38b51 100644
      int32_t *output_samples[DCA_SPEAKER_COUNT];
  } DCAXllDecoder;
 diff --git a/libavcodec/dcadec.c b/libavcodec/dcadec.c
-index 0d7bf1c53c..c6bf5e1bfc 100644
+index 0d7bf1c..fdefa3d 100644
 --- a/libavcodec/dcadec.c
 +++ b/libavcodec/dcadec.c
-@@ -394,6 +394,9 @@ static const AVOption dcadec_options[] = {
+@@ -394,6 +394,13 @@ static const AVOption dcadec_options[] = {
      { "downmix", "Request a specific channel layout from the decoder", OFFSET(downmix_layout),
          AV_OPT_TYPE_CHLAYOUT, {.str = NULL}, .flags = PARAM },
  
-+    { "x_heights", "Decode the four height channels of a DTS:X stream in the standard presentation and remove them from the 7.1 bed",
++    { "x_heights", "Decode the four height channels of a DTS:X stream (standard or alternate presentation) and output them next to the 7.1 bed as coded",
 +        OFFSET(x_heights), AV_OPT_TYPE_BOOL, { .i64 = 0 }, 0, 1, PARAM },
++
++    { "x_presentation", "With x_heights, the presentation the last decoded heights came from: 1 standard, 0xd0, 0xd1, 0xd3 or 0xd4 alternate (the low byte of its syncword), 0 none yet",
++        OFFSET(x_presentation), AV_OPT_TYPE_INT, { .i64 = 0 }, 0, 0xff,
++        PARAM | AV_OPT_FLAG_EXPORT | AV_OPT_FLAG_READONLY },
 +
      { NULL }
  };
  
 diff --git a/libavcodec/dcadec.h b/libavcodec/dcadec.h
-index 0ff28dd4d1..705f744df0 100644
+index 0ff28dd..1c14a56 100644
 --- a/libavcodec/dcadec.h
 +++ b/libavcodec/dcadec.h
-@@ -72,6 +72,7 @@ typedef struct DCAContext {
+@@ -72,6 +72,8 @@ typedef struct DCAContext {
      int     core_only;              ///< Core only decoding flag
      int     output_channel_order;
      AVChannelLayout downmix_layout;
-+    int     x_heights;              ///< Decode the DTS:X standard height channels
++    int     x_heights;              ///< Decode the DTS:X height channels
++    int     x_presentation;         ///< Presentation of the last decoded heights (exported)
  } DCAContext;
  
  int ff_dca_set_channel_layout(AVCodecContext *avctx, int *ch_remap, int dca_mask);

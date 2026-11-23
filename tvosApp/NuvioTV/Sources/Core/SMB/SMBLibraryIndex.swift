@@ -2,7 +2,7 @@ import Foundation
 
 /// One resolved SMB file within a title. `season`/`episode` are set only when
 /// the parent title is a series.
-struct SMBIndexedFile: Codable, Equatable {
+struct SMBIndexedFile: Codable, Equatable, Sendable {
     let serverID: String
     let share: String
     /// Share-relative path, e.g. `"Movies/Foo (2020)/Foo.mkv"`.
@@ -25,7 +25,7 @@ struct SMBIndexedFile: Codable, Equatable {
 /// is never stored here — it's re-fetched through the same `getMetadata` path
 /// remote catalog rows use, which is the entire point of resolving to a real
 /// id instead of caching the filename's guess.
-struct SMBIndexedTitle: Codable, Equatable {
+struct SMBIndexedTitle: Codable, Equatable, Sendable {
     let contentId: String
     let type: String
     let year: Int?

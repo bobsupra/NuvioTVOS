@@ -39,5 +39,8 @@ final class MarqueeTextTests: XCTestCase {
         XCTAssertGreaterThan(long, short * 3)
         XCTAssertGreaterThan(MarqueeText.width(of: "Naruto", size: 28, weight: .semibold), short)
         XCTAssertGreaterThan(MarqueeText.lineHeight(size: 20, weight: .regular), 20)
+        // Cached measurement matches across repeated calls cleanly.
+        XCTAssertEqual(MarqueeText.width(of: "Naruto", size: 20, weight: .semibold), short)
+        XCTAssertEqual(MarqueeText.width(of: "JoJo's Bizarre Adventure: Steel Ball Run", size: 20, weight: .semibold), long)
     }
 }

@@ -885,6 +885,7 @@ final class SeekPreviewLane {
     private var recentDecodeSeconds: [Double] = []
     private(set) var lastDecision: SeekPreviewNetworkPolicy.Decision = .busy
     private(set) var isShutDown = false
+    var isDecodeDisabled: Bool { decodeDisabledReason != nil || transport.trippedReason != nil }
 
     init(originURL: URL, headers: [String: String], diskKey: String,
          admission: @escaping Admission, localFrame: @escaping LocalFrame) {
@@ -1050,6 +1051,7 @@ final class SeekPreviewLane {
         let started = Date()
         let task = Task { @MainActor [weak self] () -> CGImage? in
             let image = await extractor.thumbnail(at: center, maxWidth: Self.width)
+            let isDecodeUnsupported = image == nil ? await extractor.isDecodeUnsupported : false
             // The cell's keyframe: at or before its center, how far is not known here.
             SeekPreviewOriginTags.shared.tag(image, "lane-net", seconds: center)
             guard let self else { return image }
@@ -1068,7 +1070,12 @@ final class SeekPreviewLane {
             } else {
                 // A retired decode gets its budget back; a real failure counts toward stopping.
                 self.networkDecodes = max(0, self.networkDecodes - 1)
-                if countsFailures, !superseded, self.lastDecision == .allowed, self.transport.trippedReason == nil {
+                if isDecodeUnsupported {
+                    self.decodeDisabledReason = "unsupported codec"
+                    self.backgroundQueue.removeAll()
+                    self.backgroundTask?.cancel()
+                    self.backgroundTask = nil
+                } else if countsFailures, !superseded, self.lastDecision == .allowed, self.transport.trippedReason == nil {
                     self.consecutiveDecodeFailures += 1
                     if self.consecutiveDecodeFailures >= Self.consecutiveDecodeFailureLimit {
                         self.decodeDisabledReason = "decode failed"

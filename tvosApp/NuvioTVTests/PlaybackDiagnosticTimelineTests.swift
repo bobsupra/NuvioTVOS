@@ -125,6 +125,27 @@ final class PlaybackDiagnosticTimelineTests: XCTestCase {
         XCTAssertTrue(events.allSatisfy { Set($0.keys).isSubset(of: ["timestamp", "name", "engine"]) })
     }
 
+    func testTrailerDiagnosticEventsPreservePrivateAllowlist() throws {
+        var timeline = PlaybackDiagnosticTimeline()
+        let context = session()
+        let names: [PlaybackDiagnosticTimeline.EventName] = [
+            .trailerResolvedAddonStreams, .trailerResolvedTrailerio, .trailerResolvedImdb,
+            .trailerResolvedYouTube, .trailerResolvedProxy, .trailerResolutionFailed,
+            .trailerPlaybackStarted, .trailerPlaybackFailed
+        ]
+        for (index, name) in names.enumerated() {
+            timeline.append(.init(timestamp: Date(timeIntervalSince1970: Double(index)),
+                                  name: name, engine: nil), session: context)
+        }
+        let data = try XCTUnwrap(timeline.encoded())
+        XCTAssertEqual(PlaybackDiagnosticTimeline.decode(data), timeline)
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let sessions = try XCTUnwrap(root["sessions"] as? [[String: Any]])
+        let events = try XCTUnwrap(sessions[0]["events"] as? [[String: Any]])
+        XCTAssertEqual(events.count, names.count)
+        XCTAssertTrue(events.allSatisfy { Set($0.keys).isSubset(of: ["timestamp", "name", "engine"]) })
+    }
+
     func testRejectsUnsupportedSchemaOversizedAndCorruptReports() throws {
         var timeline = PlaybackDiagnosticTimeline()
         timeline.schemaVersion = 2

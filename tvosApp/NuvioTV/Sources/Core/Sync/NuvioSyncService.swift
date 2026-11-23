@@ -1990,6 +1990,7 @@ final class NuvioSyncManager: ObservableObject {
             }
 
             let ownsWatchState = Self.ownsWatchState(for: activeProfile.id)
+            var pushedProgressCount = 0
             if ownsWatchState {
                 if scopes.contains(.watched) {
                     try ensureStillSyncing(profileId: activeProfile.id)
@@ -2001,7 +2002,7 @@ final class NuvioSyncManager: ObservableObject {
                 }
                 if scopes.contains(.progress) {
                     try ensureStillSyncing(profileId: activeProfile.id)
-                    try await client.pushWatchProgress(
+                    pushedProgressCount = try await client.pushWatchProgress(
                         session: session,
                         remoteProfileId: remoteProfileId,
                         profileId: activeProfile.id
@@ -2019,8 +2020,8 @@ final class NuvioSyncManager: ObservableObject {
             if scopes.contains(.watched) && ownsWatchState {
                 pushedParts.append("\(WatchedStore.items().count) watched")
             }
-            if scopes.contains(.progress) && ownsWatchState {
-                pushedParts.append("\(ContinueWatchingStore.items().count) progress item(s)")
+            if scopes.contains(.progress) && ownsWatchState && pushedProgressCount > 0 {
+                pushedParts.append("\(pushedProgressCount) progress item(s)")
             }
             if !pushedParts.isEmpty {
                 print("Nuvio sync pushed \(pushedParts.joined(separator: "; ")).")
@@ -4060,37 +4061,45 @@ final class NuvioAPIClient {
         // is the selected source, but the local store still holds marks imported
         // from Trakt or Simkl in an earlier session, and those are not this
         // account's to upload.
-        let payload = WatchedStore.items(profileId: profileId)
-            .filter {
-                $0.isLibraryVisible(
-                    under: .nuvioSync,
-                    accountID: "\(session.userId):\(remoteProfileId)"
-                )
-                    && !$0.legacyUnattributed
-                    // A series title marker is only a local aggregate used by
-                    // tvOS to render the watched state. Upload its concrete
-                    // episode rows instead, so specials and unaired episodes
-                    // are never implied by a whole-show row.
-                    && !($0.meta.isSeries && $0.season == nil && $0.episode == nil)
-            }
-            .map { item -> [String: Any] in
-            [
-                "content_id": item.meta.id,
-                "content_type": item.meta.type,
-                "title": item.meta.name,
-                "season": item.season.map { $0 as Any } ?? NSNull(),
-                "episode": item.episode.map { $0 as Any } ?? NSNull(),
-                "watched_at": Self.milliseconds(from: item.watchedAt)
+        let accountID = "\(session.userId):\(remoteProfileId)"
+        let originClientID = SyncClientIdentity.current()
+        let encodedWatchedBody: Data? = try await Task.detached(priority: .utility) {
+            let payload = WatchedStore.items(profileId: profileId)
+                .filter {
+                    $0.isLibraryVisible(
+                        under: .nuvioSync,
+                        accountID: accountID
+                    )
+                        && !$0.legacyUnattributed
+                        // A series title marker is only a local aggregate used by
+                        // tvOS to render the watched state. Upload its concrete
+                        // episode rows instead, so specials and unaired episodes
+                        // are never implied by a whole-show row.
+                        && !($0.meta.isSeries && $0.season == nil && $0.episode == nil)
+                }
+                .map { item -> [String: Any] in
+                    [
+                        "content_id": item.meta.id,
+                        "content_type": item.meta.type,
+                        "title": item.meta.name,
+                        "season": item.season.map { $0 as Any } ?? NSNull(),
+                        "episode": item.episode.map { $0 as Any } ?? NSNull(),
+                        "watched_at": Self.milliseconds(from: item.watchedAt)
+                    ]
+                }
+            guard !payload.isEmpty else { return nil }
+            let params: [String: Any] = [
+                "p_items": payload,
+                "p_profile_id": remoteProfileId,
+                "p_origin_client_id": originClientID
             ]
-        }
-        if !payload.isEmpty {
-            try await rpcVoid(
+            return try JSONSerialization.data(withJSONObject: params)
+        }.value
+        if let encodedWatchedBody {
+            _ = try await rpcData(
                 "sync_push_watched_items",
                 session: session,
-                params: [
-                    "p_items": payload,
-                    "p_profile_id": remoteProfileId
-                ]
+                encodedBody: encodedWatchedBody
             )
         }
 
@@ -4218,7 +4227,8 @@ final class NuvioAPIClient {
     /// including an episode the phone had legitimately just started. Deletions
     /// now happen only where the user actually removed something, via
     /// `deleteWatchProgress`.
-    func pushWatchProgress(session: AuthSession, remoteProfileId: Int, profileId: String? = nil) async throws {
+    @discardableResult
+    func pushWatchProgress(session: AuthSession, remoteProfileId: Int, profileId: String? = nil) async throws -> Int {
         // Resolve the default scope before awaiting the upload. An empty ID
         // explicitly selects the unscoped ledger even if a profile loads later.
         let targetProfileId = profileId ?? WatchProgressLedger.activeProfileId ?? ""
@@ -4249,7 +4259,7 @@ final class NuvioAPIClient {
             if let episode = record.episode { entry["episode"] = episode }
             return entry
         }
-        guard !payload.isEmpty else { return }
+        guard !payload.isEmpty else { return 0 }
         print("[NuvioSync] pushWatchProgress: pushing \(payload.count) progress records to server for remoteProfileId \(remoteProfileId): \(records.map { "\($0.progressKey) (pos=\($0.position)/\($0.duration))" })")
         try await rpcVoid(
             "sync_push_watch_progress",
@@ -4261,6 +4271,7 @@ final class NuvioAPIClient {
         )
         print("[NuvioSync] pushWatchProgress: successfully pushed \(payload.count) records")
         WatchProgressLedger.markPushed(records: records, profileId: targetProfileId)
+        return payload.count
     }
 
     /// Retires specific rows the user removed on this device.
@@ -4352,6 +4363,15 @@ final class NuvioAPIClient {
         session authSession: AuthSession,
         params: [String: Any]
     ) async throws -> Data {
+        let body = try JSONSerialization.data(withJSONObject: params)
+        return try await rpcData(name, session: authSession, encodedBody: body)
+    }
+
+    private func rpcData(
+        _ name: String,
+        session authSession: AuthSession,
+        encodedBody: Data
+    ) async throws -> Data {
         guard AuthConfig.isConfigured else {
             throw AuthError(message: "Account backend is not configured.")
         }
@@ -4364,7 +4384,7 @@ final class NuvioAPIClient {
         request.setValue("Bearer \(authSession.accessToken)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.httpBody = try JSONSerialization.data(withJSONObject: params)
+        request.httpBody = encodedBody
 
         let (data, response) = try await executeWithConnectionRetry(request)
         guard let http = response as? HTTPURLResponse else {

@@ -110,8 +110,10 @@ enum MdbListProgressService {
                 return nil
             }
 
+            let cutoff = TraktSettingsStore.continueWatchingCutoff(in: store)
             let seeds = rows.compactMap(playbackSeed)
                 .filter { $0.progress > 0 && $0.progress < completionPercent }
+                .filter { seed in cutoff.map { seed.updatedAt >= $0 } ?? true }
                 .sorted { $0.updatedAt > $1.updatedAt }
             var seen = Set<String>()
             let uniqueSeeds = seeds.filter { seed in
@@ -164,7 +166,7 @@ enum MdbListProgressService {
                 let upNextSeeds = nextUpSeeds(
                     from: watchedItems,
                     preferFurthestEpisode: UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
-                )
+                ).filter { seed in cutoff.map { seed.watchedAt >= $0 } ?? true }
                 let candidateSeeds = upNextSeeds.filter { seed in
                     !playbackMetas.contains(where: {
                         WatchedStore.sameContent($0, seed.meta)

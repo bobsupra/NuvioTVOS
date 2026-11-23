@@ -43,6 +43,10 @@ public actor FrameExtractor {
     /// Set by `shutdown()`. Once true, the extractor refuses further
     /// work instead of lazily reopening a closed context.
     private var isShutDown = false
+    /// Latched once opening the stream fails due to an unsupported codec or
+    /// missing/unusable video stream parameters so callers never repeatedly open
+    /// redundant remote demuxers on streams that cannot decode stills.
+    public private(set) var isDecodeUnsupported = false
     private var admissionGeneration: UInt64 = 0
     private var isClosingAuxiliaryContext = false
     private var contextCloseTask: Task<Void, Never>?
@@ -108,7 +112,7 @@ public actor FrameExtractor {
     /// Refined results bypass the rendered-frame cache so they carry the actual decoded PTS.
     func residentPreview(rawTarget: Double, refined: Bool, maxWidth: Int,
                                 isCancelled: @escaping @Sendable () -> Bool) async -> ScrubFrame? {
-        guard !isShutDown, !isClosingAuxiliaryContext, rawTarget.isFinite,
+        guard !isShutDown, !isClosingAuxiliaryContext, !isDecodeUnsupported, rawTarget.isFinite,
               !Task.isCancelled, !isCancelled() else { return nil }
         guard maxWidth > 0 else { return nil }
         // A cached approximation is still the latest scrub intent; retire an older refinement
@@ -125,21 +129,23 @@ public actor FrameExtractor {
             return cached.frame
         }
         let context = self.context
-        let result: ScrubFrame? = await withTaskCancellationHandler {
+        let (result, unsupported): (ScrubFrame?, Bool) = await withTaskCancellationHandler {
             await runOnQueue {
-                guard !token.isCancelled, !isCancelled() else { return nil }
-                do { try context.ensureOpen() } catch { return nil }
+                guard !token.isCancelled, !isCancelled() else { return (nil, false) }
+                let outcome = Self.openContext(context)
+                guard outcome.opened else { return (nil, outcome.unsupported) }
                 var actual: Double?
                 var didRefine = false
                 let image = context.decodeFrame(at: 0, mode: refined ? .snapshot : .thumbnail,
                     targetWidth: width, maxSize: CGSize(width: CGFloat(width), height: CGFloat(width)),
                     isCancelled: { token.isCancelled || isCancelled() }, residentTarget: rawTarget,
                     reportResidentTime: { actual = $0; didRefine = $1 })
-                guard let image, let actual, !token.isCancelled, !isCancelled() else { return nil }
-                return ScrubFrame(image: image, actualSeconds: actual, refined: didRefine)
+                guard let image, let actual, !token.isCancelled, !isCancelled() else { return (nil, false) }
+                return (ScrubFrame(image: image, actualSeconds: actual, refined: didRefine), false)
             }
         } onCancel: { token.cancel() }
         guard generation == admissionGeneration, !Task.isCancelled, !isCancelled(), !token.isCancelled else { return nil }
+        if unsupported { isDecodeUnsupported = true }
         if !refined, let result, result.image.bytesPerRow * result.image.height <= 512 * 1_024 {
             residentApproximation = (width, result)
         }
@@ -247,21 +253,19 @@ public actor FrameExtractor {
     /// `snapshot`, uncached (the cache keys on stream time), and with the same Dolby Vision and HDR
     /// conversion as every still.
     func snapshot(afterFirstFrameBy offset: Double, maxSize: CGSize? = nil) async -> CGImage? {
-        guard !isShutDown, !isClosingAuxiliaryContext, offset.isFinite, !Task.isCancelled else { return nil }
+        guard !isShutDown, !isClosingAuxiliaryContext, !isDecodeUnsupported, offset.isFinite, !Task.isCancelled else { return nil }
         let generation = admissionGeneration
         let context = self.context
-        let image = await runOnQueue { () -> CGImage? in
-            do { try context.ensureOpen() } catch {
-                EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback,
-                    level: FrameDecodeContext.isPermanentOpenFailure(error) ? .verbose : .info)
-                return nil
-            }
-            return context.decodeFrame(at: 0, mode: .snapshot, targetWidth: 0, maxSize: maxSize,
-                                       afterFirstFrame: offset, isCancelled: { false })
+        let outcome = await runOnQueue { () -> FrameResult in
+            let openResult = Self.openContext(context, logFailure: true)
+            guard openResult.opened else { return FrameResult(unsupported: openResult.unsupported) }
+            return FrameResult(image: context.decodeFrame(at: 0, mode: .snapshot, targetWidth: 0, maxSize: maxSize,
+                                       afterFirstFrame: offset, isCancelled: { false }))
         }
         guard generation == admissionGeneration, !Task.isCancelled else { return nil }
+        if outcome.unsupported { isDecodeUnsupported = true }
         scheduleIdleClose()
-        return image
+        return outcome.image
     }
 
     /// A still for a scrub preview over a local file, with the contract of `scrubPreviewFrame`: the
@@ -273,7 +277,7 @@ public actor FrameExtractor {
     func boundedLocalStill(at seconds: Double, refined: Bool, maxWidth: Int,
                            isCancelled: @escaping @Sendable () -> Bool) async -> (image: CGImage, decodedSeconds: Double?)? {
         boundedLocalStillCallCountForTesting += 1
-        guard !isShutDown, !isClosingAuxiliaryContext, seconds.isFinite, seconds >= 0,
+        guard !isShutDown, !isClosingAuxiliaryContext, !isDecodeUnsupported, seconds.isFinite, seconds >= 0,
               maxWidth > 0, !Task.isCancelled, !isCancelled() else { return nil }
         currentToken?.cancel()
         boundedCancellation?.cancel()
@@ -283,27 +287,25 @@ public actor FrameExtractor {
         let context = self.context
         let mode: FrameMode = refined ? .snapshot : .thumbnail
         let size = CGSize(width: maxWidth, height: maxWidth)
-        let result = await withTaskCancellationHandler {
-            await runOnQueue { () -> (image: CGImage, decodedSeconds: Double?)? in
-                if token.isCancelled || isCancelled() { return nil }
-                do { try context.ensureOpen() } catch {
-                    EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback,
-                    level: FrameDecodeContext.isPermanentOpenFailure(error) ? .verbose : .info)
-                    return nil
-                }
+        let (result, unsupported) = await withTaskCancellationHandler {
+            await runOnQueue { () -> ((image: CGImage, decodedSeconds: Double?)?, Bool) in
+                if token.isCancelled || isCancelled() { return (nil, false) }
+                let openResult = Self.openContext(context, logFailure: true)
+                guard openResult.opened else { return (nil, openResult.unsupported) }
                 var decoded: Double?
                 guard let image = context.decodeFrame(
                     at: seconds, mode: mode, targetWidth: maxWidth, maxSize: refined ? size : nil,
                     isCancelled: { token.isCancelled || isCancelled() },
                     reportDecodedTime: { decoded = $0 }, bounded: true),
-                    !token.isCancelled, !isCancelled() else { return nil }
-                return (image, decoded)
+                    !token.isCancelled, !isCancelled() else { return (nil, false) }
+                return ((image, decoded), false)
             }
         } onCancel: {
             token.cancel()
         }
         guard generation == admissionGeneration, !isShutDown, !isClosingAuxiliaryContext,
               !Task.isCancelled, !isCancelled(), !token.isCancelled else { return nil }
+        if unsupported { isDecodeUnsupported = true }
         scheduleIdleClose()
         return result
     }
@@ -318,7 +320,7 @@ public actor FrameExtractor {
                                 firstFrameOffset: Double? = nil,
                                 requiredDolbyVisionReshaping: Bool = false) async -> BoundedStillFrame? {
         let yieldWhile = self.yieldWhile
-        guard !isShutDown, !isClosingAuxiliaryContext, seconds.isFinite, !Task.isCancelled, !cancellation.isCancelled,
+        guard !isShutDown, !isClosingAuxiliaryContext, !isDecodeUnsupported, seconds.isFinite, !Task.isCancelled, !cancellation.isCancelled,
               firstFrameOffset.map({ $0.isFinite && $0 >= 0 }) ?? true,
               yieldWhile?() != true,
               let control = try? ProbeControl(limits: limits, cancellation: cancellation) else { return nil }
@@ -328,14 +330,15 @@ public actor FrameExtractor {
         let token = CancelToken(); currentToken = token
         let generation = admissionGeneration
         let context = self.context
-        let result = await withTaskCancellationHandler {
-            await runOnQueue { () -> BoundedStillFrame? in
+        let (result, unsupported) = await withTaskCancellationHandler {
+            await runOnQueue { () -> (BoundedStillFrame?, Bool) in
                 // A previously opened demuxer was outside this budget. Reject
                 // it instead of letting its teardown extend this one-shot work.
-                guard !context.isOpen else { control.finish(); return nil }
+                guard !context.isOpen else { control.finish(); return (nil, false) }
                 defer { context.close(); control.finish() }
-                guard !token.isCancelled, !cancellation.isCancelled else { return nil }
-                do { try context.ensureOpen(control: control) } catch { return nil }
+                guard !token.isCancelled, !cancellation.isCancelled else { return (nil, false) }
+                let openResult = Self.openContext(context, control: control)
+                guard openResult.opened else { return (nil, openResult.unsupported) }
                 var actual: Double?
                 guard let image = context.decodeFrame(at: seconds, mode: .snapshot,
                     targetWidth: 0, maxSize: maxSize,
@@ -345,16 +348,18 @@ public actor FrameExtractor {
                     isCancelled: { token.isCancelled || cancellation.isCancelled || control.isStopped || yieldWhile?() == true },
                     reportDecodedTime: { actual = $0 },
                     bounded: true),
-                    !token.isCancelled, !cancellation.isCancelled else { return nil }
-                do { try control.complete() } catch { return nil }
-                return BoundedStillFrame(image: image, actualSeconds: actual)
+                    !token.isCancelled, !cancellation.isCancelled else { return (nil, false) }
+                do { try control.complete() } catch { return (nil, false) }
+                return (BoundedStillFrame(image: image, actualSeconds: actual), false)
             }
         } onCancel: {
             token.cancel()
             cancellation.cancel()
         }
         if boundedCancellation === cancellation { boundedCancellation = nil }
-        return generation == admissionGeneration && !Task.isCancelled && !cancellation.isCancelled && !token.isCancelled ? result : nil
+        guard generation == admissionGeneration, !Task.isCancelled, !cancellation.isCancelled, !token.isCancelled else { return nil }
+        if unsupported { isDecodeUnsupported = true }
+        return result
     }
 
     /// Decode a frame-accurate still at thumbnail dimensions.
@@ -377,11 +382,14 @@ public actor FrameExtractor {
     /// Open the decode context ahead of the first request to hide cold-start latency
     /// (e.g. at the start of a scrub gesture).
     public func prewarm() async {
-        guard !isShutDown, !isClosingAuxiliaryContext, !Task.isCancelled else { return }
+        guard !isShutDown, !isClosingAuxiliaryContext, !isDecodeUnsupported, !Task.isCancelled else { return }
         let generation = admissionGeneration
         let context = self.context
-        await runOnQueue { try? context.ensureOpen() }
+        let unsupported = await runOnQueue { () -> Bool in
+            Self.openContext(context).unsupported
+        }
         guard generation == admissionGeneration, !Task.isCancelled else { return }
+        if unsupported { isDecodeUnsupported = true }
         scheduleIdleClose()
     }
 
@@ -479,7 +487,7 @@ public actor FrameExtractor {
         relativeToFirstFrame: Bool = false
     ) async -> CGImage? {
         // Audit BIT-105: a 0/0 scrub fraction or `CMTime.indefinite.seconds` is a host bug, not a position.
-        guard !isShutDown, !isClosingAuxiliaryContext, !Task.isCancelled, seconds.isFinite, seconds >= 0 else { return nil }
+        guard !isShutDown, !isClosingAuxiliaryContext, !isDecodeUnsupported, !Task.isCancelled, seconds.isFinite, seconds >= 0 else { return nil }
         // A valid request owns the scrub intent even when its image is already cached or it
         // yields to playback. Retire the preceding decode before either early return.
         currentToken?.cancel()
@@ -508,12 +516,9 @@ public actor FrameExtractor {
                 let start = DispatchTime.now()
                 let wasOpen = context.isOpen
                 let bytesBefore = context.bytesFetched
-                do {
-                    try context.ensureOpen()
-                } catch {
-                    EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback,
-                    level: FrameDecodeContext.isPermanentOpenFailure(error) ? .verbose : .info)
-                    return FrameResult(image: nil)
+                let openResult = Self.openContext(context, logFailure: true)
+                guard openResult.opened else {
+                    return FrameResult(image: nil, unsupported: openResult.unsupported)
                 }
                 let image = context.decodeFrame(
                     at: seconds, mode: mode,
@@ -540,10 +545,29 @@ public actor FrameExtractor {
         // Cancellation can win after the decode's last check, or while its result waits to
         // reenter this actor. Never publish/cache that result or reset a newer request's idle timer.
         guard generation == admissionGeneration, !isShutDown, !Task.isCancelled, !token.isCancelled else { return nil }
+        if result.unsupported { isDecodeUnsupported = true }
         if let image = result.image {
             cache.set(image, mode: mode, seconds: seconds, targetWidth: targetWidth, maxSize: maxSize)
         }
         return result.image
+    }
+
+    private nonisolated static func openContext(
+        _ context: FrameDecodeContext,
+        control: ProbeControl? = nil,
+        logFailure: Bool = false
+    ) -> (opened: Bool, unsupported: Bool) {
+        do {
+            try context.ensureOpen(control: control)
+            return (true, false)
+        } catch {
+            let permanent = FrameDecodeContext.isPermanentOpenFailure(error)
+            if logFailure {
+                EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback,
+                    level: permanent ? .verbose : .info)
+            }
+            return (false, permanent)
+        }
     }
 
     /// Run blocking work on the serial queue, awaiting the result without blocking the actor's executor.
@@ -609,4 +633,10 @@ public actor FrameExtractor {
 /// CGImage is immutable and already passed across domains here (see SubtitleImage).
 private struct FrameResult: @unchecked Sendable {
     let image: CGImage?
+    let unsupported: Bool
+
+    init(image: CGImage? = nil, unsupported: Bool = false) {
+        self.image = image
+        self.unsupported = unsupported
+    }
 }

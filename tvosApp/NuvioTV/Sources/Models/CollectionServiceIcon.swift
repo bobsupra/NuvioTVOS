@@ -2,7 +2,7 @@ import Foundation
 
 /// Presentation only. Provider identity comes from source filters, never an
 /// editable collection name. Unknown/custom artwork keeps its configured URLs.
-struct CollectionServiceIcon: Equatable, Hashable {
+struct CollectionServiceIcon: Equatable, Hashable, Sendable {
     let imageURLs: [String]
     let backgroundRGB: UInt32
     let fillsCircle: Bool

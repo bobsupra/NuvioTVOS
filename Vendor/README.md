@@ -21,9 +21,9 @@ Retain the local spatial-bridge patch that reports persistent APAC encoding fail
 
 Nuvio also retains its supplemental-codecs guard for non-Dolby-Vision displays, including the upstream Profile 7 to Profile 8.1 conversion. Explicit host DV assertions still enable the guarded route. The tagged API, architecture, and format docs are included for upstream documentation-consistency tests.
 
-## FFmpegBuild 3.9.0 (namespaced upstream)
+## FFmpegBuild 3.15.0 (namespaced upstream)
 
-Local pin of [FFmpegBuild 3.9.0](https://github.com/superuser404notfound/FFmpegBuild/tree/3.9.0), upstream commit `3b398c8f6340fe5fb4a7cb9a2a211a16677171e0`. The upstream release ships the nine dynamic frameworks and SwiftPM targets under the `AetherLib*` namespace so they can embed next to MPVKit’s `Libav*` stack in the same app binary. The umbrella product is `AetherFFmpegBuild`.
+Local pin of [FFmpegBuild 3.15.0](https://github.com/superuser404notfound/FFmpegBuild/tree/3.15.0), upstream commit `d445e6daa180db73f12d47606a00c914f682e278`. The upstream release ships the nine dynamic frameworks and SwiftPM targets under the `AetherLib*` namespace so they can embed next to MPVKit’s `Libav*` stack in the same app binary. The umbrella product is `AetherFFmpegBuild`.
 
 | Upstream module | Nuvio module / framework |
 |---|---|

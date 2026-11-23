@@ -1698,6 +1698,10 @@ struct AetherExternalSubtitleRegistration {
 
 enum AetherPlaybackLifecyclePolicy {
     static let maximumActiveCancellationRetries = 1
+    /// Brief Control Center / Siri / alert dismissals last a few seconds; tvOS Aerial screensaver
+    /// requires >= 2 minutes of idle time and can invalidate AVPlayer items, Hardware decoders,
+    /// or upstream sockets while paused.
+    static let pausedInactiveReloadThreshold: TimeInterval = 15
 
     static func shouldReloadAfterBackground(state: PlaybackState) -> Bool {
         switch state {
@@ -1717,6 +1721,58 @@ enum AetherPlaybackLifecyclePolicy {
         previousIntent
             || state == .playing
             || (state != .paused && (isPlayerPlaying || isTransportPlaying))
+    }
+
+    static func isPausedForInactiveTracking(
+        state: PlaybackState,
+        isPlayerPlaying: Bool,
+        isTransportPlaying: Bool,
+        isEnded: Bool
+    ) -> Bool {
+        guard !isEnded else { return false }
+        if case .paused = state { return true }
+        if case .loading = state { return false }
+        if case .seeking = state { return false }
+        return !isPlayerPlaying && !isTransportPlaying && state != .idle && !isErrorState(state)
+    }
+
+    static func shouldReloadOnBecomeActive(
+        hasReloadableSession: Bool,
+        needsForegroundReload: Bool,
+        engineNeedsSessionRecovery: Bool,
+        sawMediaServicesReset: Bool,
+        wasPausedAtResign: Bool,
+        inactiveDuration: TimeInterval?,
+        thresholdSeconds: TimeInterval = pausedInactiveReloadThreshold
+    ) -> Bool {
+        guard hasReloadableSession else { return false }
+        if needsForegroundReload || engineNeedsSessionRecovery || sawMediaServicesReset {
+            return true
+        }
+        if wasPausedAtResign, let inactiveDuration, inactiveDuration >= thresholdSeconds {
+            return true
+        }
+        return false
+    }
+
+    static func shouldRecoverOnTransportCommand(
+        hasReloadableSession: Bool,
+        needsForegroundReload: Bool,
+        engineNeedsSessionRecovery: Bool,
+        sawMediaServicesReset: Bool,
+        engineState: PlaybackState
+    ) -> Bool {
+        guard hasReloadableSession else { return false }
+        return needsForegroundReload
+            || engineNeedsSessionRecovery
+            || sawMediaServicesReset
+            || engineState == .idle
+            || isErrorState(engineState)
+    }
+
+    private static func isErrorState(_ state: PlaybackState) -> Bool {
+        if case .error = state { return true }
+        return false
     }
 
     enum ReloadFailureDisposition: Equatable {
@@ -2718,6 +2774,12 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var playbackWasPlayingBeforeBackground = false
     private var foregroundReloadTask: Task<Void, Never>?
     private var foregroundReloadActiveCancellationRetryCount = 0
+    private var resignedActiveAt: Date?
+    private var wasPausedAtResign = false
+    private var sawMediaServicesReset = false
+    private var needsPostWakePlaybackVerification = false
+    private var pendingReloadSeekTarget: (ms: Int64, exact: Bool)?
+    private var postWakePlayVerifyTask: Task<Void, Never>?
     private var artworkLoadTask: Task<Void, Never>?
     private var nowPlayingInfo: [String: Any] = [:]
     private var lifecycleReloadToken: UInt64 = 0
@@ -3521,6 +3583,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
     }
 
+    var chapterThumbnailsUnavailableForCurrentSource: Bool {
+        externalTrickplayProvider == nil && seekPreviewLaneHost.current?.isDecodeDisabled == true
+    }
+
     /// A chapter's still for the Chapters panel: the external storyboard's (the add-on's
     /// trickplay, the trickplay server or Seekr), else one held near it, else the preview
     /// lane's keyframe; sources the lane does not serve keep the ordinary preview path.
@@ -4235,6 +4301,20 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             name: UIApplication.didBecomeActiveNotification,
             object: nil
         )
+        #if os(tvOS) || os(iOS)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMediaServicesReset),
+            name: AVAudioSession.mediaServicesWereResetNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleMediaServicesReset),
+            name: AVAudioSession.mediaServicesWereLostNotification,
+            object: nil
+        )
+        #endif
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -4266,6 +4346,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     deinit {
         pendingSeekTask?.cancel()
         pendingSeekTask = nil
+        postWakePlayVerifyTask?.cancel()
+        postWakePlayVerifyTask = nil
         foregroundReloadTask?.cancel()
         activeThumbnailTask?.cancel()
         activeThumbnailCancellation?.cancel()
@@ -4277,10 +4359,37 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     @objc private func appWillResignActive() {
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive")
+        if resignedActiveAt == nil {
+            resignedActiveAt = Date()
+            wasPausedAtResign = AetherPlaybackLifecyclePolicy.isPausedForInactiveTracking(
+                state: engine.state,
+                isPlayerPlaying: isPlayerPlaying,
+                isTransportPlaying: isTransportPlaying,
+                isEnded: isPlayerEnded
+            )
+        }
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appWillResignActive: wasPaused=\(wasPausedAtResign), state=\(engine.state)")
         // Control Center, Siri and system alerts make the app inactive without
         // leaving it. Keep playing, as the Apple TV app does;
-        // only didEnterBackground (Home, another app, sleep) suspends playback.
+        // only didEnterBackground (Home, another app, sleep) or prolonged paused
+        // inactivity / media reset (screensaver) triggers foreground recovery.
+    }
+
+    @objc private func handleMediaServicesReset() {
+        sawMediaServicesReset = true
+        screensaverDebugLog("[ScreensaverDebug][AetherController] mediaServicesWereReset received: appState=\(UIApplication.shared.applicationState.rawValue), state=\(engine.state)")
+        if !playbackWasPlayingBeforeBackground {
+            playbackWasPlayingBeforeBackground = isTransportPlaying || isPlayerPlaying || diagnosticPlayIntent == "play"
+        }
+        guard UIApplication.shared.applicationState == .active,
+              activePlaybackRequest != nil,
+              !isPlayerEnded,
+              !isAwaitingEngineLoad,
+              !engine.pictureInPictureActive else { return }
+        if foregroundReloadTask == nil {
+            needsForegroundReload = true
+            startForegroundReloadIfNeeded()
+        }
     }
 
     @objc private func appDidEnterBackground() {
@@ -4320,12 +4429,35 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     @objc private func appDidBecomeActive() {
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidBecomeActive: appState=\(UIApplication.shared.applicationState.rawValue), needsReload=\(needsForegroundReload), hasTask=\(foregroundReloadTask != nil), wasPlaying=\(playbackWasPlayingBeforeBackground), pip=\(engine.pictureInPictureActive)")
+        let inactiveDuration = resignedActiveAt.map { Date().timeIntervalSince($0) }
+        let pausedAcrossResign = wasPausedAtResign
+        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidBecomeActive: appState=\(UIApplication.shared.applicationState.rawValue), needsReload=\(needsForegroundReload), engineRecovery=\(engine.needsForegroundSessionRecovery), mediaReset=\(sawMediaServicesReset), pausedAtResign=\(pausedAcrossResign), inactiveDuration=\(inactiveDuration.map { String(format: "%.1fs", $0) } ?? "nil"), hasTask=\(foregroundReloadTask != nil), wasPlaying=\(playbackWasPlayingBeforeBackground), pip=\(engine.pictureInPictureActive)")
         guard UIApplication.shared.applicationState == .active else { return }
+        resignedActiveAt = nil
+        wasPausedAtResign = false
+
+        let hasReloadableSession = activePlaybackRequest != nil && !isPlayerEnded && !isAwaitingEngineLoad
+        if AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: hasReloadableSession,
+            needsForegroundReload: needsForegroundReload,
+            engineNeedsSessionRecovery: engine.needsForegroundSessionRecovery,
+            sawMediaServicesReset: sawMediaServicesReset,
+            wasPausedAtResign: pausedAcrossResign,
+            inactiveDuration: inactiveDuration
+        ) {
+            needsForegroundReload = true
+        } else if pausedAcrossResign && hasReloadableSession {
+            needsPostWakePlaybackVerification = true
+        }
+
         if !needsForegroundReload, foregroundReloadTask == nil {
             onDidRestorePlayback?()
             return
         }
+        startForegroundReloadIfNeeded()
+    }
+
+    private func startForegroundReloadIfNeeded() {
         guard needsForegroundReload, foregroundReloadTask == nil else { return }
 
         // PiP keeps Aether's video pipeline alive across backgrounding. If PiP
@@ -4333,15 +4465,24 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         // to reopen (it may have become active after the background event).
         guard !engine.pictureInPictureActive else {
             needsForegroundReload = false
+            sawMediaServicesReset = false
+            needsPostWakePlaybackVerification = false
+            pendingReloadSeekTarget = nil
             playbackWasPlayingBeforeBackground = false
             onDidRestorePlayback?()
             return
         }
 
         needsForegroundReload = false
+        sawMediaServicesReset = false
+        needsPostWakePlaybackVerification = false
+        postWakePlayVerifyTask?.cancel()
+        postWakePlayVerifyTask = nil
+        currentErrorMessage = ""
+        didReportTerminalError = false
         let shouldResume = playbackWasPlayingBeforeBackground
         let token = lifecycleReloadToken
-        screensaverDebugLog("[ScreensaverDebug][AetherController] appDidBecomeActive: starting foreground reload task with shouldResume=\(shouldResume), token=\(token)")
+        screensaverDebugLog("[ScreensaverDebug][AetherController] startForegroundReloadIfNeeded: starting foreground reload task with shouldResume=\(shouldResume), token=\(token)")
         rebindSurface()
         var shouldRetryAfterTaskClears = false
         foregroundReloadTask = Task { @MainActor [weak self] in
@@ -4363,9 +4504,20 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 }
             }
             do {
-                screensaverDebugLog("[ScreensaverDebug][AetherController] calling engine.reloadAtCurrentPosition()")
-                try await self.engine.reloadAtCurrentPosition()
-                screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition completed")
+                if self.engine.sessionReloadRefusal == .customSourceNotSeekable {
+                    screensaverDebugLog("[ScreensaverDebug][AetherController] non-seekable custom stream detected; retuning source")
+                    if let activeRequest = self.activePlaybackRequest {
+                        var retuneRequest = activeRequest
+                        retuneRequest.autoplay = shouldResume
+                        retuneRequest.resumePositionSeconds = nil
+                        self.loadGeneration += 1
+                        self.load(retuneRequest, generation: self.loadGeneration)
+                    }
+                } else {
+                    screensaverDebugLog("[ScreensaverDebug][AetherController] calling engine.reloadAtCurrentPosition()")
+                    try await self.engine.reloadAtCurrentPosition()
+                    screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition completed")
+                }
             } catch {
                 let disposition = AetherPlaybackLifecyclePolicy.reloadFailureDisposition(
                     isCancellation: error is CancellationError || Task.isCancelled,
@@ -4389,6 +4541,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 }
                 let message = error.localizedDescription
                 screensaverDebugLog("[ScreensaverDebug][AetherController] engine.reloadAtCurrentPosition FAILED: \(message)")
+                self.pendingReloadSeekTarget = nil
                 self.currentErrorMessage = message
                 self.isPlayerLoading = false
                 if !self.didReportTerminalError {
@@ -4410,6 +4563,21 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             guard UIApplication.shared.applicationState == .active else {
                 self.needsForegroundReload = true
                 return
+            }
+            if let pendingSeek = self.pendingReloadSeekTarget {
+                let targetSeconds = max(0, Double(pendingSeek.ms) / 1000.0)
+                screensaverDebugLog("[ScreensaverDebug][AetherController] applying queued post-reload seek to \(pendingSeek.ms)ms")
+                await self.engine.seek(to: targetSeconds, exact: pendingSeek.exact)
+                guard self.lifecycleReloadToken == token,
+                      !self.engine.pictureInPictureActive else {
+                    return
+                }
+                guard !Task.isCancelled,
+                      UIApplication.shared.applicationState == .active else {
+                    self.needsForegroundReload = true
+                    return
+                }
+                self.pendingReloadSeekTarget = nil
             }
             self.foregroundReloadActiveCancellationRetryCount = 0
             self.rebindSurface()
@@ -4638,6 +4806,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerLoading = false
             isPlayerPlaying = true
             isPlayerEnded = false
+            needsPostWakePlaybackVerification = false
+            postWakePlayVerifyTask?.cancel()
+            postWakePlayVerifyTask = nil
             clearTerminalErrorAfterVerifiedRecovery()
         case .paused:
             isPlayerLoading = false
@@ -5078,6 +5249,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         pendingSeekTask?.cancel()
         pendingSeekTask = nil
         shouldResumeAfterSeek = false
+        resetLifecycleWakeState()
         resetAISubtitleStartupHold()
         loadGeneration = generation
         let isRemote = PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
@@ -5396,21 +5568,87 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var pendingSeekTask: Task<Void, Never>?
     private var shouldResumeAfterSeek: Bool = false
 
+    private func resetLifecycleWakeState() {
+        resignedActiveAt = nil
+        wasPausedAtResign = false
+        sawMediaServicesReset = false
+        needsPostWakePlaybackVerification = false
+        pendingReloadSeekTarget = nil
+        postWakePlayVerifyTask?.cancel()
+        postWakePlayVerifyTask = nil
+    }
+
+    private func schedulePostWakePlaybackVerification() {
+        postWakePlayVerifyTask?.cancel()
+        let gen = loadGeneration
+        postWakePlayVerifyTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_800_000_000)
+            guard !Task.isCancelled, let self, self.loadGeneration == gen else { return }
+            self.postWakePlayVerifyTask = nil
+            guard self.needsPostWakePlaybackVerification,
+                  self.diagnosticPlayIntent == "play",
+                  self.activePlaybackRequest != nil,
+                  !self.isPlayerEnded,
+                  !self.isAwaitingEngineLoad,
+                  self.foregroundReloadTask == nil,
+                  self.pendingSeekTask == nil,
+                  UIApplication.shared.applicationState == .active else { return }
+            let isHealthyPlaying = self.isPlayerPlaying && self.engine.state == .playing
+            guard !isHealthyPlaying else { return }
+            let waitingForHealthyBuffer = self.isTransportPlaying
+                && (self.engine.state == .playing || self.engine.state == .loading || self.engine.isBuffering || self.engine.isSeeking)
+            guard self.engine.needsForegroundSessionRecovery || !waitingForHealthyBuffer else { return }
+            screensaverDebugLog("[ScreensaverDebug][AetherController] post-wake playback stalled after inactive pause (state=\(self.engine.state), phase=\(self.engine.playbackPhase)); reloading session")
+            self.playbackWasPlayingBeforeBackground = true
+            self.needsForegroundReload = true
+            self.startForegroundReloadIfNeeded()
+        }
+    }
+
     func playPlayback() {
         cancelScrubThumbnailWork()
         diagnosticPlayIntent = "play"
-        screensaverDebugLog("[ScreensaverDebug][AetherController] playPlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
+        postWakePlayVerifyTask?.cancel()
+        postWakePlayVerifyTask = nil
+        screensaverDebugLog("[ScreensaverDebug][AetherController] playPlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime), reloadInFlight=\(foregroundReloadTask != nil), recoveryNeeded=\(engine.needsForegroundSessionRecovery)")
         if foregroundReloadTask != nil {
             playbackWasPlayingBeforeBackground = true
+            if pendingReloadSeekTarget != nil {
+                shouldResumeAfterSeek = true
+            }
+            return
+        }
+        let hasReloadableSession = activePlaybackRequest != nil && !isPlayerEnded && !isAwaitingEngineLoad
+        if AetherPlaybackLifecyclePolicy.shouldRecoverOnTransportCommand(
+            hasReloadableSession: hasReloadableSession,
+            needsForegroundReload: needsForegroundReload,
+            engineNeedsSessionRecovery: engine.needsForegroundSessionRecovery,
+            sawMediaServicesReset: sawMediaServicesReset,
+            engineState: engine.state
+        ) {
+            playbackWasPlayingBeforeBackground = true
+            needsForegroundReload = true
+            startForegroundReloadIfNeeded()
+            return
         }
         if pendingSeekTask != nil {
             shouldResumeAfterSeek = true
         }
         engine.play()
+        if needsPostWakePlaybackVerification && hasReloadableSession {
+            schedulePostWakePlaybackVerification()
+        }
     }
+
     func pausePlayback() {
         diagnosticPlayIntent = "pause"
+        postWakePlayVerifyTask?.cancel()
+        postWakePlayVerifyTask = nil
+        needsPostWakePlaybackVerification = false
         screensaverDebugLog("[ScreensaverDebug][AetherController] pausePlayback() called: state=\(engine.state), clock=\(engine.clock.currentTime)")
+        if foregroundReloadTask != nil {
+            playbackWasPlayingBeforeBackground = false
+        }
         shouldResumeAfterSeek = false
         engine.pause()
     }
@@ -5420,20 +5658,63 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func seekToMs(_ ms: Int64, exact: Bool) {
-        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms), exact=\(exact)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime)")
-        lastKnownPositionMs = max(0, ms)
+        screensaverDebugLog("[ScreensaverDebug][AetherController] seekToMs(\(ms), exact=\(exact)) called: lastKnownPos=\(lastKnownPositionMs)ms, clock=\(engine.clock.currentTime), reloadInFlight=\(foregroundReloadTask != nil)")
+        postWakePlayVerifyTask?.cancel()
+        postWakePlayVerifyTask = nil
+        let targetMs = max(0, ms)
+        lastKnownPositionMs = targetMs
         let wasPlaying = isTransportPlaying || isPlayerPlaying || diagnosticPlayIntent == "play"
         shouldResumeAfterSeek = wasPlaying
+        let hasReloadableSession = activePlaybackRequest != nil && !isPlayerEnded && !isAwaitingEngineLoad
+        if foregroundReloadTask != nil {
+            pendingSeekTask?.cancel()
+            pendingSeekTask = nil
+            pendingReloadSeekTarget = (targetMs, exact)
+            if wasPlaying {
+                playbackWasPlayingBeforeBackground = true
+            }
+            return
+        }
+        if AetherPlaybackLifecyclePolicy.shouldRecoverOnTransportCommand(
+            hasReloadableSession: hasReloadableSession,
+            needsForegroundReload: needsForegroundReload,
+            engineNeedsSessionRecovery: engine.needsForegroundSessionRecovery,
+            sawMediaServicesReset: sawMediaServicesReset,
+            engineState: engine.state
+        ) {
+            pendingSeekTask?.cancel()
+            pendingSeekTask = nil
+            pendingReloadSeekTarget = (targetMs, exact)
+            playbackWasPlayingBeforeBackground = wasPlaying
+            needsForegroundReload = true
+            startForegroundReloadIfNeeded()
+            return
+        }
         pendingSeekTask?.cancel()
+        let verifyAfterWake = needsPostWakePlaybackVerification && hasReloadableSession
+        let gen = loadGeneration
         pendingSeekTask = Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.engine.seek(to: Double(ms) / 1000.0, exact: exact)
-            guard !Task.isCancelled else { return }
+            await self.engine.seek(to: Double(targetMs) / 1000.0, exact: exact)
+            guard !Task.isCancelled, self.loadGeneration == gen else { return }
             let resume = self.shouldResumeAfterSeek
             self.shouldResumeAfterSeek = false
             self.pendingSeekTask = nil
+            if verifyAfterWake,
+               self.foregroundReloadTask == nil,
+               self.engine.needsForegroundSessionRecovery || self.engine.state == .idle {
+                screensaverDebugLog("[ScreensaverDebug][AetherController] post-wake seek detected broken session; reloading at \(targetMs)ms")
+                self.pendingReloadSeekTarget = (targetMs, exact)
+                self.playbackWasPlayingBeforeBackground = resume || self.diagnosticPlayIntent == "play"
+                self.needsForegroundReload = true
+                self.startForegroundReloadIfNeeded()
+                return
+            }
             if resume {
                 self.engine.play()
+                if verifyAfterWake {
+                    self.schedulePostWakePlaybackVerification()
+                }
             }
         }
     }
@@ -5597,6 +5878,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         playbackWasPlayingBeforeBackground = false
         foregroundReloadTask?.cancel()
         foregroundReloadTask = nil
+        resetLifecycleWakeState()
+        activePlaybackRequest = nil
         artworkLoadTask?.cancel()
         artworkLoadTask = nil
         nowPlayingInfo = [:]

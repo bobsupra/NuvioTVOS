@@ -3294,6 +3294,9 @@ public final class AetherEngine: ObservableObject {
     /// bounded reload budget. Cancelled on load reset; superseded by newer deaths.
     var itemDeathConfirmTask: Task<Void, Never>? = nil
     var itemDeathReviveGate = ItemDeathReviveGate(maxAttempts: 3)
+    /// Raised when a session-preserving recovery (#93 item death, #98 fallback, stalled reload) is held
+    /// because the app is inactive or backgrounded (e.g., behind the tvOS screensaver).
+    var pendingInactiveRecovery = false
     /// AE#561: the one rebuild onto the software path this session may spend when AVPlayer refuses
     /// the media. Replaced (not reset) on teardown, so a closure held by a dead host cannot spend
     /// the next session's.
@@ -3498,6 +3501,7 @@ public final class AetherEngine: ObservableObject {
         }
         #if os(iOS) || os(tvOS)
         if UIApplication.shared.applicationState != .active || isBackgrounded {
+            pendingInactiveRecovery = true
             EngineLog.emit(
                 "[AetherEngine] fallBackToMediaPlaylist held because application is inactive/backgrounded",
                 category: .session)
@@ -3942,6 +3946,7 @@ public final class AetherEngine: ObservableObject {
               let url = replacementURL ?? (player.currentItem?.asset as? AVURLAsset)?.url else { return }
         #if os(iOS) || os(tvOS)
         if UIApplication.shared.applicationState != .active || isBackgrounded {
+            pendingInactiveRecovery = true
             EngineLog.emit(
                 "[AetherEngine] reloadStalledConsumerItem held because application is inactive/backgrounded",
                 category: .engine)
@@ -4499,6 +4504,36 @@ public final class AetherEngine: ObservableObject {
     /// The background policy released the video item while retaining the source, playhead,
     /// selection and native host. A foreground host must rebuild before sending play().
     public var needsForegroundVideoRestore: Bool { backgroundTeardownSelection != nil }
+
+    /// Whether the active session suffered an invalidation or held recovery while inactive/backgrounded
+    /// (such as tvOS screensaver teardown, mediaserverd reset, failed AVPlayerItem, or held item death)
+    /// and requires `reloadAtCurrentPosition()` on foreground return.
+    public var needsForegroundSessionRecovery: Bool {
+        let isErrorState: Bool = if case .error = state { true } else { false }
+        return Self.shouldRecoverSessionOnForeground(
+            needsForegroundVideoRestore: needsForegroundVideoRestore,
+            pendingInactiveRecovery: pendingInactiveRecovery,
+            hasLoadedSession: loadedURL != nil,
+            mediaServicesResetPending: mediaServicesResetPending,
+            isErrorState: isErrorState,
+            nativeItemFailed: currentAVPlayer?.currentItem?.status == .failed
+                || currentAVPlayer?.status == .failed
+                || nativeHost?.failure != nil
+        )
+    }
+
+    nonisolated static func shouldRecoverSessionOnForeground(
+        needsForegroundVideoRestore: Bool,
+        pendingInactiveRecovery: Bool,
+        hasLoadedSession: Bool,
+        mediaServicesResetPending: Bool,
+        isErrorState: Bool,
+        nativeItemFailed: Bool
+    ) -> Bool {
+        needsForegroundVideoRestore
+            || pendingInactiveRecovery
+            || (hasLoadedSession && (mediaServicesResetPending || isErrorState || nativeItemFailed))
+    }
 
     /// Detached reader that decodes ALL embedded text subtitle streams in one side-demuxer pass into their
     /// ordinal's NativeSubtitleCueStore (#55, all-tracks). Parallel to the packet-store drainer (which drives
@@ -5181,6 +5216,7 @@ public final class AetherEngine: ObservableObject {
         stallReengageTask = nil
         itemDeathConfirmTask?.cancel()
         itemDeathConfirmTask = nil
+        pendingInactiveRecovery = false
         itemDeathReviveGate = ItemDeathReviveGate(maxAttempts: 3)
         stallReloadReviveGate = ItemDeathReviveGate(maxAttempts: 2)
         softwarePathEscalationBudget = SoftwarePathEscalation.Budget()
@@ -9175,6 +9211,7 @@ resumeOverride: selection.resumePosition,
         stallReengageTask = nil
         itemDeathConfirmTask?.cancel()
         itemDeathConfirmTask = nil
+        pendingInactiveRecovery = false
         // The master->media fallback single-shot is per SESSION, and the reload this teardown
         // precedes builds a new one (a fresh HLSVideoEngine with its own master). `load()` resets
         // it in loadSession's prologue, but the session-preserving rebuilds

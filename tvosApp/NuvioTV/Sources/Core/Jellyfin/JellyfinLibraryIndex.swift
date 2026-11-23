@@ -4,7 +4,7 @@ import Foundation
 /// only item; for a series it's one episode. The `episode*` fields are the
 /// per-episode display data `meta(forContentId:)` turns into `NuvioVideo`
 /// entries — nil for a movie's single item.
-struct JellyfinIndexedItem: Codable, Equatable {
+struct JellyfinIndexedItem: Codable, Equatable, Sendable {
     let itemId: String
     let container: String?
     let size: Int64?
@@ -27,6 +27,11 @@ struct JellyfinIndexedItem: Codable, Equatable {
     }
 }
 
+struct JellyfinServerAccess: Sendable {
+    let baseURL: URL
+    let accessToken: String
+}
+
 /// One Jellyfin title (a `Movie` or a `Series`), carrying every field needed
 /// to build its own `NuvioMeta` locally — no lookup against Cinemeta/TMDB/
 /// MDBList. `contentId` is synthetic (`jellyfin-<serverID>-<itemId>`), not an
@@ -34,7 +39,7 @@ struct JellyfinIndexedItem: Codable, Equatable {
 /// where the metadata came from, and it isn't anymore. `imdbId`/`tmdbId` are
 /// still captured when Jellyfin's own metadata agent found one, purely as an
 /// identifier other integrations (Trakt/Simkl scrobbling) could use later.
-struct JellyfinIndexedTitle: Codable, Equatable {
+struct JellyfinIndexedTitle: Codable, Equatable, Sendable {
     let contentId: String
     let serverID: String
     /// Optional for compatibility with titles persisted before Home rows were
@@ -180,12 +185,42 @@ final class JellyfinLibraryIndex: ObservableObject {
         meta(for: title, requestedContentId: title.contentId)
     }
 
+    func serverAccessSnapshot(for serverIDs: Set<String>? = nil) -> [String: JellyfinServerAccess] {
+        var result: [String: JellyfinServerAccess] = [:]
+        for server in JellyfinServerStore.shared.servers {
+            if let serverIDs, !serverIDs.contains(server.id) { continue }
+            guard let baseURL = server.baseURL else { continue }
+            result[server.id] = JellyfinServerAccess(
+                baseURL: baseURL,
+                accessToken: JellyfinCredentialStore.token(forServerID: server.id)
+            )
+        }
+        return result
+    }
+
     /// `requestedContentId` preserves `meta(forContentId:)`'s episode IDs when
     /// the lookup matched through a raw Jellyfin item ID or another alias.
     func meta(for title: JellyfinIndexedTitle, requestedContentId: String) -> NuvioMeta? {
-        guard let server = JellyfinServerStore.shared.server(id: title.serverID),
-              let baseURL = server.baseURL else { return nil }
-        let token = JellyfinCredentialStore.token(forServerID: server.id)
+        let accessByID = serverAccessSnapshot(for: [title.serverID])
+        return Self.meta(
+            for: title,
+            requestedContentId: requestedContentId,
+            serverAccessByID: accessByID,
+            episodeTitleTemplate: L10n.resolvedFormatTemplate("jellyfin_episode_fallback_title", fallback: "Episode %d"),
+            locale: AppLocaleManager.shared.locale
+        )
+    }
+
+    nonisolated static func meta(
+        for title: JellyfinIndexedTitle,
+        requestedContentId: String,
+        serverAccessByID: [String: JellyfinServerAccess],
+        episodeTitleTemplate: String = "Episode %d",
+        locale: Locale = .current
+    ) -> NuvioMeta? {
+        guard let access = serverAccessByID[title.serverID] else { return nil }
+        let baseURL = access.baseURL
+        let token = access.accessToken
 
         func imageURL(itemId: String, type: String, tag: String?) -> String? {
             guard let tag else { return nil }
@@ -199,7 +234,7 @@ final class JellyfinLibraryIndex: ObservableObject {
                     guard let season = file.season, let episode = file.episode else { return nil }
                     return NuvioVideo(
                         id: "\(requestedContentId):\(season):\(episode)",
-                        title: file.episodeName ?? L10n.format("jellyfin_episode_fallback_title", fallback: "Episode %d", episode),
+                        title: file.episodeName ?? String(format: episodeTitleTemplate, locale: locale, episode),
                         season: season,
                         episode: episode,
                         thumbnail: imageURL(itemId: file.itemId, type: "Primary", tag: file.episodeImageTag),
@@ -239,7 +274,7 @@ final class JellyfinLibraryIndex: ObservableObject {
         )
     }
 
-    private static func formattedRuntime(ticks: Int64) -> String {
+    nonisolated private static func formattedRuntime(ticks: Int64) -> String {
         let minutes = Int(ticks / 10_000_000 / 60)
         guard minutes > 0 else { return "" }
         let hours = minutes / 60

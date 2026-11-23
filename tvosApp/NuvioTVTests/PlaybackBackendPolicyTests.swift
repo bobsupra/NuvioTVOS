@@ -434,6 +434,205 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertTrue(didWillSuspend, "Entering background must trigger willSuspendPlayback")
     }
 
+    func testAetherScreensaverAndMediaResetRecoveryPolicy() {
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.isPausedForInactiveTracking(
+            state: .paused,
+            isPlayerPlaying: false,
+            isTransportPlaying: false,
+            isEnded: false
+        ))
+        XCTAssertFalse(AetherPlaybackLifecyclePolicy.isPausedForInactiveTracking(
+            state: .playing,
+            isPlayerPlaying: true,
+            isTransportPlaying: true,
+            isEnded: false
+        ))
+        XCTAssertFalse(AetherPlaybackLifecyclePolicy.isPausedForInactiveTracking(
+            state: .paused,
+            isPlayerPlaying: false,
+            isTransportPlaying: false,
+            isEnded: true
+        ))
+
+        // Control Center / Siri while playing or brief pause (< 15s) must not trigger reload.
+        XCTAssertFalse(AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: false,
+            wasPausedAtResign: false,
+            inactiveDuration: 300
+        ))
+        XCTAssertFalse(AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: false,
+            wasPausedAtResign: true,
+            inactiveDuration: 4
+        ))
+
+        // Prolonged paused inactivity (Apple TV Aerial screensaver) or dead/reset engine must reload.
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: false,
+            wasPausedAtResign: true,
+            inactiveDuration: AetherPlaybackLifecyclePolicy.pausedInactiveReloadThreshold
+        ))
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: true,
+            sawMediaServicesReset: false,
+            wasPausedAtResign: true,
+            inactiveDuration: 2
+        ))
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: true,
+            wasPausedAtResign: false,
+            inactiveDuration: 2
+        ))
+        XCTAssertFalse(AetherPlaybackLifecyclePolicy.shouldReloadOnBecomeActive(
+            hasReloadableSession: false,
+            needsForegroundReload: true,
+            engineNeedsSessionRecovery: true,
+            sawMediaServicesReset: true,
+            wasPausedAtResign: true,
+            inactiveDuration: 300
+        ))
+
+        // Transport commands (play / seek) recover torn-down, errored, or reset sessions instead of no-oping.
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.shouldRecoverOnTransportCommand(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: true,
+            sawMediaServicesReset: false,
+            engineState: .paused
+        ))
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.shouldRecoverOnTransportCommand(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: false,
+            engineState: .idle
+        ))
+        XCTAssertTrue(AetherPlaybackLifecyclePolicy.shouldRecoverOnTransportCommand(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: false,
+            engineState: .error("Failed")
+        ))
+        XCTAssertFalse(AetherPlaybackLifecyclePolicy.shouldRecoverOnTransportCommand(
+            hasReloadableSession: true,
+            needsForegroundReload: false,
+            engineNeedsSessionRecovery: false,
+            sawMediaServicesReset: false,
+            engineState: .paused
+        ))
+    }
+
+    func testMPVScreensaverAndMediaResetRecoveryPolicy() {
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.isPausedWhenResigningActive(
+            hasMPV: true,
+            isPlayerPlaying: false,
+            mpvIsPaused: true,
+            isPlayerEnded: false
+        ))
+        XCTAssertFalse(MPVPlaybackLifecyclePolicy.isPausedWhenResigningActive(
+            hasMPV: true,
+            isPlayerPlaying: true,
+            mpvIsPaused: false,
+            isPlayerEnded: false
+        ))
+
+        // Active Control Center / Siri or short paused interruption does not restore.
+        XCTAssertFalse(MPVPlaybackLifecyclePolicy.shouldRestoreAfterInactiveResign(
+            hasMPV: true,
+            isApplicationBackgrounded: false,
+            lifecycleRestorePending: false,
+            sawMediaServicesReset: false,
+            sawInactivePlaybackFailure: false,
+            isPlayerEnded: false,
+            wasPausedAtResign: false,
+            inactiveDuration: 180
+        ))
+        XCTAssertFalse(MPVPlaybackLifecyclePolicy.shouldRestoreAfterInactiveResign(
+            hasMPV: true,
+            isApplicationBackgrounded: false,
+            lifecycleRestorePending: false,
+            sawMediaServicesReset: false,
+            sawInactivePlaybackFailure: false,
+            isPlayerEnded: false,
+            wasPausedAtResign: true,
+            inactiveDuration: 3
+        ))
+
+        // Paused through tvOS screensaver (>= 15s), media reset, or inactive failure restores cleanly.
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldRestoreAfterInactiveResign(
+            hasMPV: true,
+            isApplicationBackgrounded: false,
+            lifecycleRestorePending: false,
+            sawMediaServicesReset: false,
+            sawInactivePlaybackFailure: false,
+            isPlayerEnded: false,
+            wasPausedAtResign: true,
+            inactiveDuration: MPVPlaybackLifecyclePolicy.pausedInactiveRestoreThreshold
+        ))
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldRestoreAfterInactiveResign(
+            hasMPV: true,
+            isApplicationBackgrounded: false,
+            lifecycleRestorePending: false,
+            sawMediaServicesReset: true,
+            sawInactivePlaybackFailure: false,
+            isPlayerEnded: false,
+            wasPausedAtResign: true,
+            inactiveDuration: 1
+        ))
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldRestoreAfterInactiveResign(
+            hasMPV: true,
+            isApplicationBackgrounded: false,
+            lifecycleRestorePending: false,
+            sawMediaServicesReset: false,
+            sawInactivePlaybackFailure: true,
+            isPlayerEnded: false,
+            wasPausedAtResign: true,
+            inactiveDuration: 1
+        ))
+
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+            sawMediaServicesReset: true,
+            hasError: false,
+            reachedUnexpectedEOF: false
+        ))
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+            sawMediaServicesReset: false,
+            hasError: true,
+            reachedUnexpectedEOF: false
+        ))
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+            sawMediaServicesReset: false,
+            hasError: false,
+            reachedUnexpectedEOF: true
+        ))
+        XCTAssertTrue(MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+            sawMediaServicesReset: false,
+            hasError: false,
+            reachedUnexpectedEOF: false,
+            isLiveStream: true
+        ))
+        XCTAssertFalse(MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
+            sawMediaServicesReset: false,
+            hasError: false,
+            reachedUnexpectedEOF: false
+        ))
+    }
+
     func testMPVBufferedBarEndsWhereTheCacheReaches() {
         // 16:01 played, cache up to 16:05: the bar ends at 16:05, not at 32:06.
         XCTAssertEqual(MPVBufferedPosition.endMs(positionMs: 961_000, cacheEndMs: 965_500), 965_500)
@@ -2643,7 +2842,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 preferredSubtitleLanguages: ["Spanish"],
                 allowForcedSubtitles: false
             ),
-            .preferredLanguages(["Spanish"])
+            .off
         )
         XCTAssertEqual(
             PlayerViewModel.automaticSubtitlePolicy(
@@ -2661,7 +2860,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 preferredSubtitleLanguages: ["English", "Arabic"],
                 allowForcedSubtitles: false
             ),
-            .preferredLanguages(["English", "Arabic"])
+            .off
         )
         XCTAssertEqual(
             PlayerViewModel.automaticSubtitlePolicy(

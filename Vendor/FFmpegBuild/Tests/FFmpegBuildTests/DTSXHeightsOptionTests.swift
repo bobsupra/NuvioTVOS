@@ -30,4 +30,16 @@ struct DTSXHeightsOptionTests {
         #expect(av_opt_get_int(context!.pointee.priv_data, "x_heights", 0, &value) >= 0)
         #expect(value == 1)
     }
+
+    @Test("the dca decoder exports x_presentation, read-only and 0 before any heights decoded")
+    func presentationIsExported() throws {
+        let codec = try #require(avcodec_find_decoder(AV_CODEC_ID_DTS))
+        var context = avcodec_alloc_context3(codec)
+        defer { avcodec_free_context(&context) }
+        #expect(avcodec_open2(context, codec, nil) >= 0)
+        var value: Int64 = -1
+        #expect(av_opt_get_int(context!.pointee.priv_data, "x_presentation", 0, &value) >= 0)
+        #expect(value == 0)
+        #expect(av_opt_set_int(context!.pointee.priv_data, "x_presentation", 1, 0) < 0, "read-only")
+    }
 }

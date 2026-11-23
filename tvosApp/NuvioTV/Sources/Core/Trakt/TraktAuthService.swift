@@ -404,6 +404,8 @@ enum TraktWatchProgressSource: String, CaseIterable, Codable, Hashable, Sendable
     case wetrakr = "WETRAKR"
     case nuvioSync = "NUVIO_SYNC"
 
+    var usesContinueWatchingWindow: Bool { self == .trakt || self == .mdblist || self == .wetrakr }
+
     var label: String {
         switch self {
         case .trakt: return "Trakt"
@@ -701,7 +703,9 @@ enum TraktAuthStore {
             if scope != "1" { TraktKeychainStorage.shared.saveSession(session, for: "1") }
         }
 
-        NotificationCenter.default.post(name: changedNotification, object: nil)
+        if isNewLogin {
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+        }
     }
 
     static func saveUser(
@@ -813,20 +817,26 @@ enum TraktSettingsStore {
     )
 
     static var continueWatchingDaysCap: Int {
-        get {
-            let defaults = ProfileSettings.current
-            guard defaults.object(forKey: SettingsKey.traktContinueWatchingDaysCap) != nil else {
-                return TraktDefaults.continueWatchingDaysCap
-            }
-            let value = defaults.integer(forKey: SettingsKey.traktContinueWatchingDaysCap)
-            return normalizeContinueWatchingDaysCap(value)
-        }
+        get { continueWatchingDaysCap(in: ProfileSettings.current) }
         set {
             let normalized = normalizeContinueWatchingDaysCap(newValue)
             guard normalized != continueWatchingDaysCap else { return }
             ProfileSettings.current.set(normalized, forKey: SettingsKey.traktContinueWatchingDaysCap)
             NotificationCenter.default.post(name: continueWatchingChangedNotification, object: nil)
         }
+    }
+
+    static func continueWatchingDaysCap(in defaults: UserDefaults) -> Int {
+        guard defaults.object(forKey: SettingsKey.traktContinueWatchingDaysCap) != nil else {
+            return TraktDefaults.continueWatchingDaysCap
+        }
+        return normalizeContinueWatchingDaysCap(defaults.integer(forKey: SettingsKey.traktContinueWatchingDaysCap))
+    }
+
+    static func continueWatchingCutoff(in defaults: UserDefaults, now: Date = Date()) -> Date? {
+        let days = continueWatchingDaysCap(in: defaults)
+        guard days != TraktDefaults.continueWatchingDaysCapAll else { return nil }
+        return Calendar.current.date(byAdding: .day, value: -days, to: now)
     }
 
     static func notifyContinueWatchingSourceInvalidated(
@@ -2443,11 +2453,7 @@ struct TraktProgressService {
         }
         seeds.append(contentsOf: upNextSeedsByContentID.values.filter { !droppedShowIDs.contains($0.contentID) })
 
-        let cutoff: Date? = {
-            let days = TraktSettingsStore.continueWatchingDaysCap
-            guard days != TraktDefaults.continueWatchingDaysCapAll else { return nil }
-            return Calendar.current.date(byAdding: .day, value: -days, to: Date())
-        }()
+        let cutoff = TraktSettingsStore.continueWatchingCutoff(in: context.store)
 
         let recentSeeds = seeds
             .filter { cutoff == nil || $0.lastUpdated >= cutoff! }

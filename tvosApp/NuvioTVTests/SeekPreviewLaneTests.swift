@@ -455,6 +455,21 @@ private final class NearestOnlyScrubThumbnailProvider: ScrubThumbnailProviding {
     }
 }
 
+@MainActor
+private final class UnavailableChapterThumbnailProvider: ScrubThumbnailProviding {
+    var supportsScrubThumbnails = true
+    var chapterThumbnailsUnavailableForCurrentSource = false
+    private(set) var chapterRequests = 0
+
+    func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? { nil }
+    func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage? { nil }
+    func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        chapterRequests += 1
+        chapterThumbnailsUnavailableForCurrentSource = true
+        return nil
+    }
+}
+
 extension SeekPreviewLaneTests {
     @MainActor
     func testNearestStillStandsInOnlyAfterTheTargetsOwnRequestsFail() async {
@@ -487,5 +502,45 @@ extension SeekPreviewLaneTests {
         await fulfillment(of: [published], timeout: 8)
         XCTAssertEqual(provider.nearestRequests, [900], "asked once, after the target's own requests")
         XCTAssertGreaterThanOrEqual(provider.decodeRequests, 4)
+    }
+
+    @MainActor
+    func testChapterThumbnailsStopRetryingWhenSourceIsPermanentlyUnsupported() async throws {
+        let defaults = ProfileSettings.current
+        let prevPreview = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        let prevScene = defaults.object(forKey: SettingsKey.sceneFeatureEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.sceneFeatureEnabled)
+        defer {
+            defaults.set(prevPreview, forKey: SettingsKey.seekPreviewEnabled)
+            defaults.set(prevScene, forKey: SettingsKey.sceneFeatureEnabled)
+        }
+
+        let provider = UnavailableChapterThumbnailProvider()
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator, scrubThumbnailProvider: provider)
+        defer { coordinator.stopAll() }
+        model.status = .paused
+        model.clock.duration = 1_800
+        model.chapters = PlaybackChapters.chapters(
+            from: [
+                (id: 1, name: "Chapter 1", start: 0, duration: 600),
+                (id: 2, name: "Chapter 2", start: 600, duration: 600),
+                (id: 3, name: "Chapter 3", start: 1200, duration: 600),
+            ],
+            totalDuration: 1_800
+        )
+
+        model.startChapterThumbnails()
+        for _ in 0..<40 where provider.chapterRequests == 0 || !provider.chapterThumbnailsUnavailableForCurrentSource {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try await Task.sleep(nanoseconds: 150_000_000)
+
+        XCTAssertEqual(provider.chapterRequests, 1, "Chapter thumbnail loader must stop after permanent codec failure rather than looping over remaining chapters")
     }
 }

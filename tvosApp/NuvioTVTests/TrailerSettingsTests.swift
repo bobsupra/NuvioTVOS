@@ -623,4 +623,364 @@ final class TrailerSettingsTests: XCTestCase {
         XCTAssertNil(none)
         XCTAssertEqual(unknown.calls, ["ids"])
     }
+
+    // MARK: Add-on trailerStreams, independent source/language, and diagnostics
+
+    func testTrailerSourceAndLanguageSettingsKeysDefined() {
+        XCTAssertEqual(SettingsKey.trailerSource, "nuvio.tv.settings.playback.trailerSource")
+        XCTAssertEqual(SettingsKey.trailerLanguage, "nuvio.tv.settings.playback.trailerLanguage")
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trailerSource))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trailerLanguage))
+        XCTAssertFalse(SettingsKey.deviceLocal.contains(SettingsKey.trailerSource))
+        XCTAssertFalse(SettingsKey.deviceLocal.contains(SettingsKey.trailerLanguage))
+
+        XCTAssertEqual(TrailerSourceMode.fromStored(nil), .auto)
+        XCTAssertEqual(TrailerSourceMode.fromStored("unknown"), .auto)
+        XCTAssertEqual(TrailerSourceMode.fromStored("trailerioOnly"), .trailerioOnly)
+        XCTAssertEqual(TrailerSourceMode.fromStored("directOnly"), .directOnly)
+        XCTAssertEqual(TrailerSourceMode.fromStored("youtubeOnly"), .youtubeOnly)
+        XCTAssertTrue(TrailerSourceMode.auto.allowsYouTubeFallback)
+        XCTAssertTrue(TrailerSourceMode.youtubeOnly.allowsYouTubeFallback)
+        XCTAssertFalse(TrailerSourceMode.trailerioOnly.allowsYouTubeFallback)
+        XCTAssertFalse(TrailerSourceMode.directOnly.allowsYouTubeFallback)
+    }
+
+    func testTrailerLanguageResolvesIndependentlyFromDisabledTMDBAndArtworkLanguage() {
+        // Fresh store on a non-English system/app language with TMDB disabled must stay English.
+        testDefaults.set(false, forKey: SettingsKey.tmdbEnabled)
+        testDefaults.set("nl", forKey: SettingsKey.language)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults, systemLanguage: "nl-NL"), "en")
+
+        // When TMDB integration is disabled, Auto must default to English rather than letting
+        // App Language or legacy TMDB language force localized YouTube trailers over direct HD sources.
+        testDefaults.set("tmdb-key", forKey: SettingsKey.tmdbApiKey)
+        TmdbMetadataLanguage.selectManual("de", in: testDefaults)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults, systemLanguage: "nl-NL"), "en")
+
+        // When TMDB is enabled but TMDB Trailers module is off, Auto still resolves to English.
+        testDefaults.set(true, forKey: SettingsKey.tmdbEnabled)
+        testDefaults.set(false, forKey: SettingsKey.tmdbUseTrailers)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults), "en")
+
+        // When TMDB trailers are active, Auto follows TMDB's resolved language.
+        testDefaults.set(true, forKey: SettingsKey.tmdbUseTrailers)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults), "de")
+
+        // Explicit Trailer Language overrides TMDB metadata/artwork language independently.
+        testDefaults.set("en", forKey: SettingsKey.trailerLanguage)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults), "en")
+
+        // Follow App Language works independently even when TMDB is disabled and TMDB language differs.
+        testDefaults.set(false, forKey: SettingsKey.tmdbEnabled)
+        testDefaults.set(TrailerLanguagePreference.followAppValue, forKey: SettingsKey.trailerLanguage)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults), "nl")
+
+        // Explicit non-English Trailer Language works even when TMDB is disabled and App Language is English.
+        testDefaults.set("en", forKey: SettingsKey.language)
+        testDefaults.set("fr-FR", forKey: SettingsKey.trailerLanguage)
+        XCTAssertEqual(TrailerLanguagePreference.resolvedLanguage(in: testDefaults), "fr-FR")
+    }
+
+    func testCinemetaMetaDecodesDirectTrailerStreamsAndExtractsYouTubeURLs() throws {
+        let json = #"""
+        {
+          "meta": {
+            "id": "tt32558705",
+            "type": "movie",
+            "name": "The Hunger Games: Sunrise on the Reaping",
+            "trailers": [
+              { "source": "loc12345678", "type": "Trailer" }
+            ],
+            "trailerStreams": [
+              {
+                "title": "MUBI 1080p",
+                "url": "https://trailers.mubicdn.net/trailer.mp4"
+              },
+              {
+                "name": "Trailerio",
+                "title": "⭐ Rotten Tomatoes 1080p",
+                "url": "https://video.fandango.com/trailer.mp4",
+                "behaviorHints": {
+                  "proxyHeaders": {
+                    "request": { "Referer": "https://trailerio.cc/" }
+                  }
+                }
+              },
+              {
+                "title": "Plex 1080p",
+                "url": "https://video.internetvideoarchive.net/video.mp4?cmd=6"
+              },
+              {
+                "title": "Localized YouTube",
+                "url": "https://www.youtube.com/watch?v=ytUrl123456"
+              },
+              {
+                "title": "Direct ytId",
+                "ytId": "ytId1234567"
+              },
+              {
+                "title": "Invalid",
+                "url": "ftp://invalid.test/trailer.mp4"
+              }
+            ]
+          }
+        }
+        """#
+
+        let decoded = try JSONDecoder().decode(CinemetaMetaResponse.self, from: Data(json.utf8))
+        let meta = decoded.meta.toMeta(fallbackType: "movie")
+
+        XCTAssertEqual(meta.trailerStreams?.count, 3)
+        XCTAssertEqual(meta.trailerStreams?.map(\.url), [
+            "https://trailers.mubicdn.net/trailer.mp4",
+            "https://video.fandango.com/trailer.mp4",
+            "https://video.internetvideoarchive.net/video.mp4?cmd=6"
+        ])
+        XCTAssertEqual(meta.trailerStreams?[1].requestHeaders, ["Referer": "https://trailerio.cc/"])
+        XCTAssertEqual(meta.trailerYtIds, ["loc12345678", "ytUrl123456", "ytId1234567"])
+
+        // Preserved across metadata merges and persistence snapshots.
+        let stub = NuvioMeta(id: "tt32558705", name: "The Hunger Games", type: "movie")
+        XCTAssertEqual(stub.fillingMissingHeroMetadata(from: meta).trailerStreams, meta.trailerStreams)
+        XCTAssertEqual(stub.mergingSearchMetadata(from: meta).trailerStreams, meta.trailerStreams)
+        XCTAssertEqual(meta.persistenceSnapshot.trailerStreams, meta.trailerStreams)
+    }
+
+    func testResolverPrefersDirectAddonTrailerStreamsOverLocalizedYouTube() async {
+        let state = TrailerResolverTestState()
+        state.language = "nl-NL"
+        let resolver = YouTubeTrailerResolver(
+            sourceModeProvider: { .auto },
+            preferredLanguageProvider: { state.language },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in
+                state.calls.append("tmdb")
+                return "tmdbLoc1234"
+            },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in
+                state.calls.append("trailerio")
+                return TrailerPlaybackSource(videoUrl: "https://trailerio.test/fallback.mp4", qualityLabel: "1080p")
+            },
+            imdbTrailerProvider: { _ in
+                state.calls.append("imdb")
+                return nil
+            },
+            youtubeSourceProvider: { videoID, _, _, _ in
+                state.calls.append("youtube:\(videoID)")
+                return TrailerPlaybackSource(videoUrl: "https://youtube.test/\(videoID).mp4", qualityLabel: "360p (MP4)")
+            }
+        )
+
+        let meta = NuvioMeta(
+            id: "tt32558705",
+            name: "The Hunger Games: Sunrise on the Reaping",
+            imdbId: "tt32558705",
+            type: "movie",
+            trailerYtIds: ["loc12345678"],
+            trailerStreams: [
+                NuvioTrailerStream(url: "https://trailers.mubicdn.net/trailer.mp4", title: "MUBI 1080p"),
+                NuvioTrailerStream(url: "https://video.internetvideoarchive.net/plex.mp4", title: "Plex 1080p"),
+                NuvioTrailerStream(url: "https://video.fandango.com/rt.mp4", title: "⭐ Rotten Tomatoes 1080p")
+            ]
+        )
+
+        let preview = await resolver.resolvePreview(for: meta)
+        XCTAssertEqual(preview?.videoUrl, "https://video.fandango.com/rt.mp4")
+        XCTAssertEqual(preview?.providerKind, .addonTrailerStreams)
+        XCTAssertEqual(preview?.providerName, "⭐ Rotten Tomatoes 1080p")
+        XCTAssertEqual(state.calls, [], "Direct addon trailerStreams must take precedence without falling back to localized YouTube")
+
+        // 4K trailerStreams stream outranks 1080p Rotten Tomatoes.
+        let with4K = NuvioMeta(
+            id: "tt32558705",
+            name: "The Hunger Games: Sunrise on the Reaping",
+            imdbId: "tt32558705",
+            type: "movie",
+            trailerStreams: [
+                NuvioTrailerStream(url: "https://video.fandango.com/rt.mp4", title: "⭐ Rotten Tomatoes 1080p"),
+                NuvioTrailerStream(url: "https://apple.test/master.m3u8", title: "Apple TV 4K HDR 5.1")
+            ]
+        )
+        let best = await resolver.resolve(for: with4K)
+        XCTAssertEqual(best?.videoUrl, "https://apple.test/master.m3u8")
+    }
+
+    func testTrailerSourceModesEnforcePriorityAndFallbacks() async {
+        let meta = NuvioMeta(
+            id: "tt32558705",
+            name: "Sunrise on the Reaping",
+            imdbId: "tt32558705",
+            type: "movie",
+            trailerYtIds: ["yt123456789"],
+            trailerStreams: [
+                NuvioTrailerStream(url: "https://addon.test/1080p.mp4", title: "Addon 1080p")
+            ]
+        )
+
+        // 1. Trailerio Only skips addon trailerStreams, IMDb, and YouTube.
+        let trailerioState = TrailerResolverTestState()
+        let trailerioOnlySuccess = YouTubeTrailerResolver(
+            sourceModeProvider: { .trailerioOnly },
+            preferredLanguageProvider: { "fr-FR" },
+            trailerYouTubeIdProvider: { _ in trailerioState.calls.append("tmdb"); return "yt123456789" },
+            trailerioProvider: { imdb, _ in
+                trailerioState.calls.append("trailerio:\(imdb)")
+                return TrailerPlaybackSource(videoUrl: "https://trailerio.test/rt.mp4", providerKind: .trailerio, providerName: "Rotten Tomatoes 1080p")
+            },
+            imdbTrailerProvider: { _ in trailerioState.calls.append("imdb"); return nil },
+            youtubeSourceProvider: { _, _, _, _ in trailerioState.calls.append("youtube"); return nil }
+        )
+        let trailerioSource = await trailerioOnlySuccess.resolvePreview(for: meta)
+        XCTAssertEqual(trailerioSource?.videoUrl, "https://trailerio.test/rt.mp4")
+        XCTAssertEqual(trailerioState.calls, ["trailerio:tt32558705"])
+
+        let trailerioMissState = TrailerResolverTestState()
+        let trailerioOnlyMiss = YouTubeTrailerResolver(
+            sourceModeProvider: { .trailerioOnly },
+            preferredLanguageProvider: { "en-US" },
+            trailerYouTubeIdProvider: { _ in trailerioMissState.calls.append("tmdb"); return "yt123456789" },
+            trailerioProvider: { _, _ in trailerioMissState.calls.append("trailerio"); return nil },
+            imdbTrailerProvider: { _ in
+                trailerioMissState.calls.append("imdb")
+                return TrailerPlaybackSource(videoUrl: "https://imdb.test/1080p.mp4")
+            },
+            youtubeSourceProvider: { _, _, _, _ in
+                trailerioMissState.calls.append("youtube")
+                return TrailerPlaybackSource(videoUrl: "https://youtube.test/360p.mp4")
+            }
+        )
+        let missed = await trailerioOnlyMiss.resolvePreview(for: meta)
+        XCTAssertNil(missed)
+        XCTAssertEqual(trailerioMissState.calls, ["trailerio"])
+
+        // 2. Direct Only tries trailerStreams -> Trailerio -> IMDb and never falls back to YouTube.
+        let directState = TrailerResolverTestState()
+        let noAddonMeta = NuvioMeta(
+            id: "tt32558705",
+            name: "Sunrise on the Reaping",
+            imdbId: "tt32558705",
+            type: "movie",
+            trailerYtIds: ["yt123456789"]
+        )
+        let directOnly = YouTubeTrailerResolver(
+            sourceModeProvider: { .directOnly },
+            preferredLanguageProvider: { "de-DE" },
+            trailerYouTubeIdProvider: { _ in directState.calls.append("tmdb"); return "yt123456789" },
+            trailerioProvider: { _, _ in directState.calls.append("trailerio"); return nil },
+            imdbTrailerProvider: { imdb in directState.calls.append("imdb:\(imdb)"); return nil },
+            youtubeSourceProvider: { _, _, _, _ in
+                directState.calls.append("youtube")
+                return TrailerPlaybackSource(videoUrl: "https://youtube.test/360p.mp4")
+            }
+        )
+        let directResult = await directOnly.resolvePreview(for: noAddonMeta)
+        XCTAssertNil(directResult)
+        XCTAssertEqual(directState.calls, ["trailerio", "imdb:tt32558705"])
+
+        // 3. YouTube / TMDB skips addon trailerStreams, Trailerio, and IMDb.
+        let ytState = TrailerResolverTestState()
+        let youtubeOnly = YouTubeTrailerResolver(
+            sourceModeProvider: { .youtubeOnly },
+            preferredLanguageProvider: { "de-DE" },
+            trailerYouTubeIdProvider: { _ in ytState.calls.append("tmdb"); return "ytDe1234567" },
+            trailerioProvider: { _, _ in ytState.calls.append("trailerio"); return nil },
+            imdbTrailerProvider: { _ in ytState.calls.append("imdb"); return nil },
+            youtubeSourceProvider: { videoID, _, _, _ in
+                ytState.calls.append("youtube:\(videoID)")
+                return TrailerPlaybackSource(videoUrl: "https://youtube.test/\(videoID).m3u8", qualityLabel: "1080p (HLS)")
+            }
+        )
+        let ytResult = await youtubeOnly.resolvePreview(for: meta)
+        XCTAssertEqual(ytResult?.videoUrl, "https://youtube.test/ytDe1234567.m3u8")
+        XCTAssertEqual(ytResult?.youtubeVideoId, "ytDe1234567")
+        XCTAssertEqual(ytState.calls, ["tmdb", "youtube:ytDe1234567"])
+    }
+
+    func testTrailerPlaybackDiagnosticsTracksProviderYouTubeIdAndResolution() {
+        let meta = NuvioMeta(id: "tt32558705", name: "Sunrise on the Reaping", type: "movie")
+
+        let ytSource = TrailerPlaybackSource(
+            videoUrl: "https://googlevideo.test/360.mp4",
+            qualityLabel: "360p (MP4)",
+            providerKind: .youtube,
+            providerName: "360p (MP4) [ios]",
+            youtubeVideoId: "abc12345678"
+        )
+        let ytToken = TrailerPlaybackDiagnostics.shared.recordResolution(
+            meta: meta,
+            context: "Details Background",
+            sourceMode: .auto,
+            resolvedLanguage: "nl",
+            tmdbEnabled: false,
+            source: ytSource
+        )
+        TrailerPlaybackDiagnostics.shared.recordPlaybackReady(token: ytToken, resolution: "640×360")
+        let ytSummary = TrailerPlaybackDiagnostics.shared.settingsSummary
+        XCTAssertTrue(ytSummary.contains("YouTube"))
+        XCTAssertTrue(ytSummary.contains("360p (MP4) [ios]"))
+        XCTAssertTrue(ytSummary.contains("yt:abc12345678"))
+        XCTAssertTrue(ytSummary.contains("640×360"))
+        XCTAssertTrue(ytSummary.contains("Details Background"))
+
+        let addonSource = TrailerPlaybackSource(
+            videoUrl: "https://video.fandango.com/rt.mp4",
+            qualityLabel: "⭐ Rotten Tomatoes 1080p",
+            providerKind: .addonTrailerStreams,
+            providerName: "⭐ Rotten Tomatoes 1080p"
+        )
+        let addonToken = TrailerPlaybackDiagnostics.shared.recordResolution(
+            meta: meta,
+            context: "Details Background",
+            sourceMode: .auto,
+            resolvedLanguage: "en",
+            tmdbEnabled: false,
+            source: addonSource
+        )
+        TrailerPlaybackDiagnostics.shared.recordPlaybackReady(token: addonToken, resolution: "1920×1080")
+        let addonSummary = TrailerPlaybackDiagnostics.shared.settingsSummary
+        XCTAssertTrue(addonSummary.contains("Addon trailerStreams"))
+        XCTAssertTrue(addonSummary.contains("⭐ Rotten Tomatoes 1080p"))
+        XCTAssertTrue(addonSummary.contains("1920×1080"))
+        XCTAssertFalse(addonSummary.contains("yt:"))
+    }
+
+    func testLiveAndFolderLeafItemsSkipTrailerResolutionWhileSportsMoviesStillResolve() async {
+        let leafLive = NuvioMeta(id: "leaf:now-sky-sports-news-hq434", name: "Sky Sports News", type: "tv")
+        let streamedLive = NuvioMeta(id: "streamed:basketball-lakers-vs-celtics", name: "Lakers vs Celtics", type: "sports")
+        let iptvChannel = NuvioMeta(id: "iptv:uk-bbc1", name: "BBC One", type: "channel")
+        let cloudFolder = NuvioMeta(id: "folder:action", name: "Action", type: "movie")
+        let sportsMovie = NuvioMeta(id: "tt1210166", name: "Moneyball", type: "movie", genres: ["Biography", "Drama", "Sport"])
+
+        XCTAssertFalse(leafLive.supportsTrailerLookup)
+        XCTAssertFalse(streamedLive.supportsTrailerLookup)
+        XCTAssertFalse(iptvChannel.supportsTrailerLookup)
+        XCTAssertFalse(cloudFolder.supportsTrailerLookup)
+        XCTAssertTrue(sportsMovie.supportsTrailerLookup)
+
+        let state = TrailerResolverTestState()
+        let resolver = YouTubeTrailerResolver(
+            sourceModeProvider: { .auto },
+            preferredLanguageProvider: { "en-US" },
+            trailerYouTubeIdProvider: { meta in state.calls.append("tmdb:\(meta.id)"); return "yt123456789" },
+            trailerioProvider: { imdb, _ in state.calls.append("trailerio:\(imdb)"); return nil },
+            imdbTrailerProvider: { imdb in state.calls.append("imdb:\(imdb)"); return nil },
+            youtubeSourceProvider: { videoID, _, _, _ in
+                state.calls.append("youtube:\(videoID)")
+                return TrailerPlaybackSource(videoUrl: "https://youtube.test/\(videoID).mp4")
+            }
+        )
+
+        let liveResult = await resolver.resolvePreview(for: leafLive)
+        let streamedResult = await resolver.resolvePreview(for: streamedLive)
+        let channelResult = await resolver.resolvePreview(for: iptvChannel)
+        XCTAssertNil(liveResult)
+        XCTAssertNil(streamedResult)
+        XCTAssertNil(channelResult)
+        XCTAssertTrue(state.calls.isEmpty, "Live/leaf/channel cards must skip all trailer providers, got \(state.calls)")
+
+        let movieResult = await resolver.resolvePreview(for: sportsMovie)
+        XCTAssertEqual(movieResult?.youtubeVideoId, "yt123456789")
+        XCTAssertFalse(state.calls.isEmpty)
+    }
 }

@@ -99,6 +99,7 @@ struct TmdbCreditMetadata {
             status: meta.status,
             videos: meta.videos,
             trailerYtIds: meta.trailerYtIds,
+            trailerStreams: meta.trailerStreams,
             externalRatings: meta.externalRatings,
             posterShape: meta.posterShape,
             isFromAddon: meta.isFromAddon,
@@ -379,31 +380,32 @@ enum TmdbDetailsService {
         return await fetchCompanies(tmdbId: resolved.id, mediaType: resolved.mediaType)
     }
 
-    static func fetchTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
+    static func fetchTrailerYouTubeId(for meta: NuvioMeta, language: String? = nil) async -> String? {
         if requestContext == nil {
-            return await withRequestContext { await fetchTrailerYouTubeId(for: meta) }
+            return await withRequestContext { await fetchTrailerYouTubeId(for: meta, language: language) }
         }
         guard useTrailers,
               apiKey != nil,
               let resolved = await resolveTmdbId(for: meta) else {
             return nil
         }
-        return await fetchTrailerYouTubeId(tmdbId: resolved.id, mediaType: resolved.mediaType)
+        return await fetchTrailerYouTubeId(tmdbId: resolved.id, mediaType: resolved.mediaType, language: language)
     }
 
-    static func fetchTrailerYouTubeId(tmdbId: Int, mediaType: String) async -> String? {
+    static func fetchTrailerYouTubeId(tmdbId: Int, mediaType: String, language: String? = nil) async -> String? {
         if requestContext == nil {
-            return await withRequestContext { await fetchTrailerYouTubeId(tmdbId: tmdbId, mediaType: mediaType) }
+            return await withRequestContext { await fetchTrailerYouTubeId(tmdbId: tmdbId, mediaType: mediaType, language: language) }
         }
         guard let apiKey else { return nil }
+        let targetLanguage = TmdbMetadataLanguage.normalized(language ?? preferredLanguage)
 
-        // 1. Try preferred language first
-        if let key = await fetchVideosKey(tmdbId: tmdbId, mediaType: mediaType, language: preferredLanguage, apiKey: apiKey) {
+        // 1. Try target language first
+        if let key = await fetchVideosKey(tmdbId: tmdbId, mediaType: mediaType, language: targetLanguage, apiKey: apiKey) {
             return key
         }
 
-        // 2. Fallback to en-US if preferred language differs
-        if preferredLanguage.caseInsensitiveCompare("en-US") != .orderedSame {
+        // 2. Fallback to en-US if target language differs
+        if targetLanguage.caseInsensitiveCompare("en-US") != .orderedSame {
             if let key = await fetchVideosKey(tmdbId: tmdbId, mediaType: mediaType, language: "en-US", apiKey: apiKey) {
                 return key
             }
@@ -944,6 +946,7 @@ enum TmdbDetailsService {
             status: meta.status,
             videos: meta.videos,
             trailerYtIds: meta.trailerYtIds,
+            trailerStreams: meta.trailerStreams,
             externalRatings: meta.externalRatings,
             posterShape: meta.posterShape,
             isFromAddon: meta.isFromAddon,
@@ -2372,6 +2375,53 @@ enum MdbListDetailsService {
         }
     }
 
+    private struct BatchRequest: Encodable {
+        let ids: [String]
+    }
+
+    private struct BatchItemIDs: Decodable {
+        let imdb: String?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            imdb = try? container.decodeIfPresent(String.self, forKey: .imdb)
+        }
+
+        private enum CodingKeys: String, CodingKey { case imdb }
+    }
+
+    private struct BatchItemResponse: Decodable {
+        let ratings: [TitleRating]?
+        let error: String?
+        let imdbIdSnake: String?
+        let imdbIdFlat: String?
+        let ids: BatchItemIDs?
+
+        var resolvedImdbID: String? {
+            for candidate in [imdbIdSnake, imdbIdFlat, ids?.imdb] {
+                if let match = MdbListDetailsService.extractImdbID(fromRaw: candidate) {
+                    return match
+                }
+            }
+            return nil
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            ratings = try? container.decodeIfPresent([TitleRating].self, forKey: .ratings)
+            error = try? container.decodeIfPresent(String.self, forKey: .error)
+            imdbIdSnake = try? container.decodeIfPresent(String.self, forKey: .imdbIdSnake)
+            imdbIdFlat = try? container.decodeIfPresent(String.self, forKey: .imdbIdFlat)
+            ids = try? container.decodeIfPresent(BatchItemIDs.self, forKey: .ids)
+        }
+
+        private enum CodingKeys: String, CodingKey {
+            case ratings, error, ids
+            case imdbIdSnake = "imdb_id"
+            case imdbIdFlat = "imdbid"
+        }
+    }
+
     /// What one title request came back with.
     enum TitleResult: Equatable, Sendable {
         /// Every rating MDBList has for the title, by provider.
@@ -2384,23 +2434,19 @@ enum MdbListDetailsService {
         case failed
     }
 
-    /// Reads a title response. Unknown sources, missing values and values
-    /// off their provider's scale are left out; zero means "no rating".
-    static func titleResult(status: Int, data: Data) -> TitleResult {
-        let response = try? JSONDecoder().decode(TitleResponse.self, from: data)
-        let error = response?.error?.lowercased()
-        if status == 429 || error?.contains("limit") == true { return .limitReached }
-        guard status == 200 else {
-            // Only an error body is searched for the limit message; a title's
-            // own text (a description) never is.
-            let body = String(data: data.prefix(512), encoding: .utf8)?.lowercased() ?? ""
-            if body.contains("limit") { return .limitReached }
-            return status == 404 ? .notFound : .failed
-        }
-        guard let response else { return .failed }
-        if let error { return error.contains("not found") ? .notFound : .failed }
+    /// What a batch POST request (`/{provider}/{mediaType}/`) came back with.
+    enum BatchResult: Equatable, Sendable {
+        /// Ratings keyed by canonical `tt...` IMDb ID.
+        case items([String: [String: Double]])
+        /// The API key's daily request limit is used up.
+        case limitReached
+        /// A network or server error: try again later.
+        case failed
+    }
+
+    private static func mappedRatings(from rawRatings: [TitleRating]) -> [String: Double] {
         var values: [String: Double] = [:]
-        for rating in response.ratings ?? [] {
+        for rating in rawRatings {
             guard let source = rating.source, let mapped = Self.provider(forSource: source),
                   values[mapped] == nil else { continue }
             var candidate = rating.value
@@ -2409,7 +2455,58 @@ enum MdbListDetailsService {
                   value <= maximumValue(for: mapped) else { continue }
             values[mapped] = value
         }
-        return .ratings(values)
+        return values
+    }
+
+    private static func bodyIndicatesRateLimit(status: Int, data: Data, errorMessage: String?) -> Bool {
+        if status == 429 || errorMessage?.lowercased().contains("limit") == true {
+            return true
+        }
+        guard status != 200 else { return false }
+        let body = String(data: data.prefix(512), encoding: .utf8)?.lowercased() ?? ""
+        return body.contains("limit")
+    }
+
+    /// Reads a title response. Unknown sources, missing values and values
+    /// off their provider's scale are left out; zero means "no rating".
+    static func titleResult(status: Int, data: Data) -> TitleResult {
+        let response = try? JSONDecoder().decode(TitleResponse.self, from: data)
+        let error = response?.error?.lowercased()
+        if bodyIndicatesRateLimit(status: status, data: data, errorMessage: error) {
+            return .limitReached
+        }
+        guard status == 200 else {
+            return status == 404 ? .notFound : .failed
+        }
+        guard let response else { return .failed }
+        if let error { return error.contains("not found") ? .notFound : .failed }
+        return .ratings(mappedRatings(from: response.ratings ?? []))
+    }
+
+    /// Reads a batch POST response (`POST /imdb/{mediaType}/?apikey=...`).
+    static func batchResult(status: Int, data: Data) -> BatchResult {
+        if status == 429 { return .limitReached }
+        if status != 200 {
+            let error = (try? JSONDecoder().decode(TitleResponse.self, from: data))?.error
+            return bodyIndicatesRateLimit(status: status, data: data, errorMessage: error) ? .limitReached : .failed
+        }
+        guard let decodedItems = try? JSONDecoder().decode([BatchItemResponse].self, from: data) else {
+            let error = (try? JSONDecoder().decode(TitleResponse.self, from: data))?.error
+            if error?.lowercased().contains("limit") == true { return .limitReached }
+            return .failed
+        }
+        var mapped: [String: [String: Double]] = [:]
+        mapped.reserveCapacity(decodedItems.count)
+        for item in decodedItems {
+            if let error = item.error?.lowercased() {
+                if error.contains("limit") { return .limitReached }
+                if error.contains("not found") { continue }
+                return .failed
+            }
+            guard let imdbID = item.resolvedImdbID else { continue }
+            mapped[imdbID] = mappedRatings(from: item.ratings ?? [])
+        }
+        return .items(mapped)
     }
 
     /// One request for every rating of a title (the per-provider endpoint
@@ -2430,6 +2527,61 @@ enum MdbListDetailsService {
         } catch {
             return .failed
         }
+    }
+
+    /// Batch POST request (`POST /imdb/{mediaType}/`) fetching up to 200 titles
+    /// in a single HTTP request (matching Android TV's MdbListRatingsClient).
+    static func requestBatchRatings(imdbIDs: [String], mediaType: String, apiKey: String) async -> BatchResult {
+        guard !imdbIDs.isEmpty else { return .items([:]) }
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "api.mdblist.com"
+        components.path = "/imdb/\(mediaType)/"
+        components.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
+        guard let url = components.url,
+              let body = try? JSONEncoder().encode(BatchRequest(ids: imdbIDs)) else { return .failed }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.timeoutInterval = 12
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.httpBody = body
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return batchResult(status: (response as? HTTPURLResponse)?.statusCode ?? 0, data: data)
+        } catch {
+            return .failed
+        }
+    }
+
+    /// Prefetches MDBList ratings for multiple catalog items via batch POST requests
+    /// without calling per-title Stremio rating add-ons.
+    static func prefetchBatchRatings(for metas: [NuvioMeta], defaults: UserDefaults = ProfileSettings.current) async {
+        guard defaults.bool(forKey: SettingsKey.mdbListEnabled),
+              let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !apiKey.isEmpty else {
+            return
+        }
+        let hasEnabledProvider = providerPriorityOrder.contains { provider in
+            guard let key = providerSettings[provider] else { return false }
+            return defaults.object(forKey: key) == nil || defaults.bool(forKey: key)
+        }
+        guard hasEnabledProvider else { return }
+
+        var seen = Set<String>()
+        var targets: [(imdbID: String, mediaType: String)] = []
+        targets.reserveCapacity(metas.count)
+        for meta in metas {
+            guard let imdbID = extractImdbID(from: meta) else { continue }
+            let mediaType = meta.isSeries ? "show" : "movie"
+            let dedupeKey = "\(mediaType):\(imdbID)"
+            if seen.insert(dedupeKey).inserted {
+                targets.append((imdbID, mediaType))
+            }
+        }
+        guard !targets.isEmpty else { return }
+        await MdbListRatingsStore.shared.prefetchBatch(titles: targets, apiKey: apiKey)
     }
 
     /// MDBList's ratings; with MyAnimeList on, the MAL score straight from MAL instead of
@@ -2488,11 +2640,17 @@ enum MdbListDetailsService {
         return await fetchRatings(for: meta)
     }
 
+    private static func extractImdbID(fromRaw candidate: String?) -> String? {
+        guard let candidate,
+              let range = candidate.range(of: #"tt\d+"#, options: .regularExpression) else { return nil }
+        return String(candidate[range])
+    }
+
     private static func extractImdbID(from meta: NuvioMeta) -> String? {
-        let candidates = [meta.imdbId, meta.id].compactMap { $0 }
-        for candidate in candidates {
-            guard let range = candidate.range(of: #"tt\d+"#, options: .regularExpression) else { continue }
-            return String(candidate[range])
+        for candidate in [meta.imdbId, meta.id] {
+            if let match = extractImdbID(fromRaw: candidate) {
+                return match
+            }
         }
         return nil
     }
@@ -2501,7 +2659,8 @@ enum MdbListDetailsService {
 private let mdbListLog = Logger(subsystem: "com.pyksel.nuviotvos", category: "mdblist")
 
 /// MDBList ratings by title, shared by the hero and Details:
-/// - one request per title for every provider;
+/// - coalesces nearby lookups into one batch POST request (`POST /imdb/{mediaType}/`)
+///   for up to 200 titles at a time, falling back to a single GET for 1 title;
 /// - kept on disk for a day (a title MDBList doesn't know for six hours),
 ///   so browsing the same rows again costs nothing;
 /// - one request at a time per title;
@@ -2514,20 +2673,40 @@ actor MdbListRatingsStore {
     static let notFoundLifetime: TimeInterval = 6 * 60 * 60
     static let limitPause: TimeInterval = 60 * 60
     static let maxEntries = 4_000
+    static let maxBatchSize = 200
+    static let batchWindowNanoseconds: UInt64 = 50_000_000
 
     struct Entry: Codable, Equatable, Sendable {
         let storedAt: Date
         let ratings: [String: Double]
     }
 
+    private struct BatchGroupKey: Hashable, Sendable {
+        let mediaType: String
+        let apiKey: String
+    }
+
     private let fileURL: URL?
+    private let batchWindowNanoseconds: UInt64
+    private let customSingleRequest: (@Sendable (String, String, String) async -> MdbListDetailsService.TitleResult)?
+    private let customBatchRequest: (@Sendable ([String], String, String) async -> MdbListDetailsService.BatchResult)?
     private var entries: [String: Entry]?
     private var inflight: [String: Task<MdbListDetailsService.TitleResult, Never>] = [:]
+    private var pendingCoalesceIDs: [BatchGroupKey: [String]] = [:]
+    private var pendingCoalesceTasks: [BatchGroupKey: Task<[String: MdbListDetailsService.TitleResult], Never>] = [:]
     private var pausedUntil: Date?
     private var saveTask: Task<Void, Never>?
 
-    init(fileURL: URL? = MdbListRatingsStore.defaultFileURL) {
+    init(
+        fileURL: URL? = MdbListRatingsStore.defaultFileURL,
+        batchWindowNanoseconds: UInt64 = MdbListRatingsStore.batchWindowNanoseconds,
+        singleRequest: (@Sendable (String, String, String) async -> MdbListDetailsService.TitleResult)? = nil,
+        batchRequest: (@Sendable ([String], String, String) async -> MdbListDetailsService.BatchResult)? = nil
+    ) {
         self.fileURL = fileURL
+        self.batchWindowNanoseconds = batchWindowNanoseconds
+        self.customSingleRequest = singleRequest
+        self.customBatchRequest = batchRequest
     }
 
     static var defaultFileURL: URL? {
@@ -2555,16 +2734,183 @@ actor MdbListRatingsStore {
         let task: Task<MdbListDetailsService.TitleResult, Never>
         if let running = inflight[key] {
             task = running
-        } else {
-            let fetch: @Sendable () async -> MdbListDetailsService.TitleResult = request ?? {
-                await MdbListDetailsService.requestTitleRatings(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey)
-            }
-            task = Task { await fetch() }
+        } else if let request {
+            task = Task { await request() }
             inflight[key] = task
+        } else {
+            task = enqueueCoalescedTask(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey, key: key)
         }
         let result = await task.value
         if inflight[key] == task { inflight[key] = nil }
+        return applyTitleResult(result, for: key, fallbackStored: stored?.ratings)
+    }
 
+    /// Batch-prefetches uncached MDBList titles grouped by media type (up to 200
+    /// IDs per HTTP POST) and shares in-flight tasks with `ratings(...)`.
+    func prefetchBatch(
+        titles: [(imdbID: String, mediaType: String)],
+        apiKey: String
+    ) async {
+        loadIfNeeded()
+        let now = Date()
+        guard pausedUntil.map({ $0 <= now }) ?? true else { return }
+
+        var byMediaType: [String: [String]] = [:]
+        var seenKeys = Set<String>()
+        for (imdbID, mediaType) in titles {
+            let key = "\(mediaType):\(imdbID)"
+            guard seenKeys.insert(key).inserted else { continue }
+            if let stored = entries?[key], Self.isFresh(stored, now: now) { continue }
+            if inflight[key] != nil { continue }
+            let groupKey = BatchGroupKey(mediaType: mediaType, apiKey: apiKey)
+            if pendingCoalesceIDs[groupKey]?.contains(imdbID) == true { continue }
+            byMediaType[mediaType, default: []].append(imdbID)
+        }
+        guard !byMediaType.isEmpty else { return }
+
+        let singleFetcher = resolvedSingleRequest
+        let batchFetcher = resolvedBatchRequest
+
+        for mediaType in byMediaType.keys.sorted() {
+            guard let ids = byMediaType[mediaType], !ids.isEmpty else { continue }
+            for start in stride(from: 0, to: ids.count, by: Self.maxBatchSize) {
+                guard !Task.isCancelled else { return }
+                if let pausedUntil, pausedUntil > Date() { return }
+                let end = min(ids.count, start + Self.maxBatchSize)
+                let chunk = Array(ids[start..<end])
+                let chunkTask = Task<[String: MdbListDetailsService.TitleResult], Never> {
+                    await Self.executeGroupRequest(
+                        ids: chunk,
+                        mediaType: mediaType,
+                        apiKey: apiKey,
+                        singleRequest: singleFetcher,
+                        batchRequest: batchFetcher
+                    )
+                }
+                var registeredTasks: [(imdbID: String, key: String, task: Task<MdbListDetailsService.TitleResult, Never>)] = []
+                registeredTasks.reserveCapacity(chunk.count)
+                for imdbID in chunk {
+                    let key = "\(mediaType):\(imdbID)"
+                    let perKeyTask = Task<MdbListDetailsService.TitleResult, Never> {
+                        let map = await chunkTask.value
+                        return map[imdbID] ?? .failed
+                    }
+                    inflight[key] = perKeyTask
+                    registeredTasks.append((imdbID, key, perKeyTask))
+                }
+                let results = await chunkTask.value
+                for (imdbID, key, perKeyTask) in registeredTasks {
+                    if inflight[key] == perKeyTask { inflight[key] = nil }
+                    _ = applyTitleResult(
+                        results[imdbID] ?? .failed,
+                        for: key,
+                        fallbackStored: entries?[key]?.ratings
+                    )
+                }
+            }
+        }
+    }
+
+    private func enqueueCoalescedTask(
+        imdbID: String,
+        mediaType: String,
+        apiKey: String,
+        key: String
+    ) -> Task<MdbListDetailsService.TitleResult, Never> {
+        let groupKey = BatchGroupKey(mediaType: mediaType, apiKey: apiKey)
+        var ids = pendingCoalesceIDs[groupKey] ?? []
+        if !ids.contains(imdbID) {
+            ids.append(imdbID)
+            pendingCoalesceIDs[groupKey] = ids
+        }
+
+        let groupTask: Task<[String: MdbListDetailsService.TitleResult], Never>
+        if let existing = pendingCoalesceTasks[groupKey] {
+            groupTask = existing
+        } else {
+            let delayNanoseconds = batchWindowNanoseconds
+            let task = Task<[String: MdbListDetailsService.TitleResult], Never> { [self] in
+                if delayNanoseconds > 0 {
+                    try? await Task.sleep(nanoseconds: delayNanoseconds)
+                } else {
+                    await Task.yield()
+                }
+                return await self.flushCoalesceGroup(groupKey)
+            }
+            pendingCoalesceTasks[groupKey] = task
+            groupTask = task
+        }
+
+        let perKeyTask = Task<MdbListDetailsService.TitleResult, Never> {
+            let map = await groupTask.value
+            return map[imdbID] ?? .failed
+        }
+        inflight[key] = perKeyTask
+        return perKeyTask
+    }
+
+    private var resolvedSingleRequest: @Sendable (String, String, String) async -> MdbListDetailsService.TitleResult {
+        customSingleRequest ?? { imdbID, mediaType, apiKey in
+            await MdbListDetailsService.requestTitleRatings(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey)
+        }
+    }
+
+    private var resolvedBatchRequest: @Sendable ([String], String, String) async -> MdbListDetailsService.BatchResult {
+        customBatchRequest ?? { imdbIDs, mediaType, apiKey in
+            await MdbListDetailsService.requestBatchRatings(imdbIDs: imdbIDs, mediaType: mediaType, apiKey: apiKey)
+        }
+    }
+
+    private func flushCoalesceGroup(_ groupKey: BatchGroupKey) async -> [String: MdbListDetailsService.TitleResult] {
+        let ids = pendingCoalesceIDs.removeValue(forKey: groupKey) ?? []
+        pendingCoalesceTasks[groupKey] = nil
+        guard !ids.isEmpty else { return [:] }
+        return await Self.executeGroupRequest(
+            ids: ids,
+            mediaType: groupKey.mediaType,
+            apiKey: groupKey.apiKey,
+            singleRequest: resolvedSingleRequest,
+            batchRequest: resolvedBatchRequest
+        )
+    }
+
+    private nonisolated static func executeGroupRequest(
+        ids: [String],
+        mediaType: String,
+        apiKey: String,
+        singleRequest: @Sendable (String, String, String) async -> MdbListDetailsService.TitleResult,
+        batchRequest: @Sendable ([String], String, String) async -> MdbListDetailsService.BatchResult
+    ) async -> [String: MdbListDetailsService.TitleResult] {
+        guard !ids.isEmpty else { return [:] }
+        if ids.count == 1 {
+            let id = ids[0]
+            return [id: await singleRequest(id, mediaType, apiKey)]
+        }
+        var combined: [String: MdbListDetailsService.TitleResult] = [:]
+        combined.reserveCapacity(ids.count)
+        for start in stride(from: 0, to: ids.count, by: maxBatchSize) {
+            let end = min(ids.count, start + maxBatchSize)
+            let chunk = Array(ids[start..<end])
+            let result = await batchRequest(chunk, mediaType, apiKey)
+            switch result {
+            case .items(let map):
+                for id in chunk {
+                    combined[id] = map[id].map { .ratings($0) } ?? .notFound
+                }
+            case .limitReached:
+                for id in chunk { combined[id] = .limitReached }
+            case .failed:
+                for id in chunk { combined[id] = .failed }
+            }
+        }
+        return combined
+    }
+
+    private func applyTitleResult(
+        _ result: MdbListDetailsService.TitleResult,
+        for key: String,
+        fallbackStored: [String: Double]?
+    ) -> [String: Double]? {
         switch result {
         case .ratings(let ratings):
             store(Entry(storedAt: Date(), ratings: ratings), for: key)
@@ -2577,9 +2923,9 @@ actor MdbListRatingsStore {
                 mdbListLog.notice("MDBList daily request limit reached; ratings paused for an hour")
             }
             pausedUntil = Date().addingTimeInterval(Self.limitPause)
-            return stored?.ratings
+            return fallbackStored
         case .failed:
-            return stored?.ratings
+            return fallbackStored
         }
     }
 

@@ -2704,5 +2704,316 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertEqual(cases.first, .home, "Home must be the first tab")
         XCTAssertFalse(cases.contains(.profile), "Profile must not be a selectable tab in TVTab.allCases")
     }
+
+    func testStartupGraceRemainingNanosecondsAndDuration() {
+        XCTAssertEqual(TVHomePrefetchPlanner.startupGraceDuration, 1.5, accuracy: 0.0001)
+        XCTAssertEqual(
+            TVHomePrefetchPlanner.remainingStartupGraceNanoseconds(until: 100.0, now: 98.5),
+            1_500_000_000
+        )
+        XCTAssertEqual(
+            TVHomePrefetchPlanner.remainingStartupGraceNanoseconds(until: 100.0, now: 99.25),
+            750_000_000
+        )
+        XCTAssertEqual(
+            TVHomePrefetchPlanner.remainingStartupGraceNanoseconds(until: 100.0, now: 100.0),
+            0
+        )
+        XCTAssertEqual(
+            TVHomePrefetchPlanner.remainingStartupGraceNanoseconds(until: 0.0, now: 50.0),
+            0
+        )
+    }
+
+    func testShouldWarmRemoteMetadataSkipsSyntheticAndAnimeIDs() {
+        XCTAssertFalse(TVHomePrefetchPlanner.shouldWarmRemoteMetadata(
+            for: NuvioMeta(id: "jellyfin-srv-123", name: "Local Movie", type: "movie")
+        ))
+        XCTAssertFalse(TVHomePrefetchPlanner.shouldWarmRemoteMetadata(
+            for: NuvioMeta(id: "plex-srv-456", name: "Plex Show", type: "series")
+        ))
+        XCTAssertFalse(TVHomePrefetchPlanner.shouldWarmRemoteMetadata(
+            for: NuvioMeta(id: "anilist:151807", name: "Solo Leveling", type: "series")
+        ))
+        XCTAssertTrue(TVHomePrefetchPlanner.shouldWarmRemoteMetadata(
+            for: NuvioMeta(id: "tt0903747", name: "Breaking Bad", type: "series")
+        ))
+        XCTAssertTrue(TVHomePrefetchPlanner.shouldWarmRemoteMetadata(
+            for: NuvioMeta(id: "tmdb:1396", name: "Breaking Bad", type: "series")
+        ))
+    }
+
+    func testAdjacentItemsReturnsNextThenPreviousInBounds() {
+        let metas = (0..<5).map { idx in
+            NuvioMeta(id: "m\(idx)", name: "Movie \(idx)", type: "movie")
+        }
+        XCTAssertEqual(TVHomePrefetchPlanner.adjacentItems(in: metas, around: 2).map(\.id), ["m3", "m1"])
+        XCTAssertEqual(TVHomePrefetchPlanner.adjacentItems(in: metas, around: 0).map(\.id), ["m1"])
+        XCTAssertEqual(TVHomePrefetchPlanner.adjacentItems(in: metas, around: 4).map(\.id), ["m3"])
+        XCTAssertEqual(TVHomePrefetchPlanner.adjacentItems(in: [metas[0]], around: 0), [])
+    }
+
+    func testRowRatingsPrefetchMetasIncludesFocusedRowAndNextItemRowSkippingPlaceholders() {
+        func makeMetas(_ prefix: String, count: Int) -> [NuvioMeta] {
+            (0..<count).map { NuvioMeta(id: "\(prefix)\($0)", name: "\(prefix) \($0)", type: "movie") }
+        }
+        let row0Items = makeMetas("r0-", count: 16)
+        let overlapMeta = row0Items[2]
+        let row1Placeholder = TVHomeSection(
+            id: "skeleton",
+            title: "Loading",
+            items: [NuvioMeta(id: "ph-1", name: "Loading", type: "movie")],
+            isLoadingPlaceholder: true
+        )
+        let row2Empty = TVHomeSection(id: "empty", title: "Empty", items: [])
+        let row3Items = [overlapMeta] + makeMetas("r3-", count: 10)
+        let row4Items = makeMetas("r4-", count: 4)
+        let sections = [
+            TVHomeSection(id: "row0", title: "Row 0", items: row0Items),
+            row1Placeholder,
+            row2Empty,
+            TVHomeSection(id: "row3", title: "Row 3", items: row3Items),
+            TVHomeSection(id: "row4", title: "Row 4", items: row4Items)
+        ]
+
+        let batch = TVHomePrefetchPlanner.rowRatingsPrefetchMetas(
+            sections: sections,
+            focusedSectionID: "row0",
+            focusedMetaID: "r0-2"
+        )
+        // Focused slice: r0-2..<r0-14 (12 items) + leading r0-0, r0-1 (2 items)
+        // Next real item row is row3 (skipping skeleton & empty): first 8 unique items (overlap r0-2 deduped)
+        let expectedIDs = (2..<14).map { "r0-\($0)" }
+            + ["r0-0", "r0-1"]
+            + (0..<7).map { "r3-\($0)" }
+        XCTAssertEqual(batch.map(\.id), expectedIDs)
+        XCTAssertFalse(batch.contains { $0.id.hasPrefix("ph-") })
+        XCTAssertFalse(batch.contains { $0.id.hasPrefix("r4-") })
+    }
+
+    func testPosterLookaheadRequestsBuildsHorizontalVerticalAndPixelSizes() {
+        func posterMeta(_ id: String) -> NuvioMeta {
+            NuvioMeta(
+                id: id,
+                name: id,
+                posterUrl: "https://example.com/\(id)/poster.jpg",
+                backgroundUrl: "https://example.com/\(id)/backdrop.jpg",
+                type: "movie"
+            )
+        }
+        let row0 = TVHomeSection(id: "row0", title: "Row 0", items: (0..<12).map { posterMeta("a\($0)") })
+        let skeleton = TVHomeSection(
+            id: "sk",
+            title: "Skeleton",
+            items: [posterMeta("s0")],
+            isLoadingPlaceholder: true
+        )
+        let row1 = TVHomeSection(
+            id: "row1",
+            title: "Row 1 Landscape",
+            items: (0..<8).map { posterMeta("b\($0)") },
+            posterShape: "landscape"
+        )
+        let row2 = TVHomeSection(id: "row2", title: "Row 2", items: (0..<6).map { posterMeta("c\($0)") })
+        let row3 = TVHomeSection(id: "row3", title: "Row 3", items: (0..<4).map { posterMeta("d\($0)") })
+        let sections = [row0, skeleton, row1, row2, row3]
+        let tileShapes: [String: CollectionTileShape] = [
+            "row0": .poster,
+            "row1": .landscape,
+            "row2": .poster,
+            "row3": .poster
+        ]
+
+        let requests = TVHomePrefetchPlanner.posterLookaheadRequests(
+            sections: sections,
+            focusedSectionID: "row0",
+            focusedMetaID: "a3",
+            tileShapesBySectionID: tileShapes,
+            homeLayout: "Modern",
+            displayScale: 2.0
+        )
+
+        // Horizontal: 5 ahead (a4..a8) + 2 behind (a1..a2) = 7 portrait @ 630px
+        // Vertical 1 (row1): 4 landscape @ 1120px (b0..b3) using backdrop.jpg
+        // Vertical 2 (row2): 3 portrait @ 630px (c0..c2) using poster.jpg
+        let expectedURLs = (4...8).map { "https://example.com/a\($0)/poster.jpg" }
+            + (1...2).map { "https://example.com/a\($0)/poster.jpg" }
+            + (0..<4).map { "https://example.com/b\($0)/backdrop.jpg" }
+            + (0..<3).map { "https://example.com/c\($0)/poster.jpg" }
+        XCTAssertEqual(requests.map(\.url.absoluteString), expectedURLs)
+        XCTAssertEqual(Array(requests.prefix(7)).map(\.maxPixelSize), Array(repeating: 630, count: 7))
+        XCTAssertEqual(Array(requests[7..<11]).map(\.maxPixelSize), Array(repeating: 1120, count: 4))
+        XCTAssertEqual(Array(requests.suffix(3)).map(\.maxPixelSize), Array(repeating: 630, count: 3))
+    }
+
+    func testComposeMainHomePublicationAndAdaptiveBatchingOffMainActor() async throws {
+        let savedLocal = HomeCatalogPayloadStore.data(forKey: SettingsKey.homeCatalogOrder)
+        let savedSynced = HomeCatalogPayloadStore.data(forKey: SettingsKey.homeCatalogSyncedOrder)
+        HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogOrder)
+        HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogSyncedOrder)
+        defer {
+            if let savedLocal {
+                _ = HomeCatalogPayloadStore.write(savedLocal, forKey: SettingsKey.homeCatalogOrder)
+            } else {
+                HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogOrder)
+            }
+            if let savedSynced {
+                _ = HomeCatalogPayloadStore.write(savedSynced, forKey: SettingsKey.homeCatalogSyncedOrder)
+            } else {
+                HomeCatalogPayloadStore.remove(forKey: SettingsKey.homeCatalogSyncedOrder)
+            }
+        }
+
+        XCTAssertEqual(
+            TVHomeStore.adaptiveBatchDelayNanoseconds(catalogSectionCount: 4, pendingDeferredReadyCount: 2),
+            120_000_000
+        )
+        XCTAssertEqual(
+            TVHomeStore.adaptiveBatchDelayNanoseconds(catalogSectionCount: 6, pendingDeferredReadyCount: 2),
+            180_000_000
+        )
+
+        let pinned = TVHomeSection(
+            id: "\(TVHomeSection.collectionIdPrefix)pinned",
+            title: "Pinned",
+            items: [try title("pin-1")],
+            isPinnedCollection: true
+        )
+        let descriptor = TVHomeSection(id: "addon-deferred", title: "Deferred", items: [])
+        let ready = TVHomeSection(id: "addon-deferred", title: "Deferred", items: [try title("def-1")])
+        let catalog = TVHomeSection(id: "catalog-1", title: "Popular", items: [try title("cat-1")])
+
+        let first = await Task.detached {
+            TVHomeStore.composeMainHomePublication(
+                catalogSections: [catalog],
+                collectionSections: [pinned],
+                aiInput: nil,
+                deferredAddonRowOrder: ["addon-deferred"],
+                deferredAddonRowsByID: ["addon-deferred": descriptor],
+                deferredReadyRowsByID: ["addon-deferred": ready],
+                mainLoadingPlaceholders: [TVHomeSection(id: "catalog-1", title: "Popular", items: [], isLoadingPlaceholder: true)],
+                currentSections: [],
+                needsSnapshotRows: true
+            )
+        }.value
+
+        XCTAssertFalse(first.isEmptyResult)
+        XCTAssertFalse(first.unchanged)
+        XCTAssertEqual(first.visibleSections.map(\.id), ["\(TVHomeSection.collectionIdPrefix)pinned", "catalog-1", "addon-deferred"])
+        XCTAssertEqual(first.hero?.id, "pin-1")
+        XCTAssertEqual(first.snapshotRows?.count, 3)
+
+        let second = await Task.detached {
+            TVHomeStore.composeMainHomePublication(
+                catalogSections: [catalog],
+                collectionSections: [pinned],
+                aiInput: nil,
+                deferredAddonRowOrder: ["addon-deferred"],
+                deferredAddonRowsByID: ["addon-deferred": descriptor],
+                deferredReadyRowsByID: ["addon-deferred": ready],
+                mainLoadingPlaceholders: [],
+                currentSections: first.visibleSections,
+                needsSnapshotRows: true
+            )
+        }.value
+
+        XCTAssertTrue(second.unchanged)
+        XCTAssertNil(second.snapshotRows)
+    }
+
+    func testOffMainJellyfinAndPlexMetaBuildersAndPlexMergeWorkOffMainActor() async throws {
+        let jfURL = URL(string: "http://127.0.0.1:8096")!
+        let plexURL = URL(string: "http://127.0.0.1:32400")!
+        let jfTitle = JellyfinIndexedTitle(
+            contentId: "jellyfin-s1-show1",
+            serverID: "s1",
+            libraryID: "lib1",
+            libraryName: "Shows",
+            itemId: "show1",
+            type: "series",
+            name: "Test Show",
+            overview: "Overview",
+            year: 2024,
+            genres: ["Drama"],
+            communityRating: 8.2,
+            officialRating: "TV-MA",
+            premiereDate: "2024-01-01",
+            runTimeTicks: 3_600_000_000,
+            imdbId: "tt1234567",
+            tmdbId: 42,
+            primaryImageTag: "ptag",
+            backdropImageTag: "btag",
+            cast: nil,
+            directors: nil,
+            items: [
+                JellyfinIndexedItem(itemId: "ep2", container: "mkv", size: 100, season: 1, episode: 2, episodeName: nil),
+                JellyfinIndexedItem(itemId: "ep1", container: "mkv", size: 100, season: 1, episode: 1, episodeName: "Pilot")
+            ]
+        )
+        let plexTitle = PlexIndexedTitle(
+            contentId: "plex-p1-101",
+            serverID: "p1",
+            libraryID: "libP",
+            libraryName: "Movies",
+            ratingKey: "101",
+            type: "movie",
+            name: "Plex Movie",
+            overview: "Desc",
+            year: 2023,
+            genres: ["Sci-Fi"],
+            rating: 7.9,
+            contentRating: "PG-13",
+            premiereDate: "2023-05-05",
+            durationMs: 7_200_000,
+            imdbId: "tt7654321",
+            tmdbId: 99,
+            thumb: "/library/metadata/101/thumb",
+            art: "/library/metadata/101/art",
+            cast: nil,
+            directors: nil,
+            items: [
+                PlexIndexedItem(ratingKey: "101", partKey: "/library/parts/1/1/file.mkv", container: "mkv", size: 200, durationMs: 7_200_000)
+            ]
+        )
+        let inProgress = PlexLibraryIndex.InProgress(
+            title: plexTitle,
+            item: plexTitle.items[0],
+            state: PlexWatchState(viewOffsetMs: 1_200_000, viewCount: 0, lastViewedAt: 1_700_000_000)
+        )
+        let mergeInput = PlexContinueWatchingMerge.MergeInput(
+            inProgress: [inProgress],
+            serverAccessByID: ["p1": PlexServerAccess(baseURL: plexURL, token: "ptoken")],
+            episodeTitleTemplate: "Episode %d",
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+
+        let result = await Task.detached { () -> (jf: NuvioMeta?, plex: NuvioMeta?, merged: [ContinueWatchingItem]) in
+            let jfMeta = JellyfinLibraryIndex.meta(
+                for: jfTitle,
+                requestedContentId: jfTitle.contentId,
+                serverAccessByID: ["s1": JellyfinServerAccess(baseURL: jfURL, accessToken: "jtoken")],
+                episodeTitleTemplate: "Episode %d",
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            let plexMeta = PlexLibraryIndex.meta(
+                for: plexTitle,
+                serverAccessByID: ["p1": PlexServerAccess(baseURL: plexURL, token: "ptoken")],
+                episodeTitleTemplate: "Episode %d",
+                locale: Locale(identifier: "en_US_POSIX")
+            )
+            let prepared = PlexContinueWatchingMerge.prepareMerge(
+                into: [],
+                input: mergeInput,
+                displayable: { _ in true }
+            )
+            return (jfMeta, plexMeta, prepared.merged)
+        }.value
+
+        XCTAssertEqual(result.jf?.videos?.map(\.episode), [1, 2])
+        XCTAssertEqual(result.jf?.videos?.last?.title, "Episode 2")
+        XCTAssertTrue(result.jf?.posterUrl?.contains("ptag") == true)
+        XCTAssertEqual(result.plex?.runtime, "2h 0m")
+        XCTAssertEqual(result.merged.map(\.meta.id), ["plex-p1-101"])
+    }
 }
 

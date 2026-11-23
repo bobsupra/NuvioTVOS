@@ -1,7 +1,7 @@
 import Foundation
 
 /// One playable file for a Plex title: the movie itself, or one episode.
-struct PlexIndexedItem: Codable, Equatable {
+struct PlexIndexedItem: Codable, Equatable, Sendable {
     /// The movie's or episode's rating key, which playback progress reports to.
     let ratingKey: String
     let partKey: String
@@ -28,11 +28,16 @@ struct PlexIndexedItem: Codable, Equatable {
     }
 }
 
+struct PlexServerAccess: Sendable {
+    let baseURL: URL
+    let token: String
+}
+
 /// One Plex movie or show with everything Home and Details need, stored
 /// locally after a sync the same way Jellyfin titles are. `contentId` is
 /// synthetic (`plex-<serverID>-<ratingKey>`); IMDb and TMDB ids are kept so
 /// catalog titles from other sources can offer the Plex copy as a stream.
-struct PlexIndexedTitle: Codable, Equatable {
+struct PlexIndexedTitle: Codable, Equatable, Sendable {
     let contentId: String
     let serverID: String
     let libraryID: String
@@ -57,7 +62,7 @@ struct PlexIndexedTitle: Codable, Equatable {
 }
 
 /// The account's watch state for one movie or episode, as Plex reports it.
-struct PlexWatchState: Codable, Equatable {
+struct PlexWatchState: Codable, Equatable, Sendable {
     var viewOffsetMs: Int64
     var viewCount: Int
     /// Unix seconds; 0 when never played.
@@ -338,7 +343,7 @@ final class PlexLibraryIndex: ObservableObject {
 
     /// One title's most recently played movie or episode that Plex has a
     /// saved position for.
-    struct InProgress: Equatable {
+    struct InProgress: Equatable, Sendable {
         let title: PlexIndexedTitle
         let item: PlexIndexedItem
         let state: PlexWatchState
@@ -427,10 +432,38 @@ final class PlexLibraryIndex: ObservableObject {
         return meta(for: title)
     }
 
+    func serverAccessSnapshot(for serverIDs: Set<String>? = nil) -> [String: PlexServerAccess] {
+        var result: [String: PlexServerAccess] = [:]
+        for server in PlexServerStore.shared.servers {
+            if let serverIDs, !serverIDs.contains(server.id) { continue }
+            guard let baseURL = server.baseURL else { continue }
+            result[server.id] = PlexServerAccess(
+                baseURL: baseURL,
+                token: PlexCredentialStore.token(forServerID: server.id)
+            )
+        }
+        return result
+    }
+
     func meta(for title: PlexIndexedTitle) -> NuvioMeta? {
-        guard let server = PlexServerStore.shared.server(id: title.serverID),
-              let baseURL = server.baseURL else { return nil }
-        let token = PlexCredentialStore.token(forServerID: server.id)
+        let accessByID = serverAccessSnapshot(for: [title.serverID])
+        return Self.meta(
+            for: title,
+            serverAccessByID: accessByID,
+            episodeTitleTemplate: L10n.resolvedFormatTemplate("jellyfin_episode_fallback_title", fallback: "Episode %d"),
+            locale: AppLocaleManager.shared.locale
+        )
+    }
+
+    nonisolated static func meta(
+        for title: PlexIndexedTitle,
+        serverAccessByID: [String: PlexServerAccess],
+        episodeTitleTemplate: String = "Episode %d",
+        locale: Locale = .current
+    ) -> NuvioMeta? {
+        guard let access = serverAccessByID[title.serverID] else { return nil }
+        let baseURL = access.baseURL
+        let token = access.token
 
         func image(_ path: String?, width: Int, height: Int) -> String? {
             PlexClient.imageURL(baseURL: baseURL, path: path, token: token, width: width, height: height)?.absoluteString
@@ -441,7 +474,7 @@ final class PlexLibraryIndex: ObservableObject {
                 guard let season = file.season, let episode = file.episode else { return nil }
                 return NuvioVideo(
                     id: "\(title.contentId):\(season):\(episode)",
-                    title: file.episodeName ?? L10n.format("jellyfin_episode_fallback_title", fallback: "Episode %d", episode),
+                    title: file.episodeName ?? String(format: episodeTitleTemplate, locale: locale, episode),
                     season: season,
                     episode: episode,
                     thumbnail: image(file.episodeThumb, width: 640, height: 360),
@@ -481,7 +514,7 @@ final class PlexLibraryIndex: ObservableObject {
         )
     }
 
-    private static func formattedRuntime(milliseconds: Int64) -> String {
+    nonisolated private static func formattedRuntime(milliseconds: Int64) -> String {
         let minutes = Int(milliseconds / 60_000)
         guard minutes > 0 else { return "" }
         return minutes >= 60 ? "\(minutes / 60)h \(minutes % 60)m" : "\(minutes)m"

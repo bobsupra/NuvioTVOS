@@ -1,0 +1,376 @@
+AV1: treat full-refresh Delayed Random Access Points as keyframes
+
+A Temporal Unit that carries a Sequence Header and opens with a hidden Key
+Frame (show_frame = 0) refreshing all eight reference slots can be decoded
+from directly, since nothing before it is reachable afterwards. Upstream
+treats it as an inter frame twice over: av1_parser sets key_frame only for
+a shown Key Frame, and for Matroska video (opened with
+AVSTREAM_PARSE_HEADERS) that verdict replaces the block's own flag; and
+muxers (mkvmerge, lavf) leave the SimpleBlock flag off, so matroskadec
+never builds an index and every seek fails. An encode built on such
+forward key frames then reaches the caller without a single keyframe
+(AetherEngine issue 931).
+
+ff_av1_is_random_access_point() (libavformat/av1.c) reads the first frame
+header up to refresh_frame_flags; matroskadec flags an unflagged, unlaced,
+unencoded AV1 SimpleBlock that passes it, and av1_parser reports the same
+case as a key frame. A hidden Key Frame with a partial refresh, which
+libaom writes for --enable-fwd-kf, is left alone: frames after it still
+reference the previous shown Key Frame.
+
+Three commits upstream as FFmpeg PR 25607, squashed here against n8.1.3.
+
+diff --git a/libavcodec/av1_parser.c b/libavcodec/av1_parser.c
+index 68a98285ef..b7aa1220d9 100644
+--- a/libavcodec/av1_parser.c
++++ b/libavcodec/av1_parser.c
+@@ -62,6 +62,7 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
+     const CodedBitstreamAV1Context *av1 = s->cbc->priv_data;
+     const AV1RawSequenceHeader *seq;
+     const AV1RawColorConfig *color;
++    int seq_header_in_tu = 0, first_frame = 1, delayed_rap = 0;
+     int ret;
+ 
+     *out_data = data;
+@@ -103,6 +104,9 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
+         const AV1RawOBU *obu = unit->content;
+         const AV1RawFrameHeader *frame;
+ 
++        if (unit->type == AV1_OBU_SEQUENCE_HEADER)
++            seq_header_in_tu = 1;
++
+         if (unit->type == AV1_OBU_FRAME)
+             frame = &obu->obu.frame.header;
+         else if (unit->type == AV1_OBU_FRAME_HEADER)
+@@ -113,6 +117,17 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
+         if (obu->header.spatial_id > 0)
+             continue;
+ 
++        /* A hidden Key Frame opening a Temporal Unit that carries a Sequence
++         * Header is a Delayed Random Access Point. When it refreshes every
++         * reference slot, nothing decoded before it is reachable afterwards
++         * and decoding can start right there. */
++        if (first_frame) {
++            first_frame = 0;
++            delayed_rap = seq_header_in_tu && !frame->show_existing_frame &&
++                          frame->frame_type == AV1_FRAME_KEY && !frame->show_frame &&
++                          frame->refresh_frame_flags == 0xFF;
++        }
++
+         if (!frame->show_frame && !frame->show_existing_frame)
+             continue;
+ 
+@@ -134,6 +149,8 @@ static int av1_parser_parse(AVCodecParserContext *ctx,
+             break;
+         }
+         ctx->picture_structure = AV_PICTURE_STRUCTURE_FRAME;
++        if (delayed_rap)
++            ctx->key_frame = 1;
+ 
+         /* Extract SAR from render_height_minus_1 & render_width_minus_1 */
+         av_reduce(&avctx->sample_aspect_ratio.num,
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 125a6bd79c..cd3b2cd382 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -361,7 +361,8 @@ OBJS-$(CONFIG_M4V_MUXER)                 += rawenc.o
+ OBJS-$(CONFIG_MATROSKA_DEMUXER)          += matroskadec.o matroska.o  \
+                                             flac_picture.o rmsipr.o \
+                                             oggparsevorbis.o vorbiscomment.o \
+-                                            qtpalette.o replaygain.o dovi_isom.o
++                                            qtpalette.o replaygain.o dovi_isom.o \
++                                            av1.o
+ OBJS-$(CONFIG_MATROSKA_MUXER)            += matroskaenc.o matroska.o \
+                                             flacenc_header.o avlanguage.o \
+                                             vorbiscomment.o wv.o dovi_isom.o
+diff --git a/libavformat/av1.c b/libavformat/av1.c
+index 1a8a0a2651..b0191167c8 100644
+--- a/libavformat/av1.c
++++ b/libavformat/av1.c
+@@ -204,8 +204,27 @@ static int parse_color_config(AV1SequenceParameters *seq_params, GetBitContext *
+     return 0;
+ }
+ 
+-static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_t *buf, int size)
++/* Sequence Header fields uncompressed_header() depends on up to
++ * refresh_frame_flags. */
++typedef struct AV1FrameHeaderContext {
++    int reduced_still_picture_header;
++    int equal_picture_interval;
++    int decoder_model_info_present_flag;
++    int buffer_removal_time_length;
++    int operating_points_cnt;
++    int operating_point_idc[AV1_MAX_OPERATING_POINTS];
++    int decoder_model_present_for_this_op[AV1_MAX_OPERATING_POINTS];
++    int frame_id_length;
++    int seq_force_screen_content_tools;
++    int seq_force_integer_mv;
++    int order_hint_bits;
++} AV1FrameHeaderContext;
++
++static int parse_sequence_header(AV1SequenceParameters *seq_params,
++                                 AV1FrameHeaderContext *fh,
++                                 const uint8_t *buf, int size)
+ {
++    AV1FrameHeaderContext dummy;
+     GetBitContext gb;
+     int reduced_still_picture_header;
+     int frame_width_bits_minus_1, frame_height_bits_minus_1;
+@@ -219,12 +238,18 @@ static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_
+     if (ret < 0)
+         return ret;
+ 
++    if (!fh)
++        fh = &dummy;
+     memset(seq_params, 0, sizeof(*seq_params));
++    memset(fh, 0, sizeof(*fh));
++    fh->seq_force_screen_content_tools = 2; // SELECT_SCREEN_CONTENT_TOOLS
++    fh->seq_force_integer_mv           = 2; // SELECT_INTEGER_MV
+ 
+     seq_params->profile = get_bits(&gb, 3);
+ 
+     skip_bits1(&gb); // still_picture
+     reduced_still_picture_header = get_bits1(&gb);
++    fh->reduced_still_picture_header = reduced_still_picture_header;
+ 
+     if (reduced_still_picture_header) {
+         seq_params->level = get_bits(&gb, 5);
+@@ -237,26 +262,29 @@ static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_
+             skip_bits_long(&gb, 32); // num_units_in_display_tick
+             skip_bits_long(&gb, 32); // time_scale
+ 
+-            if (get_bits1(&gb)) // equal_picture_interval
++            fh->equal_picture_interval = get_bits1(&gb);
++            if (fh->equal_picture_interval)
+                 uvlc(&gb); // num_ticks_per_picture_minus_1
+ 
+             decoder_model_info_present_flag = get_bits1(&gb);
+             if (decoder_model_info_present_flag) {
+                 buffer_delay_length_minus_1 = get_bits(&gb, 5);
+                 skip_bits_long(&gb, 32); // num_units_in_decoding_tick
+-                skip_bits(&gb, 10); // buffer_removal_time_length_minus_1 (5)
+-                                    // frame_presentation_time_length_minus_1 (5)
++                fh->buffer_removal_time_length = get_bits(&gb, 5) + 1;
++                skip_bits(&gb, 5); // frame_presentation_time_length_minus_1
+             }
+         } else
+             decoder_model_info_present_flag = 0;
++        fh->decoder_model_info_present_flag = decoder_model_info_present_flag;
+ 
+         initial_display_delay_present_flag = get_bits1(&gb);
+ 
+         operating_points_cnt_minus_1 = get_bits(&gb, 5);
++        fh->operating_points_cnt = operating_points_cnt_minus_1 + 1;
+         for (int i = 0; i <= operating_points_cnt_minus_1; i++) {
+             int seq_level_idx, seq_tier;
+ 
+-            skip_bits(&gb, 12); // operating_point_idc
++            fh->operating_point_idc[i] = get_bits(&gb, 12);
+             seq_level_idx = get_bits(&gb, 5);
+ 
+             if (seq_level_idx > 7)
+@@ -265,7 +293,8 @@ static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_
+                 seq_tier = 0;
+ 
+             if (decoder_model_info_present_flag) {
+-                if (get_bits1(&gb)) { // decoder_model_present_for_this_op
++                fh->decoder_model_present_for_this_op[i] = get_bits1(&gb);
++                if (fh->decoder_model_present_for_this_op[i]) {
+                     skip_bits_long(&gb, buffer_delay_length_minus_1 + 1); // decoder_buffer_delay
+                     skip_bits_long(&gb, buffer_delay_length_minus_1 + 1); // encoder_buffer_delay
+                     skip_bits1(&gb); // low_delay_mode_flag
+@@ -291,8 +320,11 @@ static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_
+     skip_bits(&gb, frame_height_bits_minus_1 + 1); // max_frame_height_minus_1
+ 
+     if (!reduced_still_picture_header) {
+-        if (get_bits1(&gb)) // frame_id_numbers_present_flag
+-            skip_bits(&gb, 7); // delta_frame_id_length_minus_2 (4), additional_frame_id_length_minus_1 (3)
++        if (get_bits1(&gb)) { // frame_id_numbers_present_flag
++            int delta_frame_id_length_minus_2 = get_bits(&gb, 4);
++            fh->frame_id_length = delta_frame_id_length_minus_2 + 2 +
++                                  get_bits(&gb, 3) + 1; // additional_frame_id_length_minus_1
++        }
+     }
+ 
+     skip_bits(&gb, 3); // use_128x128_superblock (1), enable_filter_intra (1), enable_intra_edge_filter (1)
+@@ -312,13 +344,14 @@ static int parse_sequence_header(AV1SequenceParameters *seq_params, const uint8_
+         else
+             seq_force_screen_content_tools = get_bits1(&gb);
+ 
++        fh->seq_force_screen_content_tools = seq_force_screen_content_tools;
+         if (seq_force_screen_content_tools) {
+             if (!get_bits1(&gb)) // seq_choose_integer_mv
+-                skip_bits1(&gb); // seq_force_integer_mv
++                fh->seq_force_integer_mv = get_bits1(&gb);
+         }
+ 
+         if (enable_order_hint)
+-            skip_bits(&gb, 3); // order_hint_bits_minus_1
++            fh->order_hint_bits = get_bits(&gb, 3) + 1;
+     }
+ 
+     skip_bits(&gb, 3); // enable_superres (1), enable_cdef (1), enable_restoration (1)
+@@ -385,7 +418,7 @@ int ff_av1_parse_seq_header(AV1SequenceParameters *seq, const uint8_t *buf, int
+             if (!obu_size)
+                 return AVERROR_INVALIDDATA;
+ 
+-            return parse_sequence_header(seq, buf + start_pos, obu_size);
++            return parse_sequence_header(seq, NULL, buf + start_pos, obu_size);
+         default:
+             break;
+         }
+@@ -396,6 +429,86 @@ int ff_av1_parse_seq_header(AV1SequenceParameters *seq, const uint8_t *buf, int
+     return is_av1c ? 0 : AVERROR_INVALIDDATA;
+ }
+ 
++/* Whether the first frame of a Temporal Unit is a Key Frame that refreshes
++ * every reference slot. Reads uncompressed_header() up to refresh_frame_flags. */
++static int is_full_key_frame(const AV1FrameHeaderContext *fh, const uint8_t *buf,
++                             int size, int temporal_id, int spatial_id)
++{
++    GetBitContext gb;
++    int frame_type, show_frame, allow_screen_content_tools;
++
++    if (fh->reduced_still_picture_header)
++        return 1;
++
++    if (init_get_bits8(&gb, buf, size) < 0)
++        return 0;
++
++    if (get_bits1(&gb)) // show_existing_frame
++        return 0;
++    frame_type = get_bits(&gb, 2);
++    if (frame_type != AV1_FRAME_KEY)
++        return 0;
++    show_frame = get_bits1(&gb);
++    if (show_frame) // refresh_frame_flags is allFrames
++        return 1;
++
++    skip_bits(&gb, 3); // showable_frame, error_resilient_mode, disable_cdf_update
++    if (fh->seq_force_screen_content_tools == 2)
++        allow_screen_content_tools = get_bits1(&gb);
++    else
++        allow_screen_content_tools = fh->seq_force_screen_content_tools;
++    if (allow_screen_content_tools && fh->seq_force_integer_mv == 2)
++        skip_bits1(&gb); // force_integer_mv
++    skip_bits_long(&gb, fh->frame_id_length); // current_frame_id
++    skip_bits1(&gb); // frame_size_override_flag
++    skip_bits(&gb, fh->order_hint_bits); // order_hint
++    if (fh->decoder_model_info_present_flag && get_bits1(&gb)) { // buffer_removal_time_present_flag
++        for (int i = 0; i < fh->operating_points_cnt; i++) {
++            int idc = fh->operating_point_idc[i];
++            if (!fh->decoder_model_present_for_this_op[i])
++                continue;
++            if (!idc || (((idc >> temporal_id) & 1) && ((idc >> (spatial_id + 8)) & 1)))
++                skip_bits_long(&gb, fh->buffer_removal_time_length);
++        }
++    }
++
++    return get_bits_left(&gb) >= 8 && get_bits(&gb, 8) == 0xFF; // refresh_frame_flags
++}
++
++int ff_av1_is_random_access_point(const uint8_t *buf, int size)
++{
++    AV1SequenceParameters seq;
++    AV1FrameHeaderContext fh;
++    int seq_header = 0;
++
++    while (size > 0) {
++        int64_t obu_size;
++        int start_pos, type, temporal_id, spatial_id;
++        int len = parse_obu_header(buf, size, &obu_size, &start_pos,
++                                   &type, &temporal_id, &spatial_id);
++        if (len < 0)
++            return 0;
++
++        switch (type) {
++        case AV1_OBU_SEQUENCE_HEADER:
++            if (!obu_size || parse_sequence_header(&seq, &fh, buf + start_pos, obu_size) < 0)
++                return 0;
++            seq_header = 1;
++            break;
++        case AV1_OBU_FRAME_HEADER:
++        case AV1_OBU_FRAME:
++            return seq_header && obu_size &&
++                   is_full_key_frame(&fh, buf + start_pos, obu_size, temporal_id, spatial_id);
++        default:
++            break;
++        }
++        size -= len;
++        buf  += len;
++    }
++
++    return 0;
++}
++
+ int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
+                        int write_seq_header)
+ {
+@@ -444,7 +557,7 @@ int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
+                 ret = AVERROR_INVALIDDATA;
+                 goto fail;
+             }
+-            ret = parse_sequence_header(&seq_params, buf + start_pos, obu_size);
++            ret = parse_sequence_header(&seq_params, NULL, buf + start_pos, obu_size);
+             if (ret < 0)
+                 goto fail;
+ 
+diff --git a/libavformat/av1.h b/libavformat/av1.h
+index c67a485246..9e0e33442a 100644
+--- a/libavformat/av1.h
++++ b/libavformat/av1.h
+@@ -89,6 +89,20 @@ int ff_av1_filter_obus_buf(const uint8_t *in, uint8_t **out,
+  */
+ int ff_av1_parse_seq_header(AV1SequenceParameters *seq, const uint8_t *buf, int size);
+ 
++/**
++ * Check whether a Temporal Unit is a random access point: it carries a
++ * Sequence Header OBU and its first frame is a Key Frame that refreshes every
++ * reference slot. That includes a hidden Key Frame (show_frame equal to 0),
++ * the Delayed Random Access Point forward key frame encodes are built on,
++ * as long as nothing decoded before it can be referenced after it.
++ *
++ * @param buf Temporal Unit in low overhead bitstream format
++ * @param size size in bytes of the input data buffer
++ *
++ * @return 1 if it is a random access point, 0 otherwise
++ */
++int ff_av1_is_random_access_point(const uint8_t *buf, int size);
++
+ /**
+  * Writes AV1 extradata (Sequence Header and Metadata OBUs) to the provided
+  * AVIOContext.
+diff --git a/libavformat/matroskadec.c b/libavformat/matroskadec.c
+index 344e610e18..518a0980ce 100644
+--- a/libavformat/matroskadec.c
++++ b/libavformat/matroskadec.c
+@@ -58,6 +58,7 @@
+ #include "libavcodec/mpeg4audio.h"
+ #include "libavcodec/packet_internal.h"
+ 
++#include "av1.h"
+ #include "avformat.h"
+ #include "avio_internal.h"
+ #include "demux.h"
+@@ -4157,8 +4158,20 @@ static int matroska_parse_block(MatroskaDemuxContext *matroska, AVBufferRef *buf
+     data      += 2;
+     flags      = *data++;
+     size      -= 3;
+-    if (is_keyframe == -1)
++    if (is_keyframe == -1) {
+         is_keyframe = flags & 0x80 ? AV_PKT_FLAG_KEY : 0;
++        /* The AV1 mapping lets a SimpleBlock be a keyframe when it carries a
++         * Sequence Header and its first frame is a Key Frame, and does not
++         * ask for that frame to be shown. Muxers leave the flag off for a
++         * hidden one (a Delayed Random Access Point), so an encode built on
++         * forward key frames has no keyframe, no Cues and nothing to seek
++         * with. Only one that refreshes every reference slot is taken, as
++         * decoding from it is correct right away. */
++        if (!is_keyframe && st->codecpar->codec_id == AV_CODEC_ID_AV1 &&
++            !(flags & 0x06) && !track->encodings.nb_elem &&
++            ff_av1_is_random_access_point(data, size))
++            is_keyframe = AV_PKT_FLAG_KEY;
++    }
+ 
+     if (cluster_time != (uint64_t) -1 &&
+         (block_time >= 0 || cluster_time >= -block_time)) {

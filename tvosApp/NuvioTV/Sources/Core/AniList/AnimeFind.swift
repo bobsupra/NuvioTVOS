@@ -89,9 +89,9 @@ enum AnimeFind {
         let small = UIGraphicsImageRenderer(size: size).image { _ in
             image.draw(in: CGRect(origin: .zero, size: size))
         }
-        iconLock.lock()
-        loadedIcon = small
-        iconLock.unlock()
+        iconLock.withLock {
+            loadedIcon = small
+        }
     }
 
     /// Opens the title's details (NuvioTVApp listens).

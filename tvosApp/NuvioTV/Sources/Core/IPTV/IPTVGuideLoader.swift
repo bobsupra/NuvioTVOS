@@ -38,7 +38,7 @@ struct IPTVGuideBatch: Sendable {
 struct IPTVGuideLoader {
     private static let maximumConcurrentFeeds = 2
     private static let maximumMergedProgrammes = 250_000
-    private static let updateInterval: TimeInterval = 0.3
+    private static let updateInterval: TimeInterval = 1.5
     static let maximumTransferBytes = 128 * 1024 * 1024
     private let session: URLSession
     init(session: URLSession = .shared) { self.session = session }

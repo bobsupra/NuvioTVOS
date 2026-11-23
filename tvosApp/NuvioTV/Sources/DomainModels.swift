@@ -668,36 +668,52 @@ public class ProfileViewModel: ObservableObject {
     /// the app's Library directory is writable. Try persistent sandbox
     /// locations in order and verify them with a real atomic write before use.
     private static func makeDefaultProfileManager(fileManager: FileManager = .default) throws -> ProfileManager {
-        var candidates: [URL] = []
-
-        if let applicationSupport = fileManager.urls(
-            for: .applicationSupportDirectory,
-            in: .userDomainMask
-        ).first {
-            candidates.append(applicationSupport.appendingPathComponent("Nuvio", isDirectory: true))
-        }
-
         let homeLibrary = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library", isDirectory: true)
-        candidates.append(
-            homeLibrary
-                .appendingPathComponent("Application Support", isDirectory: true)
-                .appendingPathComponent("Nuvio", isDirectory: true)
-        )
+        let appSupportURL = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first?.appendingPathComponent("Nuvio", isDirectory: true)
+        let homeAppSupportURL = homeLibrary
+            .appendingPathComponent("Application Support", isDirectory: true)
+            .appendingPathComponent("Nuvio", isDirectory: true)
+        let cachesURL = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+        let homeCachesURL = homeLibrary.appendingPathComponent("Caches", isDirectory: true)
+            .appendingPathComponent("Nuvio", isDirectory: true)
+        let libraryNuvioURL = homeLibrary.appendingPathComponent("Nuvio", isDirectory: true)
+        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent("Nuvio", isDirectory: true)
 
-        if let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first {
-            candidates.append(caches.appendingPathComponent("Nuvio", isDirectory: true))
+        var candidates: [URL] = []
+
+        #if os(tvOS) && !targetEnvironment(simulator)
+        // Physical tvOS containers typically deny writes to Application Support
+        // (NSCocoaErrorDomain Code=513 / EPERM). Keep using an existing
+        // Application Support store if present, otherwise probe Library/Nuvio
+        // and Caches first to avoid noisy launch failures.
+        if let appSupportURL,
+           fileManager.fileExists(atPath: appSupportURL.appendingPathComponent("profiles.json").path) {
+            candidates.append(appSupportURL)
         }
-        candidates.append(homeLibrary.appendingPathComponent("Caches", isDirectory: true).appendingPathComponent("Nuvio", isDirectory: true))
-        candidates.append(homeLibrary.appendingPathComponent("Nuvio", isDirectory: true))
-
-        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
-        if let documentsURL {
-            candidates.append(documentsURL.appendingPathComponent("Nuvio", isDirectory: true))
-        }
-
-        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true).appendingPathComponent("Nuvio", isDirectory: true)
+        candidates.append(libraryNuvioURL)
+        if let cachesURL { candidates.append(cachesURL) }
+        candidates.append(homeCachesURL)
+        if let appSupportURL { candidates.append(appSupportURL) }
+        candidates.append(homeAppSupportURL)
+        if let documentsURL { candidates.append(documentsURL) }
         candidates.append(tmpURL)
+        #else
+        if let appSupportURL { candidates.append(appSupportURL) }
+        candidates.append(homeAppSupportURL)
+        if let cachesURL { candidates.append(cachesURL) }
+        candidates.append(homeCachesURL)
+        candidates.append(libraryNuvioURL)
+        if let documentsURL { candidates.append(documentsURL) }
+        candidates.append(tmpURL)
+        #endif
 
         var attemptedPaths = Set<String>()
         var lastError: Error?

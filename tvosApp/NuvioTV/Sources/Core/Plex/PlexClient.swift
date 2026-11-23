@@ -37,7 +37,7 @@ struct PlexResource: Equatable {
 
 /// One playable file of a movie or episode. An item has several when the
 /// library holds more than one version (4K and 1080p) or a split file.
-struct PlexFile: Codable, Equatable {
+struct PlexFile: Codable, Equatable, Sendable {
     /// `/library/parts/<id>/<ts>/file.<ext>`.
     let partKey: String
     let container: String?
@@ -49,7 +49,7 @@ struct PlexFile: Codable, Equatable {
 }
 
 /// A file's format as Plex's library listing reports it.
-struct PlexFileDetails: Codable, Equatable {
+struct PlexFileDetails: Codable, Equatable, Sendable {
     /// `"1080"`, `"4k"`, `"sd"`.
     var videoResolution: String? = nil
     var videoCodec: String? = nil
