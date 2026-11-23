@@ -713,10 +713,20 @@ struct PosterCard: View {
                             .fill(continueBadgeFill)
                     }
                 }
-                .padding(.top, 16)
+                .padding(.top, continueBadgeTopInset)
                 .padding(.bottom, 16)
                 .padding(.horizontal, effectiveLandscape ? 16 : 8)
         }
+    }
+
+    /// Art from Settings → Custom Poster URL often has its own tags printed
+    /// along the top (quality, "New Season", rankings). Over that art the
+    /// badge sits below that strip instead of covering it.
+    private var continueBadgeTopInset: CGFloat {
+        let showsCustomArt = effectiveLandscape
+            ? usesLoadedCustomLandscapeArtwork
+            : customPortraitArtworkURL != nil
+        return showsCustomArt ? 52 : 16
     }
 
     private var continueBadgeFill: Color {
