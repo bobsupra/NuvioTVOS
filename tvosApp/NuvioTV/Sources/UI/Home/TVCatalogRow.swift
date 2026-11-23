@@ -571,6 +571,7 @@ struct TVCatalogRow: View {
 
     @State private var scrollIndex: Int?
     @FocusState private var ownCardFocus: String?
+    @ObservedObject private var cardDisintegration = CardDisintegration.shared
     @State private var stagedCardCount = 0
     @State private var cardStaging = TVRowCardStaging()
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
@@ -743,6 +744,17 @@ struct TVCatalogRow: View {
         ownCardFocus = key
     }
 
+    /// True while a Continue Watching card is shown as dust instead of itself.
+    private func isDissolving(_ item: NuvioMeta) -> Bool {
+        cardDisintegration.hiddenContentIds.contains(dissolveKey(item))
+    }
+
+    /// The row and the title: a title in both Continue Watching and Upcoming
+    /// only disappears from the row it was removed from.
+    private func dissolveKey(_ item: NuvioMeta) -> String {
+        "\(id)|\(item.id)"
+    }
+
     /// One card of the row.
     @ViewBuilder
     private func catalogCard(_ card: TVCatalogMaterializedCard, mountedCount: Int) -> some View {
@@ -841,7 +853,10 @@ struct TVCatalogRow: View {
                 if let p = progressItem { onStartContinueWatchingFromBeginning?(p) }
             } : nil,
             onRemoveFromContinueWatching: ((id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId) && progressItem != nil) ? {
-                if let p = progressItem { onRemoveFromContinueWatching?(p) }
+                guard let p = progressItem else { return }
+                cardDisintegration.dissolveCard(contentId: dissolveKey(item)) {
+                    onRemoveFromContinueWatching?(p)
+                }
             } : nil,
             onRefreshCatalog: onRefreshCatalog,
             cardIndex: itemIndex,
@@ -880,6 +895,14 @@ struct TVCatalogRow: View {
             LazyHStack(alignment: .top, spacing: rowCardSpacing) {
                 ForEach(cards) { card in
                     catalogCard(card, mountedCount: cards.count)
+                        .modifier(DissolveFrameReporter(
+                            isEnabled: id == TVHomeSection.continueWatchingId || id == TVHomeSection.upcomingId,
+                            key: dissolveKey(card.item)
+                        ))
+                        .opacity(isDissolving(card.item) ? 0 : 1)
+                        // A dissolving card can't take focus: Select or a second
+                        // Remove on it would act on a title being removed.
+                        .disabled(isDissolving(card.item))
                         .id(card.id)
                 }
             }
@@ -2285,5 +2308,26 @@ extension TVCollectionFolderCard: Equatable {
         lhs.retainFocusAppearance == rhs.retainFocusAppearance &&
         lhs.allowsFocus == rhs.allowsFocus &&
         lhs.focusCallbackContext == rhs.focusCallbackContext
+    }
+}
+
+/// Tells `CardDisintegration` where a removable card is, so the dissolve can
+/// capture it. Only Continue Watching and Upcoming cards report.
+private struct DissolveFrameReporter: ViewModifier {
+    let isEnabled: Bool
+    let key: String
+
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .onGeometryChange(for: CGRect.self) { proxy in
+                    proxy.frame(in: .global)
+                } action: { frame in
+                    CardDisintegration.shared.setFrame(frame, for: key)
+                }
+                .onDisappear { CardDisintegration.shared.setFrame(nil, for: key) }
+        } else {
+            content
+        }
     }
 }
