@@ -1906,8 +1906,21 @@ struct ContentView: View {
                 episodeId: episodeId
             )
         }
-        guard !WatchedStore.contains(meta: currentItem.meta) else { return nil }
+        guard !continueWatchingMovieStartsOver(
+            isWatched: WatchedStore.contains(meta: currentItem.meta),
+            position: currentItem.position,
+            duration: currentItem.duration
+        ) else { return nil }
         return currentItem.resumePosition
+    }
+
+    /// A movie already marked watched can be back in Continue Watching because
+    /// it is being watched again. Resume that rewatch; start over only when the
+    /// saved progress is complete or unknown.
+    static func continueWatchingMovieStartsOver(isWatched: Bool, position: Double, duration: Double) -> Bool {
+        guard isWatched else { return false }
+        guard position > 0, duration > 0 else { return true }
+        return position / duration >= WatchProgressLedger.completionFraction
     }
 
     private static func resumePosition(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
