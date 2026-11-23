@@ -234,6 +234,8 @@ final class FrameDecodeContext: @unchecked Sendable {
             close()
             if Self.isPermanentOpenFailure(error), let failure = error as? FrameDecodeError {
                 permanentOpenFailure = failure
+                // Logged once here; later requests rethrow it without a log line (see FrameExtractor).
+                EngineLog.emit("[FrameExtractor] open failed permanently, stills off for this source: \(failure)", category: .swPlayback)
             }
             throw error
         }
@@ -421,7 +423,10 @@ final class FrameDecodeContext: @unchecked Sendable {
         } catch FFmpegDecoderContext.Failure.allocation {
             throw FrameDecodeError.allocationFailed
         } catch FFmpegDecoderContext.Failure.parameters {
-            throw FrameDecodeError.noCodecParameters
+            // `avcodec_parameters_to_context` only copies extradata and side data, so it fails on
+            // memory, not on the source. Reported as an allocation failure so `ensureOpen` retries it;
+            // `.noCodecParameters` (permanent) is kept for a stream that has none.
+            throw FrameDecodeError.allocationFailed
         } catch {
             throw FrameDecodeError.decoderOpenFailed
         }
