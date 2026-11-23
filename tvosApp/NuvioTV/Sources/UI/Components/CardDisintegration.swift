@@ -55,7 +55,13 @@ final class CardDisintegration: ObservableObject {
     /// Dissolves the card of `contentId`, then calls `removal`. The card is
     /// found by the frame its row reported: when a context menu asks for the
     /// removal, focus is still in the closing menu, not on the card.
+    /// When `continueWatchingPerishAnimation` is disabled (the default),
+    /// removal runs immediately.
     func dissolveCard(contentId: String, removal: @escaping () -> Void) {
+        guard UserDefaults.standard.bool(forKey: SettingsKey.continueWatchingPerishAnimation) else {
+            removal()
+            return
+        }
         dissolve(
             contentId: contentId,
             capture: UIAccessibility.isReduceMotionEnabled ? nil : cardFrames[contentId].flatMap(Self.capture(frame:)),

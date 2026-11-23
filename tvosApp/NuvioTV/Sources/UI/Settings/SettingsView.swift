@@ -246,6 +246,7 @@ enum SettingsKey {
     static let aiCatalogAnimeSeries = "nuvio.tv.settings.integrations.aiCatalogAnimeSeries"
     static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     static let useNuvioRail = "nuvio.tv.settings.layout.useNuvioRail"
+    static let continueWatchingPerishAnimation = "nuvio.tv.settings.appearance.continueWatchingPerishAnimation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
     /// Settings → Layout → Calendar → Today Row.
@@ -499,7 +500,7 @@ enum SettingsKey {
         p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage,
         // The account payload of other devices has no value for it, and a
         // pull would switch the sidebar off again.
-        useNuvioRail,
+        useNuvioRail, continueWatchingPerishAnimation,
         aniListClientID, malClientID
     ])
 
@@ -3080,6 +3081,7 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.continueWatchingPerishAnimation) private var continueWatchingPerishAnimation = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
@@ -3183,17 +3185,6 @@ private struct AppearanceSettingsView: View {
                     accentColor: accentColor
                 )
                 SettingsToggleRow(
-                    title: L10n.string("settings_nuvio_rail", fallback: "Nuvio Icon Sidebar"),
-                    subtitle: L10n.string(
-                        "settings_nuvio_rail_subtitle",
-                        fallback: "A slim icon rail like Nuvio on desktop and mobile, in place of the Apple TV sidebar. Collection pages aren't listed in it."
-                    ),
-                    isOn: $useNuvioRail,
-                    accentColor: accentColor
-                )
-                .opacity(useTopNavigation ? 0.46 : 1)
-                .disabled(useTopNavigation)
-                SettingsToggleRow(
                     title: L10n.string("nav_calendar", fallback: "Calendar"),
                     subtitle: L10n.string(
                         "settings_show_calendar_tab_subtitle",
@@ -3209,6 +3200,36 @@ private struct AppearanceSettingsView: View {
                         fallback: "Show Watch Party in the sidebar"
                     ),
                     isOn: $showWatchPartyTab,
+                    accentColor: accentColor
+                )
+            }
+
+            SettingsGroup(
+                title: L10n.string("appearance_nuvio_android_tv_styling", fallback: "Nuvio Android TV Styling"),
+                subtitle: L10n.string(
+                    "appearance_nuvio_android_tv_styling_subtitle",
+                    fallback: "Android TV and desktop appearance options for navigation, animations, and layouts"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("settings_nuvio_rail", fallback: "Nuvio Icon Sidebar"),
+                    subtitle: L10n.string(
+                        "settings_nuvio_rail_subtitle",
+                        fallback: "A slim icon rail like Nuvio on Android TV, desktop, and mobile, in place of the Apple TV sidebar. Collection pages aren't listed in it."
+                    ),
+                    isOn: $useNuvioRail,
+                    accentColor: accentColor
+                )
+                .opacity(useTopNavigation ? 0.46 : 1)
+                .disabled(useTopNavigation)
+
+                SettingsToggleRow(
+                    title: L10n.string("appearance_cw_perish_animation", fallback: "Continue Watching Perish Animation"),
+                    subtitle: L10n.string(
+                        "appearance_cw_perish_animation_subtitle",
+                        fallback: "Dissolve a card into drifting particles when removing it from Continue Watching"
+                    ),
+                    isOn: $continueWatchingPerishAnimation,
                     accentColor: accentColor
                 )
             }

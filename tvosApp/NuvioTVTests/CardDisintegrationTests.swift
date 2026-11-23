@@ -97,4 +97,27 @@ final class CardDisintegrationTests: XCTestCase {
         XCTAssertEqual(removed, 1)
         XCTAssertFalse(CardDisintegration.shared.hiddenContentIds.contains("tt0000001"))
     }
+
+    func testDissolveCardRunsImmediatelyWhenPerishAnimationIsDisabledByDefault() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: SettingsKey.continueWatchingPerishAnimation)
+        var removed = 0
+        CardDisintegration.shared.setFrame(CGRect(x: 100, y: 100, width: 200, height: 120), for: "tt-disabled")
+        CardDisintegration.shared.dissolveCard(contentId: "tt-disabled") { removed += 1 }
+        XCTAssertEqual(removed, 1, "removal must run immediately when perish animation is off")
+        XCTAssertFalse(CardDisintegration.shared.hiddenContentIds.contains("tt-disabled"))
+        CardDisintegration.shared.setFrame(nil, for: "tt-disabled")
+    }
+
+    func testDissolveCardRunsImmediatelyWhenExplicitlySetToFalse() {
+        let defaults = UserDefaults.standard
+        defaults.set(false, forKey: SettingsKey.continueWatchingPerishAnimation)
+        defer { defaults.removeObject(forKey: SettingsKey.continueWatchingPerishAnimation) }
+        var removed = 0
+        CardDisintegration.shared.setFrame(CGRect(x: 100, y: 100, width: 200, height: 120), for: "tt-explicit-false")
+        CardDisintegration.shared.dissolveCard(contentId: "tt-explicit-false") { removed += 1 }
+        XCTAssertEqual(removed, 1)
+        XCTAssertFalse(CardDisintegration.shared.hiddenContentIds.contains("tt-explicit-false"))
+        CardDisintegration.shared.setFrame(nil, for: "tt-explicit-false")
+    }
 }
