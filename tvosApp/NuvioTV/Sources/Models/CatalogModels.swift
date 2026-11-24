@@ -4997,9 +4997,14 @@ enum ContinueWatchingStore {
 
     /// Drops the derived file the way tvOS does when it reclaims Caches, leaving
     /// the ledger untouched. Exists so the recovery path is actually covered.
+    ///
+    /// The cache is invalidated before the file is removed. A save still
+    /// writing in the background then sees a stale generation after its write
+    /// and deletes its own file. In the other order, a save could write the file
+    /// back after it was removed and still pass that check.
     static func simulateStorageEvictionForTesting() {
-        removeStorage(for: storageKey)
         invalidateCache()
+        removeStorage(for: storageKey)
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
