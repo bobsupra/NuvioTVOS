@@ -8247,15 +8247,20 @@ private struct TvDetailsCastAndTrailer: View {
     let entryLocked: Bool
     let onFocus: () -> Void
 
-    @State private var focusedPersonIndex = 0
+    /// The person under the row's title: moved there by Core Animation, as the other rows of
+    /// Details. tvOS scrolled this row by itself before: the first person could be cut off at
+    /// the screen's edge or out of it, and the row moved in steps of its own.
+    @State private var scrollIndex = 0
     /// The row's people come a few at a time, empty space of their width until then: built all
     /// at once as focus moved down into the episodes (Details builds the section below the one
     /// focus goes into), the whole row came in the frame of the move, a 120-145 ms frame. All
     /// of them once focus comes into the row.
     @State private var builtCount = Self.firstCards
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
 
     private static let firstCards = 3
     private static let cardsPerStep = 3
+    private static let spacing: CGFloat = 58
 
     var body: some View {
         let items = displayPeople
@@ -8288,48 +8293,43 @@ private struct TvDetailsCastAndTrailer: View {
                         .disabled(entryLocked || focusRequestID != nil)
                 }
 
-                ScrollViewReader { scrollProxy in
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 58) {
-                            ForEach(Array(items.enumerated()), id: \.element.id) { index, person in
-                                if index < builtCount {
-                                    TvDetailsPersonCard(
-                                        person: person,
-                                        externalFocus: externalFocus,
-                                        onSelect: { onPersonClick(person) },
-                                        onFocus: {
-                                            focusedPersonIndex = index
-                                            if builtCount < items.count { builtCount = items.count }
-                                            onFocus()
-                                            onPersonFocus?(person)
-                                        },
-                                        onBack: onBack
-                                    )
-                                    .id(person.id)
-                                    .detailsSnapshot(TvDetailsCardSnapshotKey(item: person, index: index))
-                                    .disabled(focusRequestID.map { $0 != person.id } ?? entryLocked)
-                                } else {
-                                    Color.clear
-                                        .frame(width: TvDetailsPersonCard.width, height: 1)
-                                }
+                TVCAStrip(index: scrollIndex, step: TvDetailsPersonCard.width + Self.spacing, animated: smoothFocus) {
+                    HStack(spacing: Self.spacing) {
+                        ForEach(Array(items.enumerated()), id: \.element.id) { index, person in
+                            if index < builtCount {
+                                TvDetailsPersonCard(
+                                    person: person,
+                                    externalFocus: externalFocus,
+                                    onSelect: { onPersonClick(person) },
+                                    onFocus: {
+                                        if scrollIndex != index { scrollIndex = index }
+                                        if builtCount < items.count { builtCount = items.count }
+                                        onFocus()
+                                        onPersonFocus?(person)
+                                    },
+                                    onBack: onBack
+                                )
+                                .detailsSnapshot(TvDetailsCardSnapshotKey(item: person, index: index))
+                                .disabled(focusRequestID.map { $0 != person.id } ?? entryLocked)
+                            } else {
+                                Color.clear
+                                    .frame(width: TvDetailsPersonCard.width, height: 1)
                             }
                         }
-                        .padding(.trailing, 80)
                     }
-                    .scrollClipDisabledIfAvailable()
-                    .onAppear {
-                        positionAtRequestedItem(using: scrollProxy)
-                        onMounted?()
-                    }
-                    .onChange(of: focusRequestID) { _, _ in
-                        positionAtRequestedItem(using: scrollProxy)
-                    }
-                    .onChange(of: people.map(\.id)) { _, _ in
-                        positionAtRequestedItem(using: scrollProxy)
-                    }
-                    .onDisappear {
-                        onUnmounted?()
-                    }
+                }
+                .onAppear {
+                    positionAtRequestedItem()
+                    onMounted?()
+                }
+                .onChange(of: focusRequestID) { _, _ in
+                    positionAtRequestedItem()
+                }
+                .onChange(of: people.map(\.id)) { _, _ in
+                    positionAtRequestedItem()
+                }
+                .onDisappear {
+                    onUnmounted?()
                 }
             }
             .focusSection()
@@ -8354,10 +8354,16 @@ private struct TvDetailsCastAndTrailer: View {
         people
     }
 
-    private func positionAtRequestedItem(using scrollProxy: ScrollViewProxy) {
+    /// Back from a person's page: that person under the title, built, for focus to go back to.
+    private func positionAtRequestedItem() {
         guard let focusRequestID,
-              people.contains(where: { $0.id == focusRequestID }) else { return }
-        scrollProxy.scrollTo(focusRequestID, anchor: .center)
+              let index = displayPeople.firstIndex(where: { $0.id == focusRequestID }) else { return }
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
+        withTransaction(transaction) {
+            if scrollIndex != index { scrollIndex = index }
+            if builtCount <= index { builtCount = displayPeople.count }
+        }
     }
 }
 
@@ -9905,11 +9911,15 @@ private struct TvDetailsPersonCard: View {
     /// The card's width, also kept by the cast row for a card not built yet.
     static let width: CGFloat = 220
 
-    @FocusState private var localFocusID: String?
+    /// Its own focus, as the company card's: bound only to Details' shared focus, the card
+    /// didn't see its focus change, so it showed no focus and never told Details or the row,
+    /// and Details went back to Play after a person's page.
+    @FocusState private var isFocused: Bool
     @State private var profileImage: UIImage?
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
 
-    private var isFocused: Bool {
-        externalFocus?.wrappedValue == person.id || localFocusID == person.id
+    private var showsFocusedAppearance: Bool {
+        isFocused || externalFocus?.wrappedValue == person.id
     }
 
     var body: some View {
@@ -9917,10 +9927,10 @@ private struct TvDetailsPersonCard: View {
             VStack(spacing: 18) {
                 Circle()
                     .frame(width: 188, height: 188)
-                    .modifier(TvDetailsGlassBackground(filled: isFocused, shape: Circle()))
+                    .modifier(TvDetailsGlassBackground(filled: showsFocusedAppearance, shape: Circle()))
                     .overlay(
                         Circle()
-                            .strokeBorder(Color.white.opacity(isFocused ? 0.0 : 0.22), lineWidth: 1)
+                            .strokeBorder(Color.white.opacity(showsFocusedAppearance ? 0.0 : 0.22), lineWidth: 1)
                     )
                     .overlay {
                         if let profileImage {
@@ -9932,18 +9942,34 @@ private struct TvDetailsPersonCard: View {
                         } else {
                             Text(initials)
                                 .font(.system(size: 44, weight: .medium))
-                                .foregroundColor(isFocused ? .black : .white)
+                                .foregroundColor(showsFocusedAppearance ? .black : .white)
                         }
                     }
+                    // The focus outline of the other cards (More Like This), round: a photo
+                    // covers the filled circle, so focus showed only as the card's scale.
+                    .overlay {
+                        if showsFocusedAppearance {
+                            Circle()
+                                .stroke(
+                                    AppFocusOutline.color,
+                                    lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                                )
+                        }
+                    }
+                    .shadow(
+                        color: Color.black.opacity(showsFocusedAppearance ? 0.55 : 0),
+                        radius: showsFocusedAppearance ? 14 : 0,
+                        y: showsFocusedAppearance ? 4 : 0
+                    )
 
                 MarqueeText(person.name, size: 24, weight: .medium,
-                            color: isFocused ? .white : .white.opacity(0.74), isActive: isFocused, alignment: .center)
+                            color: showsFocusedAppearance ? .white : .white.opacity(0.74), isActive: showsFocusedAppearance, alignment: .center)
                     .frame(width: 210)
 
                 if let role = person.displayRole {
                     Text(role)
                         .font(.system(size: 20, weight: .regular))
-                        .foregroundColor(.white.opacity(isFocused ? 0.82 : 0.55))
+                        .foregroundColor(.white.opacity(showsFocusedAppearance ? 0.82 : 0.55))
                         .lineLimit(1)
                         .frame(width: 210)
                 }
@@ -9951,11 +9977,12 @@ private struct TvDetailsPersonCard: View {
             .frame(width: Self.width)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused(externalFocus ?? $localFocusID, equals: person.id)
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: person.id))
         .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.08 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { _, focused in
+        .scaleEffect(showsFocusedAppearance ? 1.08 : 1)
+        .animation(.easeOut(duration: 0.14), value: showsFocusedAppearance)
+        .onChange(of: showsFocusedAppearance) { _, focused in
             if focused {
                 onFocus()
             }
