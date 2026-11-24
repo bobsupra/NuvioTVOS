@@ -9909,6 +9909,7 @@ private struct TvDetailsPersonCard: View {
     /// and Details went back to Play after a person's page.
     @FocusState private var isFocused: Bool
     @State private var profileImage: UIImage?
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
 
     private var showsFocusedAppearance: Bool {
         isFocused || externalFocus?.wrappedValue == person.id
@@ -9937,6 +9938,22 @@ private struct TvDetailsPersonCard: View {
                                 .foregroundColor(showsFocusedAppearance ? .black : .white)
                         }
                     }
+                    // The focus outline of the other cards (More Like This), round: a photo
+                    // covers the filled circle, so focus showed only as the card's scale.
+                    .overlay {
+                        if showsFocusedAppearance {
+                            Circle()
+                                .stroke(
+                                    AppFocusOutline.color,
+                                    lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                                )
+                        }
+                    }
+                    .shadow(
+                        color: Color.black.opacity(showsFocusedAppearance ? 0.55 : 0),
+                        radius: showsFocusedAppearance ? 14 : 0,
+                        y: showsFocusedAppearance ? 4 : 0
+                    )
 
                 MarqueeText(person.name, size: 24, weight: .medium,
                             color: showsFocusedAppearance ? .white : .white.opacity(0.74), isActive: showsFocusedAppearance, alignment: .center)
