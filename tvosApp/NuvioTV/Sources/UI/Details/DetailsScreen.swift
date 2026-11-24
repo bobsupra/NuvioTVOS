@@ -9904,11 +9904,14 @@ private struct TvDetailsPersonCard: View {
     /// The card's width, also kept by the cast row for a card not built yet.
     static let width: CGFloat = 220
 
-    @FocusState private var localFocusID: String?
+    /// Its own focus, as the company card's: bound only to Details' shared focus, the card
+    /// didn't see its focus change, so it showed no focus and never told Details or the row,
+    /// and Details went back to Play after a person's page.
+    @FocusState private var isFocused: Bool
     @State private var profileImage: UIImage?
 
-    private var isFocused: Bool {
-        externalFocus?.wrappedValue == person.id || localFocusID == person.id
+    private var showsFocusedAppearance: Bool {
+        isFocused || externalFocus?.wrappedValue == person.id
     }
 
     var body: some View {
@@ -9916,10 +9919,10 @@ private struct TvDetailsPersonCard: View {
             VStack(spacing: 18) {
                 Circle()
                     .frame(width: 188, height: 188)
-                    .modifier(TvDetailsGlassBackground(filled: isFocused, shape: Circle()))
+                    .modifier(TvDetailsGlassBackground(filled: showsFocusedAppearance, shape: Circle()))
                     .overlay(
                         Circle()
-                            .strokeBorder(Color.white.opacity(isFocused ? 0.0 : 0.22), lineWidth: 1)
+                            .strokeBorder(Color.white.opacity(showsFocusedAppearance ? 0.0 : 0.22), lineWidth: 1)
                     )
                     .overlay {
                         if let profileImage {
@@ -9931,18 +9934,18 @@ private struct TvDetailsPersonCard: View {
                         } else {
                             Text(initials)
                                 .font(.system(size: 44, weight: .medium))
-                                .foregroundColor(isFocused ? .black : .white)
+                                .foregroundColor(showsFocusedAppearance ? .black : .white)
                         }
                     }
 
                 MarqueeText(person.name, size: 24, weight: .medium,
-                            color: isFocused ? .white : .white.opacity(0.74), isActive: isFocused, alignment: .center)
+                            color: showsFocusedAppearance ? .white : .white.opacity(0.74), isActive: showsFocusedAppearance, alignment: .center)
                     .frame(width: 210)
 
                 if let role = person.displayRole {
                     Text(role)
                         .font(.system(size: 20, weight: .regular))
-                        .foregroundColor(.white.opacity(isFocused ? 0.82 : 0.55))
+                        .foregroundColor(.white.opacity(showsFocusedAppearance ? 0.82 : 0.55))
                         .lineLimit(1)
                         .frame(width: 210)
                 }
@@ -9950,11 +9953,12 @@ private struct TvDetailsPersonCard: View {
             .frame(width: Self.width)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused(externalFocus ?? $localFocusID, equals: person.id)
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: person.id))
         .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.08 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { _, focused in
+        .scaleEffect(showsFocusedAppearance ? 1.08 : 1)
+        .animation(.easeOut(duration: 0.14), value: showsFocusedAppearance)
+        .onChange(of: showsFocusedAppearance) { _, focused in
             if focused {
                 onFocus()
             }
