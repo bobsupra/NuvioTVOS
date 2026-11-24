@@ -13961,7 +13961,7 @@ private struct TvStreamCard: View {
                     )
             )
         }
-        .buttonStyle(PosterCardButtonStyle())
+        .buttonStyle(TvStreamCardButtonStyle(isFocused: isFocused))
         .focused($isFocused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: focusID))
         .focusEffectDisabledIfAvailable()
@@ -14028,6 +14028,30 @@ private struct TvStreamCard: View {
         } else {
             fallback.frame(width: size, height: size)
         }
+    }
+}
+
+/// PosterCardButtonStyle for a source card, with an opaque fill while the
+/// card is held down after focus has moved to its "Play with" menu.
+///
+/// Holding Select opens the menu: tvOS draws a slightly enlarged copy of the
+/// held card over the card itself. The card's fill is mostly transparent, so
+/// the card showed through that copy, shrunk by the press effect, and the two
+/// sets of text overlapped. The fill only shows while the menu has focus: a
+/// quick press is still focused, and tvOS leaves the card pressed after Back
+/// until focus moves, by which time the card has its focus again.
+private struct TvStreamCardButtonStyle: ButtonStyle {
+    let isFocused: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color(white: 0.12))
+                    .opacity(configuration.isPressed && !isFocused ? 1 : 0)
+            )
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
     }
 }
 
