@@ -45,13 +45,20 @@ final class ICloudSettingsSyncManager: ObservableObject {
             UserDefaults.standard.bool(forKey: SettingsKey.iCloudSyncEnabled)
         }
         set {
-            let previous = isEnabled
             UserDefaults.standard.set(newValue, forKey: SettingsKey.iCloudSyncEnabled)
-            if newValue && !previous {
+            // The Settings switch writes this key through @AppStorage before it sets this
+            // property, so the stored value can't tell whether sync was just turned on.
+            // `start()` runs once; turning sync on again only syncs.
+            if newValue {
                 start()
                 syncNow()
             }
         }
+    }
+
+    /// Whether `start()` has registered the iCloud and UserDefaults observers.
+    var isStarted: Bool {
+        didStart
     }
 
     /// Starts observing iCloud and local UserDefaults changes.
@@ -95,12 +102,21 @@ final class ICloudSettingsSyncManager: ObservableObject {
         }
     }
 
+    /// Removes the observers so a test can check `start()` from a stopped manager.
+    func stopForTesting() {
+        pushDebounceTask?.cancel()
+        observers.forEach(NotificationCenter.default.removeObserver)
+        observers.removeAll()
+        didStart = false
+    }
+
     /// Trigger an immediate sync (both push local and pull remote).
     func syncNow() {
         guard isEnabled else { return }
         NSUbiquitousKeyValueStore.default.synchronize()
         applyRemoteChanges(changedKeys: nil)
         pushLocalSettingsToCloud()
+        markSynced()
     }
 
     // MARK: - Outbound: Push to iCloud
@@ -114,33 +130,55 @@ final class ICloudSettingsSyncManager: ObservableObject {
         }
     }
 
-    private func pushLocalSettingsToCloud() {
-        guard isEnabled, !isApplyingRemote else { return }
+    /// Writes the payloads that differ from iCloud and returns whether it wrote any.
+    ///
+    /// Recording the sync date is itself a UserDefaults change, and applying iCloud
+    /// values posts one too. Pushing only what differs lets those notifications end in
+    /// a push that writes nothing, instead of a new write every 1.5 seconds.
+    @discardableResult
+    private func pushLocalSettingsToCloud() -> Bool {
+        guard isEnabled, !isApplyingRemote else { return false }
 
         let store = NSUbiquitousKeyValueStore.default
-        let knownProfileIds = collectProfileIds()
+        var localPayloads: [String: [String: Any]] = [:]
 
-        for profileId in knownProfileIds {
+        for profileId in collectProfileIds() {
             let profileDefaults = ProfileSettings.store(for: profileId)
-            let payload = extractSettingsPayload(from: profileDefaults)
-            if !payload.isEmpty {
-                store.set(payload, forKey: "\(Self.profileSettingsPrefix)\(profileId)")
-            }
+            localPayloads["\(Self.profileSettingsPrefix)\(profileId)"] = extractSettingsPayload(from: profileDefaults)
         }
 
         // Global settings in UserDefaults.standard
-        let globalPayload = extractSettingsPayload(from: .standard)
-        if !globalPayload.isEmpty {
-            store.set(globalPayload, forKey: Self.globalSettingsKey)
-        }
+        localPayloads[Self.globalSettingsKey] = extractSettingsPayload(from: .standard)
 
-        store.set(Date().timeIntervalSince1970, forKey: Self.cloudTimestampKey)
-        let success = store.synchronize()
-        if success {
-            let now = Date()
-            lastSyncDate = now
-            UserDefaults.standard.set(now, forKey: SettingsKey.iCloudLastSyncDate)
+        let changed = Self.payloadsToPush(local: localPayloads, cloud: store.dictionaryRepresentation)
+        guard !changed.isEmpty else { return false }
+
+        for (key, payload) in changed {
+            store.set(payload, forKey: key)
         }
+        store.set(Date().timeIntervalSince1970, forKey: Self.cloudTimestampKey)
+        if store.synchronize() {
+            markSynced()
+        }
+        return true
+    }
+
+    /// The non-empty local payloads whose value in iCloud is missing or different.
+    nonisolated static func payloadsToPush(
+        local: [String: [String: Any]],
+        cloud: [String: Any]
+    ) -> [String: [String: Any]] {
+        local.filter { key, payload in
+            guard !payload.isEmpty else { return false }
+            guard let stored = cloud[key] as? NSDictionary else { return true }
+            return !stored.isEqual(to: payload)
+        }
+    }
+
+    private func markSynced() {
+        let now = Date()
+        lastSyncDate = now
+        UserDefaults.standard.set(now, forKey: SettingsKey.iCloudLastSyncDate)
     }
 
     // MARK: - Inbound: Pull from iCloud
@@ -153,6 +191,7 @@ final class ICloudSettingsSyncManager: ObservableObject {
         defer { isApplyingRemote = false }
 
         var appliedAny = false
+        var changedAny = false
         let allCloudKeys = store.dictionaryRepresentation.keys
 
         // Apply profile-scoped settings
@@ -164,23 +203,23 @@ final class ICloudSettingsSyncManager: ObservableObject {
             guard !profileId.isEmpty, let dict = store.dictionary(forKey: key) else { continue }
 
             let profileDefaults = ProfileSettings.store(for: profileId)
-            applySettingsPayload(dict, to: profileDefaults)
+            if applySettingsPayload(dict, to: profileDefaults) { changedAny = true }
             appliedAny = true
         }
 
         // Apply global settings
         if changedKeys == nil || (changedKeys?.contains(Self.globalSettingsKey) ?? false) {
             if let globalDict = store.dictionary(forKey: Self.globalSettingsKey) {
-                applySettingsPayload(globalDict, to: .standard)
+                if applySettingsPayload(globalDict, to: .standard) { changedAny = true }
                 appliedAny = true
             }
         }
 
         if appliedAny {
-            let now = Date()
-            lastSyncDate = now
-            UserDefaults.standard.set(now, forKey: SettingsKey.iCloudLastSyncDate)
+            markSynced()
+        }
 
+        if changedAny {
             // Notify UI to refresh appearance, layout, integrations
             AppLocaleManager.shared.reloadFromProfileStore()
             AppFontManager.shared.reloadFromProfileStore()
@@ -219,19 +258,26 @@ final class ICloudSettingsSyncManager: ObservableObject {
         return payload
     }
 
-    private func applySettingsPayload(_ payload: [String: Any], to defaults: UserDefaults) {
+    /// Writes the iCloud values that differ from `defaults` and returns whether it wrote any.
+    @discardableResult
+    private func applySettingsPayload(_ payload: [String: Any], to defaults: UserDefaults) -> Bool {
+        var changed = false
         for (key, value) in payload {
             guard SettingsKey.all.contains(key), !SettingsKey.deviceLocal.contains(key) else { continue }
             // Don't overwrite if identical
             let currentVal = defaults.object(forKey: key)
             if let strVal = value as? String, (currentVal as? String) != strVal {
                 defaults.set(strVal, forKey: key)
+                changed = true
             } else if let numVal = value as? NSNumber, (currentVal as? NSNumber) != numVal {
                 defaults.set(numVal, forKey: key)
+                changed = true
             } else if let dataVal = value as? Data, (currentVal as? Data) != dataVal {
                 defaults.set(dataVal, forKey: key)
+                changed = true
             } else if let arrayVal = value as? [String], (currentVal as? [String]) != arrayVal {
                 defaults.set(arrayVal, forKey: key)
+                changed = true
             }
         }
 
@@ -241,5 +287,6 @@ final class ICloudSettingsSyncManager: ObservableObject {
                   let legacySound = payload[SettingsKey.trailerPreviewSound] as? Bool {
             ProfileSettings.importLegacyTrailerSoundIfNeeded(legacySound, in: defaults)
         }
+        return changed
     }
 }
