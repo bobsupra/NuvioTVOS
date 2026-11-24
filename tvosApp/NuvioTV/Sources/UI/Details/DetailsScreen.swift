@@ -5938,6 +5938,13 @@ struct TvDetailsContent: View {
                     .opacity(isContentRevealed ? 1 : 0)
                     .onAppear {
                         guard !isContentRevealed else { return }
+                        // Back to a card (from a person's or a title's page): the content is
+                        // there at once, where it was. Faded in, only the backdrop showed for a
+                        // moment before it.
+                        guard initialFocusTarget == nil else {
+                            isContentRevealed = true
+                            return
+                        }
                         withAnimation(.easeOut(duration: 0.28)) { isContentRevealed = true }
                     }
 
