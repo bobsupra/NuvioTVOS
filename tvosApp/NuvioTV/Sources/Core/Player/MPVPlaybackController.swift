@@ -1989,12 +1989,15 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let unexpectedEOF = getFlag("eof-reached") && !didReachCleanEndOfFile
         let hasError = !currentErrorMessage.isEmpty && !isPlayerEnded
         let isLive = lastSubmittedLoadRequest?.isLiveStream == true
+        // A live stream is not reloaded on an ordinary play: the startup path
+        // (applyPendingLoadConfiguration / releasing the startup display gate)
+        // calls playPlayback(), so reloading here restarted the load forever.
+        // Wake and restore paths keep their own live reload.
         if !lifecycleRestorePending,
            MPVPlaybackLifecyclePolicy.shouldReloadStreamInsteadOfSeek(
                sawMediaServicesReset: sawMediaServicesReset,
                hasError: hasError,
-               reachedUnexpectedEOF: unexpectedEOF,
-               isLiveStream: isLive
+               reachedUnexpectedEOF: unexpectedEOF
            ), lastSubmittedLoadRequest != nil {
             let targetMs = lastVerifiedPositionMs ?? milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
             reloadLastSubmittedRequest(atMs: isLive ? nil : targetMs, resumePlaying: true)
