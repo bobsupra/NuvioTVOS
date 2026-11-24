@@ -6406,7 +6406,7 @@ private struct IntegrationSettingsView: View {
                 SettingsActionRow(
                     title: L10n.string("settings_mdblist_ratings_title", fallback: "MDBList Ratings & Badges (API Key)"),
                     subtitle: L10n.string("tvos_settings_mdblist_integration_subtitle", fallback: "Get a free API key at mdblist.com/preferences for ratings and artwork badges"),
-                    value: mdbListEnabled && mdbListHasApiKey ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
+                    value: mdbListEnabled && mdbListHasCredential ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
                     accentColor: accentColor
                 ) {
                     showingMdbListOptions = true
@@ -6571,7 +6571,7 @@ private struct IntegrationSettingsView: View {
             }
         }
         .onChange(of: mdbListApiKey) { _, _ in
-            if !mdbListHasApiKey {
+            if !mdbListHasCredential {
                 mdbListEnabled = false
             }
             RemoteTrackingState.normalizeWatchProgressSource()
@@ -6860,8 +6860,10 @@ private struct IntegrationSettingsView: View {
         !tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private var mdbListHasApiKey: Bool {
+    /// A key, or the connected MDBList account: either one can fetch ratings.
+    private var mdbListHasCredential: Bool {
         !mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || MdbListRuntimeSession.isAuthenticated()
     }
 
     private var aiSubtitlesHasApiKey: Bool {
@@ -8681,11 +8683,14 @@ private struct TmdbOptionsSheet: View {
                     ) {
                         SettingsNativeTextFieldRow(
                             title: L10n.string("settings_tmdb_api_key", fallback: "TMDB API Key"),
-                            subtitle: L10n.string("settings_tmdb_api_key_subtitle", fallback: "Paste the key from TMDB — stored only on this Apple TV"),
+                            subtitle: L10n.string("settings_tmdb_api_key_subtitle", fallback: "Paste the key from TMDB, or set it in Nuvio on another device: it syncs with your account"),
                             placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                             text: $tmdbApiKey,
                             isSecure: true,
-                            onCommit: normalizeTmdbApiKey
+                            onCommit: {
+                                normalizeTmdbApiKey()
+                                NuvioSyncManager.current?.pushProviderCredential(.tmdb)
+                            }
                         )
 
                         SettingsToggleRow(
@@ -9012,11 +9017,14 @@ private struct MdbListOptionsSheet: View {
                     ) {
                         SettingsNativeTextFieldRow(
                             title: L10n.string("settings_mdblist_api_key", fallback: "MDBList API Key"),
-                            subtitle: L10n.string("settings_mdblist_api_key_subtitle", fallback: "Paste the key from MDBList — stored only on this Apple TV"),
+                            subtitle: L10n.string("settings_mdblist_api_key_subtitle", fallback: "Optional with a connected account. Set here or in Nuvio on another device: it syncs with your account"),
                             placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                             text: $mdbListApiKey,
                             isSecure: true,
-                            onCommit: normalizeMdbListApiKey
+                            onCommit: {
+                                normalizeMdbListApiKey()
+                                NuvioSyncManager.current?.pushProviderCredential(.mdblist)
+                            }
                         )
 
                         SettingsToggleRow(
@@ -9024,7 +9032,7 @@ private struct MdbListOptionsSheet: View {
                             subtitle: L10n.string("settings_mdblist_enable_ratings_subtitle", fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and more"),
                             isOn: $mdbListEnabled,
                             accentColor: accentColor,
-                            isAvailable: mdbListHasApiKey
+                            isAvailable: mdbListHasCredential
                         )
                     }
 
@@ -9095,7 +9103,7 @@ private struct MdbListOptionsSheet: View {
             buildRatingProviderRows()
         }
         .onChange(of: mdbListApiKey) { _, _ in
-            if !mdbListHasApiKey {
+            if !mdbListHasCredential {
                 mdbListEnabled = false
             }
             buildRatingProviderRows()
@@ -9208,17 +9216,19 @@ private struct MdbListOptionsSheet: View {
         AddonRatingsService.setRatingOrder(ratingProviderRows.map(\.id))
     }
 
-    private var mdbListHasApiKey: Bool {
+    /// A key, or the connected MDBList account: either one can fetch ratings.
+    private var mdbListHasCredential: Bool {
         !mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || MdbListRuntimeSession.isAuthenticated()
     }
 
     private var mdbListControlsEnabled: Bool {
-        mdbListEnabled && mdbListHasApiKey
+        mdbListEnabled && mdbListHasCredential
     }
 
     private func normalizeMdbListApiKey() {
         mdbListApiKey = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !mdbListHasApiKey {
+        if !mdbListHasCredential {
             mdbListEnabled = false
         }
     }

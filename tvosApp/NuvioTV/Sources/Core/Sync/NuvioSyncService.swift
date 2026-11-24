@@ -1451,6 +1451,12 @@ final class NuvioSyncManager: ObservableObject {
                     localProfileId: activeProfile.id
                 )
                 try ensureStillSyncing(profileId: activeProfile.id)
+                await pullProviderCredentials(
+                    session: session,
+                    remoteProfileId: remoteProfileId,
+                    localProfileId: activeProfile.id
+                )
+                try ensureStillSyncing(profileId: activeProfile.id)
                 if !settingsApplied {
                     try await client.pushProfileSettings(
                         session: session,
@@ -1929,6 +1935,56 @@ final class NuvioSyncManager: ObservableObject {
             return array
         }
         return nil
+    }
+
+    /// Applies the account's MDBList and TMDB keys (non-empty ones only).
+    /// A failure leaves the stored keys as they are.
+    private func pullProviderCredentials(session: AuthSession, remoteProfileId: Int, localProfileId: String) async {
+        do {
+            let rows = try await client.pullProviderCredentials(session: session, remoteProfileId: remoteProfileId)
+            let changed = ProviderCredentialSync.apply(rows: rows, to: ProfileSettings.store(for: localProfileId))
+            if !changed.isEmpty {
+                print("Nuvio sync applied provider credentials: \(changed.map(\.rawValue).joined(separator: ", "))")
+            }
+        } catch is CancellationError {
+            return
+        } catch {
+            print("Nuvio provider credential pull failed: \(error.localizedDescription)")
+        }
+    }
+
+    /// Sends a key saved on this Apple TV to the account, merged into the
+    /// rows the account already has.
+    func pushProviderCredential(_ provider: ProviderCredentialSync.Provider) {
+        guard provider.isPushed else { return }
+        Task { @MainActor in
+            guard let authManager, let profileViewModel,
+                  let key = currentSyncKey(), completedInitialPullKeys.contains(key),
+                  let session = await authManager.validSessionForSync(),
+                  let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else { return }
+            let remoteProfileId = ProfileSyncIndexStore.remoteId(for: activeProfile, in: profileViewModel.profiles)
+            let value = ProfileSettings.store(for: activeProfile.id).string(forKey: provider.localKey)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            // An empty field never clears the account's key: leaving the field
+            // without typing commits it too.
+            guard !value.isEmpty else { return }
+            do {
+                try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
+                let rows = try await client.pullProviderCredentials(session: session, remoteProfileId: remoteProfileId)
+                guard ProviderCredentialSync.remoteKeys(in: rows)[provider] != value else { return }
+                try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
+                try await client.pushProviderCredentials(
+                    session: session,
+                    remoteProfileId: remoteProfileId,
+                    rows: ProviderCredentialSync.pushRows(merging: provider, value: value, into: rows)
+                )
+                print("Nuvio sync pushed provider credential: \(provider.rawValue)")
+            } catch is CancellationError {
+                return
+            } catch {
+                print("Nuvio provider credential push failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func pushLocalSnapshots(scopes: SyncPushScope = .all) async {
@@ -3609,6 +3665,27 @@ final class NuvioAPIClient {
                 "p_client_max_profiles": 6,
                 "p_profiles": payloads
             ]
+        )
+    }
+
+    /// The account's provider credential rows (see `ProviderCredentialSync`).
+    func pullProviderCredentials(session: AuthSession, remoteProfileId: Int) async throws -> [[String: Any]] {
+        let object = try await rpcJSONObject(
+            "sync_pull_provider_credentials",
+            session: session,
+            params: ["p_profile_id": remoteProfileId]
+        )
+        return object as? [[String: Any]] ?? []
+    }
+
+    /// Sends provider credential rows. Called through `rpcData`, not
+    /// `rpcVoid`: the desktop app sends only these two parameters, and
+    /// `rpcVoid` would add `p_origin_client_id` to a `sync_push_` call.
+    func pushProviderCredentials(session: AuthSession, remoteProfileId: Int, rows: [[String: Any]]) async throws {
+        _ = try await rpcData(
+            "sync_push_provider_credentials",
+            session: session,
+            params: ["p_profile_id": remoteProfileId, "p_credentials": rows]
         )
     }
 
