@@ -170,25 +170,19 @@ final class PluginSettingsSyncTests: XCTestCase {
 
     // MARK: Changes here
 
+    // The Keychain itself isn't available to the unit tests: the change note
+    // that `PluginSettingsVault.save` and `remove` make after a Keychain write.
     func testASettingsChangeIsVisibleToTheSync() {
         let defaults = ProfileSettings.current
         let key = PluginSettingsSync.revisionKey
         let hadRevision = defaults.object(forKey: key) != nil
-        let scraperID = "https://sync.example.test/manifest.json:test-\(UUID().uuidString)"
-        defer {
-            PluginSettingsVault.remove(scraperID: scraperID)
-            if !hadRevision { defaults.removeObject(forKey: key) }
-        }
+        defer { if !hadRevision { defaults.removeObject(forKey: key) } }
         let before = defaults.integer(forKey: key)
-        XCTAssertTrue(PluginSettingsVault.save(["apiKey": "secret"], scraperID: scraperID))
+        PluginSettingsVault.noteChange(profileScope: ProfileSettings.activeProfileScope)
         XCTAssertEqual(defaults.integer(forKey: key), before + 1)
-        XCTAssertTrue(PluginSettingsVault.remove(scraperID: scraperID))
-        XCTAssertEqual(defaults.integer(forKey: key), before + 2)
-        // From the account: saved, but not counted as a change here.
-        XCTAssertTrue(PluginSettingsVault.saveFromAccount(
-            ["apiKey": "other"], scraperID: scraperID, profileScope: ProfileSettings.activeProfileScope))
-        XCTAssertEqual(defaults.integer(forKey: key), before + 2)
-        XCTAssertEqual(PluginSettingsVault.settings(scraperID: scraperID)["apiKey"] as? String, "other")
+        // Another profile's settings (a plugin still running for it): not this profile's change.
+        PluginSettingsVault.noteChange(profileScope: "another-profile-\(UUID().uuidString)")
+        XCTAssertEqual(defaults.integer(forKey: key), before + 1)
         XCTAssertTrue(PluginSettingsSync.syncObservedKeys.contains(PluginSettingsSync.revisionKey))
         XCTAssertTrue(PluginSettingsSync.syncObservedKeys.contains(PluginSettingsSync.syncToAccountKey))
     }

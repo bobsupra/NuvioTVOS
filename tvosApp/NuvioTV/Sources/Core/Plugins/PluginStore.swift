@@ -648,7 +648,7 @@ enum PluginSettingsVault {
 
     /// Lets the account sync notice the change (`PluginSettingsSync.revisionKey`),
     /// in the active profile's settings: the profile whose settings change here.
-    private static func noteChange(profileScope: String) {
+    static func noteChange(profileScope: String) {
         guard profileScope == ProfileSettings.activeProfileScope else { return }
         let store = ProfileSettings.current
         store.set(store.integer(forKey: PluginSettingsSync.revisionKey) &+ 1, forKey: PluginSettingsSync.revisionKey)
