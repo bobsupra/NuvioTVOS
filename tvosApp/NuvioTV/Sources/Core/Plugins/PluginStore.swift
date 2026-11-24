@@ -8,7 +8,8 @@ import Security
 /// their scrapers' JavaScript is downloaded next to the manifest and kept in
 /// files (`LargePayloadStore`, never `UserDefaults`), and the list of
 /// repository URLs syncs with the account's `plugins` table so it matches the
-/// Android and iOS apps. Scraper settings stay on this Apple TV, in Keychain.
+/// Android and iOS apps. Scraper settings stay on this Apple TV, in Keychain,
+/// unless the profile keeps them in the account too (`PluginSettingsSync`).
 @MainActor
 final class PluginStore: ObservableObject {
     static let shared = PluginStore()
@@ -587,7 +588,8 @@ final class PluginStore: ObservableObject {
 }
 
 /// Each scraper's settings (the values of its `onSettings()` form) as a JSON
-/// object in Keychain, per profile: they often hold API keys.
+/// object in Keychain, per profile: they often hold API keys. They reach the
+/// account only when the profile opts in (`PluginSettingsSync`).
 enum PluginSettingsVault {
     private static let service = "com.nuvio.tv.plugins.settings"
 
@@ -604,6 +606,19 @@ enum PluginSettingsVault {
 
     @discardableResult
     static func save(_ settings: [String: Any], scraperID: String, profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
+        guard write(settings, scraperID: scraperID, profileScope: profileScope) else { return false }
+        noteChange(profileScope: profileScope)
+        return true
+    }
+
+    /// Settings an account pull brought (`PluginSettingsSync`): saved without
+    /// counting as a change here, which would only push them back.
+    @discardableResult
+    static func saveFromAccount(_ settings: [String: Any], scraperID: String, profileScope: String) -> Bool {
+        write(settings, scraperID: scraperID, profileScope: profileScope)
+    }
+
+    private static func write(_ settings: [String: Any], scraperID: String, profileScope: String) -> Bool {
         guard JSONSerialization.isValidJSONObject(settings),
               let data = try? JSONSerialization.data(withJSONObject: settings) else { return false }
         // Cached plugin answers may depend on the old values.
@@ -627,7 +642,16 @@ enum PluginSettingsVault {
     @discardableResult
     static func remove(scraperID: String, profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
         let status = SecItemDelete(baseQuery(scraperID, profileScope) as CFDictionary)
+        if status == errSecSuccess { noteChange(profileScope: profileScope) }
         return status == errSecSuccess || status == errSecItemNotFound
+    }
+
+    /// Lets the account sync notice the change (`PluginSettingsSync.revisionKey`),
+    /// in the active profile's settings: the profile whose settings change here.
+    private static func noteChange(profileScope: String) {
+        guard profileScope == ProfileSettings.activeProfileScope else { return }
+        let store = ProfileSettings.current
+        store.set(store.integer(forKey: PluginSettingsSync.revisionKey) &+ 1, forKey: PluginSettingsSync.revisionKey)
     }
 
     private static func baseQuery(_ scraperID: String, _ profileScope: String) -> [String: Any] {

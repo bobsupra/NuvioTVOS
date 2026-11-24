@@ -18611,6 +18611,7 @@ private struct PluginsSettingsSection: View {
     @State private var logScraper: PluginScraperRecord?
     @State private var testScraper: PluginScraperRecord?
     @State private var showingWebSetup = false
+    @State private var syncSettingsToAccount = PluginSettingsSync.syncChoice() ?? false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -18658,6 +18659,24 @@ private struct PluginsSettingsSection: View {
                     isOn: Binding(
                         get: { store.autoUpdates },
                         set: { store.setAutoUpdates($0) }
+                    ),
+                    accentColor: accentColor
+                )
+
+                // Written only from the toggle: a profile that never chose leaves
+                // the account's copy alone (see PluginSettingsSync).
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_plugins_sync", fallback: "Save to Nuvio Account"),
+                    subtitle: L10n.string(
+                        "tvos_settings_plugins_sync_subtitle",
+                        fallback: "Keep the providers' settings, API keys and passwords included, in this profile of your Nuvio account, so a reinstall or another Apple TV gets them back. Stored like debrid keys. Turning it off removes them from the account."
+                    ),
+                    isOn: Binding(
+                        get: { syncSettingsToAccount },
+                        set: { value in
+                            syncSettingsToAccount = value
+                            PluginSettingsSync.setSyncChoice(value)
+                        }
                     ),
                     accentColor: accentColor
                 )
@@ -18728,7 +18747,14 @@ private struct PluginsSettingsSection: View {
                 }
             }
         }
-        .onAppear { store.ensureLoaded() }
+        .onAppear {
+            store.ensureLoaded()
+            syncSettingsToAccount = PluginSettingsSync.syncChoice() ?? false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: PluginSettingsSync.syncedFromAccountNotification)) { _ in
+            // An account pull may have turned the choice on or off.
+            syncSettingsToAccount = PluginSettingsSync.syncChoice() ?? false
+        }
         .sheet(item: $settingsScraper) { scraper in
             PluginScraperSettingsSheet(scraper: scraper, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
