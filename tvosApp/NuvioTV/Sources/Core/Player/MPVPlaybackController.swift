@@ -1571,6 +1571,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         ), lastSubmittedLoadRequest != nil {
             let resume = wasPlayingBeforeBackground && watchPartyRemoteIntent == nil
             wasPlayingBeforeBackground = false
+            // suspendPlayback set vid=no, and mpv keeps that option for the reloaded file.
+            setStringProperty("vid", "auto")
             reloadLastSubmittedRequest(atMs: isLive ? nil : targetForPlan, resumePlaying: resume)
             onDidRestorePlayback?()
             return
@@ -4432,6 +4434,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
               seconds <= Double(Int64.max) / 1000 else { return nil }
         return Int64(seconds * 1000)
     }
+
+    /// Test-only read of mpv's selected video track.
+    var videoTrackSelectionForTesting: String? { getString("vid") }
 
     private func getString(_ name: String) -> String? {
         guard mpv != nil else { return nil }

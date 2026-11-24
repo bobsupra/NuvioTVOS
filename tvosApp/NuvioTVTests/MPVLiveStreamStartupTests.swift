@@ -34,6 +34,44 @@ final class MPVLiveStreamStartupTests: XCTestCase {
         XCTAssertTrue(controller.isPlayerPlaying, "The live request should play, not reload on start")
     }
 
+    func testLiveStreamGetsItsVideoBackAfterTheBackground() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("nuvio-mpv-live-wake-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let fileURL = directory.appendingPathComponent("live.mp4")
+        try XCTUnwrap(Data(base64Encoded: Self.fixture, options: .ignoreUnknownCharacters)).write(to: fileURL)
+
+        let controller = MPVPlayerViewController()
+        let window = UIWindow(frame: UIScreen.main.bounds)
+        window.rootViewController = controller
+        window.makeKeyAndVisible()
+        defer {
+            controller.destroyPlayer()
+            window.isHidden = true
+            window.rootViewController = nil
+            try? FileManager.default.removeItem(at: directory)
+        }
+
+        controller.load(PlaybackLoadRequest(videoURL: fileURL, isLiveStream: true, autoplay: true))
+        var deadline = Date().addingTimeInterval(5)
+        while Date() < deadline, !controller.isPlayerPlaying { try? await Task.sleep(nanoseconds: 50_000_000) }
+        XCTAssertTrue(controller.isPlayerPlaying)
+
+        let center = NotificationCenter.default
+        center.post(name: UIApplication.willResignActiveNotification, object: nil)
+        center.post(name: UIApplication.didEnterBackgroundNotification, object: nil)
+        try? await Task.sleep(nanoseconds: 500_000_000)
+        print("[LiveWake] vid in background: \(controller.videoTrackSelectionForTesting ?? "nil")")
+        center.post(name: UIApplication.willEnterForegroundNotification, object: nil)
+        center.post(name: UIApplication.didBecomeActiveNotification, object: nil)
+
+        deadline = Date().addingTimeInterval(5)
+        while Date() < deadline { try? await Task.sleep(nanoseconds: 100_000_000) }
+        let vid = controller.videoTrackSelectionForTesting
+        print("[LiveWake] vid after return: \(vid ?? "nil") playing=\(controller.isPlayerPlaying)")
+        XCTAssertNotEqual(vid, "no", "Video must be re-enabled after returning from the background")
+    }
+
     // 6-second 64x36 H.264/AAC clip, embedded so the test needs no network.
     private static let fixture = """
 AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAwZbW9vdgAAAGxtdmhkAAAAAAAAAAAA
