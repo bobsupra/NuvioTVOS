@@ -46,7 +46,7 @@ Every plugin request (keys masked) and its timing is in the provider's Logs. Rep
 **Sync and storage**
 
 - **Sync:** the repository list syncs through the account's `plugins` table (`sync_push_plugins` RPC), with the same first-sync rule as Android. Repositories added on nuvio.tv or on Android show up on the Apple TV, and the other way round.
-- **Settings stay on the device:** provider settings are kept in the Keychain per profile and are never synced. They often hold API keys.
+- **Settings:** provider settings are kept in the Keychain per profile, since they often hold API keys. They stay on the device unless the profile turns on **Save to Nuvio Account** (Settings → Plugins): then they are kept in the profile's `tv` settings blob too (feature `tvos_plugin_settings`, by provider id with its repository, unencrypted like Usenet's passwords and debrid keys), so a reinstall or another Apple TV gets them back once the repositories are back (`PluginSettingsSync`). Turning it off removes them from the account.
 
 ---
 

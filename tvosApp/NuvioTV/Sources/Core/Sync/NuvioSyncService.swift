@@ -51,6 +51,12 @@ enum ProfileSettingsSnapshot {
                 snapshot[key] = value
             }
         }
+        // Plugin settings, the same way (PluginSettingsSync).
+        for key in PluginSettingsSync.syncObservedKeys {
+            if let value = defaults.object(forKey: key) {
+                snapshot[key] = value
+            }
+        }
         // AIOStreams in Nuvio: the Apple TV's own keys; synced only when
         // chosen, which the export decides (AIOSettingsSync).
         for (key, value) in AIOSettingsSync.observedValues() {
@@ -3738,8 +3744,9 @@ final class NuvioAPIClient {
             ?? (features[Self.themeSettingsFeature] as? [String: Any])
         let usenetFeature = features[UsenetSettingsSync.featureKey] as? [String: Any]
         let aioFeature = features[AIOSettingsSync.featureKey] as? [String: Any]
+        let pluginSettingsFeature = features[PluginSettingsSync.featureKey] as? [String: Any]
 
-        guard tvosFeature != nil || layoutSettingsFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil || posterCardStyleFeature != nil || playerFeature != nil || continueWatchingFeature != nil || androidTraktFeature != nil || mdbListFeature != nil || themeFeature != nil || usenetFeature != nil || aioFeature != nil else {
+        guard tvosFeature != nil || layoutSettingsFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil || posterCardStyleFeature != nil || playerFeature != nil || continueWatchingFeature != nil || androidTraktFeature != nil || mdbListFeature != nil || themeFeature != nil || usenetFeature != nil || aioFeature != nil || pluginSettingsFeature != nil else {
             return false
         }
 
@@ -3765,6 +3772,12 @@ final class NuvioAPIClient {
             store: ProfileSettings.store(for: localProfileId),
             savePassword: { UsenetCredentialStore.save($0, forServerID: $1, profileScope: localProfileId) },
             removePassword: { UsenetCredentialStore.remove(forServerID: $0, profileScope: localProfileId) }
+        )
+        PluginSettingsSync.importPayload(
+            pluginSettingsFeature,
+            store: ProfileSettings.store(for: localProfileId),
+            current: { PluginSettingsVault.settings(scraperID: $0, profileScope: localProfileId) },
+            save: { PluginSettingsVault.saveFromAccount($0, scraperID: $1, profileScope: localProfileId) }
         )
         // AIOStreams in Nuvio: its settings and configuration, when chosen.
         if let imported = AIOSettingsSync.importPayload(
@@ -3930,6 +3943,13 @@ final class NuvioAPIClient {
             store: profileDefaults,
             existing: features[UsenetSettingsSync.featureKey] as? [String: Any],
             password: { UsenetCredentialStore.password(forServerID: $0, profileScope: localProfileId) }
+        )
+        // Plugin settings: only when the profile opted in (API keys and passwords included).
+        features[PluginSettingsSync.featureKey] = PluginSettingsSync.export(
+            store: profileDefaults,
+            existing: features[PluginSettingsSync.featureKey] as? [String: Any],
+            state: PluginStore.loadState(scope: localProfileId),
+            settings: { PluginSettingsVault.settings(scraperID: $0, profileScope: localProfileId) }
         )
         // AIOStreams in Nuvio: only when this Apple TV chose it (password included).
         features[AIOSettingsSync.featureKey] = AIOSettingsSync.export(
