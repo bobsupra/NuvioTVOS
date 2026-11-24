@@ -63,9 +63,16 @@ struct NuvioTVApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
-                .environmentObject(atvloadlyService)
-                .overlay { CardDisintegrationOverlay() }
+            // When the app only hosts unit tests, keep Home off screen: it reloads
+            // add-on rows (fetching their manifests) whenever tests change add-on
+            // settings, which skews tests that count those requests.
+            if ProcessInfo.processInfo.environment["XCTestConfigurationFilePath"] != nil {
+                Color.black
+            } else {
+                ContentView()
+                    .environmentObject(atvloadlyService)
+                    .overlay { CardDisintegrationOverlay() }
+            }
         }
     }
 }
