@@ -19,7 +19,7 @@ enum MdbListProgressService {
         if MdbListAuthStore.state(in: store, profileScope: scope, tokenStorage: tokenStorage).hasOAuthTokens {
             return true
         }
-        return !(store.string(forKey: SettingsKey.mdbListApiKey)?
+        return !(ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
     }
 

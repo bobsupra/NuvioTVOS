@@ -2054,11 +2054,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return cached
         }
         let apiKey: String = {
-            if let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
-                .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
-                return key
-            }
-            if let key = UserDefaults.standard.string(forKey: SettingsKey.tmdbApiKey)?
+            if let key = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: ProfileSettings.current)?
                 .trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty {
                 return key
             }

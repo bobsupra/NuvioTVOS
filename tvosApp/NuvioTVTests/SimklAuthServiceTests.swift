@@ -8,6 +8,30 @@ final class SimklAuthServiceTests: XCTestCase {
     private var suiteName: String!
     private var tokenStorage: SimklMemoryTokenStorage!
 
+    private final class FakeCredentialKeychain: ProviderCredentialKeychain {
+        var values: [String: String] = [:]
+        var failReads = false
+        var failWrites = false
+        var failDeletes = false
+
+        private func key(_ service: String, _ account: String) -> String { "\(service)|\(account)" }
+        func read(service: String, account: String) -> ProviderCredentialKeychainRead {
+            if failReads { return .failed }
+            guard let value = values[key(service, account)] else { return .missing }
+            return .value(value)
+        }
+        func write(_ value: String, service: String, account: String) -> Bool {
+            guard !failWrites else { return false }
+            values[key(service, account)] = value
+            return true
+        }
+        func delete(service: String, account: String) -> Bool {
+            guard !failDeletes else { return false }
+            values.removeValue(forKey: key(service, account))
+            return true
+        }
+    }
+
     private struct SimklWatchedProfile {
         let id: String
         let store: UserDefaults
@@ -1399,55 +1423,45 @@ final class SimklAuthServiceTests: XCTestCase {
         return (response, Data(json.utf8))
     }
 
-    func testSimklKeychainTokenStorageMirrorsAndRecoversFromProfileSettings() {
-        let storage = SimklKeychainTokenStorage()
+    func testSimklKeychainTokenStorageMigratesLegacyProfileTokenWithoutMirroringNewWrites() {
+        let keychain = FakeCredentialKeychain()
+        let storage = SimklKeychainTokenStorage(keychain: keychain)
         let testScope = "test-profile-\(UUID().uuidString)"
         let profileStore = ProfileSettings.store(for: testScope)
 
-        // Clean slate
-        storage.setAccessToken(nil, for: testScope)
-        XCTAssertNil(storage.accessToken(for: testScope))
+        profileStore.removeObject(forKey: SettingsKey.simklAccessToken)
+        profileStore.set("legacy-token", forKey: SettingsKey.simklAccessToken)
+        XCTAssertEqual(storage.accessToken(for: testScope), "legacy-token")
+        XCTAssertEqual(keychain.values["com.nuvio.tv.simkl.auth|accessToken.\(testScope)"], "legacy-token")
         XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
 
-        // Saving token mirrors to ProfileSettings
         storage.setAccessToken("test-token-12345", for: testScope)
-        XCTAssertEqual(profileStore.string(forKey: SettingsKey.simklAccessToken), "test-token-12345")
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
         XCTAssertEqual(storage.accessToken(for: testScope), "test-token-12345")
 
-        // Clearing token deletes from ProfileSettings
         storage.setAccessToken(nil, for: testScope)
         XCTAssertNil(storage.accessToken(for: testScope))
         XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
-
-        // If another device synced the token via iCloud into ProfileSettings, storage recovers it
-        profileStore.set("cloud-synced-token", forKey: SettingsKey.simklAccessToken)
-        XCTAssertEqual(storage.accessToken(for: testScope), "cloud-synced-token")
-
-        // Clean up
-        storage.setAccessToken(nil, for: testScope)
     }
 
-    func testSimklKeychainRefreshTokenStorageMirrorsAndRecoversFromProfileSettings() {
-        let storage = SimklKeychainTokenStorage()
+    func testSimklKeychainTokenStoragePrefersKeychainAndKeepsLegacyFallbackDuringReadFailure() {
+        let keychain = FakeCredentialKeychain()
+        let storage = SimklKeychainTokenStorage(keychain: keychain)
         let testScope = "test-profile-\(UUID().uuidString)"
         let profileStore = ProfileSettings.store(for: testScope)
 
-        storage.setRefreshToken(nil, for: testScope)
-        XCTAssertNil(storage.refreshToken(for: testScope))
-        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklRefreshToken))
+        profileStore.set("stale-mirror", forKey: SettingsKey.simklAccessToken)
+        keychain.values["com.nuvio.tv.simkl.auth|accessToken.\(testScope)"] = "secure-token"
+        XCTAssertEqual(storage.accessToken(for: testScope), "secure-token")
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
 
-        storage.setRefreshToken("test-refresh-token-12345", for: testScope)
-        XCTAssertEqual(profileStore.string(forKey: SettingsKey.simklRefreshToken), "test-refresh-token-12345")
-        XCTAssertEqual(storage.refreshToken(for: testScope), "test-refresh-token-12345")
-
-        storage.setRefreshToken(nil, for: testScope)
-        XCTAssertNil(storage.refreshToken(for: testScope))
-        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklRefreshToken))
-
-        profileStore.set("cloud-synced-refresh-token", forKey: SettingsKey.simklRefreshToken)
-        XCTAssertEqual(storage.refreshToken(for: testScope), "cloud-synced-refresh-token")
-
-        storage.setRefreshToken(nil, for: testScope)
+        let secondScope = "test-profile-\(UUID().uuidString)"
+        let secondStore = ProfileSettings.store(for: secondScope)
+        secondStore.set("legacy-token", forKey: SettingsKey.simklRefreshToken)
+        keychain.failReads = true
+        XCTAssertEqual(storage.refreshToken(for: secondScope), "legacy-token")
+        XCTAssertEqual(secondStore.string(forKey: SettingsKey.simklRefreshToken), "legacy-token")
+        XCTAssertNil(keychain.values["com.nuvio.tv.simkl.auth|refreshToken.\(secondScope)"])
     }
 
     @MainActor

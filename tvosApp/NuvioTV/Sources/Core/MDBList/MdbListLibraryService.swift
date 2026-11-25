@@ -139,7 +139,7 @@ enum MdbListLibraryService {
         if tokenStorage.tokens(for: profileScope) != nil {
             return "oauth:\(MdbListAuthStore.accountBindingID(in: store))"
         }
-        let key = store.string(forKey: SettingsKey.mdbListApiKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let key = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return "key:\(key)"
     }
 

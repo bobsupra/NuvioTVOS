@@ -23,4 +23,34 @@ final class ProfileSettingsStoreIdentityTests: XCTestCase {
         XCTAssertTrue(ProfileSettings.store(for: nil) === UserDefaults.standard)
         XCTAssertTrue(ProfileSettings.store(for: "") === UserDefaults.standard)
     }
+
+    func testActivatingExistingSecondaryProfilePreservesWeTrakrSignInMarker() {
+        let id = "wetrakr-secondary-preservation-\(UUID().uuidString)"
+        let store = ProfileSettings.store(for: id)
+        let tokenStorage = WeTrakrMemoryTokenStorage()
+        let previousID = ProfileSettings.activeProfileID
+        let previousWasPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        defer {
+            WeTrakrAuthStore.clearAuth(profileScope: id, store: store, tokenStorage: tokenStorage)
+            if let previousID {
+                ProfileSettings.setActiveProfile(previousID, isPrimary: previousWasPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+            UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(id)")
+        }
+
+        store.set("existing-wetrakr-client", forKey: SettingsKey.wetrakrClientID)
+        WeTrakrAuthStore.saveToken(
+            "existing-wetrakr-token",
+            clientID: "existing-wetrakr-client",
+            profileScope: id,
+            store: store,
+            tokenStorage: tokenStorage
+        )
+        ProfileSettings.setActiveProfile(id, isPrimary: false)
+
+        XCTAssertTrue(store.bool(forKey: "nuvio.tv.wetrakr.auth.hasAccessToken"))
+        XCTAssertEqual(store.string(forKey: SettingsKey.wetrakrClientID), "existing-wetrakr-client")
+    }
 }

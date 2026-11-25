@@ -43,7 +43,7 @@ struct CloudLibraryService {
             list.append(ConnectedCloudProvider(id: "premiumize", displayName: "Premiumize", apiKey: premKey))
         }
         if list.isEmpty {
-            let legacyKey = (store.string(forKey: SettingsKey.debridApiKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let legacyKey = (ProviderCredentialStore.string(forKey: SettingsKey.debridApiKey, in: store) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let selectedKind = DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider))
             if !legacyKey.isEmpty {
                 if selectedKind == .torbox {

@@ -1179,7 +1179,7 @@ enum RemoteTrackingState {
             return ProfileSettings.isActiveStore(store)
                 && SimklRuntimeSession.authenticatedState(store: store) != nil
         case .tmdb:
-            let apiKey = store.string(forKey: SettingsKey.tmdbApiKey)?
+            let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let enabled = (store.object(forKey: SettingsKey.tmdbEnabled) as? Bool) ?? false
             let useMoreLikeThis = (store.object(forKey: SettingsKey.tmdbUseMoreLikeThis) as? Bool) ?? true

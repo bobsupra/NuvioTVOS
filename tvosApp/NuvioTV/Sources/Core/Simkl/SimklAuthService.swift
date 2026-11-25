@@ -78,12 +78,19 @@ extension SimklTokenStorage {
     func setRefreshToken(_ token: String?, for profileScope: String) {}
 }
 
-/// Long-lived Simkl access and refresh tokens live in the Keychain, namespaced by profile,
-/// with ProfileSettings mirroring for iCloud sync across Apple TVs.
+/// Long-lived Simkl access and refresh tokens live in the Keychain, namespaced by profile.
+/// ProfileSettings is read only as a migration source for older installs.
 final class SimklKeychainTokenStorage: SimklTokenStorage {
     private let service = "com.nuvio.tv.simkl.auth"
-    private static let lock = NSLock()
+    private let keychain: ProviderCredentialKeychain
+    private static let lock = NSRecursiveLock()
     private static var tokenCache: [String: String] = [:]
+    private static var deletedTokens: Set<String> = []
+    private static var pendingWrites: [String: String] = [:]
+
+    init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
+        self.keychain = keychain
+    }
 
     func accessToken(for profileScope: String) -> String? {
         readToken(accountType: "accessToken", profileScope: profileScope, fallbackKey: SettingsKey.simklAccessToken)
@@ -102,62 +109,66 @@ final class SimklKeychainTokenStorage: SimklTokenStorage {
     }
 
     private func readToken(accountType: String, profileScope: String, fallbackKey: String) -> String? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
         let cacheKey = "\(accountType):\(profileScope)"
-        if let cached = Self.lock.withLock({ Self.tokenCache[cacheKey] }), !cached.isEmpty {
+        if Self.deletedTokens.contains(cacheKey) {
+            if keychain.delete(service: service, account: "\(accountType).\(profileScope)") {
+                Self.deletedTokens.remove(cacheKey)
+            }
+            return nil
+        }
+        if let cached = Self.tokenCache[cacheKey], !cached.isEmpty {
+            if Self.pendingWrites[cacheKey] == cached,
+               keychain.write(cached, service: service, account: "\(accountType).\(profileScope)") {
+                Self.pendingWrites.removeValue(forKey: cacheKey)
+                ProfileSettings.store(for: profileScope).removeObject(forKey: fallbackKey)
+            }
             return cached
         }
-
-        var query = keychainQuery(for: profileScope, accountType: accountType)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var item: CFTypeRef?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-           let data = item as? Data,
-           let token = String(data: data, encoding: .utf8), !token.isEmpty {
-            Self.lock.withLock { Self.tokenCache[cacheKey] = token }
+        let keychainRead = keychain.read(service: service, account: "\(accountType).\(profileScope)")
+        switch keychainRead {
+        case let .value(token) where !token.isEmpty:
+            Self.tokenCache[cacheKey] = token
+            ProfileSettings.store(for: profileScope).removeObject(forKey: fallbackKey)
             return token
+        case .value, .missing, .failed:
+            break
         }
 
-        // Fallback to ProfileSettings (mirrored by iCloud sync across Apple TVs)
         let store = ProfileSettings.store(for: profileScope)
         if let mirrored = store.string(forKey: fallbackKey), !mirrored.isEmpty {
-            writeToken(mirrored, accountType: accountType, profileScope: profileScope, mirrorKey: fallbackKey)
+            if case .missing = keychainRead,
+               keychain.write(mirrored, service: service, account: "\(accountType).\(profileScope)") {
+                store.removeObject(forKey: fallbackKey)
+                Self.deletedTokens.remove(cacheKey)
+                Self.tokenCache[cacheKey] = mirrored
+            }
             return mirrored
         }
         return nil
     }
 
     private func writeToken(_ token: String?, accountType: String, profileScope: String, mirrorKey: String) {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
         let cacheKey = "\(accountType):\(profileScope)"
-        Self.lock.withLock {
-            if let token, !token.isEmpty {
-                Self.tokenCache[cacheKey] = token
-            } else {
-                Self.tokenCache.removeValue(forKey: cacheKey)
-            }
-        }
-        SecItemDelete(keychainQuery(for: profileScope, accountType: accountType) as CFDictionary)
         let store = ProfileSettings.store(for: profileScope)
         if let token, !token.isEmpty {
-            store.set(token, forKey: mirrorKey)
-            if let data = token.data(using: .utf8) {
-                var addQuery = keychainQuery(for: profileScope, accountType: accountType)
-                addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-                addQuery[kSecValueData as String] = data
-                SecItemAdd(addQuery as CFDictionary, nil)
-            }
+            let saved = keychain.write(token, service: service, account: "\(accountType).\(profileScope)")
+            Self.deletedTokens.remove(cacheKey)
+            Self.tokenCache[cacheKey] = token
+            if saved { Self.pendingWrites.removeValue(forKey: cacheKey) }
+            else { Self.pendingWrites[cacheKey] = token }
+            if saved { store.removeObject(forKey: mirrorKey) }
         } else {
             store.removeObject(forKey: mirrorKey)
+            let deleted = keychain.delete(service: service, account: "\(accountType).\(profileScope)")
+            Self.tokenCache.removeValue(forKey: cacheKey)
+            Self.pendingWrites.removeValue(forKey: cacheKey)
+            if deleted { Self.deletedTokens.remove(cacheKey) }
+            else { Self.deletedTokens.insert(cacheKey) }
         }
-    }
-
-    private func keychainQuery(for profileScope: String, accountType: String = "accessToken") -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: "\(accountType).\(profileScope)"
-        ]
     }
 }
 

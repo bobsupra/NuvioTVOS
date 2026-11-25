@@ -88,6 +88,26 @@ private final class WeTrakrFixtureURLProtocol: URLProtocol {
 
 @MainActor
 final class WeTrakrAuthServiceTests: XCTestCase {
+    private final class FakeCredentialKeychain: ProviderCredentialKeychain {
+        var values: [String: String] = [:]
+        var failReads = false
+
+        private func key(_ service: String, _ account: String) -> String { "\(service)|\(account)" }
+        func read(service: String, account: String) -> ProviderCredentialKeychainRead {
+            if failReads { return .failed }
+            guard let value = values[key(service, account)] else { return .missing }
+            return .value(value)
+        }
+        func write(_ value: String, service: String, account: String) -> Bool {
+            values[key(service, account)] = value
+            return true
+        }
+        func delete(service: String, account: String) -> Bool {
+            values.removeValue(forKey: key(service, account))
+            return true
+        }
+    }
+
     private var suiteName: String!
     private var store: UserDefaults!
     private var memoryStorage: WeTrakrMemoryTokenStorage!
@@ -97,6 +117,27 @@ final class WeTrakrAuthServiceTests: XCTestCase {
     private var originalProgressClient: WeTrakrAPIClient!
     private var originalProgressTokenStorage: WeTrakrTokenStorage!
     private var fixtureSession: URLSession?
+
+    func testWeTrakrKeychainTokenStorageMigratesLegacyTokenAndPrefersKeychain() {
+        let scope = "wetrakr-storage-\(UUID().uuidString)"
+        let profileStore = ProfileSettings.store(for: scope)
+        let keychain = FakeCredentialKeychain()
+        let storage = WeTrakrKeychainTokenStorage(keychain: keychain)
+        profileStore.set("legacy-token", forKey: SettingsKey.wetrakrRefreshToken)
+
+        XCTAssertEqual(storage.refreshToken(for: scope), "legacy-token")
+        XCTAssertEqual(keychain.values["com.nuvio.tv.wetrakr.auth|refreshToken.\(scope)"], "legacy-token")
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrRefreshToken))
+
+        profileStore.set("stale-mirror", forKey: SettingsKey.wetrakrAccessToken)
+        keychain.values["com.nuvio.tv.wetrakr.auth|accessToken.\(scope)"] = "secure-token"
+        XCTAssertEqual(storage.accessToken(for: scope), "secure-token")
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrAccessToken))
+
+        storage.setAccessToken("new-token", for: scope)
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrAccessToken))
+        XCTAssertEqual(storage.accessToken(for: scope), "new-token")
+    }
 
     override func setUp() {
         super.setUp()

@@ -2,8 +2,8 @@
 //  ICloudSettingsSyncManager.swift
 //  NuvioTV
 //
-//  Synchronizes local application settings, player configurations, UI themes,
-//  and third-party API credentials across Apple TVs using NSUbiquitousKeyValueStore.
+//  Synchronizes local application settings, player configurations, and UI themes
+//  across Apple TVs using NSUbiquitousKeyValueStore.
 //
 
 import Combine
@@ -59,6 +59,13 @@ final class ICloudSettingsSyncManager: ObservableObject {
     /// Whether `start()` has registered the iCloud and UserDefaults observers.
     var isStarted: Bool {
         didStart
+    }
+
+    /// Starts observing iCloud and local UserDefaults changes during normal app launch,
+    /// skipping automatic startup when the app is hosted inside XCTest.
+    func startForAppLaunch() {
+        guard NSClassFromString("XCTestCase") == nil else { return }
+        start()
     }
 
     /// Starts observing iCloud and local UserDefaults changes.
@@ -163,16 +170,65 @@ final class ICloudSettingsSyncManager: ObservableObject {
         return true
     }
 
-    /// The non-empty local payloads whose value in iCloud is missing or different.
+    /// Local settings updates retain current behavior. Old secret fields are
+    /// removed from every managed iCloud dictionary, including dictionaries
+    /// with no local settings, while other cloud settings are preserved.
     nonisolated static func payloadsToPush(
         local: [String: [String: Any]],
         cloud: [String: Any]
     ) -> [String: [String: Any]] {
-        local.filter { key, payload in
-            guard !payload.isEmpty else { return false }
-            guard let stored = cloud[key] as? NSDictionary else { return true }
-            return !stored.isEqual(to: payload)
+        let managedKeys = Set(local.keys).union(cloud.keys.filter(isManagedSettingsPayloadKey))
+        var changed: [String: [String: Any]] = [:]
+        for key in managedKeys where isManagedSettingsPayloadKey(key) {
+            let localPayload = local[key] ?? [:]
+            guard let stored = cloud[key] as? NSDictionary,
+                  let storedDictionary = stored as? [String: Any] else {
+                if !localPayload.isEmpty { changed[key] = localPayload }
+                continue
+            }
+
+            let sanitized = sanitizeCredentialValues(in: storedDictionary)
+            let hadSecretFields = !stored.isEqual(to: sanitized)
+            if hadSecretFields {
+                var merged = sanitized
+                localPayload.forEach { merged[$0.key] = $0.value }
+                if !stored.isEqual(to: merged) {
+                    changed[key] = merged
+                }
+            } else if !localPayload.isEmpty, !stored.isEqual(to: localPayload) {
+                changed[key] = localPayload
+            }
         }
+        return changed
+    }
+
+    nonisolated private static func isManagedSettingsPayloadKey(_ key: String) -> Bool {
+        key == "nuvio.icloud.global.settings" || key.hasPrefix("nuvio.icloud.profile.settings.")
+    }
+
+    nonisolated private static func sanitizeCredentialValues(in payload: [String: Any]) -> [String: Any] {
+        var sanitized: [String: Any] = [:]
+        for (key, value) in payload {
+            guard !isSecretField(key) else { continue }
+            sanitized[key] = value
+        }
+        return sanitized
+    }
+
+    nonisolated private static func hasLegacyCredentialFields(in cloud: [String: Any]) -> Bool {
+        cloud.contains { key, value in
+            guard isManagedSettingsPayloadKey(key),
+                  let payload = value as? [String: Any] else { return false }
+            return payload.keys.contains(where: isSecretField)
+        }
+    }
+
+    nonisolated private static func isSecretField(_ key: String) -> Bool {
+        ProviderCredentialStore.keys.contains(key)
+            || key == SettingsKey.simklAccessToken
+            || key == SettingsKey.simklRefreshToken
+            || key == SettingsKey.wetrakrAccessToken
+            || key == SettingsKey.wetrakrRefreshToken
     }
 
     private func markSynced() {
@@ -189,6 +245,8 @@ final class ICloudSettingsSyncManager: ObservableObject {
 
         isApplyingRemote = true
         defer { isApplyingRemote = false }
+
+        let hasLegacyCredentials = Self.hasLegacyCredentialFields(in: store.dictionaryRepresentation)
 
         var appliedAny = false
         var changedAny = false
@@ -226,6 +284,7 @@ final class ICloudSettingsSyncManager: ObservableObject {
             NotificationCenter.default.post(name: Self.iCloudSettingsDidSyncNotification, object: nil)
             NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: nil)
         }
+        if hasLegacyCredentials { schedulePush() }
     }
 
     // MARK: - Helpers
@@ -238,10 +297,11 @@ final class ICloudSettingsSyncManager: ObservableObject {
         return ids
     }
 
-    private func extractSettingsPayload(from defaults: UserDefaults) -> [String: Any] {
+    func extractSettingsPayload(from defaults: UserDefaults) -> [String: Any] {
         var payload: [String: Any] = [:]
         for key in SettingsKey.all {
-            guard !SettingsKey.deviceLocal.contains(key) else { continue }
+            guard !SettingsKey.deviceLocal.contains(key),
+                  !SettingsKey.syncedViaAddonRPC.contains(key) else { continue }
             if let value = defaults.object(forKey: key) {
                 // Only encode plist-compatible types supported by NSUbiquitousKeyValueStore
                 if let str = value as? String {
@@ -260,10 +320,13 @@ final class ICloudSettingsSyncManager: ObservableObject {
 
     /// Writes the iCloud values that differ from `defaults` and returns whether it wrote any.
     @discardableResult
-    private func applySettingsPayload(_ payload: [String: Any], to defaults: UserDefaults) -> Bool {
+    func applySettingsPayload(_ payload: [String: Any], to defaults: UserDefaults) -> Bool {
         var changed = false
-        for (key, value) in payload {
-            guard SettingsKey.all.contains(key), !SettingsKey.deviceLocal.contains(key) else { continue }
+        let safePayload = Self.sanitizeCredentialValues(in: payload)
+        for (key, value) in safePayload {
+            guard SettingsKey.all.contains(key),
+                  !SettingsKey.deviceLocal.contains(key),
+                  !SettingsKey.syncedViaAddonRPC.contains(key) else { continue }
             // Don't overwrite if identical
             let currentVal = defaults.object(forKey: key)
             if let strVal = value as? String, (currentVal as? String) != strVal {

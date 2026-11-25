@@ -461,7 +461,7 @@ enum SettingsKey {
     static let sceneTabDisabled = "nuvio.tv.settings.playback.sceneTabDisabled"
     static let seekPreviewEnabled = "nuvio.tv.settings.playback.seekPreviewEnabled"
     static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
-    /// Seekr (seekr.tv) API key for seek previews; kept in the Nuvio account like the other settings.
+    /// Seekr (seekr.tv) API key for seek previews; stored in this profile's Keychain.
     static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
     /// Whether Seekr is asked at all (on by default); the key stays saved while it is off.
     static let seekrEnabled = "nuvio.tv.settings.playback.seekrEnabled"
@@ -497,11 +497,23 @@ enum SettingsKey {
     /// and never enter the account settings payload.
     static let deviceLocal = Set([
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
+        tmdbApiKey, mdbListApiKey, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken, seekrApiKey,
+        simklAccessToken, simklRefreshToken, wetrakrAccessToken, wetrakrRefreshToken,
         p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage,
         // The account payload of other devices has no value for it, and a
         // pull would switch the sidebar off again.
         useNuvioRail, continueWatchingPerishAnimation,
         aniListClientID, malClientID
+    ])
+
+    /// Synced through the dedicated `addons` table and `sync_push_addons` RPC,
+    /// never through the generic `tvos_settings` blob or iCloud KVS. Keeping
+    /// them out of generic settings sync prevents a stale or empty settings blob
+    /// or iCloud payload from overwriting a profile's installed add-ons.
+    static let syncedViaAddonRPC = Set([
+        streamAddonManifestURL,
+        streamAddonManifestURLs,
+        streamAddonManifestStates
     ])
 
     static let all = [
@@ -5942,17 +5954,17 @@ private struct IntegrationSettingsView: View {
     @State private var wetrakrClientIDDraft: String
     @State private var wetrakrClientSecretDraft: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
-    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
+    @State private var tmdbApiKey = ""
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
-    @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
+    @State private var mdbListApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
-    @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
+    @State private var debridApiKey = ""
     @AppStorage(SettingsKey.debridEnabled) private var debridEnabled = true
     @AppStorage(SettingsKey.cloudLibraryEnabled) private var cloudLibraryEnabled = true
     @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
-    @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
-    @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
-    @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
+    @State private var torboxAccessToken = ""
+    @State private var premiumizeAccessToken = ""
+    @State private var realDebridAccessToken = ""
     @AppStorage(SettingsKey.aiSubtitlesEnabled) private var aiSubtitlesEnabled = false
     @AppStorage private var p2pEnabled: Bool
     @AppStorage private var p2pConsentAccepted: Bool
@@ -6536,6 +6548,7 @@ private struct IntegrationSettingsView: View {
             PlexSettingsSection(accentColor: accentColor)
         }
         .onAppear {
+            refreshDebridCredentials()
             refreshAddonSummaryCount()
             RemoteTrackingState.normalizeWatchProgressSource()
             RemoteTrackingState.normalizeLibrarySource()
@@ -6547,6 +6560,12 @@ private struct IntegrationSettingsView: View {
             mdbListViewModel.reload()
             wetrakrViewModel.reload()
             wetrakrViewModel.loadConnectedData()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshDebridCredentials()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshDebridCredentials()
         }
         .alert(
             L10n.string("tvos_settings_p2p_consent_title", fallback: "P2P Torrent Streaming"),
@@ -6565,15 +6584,7 @@ private struct IntegrationSettingsView: View {
                 fallback: "P2P connects directly to other peers. Your public IP address may be visible to them, and your device may upload data. Enable this only for content you have the legal right to access."
             ))
         }
-        .onChange(of: tmdbApiKey) { _, _ in
-            if !tmdbHasApiKey {
-                tmdbEnabled = false
-            }
-        }
         .onChange(of: mdbListApiKey) { _, _ in
-            if !mdbListHasCredential {
-                mdbListEnabled = false
-            }
             RemoteTrackingState.normalizeWatchProgressSource()
             RemoteTrackingState.normalizeLibrarySource()
         }
@@ -6691,6 +6702,7 @@ private struct IntegrationSettingsView: View {
             ) {
                 AddonsSettingsSection(accentColor: accentColor, onSyncedAddonsChange: receiveSyncedAddonSummary)
             }
+            .defaultAppStorage(profileStore)
             .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .fullScreenCover(isPresented: $showingPluginsSettings, onDismiss: {
@@ -6830,10 +6842,13 @@ private struct IntegrationSettingsView: View {
 
     private func refreshDebridCredentials() {
         let store = ProfileSettings.current
-        torboxAccessToken = store.string(forKey: SettingsKey.torboxAccessToken) ?? ""
-        premiumizeAccessToken = store.string(forKey: SettingsKey.premiumizeAccessToken) ?? ""
-        realDebridAccessToken = store.string(forKey: SettingsKey.realDebridAccessToken) ?? ""
-        debridApiKey = store.string(forKey: SettingsKey.debridApiKey) ?? ""
+        let profileScope = ProfileSettings.activeProfileScope
+        tmdbApiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store, profileScope: profileScope) ?? ""
+        mdbListApiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store, profileScope: profileScope) ?? ""
+        torboxAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.torboxAccessToken, in: store, profileScope: profileScope) ?? ""
+        premiumizeAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.premiumizeAccessToken, in: store, profileScope: profileScope) ?? ""
+        realDebridAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.realDebridAccessToken, in: store, profileScope: profileScope) ?? ""
+        debridApiKey = ProviderCredentialStore.string(forKey: SettingsKey.debridApiKey, in: store, profileScope: profileScope) ?? ""
         debridProvider = store.string(forKey: SettingsKey.debridProvider) ?? "None"
     }
 
@@ -8644,7 +8659,7 @@ private struct TmdbOptionsSheet: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
-    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
+    @State private var tmdbApiKey = ""
     @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
     @AppStorage(SettingsKey.tmdbFollowAppLanguage) private var tmdbFollowAppLanguage = true
     @AppStorage(SettingsKey.tmdbUseTrailers) private var tmdbUseTrailers = true
@@ -8857,11 +8872,9 @@ private struct TmdbOptionsSheet: View {
             }
             .focusSection()
         }
-        .onAppear(perform: normalizeTmdbApiKey)
-        .onChange(of: tmdbApiKey) { _, _ in
-            if !tmdbHasApiKey {
-                tmdbEnabled = false
-            }
+        .onAppear(perform: loadTmdbApiKey)
+        .onReceive(NotificationCenter.default.publisher(for: ProviderCredentialStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            loadTmdbApiKey()
         }
         .onExitCommand { dismiss() }
     }
@@ -8882,10 +8895,34 @@ private struct TmdbOptionsSheet: View {
     }
 
     private func normalizeTmdbApiKey() {
-        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tmdbHasApiKey {
+        let normalized = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let store = ProfileSettings.current
+        let profileScope = ProfileSettings.activeProfileScope
+        guard ProviderCredentialStore.set(
+            normalized.isEmpty ? nil : normalized,
+            forKey: SettingsKey.tmdbApiKey,
+            in: store,
+            profileScope: profileScope
+        ) else {
+            tmdbApiKey = ProviderCredentialStore.string(
+                forKey: SettingsKey.tmdbApiKey,
+                in: store,
+                profileScope: profileScope
+            ) ?? ""
+            return
+        }
+        tmdbApiKey = normalized
+        if normalized.isEmpty {
             tmdbEnabled = false
         }
+    }
+
+    private func loadTmdbApiKey() {
+        tmdbApiKey = ProviderCredentialStore.string(
+            forKey: SettingsKey.tmdbApiKey,
+            in: ProfileSettings.current,
+            profileScope: ProfileSettings.activeProfileScope
+        ) ?? ""
     }
 
     private var tmdbLanguageSelection: Binding<String> {
@@ -8978,7 +9015,7 @@ private struct MdbListOptionsSheet: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
-    @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
+    @State private var mdbListApiKey = ""
     @AppStorage(SettingsKey.mdbListUseImdb) private var mdbListUseImdb = true
     @AppStorage(SettingsKey.mdbListUseTmdb) private var mdbListUseTmdb = true
     @AppStorage(SettingsKey.mdbListUseTomatoes) private var mdbListUseTomatoes = true
@@ -9095,17 +9132,17 @@ private struct MdbListOptionsSheet: View {
             .focusSection()
         }
         .onAppear {
-            normalizeMdbListApiKey()
+            loadMdbListApiKey()
             buildRatingProviderRows()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProviderCredentialStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            loadMdbListApiKey()
         }
         .task {
             addonRatingSources = await AddonRatingsService.availableRatingSources()
             buildRatingProviderRows()
         }
         .onChange(of: mdbListApiKey) { _, _ in
-            if !mdbListHasCredential {
-                mdbListEnabled = false
-            }
             buildRatingProviderRows()
         }
         .onChange(of: mdbListEnabled) { _, _ in
@@ -9227,10 +9264,34 @@ private struct MdbListOptionsSheet: View {
     }
 
     private func normalizeMdbListApiKey() {
-        mdbListApiKey = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let store = ProfileSettings.current
+        let profileScope = ProfileSettings.activeProfileScope
+        guard ProviderCredentialStore.set(
+            normalized.isEmpty ? nil : normalized,
+            forKey: SettingsKey.mdbListApiKey,
+            in: store,
+            profileScope: profileScope
+        ) else {
+            mdbListApiKey = ProviderCredentialStore.string(
+                forKey: SettingsKey.mdbListApiKey,
+                in: store,
+                profileScope: profileScope
+            ) ?? ""
+            return
+        }
+        mdbListApiKey = normalized
         if !mdbListHasCredential {
             mdbListEnabled = false
         }
+    }
+
+    private func loadMdbListApiKey() {
+        mdbListApiKey = ProviderCredentialStore.string(
+            forKey: SettingsKey.mdbListApiKey,
+            in: ProfileSettings.current,
+            profileScope: ProfileSettings.activeProfileScope
+        ) ?? ""
     }
 }
 
@@ -10142,7 +10203,11 @@ private struct PremiumizeApiKeySheet: View {
                 return
             }
 
-            DebridCredentials.save(key, for: .premiumize, store: ProfileSettings.current)
+            guard DebridCredentials.save(key, for: .premiumize, store: ProfileSettings.current) else {
+                validationFailed = true
+                statusMessage = "This Apple TV could not save the key securely."
+                return
+            }
             validationFailed = false
             statusMessage = "Premiumize connected."
             dismiss()
@@ -12578,7 +12643,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
-    @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
+    @State private var seekrApiKey = ""
     @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = false
     @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
     @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
@@ -12656,7 +12721,22 @@ private struct PlaybackSettingsView: View {
 
     private func commitSeekrApiKey() {
         let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if key != seekrApiKey { seekrApiKey = key }
+        let store = ProfileSettings.current
+        let profileScope = ProfileSettings.activeProfileScope
+        if ProviderCredentialStore.set(
+            key.isEmpty ? nil : key,
+            forKey: SettingsKey.seekrApiKey,
+            in: store,
+            profileScope: profileScope
+        ) {
+            seekrApiKey = key
+        } else {
+            seekrApiKey = ProviderCredentialStore.string(
+                forKey: SettingsKey.seekrApiKey,
+                in: store,
+                profileScope: profileScope
+            ) ?? ""
+        }
         checkSeekrApiKey()
     }
 
@@ -12824,8 +12904,8 @@ private struct PlaybackSettingsView: View {
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
                     subtitle: L10n.string(
-                        "tvos_settings_seekr_api_key_subtitle",
-                        fallback: "Get your API key at seekr.tv/join. Saved in your Nuvio account."
+                        "tvos_settings_seekr_api_key_local_subtitle",
+                        fallback: "Get your API key at seekr.tv/join. Stored on this Apple TV."
                     ),
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                     text: $seekrApiKey,
@@ -12836,7 +12916,26 @@ private struct PlaybackSettingsView: View {
                 )
                 .disabled(!seekPreviewEnabled)
                 .onAppear {
+                    seekrApiKey = ProviderCredentialStore.string(
+                        forKey: SettingsKey.seekrApiKey,
+                        in: ProfileSettings.current,
+                        profileScope: ProfileSettings.activeProfileScope
+                    ) ?? ""
                     if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: ProviderCredentialStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                    seekrApiKey = ProviderCredentialStore.string(
+                        forKey: SettingsKey.seekrApiKey,
+                        in: ProfileSettings.current,
+                        profileScope: ProfileSettings.activeProfileScope
+                    ) ?? ""
+                }
+                .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification).receive(on: RunLoop.main)) { _ in
+                    seekrApiKey = ProviderCredentialStore.string(
+                        forKey: SettingsKey.seekrApiKey,
+                        in: ProfileSettings.current,
+                        profileScope: ProfileSettings.activeProfileScope
+                    ) ?? ""
                 }
                 .onChange(of: seekrApiKey) { _, _ in
                     checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
@@ -15184,6 +15283,12 @@ private struct AdvancedSettingsView: View {
                     isDiagnostic: true
                 )
 
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_addon_sync", fallback: "Add-on Sync"),
+                    value: NuvioSyncManager.addonSyncDiagnostic,
+                    isDiagnostic: true
+                )
+
                 // Reports how many synced rows arrived versus how many could be
                 // rendered. A large "awaiting metadata" count means add-ons could
                 // not resolve those titles — the history itself is still stored.
@@ -15283,7 +15388,14 @@ private struct AdvancedSettingsView: View {
         let defaults = ProfileSettings.current
         PlaybackTimelineRecorder.setEnabled(false)
         defaults.removeObject(forKey: PlaybackTimelineRecorder.enabledKey)
-        SettingsKey.all.forEach { defaults.removeObject(forKey: $0) }
+        _ = ProviderCredentialStore.removeAll(in: defaults, profileScope: ProfileSettings.activeProfileScope)
+        ProviderCredentialStore.keys.forEach { defaults.removeObject(forKey: $0) }
+        SettingsKey.all
+            .filter {
+                !SettingsKey.syncedViaAddonRPC.contains($0)
+                    && !ProviderCredentialStore.keys.contains($0)
+            }
+            .forEach { defaults.removeObject(forKey: $0) }
         ProfileSettings.resetTrailerSoundPreference(in: defaults)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
@@ -17810,6 +17922,7 @@ private struct AddonsSettingsSection: View {
     @State private var renamingText = ""
     @State private var addons: [AddonItem] = AddonsSettingsSection.initialLocalAddons()
     @State private var syncedAddons: [SyncedAddon] = []
+    @State private var syncRefreshGeneration: UInt = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -17928,8 +18041,11 @@ private struct AddonsSettingsSection: View {
                 addonsSignature: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates
             )
         }
-        .task(id: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates) {
+        .task(id: "\(syncRefreshGeneration)\n\(streamAddonManifestURL)\n\(streamAddonManifestURLs)\n\(streamAddonManifestStates)") {
             await loadSyncedAddons()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification).receive(on: RunLoop.main)) { _ in
+            syncRefreshGeneration &+= 1
         }
     }
 
@@ -20644,7 +20760,7 @@ private enum StreamingServicesCollectionTemplate {
 
     static func resolveLogoURLs() async -> [Int: String] {
         var resolved = fallbackLogoURLs
-        let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+        let key = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: ProfileSettings.current)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !key.isEmpty else { return resolved }
 
@@ -25170,6 +25286,7 @@ private struct AIOStreamsHostSheet: View {
     let accentColor: Color
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var aio = AIOStreamsHost.shared
     @State private var sourceDraft = ""
 
@@ -25385,9 +25502,16 @@ private struct AIOStreamsHostSheet: View {
         }
         .onAppear {
             aio.setLogVisible(true)
+            aio.setConfigurationSheetVisible(true)
             sourceDraft = aio.source
         }
-        .onDisappear { aio.setLogVisible(false) }
+        .onDisappear {
+            aio.setLogVisible(false)
+            aio.setConfigurationSheetVisible(false)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            aio.configurationSheetSceneChanged(isActive: phase == .active)
+        }
     }
 
     private func logLine(_ line: String) -> some View {
@@ -25413,7 +25537,7 @@ private struct AIOStreamsHostSheet: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color.white.opacity(0.08))
                 .frame(width: 244, height: 244)
-                .overlay(ProgressView().opacity(aio.phase == .starting ? 1 : 0))
+                .overlay(ProgressView().opacity(aio.phase == .starting || aio.phase == .running ? 1 : 0))
         }
     }
 

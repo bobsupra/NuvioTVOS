@@ -224,4 +224,91 @@ final class AddonCatalogRemovalTests: XCTestCase {
         XCTAssertFalse(AddonCatalogRemovalStore.hasPendingRemoval(in: settings))
         XCTAssertTrue(AddonCatalogRemovalStore.context(in: settings).addonIDs.isEmpty)
     }
+
+    func testGenericProfileSettingsSyncNeverExportsOrOverwritesInstalledAddons() {
+        let (id, settings) = profile()
+        install(settings)
+        settings.set("Modern", forKey: SettingsKey.homeLayout)
+
+        let client = NuvioAPIClient()
+        let exported = client.exportSettings(localProfileId: id)
+        XCTAssertNil(exported[SettingsKey.streamAddonManifestStates])
+        XCTAssertNil(exported[SettingsKey.streamAddonManifestURL])
+        XCTAssertNil(exported[SettingsKey.streamAddonManifestURLs])
+        XCTAssertNotNil(exported[SettingsKey.homeLayout])
+
+        let snapshot = ProfileSettingsSnapshot.capture(for: id)
+        XCTAssertNil(snapshot[SettingsKey.streamAddonManifestStates])
+        XCTAssertNil(snapshot[SettingsKey.streamAddonManifestURL])
+        XCTAssertNil(snapshot[SettingsKey.streamAddonManifestURLs])
+
+        // A stale/empty tvos_settings blob from another device must not wipe installed add-ons.
+        client.importSettings([
+            SettingsKey.streamAddonManifestStates: ["type": "string", "value": "[]"],
+            SettingsKey.streamAddonManifestURL: ["type": "string", "value": ""],
+            SettingsKey.streamAddonManifestURLs: ["type": "string", "value": ""],
+            SettingsKey.homeLayout: ["type": "string", "value": "Grid"]
+        ], localProfileId: id)
+
+        XCTAssertEqual(
+            CinemetaCatalogRepository.configuredStreamAddonPreferences(in: settings).map(\.url),
+            [aURL, bURL]
+        )
+        XCTAssertEqual(settings.string(forKey: SettingsKey.homeLayout), "Grid")
+    }
+
+    @MainActor
+    func testICloudSettingsSyncNeverExportsOrOverwritesInstalledAddons() {
+        let (_, settings) = profile()
+        install(settings)
+        settings.set("Modern", forKey: SettingsKey.homeLayout)
+
+        let manager = ICloudSettingsSyncManager.shared
+        let payload = manager.extractSettingsPayload(from: settings)
+        XCTAssertNil(payload[SettingsKey.streamAddonManifestStates])
+        XCTAssertNil(payload[SettingsKey.streamAddonManifestURL])
+        XCTAssertNil(payload[SettingsKey.streamAddonManifestURLs])
+        XCTAssertEqual(payload[SettingsKey.homeLayout] as? String, "Modern")
+
+        // An incoming iCloud snapshot carrying empty add-on keys must leave local add-ons intact.
+        manager.applySettingsPayload([
+            SettingsKey.streamAddonManifestStates: "[]",
+            SettingsKey.streamAddonManifestURL: "",
+            SettingsKey.streamAddonManifestURLs: "",
+            SettingsKey.homeLayout: "Classic"
+        ], to: settings)
+
+        XCTAssertEqual(
+            CinemetaCatalogRepository.configuredStreamAddonPreferences(in: settings).map(\.url),
+            [aURL, bURL]
+        )
+        XCTAssertEqual(settings.string(forKey: SettingsKey.homeLayout), "Classic")
+    }
+
+    func testMalformedRemoteAddonsDoNotWipeInstalledAddons() {
+        let (id, settings) = profile()
+        install(settings)
+
+        let client = NuvioAPIClient()
+        XCTAssertThrowsError(try client.applyAddons([
+            RemoteAddon(url: "", enabled: true, sortOrder: 0),
+            RemoteAddon(url: "   ", enabled: true, sortOrder: 1)
+        ], localProfileId: id))
+
+        XCTAssertEqual(
+            CinemetaCatalogRepository.configuredStreamAddonPreferences(in: settings).map(\.url),
+            [aURL, bURL]
+        )
+    }
+
+    @MainActor
+    func testAddonPushIsBlockedUntilAddonPullCompletesForProfile() {
+        let syncManager = NuvioSyncManager()
+        let key = "user-1:1"
+        XCTAssertFalse(syncManager.canPushAddonPreferences(forSyncKey: key))
+
+        syncManager.completedAddonPullKeys.insert(key)
+        XCTAssertTrue(syncManager.canPushAddonPreferences(forSyncKey: key))
+        XCTAssertFalse(syncManager.canPushAddonPreferences(forSyncKey: "user-1:2"))
+    }
 }

@@ -848,7 +848,7 @@ final class MdbListAuthService {
             return response
         }
 
-        let apiKey = store.string(forKey: SettingsKey.mdbListApiKey)?
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !apiKey.isEmpty else {
             throw MdbListServiceError.message("MDBList is not connected.")
@@ -1107,7 +1107,7 @@ enum MdbListRuntimeSession {
     }
 
     static func hasAPIKey(in store: UserDefaults = ProfileSettings.current) -> Bool {
-        !(store.string(forKey: SettingsKey.mdbListApiKey)?
+        !(ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
     }
 }
@@ -1162,7 +1162,7 @@ final class MdbListSettingsViewModel: ObservableObject {
     }
 
     var hasAPIKey: Bool {
-        !(store.string(forKey: SettingsKey.mdbListApiKey)?
+        !(ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
     }
 

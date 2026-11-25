@@ -2595,7 +2595,7 @@ enum TrailerLanguagePreference {
     static func isTmdbTrailerIntegrationActive(in store: UserDefaults) -> Bool {
         let tmdbEnabled = (store.object(forKey: SettingsKey.tmdbEnabled) as? Bool) ?? false
         let tmdbUseTrailers = (store.object(forKey: SettingsKey.tmdbUseTrailers) as? Bool) ?? true
-        let apiKey = store.string(forKey: SettingsKey.tmdbApiKey)?
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return tmdbEnabled && tmdbUseTrailers && !apiKey.isEmpty
     }
@@ -13489,9 +13489,19 @@ enum ProfileSettings {
         SettingsKey.simklAccessToken,
         SettingsKey.simklRefreshToken,
         SettingsKey.simklPlanToWatchHomeCatalogs,
+        // WeTrakr
+        SettingsKey.wetrakrAccessToken,
+        SettingsKey.wetrakrRefreshToken,
         // MDBList
         SettingsKey.mdbListApiKey,
-        SettingsKey.mdbListEnabled
+        SettingsKey.mdbListEnabled,
+        // Provider credentials stay local to the profile that entered them.
+        SettingsKey.tmdbApiKey,
+        SettingsKey.debridApiKey,
+        SettingsKey.torboxAccessToken,
+        SettingsKey.premiumizeAccessToken,
+        SettingsKey.realDebridAccessToken,
+        SettingsKey.seekrApiKey
     ]
 
     private static var profileLocalTraktKeys: Set<String> { profileLocalIntegrationKeys }
@@ -13536,6 +13546,18 @@ enum ProfileSettings {
         return suite
     }
 
+    /// Resolves a cached profile suite without treating `.standard` as the
+    /// active profile. Credential services also pass explicit IDs while a
+    /// profile is being activated, before its suite marker is written.
+    static func credentialScope(for store: UserDefaults) -> String {
+        if store === UserDefaults.standard { return "default" }
+        storesLock.lock()
+        defer { storesLock.unlock() }
+        if let activeProfileID, current === store { return activeProfileID }
+        if let match = stores.first(where: { $0.value === store }) { return match.key }
+        return "default"
+    }
+
     private static let storesLock = NSLock()
     nonisolated(unsafe) private static var stores: [String: UserDefaults] = [:]
 
@@ -13573,6 +13595,12 @@ enum ProfileSettings {
         migrateTraktIsolationIfNeeded(in: suite, isPrimary: primary)
         migrateSimklIsolationIfNeeded(in: suite, profileScope: id, isPrimary: primary)
         migrateMdbListIsolationIfNeeded(in: suite, profileScope: id, isPrimary: primary)
+        ProviderCredentialStore.migrateLegacyCredentials(in: suite, profileScope: id)
+        if primary {
+            migrateOAuthMirrorsFromStandard(in: suite, profileScope: id)
+        }
+        _ = SimklAuthStore.state(in: suite, profileScope: id, tokenStorage: SimklKeychainTokenStorage())
+        _ = WeTrakrAuthStore.state(in: suite, profileScope: id, tokenStorage: WeTrakrKeychainTokenStorage())
         migrateTrailerSoundIfNeeded(in: suite)
         AISubtitleKeyStore.migrateLegacyKey(from: suite, profileScope: id)
         if needsSeed {
@@ -13658,6 +13686,10 @@ enum ProfileSettings {
         return store.string(forKey: profileScopeKey) == "1"
     }
 
+    static func isPrimaryCredentialScope(_ profileScope: String) -> Bool {
+        isPrimaryProfileStore(store(for: profileScope))
+    }
+
     /// Deletes the given profiles' settings suites and the pre-profile copies
     /// in `.standard`, so sign-out leaves no add-ons, API keys, or preferences
     /// behind. Points `current` back at `.standard` first so nothing keeps
@@ -13667,10 +13699,22 @@ enum ProfileSettings {
         activeProfileID = nil
         IPTVSourceStore.removeAllSources(profileIDs: profileIds)
         let simklTokenStorage = SimklKeychainTokenStorage()
+        let wetrakrTokenStorage = WeTrakrKeychainTokenStorage()
         let mdbListTokenStorage = MdbListKeychainTokenStorage()
         for id in Set(profileIds) where !id.isEmpty {
-            HomeCatalogPayloadStore.removeAll(in: store(for: id), profileID: id)
-            simklTokenStorage.setAccessToken(nil, for: id)
+            let profileDefaults = store(for: id)
+            _ = ProviderCredentialStore.removeAll(in: profileDefaults, profileScope: id)
+            HomeCatalogPayloadStore.removeAll(in: profileDefaults, profileID: id)
+            SimklAuthStore.clearAuth(
+                profileScope: id,
+                store: profileDefaults,
+                tokenStorage: simklTokenStorage
+            )
+            WeTrakrAuthStore.clearAuth(
+                profileScope: id,
+                store: profileDefaults,
+                tokenStorage: wetrakrTokenStorage
+            )
             MdbListAuthStore.clearAuth(
                 profileScope: id,
                 store: store(for: id),
@@ -13701,6 +13745,11 @@ enum ProfileSettings {
             store: .standard,
             tokenStorage: simklTokenStorage
         )
+        WeTrakrAuthStore.clearAuth(
+            profileScope: "default",
+            store: .standard,
+            tokenStorage: wetrakrTokenStorage
+        )
         MdbListAuthStore.clearAuth(
             profileScope: "default",
             store: .standard,
@@ -13713,6 +13762,10 @@ enum ProfileSettings {
         // Interrupted Jellyfin syncs keep the server's library listing in checkpoint pages.
         JellyfinSyncCheckpoints.eraseAll()
         LargePayloadStore.purgeLegacyOversizedPreferences(in: .standard)
+        _ = ProviderCredentialStore.removeAll(in: .standard, profileScope: "default")
+        if let primaryProfileId = Set(profileIds).first(where: { isPrimaryCredentialScope($0) }) {
+            _ = ProviderCredentialStore.removeAll(in: .standard, profileScope: primaryProfileId)
+        }
         for key in SettingsKey.all {
             UserDefaults.standard.removeObject(forKey: key)
         }
@@ -13740,7 +13793,9 @@ enum ProfileSettings {
         }
         clearTraktProfileState(in: destination)
         clearSimklProfileState(in: destination, profileScope: profileId)
+        clearWeTrakrProfileState(in: destination, profileScope: profileId)
         clearMdbListProfileState(in: destination, profileScope: profileId)
+        _ = ProviderCredentialStore.removeAll(in: destination, profileScope: profileId)
         // Secrets never cross profile boundaries. Keep AI translation disabled
         // until this profile explicitly supplies its own Keychain credential.
         destination.set(false, forKey: SettingsKey.aiSubtitlesEnabled)
@@ -13832,6 +13887,47 @@ enum ProfileSettings {
         RemoteTrackingState.normalizeMoreLikeThisSource(in: store)
     }
 
+    private static func clearWeTrakrProfileState(in store: UserDefaults, profileScope: String) {
+        store.removeObject(forKey: SettingsKey.wetrakrClientID)
+        store.removeObject(forKey: SettingsKey.wetrakrClientSecret)
+        store.removeObject(forKey: SettingsKey.wetrakrConnected)
+        store.removeObject(forKey: SettingsKey.wetrakrAccessToken)
+        store.removeObject(forKey: SettingsKey.wetrakrRefreshToken)
+        WeTrakrAuthStore.clearAuth(
+            profileScope: profileScope,
+            store: store,
+            tokenStorage: WeTrakrKeychainTokenStorage()
+        )
+        RemoteTrackingState.normalizeWatchProgressSource(in: store)
+        RemoteTrackingState.normalizeLibrarySource(in: store)
+    }
+
+    private static func migrateOAuthMirrorsFromStandard(in profileStore: UserDefaults, profileScope: String) {
+        let keychain = SystemProviderCredentialKeychain.shared
+        let tokenMirrors: [(account: String, key: String, service: String, authMarker: String)] = [
+            ("accessToken.\(profileScope)", SettingsKey.simklAccessToken, "com.nuvio.tv.simkl.auth", "nuvio.tv.simkl.auth.hasAccessToken"),
+            ("refreshToken.\(profileScope)", SettingsKey.simklRefreshToken, "com.nuvio.tv.simkl.auth", "nuvio.tv.simkl.auth.hasAccessToken"),
+            ("accessToken.\(profileScope)", SettingsKey.wetrakrAccessToken, "com.nuvio.tv.wetrakr.auth", "nuvio.tv.wetrakr.auth.hasAccessToken"),
+            ("refreshToken.\(profileScope)", SettingsKey.wetrakrRefreshToken, "com.nuvio.tv.wetrakr.auth", "nuvio.tv.wetrakr.auth.hasAccessToken")
+        ]
+        for mirror in tokenMirrors {
+            guard profileStore.bool(forKey: mirror.authMarker),
+                  let legacy = UserDefaults.standard.string(forKey: mirror.key),
+                  !legacy.isEmpty else { continue }
+            switch keychain.read(service: mirror.service, account: mirror.account) {
+            case .value:
+                UserDefaults.standard.removeObject(forKey: mirror.key)
+            case .missing:
+                guard keychain.write(legacy, service: mirror.service, account: mirror.account),
+                      case .value(let durable) = keychain.read(service: mirror.service, account: mirror.account),
+                      durable == legacy else { continue }
+                UserDefaults.standard.removeObject(forKey: mirror.key)
+            case .failed:
+                continue
+            }
+        }
+    }
+
     private static func migrateMdbListIsolationIfNeeded(
         in store: UserDefaults,
         profileScope: String,
@@ -13845,7 +13941,12 @@ enum ProfileSettings {
     }
 
     private static func clearMdbListProfileState(in store: UserDefaults, profileScope: String) {
-        store.removeObject(forKey: SettingsKey.mdbListApiKey)
+        _ = ProviderCredentialStore.set(
+            nil,
+            forKey: SettingsKey.mdbListApiKey,
+            in: store,
+            profileScope: profileScope
+        )
         store.removeObject(forKey: SettingsKey.mdbListEnabled)
         MdbListAuthStore.clearAuth(
             profileScope: profileScope,

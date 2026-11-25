@@ -117,7 +117,7 @@ struct CollectionSourceResolver {
     // MARK: - TMDB
 
     private func browseTmdb(_ source: NuvioCollectionSource, page: Int) async throws -> CatalogPage {
-        guard let apiKey = nonEmpty(settings.string(forKey: SettingsKey.tmdbApiKey)) else {
+        guard let apiKey = nonEmpty(ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: settings)) else {
             throw CollectionSourceError.missingTmdbAPIKey
         }
 
@@ -603,7 +603,7 @@ struct CollectionSourceResolver {
         source: NuvioCollectionSource,
         page: Int
     ) async throws -> (items: [MdbListCollectionRawItem], hasMore: Bool) {
-        let apiKey = settings.string(forKey: SettingsKey.mdbListApiKey)?
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: settings)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         let targetUrl: URL
