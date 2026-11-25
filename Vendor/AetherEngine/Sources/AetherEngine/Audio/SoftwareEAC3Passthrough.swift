@@ -61,6 +61,7 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
     /// Decodes for the audio tap only: `decode` itself never runs it.
     private let tap: LazyTapDecoder
     private let lock = NSLock()
+    private var _feedEpoch: UInt64 = 0
     /// Where the next packet sits when the container left its stamps out.
     private var nextSeconds: Double?
 
@@ -191,12 +192,30 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
 
     // MARK: - SoftwareAudioProducing
 
+    var feedEpoch: UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return _feedEpoch
+    }
+
     func decode(packet: UnsafeMutablePointer<AVPacket>) -> [CMSampleBuffer] {
+        decode(packet: packet, expectedEpoch: nil)
+    }
+
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64) -> [CMSampleBuffer] {
+        decode(packet: packet, expectedEpoch: epoch)
+    }
+
+    private func decode(packet: UnsafeMutablePointer<AVPacket>, expectedEpoch: UInt64?) -> [CMSampleBuffer] {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return [] }
         let tb = timeBase
         let ticks = packet.pointee.pts != Int64.min ? packet.pointee.pts : packet.pointee.dts
         let seconds: Double
         lock.lock()
+        guard expectedEpoch == nil || expectedEpoch == _feedEpoch else {
+            lock.unlock()
+            return []
+        }
         if ticks != Int64.min, tb.den > 0 {
             seconds = Double(ticks) * Double(tb.num) / Double(tb.den)
         } else if let next = nextSeconds {
@@ -224,12 +243,17 @@ final class SoftwareEAC3Passthrough: SoftwareAudioProducing, @unchecked Sendable
 
     func flush() {
         lock.lock()
+        _feedEpoch &+= 1
         nextSeconds = nil
         lock.unlock()
         tap.flush()
     }
 
     func close() {
+        lock.lock()
+        _feedEpoch &+= 1
+        nextSeconds = nil
+        lock.unlock()
         tap.close()
     }
 

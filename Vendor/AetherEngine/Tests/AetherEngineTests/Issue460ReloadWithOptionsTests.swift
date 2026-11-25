@@ -67,6 +67,7 @@ struct Issue460SessionOptionCorrectionTests {
         proposed.sourceDiagnosticsContext = .init(playbackID: UUID(), attemptID: UUID())
         proposed.isLive = true
         proposed.audioOnly = true
+        proposed.discImageHint = true
         proposed.nativeRemoteHLS = true
         proposed.sequentialOrigin = true
         proposed.heldSourceConnection = true

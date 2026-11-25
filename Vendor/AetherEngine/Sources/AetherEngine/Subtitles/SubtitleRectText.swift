@@ -91,7 +91,13 @@ enum SubtitleRectText {
     }
 
     /// Drop every `{...}` span: from a `{` to the first `}` after it, so `{a{b}c}` leaves `c}`. A `{`
-    /// with no `}` behind it keeps itself and the rest verbatim.
+    /// with no `}` behind it keeps itself and the rest verbatim, except in drawing mode, where the
+    /// rest goes too.
+    ///
+    /// Text drawn in ASS drawing mode goes: it is vector commands (`m 10 20 l 30 40`), not words.
+    /// Anime typesetting uses drawings for boxes and masks, and these came out as rows of numbers.
+    /// Drawing starts at `\p1` or higher and ends at `\p0` or a bare `\p`, for the rest of the event
+    /// (`drawingScale(inBlock:)` reads the tags).
     ///
     /// Audit SUB-101: this was `\\{[^}]*\\}` through `NSRegularExpression`, which rescans to the end
     /// of the text at every unclosed `{` (20k braces took 2.6 s, doubling cost 4x). One forward pass
@@ -103,20 +109,71 @@ enum SubtitleRectText {
         var out: [UInt8] = []
         out.reserveCapacity(bytes.count)
         var index = 0
+        var drawing = false
         while index < bytes.count {
             let byte = bytes[index]
             guard byte == 0x7B else {
-                out.append(byte)
+                if !drawing { out.append(byte) }
                 index += 1
                 continue
             }
             guard let close = bytes[(index + 1)...].firstIndex(of: 0x7D) else {
-                out.append(contentsOf: bytes[index...])
+                if !drawing { out.append(contentsOf: bytes[index...]) }
                 break
             }
+            if let scale = drawingScale(inBlock: bytes[(index + 1)..<close]) { drawing = scale > 0 }
             index = close + 1
         }
         return String(decoding: out, as: UTF8.self)
+    }
+
+    /// The drawing scale an override block leaves in force, or nil when it changes nothing. Read the
+    /// way libass's `ass_parse_tags` reads it, and the last tag that sets it wins:
+    ///
+    /// - `\p<n>` sets it to `n`, parsed like `strtoll`: leading spaces and a sign are fine, so `\p 1`
+    ///   draws, and a bare `\p` or a negative value is 0 and ends drawing.
+    /// - Tags inside `\t(...)` count, because libass parses them like any other tag and `\p` has no
+    ///   animation guard. Inside the parentheses of any other tag they are only an argument.
+    /// - `\pos(...)` and `\pbo<n>` are other tags. `\r` does not end drawing: libass resets the
+    ///   scale only at the start of an event (`init_render_context`), not in `ass_reset_render_context`.
+    static func drawingScale<Bytes: Collection>(inBlock block: Bytes) -> Int? where Bytes.Element == UInt8 {
+        var scale: Int?
+        var tag: [UInt8] = []
+        var inTag = false
+        var depth = 0
+        func finish() {
+            defer { tag.removeAll(keepingCapacity: true) }
+            guard tag.first == 0x70, !tag.starts(with: "pos".utf8), !tag.starts(with: "pbo".utf8) else { return }
+            var digits = tag.dropFirst().drop(while: { $0 == 0x20 || $0 == 0x09 })
+            var negative = false
+            if let sign = digits.first, sign == 0x2B || sign == 0x2D {
+                negative = sign == 0x2D
+                digits = digits.dropFirst()
+            }
+            var value = 0
+            for byte in digits {
+                guard (0x30...0x39).contains(byte) else { break }
+                value = min(value * 10 + Int(byte - 0x30), 1_000)
+            }
+            scale = negative ? 0 : value
+        }
+        for byte in block {
+            if byte == 0x5C, depth == 0 { // a backslash outside an argument list starts a new tag
+                finish()
+                inTag = true
+                continue
+            }
+            // libass skips spaces between the backslash and the tag name.
+            if inTag, tag.isEmpty, byte == 0x20 || byte == 0x09 { continue }
+            if byte == 0x28 {
+                // `\t(` holds tags that libass parses again, so its parentheses do not hide them.
+                if !(inTag && tag.first == 0x74) { depth += 1 }
+            }
+            if byte == 0x29 { depth = max(0, depth - 1) }
+            if inTag { tag.append(byte) }
+        }
+        finish()
+        return scale
     }
 
     /// Default ASS play resolution (`ASS_DEFAULT_PLAYRESX/Y`, libavcodec/ass.h). Every event line
@@ -171,7 +228,8 @@ enum SubtitleRectText {
     /// Inline state comes from `\c`/`\1c` (BGR; a bare tag or unparseable value resets to the page
     /// default), `\b`, `\i`, `\u`, `\s`, `\fn`, `\fs` and `\r`. Cue-level `\an` and `\pos` are
     /// lifted out into the placement, with `\pos` normalized against `playRes`. Applies `\N`/`\n`
-    /// -> newline and `\h` -> space. Tags that merely look like these (`\be`, `\bord`, `\iclip`,
+    /// -> newline and `\h` -> space. Text in drawing mode (`\p1` and up, see `drawingScale`) is
+    /// vector commands and is left out. Tags that merely look like these (`\be`, `\bord`, `\iclip`,
     /// `\shad`, `\fscx`, `\fsp`) are left alone. Adjacent runs of equal styling are collapsed.
     /// nil when nothing displayable remains.
     ///
@@ -192,7 +250,8 @@ enum SubtitleRectText {
         var style = RunStyle()
         var alignment: Int?
         var position: CGPoint?
-        var drawingMode = 0
+        // In ASS drawing mode (`\p1` and up) the text is vector commands, never shown as words.
+        var drawing = false
 
         func flush() {
             guard !current.isEmpty else { return }
@@ -208,28 +267,25 @@ enum SubtitleRectText {
         var i = 0
         while i < chars.count {
             let c = chars[i]
+            if c == "\\", i + 1 < chars.count {
+                let n = chars[i + 1]
+                if n == "N" || n == "n" { if !drawing { current += "\n" }; i += 2; continue }
+                if n == "h" { if !drawing { current += " " }; i += 2; continue }
+            }
             if c == "{" {
                 var j = i + 1
                 var block = ""
                 while j < chars.count, chars[j] != "}" { block.append(chars[j]); j += 1 }
                 var next = style
-                let previousDrawingMode = drawingMode
                 applyOverrides(block, to: &next, alignment: &alignment,
-                               position: &position, drawingMode: &drawingMode, playRes: playRes)
+                               position: &position, playRes: playRes)
+                if let scale = drawingScale(inBlock: block.utf8) { drawing = scale > 0 }
                 // The text collected so far belongs to the style in force before this block.
-                if next != style || drawingMode != previousDrawingMode { flush(); style = next }
+                if next != style { flush(); style = next }
                 i = (j < chars.count) ? j + 1 : j
                 continue
             }
-            // ASS \p turns the following characters into vector path commands,
-            // not dialogue. Keep parsing override blocks so \p0 can resume text.
-            if drawingMode > 0 { i += 1; continue }
-            if c == "\\", i + 1 < chars.count {
-                let n = chars[i + 1]
-                if n == "N" || n == "n" { current += "\n"; i += 2; continue }
-                if n == "h" { current += " "; i += 2; continue }
-            }
-            current.append(c)
+            if !drawing { current.append(c) }
             i += 1
         }
         flush()
@@ -261,14 +317,10 @@ enum SubtitleRectText {
     /// cue-level and are lifted out instead, so they never split a run.
     private static func applyOverrides(_ block: String, to style: inout RunStyle,
                                        alignment: inout Int?, position: inout CGPoint?,
-                                       drawingMode: inout Int,
                                        playRes: CGSize) {
         for tag in block.split(separator: "\\").map(String.init) {
             if tag == "r" || (tag.hasPrefix("r") && !tag.hasPrefix("rnd")) {
                 style = RunStyle()
-                drawingMode = 0
-            } else if let value = intValue(tag, after: "p") {
-                drawingMode = value
             } else if let color = parseColorTag("\\" + tag) {
                 style.color = color   // nil means reset
             } else if let v = intValue(tag, after: "b") {

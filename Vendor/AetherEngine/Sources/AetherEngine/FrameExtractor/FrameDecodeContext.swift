@@ -222,8 +222,43 @@ final class FrameDecodeContext: @unchecked Sendable {
         reader?.close()
     }
 
+    /// An open failure no retry can fix, kept for the life of the context: the source has no video
+    /// stream, no codec parameters, or no decoder for its codec. Every open reads the source's header
+    /// again, over HTTP a new request to the origin, so a scrub that asked again on every request
+    /// re-read a remote source about 1.6 times a second for a whole session, beside playback.
+    private var permanentOpenFailure: FrameDecodeError?
+
+    /// A source failure (no video stream, a codec with no decoder) says something about the source only
+    /// when the stream analysis ran to one of its own limits. `avformat_find_stream_info` returns
+    /// success once any stream has its parameters, even when a read error or a stop ended it, so an
+    /// FLV or MPEG-PS cut after its first audio packets looks like a source without video, and a video
+    /// stream whose codec was still being probed has none. Those become `.streamAnalysisCutShort`, and
+    /// the next request tries again. So does a missing report, which means the analysis did not run.
+    static func sourceFailure(_ failure: FrameDecodeError, probe: ProbeReport?) -> FrameDecodeError {
+        switch probe?.stop {
+        case .resolved, .probesize, .analyzeduration, .eof: failure
+        case .readError, .stopped, .interrupted, nil: .streamAnalysisCutShort
+        }
+    }
+
+    /// The `open failed` line of a still request. A permanent failure was logged once when it was
+    /// kept (`ensureOpen`), so every later request logs it at verbose only.
+    static func logOpenFailure(_ error: any Error) {
+        EngineLog.emit("[FrameExtractor] open failed: \(error)", category: .swPlayback,
+                       level: isPermanentOpenFailure(error) ? .verbose : .info)
+    }
+
+    /// Whether an open that failed with `error` can only fail the same way again on this source.
+    static func isPermanentOpenFailure(_ error: any Error) -> Bool {
+        switch error as? FrameDecodeError {
+        case .noVideoStream, .noCodecParameters, .unsupportedCodec: true
+        case .allocationFailed, .parametersCopyFailed, .decoderOpenFailed, .streamAnalysisCutShort, nil: false
+        }
+    }
+
     /// Open demuxer + decoder if not already open. Throws on failure, leaving the
-    /// context fully closed (no partial state to leak).
+    /// context fully closed (no partial state to leak). After a permanent failure
+    /// (`isPermanentOpenFailure`) it throws that error again without touching the source.
     func ensureOpen(control: ProbeControl? = nil) throws {
         guard !isOpen else { return }
         if let permanentOpenFailure { throw permanentOpenFailure }
@@ -238,20 +273,6 @@ final class FrameDecodeContext: @unchecked Sendable {
                 EngineLog.emit("[FrameExtractor] open failed permanently, stills off for this source: \(failure)", category: .swPlayback)
             }
             throw error
-        }
-    }
-
-    /// An open failure no retry can fix, kept for the life of the context: no video stream, no
-    /// codec parameters, or no decoder for the codec (including the 4K HEVC software refusal in
-    /// `makeCodecContext`). Every open reads the source's header again, so a seek-preview lane that
-    /// asked again on every request re-read a remote source about 1.6 times a second during playback.
-    private var permanentOpenFailure: FrameDecodeError?
-
-    /// Whether an open that failed with `error` can only fail the same way again on this source.
-    static func isPermanentOpenFailure(_ error: any Error) -> Bool {
-        switch error as? FrameDecodeError {
-        case .noVideoStream, .noCodecParameters, .unsupportedCodec: true
-        case .allocationFailed, .decoderOpenFailed, nil: false
         }
     }
 
@@ -323,7 +344,7 @@ final class FrameDecodeContext: @unchecked Sendable {
 
         let videoIdx = demuxer.videoStreamIndex
         guard videoIdx >= 0, let stream = demuxer.stream(at: videoIdx) else {
-            throw FrameDecodeError.noVideoStream
+            throw Self.sourceFailure(.noVideoStream, probe: demuxer.probeReport)
         }
         videoStreamIndex = videoIdx
         timeBase = stream.pointee.time_base
@@ -351,7 +372,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
-            throw FrameDecodeError.unsupportedCodec
+            throw Self.sourceFailure(.unsupportedCodec, probe: demuxer.probeReport)
         }
         var openedWithHardware = false
         if Self.stillUsesHardware(allows: allowsHardwareDecode, disabled: hardwareDecodeDisabled,
@@ -422,11 +443,10 @@ final class FrameDecodeContext: @unchecked Sendable {
             }
         } catch FFmpegDecoderContext.Failure.allocation {
             throw FrameDecodeError.allocationFailed
-        } catch FFmpegDecoderContext.Failure.parameters {
+        } catch FFmpegDecoderContext.Failure.parameters(let code) {
             // `avcodec_parameters_to_context` only copies extradata and side data, so it fails on
-            // memory, not on the source. Reported as an allocation failure so `ensureOpen` retries it;
-            // `.noCodecParameters` (permanent) is kept for a stream that has none.
-            throw FrameDecodeError.allocationFailed
+            // memory, not on the source: retried, unlike `.noCodecParameters` (a stream that has none).
+            throw FrameDecodeError.parametersCopyFailed(code)
         } catch {
             throw FrameDecodeError.decoderOpenFailed
         }
@@ -957,7 +977,11 @@ enum FrameDecodeError: Error, CustomStringConvertible, LocalizedError {
     case noCodecParameters
     case unsupportedCodec
     case allocationFailed
+    case parametersCopyFailed(Int32)
     case decoderOpenFailed
+    /// No video stream, or no decoder for it, after a read error or a stop cut the stream analysis
+    /// short. Retried, unlike `.noVideoStream` and `.unsupportedCodec`.
+    case streamAnalysisCutShort
 
     var description: String {
         switch self {
@@ -965,7 +989,9 @@ enum FrameDecodeError: Error, CustomStringConvertible, LocalizedError {
         case .noCodecParameters: "FrameDecode: video stream has no codec parameters"
         case .unsupportedCodec: "FrameDecode: no decoder for the video codec"
         case .allocationFailed: "FrameDecode: avcodec_alloc_context3 failed"
+        case .parametersCopyFailed(let code): "FrameDecode: avcodec_parameters_to_context failed (\(code))"
         case .decoderOpenFailed: "FrameDecode: decoder open failed"
+        case .streamAnalysisCutShort: "FrameDecode: no usable video stream before the stream analysis was cut short"
         }
     }
 

@@ -47,6 +47,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// backing off included) without a rebuild. Nil for every reader opened outside a session (a probe,
     /// a sidecar, a still), which keep the headers they were opened with.
     private let requestHeaderStore: RequestHeaderStore?
+    /// AE#1100: asked for the URL of each live reconnect, so an origin that replays a session opened
+    /// twice on one URL (HDHomeRun's `SessionID`) is joined at live again. Nil: reconnect as before.
+    private let liveReopenURL: (@Sendable (URL) -> URL?)?
     private var extraHeaders: [String: String] { requestHeaderStore?.current ?? openedHeaders }
     /// #450: connections the BOUNDED pool may hold to one host. A throttle, and it is allowed to be
     /// one: every request on that pool ends (a 4 MB detour block, a size probe, the tail prefetch),
@@ -228,6 +231,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// refusing, which is the reading that puts metering back on the table. Two different causes,
     /// two different fixes, one log line to tell them apart.
     private var _droppedResolvedURL: URL?
+
+    /// The URL a persistent connection opens: the host's fresh one for a live reconnect when it
+    /// gave one (AE#1100), otherwise the pinned or loaded URL.
+    private func connectionURL(generation: Int) -> URL {
+        guard isLive, generation > 1, let provider = liveReopenURL, let fresh = provider(url) else {
+            return requestURL()
+        }
+        EngineLog.emit("[AVIOReader] \(label) AE#1100 live reconnect gen=\(generation) on the URL the host handed over",
+                       category: .demux)
+        return fresh
+    }
 
     private func requestURL() -> URL {
         resolvedURLLock.lock()
@@ -551,6 +565,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// at 5+ ops/sec without meaningful latency benefit. Still-extraction passes a
     /// smaller value for random-access single-keyframe fetches.
     private let chunkSize: Int
+    private let rangeCapLock = NSLock()
+    private var rangeCap: Int?
     /// When false the reader serves discrete Range chunks (random access: the next read almost always
     /// seeks elsewhere, so nothing is read ahead). When true it keeps the persistent sliding window.
     private let prefetchEnabled: Bool
@@ -1214,6 +1230,95 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// a body with a volume signature at sector 16. winCond-guarded, set once by `open()`.
     private var openSuggestsDisc = false
     private var headSpanServeLogged = false
+
+    // MARK: Fragment headers of a fragmented MP4
+    //
+    // libavformat indexes a fragmented MP4 by reading every top-level `moof` before the header
+    // returns. Through this reader that walk is a forward read of the whole file: each hop to the
+    // next `moof` either waits for the data connection to deliver everything in between or opens
+    // a new request, so the open takes about as long as the download (24 s for a 61 MB file at
+    // 19 Mbps). The index it builds is what makes the keyframe plan and every later seek exact, so
+    // the walk has to stay; what can change is where its bytes come from.
+    //
+    // When the file ends in an `mfra`, the tail prefetch already holds the offset of every `moof`.
+    // The first time the parse leaves the head for one of them, the small ranges that hold the
+    // fragment headers are fetched side by side on a few connections and the walk is answered
+    // from them, in the order it asks. Nothing is told to the demuxer and nothing it reads is
+    // made up: these are the file's own bytes at the file's own offsets, so an `mfra` that is
+    // wrong or incomplete costs speed (the read falls through to the paths below) and never
+    // correctness. A file without an `mfra` is read exactly as before.
+
+    /// The ranges holding the fragment headers. Guarded by `winCond`.
+    private final class FragmentHeaders: @unchecked Sendable {
+        let starts: [Int64]             // ascending, never overlapping
+        let lengths: [Int]
+        var blocks: [Data?]
+        var failed: [Bool]
+        var inFlight: [Bool]
+        var next: Int                   // next range a worker takes
+        var workers = 0
+        var consecutiveFailures = 0
+        var requests = 0
+        var bytes = 0
+        var served = 0
+        var startedAt = DispatchTime.now()
+        var finishedLogged = false
+        /// Lazy index: one range per read, not the whole walk.
+        var onDemand = false
+        init(starts: [Int64], lengths: [Int], from first: Int) {
+            self.starts = starts
+            self.lengths = lengths
+            blocks = Array(repeating: nil, count: starts.count)
+            failed = Array(repeating: false, count: starts.count)
+            inFlight = Array(repeating: false, count: starts.count)
+            next = first
+        }
+        /// Index of the range that holds `offset`, planned or fetched.
+        func index(holding offset: Int64) -> Int? {
+            var lo = 0, hi = starts.count
+            while lo < hi {
+                let mid = (lo + hi) / 2
+                if starts[mid] <= offset { lo = mid + 1 } else { hi = mid }
+            }
+            guard lo > 0 else { return nil }
+            let i = lo - 1
+            let extent = max(lengths[i], blocks[i]?.count ?? 0)
+            return offset < starts[i] + Int64(extent) ? i : nil
+        }
+    }
+    private var fragmentHeaders: FragmentHeaders?
+    /// The open indexes this file lazily (`FragmentedMP4RandomAccess`): there is no walk, only the
+    /// odd fragment the demuxer reads (the last one, for the durations). Each is fetched on its own
+    /// when it is read, on the side, so the data connection stays on the head instead of following
+    /// the read to the end of the file and back (2.1 s on a WAN origin).
+    private var fragmentHeadersOnDemand = false
+    /// One plan per open: set once the tail has been looked at, whatever it held.
+    private var fragmentHeadersPlanned = false
+    /// The `mfra` is larger than the tail prefetch: the bytes still missing in front of it.
+    private var fragmentHeadersMissingIndex: Range<Int64>?
+    private var fragmentHeadersIndexPrefix = Data()
+    /// Connections the fragment header fetch may hold; requests still pass the origin budget.
+    static let fragmentHeaderConnections = 8
+    /// Bytes fetched in front of each `moof`, for a `sidx` or `styp` that sits there.
+    private static let fragmentHeaderLead = 256
+    /// A fragment this small is fetched whole, so that a read-ahead from its `moof` to the next
+    /// one (libavformat reads through a short forward seek instead of seeking) stays in the ranges.
+    private static let fragmentHeaderWholeBelow: Int64 = 64 * 1024
+    /// movdec's MOV_LAZY_PROBE: what the lazy walk reads at each box (FFmpegBuild patch).
+    private static let lazyProbeBytes = 8192
+    /// A/B switch: `AETHER_NO_FRAGMENT_HEADERS=1` leaves the walk as it was.
+    private static let fragmentHeadersDisabled =
+        ProcessInfo.processInfo.environment["AETHER_NO_FRAGMENT_HEADERS"] == "1"
+    /// What names this source in `FragmentHeaderShare`: the URL as opened and the size it has.
+    private var fragmentHeaderShareKey: String { "\(url.absoluteString)#\(fileSize)" }
+    /// This reader published ranges and takes them back when it closes.
+    private var fragmentHeadersPublished = false
+    private static let fragmentHeaderSession: URLSession = {
+        let config = makeSessionConfig()
+        config.httpMaximumConnectionsPerHost = fragmentHeaderConnections
+        return URLSession(configuration: config, delegate: EngineTLS.sessionDelegate,
+                          delegateQueue: AVIOReader.makePlaybackDelegateQueue())
+    }()
     private var headSpanPlaybackServeLogged = false
     private var tailSpanServeLogged = false
 
@@ -1346,7 +1451,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// AE#927: grows a controlled probe's sequential ranges. Demux thread only, like `position`.
     private var probeRangeGrowth: ProbeRangeGrowth?
 
-    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false) {
+    init(url: URL, extraHeaders: [String: String] = [:], label: String = "source", chunkSize: Int = 4 * 1024 * 1024, prefetchEnabled: Bool = true, isLive: Bool = false, chunkRequestTimeout: TimeInterval = 35, chunkMaxRetries: Int = 3, boundedInitialFetch: Int64? = nil, sequentialOnly: Bool = false, connStallTimeout: TimeInterval = AVIOReader.connStallTimeoutDefault, trickleFloorBytes: Int64? = nil, windowHighWater: Int? = nil, streamHighWater: Int? = nil, detourIdleSeconds: TimeInterval? = nil, detourFetchBudget: TimeInterval? = nil, heldConnection: Bool = false, probeControl: ProbeControl? = nil, probeRequestSession: URLSession? = nil, probeRangeCeiling: Int? = nil, sourceOpenPolicy: SourceOpenPolicy = .init(), requestHeaderStore: RequestHeaderStore? = nil, backoffScale: Double = 1, pinIdleSeconds: TimeInterval = AVIOReader.pinIdleRepinSecondsDefault, liveRefusalRetryBudget: TimeInterval = AVIOReader.liveRefusalRetryBudget, persistentRequestSession: URLSession? = nil, diagnosticContext: SourceNetworkDiagnostics.Context? = SourceNetworkDiagnostics.context, routesDiscMediaType: Bool = false, liveReopenURL: (@Sendable (URL) -> URL?)? = nil) {
         self.diagnosticContext = diagnosticContext
         self.routesDiscMediaType = routesDiscMediaType
         self.sourceOpenPolicy = sourceOpenPolicy
@@ -1360,6 +1465,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         self.label = label
         self.openedHeaders = extraHeaders
         self.requestHeaderStore = requestHeaderStore
+        self.liveReopenURL = liveReopenURL
         self.chunkSize = chunkSize
         self.prefetchEnabled = prefetchEnabled
         self.isLive = isLive
@@ -2234,6 +2340,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         bufferLock.unlock()
 
         detourCache.clear()
+        winCond.lock()
+        let publishedFragmentHeaders = fragmentHeadersPublished
+        let fragmentShareKey = fragmentHeaderShareKey
+        winCond.unlock()
+        if publishedFragmentHeaders { FragmentHeaderShare.shared.drop(key: fragmentShareKey) }
 
         streamLock.lock()
         streamEnded = true
@@ -2262,6 +2373,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         headSpan = Data()
         headSpanCheckTail = nil
         tailSpan = nil
+        fragmentHeaders = nil
+        fragmentHeadersIndexPrefix = Data()
         openPhaseActive = false
         let tailTask = tailPrefetchTask
         tailPrefetchTask = nil
@@ -2328,8 +2441,19 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
                 bufferLock.unlock()
             } else {
+                // Fragment headers: the playing reader of this source has fetched the
+                // ranges its index walk needed, and this reader's walk asks for the same bytes.
+                if fileSize > 0, !Self.fragmentHeadersDisabled,
+                   let n = FragmentHeaderShare.shared.serve(
+                    key: fragmentHeaderShareKey, into: buf.advanced(by: totalRead),
+                    maxLen: requestSize - totalRead, at: position) {
+                    position += Int64(n)
+                    totalRead += n
+                    return Int32(totalRead)
+                }
+
                 let rangeSize = probeRangeGrowth?.size(at: position, remainingInput: probeControl?.remainingInputBytes)
-                    ?? chunkSize
+                    ?? seekableRangeSize
                 let fetchSize: Int
                 if fileSize > 0 {
                     fetchSize = min(rangeSize, Int(fileSize - position))
@@ -2387,6 +2511,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // #281 retest: fixed once per read, so a loop that wakes repeatedly cannot keep extending
         // its own patience for the speculative fetch.
         var tailWaitDeadline: Date?
+        var fragmentWaitDeadline: Date?
         func msSince(_ t: DispatchTime) -> Double {
             Double(DispatchTime.now().uptimeNanoseconds - t.uptimeNanoseconds) / 1_000_000
         }
@@ -2516,6 +2641,62 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 continue
             }
 
+            // Fragment headers: a read the fetched ranges hold is answered from them,
+            // and returns short at the range's end rather than going to the network for the rest
+            // of the AVIO buffer, which would be sample data the parse is about to seek past.
+            if !windowCanServe {
+                switch fragmentHeaderServeLocked(into: buf.advanced(by: totalRead),
+                                                 maxLen: requestSize - totalRead, at: spanPos) {
+                case .served(let n):
+                    position = spanPos + Int64(n)
+                    winCond.broadcast()
+                    winCond.unlock()
+                    totalRead += n
+                    diag.recordDetourServe(ms: 0, fetched: false)
+                    return Int32(totalRead)
+                case .wait(let start):
+                    let deadline = fragmentWaitDeadline ?? Date(timeIntervalSinceNow: 12)
+                    fragmentWaitDeadline = deadline
+                    if Date() < deadline {
+                        let waitStart = DispatchTime.now()
+                        if start { startFragmentHeaderWorkersLocked() }
+                        _ = winCond.wait(until: min(deadline, readDeadline))
+                        winCond.unlock()
+                        diag.recordTailWait(ms: msSince(waitStart))
+                        continue
+                    }
+                    abandonFragmentHeadersLocked(reason: "a range did not arrive in 12 s")
+                case .waitForIndex:
+                    // The #281 bound: a round trip against this origin as measured, less what the
+                    // suffix fetch has already been out. Past it, this open stops looking for the
+                    // offsets, so a later read does not wait again.
+                    let deadline = tailWaitDeadline ?? Date(
+                        timeIntervalSinceNow: max(0, tailPrefetchWaitBudget()
+                            - Double(DispatchTime.now().uptimeNanoseconds
+                                     - tailPrefetchStartedAt.uptimeNanoseconds) / 1_000_000_000))
+                    tailWaitDeadline = deadline
+                    if Date() < deadline {
+                        let waitStart = DispatchTime.now()
+                        _ = winCond.wait(until: min(deadline, readDeadline))
+                        winCond.unlock()
+                        diag.recordTailWait(ms: msSince(waitStart))
+                        continue
+                    }
+                    fragmentHeadersPlanned = true
+                case .needsIndex(let missing):
+                    winCond.unlock()
+                    let prefix = fragmentHeaderFetch(from: missing.lowerBound,
+                                                     size: Int(missing.upperBound - missing.lowerBound))
+                    winCond.lock()
+                    fragmentHeadersMissingIndex = nil
+                    if let prefix { fragmentHeadersIndexPrefix = prefix } else { fragmentHeadersPlanned = true }
+                    winCond.unlock()
+                    continue
+                case .none:
+                    break
+                }
+            }
+
             // #281 retest: this read wants bytes the speculative fetch is on the wire for RIGHT NOW.
             // Reconnecting here is what made that fetch pure cost in the field: the demuxer arrives
             // microseconds after the data connection's first byte, so the fetch, which pays the same
@@ -2571,8 +2752,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // `.reconnecting`, bounded give-up. Planned ends stay here — a completed range
             // (connEndedAtRangeEnd) and a hard-cap end delivered their bytes, and any
             // generation that delivered at least one byte keeps the fast path.
-            let endedInError = connEnded && !connEndedAtRangeEnd && !connEndedByBackpressure
-                && !connFirstDataSeen
+            //
+            // Except on live, where nothing ends a connection on plan: a live generation that
+            // ended within `liveTextNoticeMaxBytes` is charged like an error end. A channel still
+            // spinning up answered every request 200 with "Channel starting.\n" as TS (no AE#925
+            // suspect), and each 18 B answer took this branch: 46,000 requests in 40 s on
+            // loopback (StreamX, 4,330 in 19 s in the field). A live source that ends its
+            // connections after real data, even a low-bitrate one closing every few hundred KB,
+            // still reconnects here, unpaced and off the books.
+            let endedUnplanned = connEnded && !connEndedAtRangeEnd && !connEndedByBackpressure
+            let endedInError = endedUnplanned
+                && (!connFirstDataSeen || (isLive && genDeliveredBytes <= Self.liveTextNoticeMaxBytes))
             if activeTransfer == nil, !connEndedByBackpressure, !windowCanServe, !endedInError {
                 let target = position
                 winCond.unlock()
@@ -2697,7 +2887,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 // storm held streak=1 across 4 MB of served reads, and the bounded give-up and the
                 // re-resolve rung were both unreachable until the window hit empty).
                 if connFirstDataSeen {
-                    unproductiveReconnects = 0      // real progress
+                    // On live a generation's first bytes are not progress yet: a source answering
+                    // every request with 18 B cleared the streak on each serve and was retried at
+                    // backoff zero forever. `recordReconnectAndShouldGiveUp` resets it once a
+                    // reconnect has really delivered.
+                    if !isLive || genDeliveredBytes > Self.liveTextNoticeMaxBytes {
+                        unproductiveReconnects = 0  // real progress
+                    }
                     rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
                     credentialRefusalStreak = 0     // and the credential one (#792)
                     rateLimitStreakStartedAt = nil
@@ -2928,9 +3124,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         if now == 0 && isHardError {
             return unproductiveReconnects > 1
         }
-        // Dead-on-arrival sources (never produced data) get a reduced budget;
-        // sources that ever produced data keep the full budget for mid-stream resilience.
-        let cap = now == 0
+        // Dead-on-arrival sources get a reduced budget; sources that ever produced data keep the
+        // full budget for mid-stream resilience. A few bytes are not data: a channel answering
+        // "Channel starting.\n" to every request had delivered something, and got the full twelve.
+        let cap = now < Self.minReconnectProgress
             ? Self.reconnectMaxUnproductiveNeverProductive
             : Self.reconnectMaxUnproductive
         return unproductiveReconnects > cap
@@ -3460,6 +3657,332 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                        category: .demux)
     }
 
+    // MARK: - Fragment headers, see `FragmentHeaders`
+
+    private enum FragmentHeaderServe {
+        case served(Int)
+        /// The range is planned and not here yet; `start` when the fetch has to be started first.
+        case wait(start: Bool)
+        /// The `mfra` would be in the tail prefetch, which is still out.
+        case waitForIndex
+        /// The `mfra` reaches in front of the tail prefetch: fetch this much, then ask again.
+        case needsIndex(Range<Int64>)
+        case none
+    }
+
+    /// Lazy index: set by the demuxer before it reads the file's index boxes, cleared
+    /// again when the file turns out to need the full walk.
+    func setFragmentHeadersOnDemand(_ onDemand: Bool) {
+        winCond.lock()
+        fragmentHeadersOnDemand = onDemand
+        fragmentHeaders?.onDemand = onDemand
+        winCond.unlock()
+    }
+
+    /// Caller holds `winCond`.
+    private func fragmentHeaderServeLocked(into dst: UnsafeMutablePointer<UInt8>, maxLen: Int,
+                                           at offset: Int64) -> FragmentHeaderServe {
+        if fragmentHeaders == nil, fileSize > 0, !Self.fragmentHeadersDisabled,
+           let n = FragmentHeaderShare.shared.serve(key: fragmentHeaderShareKey, into: dst,
+                                                    maxLen: maxLen, at: offset) {
+            return .served(n)
+        }
+        if fragmentHeaders == nil, !fragmentHeadersPlanned {
+            // Only a parse that jumps forward out of a fragmented MP4's head is this path's
+            // business; everything else must not wait or look here.
+            guard !Self.fragmentHeadersDisabled, openPhaseActive, detourEligible, maxLen > 0,
+                  offset > winStart + Int64(window.count),
+                  Self.headIsFragmentedMP4(headSpan) else { return .none }
+            if let missing = fragmentHeadersMissingIndex { return .needsIndex(missing) }
+            guard let tail = tailSpan else {
+                // The suffix fetch is still out. The offsets would be in it, but a file without an
+                // mfra gains nothing from the wait, so the caller bounds it like the #281 tail wait.
+                return tailPrefetchInFlight ? .waitForIndex : .none
+            }
+            switch Self.fragmentOffsets(tail: tail, prefix: fragmentHeadersIndexPrefix, fileSize: fileSize) {
+            case .missing(let range):
+                fragmentHeadersMissingIndex = range
+                return .needsIndex(range)
+            case .none:
+                fragmentHeadersPlanned = true
+                return .none
+            case .offsets(let offsets, let end):
+                fragmentHeadersPlanned = true
+                fragmentHeadersIndexPrefix = Data()
+                fragmentHeaders = planFragmentHeadersLocked(offsets: offsets, end: end, from: offset)
+            }
+        }
+        guard let plan = fragmentHeaders, let i = plan.index(holding: offset) else { return .none }
+        if let block = plan.blocks[i] {
+            let at = Int(offset - plan.starts[i])
+            guard at < block.count else { return .none }
+            let n = min(maxLen, block.count - at)
+            block.withUnsafeBytes { raw in
+                if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                    dst.update(from: base + at, count: n)
+                }
+            }
+            plan.served += 1
+            return .served(n)
+        }
+        if plan.failed[i] || !openPhaseActive { return .none }
+        if plan.inFlight[i] { return .wait(start: false) }
+        // The walk is at a range no worker has taken: they go on from here.
+        plan.next = i
+        return .wait(start: true)
+    }
+
+    /// Caller holds `winCond`.
+    private func planFragmentHeadersLocked(offsets: [Int64], end: Int64, from offset: Int64) -> FragmentHeaders? {
+        // The first `moof` is in the head: twice its size is the estimate for the others, and a
+        // header that turns out longer is completed by the worker that fetched it.
+        var estimate = 8 * 1024
+        if let first = offsets.first, first + 8 <= Int64(headSpan.count) {
+            let at = headSpan.startIndex + Int(first)
+            let size = headSpan[at..<at + 4].reduce(0) { $0 << 8 | Int($1) }
+            if headSpan[at + 4..<at + 8].elementsEqual("moof".utf8), size >= 16, size < 4 * 1024 * 1024 {
+                estimate = min(max((2 * size + 64 + 1023) / 1024 * 1024, 2 * 1024), 64 * 1024)
+            }
+        }
+        // Lazy index: movdec's lazy walk reads 8 KB at every box it checks (MOV_LAZY_PROBE), the
+        // moof and then the mdat header behind it, so a range has to reach that far past the moof.
+        if fragmentHeadersOnDemand { estimate = max(estimate + Self.lazyProbeBytes, 32 * 1024) }
+        var starts: [Int64] = [], lengths: [Int] = []
+        var previousEnd: Int64 = 0
+        for (i, moof) in offsets.enumerated() {
+            let next = i + 1 < offsets.count ? offsets[i + 1] : end
+            let start = max(moof - Int64(Self.fragmentHeaderLead), previousEnd)
+            let wanted = next - moof <= Self.fragmentHeaderWholeBelow ? next : moof + Int64(estimate)
+            let stop = min(max(wanted, start + 16), next, end)
+            guard stop > start else { continue }
+            starts.append(start)
+            lengths.append(Int(stop - start))
+            previousEnd = stop
+        }
+        guard starts.count >= 2 else { return nil }
+        let plan = FragmentHeaders(starts: starts, lengths: lengths, from: 0)
+        plan.next = starts.firstIndex { $0 + Int64(Self.fragmentHeaderLead) >= offset } ?? starts.count
+        plan.onDemand = fragmentHeadersOnDemand
+        if plan.onDemand {
+            EngineLog.emit("[AVIOReader] \(label) fragment headers: lazy index, \(offsets.count) moof offsets from the mfra; "
+                           + "a fragment the demuxer reads is fetched on its own, on the side", category: .demux)
+            return plan
+        }
+        EngineLog.emit(
+            "[AVIOReader] \(label) fragment headers: the mfra lists \(offsets.count) moof offsets; "
+            + "fetching \(starts.count - plan.next) ranges of about \(estimate) B, "
+            + "up to \(Self.fragmentHeaderConnections) at a time within the origin's request budget, for the index walk",
+            category: .demux)
+        return plan
+    }
+
+    /// Caller holds `winCond`.
+    private func startFragmentHeaderWorkersLocked() {
+        guard let plan = fragmentHeaders else { return }
+        if plan.workers == 0 { plan.startedAt = DispatchTime.now() }
+        let limit = OriginRequestBudget.shared.snapshot(for: requestURL())?.limit
+        let wanted = plan.onDemand ? 1 : min(Self.fragmentHeaderConnections, max(1, (limit ?? Int.max) - 1))
+        while plan.workers < wanted {
+            plan.workers += 1
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                self?.runFragmentHeaderWorker(plan)
+            }
+        }
+    }
+
+    private func runFragmentHeaderWorker(_ plan: FragmentHeaders) {
+        while true {
+            winCond.lock()
+            // Only for the parse: once the open is over nothing walks the fragments any more.
+            guard fragmentHeaders === plan, openPhaseActive, !isClosed, plan.next < plan.starts.count else {
+                plan.workers -= 1
+                let done = plan.workers == 0 && !plan.finishedLogged
+                if done { plan.finishedLogged = true }
+                let line = "[AVIOReader] \(label) fragment headers: \(plan.requests) requests, "
+                    + "\(plan.bytes) B in "
+                    + "\(Int(Double(DispatchTime.now().uptimeNanoseconds - plan.startedAt.uptimeNanoseconds) / 1_000_000)) ms"
+                winCond.broadcast()
+                winCond.unlock()
+                if done { EngineLog.emit(line, category: .demux) }
+                return
+            }
+            let i = plan.next
+            plan.next += 1
+            // Lazy index: the range that was asked for and nothing after it.
+            if plan.onDemand { plan.next = plan.starts.count }
+            if plan.blocks[i] != nil || plan.failed[i] || plan.inFlight[i] { winCond.unlock(); continue }
+            plan.inFlight[i] = true
+            let start = plan.starts[i], length = plan.lengths[i]
+            let ceiling = (i + 1 < plan.starts.count ? plan.starts[i + 1] : fileSize) - start
+            winCond.unlock()
+
+            var block = fragmentHeaderFetch(from: start, size: length)
+            var requests = 1
+            // A `moof` longer than the estimate: the box says how long, so one more request
+            // completes it (and the `mdat` header behind it, which the walk reads next).
+            if let got = block, got.count == length,
+               let missing = Self.fragmentHeaderShortfall(got, ceiling: Int(min(ceiling, Int64(Int.max))),
+                                                          trailing: plan.onDemand ? Self.lazyProbeBytes + 16 : 16) {
+                requests += 1
+                if let rest = fragmentHeaderFetch(from: start + Int64(got.count), size: missing) {
+                    block = got + rest
+                }
+            }
+
+            winCond.lock()
+            plan.inFlight[i] = false
+            plan.requests += requests
+            if let block {
+                plan.blocks[i] = block
+                plan.bytes += block.count
+                plan.consecutiveFailures = 0
+                // Side readers walk the moof and the mdat header behind it: that much is shared.
+                if let core = Self.fragmentHeaderCore(block) {
+                    fragmentHeadersPublished = true
+                    FragmentHeaderShare.shared.publish(key: fragmentHeaderShareKey, start: start + Int64(core.lowerBound),
+                                                       block: Data(block[(block.startIndex + core.lowerBound)..<(block.startIndex + core.upperBound)]))
+                }
+            } else {
+                plan.failed[i] = true
+                plan.consecutiveFailures += 1
+                // An origin that refuses these is not asked again: the walk goes on as it
+                // always did.
+                if plan.consecutiveFailures >= 3, fragmentHeaders === plan {
+                    abandonFragmentHeadersLocked(reason: "the origin refused three ranges in a row")
+                }
+            }
+            winCond.broadcast()
+            winCond.unlock()
+        }
+    }
+
+    /// Caller holds `winCond`.
+    private func abandonFragmentHeadersLocked(reason: String) {
+        guard let plan = fragmentHeaders else { return }
+        for i in plan.failed.indices where plan.blocks[i] == nil { plan.failed[i] = true }
+        plan.next = plan.starts.count
+        EngineLog.emit("[AVIOReader] \(label) fragment headers: stopped (\(reason)); "
+                       + "the index walk continues through the data connection", category: .demux)
+    }
+
+    /// One range of fragment headers. Never called with a lock held.
+    private func fragmentHeaderFetch(from offset: Int64, size: Int) -> Data? {
+        guard size > 0 else { return nil }
+        let budget = min(10, chunkRequestTimeout)
+        var request = URLRequest(engineURL: requestURL())
+        request.setValue("bytes=\(offset)-\(offset + Int64(size) - 1)", forHTTPHeaderField: "Range")
+        request.timeoutInterval = budget
+        applyExtraHeaders(&request)
+        guard let (data, response) = try? syncRequest(request, budget: budget, slotLabel: "fragment headers",
+                                                      slotWait: budget, session: Self.fragmentHeaderSession),
+              let http = response as? HTTPURLResponse, http.statusCode == 206,
+              Self.misplacedRangeStart(http, requestedOffset: offset) == nil,
+              data.count == size else { return nil }
+        addBytesFetched(data.count)
+        return data
+    }
+
+    /// Whether the retained head is that of a fragmented MP4: `ftyp` first and an `mvex` in the
+    /// first 64 KB, which is where a fragmented file's short `moov` is.
+    nonisolated static func headIsFragmentedMP4(_ head: Data) -> Bool {
+        guard head.count >= 16, head[head.startIndex + 4..<head.startIndex + 8].elementsEqual("ftyp".utf8) else {
+            return false
+        }
+        return head.prefix(64 * 1024).range(of: Data("mvex".utf8)) != nil
+    }
+
+    enum FragmentOffsets: Equatable {
+        case offsets([Int64], end: Int64)
+        /// The `mfra` starts in front of the tail: these bytes are needed too.
+        case missing(Range<Int64>)
+        case none
+    }
+
+    /// The `moof` offsets an `mfra` at the end of the file lists (every `tfra`, every track),
+    /// ascending and without repeats, and where the `mfra` starts.
+    nonisolated static func fragmentOffsets(tail: ResidentSpan, prefix: Data, fileSize: Int64) -> FragmentOffsets {
+        func be32(_ d: Data, _ at: Int) -> Int64 {
+            d[d.startIndex + at..<d.startIndex + at + 4].reduce(0) { $0 << 8 | Int64($1) }
+        }
+        func be64(_ d: Data, _ at: Int) -> Int64 {
+            Int64(bitPattern: d[d.startIndex + at..<d.startIndex + at + 8].reduce(UInt64(0)) { $0 << 8 | UInt64($1) })
+        }
+        let t = tail.data
+        guard fileSize > 0, tail.end == fileSize, t.count >= 16,
+              t[t.startIndex + t.count - 12..<t.startIndex + t.count - 8].elementsEqual("mfro".utf8),
+              be32(t, t.count - 16) == 16 else { return .none }
+        let size = be32(t, t.count - 4)
+        guard size >= 16 + 24, size <= min(fileSize, 16 * 1024 * 1024) else { return .none }
+        let start = fileSize - size
+        var box = t
+        if start < tail.start {
+            guard Int64(prefix.count) == tail.start - start else { return .missing(start..<tail.start) }
+            box = prefix + t
+        } else {
+            box = t.suffix(Int(size))
+        }
+        box = Data(box)                 // indices from 0
+        guard Int64(box.count) == size, be32(box, 0) == size,
+              box[4..<8].elementsEqual("mfra".utf8) else { return .none }
+        var offsets = Set<Int64>()
+        var p = 8
+        while p + 8 <= box.count {
+            let boxSize = Int(be32(box, p))
+            guard boxSize >= 8, p + boxSize <= box.count else { break }
+            if box[p + 4..<p + 8].elementsEqual("tfra".utf8), boxSize >= 24 {
+                let version = box[p + 8]
+                let fields = be32(box, p + 16)
+                let count = Int(be32(box, p + 20))
+                let entry = (version == 1 ? 16 : 8)
+                    + Int((fields >> 4) & 3) + Int((fields >> 2) & 3) + Int(fields & 3) + 3
+                guard count <= (boxSize - 24) / entry else { return .none }
+                var e = p + 24
+                for _ in 0..<count {
+                    let offset = version == 1 ? be64(box, e + 8) : be32(box, e + 4)
+                    if offset > 0, offset < start { offsets.insert(offset) }
+                    e += entry
+                }
+            }
+            p += boxSize
+        }
+        guard offsets.count >= 2 else { return .none }
+        return .offsets(offsets.sorted(), end: start)
+    }
+
+    /// Where a fetched range's `moof` and the 16 bytes behind it are, nil when it holds no whole
+    /// `moof`. What `FragmentHeaderShare` keeps: the side readers' walk reads nothing else there.
+    nonisolated static func fragmentHeaderCore(_ block: Data) -> Range<Int>? {
+        let bytes = [UInt8](block)
+        var p = 0
+        while p + 8 <= bytes.count {
+            if bytes[p + 4] == 0x6D, bytes[p + 5] == 0x6F, bytes[p + 6] == 0x6F, bytes[p + 7] == 0x66 {
+                let size = Int(bytes[p]) << 24 | Int(bytes[p + 1]) << 16 | Int(bytes[p + 2]) << 8 | Int(bytes[p + 3])
+                guard size >= 16, p + size <= bytes.count else { return nil }
+                return p..<min(p + size + 16, bytes.count)
+            }
+            p += 1
+        }
+        return nil
+    }
+
+    /// How many more bytes a fetched range needs to hold its `moof` and the 16 bytes behind it,
+    /// nil when it holds them or when what was fetched is not a `moof` after all.
+    nonisolated static func fragmentHeaderShortfall(_ block: Data, ceiling: Int, trailing: Int = 16) -> Int? {
+        let bytes = [UInt8](block)
+        var p = 0
+        // the `moof` is at the lead, or earlier when the range started at the previous one's end
+        while p + 8 <= bytes.count {
+            let size = Int(bytes[p]) << 24 | Int(bytes[p + 1]) << 16 | Int(bytes[p + 2]) << 8 | Int(bytes[p + 3])
+            if bytes[p + 4] == 0x6D, bytes[p + 5] == 0x6F, bytes[p + 6] == 0x6F, bytes[p + 7] == 0x66 {
+                guard size >= 16, size <= 32 * 1024 * 1024 else { return nil }
+                let need = min(p + size + trailing, ceiling)
+                return need > bytes.count ? need - bytes.count : nil
+            }
+            p += 1
+        }
+        return nil
+    }
+
     /// Whether `offset` lies in the range the speculative fetch asked for. Caller holds `winCond`.
     private func isInTailPrefetchRangeLocked(_ offset: Int64) -> Bool {
         guard fileSize > 0 else { return false }
@@ -3523,7 +4046,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     func markOpenPhaseFinished() {
         winCond.lock()
         openPhaseActive = false
+        // Fragment headers: the parse has what it came for.
+        let served = fragmentHeaders?.served ?? 0
+        fragmentHeaders = nil
+        fragmentHeadersIndexPrefix = Data()
+        winCond.broadcast()
         winCond.unlock()
+        if served > 0 {
+            EngineLog.emit("[AVIOReader] \(label) fragment headers: answered \(served) reads of the index walk",
+                           category: .demux)
+        }
     }
 
     /// AE#585: the reads that follow are a bounded index pass, not playback.
@@ -3723,7 +4255,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         if isClosed { return }
 
-        var request = URLRequest(engineURL: requestURL())
+        var request = URLRequest(engineURL: connectionURL(generation: generation))
         // #93 residual: a bounded open connection asks for a finite range so an origin that dribbles
         // the open-ended `bytes=0-` stream serves it as a fast finite GET. The 206 Content-Range still
         // carries the total size, so fileSize resolution (issue #70) is unaffected.
@@ -4860,6 +5392,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
     }
 
+    /// Caps the Range a seekable read asks for, below `chunkSize`; nil lifts it. The I-frame side
+    /// reader sets it from the keyframes it has seen: 1 MB for a 30 KB keyframe was 90% of each
+    /// read's time on an 80 Mbit link.
+    func setRangeSizeCap(_ bytes: Int?) {
+        rangeCapLock.lock(); rangeCap = bytes; rangeCapLock.unlock()
+    }
+
+    /// Never below the AVIO buffer: `readSeekable` fills a whole buffer per call, so a smaller range
+    /// only adds a second fetch to the same read.
+    var seekableRangeSize: Int {
+        rangeCapLock.lock(); defer { rangeCapLock.unlock() }
+        guard let rangeCap else { return chunkSize }
+        return min(chunkSize, max(Int(Self.avioBufferSize), rangeCap))
+    }
+
     private func fetchChunk(from offset: Int64, size: Int) -> Data? {
         if let data = fetchChunkAttempt(from: offset, size: size, forceSource: false) {
             return data
@@ -5094,7 +5641,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     private func syncRequest(_ request: URLRequest, budget: TimeInterval = 35,
                              slotLabel: String = "fetch",
-                             slotWait: TimeInterval = AVIOReader.shortFetchSlotWaitSeconds) throws -> (Data, URLResponse) {
+                             slotWait: TimeInterval = AVIOReader.shortFetchSlotWaitSeconds,
+                             session: URLSession? = nil) throws -> (Data, URLResponse) {
         // #377: every short fetch the reader makes (detour blocks, size probes, HEAD) funnels
         // through here, so this is the one place that has to take an origin slot for all of them.
         // Refusals are charged before the completion callback returns the slot. Early exit
@@ -5107,7 +5655,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
         let delegate = ChunkFetchDelegate(extraHeaders: headers(for: request.url),
                                           bodyLimit: Self.expectedBodyBytes(for: request), diagnosticContext: diagnosticContext)
-        let task = (probeRequestSession ?? Self.chunkSession).dataTask(with: request)
+        let task = (probeRequestSession ?? session ?? Self.chunkSession).dataTask(with: request)
         task.delegate = delegate
         delegate.onBodyReserve = { [weak self] reserve in
             guard let self else { return }
@@ -5152,6 +5700,103 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         return (delegate.body, response)
     }
+}
+
+// MARK: - Fragment header share
+
+/// The fragment header ranges of the source that is playing, for its other readers. The I-frame
+/// rendition and every still extraction open a demuxer of their own on the same URL, and each of
+/// those walks every `moof` again (27 s for the I-frame reader on the 61 MB test file, with or
+/// without this). The ranges the playing reader fetched answer those walks too. One source at a
+/// time, only the `moof` and the 16 bytes behind it, a byte cap, and released `retentionSeconds`
+/// after the first range of a source: this is a courtesy to the side readers while they open,
+/// not a cache. A side reader that opens later fetches its own headers.
+final class FragmentHeaderShare: @unchecked Sendable {
+    static let shared = FragmentHeaderShare()
+    static let byteCap = 8 * 1024 * 1024
+    /// Long enough for the I-frame reader and still extractions that open with the session.
+    static let retentionSeconds: Double = 60
+    private let lock = NSLock()
+    private var key: String?
+    private var generation = 0
+    private var starts: [Int64] = []
+    private var blocks: [Data] = []
+    private var bytes = 0
+
+    func publish(key: String, start: Int64, block: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        if self.key != key {
+            self.key = key
+            starts = []
+            blocks = []
+            bytes = 0
+            generation &+= 1
+            let expiring = generation
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + Self.retentionSeconds) { [weak self] in
+                self?.drop(generation: expiring)
+            }
+        }
+        guard bytes + block.count <= Self.byteCap else { return }
+        var lo = 0, hi = starts.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if starts[mid] < start { lo = mid + 1 } else { hi = mid }
+        }
+        if lo < starts.count, starts[lo] == start { return }
+        starts.insert(start, at: lo)
+        blocks.insert(block, at: lo)
+        bytes += block.count
+    }
+
+    /// Copies what a published range holds at `offset`, nil when none does.
+    func serve(key: String, into dst: UnsafeMutablePointer<UInt8>, maxLen: Int, at offset: Int64) -> Int? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.key == key, maxLen > 0 else { return nil }
+        var lo = 0, hi = starts.count
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if starts[mid] <= offset { lo = mid + 1 } else { hi = mid }
+        }
+        guard lo > 0 else { return nil }
+        let block = blocks[lo - 1]
+        let at = Int(offset - starts[lo - 1])
+        guard at < block.count else { return nil }
+        let n = min(maxLen, block.count - at)
+        block.withUnsafeBytes { raw in
+            if let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) {
+                dst.update(from: base + at, count: n)
+            }
+        }
+        return n
+    }
+
+    func drop(key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard self.key == key else { return }
+        clearLocked()
+    }
+
+    /// The retention timer of one source: a newer source published since is left alone.
+    func drop(generation expiring: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard generation == expiring, key != nil else { return }
+        clearLocked()
+    }
+
+    private func clearLocked() {
+        key = nil
+        starts = []
+        blocks = []
+        bytes = 0
+    }
+
+    /// Tests: what the share holds now, and which source's retention timer is current.
+    var heldBytes: Int { lock.lock(); defer { lock.unlock() }; return bytes }
+    var currentGeneration: Int { lock.lock(); defer { lock.unlock() }; return generation }
 }
 
 // MARK: - Detour Block Cache

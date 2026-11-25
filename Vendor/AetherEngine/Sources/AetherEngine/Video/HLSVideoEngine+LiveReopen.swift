@@ -529,7 +529,7 @@ extension HLSVideoEngine {
             return
         }
         let metered = OriginRequestBudget.shared.refusedRecently(
-            sourceURL, within: Self.rateLimitVerdictWindowSeconds)
+            refusalBooksURL, within: Self.rateLimitVerdictWindowSeconds)
 
         let reviveProgress = cache?.totalStoredCount ?? 0
         restartLock.lock()
@@ -538,6 +538,8 @@ extension HLSVideoEngine {
         let cap = metered ? 0 : readErrorReviveGate.maxAttempts
         let spent = metered ? rateLimitReviveGate.elapsedSeconds() : 0
         let budget = rateLimitReviveGate.budgetSeconds
+        let ceilingHit = !metered && readErrorReviveGate.refusedByCeiling
+        let ceiling = readErrorReviveGate.ceiling
         if admitted { mainDemuxerSuspectDead = true }
         restartLock.unlock()
         guard admitted else {
@@ -552,11 +554,21 @@ extension HLSVideoEngine {
                     + "across \(attempts) attempts); giving up. The source is REFUSING us, "
                     + "not lost: retrying this same request later is expected to work, and handing "
                     + "off to another player will meet the same refusal."
-                    + OriginRequestBudget.shared.refusalShapeNote(for: sourceURL),
+                    + OriginRequestBudget.shared.refusalShapeNote(for: refusalBooksURL),
                     category: .session
                 )
                 surfaceVODSourceFailure(code, "Source is rate limiting this session",
                                         kind: .sourceRateLimited)
+                return
+            }
+            if ceilingHit, let ceiling {
+                EngineLog.emit(
+                    "[HLSVideoEngine] AE#1085 VOD readError revive ceiling reached "
+                    + "(\(ceiling.maxRevives) revives already in the last \(Int(ceiling.windowSeconds))s); "
+                    + "giving up so the host decides whether to reopen this source",
+                    category: .session
+                )
+                surfaceVODSourceFailure(code, "Source read failed")
                 return
             }
             EngineLog.emit(
@@ -611,14 +623,42 @@ extension HLSVideoEngine {
         }
     }
 
-    /// Where a VOD revive re-anchors: a pending seek that never landed owns the aim, else the
-    /// consumer's frozen position (0 when the host has none yet), mapped to its segment index.
+    /// Where a VOD revive re-anchors: a pending seek that never landed owns the aim, then the load's
+    /// start position while nothing has rendered yet, else the consumer's frozen position, mapped
+    /// to its segment index.
     func consumerRecoveryTarget() -> (anchor: TimeInterval, index: Int) {
         let frozen = currentPlaybackPositionProvider?() ?? 0
-        let anchor = AetherEngine.recoveryAnchorPosition(
-            frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
-            currentRendered: frozen)
+        let pending = recoverySeekTargetProvider?()
+        let hasRendered = hasStartedRenderingProvider?() ?? true
+        let start = honouredStartSeconds
+        let anchor = Self.vodRecoveryAnchor(frozenPosition: frozen, pendingSeekTarget: pending,
+                                            hasRendered: hasRendered, startPosition: start)
+        if pending == nil, !hasRendered, let start {
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#1126 revive before the first frame keeps the load's start position "
+                + "\(String(format: "%.2f", start))s (rendered position \(String(format: "%.2f", frozen))s)",
+                category: .session)
+        }
         return (anchor, segmentIndexForPlaylistTime(anchor))
+    }
+
+    /// AE#1126: before the first frame the consumer has no position of its own. AVPlayer was mounted
+    /// at the load's start position and asks for a segment near it, so a revive that aimed at the
+    /// unset rendered position (0) restarted the producer at seg0 and lost the resume.
+    static func vodRecoveryAnchor(frozenPosition: Double, pendingSeekTarget: Double?,
+                                  hasRendered: Bool, startPosition: Double?) -> Double {
+        if pendingSeekTarget == nil, !hasRendered, let startPosition { return startPosition }
+        return AetherEngine.recoveryAnchorPosition(
+            frozenPosition: frozenPosition, pendingSeekTarget: pendingSeekTarget,
+            currentRendered: frozenPosition)
+    }
+
+    /// The start position `start()` anchored the first producer at, nil when it produced from 0 (no
+    /// start position, a live session, or a sequential origin that can only be read from byte 0).
+    var honouredStartSeconds: Double? {
+        guard !isLiveSession, !sequentialOriginPinsProducerToZero,
+              let start = initialStartSeconds, start > 0 else { return nil }
+        return start
     }
 
     /// AE#792 part 2: what a read error over a refused credential calls for. The store's revision says
@@ -859,9 +899,25 @@ extension HLSVideoEngine {
 
     /// #99: revive a VOD session whose pump died with muxerFailed. The restart path rebuilds the
     /// producer with a fresh muxer and calls audioBridge.startSegment() (which also rebuilds a
-    /// post-EOF-drained encoder), so the known transient causes heal. Aimed like the wedge re-anchor:
-    /// a pending never-landed seek target owns the recovery aim, else AVPlayer's real position.
+    /// post-EOF-drained encoder), so the known transient causes heal. Aimed by
+    /// `consumerRecoveryTarget()`: a pending never-landed seek target, the load's start position
+    /// before the first frame, else AVPlayer's real position.
+    /// A full segment volume before the first segment is stored ends the session without a revive.
     func handleVODMuxerFailure() {
+        // Before the first segment is stored, a full volume is not worth a revive: the rebuild
+        // fails the same way (AE#1124). Mid-session the latch can be set
+        // by a brief dip below the free reserve that eviction or the OS clears, so the revives run
+        // first and the cap-reached arm below names the full volume.
+        if cache?.storageExhausted == true, (cache?.totalStoredCount ?? 0) == 0 {
+            EngineLog.emit(
+                "[HLSVideoEngine] VOD muxerFailed on a full segment volume before any segment was stored; "
+                + "not reviving",
+                category: .session
+            )
+            surfaceVODSourceFailure(FFmpegErr.enospc, "Device storage is full: video segments cannot be written",
+                                    kind: .storageExhausted)
+            return
+        }
         restartLock.lock()
         let admitted = muxerFailureReviveGate.admit()
         let attempts = muxerFailureReviveGate.attempts
@@ -1178,8 +1234,15 @@ extension HLSVideoEngine {
             do {
                 switch transport {
                 case .url:
-                    try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders,
-                                 profile: openProfile.withRequestHeaders(requestHeaders), isLive: true)
+                    // AE#1100: an origin that replays its session on the same URL gets a fresh one.
+                    let reopenURL = liveReopenURL?(sourceURL) ?? sourceURL
+                    if reopenURL != sourceURL {
+                        EngineLog.emit("[HLSVideoEngine] AE#1100 live reopen attempt \(attempt): on the URL the host handed over",
+                                       category: .session)
+                    }
+                    try dem.open(url: reopenURL, extraHeaders: sourceHTTPHeaders,
+                                 profile: openProfile.withRequestHeaders(requestHeaders)
+                                    .withLiveReopenURL(liveReopenURL), isLive: true)
                 case .customFactory:
                     // #199: fresh engine-created ingest reader over the same channel; the dead
                     // reader's construction inputs are immutable, so this rejoins at the live edge.

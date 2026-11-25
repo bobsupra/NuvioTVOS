@@ -25,21 +25,39 @@ public enum VideoFieldOrder: String, Sendable, Equatable {
 
 /// AE#983: the deinterlace graph in the software decoder's frame path, part of `DecodedVideoFormat`.
 public struct VideoDeinterlace: Sendable, Equatable {
-    /// The FFmpeg filter: `yadif_videotoolbox` (Metal), `bwdif`, or `yadif` on older linked builds.
+    /// The FFmpeg filter: `bwdif_videotoolbox` or `yadif_videotoolbox` (Metal), `bwdif`, or `yadif`
+    /// on older linked builds.
     public let filter: String
     public let isHardware: Bool
     /// `.field` emits one frame per field (25i to 50p), `.frame` one per frame (25i to 25p). The
     /// software filter always runs `.frame`, whatever `LoadOptions.deinterlaceFieldRate` asks for.
     public let fieldRate: DeinterlaceFieldRate
+    /// #853: the graph matches fields back into film frames (`fieldmatch`) and drops the repeated
+    /// frame of each five (`decimate`) around `filter`, which then only touches frames left combed
+    /// (titles and credits made at video rate). The output runs at 4/5 of the source rate
+    /// (29.97 to 23.976 fps) and `fieldRate` is `.frame`.
+    public let inverseTelecine: Bool
+    /// AE#1108: `fieldmatch` and `decimate` run on the GPU (`fieldmatch_videotoolbox`,
+    /// `decimate_videotoolbox`) rather than on the CPU ahead of the upload. Only ever true together
+    /// with `inverseTelecine` and `isHardware`. The output is the same either way, only the cost moves.
+    public let inverseTelecineIsHardware: Bool
 
-    public init(filter: String, isHardware: Bool, fieldRate: DeinterlaceFieldRate) {
+    public init(filter: String, isHardware: Bool, fieldRate: DeinterlaceFieldRate, inverseTelecine: Bool = false,
+                inverseTelecineIsHardware: Bool = false) {
         self.filter = filter
         self.isHardware = isHardware
         self.fieldRate = fieldRate
+        self.inverseTelecine = inverseTelecine
+        self.inverseTelecineIsHardware = inverseTelecine && isHardware && inverseTelecineIsHardware
     }
 
-    /// Output frames per source frame: multiply `sourceVideoFrameRate` by it for the output rate.
+    /// Frames the deinterlacer emits per frame it takes in. Under `inverseTelecine` the graph then
+    /// keeps four of every five, so for the output rate use `outputFrameRateFactor`.
     public var outputFramesPerSourceFrame: Int { fieldRate == .field ? 2 : 1 }
+
+    /// Multiply `sourceVideoFrameRate` by it for the rate the frames come out at: 2 at field rate,
+    /// 1 at frame rate, 0.8 under inverse telecine.
+    public var outputFrameRateFactor: Double { inverseTelecine ? 0.8 : Double(outputFramesPerSourceFrame) }
 }
 
 extension VideoScan {

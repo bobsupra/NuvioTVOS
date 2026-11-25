@@ -521,14 +521,6 @@ enum LiveEdgePolicy {
         max(30, (edgeCushionSeconds ?? 0) + 15)
     }
 
-    /// One observed segment duration gives a strict-realtime fastZap source one more chance to fill
-    /// naturally, while the clamp keeps the startup bound useful for unusually short or long GOPs.
-    static func fastZapDegradedGraceSeconds(
-        maxSegmentDuration: Double
-    ) -> TimeInterval {
-        min(2.0, max(0.5, maxSegmentDuration))
-    }
-
     /// First-serve gate: hold the first live manifest until the window carries at least the live-edge
     /// holdback (`3 x TD`) of content behind the edge, so AVPlayer's initial seek-to-edge-minus-holdback
     /// lands inside the window instead of the stall-danger zone. Bounded above by `windowSegmentCount`: a
@@ -798,7 +790,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     var liveEdgeCushionSeconds: Double? { baseLiveWindowSizing.edgeCushionSeconds }
     /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
     private let allowsBoundedDegradedStart: Bool
-    private let startupGraceSeconds: TimeInterval?
+    /// 0 unless the host asked for a grace. The automatic one-segment grace this replaced cost every
+    /// raw TS start 1 to 2 s and bought only the absence of one harmless -16832 warning (measured on
+    /// 0.5, 1 and 2 s GOPs, strict-realtime and bursting origins alike, no rebuffer in either arm).
+    private let startupGraceSeconds: TimeInterval
     private let singleSegmentStartupMinimumSeconds: TimeInterval?
     /// Report the selected startup policy once per session, including repeat requests.
     private var didLogStartupPolicy = false
@@ -935,7 +930,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// 8 absorbs AVPlayer's 5-7 segment speculative prefetch at 4 s segments (~32 s headroom)
     /// while keeping user-initiated 30+ s scrubs below the threshold. Tightened to 3 once;
     /// every AVPlayer prefetch above cache.max+3 cascaded into restarts and produced cache holes.
-    private static let forwardWaitWindow = 8
+    static let forwardWaitWindow = 8
 
     /// #50: re-asserting reposition wait. Sliced waits re-fire restart only when lastRestartIndex
     /// changed (orphan signature: #35 coalescer's single slot was overwritten by a newer scrub).
@@ -1185,7 +1180,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
         self.startupGraceSeconds = startupGraceSeconds.flatMap {
             $0.isFinite && $0 >= 0 ? min(120, $0) : nil
-        }
+        } ?? 0
         self.boundedStartFloorsAtHoldback = boundedStartFloorsAtHoldback
         self.firstServeLatchCoversEngineCut = firstServeLatchCoversEngineCut
         self.blockingReloadOverride = blockingReloadOverride
@@ -3192,7 +3187,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             if waitersCancelled || waitersHaltedForRetune { return false }
             if !didLogStartupPolicy {
                 didLogStartupPolicy = true
-                let grace = startupGraceSeconds.map(LiveEdgePolicy.seconds) ?? "auto"
+                let grace = LiveEdgePolicy.seconds(startupGraceSeconds)
                 let single = singleSegmentStartupMinimumSeconds.map(LiveEdgePolicy.seconds) ?? "off"
                 let cushion = liveEdgeCushionSeconds.map(LiveEdgePolicy.seconds) ?? "off"
                 EngineLog.emit("[HLSVideoEngine] live startup policy: bounded=\(allowsBoundedDegradedStart) grace=\(grace) singleSegmentMinimum=\(single) holdbackFloor=\(boundedStartFloorsAtHoldback) edgeCushion=\(cushion)", category: .session)
@@ -3220,11 +3215,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                !boundedStartFloorsAtHoldback,
                hasBoundedStartupMedia(snap),
                degradedDeadline == nil {
-                let grace = startupGraceSeconds ?? LiveEdgePolicy.fastZapDegradedGraceSeconds(
-                    maxSegmentDuration: snap.maxDuration
-                )
-                degradedGrace = grace
-                degradedDeadline = Date().addingTimeInterval(grace)
+                degradedGrace = startupGraceSeconds
+                degradedDeadline = Date().addingTimeInterval(startupGraceSeconds)
             }
             // AE#936: after a burst on a long GOP the next keyframe is further off than the grace, so
             // waiting it out serves the same window later.
@@ -3459,7 +3451,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     var iFrameRenditionServed: Bool { iFrameSource != nil }
     var iFrameRenditionFormat: IFrameRenditionFormat? { iFrameSource?.format }
     func iFrameInitSegment() -> Data? { iFrameSource?.initSegment() }
-    func iFrameSegment(at index: Int) -> Data? { iFrameSource?.fragment(at: index) }
+    func iFrameSegment(at index: Int, isAbandoned: @escaping () -> Bool) -> Data? {
+        iFrameSource?.fragment(at: index, isAbandoned: isAbandoned)
+    }
 
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
@@ -3602,8 +3596,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// the AVPlayer timeline. `segments[i].startSeconds` is the absolute output-axis start (correct for both
     /// VOD and the live sliding window, where a cumulative EXTINF sum from firstVisible would not be), so the
     /// window is read straight off the segment plan rather than recomputed.
-    func nativeSubtitleServesSilently(ordinal: Int) -> Bool {
-        ordinal >= 0 && ordinal < nativeSubStores.count && nativeSubStores[ordinal].servesSilently
+    func nativeSubtitleServesEmptyByDesign(ordinal: Int) -> Bool {
+        ordinal >= 0 && ordinal < nativeSubStores.count && nativeSubStores[ordinal].servesEmptyByDesign
     }
 
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
@@ -3622,9 +3616,12 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // while A/V keeps loading, and a failed fill is answered at once. Reader-fed stores keep the wait.
             switch store.wholeProgramServe {
             case .retryLater:
+                store.noteRefusedWhilePending()
                 EngineLog.emit("[HLSVideoEngine] AE#984: whole-program subtitle .vtt ord=\(ordinal) requested before "
                                + "its sidecar is decoded; answering 404 so AVPlayer asks again", category: .hlsServer)
                 return nil
+            case .waitForReader where !store.waitsForFill:
+                noteServedWithoutFill(store: store, ordinal: ordinal)
             case .waitForReader:
                 let deadline = Date().addingTimeInterval(30.0)
                 while store.wholeProgramServe == .waitForReader, Date() < deadline {
@@ -3656,6 +3653,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         // AE#1052: a menu marker. No wait, no cues; AVKit fetches again when the marker becomes the display.
         if store.servesSilently { return WebVTTBuilder.segment(cues: [], segmentStart: start) }
+        // AE#984: a sidecar that failed has nothing coming, so it is served empty at once. One still
+        // decoding keeps the bounded wait below rather than the whole-program 404: a 404 on a selected
+        // rendition before `readyToPlay` fails the item after ~30 s (measured on the bypass), and the
+        // windowed shape is unmeasured. The select waits for the decode, so this is only reached when
+        // something else selected the rendition.
+        if store.wholeProgramServe == .failedFill {
+            return WebVTTBuilder.segment(cues: [], segmentStart: start)
+        }
+        // Its decode goes next, though: the request means the rendition is selected.
+        if store.wholeProgramServe == .retryLater { store.noteRefusedWhilePending() }
         // Sodalite#32: bounded, distance-aware readiness wait replacing the 25 s wait-for-isFinished. AVKit
         // caches an empty-served window forever, so waiting is worth it; but blocking every fetch on a store
         // that never finishes serialized the loopback connection AVPlayer also uses for video (device:
@@ -3663,7 +3670,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // cover THIS window (read head within the horizon, or still warming up), and only briefly.
         let horizonSeconds = 30.0
         let deadline = Date().addingTimeInterval(3.0)
-        while !store.isFinished,
+        let waits = store.waitsForFill
+        if !waits { noteServedWithoutFill(store: store, ordinal: ordinal) }
+        while waits, !store.isFinished,
               store.readMaxCueEnd() < end,
               end <= store.readMaxCueEnd() + horizonSeconds || store.readMaxCueEnd() <= 0,
               Date() < deadline {
@@ -3674,6 +3683,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // Absolute media-timeline cue times + MPEGTS:0 identity map. Flip to segment-relative here (one line:
         // relativeToStart: true) if on-device PiP shows subtitles shifted by the segment start. See WebVTTBuilder.segment.
         return WebVTTBuilder.segment(cues: cues, segmentStart: start)
+    }
+
+    /// AE#1052: once per store, the reason its segments come back at once and empty.
+    private func noteServedWithoutFill(store: NativeSubtitleCueStore, ordinal: Int) {
+        guard store.noteServedWithoutFill() else { return }
+        EngineLog.emit("[HLSVideoEngine] AE#1052 subtitle rendition ord=\(ordinal) is a bitmap track no OCR "
+                       + "worker fills; its segments are served at once, without the readiness wait",
+                       category: .hlsServer)
     }
 
     /// Sodalite#32 Phase 2: see `stripASSMarkupInVTT`.

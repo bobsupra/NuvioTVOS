@@ -1,5 +1,6 @@
 import Foundation
 import AetherLibavfilter
+import AetherLibavformat
 import AetherLibavutil
 
 /// Deinterlacer selection + cadence for the software-decode path, resolved from `LoadOptions`
@@ -7,6 +8,42 @@ import AetherLibavutil
 struct DeinterlaceConfig: Sendable, Equatable {
     var mode: DeinterlaceMode = .auto
     var fieldRate: DeinterlaceFieldRate = .field
+    /// #853: match fields back into film frames and drop the repeated frame of each five around the
+    /// deinterlacer (`fieldmatch` + `decimate`), for hard-telecined film. Decided at load.
+    var inverseTelecine = false
+    /// The video stream's frame rate, which the buffer source declares under inverse telecine:
+    /// `decimate` refuses an input link without one. Unknown (0/1) keeps inverse telecine off.
+    var sourceFrameRate = SourceFrameRate()
+
+    struct SourceFrameRate: Sendable, Equatable {
+        var num: Int32 = 0
+        var den: Int32 = 1
+        var isKnown: Bool { num > 0 && den > 0 }
+        var framesPerSecond: Double? { isKnown ? Double(num) / Double(den) : nil }
+
+        init(num: Int32 = 0, den: Int32 = 1) {
+            self.num = num
+            self.den = den
+        }
+
+        /// The stream's declared rate (`avg_frame_rate`, else `r_frame_rate`, as
+        /// `AetherEngine.detectFrameRate` reads it), with the NTSC rates snapped to their exact
+        /// rationals: a container that rounds 30000/1001 to 2997/100 would otherwise put
+        /// `decimate`'s output a hair off 24000/1001.
+        init(stream: UnsafeMutablePointer<AVStream>) {
+            let avg = stream.pointee.avg_frame_rate
+            let rate = avg.num > 0 && avg.den > 0 ? avg : stream.pointee.r_frame_rate
+            guard rate.num > 0, rate.den > 0 else { self.init(); return }
+            let fps = Double(rate.num) / Double(rate.den)
+            if abs(fps - 30000.0 / 1001.0) < 0.01 {
+                self.init(num: 30000, den: 1001)
+            } else if abs(fps - 30) < 0.01 {
+                self.init(num: 30, den: 1)
+            } else {
+                self.init(num: rate.num, den: rate.den)
+            }
+        }
+    }
 }
 
 /// Persistent deinterlacing graph for the software-decode path (MPEG-2/VC-1/MPEG-4 and, per the
@@ -14,14 +51,34 @@ struct DeinterlaceConfig: Sendable, Equatable {
 /// broadcast routes here; see VideoRoutingPolicy).
 ///
 /// Two engines:
-/// - HARDWARE (`config.mode == .auto`, default): `format=nv12,hwupload,yadif_videotoolbox`, the
-///   yadif kernel as a Metal compute shader over VideoToolbox frames. The sink emits
-///   `AV_PIX_FMT_VIDEOTOOLBOX` frames wrapping IOSurface-backed CVPixelBuffers (`frame.data[3]`)
-///   that go straight to the renderer, skipping the sws_scale copy. Runs at field rate by default
-///   (`config.fieldRate`). Requires yadif_videotoolbox in the linked FFmpeg build (FFmpegBuild
-///   >= 2.1) and a Metal device; any build failure disables hw for the session and falls back.
+/// - HARDWARE (`config.mode == .auto`, default): `format=nv12,hwupload,bwdif_videotoolbox`, bwdif
+///   as a Metal compute shader over VideoToolbox frames, the same algorithm as the software engine
+///   (AE#1102). `yadif_videotoolbox` takes over when the linked FFmpeg build has no
+///   bwdif_videotoolbox or its graph fails to build. The sink emits `AV_PIX_FMT_VIDEOTOOLBOX` frames
+///   wrapping IOSurface-backed CVPixelBuffers (`frame.data[3]`) that go straight to the renderer,
+///   skipping the sws_scale copy. Runs at field rate by default (`config.fieldRate`). Needs a
+///   Metal device; when every GPU filter has failed to build, or a GPU graph errors while
+///   running, hw stays off for the session.
 /// - SOFTWARE (fallback, or `config.mode == .software`): CPU bwdif (yadif for older linked
 ///   frameworks), always `mode=send_frame`, field rate without the GPU is the wrong cost trade.
+///
+/// Inverse telecine (#853, `config.inverseTelecine`) wraps either engine for hard-telecined film:
+/// `fieldmatch` rebuilds the film frames from the fields, the deinterlacer then touches only the
+/// frames `fieldmatch` could not match (it flags them interlaced, so `deint=interlaced` skips the
+/// rest), and `decimate` drops the repeated frame of each five, 29.97 to 23.976 fps. Software:
+/// `fieldmatch,bwdif,decimate`, the order the FFmpeg docs give. Hardware: the whole chain runs on
+/// the GPU, `format=nv12,hwupload,fieldmatch_videotoolbox,decimate_videotoolbox,<gpu filter>`
+/// (AE#1108). Those are Metal ports whose output equals the CPU filters; on an M1 they cost 30 to
+/// 85% of the CPU time, least where `fieldmatch` is expensive (grain, HD). Where the linked build
+/// lacks them, the stream is not 8-bit 4:2:0 with a height that is a multiple of 4, or they fail to
+/// build or error while running, the cadence work stays on the CPU before the upload:
+/// `fieldmatch,decimate,format,hwupload,<gpu filter>`. Always `send_frame`: at field rate the frame
+/// count doubles before `decimate` and its 1-in-5 cycle no longer lines up with the pulldown.
+/// `fieldmatch` runs `combmatch=full`, because only a match judged by comb scores flags the frames
+/// it could not match (`interlaced_frame = combs[match] >= combpel`; the scores are never computed
+/// otherwise). `decimate` stamps its output from the graph's first frame plus one 1001/24000 tick
+/// per frame, so a rebuild (every seek) re-anchors it, and so does a gap in the input timestamps
+/// (`breaksInverseTelecineCadence`).
 ///
 /// MUST be persistent: yadif/bwdif are temporal filters that need a continuous frame stream.
 /// `deint=interlaced` passes progressive frames through untouched.
@@ -54,9 +111,20 @@ final class DeinterlaceFilter {
     private var pixFmt: Int32 = -1
     private var loggedUnavailable = false
 
-    /// Latched on the first hardware graph failure: a missing filter or Metal device will not
+    /// Latched once every GPU filter has failed: a missing filter or Metal device will not
     /// appear mid-session, so don't re-attempt (and re-log) on every geometry change.
     private var hwDisabled = false
+
+    /// GPU deinterlacers, preferred first. bwdif_videotoolbox matches the software engine's bwdif;
+    /// yadif_videotoolbox covers FFmpegBuild releases without it.
+    static let hardwareFilterNames = ["bwdif_videotoolbox", "yadif_videotoolbox"]
+
+    /// The GPU filters the linked FFmpeg build carries, in preference order.
+    static let linkedHardwareFilters: [String] =
+        hardwareFilterNames.filter { avfilter_get_by_name($0) != nil }
+
+    /// GPU filters whose graph failed to build in this session; the next one takes over.
+    private(set) var failedHardwareFilters: Set<String> = []
 
     /// VideoToolbox hw device, created lazily for the hardware graph and kept across seek
     /// teardowns (device creation is not per-stream state).
@@ -66,15 +134,82 @@ final class DeinterlaceFilter {
 
     private var builtFilterName: String?
 
+    /// True while the built graph runs inverse telecine (#853).
+    private(set) var builtInverseTelecine = false
+    /// Graphs built so far, so a caller can tell a build from the check of a graph already standing (AE#1112).
+    private(set) var graphBuilds = 0
+
+    /// True while that inverse telecine runs on the GPU (AE#1108).
+    private(set) var builtInverseTelecineHardware = false
+
+    /// Latched once the GPU cadence filters failed to build or errored. The next builds then keep the
+    /// cadence work on the CPU instead of paying the failed attempt on every seek. Tests set it to
+    /// pin the CPU cadence chain.
+    var hwInverseTelecineDisabled = false
+
+    /// The PTS (input time base) of the last frame pushed into an inverse telecine graph, for the
+    /// cadence-gap check. nil while no such graph is built.
+    private var lastInverseTelecinePTS: Int64?
+
+    /// Logged once per filter instance when inverse telecine was asked for and cannot be built.
+    private var loggedInverseTelecineUnavailable = false
+
+    /// `fieldmatch` and `decimate` are both in the linked FFmpeg build (FFmpegBuild 3.11+).
+    static let inverseTelecineFiltersLinked: Bool =
+        avfilter_get_by_name("fieldmatch") != nil && avfilter_get_by_name("decimate") != nil
+
+    /// The `fieldmatch` options of the playback chain. `combmatch=full`: see the class doc.
+    static let inverseTelecineFieldMatchOptions = "order=auto:combmatch=full"
+    static let inverseTelecineFieldMatch = "fieldmatch=\(inverseTelecineFieldMatchOptions)"
+
+    /// AE#1108: `fieldmatch_videotoolbox` and `decimate_videotoolbox` are in the linked FFmpeg build.
+    static let hardwareInverseTelecineFiltersLinked: Bool =
+        avfilter_get_by_name("fieldmatch_videotoolbox") != nil
+        && avfilter_get_by_name("decimate_videotoolbox") != nil
+
+    /// Whether the GPU inverse telecine chain gives the CPU chain's pictures for this frame.
+    /// - 8-bit 4:2:0 only. The ports read NV12, and the `format=nv12` ahead of them is then a repack.
+    ///   For 4:2:2 or 4:4:4 it would subsample chroma across the two fields of a combed frame before
+    ///   `fieldmatch` separates them, which the CPU chain never does.
+    /// - A height that is a multiple of 4. On a plane with an odd row count the CPU filter reads a row
+    ///   it never wrote, so the GPU port refuses such a frame.
+    /// - At least 32x16, the port's minimum.
+    static func hardwareInverseTelecineAccepts(width: Int32, height: Int32, pixelFormat: Int32) -> Bool {
+        guard let desc = av_pix_fmt_desc_get(AVPixelFormat(rawValue: pixelFormat)) else { return false }
+        let d = desc.pointee
+        let isHardwareFormat = d.flags & UInt64(AV_PIX_FMT_FLAG_HWACCEL) != 0
+        return !isHardwareFormat && d.nb_components >= 3 && d.comp.0.depth == 8
+            && d.log2_chroma_w == 1 && d.log2_chroma_h == 1
+            && height % 4 == 0 && width >= 32 && height >= 16
+    }
+
     /// The built graph as the public report describes it (AE#983); nil while no graph is built.
     var activeDeinterlace: VideoDeinterlace? {
         guard let engine, let builtFilterName else { return nil }
         return VideoDeinterlace(filter: builtFilterName, isHardware: engine == .hardware,
-                                fieldRate: engine == .hardware ? config.fieldRate : .frame)
+                                fieldRate: engine == .hardware && !builtInverseTelecine ? config.fieldRate : .frame,
+                                inverseTelecine: builtInverseTelecine,
+                                inverseTelecineIsHardware: builtInverseTelecineHardware)
+    }
+
+    /// Inverse telecine for the next build: asked for, with a known source rate (the buffer source
+    /// must declare it for `decimate`), and both filters linked. Logs once why not.
+    private func inverseTelecineBuildable() -> Bool {
+        guard config.inverseTelecine else { return false }
+        let missing: String? = !Self.inverseTelecineFiltersLinked
+            ? "no fieldmatch / decimate in the linked FFmpeg build"
+            : (!config.sourceFrameRate.isKnown ? "the stream states no frame rate" : nil)
+        guard let missing else { return true }
+        if !loggedInverseTelecineUnavailable {
+            loggedInverseTelecineUnavailable = true
+            EngineLog.emit("[Deinterlace] inverse telecine unavailable (\(missing)); deinterlacing instead (#853)",
+                           category: .swPlayback)
+        }
+        return false
     }
 
     static func prewarmHardwarePipeline() -> Bool {
-        guard avfilter_get_by_name("yadif_videotoolbox") != nil,
+        guard !linkedHardwareFilters.isEmpty,
               let frame = av_frame_alloc() else {
             return false
         }
@@ -105,6 +240,15 @@ final class DeinterlaceFilter {
         ) else {
             return false
         }
+        // AE#1108: the GPU cadence filters load their Metal library and pipelines at init too, so a
+        // film session's first build does not compile them on the decode thread.
+        if filter.engine == .hardware, hardwareInverseTelecineFiltersLinked {
+            let cadence = DeinterlaceFilter()
+            cadence.config = DeinterlaceConfig(mode: .auto, fieldRate: .frame, inverseTelecine: true,
+                                               sourceFrameRate: .init(num: 30000, den: 1001))
+            _ = cadence.ensureGraph(frame: frame, timeBase: AVRational(num: 1001, den: 30000))
+            cadence.teardown()
+        }
         return filter.engine == .hardware
     }
 
@@ -122,11 +266,36 @@ final class DeinterlaceFilter {
         if passthroughLatched { return false }
 
         if config.mode == .auto, !hwDisabled {
-            if buildGraph(frame: frame, timeBase: timeBase, engine: .hardware) {
-                return true
+            let candidates = Self.linkedHardwareFilters.filter { !failedHardwareFilters.contains($0) }
+            if candidates.isEmpty, !loggedUnavailable, failedHardwareFilters.isEmpty {
+                loggedUnavailable = true
+                EngineLog.emit(
+                    "[Deinterlace] no GPU deinterlacer (\(Self.hardwareFilterNames.joined(separator: " / "))) in the linked FFmpeg build",
+                    category: .swPlayback
+                )
             }
-            // One-shot fallback: whatever failed (filter not in the linked build, no Metal
-            // device, hwframes alloc) will keep failing; don't retry per geometry change.
+            for name in candidates {
+                let triedGPUCadence = wantsHardwareInverseTelecine(frame: frame)
+                if triedGPUCadence, buildGraph(frame: frame, timeBase: timeBase, engine: .hardware,
+                                               hardwareFilter: name, inverseTelecineOnGPU: true) {
+                    return true
+                }
+                if buildGraph(frame: frame, timeBase: timeBase, engine: .hardware, hardwareFilter: name) {
+                    // The same deinterlacer builds with the CPU cadence, so the GPU cadence filters were
+                    // what failed. When it does not, the deinterlacer or the device is at fault, and the
+                    // next candidate tries the GPU cadence again.
+                    if triedGPUCadence {
+                        hwInverseTelecineDisabled = true
+                        EngineLog.emit("[Deinterlace] GPU inverse telecine filters failed to build; "
+                                       + "fieldmatch / decimate stay on the CPU (AE#1108)", category: .swPlayback)
+                    }
+                    return true
+                }
+                failedHardwareFilters.insert(name)
+            }
+            // One-shot fallback: whatever failed (no Metal device, hwframes alloc) will keep
+            // failing; don't retry per geometry change. The prewarm ran this same order, so the
+            // filter that builds here had its Metal pipeline compiled already.
             hwDisabled = true
             EngineLog.emit(
                 "[Deinterlace] hardware graph unavailable; falling back to software",
@@ -136,10 +305,22 @@ final class DeinterlaceFilter {
         return buildGraph(frame: frame, timeBase: timeBase, engine: .software)
     }
 
+    /// AE#1108: the next hardware build should try the GPU cadence filters.
+    private func wantsHardwareInverseTelecine(frame: UnsafeMutablePointer<AVFrame>) -> Bool {
+        guard config.inverseTelecine, !hwInverseTelecineDisabled, Self.hardwareInverseTelecineFiltersLinked,
+              Self.hardwareInverseTelecineAccepts(width: frame.pointee.width, height: frame.pointee.height,
+                                                  pixelFormat: frame.pointee.format) else {
+            return false
+        }
+        return inverseTelecineBuildable()
+    }
+
     private func buildGraph(
         frame: UnsafeMutablePointer<AVFrame>,
         timeBase: AVRational,
-        engine wanted: Engine
+        engine wanted: Engine,
+        hardwareFilter: String? = nil,
+        inverseTelecineOnGPU: Bool = false
     ) -> Bool {
         // AE#492: the build cost belongs on the line that reports the build. A seek tears the graph
         // down, so this is paid per seek on interlaced sources and never on progressive ones, and
@@ -148,17 +329,7 @@ final class DeinterlaceFilter {
         // Engine-specific preconditions.
         switch wanted {
         case .hardware:
-            guard avfilter_get_by_name("yadif_videotoolbox") != nil else {
-                if !loggedUnavailable {
-                    loggedUnavailable = true
-                    EngineLog.emit(
-                        "[Deinterlace] no yadif_videotoolbox in the linked FFmpeg build (needs FFmpegBuild >= 2.1)",
-                        category: .swPlayback
-                    )
-                }
-                return false
-            }
-            guard ensureHWDevice() else { return false }
+            guard hardwareFilter != nil, ensureHWDevice() else { return false }
         case .software:
             guard avfilter_get_by_name("bwdif") != nil || avfilter_get_by_name("yadif") != nil else {
                 if !loggedUnavailable {
@@ -197,6 +368,12 @@ final class DeinterlaceFilter {
         if frame.pointee.color_range != AVCOL_RANGE_UNSPECIFIED {
             args += ":range=\(frame.pointee.color_range.rawValue)"
         }
+        // #853: decimate's output rate is the input link's rate times 4/5, and a link with no rate
+        // (0/1) fails the graph, so an inverse telecine graph declares the stream's.
+        let inverseTelecine = inverseTelecineBuildable()
+        if inverseTelecine {
+            args += ":frame_rate=\(config.sourceFrameRate.num)/\(config.sourceFrameRate.den)"
+        }
 
         var src: UnsafeMutablePointer<AVFilterContext>?
         var sink: UnsafeMutablePointer<AVFilterContext>?
@@ -225,13 +402,22 @@ final class DeinterlaceFilter {
             // compatible). deint=interlaced: progressive frames pass through (uploaded but
             // untouched).
             let swFmt = is10Bit(frame.pointee.format) ? "p010le" : "nv12"
-            let mode = config.fieldRate == .field ? "send_field" : "send_frame"
+            // #853: never field rate under inverse telecine, see the class doc.
+            let mode = config.fieldRate == .field && !inverseTelecine ? "send_field" : "send_frame"
             let deintOpts = "mode=\(mode):parity=auto:deint=interlaced"
-            chain = "format=\(swFmt),hwupload,yadif_videotoolbox=\(deintOpts)"
+            let hardwareFilter = hardwareFilter ?? ""
+            let gpuCadence = inverseTelecine && inverseTelecineOnGPU
+            if gpuCadence {
+                chain = "format=\(swFmt),hwupload,fieldmatch_videotoolbox=\(Self.inverseTelecineFieldMatchOptions),"
+                    + "decimate_videotoolbox,\(hardwareFilter)=\(deintOpts)"
+            } else {
+                chain = (inverseTelecine ? "\(Self.inverseTelecineFieldMatch),decimate," : "")
+                    + "format=\(swFmt),hwupload,\(hardwareFilter)=\(deintOpts)"
+            }
 
             guard let formatFilter = avfilter_get_by_name("format"),
                   let uploadFilter = avfilter_get_by_name("hwupload"),
-                  let deintFilter = avfilter_get_by_name("yadif_videotoolbox"),
+                  let deintFilter = avfilter_get_by_name(hardwareFilter),
                   let dev = hwDeviceRef else {
                 return false
             }
@@ -245,20 +431,32 @@ final class DeinterlaceFilter {
             }
             upC.pointee.hw_device_ctx = av_buffer_ref(dev)
             deintC.pointee.hw_device_ctx = av_buffer_ref(dev)
-            // yadif_videotoolbox init creates the Metal pipeline; failure here (no Metal
-            // device, e.g. some CI VMs) is the fallback trigger.
+            // The filter's init creates the Metal pipeline; failure here (no Metal device, e.g.
+            // some CI VMs) is the fallback trigger.
             let upInit = avfilter_init_str(upC, nil)
             let deintInit = avfilter_init_str(deintC, deintOpts)
             guard upInit >= 0, deintInit >= 0 else {
                 EngineLog.emit(
-                    "[Deinterlace] hw filter init failed hwupload=\(upInit) yadif_vt=\(deintInit)",
+                    "[Deinterlace] hw filter init failed hwupload=\(upInit) \(hardwareFilter)=\(deintInit)",
                     category: .swPlayback
                 )
                 return false
             }
-            guard avfilter_link(srcC, 0, fmtC, 0) >= 0,
+            // #853: CPU fieldmatch and decimate take CPU frames only, so they sit between the source
+            // and the format conversion. AE#1108: their GPU ports sit between the upload and the
+            // deinterlacer and take their frames context from the upload's link.
+            var head = srcC
+            var gpuTail = upC
+            if gpuCadence {
+                guard let decimateC = linkCadenceFilters(after: upC, in: g, onGPU: true) else { return false }
+                gpuTail = decimateC
+            } else if inverseTelecine {
+                guard let decimateC = linkCadenceFilters(after: srcC, in: g, onGPU: false) else { return false }
+                head = decimateC
+            }
+            guard avfilter_link(head, 0, fmtC, 0) >= 0,
                   avfilter_link(fmtC, 0, upC, 0) >= 0,
-                  avfilter_link(upC, 0, deintC, 0) >= 0,
+                  avfilter_link(gpuTail, 0, deintC, 0) >= 0,
                   avfilter_link(deintC, 0, sinkC, 0) >= 0 else {
                 EngineLog.emit("[Deinterlace] hw graph link failed", category: .swPlayback)
                 return false
@@ -269,7 +467,8 @@ final class DeinterlaceFilter {
             // linked frameworks. Always send_frame: see class doc. No hw device involved, so
             // the string-parse path is fine here.
             let filterName = avfilter_get_by_name("bwdif") != nil ? "bwdif" : "yadif"
-            chain = "\(filterName)=mode=send_frame:parity=auto:deint=interlaced"
+            let deinterlace = "\(filterName)=mode=send_frame:parity=auto:deint=interlaced"
+            chain = inverseTelecine ? "\(Self.inverseTelecineFieldMatch),\(deinterlace),decimate" : deinterlace
 
             var inputs = avfilter_inout_alloc()
             var outputs = avfilter_inout_alloc()
@@ -301,12 +500,16 @@ final class DeinterlaceFilter {
         }
 
         built = true
+        graphBuilds &+= 1
         graph = g
         srcCtx = src
         sinkCtx = sink
         engine = wanted
-        builtFilterName = wanted == .hardware ? "yadif_videotoolbox"
+        builtFilterName = wanted == .hardware ? hardwareFilter
             : (avfilter_get_by_name("bwdif") != nil ? "bwdif" : "yadif")
+        builtInverseTelecine = inverseTelecine
+        builtInverseTelecineHardware = inverseTelecine && inverseTelecineOnGPU && wanted == .hardware
+        lastInverseTelecinePTS = nil
         outputTimeBase = av_buffersink_get_time_base(sink)
         width = frame.pointee.width
         height = frame.pointee.height
@@ -317,6 +520,29 @@ final class DeinterlaceFilter {
             category: .swPlayback
         )
         return true
+    }
+
+    /// Creates `fieldmatch` and `decimate` (or their `_videotoolbox` ports) and links
+    /// `upstream -> fieldmatch -> decimate`. Returns `decimate`, or nil when either fails.
+    private func linkCadenceFilters(after upstream: UnsafeMutablePointer<AVFilterContext>,
+                                    in g: UnsafeMutablePointer<AVFilterGraph>,
+                                    onGPU: Bool) -> UnsafeMutablePointer<AVFilterContext>? {
+        let suffix = onGPU ? "_videotoolbox" : ""
+        guard let matchFilter = avfilter_get_by_name("fieldmatch" + suffix),
+              let decimateFilter = avfilter_get_by_name("decimate" + suffix) else { return nil }
+        var matchCtx: UnsafeMutablePointer<AVFilterContext>?
+        var decimateCtx: UnsafeMutablePointer<AVFilterContext>?
+        let matchRet = avfilter_graph_create_filter(&matchCtx, matchFilter, "match",
+                                                    Self.inverseTelecineFieldMatchOptions, nil, g)
+        let decimateRet = avfilter_graph_create_filter(&decimateCtx, decimateFilter, "decimate", nil, nil, g)
+        guard matchRet >= 0, decimateRet >= 0, let matchC = matchCtx, let decimateC = decimateCtx,
+              avfilter_link(upstream, 0, matchC, 0) >= 0,
+              avfilter_link(matchC, 0, decimateC, 0) >= 0 else {
+            EngineLog.emit("[Deinterlace] inverse telecine filters failed fieldmatch\(suffix)=\(matchRet) "
+                           + "decimate\(suffix)=\(decimateRet)", category: .swPlayback)
+            return nil
+        }
+        return decimateC
     }
 
     /// Create (once) the VideoToolbox hw device the hardware graph uploads into.
@@ -341,7 +567,29 @@ final class DeinterlaceFilter {
     /// call had emptied. The caller unrefs the frame after a successful push.
     func push(_ frame: UnsafeMutablePointer<AVFrame>) -> Int32 {
         guard let src = srcCtx else { return -1 }
-        return av_buffersrc_add_frame_flags(src, frame, Int32(AV_BUFFERSRC_FLAG_KEEP_REF))
+        let ret = av_buffersrc_add_frame_flags(src, frame, Int32(AV_BUFFERSRC_FLAG_KEEP_REF))
+        if ret >= 0, builtInverseTelecine, frame.pointee.pts != Int64.min {
+            lastInverseTelecinePTS = frame.pointee.pts
+        }
+        return ret
+    }
+
+    /// #853: `decimate` stamps its output from the graph's first frame plus one tick per frame it
+    /// keeps, never from the frames' own timestamps. A source frame that never arrives (a damaged or
+    /// cut stream) would then move every later picture against the audio for as long as the graph
+    /// lives. True when `frame` lands more than 1.75 source frame durations after the previous push
+    /// into an inverse telecine graph (one missing frame is 2; a soft-telecine frame that repeats a
+    /// field is 1.5 and rounds either side of it at 90 kHz, so a threshold of 1.5 rebuilt the graph on
+    /// every other such frame): the caller flushes the graph and lets this frame build a fresh
+    /// one, which anchors on it. A timestamp going backwards (a seam the decoder did not flush) is
+    /// the same discontinuity. A repeated timestamp is not: `decimate` ignores input timestamps.
+    func breaksInverseTelecineCadence(_ frame: UnsafeMutablePointer<AVFrame>, timeBase: AVRational) -> Bool {
+        guard builtInverseTelecine, let last = lastInverseTelecinePTS, frame.pointee.pts != Int64.min,
+              let rate = config.sourceFrameRate.framesPerSecond, rate > 0, timeBase.num > 0, timeBase.den > 0 else {
+            return false
+        }
+        let delta = Double(frame.pointee.pts - last) * Double(timeBase.num) / Double(timeBase.den)
+        return delta > 1.75 / rate || delta < 0
     }
 
     /// DEC-203: tells the graph no more input is coming, so yadif/bwdif release the frame they hold as
@@ -367,8 +615,19 @@ final class DeinterlaceFilter {
         guard code < 0, code != FFmpegErr.eagain, code != FFmpegErr.eof else { return false }
         graphErrorCount += 1
         let wasHardware = engine == .hardware
+        let wasGPUCadence = builtInverseTelecineHardware
         teardown()
-        if wasHardware { hwDisabled = true }
+        // A running GPU graph that errors goes straight to software, not to the next GPU filter:
+        // the cause is usually the device (hwupload ENOMEM, IOSurface pressure) and would hit the
+        // next filter too, and only the first filter's pipeline was warmed.
+        // AE#1108: a graph with the GPU cadence filters first gives up only those and keeps the GPU
+        // deinterlacer, which is far cheaper than the software chain. If the device was at fault,
+        // the next hardware graph errors too and goes to software as above.
+        if wasGPUCadence {
+            hwInverseTelecineDisabled = true
+        } else if wasHardware {
+            hwDisabled = true
+        }
         if graphErrorCount >= Self.maxGraphErrors { passthroughLatched = true }
         EngineLog.emit(
             "[Deinterlace] graph error \(FFmpegErr.text(for: code)), graph dropped "
@@ -398,6 +657,9 @@ final class DeinterlaceFilter {
         sinkCtx = nil
         engine = nil
         builtFilterName = nil
+        builtInverseTelecine = false
+        builtInverseTelecineHardware = false
+        lastInverseTelecinePTS = nil
         outputTimeBase = AVRational(num: 0, den: 1)
         width = 0
         height = 0

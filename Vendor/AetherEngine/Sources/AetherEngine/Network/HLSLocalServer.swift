@@ -76,6 +76,11 @@ protocol HLSSegmentProvider: AnyObject {
     /// describe them with. Nil on every producer-backed provider, which builds its master as before.
     var staticMasterPlaylistBody: String? { get }
 
+    /// AE#1122: the origin variant playlist the remote-HLS proxy already fetched, served VERBATIM at
+    /// `/origin_variant.m3u8`. Its URIs are absolute, so the media still comes from the origin. May block
+    /// the connection thread on a resume (`RemoteHLSResumeWarm.Gate`); `userAgent` is the requester's.
+    func servedVariantPlaylist(userAgent: String?) -> String?
+
     /// Master-playlist metadata. When masterCodecs is non-nil the server publishes master.m3u8; nil means media-playlist-only.
     var masterCodecs: String? { get }
     var masterResolution: (width: Int, height: Int)? { get }
@@ -126,8 +131,9 @@ protocol HLSSegmentProvider: AnyObject {
     /// playlist one segment per video segment, so the embedded reader (parked ~90s ahead of the playhead)
     /// has the cues for a segment in the store by the time AVPlayer fetches it.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String?
-    /// AE#1052: true while `ordinal` is a menu marker, served empty on purpose.
-    func nativeSubtitleServesSilently(ordinal: Int) -> Bool
+    /// AE#1052: true while `ordinal` is served empty on purpose (a menu marker, or a bitmap rendition
+    /// nothing fills), so an empty segment from it is no defect.
+    func nativeSubtitleServesEmptyByDesign(ordinal: Int) -> Bool
 
     /// AE#682: true when this session lists an I-frame rendition in its master. The two calls below
     /// answer `iframe_init.mp4` and `iframe{N}.mp4`; both may block on a source read.
@@ -135,7 +141,8 @@ protocol HLSSegmentProvider: AnyObject {
     /// What the rendition carries; nil reads as `.keyframes`.
     var iFrameRenditionFormat: IFrameRenditionFormat? { get }
     func iFrameInitSegment() -> Data?
-    func iFrameSegment(at index: Int) -> Data?
+    /// `isAbandoned` turns true once the client closed the connection that asked.
+    func iFrameSegment(at index: Int, isAbandoned: @escaping () -> Bool) -> Data?
 
     /// Atomic snapshot at the top of each playlist build. discontinuitySequence = EXT-X-DISCONTINUITY-tagged segments that slid out of the window (RFC 8216 §6.2.2 requires incrementing it; omission slips AVPlayer's discontinuity tracking one window per boundary). firstVisible in the same snapshot: a separate lock acquisition let a concurrent slide produce MEDIA-SEQUENCE newer than the count.
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int)
@@ -198,6 +205,7 @@ extension HLSSegmentProvider {
     func didServeMediaSegment(index: Int, delivered: Bool) {}
     func didDeliverProgressiveChunk(index: Int) {}
     var staticMasterPlaylistBody: String? { nil }
+    func servedVariantPlaylist(userAgent: String?) -> String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
     func initVersionID(forSegment index: Int) -> Int { 0 }
@@ -220,11 +228,12 @@ extension HLSSegmentProvider {
     var nativeSubtitleDefaultOrdinal: Int { 0 }
     var nativeSubtitleWholeProgram: Bool { false }
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? { nil }
-    func nativeSubtitleServesSilently(ordinal: Int) -> Bool { false }
+    func nativeSubtitleServesEmptyByDesign(ordinal: Int) -> Bool { false }
     var iFrameRenditionServed: Bool { false }
     var iFrameRenditionFormat: IFrameRenditionFormat? { nil }
     func iFrameInitSegment() -> Data? { nil }
-    func iFrameSegment(at index: Int) -> Data? { nil }
+    func iFrameSegment(at index: Int, isAbandoned: @escaping () -> Bool) -> Data? { nil }
+    func iFrameSegment(at index: Int) -> Data? { iFrameSegment(at: index, isAbandoned: { false }) }
     var liveTargetSegmentDuration: Double? { nil }
     var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? { nil }
     func noteServedLiveRejoinPlacement(timeOffset: Double, firstVisible: Int) {}
@@ -1183,6 +1192,15 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return send404(fd: fd, path: normalizedPath, reason: "no masterCodecs")
 
+        case "/\(RemoteHLSMasterRewrite.servedVariantURI)":
+            let userAgent = Self.requestHeader(
+                named: "user-agent", in: Array(text.components(separatedBy: "\r\n").dropFirst()))
+            guard let body = provider?.servedVariantPlaylist(userAgent: userAgent) else {
+                return send404(fd: fd, path: normalizedPath, reason: "no served origin variant")
+            }
+            return send200(fd: fd, path: normalizedPath, data: Data(body.utf8),
+                           contentType: "application/vnd.apple.mpegurl")
+
         case "/master_hdr.m3u8":
             // #98: HDR-preserving reduced master (DV signaling dropped, source range + subtitle
             // renditions kept), served by the #35 cold-DV-start gate on an HDR TV.
@@ -1273,8 +1291,10 @@ final class HLSLocalServer: @unchecked Sendable {
             // a visible level would push the surrounding evidence out of the 300-line ring, and it is
             // exactly the surrounding evidence that says WHY a segment came out empty.
             let cues = vtt.components(separatedBy: "-->").count - 1
-            // An AE#1052 marker is empty on purpose and gets refetched on the next select.
-            if cues == 0, prov.nativeSubtitleServesSilently(ordinal: parsed.ordinal) == false {
+            // AE#1052: a marker and a bitmap rendition nothing fills are empty on purpose, and the
+            // select that later gives either one text deselects and reselects, so AVKit asks again.
+            // The second case is logged once per rendition by the provider.
+            if cues == 0, prov.nativeSubtitleServesEmptyByDesign(ordinal: parsed.ordinal) == false {
                 EngineLog.emit("[HLSLocalServer] served an EMPTY subtitle .vtt ord=\(parsed.ordinal) "
                                + "seg=\(seg) bytes=\(vtt.utf8.count); the receiver caches this segment "
                                + "as it is and never asks again", category: .hlsServer)
@@ -1308,7 +1328,8 @@ final class HLSLocalServer: @unchecked Sendable {
 
         case let p where p.hasPrefix("/iframe") && p.hasSuffix(".mp4"):
             guard let index = Self.parseIFramePath(p),
-                  let data = provider?.iFrameSegment(at: index), !data.isEmpty else {
+                  let data = provider?.iFrameSegment(at: index, isAbandoned: { Self.peerHasClosed(fd) }),
+                  !data.isEmpty else {
                 return send404(fd: fd, path: normalizedPath, reason: "no I-frame for \(normalizedPath)")
             }
             return send200(fd: fd, path: normalizedPath, data: data, contentType: "video/mp4")
@@ -2023,6 +2044,17 @@ stateLock.lock()
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { entry in videoPrefixes.contains { entry.hasPrefix($0) } }
         return video.isEmpty ? codecs : video.joined(separator: ",")
+    }
+
+    /// True once the client closed its end. AVKit moves on while a request waits for the side reader,
+    /// and a request nobody reads any more should not cost a source read. Peeks, so a pipelined next
+    /// request on the same connection stays where it is.
+    static func peerHasClosed(_ fd: Int32) -> Bool {
+        var byte: UInt8 = 0
+        let n = recv(fd, &byte, 1, Int32(MSG_PEEK | MSG_DONTWAIT))
+        if n == 0 { return true }
+        if n < 0 { return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR }
+        return false
     }
 
     /// "/iframe{N}.mp4" -> N. nil for the init, for a negative or non-numeric index, and for any

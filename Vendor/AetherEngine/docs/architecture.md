@@ -94,16 +94,16 @@ The engine picks at load (`load(url:)` / `load(source:)`), in this order:
 1. **Audio-only**, when `LoadOptions.audioOnly` is set.
 2. Otherwise **by the video codec** (`VideoRoutingPolicy`).
    - The native side is an allowlist of what AVPlayer's HLS-fMP4 pipeline reliably accepts: HEVC, progressive H.264 and, on devices with a hardware AV1 decoder, AV1.
-   - Everything else goes to the software host: AV1 without hardware decode, VP9, VP8, MPEG-4 Part 2, MPEG-2, VC-1, interlaced H.264 (for deinterlacing), profiles VideoToolbox cannot decode, and every other codec.
+   - Everything else goes to the software host: AV1 without hardware decode, VP9, VP8, MPEG-4 Part 2, MPEG-2, VC-1, interlaced H.264 (for deinterlacing, except while an AirPlay receiver that shows video holds the route, AE#1070), profiles VideoToolbox cannot decode, and every other codec.
    - The full per-codec table, with the reason for each row, is in [formats.md, Software decode](formats.md#software-decode) and [Hardware decode](formats.md#hardware-decode).
 3. **How the source reaches AVPlayer.** Remote HLS can go to AVPlayer directly. HLS the engine reads itself feeds the loopback. MPEG-DASH becomes a virtual MP4 file. See [Native route variants](architecture-native.md#native-route-variants).
-4. **Optional stages**, all opt-in: low-resolution upscaling and Dolby Vision FEL composition (both can move a session onto the software path), the FEL curve fold, rendered object audio, the I-frame rendition and live recording. See [Optional video stages](architecture-software.md#optional-video-stages), [Audio routes and object audio](architecture-native.md#audio-routes-and-object-audio), [Trick play and scrub stills](architecture-native.md#trick-play-and-scrub-stills) and [Live recording](architecture-native.md#live-recording).
+4. **Optional stages**, all opt-in: low-resolution upscaling, picture processing (the HDR10 tone map) and Dolby Vision FEL composition (all three can move a session onto the software path), the FEL curve fold, rendered object audio, the I-frame rendition and live recording. See [Optional video stages](architecture-software.md#optional-video-stages), [Audio routes and object audio](architecture-native.md#audio-routes-and-object-audio), [Trick play and scrub stills](architecture-native.md#trick-play-and-scrub-stills) and [Live recording](architecture-native.md#live-recording).
 
 A few recoveries move a running session to another pipeline:
 
 - **Software escalation** (`SoftwarePathEscalation`): CoreMedia refuses the media mid-session, so the engine rebuilds the session on the software host.
 - **Remote HLS carriage fallback** (`RemoteHLSIngestFallback`): AVPlayer cannot play a remote HLS stream directly, so the engine reads it itself and serves it through the loopback.
-- **Return from the upscale route**: the upscaler gives up and the session goes back to native.
+- **Return from the upscale or picture processing route**: the stage gives up and the session goes back to native.
 
 `videoRoute` always reports the route actually running. The transitions are listed under [Effective video route](#effective-video-route-videoroute).
 
@@ -152,7 +152,7 @@ Precedence (highest first): `error > ended > idle > loading > stalled > seeking 
 
 A seek stays visible through `isSeeking` and `seekEvents`. The reader axis is visible nowhere else. On a source that delivers, nothing changes: the reader is `flowing` and a seek reads `.seeking`.
 
-**`.rebuffering`** is a buffer underrun on a healthy connection. Either AVPlayer is waiting to play, or a software pump (a read and feed loop on the software host) has paused its synchronizer (the clock that drives audio and video, see [architecture-software.md](architecture-software.md#software-decoder-pipeline)) to refill. The live feeder pauses at a dry ring, the on-demand loop when its audio lead is used up. `state` stays `.playing` throughout.
+**`.rebuffering`** is a buffer underrun on a healthy connection. Either AVPlayer is waiting to play, or a software pump (a read and feed loop on the software host) has paused its synchronizer (the clock that drives audio and video, see [architecture-software.md](architecture-software.md#software-decoder-pipeline)) to refill. The live feeder pauses at a dry ring, live without a DVR window at a dry source (AE#1121), the on-demand loop when its audio lead is used up. `state` stays `.playing` throughout.
 
 - The software host publishes its pumps' hold as `isRebuffering`. That is folded into `isBuffering` the same way the audio host's wait is, so the phase turns `.rebuffering` the moment the clock stops. A live source that merely pauses therefore reads `.rebuffering`, not `.playing` over a still picture ([history](measurements.md#live-pause-read-as-playing)).
 - When the software on-demand loop pauses, and how it resumes: [architecture-software.md, Rebuffering on the on-demand loop](architecture-software.md#rebuffering-on-the-on-demand-loop).
@@ -255,6 +255,7 @@ What stays the same: per-origin caps, FIFO ordering, pacing, cancellation drains
 
 - The task prefers `BlockingExecutor`, which runs its jobs on GCD's global queues. GCD adds a thread when one blocks.
 - Otherwise the task behaves like any detached task: it awaits, hops to the main actor, and can be cancelled.
+- **Its priority is fixed when it is enqueued.** The job lands on the global queue of that QoS, and a caller that awaits it later does not raise it, unlike a plain `Task.detached`. So work a caller waits for gets the caller's priority. The software host's load waited 11.7 s on a `.utility` packet cache setup in a busy test run, and 4.4 s at `.userInitiated`.
 - `BlockingWorkTests` pins both halves, and a test fails the build if a `Task.detached` comes back into `Sources/AetherEngine`.
 
 **Testing it.** `LIBDISPATCH_COOPERATIVE_POOL_STRICT=1` narrows the pool to one thread and reproduces pool exhaustion on any Mac. The full suite has to pass under it. How CI found the problem: [measurements.md, Cooperative pool exhaustion on CI](measurements.md#cooperative-pool-exhaustion-on-ci).
@@ -267,13 +268,14 @@ Bitmap subtitles (subtitles stored as images) are turned into text by OCR. Each 
 
 - `VNImageRequestHandler.perform` blocks while Vision works. Called directly from a Swift task, even `Task.detached`, it can exhaust the cooperative executor. So the embedded and sidecar OCR workers suspend during recognition instead of holding that executor.
 - One process-wide admission slot stays taken until the native call actually returns, including after cancellation. Cancelled callers still waiting in the queue leave without starting another thread.
+- The overlay's text reader (`recognizesBitmapSubtitleText`, AE#1114) goes through the same slot, so it never runs Vision next to the native worker.
 - Completed cues stay in the store. An embedded worker cancelled mid-batch invalidates that batch's advanced cursor (its read position), so selecting the track again collects the batch again instead of skipping unfinished cues.
 
 ## Dependencies
 
 | Package | License | Purpose |
 | --- | --- | --- |
-| [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) | LGPL-2.1-or-later | Slim FFmpeg 8.1 (avcodec / avformat / avutil / swresample / swscale / avfilter + zimg) for demux, HLS-fMP4 mux, AudioBridge E-AC-3 / FLAC encode, software-path dav1d decode, and sws_scale YUV → NV12 / P010. avfilter ships a trimmed filter set: zscale + tonemap + colorspace (HDR → SDR still extraction), bwdif + yadif + yadif_videotoolbox + hwupload (software and GPU deinterlacing), and the audio shaping graph (abuffer, abuffersink, aformat, aresample, pan, dialoguenhance, acompressor, alimiter; #923). The dca decoder's `x_heights` option decodes DTS:X height channels (#798). Bundles libzvbi for the DVB teletext decoder (#107). Shipped as dynamically linked frameworks, no GPL components. |
+| [FFmpegBuild](https://github.com/superuser404notfound/FFmpegBuild) | LGPL-2.1-or-later | Slim FFmpeg 8.1 (avcodec / avformat / avutil / swresample / swscale / avfilter + zimg) for demux, HLS-fMP4 mux, AudioBridge E-AC-3 / FLAC encode, software-path dav1d decode, and sws_scale YUV → NV12 / P010. avfilter ships a trimmed filter set: zscale + tonemap + colorspace (HDR → SDR still extraction), bwdif + yadif + bwdif_videotoolbox + yadif_videotoolbox + hwupload (software and GPU deinterlacing), and the audio shaping graph (abuffer, abuffersink, aformat, aresample, pan, dialoguenhance, acompressor, alimiter; #923). The dca decoder's `x_heights` option decodes DTS:X height channels (#798). Bundles libzvbi for the DVB teletext decoder (#107). Shipped as dynamically linked frameworks, no GPL components. |
 | [LibDovi](https://github.com/superuser404notfound/LibDovi) | MIT / Apache-2.0 | libdovi (the `dolby_vision` crate's C API) for live Dolby Vision Profile 7 to single-layer 8.1 RPU conversion (`dovi_convert_rpu_with_mode`, mode 2), so the Apple TV engages real DV on dual-layer UHD-BD remuxes instead of plain HDR10. The software FEL path uses the same library to read the reshaping and NLQ parameters for the Metal composer and to produce the per-frame 8.1 RPU it attaches as display metadata. The native FEL curve fold writes its polynomial mapping back with `dovi_rpu_set_polynomial_mapping`. Prebuilt xcframework, no Rust at the consumer's build time. |
 | [SMBClient](https://github.com/kishikawakatsumi/SMBClient) | MIT | Pure-Swift SMB2 client over `NWConnection`, used only by the opt-in `AetherEngineSMB` product (never linked by the core engine). NTLMv2 / guest, SMB 2.0.2 / 2.1. Replaced AMSMB2/libsmb2, which `EPERM`s on tvOS / iOS. |
 | [dav1d](https://code.videolan.org/videolan/dav1d) film grain synthesis, ported | BSD-2-Clause | `AV1FilmGrain.swift` (`AV1FilmGrainTables`) and `AV1FilmGrainShaderSource.swift` port dav1d's grain synthesis (`filmgrain_tmpl.c`, `fg_apply_tmpl.c`) to the CPU tables and the Metal pass of `GPUFrameConverter`, so the GPU route's picture matches dav1d's sample for sample. dav1d's notice is kept in both files. |
