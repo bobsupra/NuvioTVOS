@@ -893,7 +893,7 @@ struct ContentView: View {
             AtvloadlyNoticeCountdownDriver(release: atvloadlyNoticeRelease)
 
             // A quick Back during a transition (nothing focused) stays in the app.
-            RemoteBackGuard()
+            RemoteBackGuard(allowsAppExit: !isOverlayPresented)
                 .allowsHitTesting(false)
                 .frame(width: 0, height: 0)
         }

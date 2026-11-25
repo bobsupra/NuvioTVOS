@@ -75,3 +75,51 @@ final class CollectionSourceIdDecodingTests: XCTestCase {
         XCTAssertEqual(source.title, "Broken")
     }
 }
+
+final class CollectionsExportFileTests: XCTestCase {
+    private var root: URL!
+    private var caches: URL!
+    private var documents: URL!
+
+    override func setUpWithError() throws {
+        root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        caches = root.appendingPathComponent("Caches", isDirectory: true)
+        documents = root.appendingPathComponent("Documents", isDirectory: true)
+        try FileManager.default.createDirectory(at: documents, withIntermediateDirectories: true)
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+    }
+
+    func testExportUsesCacheURLAndRoundTripsUnknownMetadata() throws {
+        let data = Data(#"[{"id":"one","title":"One","extra":{"nested":[1,"keep"]}}]"#.utf8)
+        let expectedURL = caches.appendingPathComponent("nuvio-collections.json")
+
+        XCTAssertEqual(LocalCollectionsExportFile.primaryURL(cachesDirectory: caches), expectedURL)
+        try LocalCollectionsExportFile.write(data, cachesDirectory: caches)
+        let rows = try XCTUnwrap(LocalCollectionsExportFile.parse(LocalCollectionsExportFile.read(
+            cachesDirectory: caches,
+            documentsDirectory: documents
+        )))
+
+        let extra = try XCTUnwrap(rows[0]["extra"] as? [String: Any])
+        let nested = try XCTUnwrap(extra["nested"] as? [Any])
+        XCTAssertEqual(nested[0] as? Int, 1)
+        XCTAssertEqual(nested[1] as? String, "keep")
+    }
+
+    func testLegacyDocumentsFileIsUsedOnlyWhenPrimaryIsMissing() throws {
+        let legacyData = Data(#"[{"id":"legacy","title":"Legacy"}]"#.utf8)
+        let legacyURL = documents.appendingPathComponent("nuvio-collections.json")
+        try legacyData.write(to: legacyURL)
+
+        XCTAssertEqual(try LocalCollectionsExportFile.read(cachesDirectory: caches, documentsDirectory: documents), legacyData)
+
+        let currentData = Data("not-json".utf8)
+        try FileManager.default.createDirectory(at: caches, withIntermediateDirectories: true)
+        try currentData.write(to: caches.appendingPathComponent("nuvio-collections.json"))
+        XCTAssertEqual(try LocalCollectionsExportFile.read(cachesDirectory: caches, documentsDirectory: documents), currentData)
+        XCTAssertNil(LocalCollectionsExportFile.parse(currentData))
+    }
+}

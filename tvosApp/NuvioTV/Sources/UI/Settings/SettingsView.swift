@@ -13750,7 +13750,7 @@ private struct AudioVideoProcessingSettingsSection: View {
                     title: L10n.string("tvos_settings_upscale_scaler", fallback: "Upscaling Mode"),
                     subtitle: L10n.string(
                         "tvos_settings_upscale_scaler_subtitle",
-                        fallback: "AetherEngine only. Auto automatically applies Anime4K to animation and MetalFX to movies & TV shows. You can also force a specific engine or turn upscaling off."
+                        fallback: "AetherEngine only. Auto applies Anime4K to animation, MetalFX below 1080p, and Lanczos-3 for 1080p SDR movies & TV shows. You can also force a specific engine or turn upscaling off."
                     ),
                     selection: Binding(
                         get: {
@@ -20026,6 +20026,55 @@ private struct DetailsSectionOrderRow: View {
 
 // MARK: - Collections manager
 
+enum LocalCollectionsExportFile {
+    static let fileName = "nuvio-collections.json"
+
+    static func primaryURL(fileManager: FileManager = .default, cachesDirectory: URL? = nil) -> URL {
+        let directory = cachesDirectory ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? fileManager.temporaryDirectory
+        return directory.appendingPathComponent(fileName)
+    }
+
+    static func legacyDocumentsURL(fileManager: FileManager = .default, documentsDirectory: URL? = nil) -> URL? {
+        (documentsDirectory ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask).first)?
+            .appendingPathComponent(fileName)
+    }
+
+    static func write(_ data: Data, fileManager: FileManager = .default, cachesDirectory: URL? = nil) throws {
+        let url = primaryURL(fileManager: fileManager, cachesDirectory: cachesDirectory)
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func read(fileManager: FileManager = .default, cachesDirectory: URL? = nil, documentsDirectory: URL? = nil) throws -> Data {
+        let primary = primaryURL(fileManager: fileManager, cachesDirectory: cachesDirectory)
+        do {
+            return try Data(contentsOf: primary)
+        } catch {
+            let nsError = error as NSError
+            guard nsError.domain == NSCocoaErrorDomain,
+                  nsError.code == CocoaError.fileReadNoSuchFile.rawValue,
+                  let legacy = legacyDocumentsURL(fileManager: fileManager, documentsDirectory: documentsDirectory) else {
+                throw error
+            }
+            return try Data(contentsOf: legacy)
+        }
+    }
+
+    static func parse(_ data: Data) -> [[String: Any]]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        if let rows = object as? [[String: Any]] {
+            return rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) ? rows : nil
+        }
+        if let wrapped = object as? [String: Any],
+           let rows = wrapped["collections"] as? [[String: Any]],
+           rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) {
+            return rows
+        }
+        return nil
+    }
+}
+
 /// Settings → Layout → Collections: Android-style Export / Import / New entry
 /// points, liquid-glass panels, and a full create/edit form. Edits mutate the
 /// raw synced JSON so Android-only fields survive the round-trip.
@@ -20185,19 +20234,12 @@ private struct CollectionsSettingsSection: View {
         }
         // tvOS has no general pasteboard/share sheet for arbitrary files in this
         // context — write a stable JSON export the Import flow can re-load.
-        let url = Self.collectionsExportURL
         do {
-            try data.write(to: url, options: .atomic)
-            showToast("Exported to Documents/nuvio-collections.json")
+            try LocalCollectionsExportFile.write(data)
+            showToast("Exported on this Apple TV")
         } catch {
             showToast("Export failed: \(error.localizedDescription)")
         }
-    }
-
-    static var collectionsExportURL: URL {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return documents.appendingPathComponent("nuvio-collections.json")
     }
 
     private func importCollections(_ imported: [[String: Any]]) {
@@ -22644,7 +22686,7 @@ private struct ImportCollectionsSheet: View {
                     switch mode {
                     case .file:
                         VStack(alignment: .leading, spacing: 14) {
-                            Text(L10n.string("tvos_settings_looks_for_documents_nuvio_collections_js_6c13671b", fallback: "Looks for Documents/nuvio-collections.json — the file written by Export on this Apple TV."))
+                            Text(L10n.string("tvos_settings_looks_for_export_on_this_apple_tv", fallback: "Looks for the collections export saved on this Apple TV."))
                                 .font(.system(size: 18, weight: .medium))
                                 .foregroundColor(.white.opacity(0.55))
                                 .fixedSize(horizontal: false, vertical: true)
@@ -22737,16 +22779,10 @@ private struct ImportCollectionsSheet: View {
     }
 
     private func loadLocalExport() {
-        let url = CollectionsSettingsSection.collectionsExportURL
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            loadedRows = nil
-            statusNote = "No export file found yet. Use Export first, or switch to From URL."
-            errorMessage = nil
-            return
-        }
+        statusNote = nil
         do {
-            let data = try Data(contentsOf: url)
-            guard let rows = parseCollections(data: data) else {
+            let data = try LocalCollectionsExportFile.read()
+            guard let rows = LocalCollectionsExportFile.parse(data) else {
                 loadedRows = nil
                 errorMessage = "Export file is not valid collections JSON"
                 return
@@ -22756,7 +22792,13 @@ private struct ImportCollectionsSheet: View {
             errorMessage = nil
         } catch {
             loadedRows = nil
-            errorMessage = error.localizedDescription
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain && nsError.code == CocoaError.fileReadNoSuchFile.rawValue {
+                statusNote = "No export file found yet. Use Export first, or switch to From URL."
+                errorMessage = nil
+            } else {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -22775,7 +22817,7 @@ private struct ImportCollectionsSheet: View {
                 errorMessage = "HTTP \(http.statusCode)"
                 return
             }
-            guard let rows = parseCollections(data: data) else {
+            guard let rows = LocalCollectionsExportFile.parse(data) else {
                 errorMessage = "URL did not return valid collections JSON"
                 loadedRows = nil
                 return
@@ -22788,18 +22830,6 @@ private struct ImportCollectionsSheet: View {
         }
     }
 
-    private func parseCollections(data: Data) -> [[String: Any]]? {
-        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
-        if let rows = object as? [[String: Any]] {
-            return rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) ? rows : nil
-        }
-        if let wrapped = object as? [String: Any],
-           let rows = wrapped["collections"] as? [[String: Any]],
-           rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) {
-            return rows
-        }
-        return nil
-    }
 }
 
 private struct CollectionCatalogPickerSheet: View {

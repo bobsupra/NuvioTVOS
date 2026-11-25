@@ -11979,14 +11979,14 @@ struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if filled {
-            if #available(tvOS 26.0, *) {
+            if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                 content
                     .background(Color.white.opacity(0.96), in: shape)
                     .glassEffect(.regular, in: shape)
             } else {
                 content.background(Color.white, in: shape)
             }
-        } else if #available(tvOS 26.0, *) {
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content
                 .background(Color.black.opacity(0.20), in: shape)
                 .background(Color.white.opacity(0.08), in: shape)
@@ -12000,18 +12000,26 @@ struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
 }
 
 /// Translucent "liquid glass" fill used by the stream picker panel and cards.
-/// Uses real Liquid Glass on tvOS 26+, falling back to a frosted material with
-/// a matching tint on older systems so the look stays consistent.
+/// Uses real Liquid Glass on supported tvOS 26 hardware, falling back to a
+/// frosted material with a matching tint on older or unsupported hardware.
+///
+/// The glass effect lives in a sibling background layer rather than wrapping
+/// `content`: on tvOS 26+, applying `.glassEffect` directly around a
+/// `ScrollView` prevents `UIContextMenuInteraction` from hiding the source card
+/// while lifted, rendering a duplicate overlapping copy behind the menu.
 private struct TvStreamGlass<S: InsettableShape>: ViewModifier {
     let shape: S
     let tint: Color
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content
-                .background(tint, in: shape)
-                .glassEffect(.regular, in: shape)
+                .background {
+                    shape
+                        .fill(tint)
+                        .glassEffect(.regular, in: shape)
+                }
         } else {
             content
                 .background(.ultraThinMaterial, in: shape)
@@ -13959,12 +13967,13 @@ private struct TvStreamCard: View {
                     )
             )
         }
-        .buttonStyle(TvStreamCardButtonStyle(isFocused: isFocused))
+        .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: focusID))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(looksFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+        .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 22, style: .continuous))
         .contextMenu {
             Section(L10n.string("details_play_with", fallback: "Play with")) {
                 ForEach(ExternalPlayer.allCases) { player in
@@ -14026,57 +14035,6 @@ private struct TvStreamCard: View {
         } else {
             fallback.frame(width: size, height: size)
         }
-    }
-}
-
-/// PosterCardButtonStyle for a source card, with an opaque fill once the card
-/// is held long enough to open its "Play with" menu.
-///
-/// When the menu opens, tvOS draws an enlarged copy of the card over the card
-/// and keeps it there while the menu is up. The copy is a snapshot taken as the
-/// menu opens. The card's own fill is mostly transparent, so a transparent copy
-/// let the card show through it, and the two sets of text overlapped. The fill
-/// appears a quarter of a second into a press, before tvOS takes the snapshot,
-/// so the copy is opaque and hides the card. A click is shorter, so it looks as
-/// before. tvOS leaves the card pressed after Back until focus moves; the fill
-/// goes as soon as the card has its focus again.
-private struct TvStreamCardButtonStyle: ButtonStyle {
-    let isFocused: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        TvStreamCardPressBody(configuration: configuration, isFocused: isFocused)
-    }
-}
-
-private struct TvStreamCardPressBody: View {
-    let configuration: ButtonStyleConfiguration
-    let isFocused: Bool
-    /// Pressed for longer than a click.
-    @State private var isHeld = false
-    /// Focus came back from the menu while tvOS still reports the card pressed.
-    @State private var isBackFromMenu = false
-
-    var body: some View {
-        configuration.label
-            .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(Color(white: 0.12))
-                    .opacity(isHeld && !isBackFromMenu ? 1 : 0)
-            )
-            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
-            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
-            .task(id: configuration.isPressed) {
-                guard configuration.isPressed else {
-                    isHeld = false
-                    isBackFromMenu = false
-                    return
-                }
-                try? await Task.sleep(for: .milliseconds(250))
-                if !Task.isCancelled { isHeld = true }
-            }
-            .onChange(of: isFocused) { _, focused in
-                if focused, isHeld { isBackFromMenu = true }
-            }
     }
 }
 
