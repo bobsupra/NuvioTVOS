@@ -14031,27 +14031,54 @@ private struct TvStreamCard: View {
     }
 }
 
-/// PosterCardButtonStyle for a source card, with an opaque fill while the
-/// card is held down after focus has moved to its "Play with" menu.
+/// PosterCardButtonStyle for a source card, with an opaque fill once the card
+/// is held long enough to open its "Play with" menu.
 ///
-/// Holding Select opens the menu: tvOS draws a slightly enlarged copy of the
-/// held card over the card itself. The card's fill is mostly transparent, so
-/// the card showed through that copy, shrunk by the press effect, and the two
-/// sets of text overlapped. The fill only shows while the menu has focus: a
-/// quick press is still focused, and tvOS leaves the card pressed after Back
-/// until focus moves, by which time the card has its focus again.
+/// When the menu opens, tvOS draws an enlarged copy of the card over the card
+/// and keeps it there while the menu is up. The copy is a snapshot taken as the
+/// menu opens. The card's own fill is mostly transparent, so a transparent copy
+/// let the card show through it, and the two sets of text overlapped. The fill
+/// appears a quarter of a second into a press, before tvOS takes the snapshot,
+/// so the copy is opaque and hides the card. A click is shorter, so it looks as
+/// before. tvOS leaves the card pressed after Back until focus moves; the fill
+/// goes as soon as the card has its focus again.
 private struct TvStreamCardButtonStyle: ButtonStyle {
     let isFocused: Bool
 
     func makeBody(configuration: Configuration) -> some View {
+        TvStreamCardPressBody(configuration: configuration, isFocused: isFocused)
+    }
+}
+
+private struct TvStreamCardPressBody: View {
+    let configuration: ButtonStyleConfiguration
+    let isFocused: Bool
+    /// Pressed for longer than a click.
+    @State private var isHeld = false
+    /// Focus came back from the menu while tvOS still reports the card pressed.
+    @State private var isBackFromMenu = false
+
+    var body: some View {
         configuration.label
             .background(
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
                     .fill(Color(white: 0.12))
-                    .opacity(configuration.isPressed && !isFocused ? 1 : 0)
+                    .opacity(isHeld && !isBackFromMenu ? 1 : 0)
             )
             .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
             .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
+            .task(id: configuration.isPressed) {
+                guard configuration.isPressed else {
+                    isHeld = false
+                    isBackFromMenu = false
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+                if !Task.isCancelled { isHeld = true }
+            }
+            .onChange(of: isFocused) { _, focused in
+                if focused, isHeld { isBackFromMenu = true }
+            }
     }
 }
 
