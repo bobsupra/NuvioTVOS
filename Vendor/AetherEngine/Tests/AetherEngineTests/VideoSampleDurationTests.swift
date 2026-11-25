@@ -12,6 +12,7 @@
 // can never overshoot.
 import Foundation
 import Testing
+import AetherLibavutil
 @testable import AetherEngine
 
 @Suite("Video sample-duration telescoping (#92)")
@@ -105,5 +106,99 @@ struct VideoSampleDurationTests {
             existingDuration: 42, dts: Int64.min, nextDts: 1_000, fallback: 33, capTicks: 10_000) == 42)
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
             existingDuration: 0, dts: 1_000, nextDts: Int64.min, fallback: 33, capTicks: 10_000) == 33)
+    }
+
+    @Test("CFRFrameGrid transitions between snapped and off-grid frames telescope without overshoot")
+    func frameGridTransitionsTelescopeInMuxerTimeBase() throws {
+        let ms = AVRational(num: 1, den: 1000)
+        let grid = try #require(CFRFrameGrid.make(
+            sourceTimeBase: ms,
+            frameRate: AVRational(num: 24000, den: 1001),
+            startPts: 0
+        ))
+        let muxerTb = grid.outputTimeBase
+
+        // Field trace shape around t=486..490s:
+        // - off-grid frame -> snapped frame (prev duration 42ms=1008 would overshoot by 12 ticks)
+        // - PTS-snapped / DTS-off-grid (488239) -> off-grid (488280) (-17 ticks before fix)
+        // - PTS-snapped / DTS-off-grid (489782) -> snapped (489823) (-25 ticks before fix)
+        // - off-grid (490157) -> snapped (490199) (-23 ticks before fix)
+        let samples: [(pts: Int64, dts: Int64, duration: Int64)] = [
+            (486_947, 486_945, 42),  // PTS 486947 is 27 ticks off slot 11675 (off-grid)
+            (486_987, 486_987, 42),  // snapped to 11676*1001 = 11687676
+            (488_238, 488_239, 41),  // PTS snaps (11706*1001), DTS 488239*24=11717736 is 30 ticks off (unsnapped)
+            (488_281, 488_280, 42),  // PTS 488281 is 37 ticks off slot 11707 (off-grid)
+            (489_781, 489_782, 41),  // PTS snaps (11743*1001), DTS 489782*24=11754768 is 25 ticks off (unsnapped)
+            (489_823, 489_823, 42),  // snapped to 11744*1001 = 11755744
+            (490_158, 490_157, 42),  // PTS 490158 is 32 ticks off slot 11752 (off-grid)
+            (490_198, 490_199, 42),  // PTS snaps (11753*1001), DTS 490199 snaps to 11753*1001 = 11764753
+        ]
+
+        let placements = samples.map { s in
+            HLSSegmentProducer.placeVideoPacket(
+                pts: s.pts,
+                dts: s.dts,
+                sourceDuration: s.duration,
+                sourceTimeBase: ms,
+                muxerTimeBase: muxerTb,
+                shift: 0,
+                frameGrid: grid,
+                pulldownRetimer: nil
+            )
+        }
+
+        for i in 0..<(placements.count - 1) {
+            let duration = HLSSegmentProducer.resolveVideoSampleDuration(
+                existingDuration: placements[i].duration,
+                dts: placements[i].dts,
+                nextDts: placements[i + 1].dts,
+                fallback: 42 * 24,
+                capTicks: 10_000 * 24
+            )
+            #expect(duration > 0)
+            #expect(placements[i].dts + duration == placements[i + 1].dts,
+                    "idx \(i): dts+dur \(placements[i].dts + duration) != next \(placements[i + 1].dts)")
+        }
+    }
+
+    @Test("PulldownCadenceRetimer placements telescope without overshoot in muxer time base")
+    func pulldownRetimerTelescopesInMuxerTimeBase() throws {
+        let ms = AVRational(num: 1, den: 1000)
+        let grid = try #require(CFRFrameGrid.make(
+            sourceTimeBase: ms,
+            frameRate: AVRational(num: 24000, den: 1001),
+            startPts: 0
+        ))
+        let retimer = try #require(PulldownCadenceRetimer(grid: grid))
+        let muxerTb = grid.outputTimeBase
+
+        var placements: [HLSSegmentProducer.VideoOutputPlacement] = []
+        for (idx, pts) in PulldownCadenceRetimerTests.clipPts.enumerated() {
+            let dts = PulldownCadenceRetimerTests.clipDts[idx] ?? Int64.min
+            placements.append(HLSSegmentProducer.placeVideoPacket(
+                pts: pts,
+                dts: dts,
+                sourceDuration: 50,
+                sourceTimeBase: ms,
+                muxerTimeBase: muxerTb,
+                shift: 0,
+                frameGrid: grid,
+                pulldownRetimer: retimer
+            ))
+        }
+
+        for i in 0..<(placements.count - 1) {
+            let prev = placements[i]
+            let next = placements[i + 1]
+            guard prev.dts != Int64.min, next.dts != Int64.min, next.dts > prev.dts else { continue }
+            let duration = HLSSegmentProducer.resolveVideoSampleDuration(
+                existingDuration: prev.duration,
+                dts: prev.dts,
+                nextDts: next.dts,
+                fallback: 42 * 24,
+                capTicks: 10_000 * 24
+            )
+            #expect(prev.dts + duration == next.dts)
+        }
     }
 }

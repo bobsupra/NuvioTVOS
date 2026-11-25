@@ -719,6 +719,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// One-packet look-behind; next packet's dts fills pending.duration when per-block duration is missing.
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
+    private var pendingVideoPlacement: VideoOutputPlacement?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
 
     /// Live segment index captured when pending packet was examined; the live cutter advances at keyframes.
@@ -2761,7 +2762,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 firstSyncItemPtsBySegment[currentMuxerSegmentIndex] =
                     planBoundaryAxis.timestamp(dts: pending.pointee.dts, pts: pending.pointee.pts)
             }
-            finalizeAndWriteVideo(pending, nextDts: nil, muxer: muxer)
+            finalizeAndWriteVideo(pending, nextPacket: nil, muxer: muxer)
             bumpPacketsWritten()
         }
         switch muxer.cutFragmentForNextSegment(newIdx) {
@@ -4999,12 +5000,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                                                    pts: prev.pointee.pts)
                                 }
                             }
-                            finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
+                            finalizeAndWriteVideo(prev, nextPacket: packet, muxer: muxer)
                             bumpPacketsWritten()
                         } else {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
                             trackedPacketFree(&pkt)
                             pendingVideoPkt = nil
+                            pendingVideoPlacement = nil
                             exitReason = .muxerFailed
                             break readLoop
                         }
@@ -5148,11 +5150,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if let prev = pendingVideoPkt {
             let prevSeg = pendingVideoSegIndex   // unified: live + VOD both carry the routed index
             if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
-                finalizeAndWriteVideo(prev, nextDts: nil, muxer: muxer)
+                finalizeAndWriteVideo(prev, nextPacket: nil, muxer: muxer)
                 bumpPacketsWritten()
             } else {
                 var pkt: UnsafeMutablePointer<AVPacket>? = prev
                 trackedPacketFree(&pkt)
+                pendingVideoPlacement = nil
             }
             pendingVideoPkt = nil
         }
@@ -5341,19 +5344,93 @@ final class HLSSegmentProducer: @unchecked Sendable {
             : Int64.max
     }
 
+    /// Output-time-base timestamps and placement outcome for a video packet before telescoping
+    /// duration to its successor's output DTS.
+    struct VideoOutputPlacement: Equatable {
+        enum Outcome: Equatable {
+            case passedThrough
+            case gridded
+            case retimed
+        }
+
+        let muxerTimeBase: AVRational
+        let pts: Int64
+        let dts: Int64
+        let duration: Int64
+        let outcome: Outcome
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.muxerTimeBase.num == rhs.muxerTimeBase.num
+                && lhs.muxerTimeBase.den == rhs.muxerTimeBase.den
+                && lhs.pts == rhs.pts
+                && lhs.dts == rhs.dts
+                && lhs.duration == rhs.duration
+                && lhs.outcome == rhs.outcome
+        }
+    }
+
+    static func rescaledVideoTicks(
+        _ ticks: Int64,
+        from sourceTimeBase: AVRational,
+        to targetTimeBase: AVRational
+    ) -> Int64 {
+        guard ticks != Int64.min,
+              sourceTimeBase.num > 0, sourceTimeBase.den > 0,
+              targetTimeBase.num > 0, targetTimeBase.den > 0 else {
+            return ticks
+        }
+        return av_rescale_q(ticks, sourceTimeBase, targetTimeBase)
+    }
+
+    /// Computes a packet's output `(pts, dts, duration)` in `muxerTimeBase`, applying
+    /// `pulldownRetimer` / `frameGrid` when active on a matching grid muxer and otherwise rescaling
+    /// from `sourceTimeBase`.
+    static func placeVideoPacket(
+        pts: Int64,
+        dts: Int64,
+        sourceDuration: Int64,
+        sourceTimeBase: AVRational,
+        muxerTimeBase: AVRational,
+        shift: Int64,
+        frameGrid: CFRFrameGrid?,
+        pulldownRetimer: PulldownCadenceRetimer?
+    ) -> VideoOutputPlacement {
+        let onGridMuxer = frameGrid.map { muxerTimeBase.den == $0.outputTimeBase.den } ?? false
+        let gridded: (pts: Int64, dts: Int64, duration: Int64)?
+        if !onGridMuxer {
+            gridded = nil
+        } else if let pulldownRetimer {
+            gridded = pulldownRetimer.place(pts: pts, dts: dts, duration: sourceDuration, shift: shift)
+        } else {
+            gridded = frameGrid?.place(pts: pts, dts: dts, duration: sourceDuration, shift: shift)
+        }
+        if let gridded {
+            let outcome: VideoOutputPlacement.Outcome =
+                pulldownRetimer?.lastOutcome == .retimed ? .retimed : .gridded
+            return VideoOutputPlacement(
+                muxerTimeBase: muxerTimeBase,
+                pts: gridded.pts,
+                dts: gridded.dts,
+                duration: gridded.duration,
+                outcome: outcome
+            )
+        }
+        return VideoOutputPlacement(
+            muxerTimeBase: muxerTimeBase,
+            pts: rescaledVideoTicks(pts, from: sourceTimeBase, to: muxerTimeBase),
+            dts: rescaledVideoTicks(dts, from: sourceTimeBase, to: muxerTimeBase),
+            duration: sourceDuration > 0
+                ? rescaledVideoTicks(sourceDuration, from: sourceTimeBase, to: muxerTimeBase)
+                : sourceDuration,
+            outcome: .passedThrough
+        )
+    }
+
     private func finalizeAndWriteVideo(
         _ packet: UnsafeMutablePointer<AVPacket>,
-        nextDts: Int64?,
+        nextPacket: UnsafeMutablePointer<AVPacket>?,
         muxer: MP4SegmentMuxer
     ) {
-        packet.pointee.duration = Self.resolveVideoSampleDuration(
-            existingDuration: packet.pointee.duration,
-            dts: packet.pointee.dts,
-            nextDts: nextDts,
-            fallback: videoFallbackDurationPts,
-            capTicks: videoSampleDurationCapTicks
-        )
-
         packet.pointee.stream_index = muxer.videoOutputStreamIndex
 
         if !hdr10PlusDetected, HDR10PlusMetadataScan.packetCarriesHDR10Plus(
@@ -5396,31 +5473,77 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let tapSourceKey = packet.pointee.pts
         let tapForWrite = convertP7Active ? videoPacketTapProvider?() : nil
 
-        // AE#886: decided on the source time base, before the rescale rounds it away.
-        // Sodalite#236: the retimer owns every packet of a 24p grid, so its window sees them all.
-        let onGridMuxer = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den
-        let gridded: (pts: Int64, dts: Int64, duration: Int64)?
-        if !onGridMuxer {
-            gridded = nil
-        } else if let pulldownRetimer {
-            gridded = pulldownRetimer.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
-                                            duration: packet.pointee.duration, shift: videoShiftPts)
+        // AE#886 / Sodalite#236: place both the look-behind packet and its successor on the muxer's
+        // output time base BEFORE resolving duration, then telescope duration to `next.dts - prev.dts`
+        // in that output time base. Resolving duration in the source time base before placement left
+        // snapped/unsnapped transitions and off-grid DTS fallbacks with `prev.dts + prev.duration >
+        // next.dts`, tripping movenc's `check_pkt` (`Packet duration: -N ... out of range` + `pts has
+        // no value`).
+        let muxerTb = muxer.muxerVideoTimeBase
+        let prevPlacement: VideoOutputPlacement
+        if let cached = pendingVideoPlacement,
+           cached.muxerTimeBase.num == muxerTb.num,
+           cached.muxerTimeBase.den == muxerTb.den {
+            prevPlacement = cached
         } else {
-            gridded = frameGrid?.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
-                                       duration: packet.pointee.duration, shift: videoShiftPts)
+            prevPlacement = Self.placeVideoPacket(
+                pts: packet.pointee.pts,
+                dts: packet.pointee.dts,
+                sourceDuration: packet.pointee.duration,
+                sourceTimeBase: sourceVideoTimeBase,
+                muxerTimeBase: muxerTb,
+                shift: videoShiftPts,
+                frameGrid: frameGrid,
+                pulldownRetimer: pulldownRetimer
+            )
         }
-        av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
-        if let gridded {
-            packet.pointee.pts = gridded.pts
-            packet.pointee.dts = gridded.dts
-            packet.pointee.duration = gridded.duration
-            if onGridMuxer, pulldownRetimer?.lastOutcome == .retimed {
-                retimedVideoPackets += 1
-            } else {
-                griddedVideoPackets += 1
+
+        let nextPlacement: VideoOutputPlacement?
+        if let nextPacket {
+            let placedNext = Self.placeVideoPacket(
+                pts: nextPacket.pointee.pts,
+                dts: nextPacket.pointee.dts,
+                sourceDuration: nextPacket.pointee.duration,
+                sourceTimeBase: sourceVideoTimeBase,
+                muxerTimeBase: muxerTb,
+                shift: videoShiftPts,
+                frameGrid: frameGrid,
+                pulldownRetimer: pulldownRetimer
+            )
+            pendingVideoPlacement = placedNext
+            nextPlacement = placedNext
+        } else {
+            pendingVideoPlacement = nil
+            nextPlacement = nil
+        }
+
+        let muxerCapTicks = videoSampleDurationCapTicks == Int64.max
+            ? Int64.max
+            : Self.rescaledVideoTicks(videoSampleDurationCapTicks, from: sourceVideoTimeBase, to: muxerTb)
+        let muxerFallback = videoFallbackDurationPts > 0
+            ? max(1, Self.rescaledVideoTicks(videoFallbackDurationPts, from: sourceVideoTimeBase, to: muxerTb))
+            : videoFallbackDurationPts
+
+        let resolvedDuration = Self.resolveVideoSampleDuration(
+            existingDuration: prevPlacement.duration,
+            dts: prevPlacement.dts,
+            nextDts: nextPlacement?.dts,
+            fallback: muxerFallback,
+            capTicks: muxerCapTicks
+        )
+
+        packet.pointee.pts = prevPlacement.pts
+        packet.pointee.dts = prevPlacement.dts
+        packet.pointee.duration = resolvedDuration
+        switch prevPlacement.outcome {
+        case .retimed:
+            retimedVideoPackets += 1
+        case .gridded:
+            griddedVideoPackets += 1
+        case .passedThrough:
+            if frameGrid != nil {
+                offGridVideoPackets += 1
             }
-        } else if frameGrid != nil {
-            offGridVideoPackets += 1
         }
         let write = writeMuxPacket { muxer.writePacket(packet) }
         if write.rc < 0, !loggedVideoWriteFailure {
