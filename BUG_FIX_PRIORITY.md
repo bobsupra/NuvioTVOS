@@ -1,6 +1,6 @@
 # NuvioTVOS Bug Fix Priority & Remediation Plan
 
-**Generated:** 2026-11-25  
+**Generated:** 2026-11-25<br>
 **Source:** [BUG_AUDIT_REPORT.md](file:///Users/suupra./Downloads/NuvioTVOS/BUG_AUDIT_REPORT.md)
 
 This plan sequences remediation by **user impact, regression risk, and engineering leverage**. Each phase should land with its corresponding regression tests enabled in CI.

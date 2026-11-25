@@ -1,7 +1,7 @@
 # NuvioTVOS Full Codebase Bug & Stability Audit Report
 
-**Audit Date:** 2026-11-25  
-**Scope:** Complete `NuvioTVOS` repository (`tvosApp/NuvioTV`, `tvosApp/TopShelf`, `tvosApp/NuvioTV/AIOInstaller`, `supabase`, and `Vendor/AetherEngine`)  
+**Audit Date:** 2026-11-25<br>
+**Scope:** Complete `NuvioTVOS` repository (`tvosApp/NuvioTV`, `tvosApp/TopShelf`, `tvosApp/NuvioTV/AIOInstaller`, `supabase`, and `Vendor/AetherEngine`)<br>
 **Policy:** Read-only audit — **zero production source files modified**.
 
 ---

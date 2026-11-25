@@ -243,4 +243,3 @@ test('local proxy forwards page assets and API requests, exchanges QR token, str
   assert.equal(denied.status, 200, 'same-device access survives peer-session revocation');
   assert.equal(stripSetupCookie(`a=1; ${setupCookie}=secret; b=2`), 'a=1; b=2');
 });
-
