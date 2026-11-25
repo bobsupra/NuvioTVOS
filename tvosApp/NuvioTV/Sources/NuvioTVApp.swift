@@ -1603,20 +1603,29 @@ struct ContentView: View {
         // session still makes retries/idempotent duplicate callbacks harmless.
         guard !callback.isError else { return }
 
-        let callbackDuration = callback.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        let duration = callbackDuration
-            ?? session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        let progress = callback.progress ?? callback.position.flatMap { position in
-            guard let duration, position.isFinite, position >= 0 else { return nil }
-            let normalizedProgress = position / duration
-            guard callbackDuration != nil,
-                  position > duration,
-                  position - duration <= 1 else {
-                return normalizedProgress
+        guard let report = callback.report(
+            listedDuration: session.duration,
+            startPosition: session.startPosition
+        ) else { return }
+        let progress = report.progress
+        let duration = report.duration
+        // Plex hears about built-in playback while it plays, and nothing while
+        // another app plays. Tell it where that app stopped, so its resume
+        // point and watched state match. A player closed before anything
+        // played says nothing new, and Plex may have a later position from
+        // another Plex app.
+        if progress > 0, !report.isAtStart, let position = report.position {
+            let sourceURL = session.sourceURL
+            let reportedDuration = report.duration
+            Task { @MainActor in
+                await PlexPlaybackSync.shared.externalPlaybackEnded(
+                    url: sourceURL,
+                    position: position,
+                    duration: reportedDuration
+                )
             }
-            return 1
         }
-        guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
+
         // External callbacks can underreport EOF position; allow up to two minutes of grace,
         // with an 80% floor, while built-in playback keeps its stream-timed threshold.
         let callbackCompletionCutoff: (Double) -> Double = { completionFraction in
@@ -1646,7 +1655,7 @@ struct ContentView: View {
                 let reportDuration = duration ?? 100
                 let reportPosition = isComplete
                     ? reportDuration
-                    : (duration.map { $0 * progress } ?? (100 * progress))
+                    : (duration.map { report.position ?? $0 * progress } ?? (100 * progress))
                 let action: TraktScrobbleAction = isComplete ? .stop : .pause
                 let store = ProfileSettings.current
                 if let localCheckpointDuration = duration ?? (isComplete ? reportDuration : nil) {
@@ -1709,7 +1718,7 @@ struct ContentView: View {
                 episode: session.episode
             )
         } else if let duration, progress > 0 {
-            let position = duration * progress
+            let position = report.position ?? duration * progress
             if position >= WatchProgressLedger.minimumTrackableSeconds {
                 ContinueWatchingDismissStore.clear(contentId: session.meta.id)
             }
@@ -2301,9 +2310,12 @@ struct ContentView: View {
                 sourceURL: url.absoluteString,
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
-                duration: Self.runtimeSeconds(meta.runtime),
+                // Plex has a Plex stream's exact length. A listed runtime
+                // can be minutes off.
+                duration: PlexPlaybackSync.shared.duration(for: url) ?? Self.runtimeSeconds(meta.runtime),
                 profileID: profileID,
-                collectionContext: provenance
+                collectionContext: provenance,
+                startPosition: resumeFrom
             )
             successCallback = URL(string: "nuvio-tv://external-playback/\(id)")
             errorCallback = URL(string: "nuvio-tv://external-playback/error/\(id)")
