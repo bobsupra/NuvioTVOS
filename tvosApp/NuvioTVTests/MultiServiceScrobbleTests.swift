@@ -120,20 +120,21 @@ final class MultiServiceScrobbleTests: XCTestCase {
         TraktAuthStore.saveUser(username: "Test", slug: slug, store: store)
     }
 
-    private func authenticateMdbList(in store: UserDefaults, tokenStorage: MdbListTokenStorage = MdbListKeychainTokenStorage()) {
+    private func authenticateMdbList(in store: UserDefaults) {
         let tokens = MdbListStoredTokens(
             accessToken: "test-mdblist-access",
             refreshToken: "test-mdblist-refresh",
             expiresAtMillis: Date().timeIntervalSince1970 * 1_000 + 3_600_000
         )
         let scope = MdbListRuntimeSession.profileScope()
-        _ = MdbListAuthStore.saveTokens(
+        let storage = MdbListKeychainTokenStorage(keychain: InMemoryProviderCredentialKeychain())
+        XCTAssertTrue(MdbListAuthStore.saveTokens(
             tokens,
             user: MdbListUser(accountID: "1", username: "testuser", displayName: "Test User"),
             profileScope: scope,
             store: store,
-            tokenStorage: tokenStorage
-        )
+            tokenStorage: storage
+        ))
     }
 
     func testNuvioSyncMirrorDefaultsOffAndIsProfileScoped() {

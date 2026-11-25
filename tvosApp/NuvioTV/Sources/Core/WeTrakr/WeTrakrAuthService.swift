@@ -64,98 +64,45 @@ protocol WeTrakrTokenStorage: AnyObject {
     func setAccessToken(_ token: String?, for profileScope: String)
     func refreshToken(for profileScope: String) -> String?
     func setRefreshToken(_ token: String?, for profileScope: String)
+    func saveTokens(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool
+    func clearTokens(for profileScope: String) -> Bool
+}
+
+extension WeTrakrTokenStorage {
+    func saveTokens(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool {
+        guard !accessToken.isEmpty else { return false }
+        setAccessToken(accessToken, for: profileScope)
+        setRefreshToken(refreshToken, for: profileScope)
+        return true
+    }
+
+    func clearTokens(for profileScope: String) -> Bool {
+        setAccessToken(nil, for: profileScope)
+        setRefreshToken(nil, for: profileScope)
+        return true
+    }
 }
 
 final class WeTrakrKeychainTokenStorage: WeTrakrTokenStorage {
-    private let service = "com.nuvio.tv.wetrakr.auth"
-    private let keychain: ProviderCredentialKeychain
-    private static let lock = NSRecursiveLock()
-    private static var tokenCache: [String: String] = [:]
-    private static var deletedTokens: Set<String> = []
-    private static var pendingWrites: [String: String] = [:]
+    private let pairs: ProviderOAuthTokenPairStorage
 
     init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
-        self.keychain = keychain
+        pairs = ProviderOAuthTokenPairStorage(
+            service: "com.nuvio.tv.wetrakr.auth",
+            keychain: keychain,
+            accessMirrorKey: SettingsKey.wetrakrAccessToken,
+            refreshMirrorKey: SettingsKey.wetrakrRefreshToken
+        )
     }
 
-    func accessToken(for profileScope: String) -> String? {
-        readToken(accountType: "accessToken", profileScope: profileScope, fallbackKey: SettingsKey.wetrakrAccessToken)
+    func accessToken(for profileScope: String) -> String? { pairs.tokens(for: profileScope).accessToken }
+    func setAccessToken(_ token: String?, for profileScope: String) { pairs.set(token, accountType: "accessToken", for: profileScope) }
+    func refreshToken(for profileScope: String) -> String? { pairs.tokens(for: profileScope).refreshToken }
+    func setRefreshToken(_ token: String?, for profileScope: String) { pairs.set(token, accountType: "refreshToken", for: profileScope) }
+    func saveTokens(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool {
+        pairs.save(accessToken: accessToken, refreshToken: refreshToken, for: profileScope)
     }
-
-    func setAccessToken(_ token: String?, for profileScope: String) {
-        writeToken(token, accountType: "accessToken", profileScope: profileScope, mirrorKey: SettingsKey.wetrakrAccessToken)
-    }
-
-    func refreshToken(for profileScope: String) -> String? {
-        readToken(accountType: "refreshToken", profileScope: profileScope, fallbackKey: SettingsKey.wetrakrRefreshToken)
-    }
-
-    func setRefreshToken(_ token: String?, for profileScope: String) {
-        writeToken(token, accountType: "refreshToken", profileScope: profileScope, mirrorKey: SettingsKey.wetrakrRefreshToken)
-    }
-
-    private func readToken(accountType: String, profileScope: String, fallbackKey: String) -> String? {
-        Self.lock.lock()
-        defer { Self.lock.unlock() }
-        let cacheKey = "\(accountType):\(profileScope)"
-        if Self.deletedTokens.contains(cacheKey) {
-            if keychain.delete(service: service, account: "\(accountType).\(profileScope)") {
-                Self.deletedTokens.remove(cacheKey)
-            }
-            return nil
-        }
-        if let cached = Self.tokenCache[cacheKey], !cached.isEmpty {
-            if Self.pendingWrites[cacheKey] == cached,
-               keychain.write(cached, service: service, account: "\(accountType).\(profileScope)") {
-                Self.pendingWrites.removeValue(forKey: cacheKey)
-                ProfileSettings.store(for: profileScope).removeObject(forKey: fallbackKey)
-            }
-            return cached
-        }
-        let keychainRead = keychain.read(service: service, account: "\(accountType).\(profileScope)")
-        switch keychainRead {
-        case let .value(token) where !token.isEmpty:
-            Self.tokenCache[cacheKey] = token
-            ProfileSettings.store(for: profileScope).removeObject(forKey: fallbackKey)
-            return token
-        case .value, .missing, .failed:
-            break
-        }
-
-        let store = ProfileSettings.store(for: profileScope)
-        if let mirrored = store.string(forKey: fallbackKey), !mirrored.isEmpty {
-            if case .missing = keychainRead,
-               keychain.write(mirrored, service: service, account: "\(accountType).\(profileScope)") {
-                store.removeObject(forKey: fallbackKey)
-                Self.deletedTokens.remove(cacheKey)
-                Self.tokenCache[cacheKey] = mirrored
-            }
-            return mirrored
-        }
-        return nil
-    }
-
-    private func writeToken(_ token: String?, accountType: String, profileScope: String, mirrorKey: String) {
-        Self.lock.lock()
-        defer { Self.lock.unlock() }
-        let cacheKey = "\(accountType):\(profileScope)"
-        let store = ProfileSettings.store(for: profileScope)
-        if let token, !token.isEmpty {
-            let saved = keychain.write(token, service: service, account: "\(accountType).\(profileScope)")
-            Self.deletedTokens.remove(cacheKey)
-            Self.tokenCache[cacheKey] = token
-            if saved { Self.pendingWrites.removeValue(forKey: cacheKey) }
-            else { Self.pendingWrites[cacheKey] = token }
-            if saved { store.removeObject(forKey: mirrorKey) }
-        } else {
-            store.removeObject(forKey: mirrorKey)
-            let deleted = keychain.delete(service: service, account: "\(accountType).\(profileScope)")
-            Self.tokenCache.removeValue(forKey: cacheKey)
-            Self.pendingWrites.removeValue(forKey: cacheKey)
-            if deleted { Self.deletedTokens.remove(cacheKey) }
-            else { Self.deletedTokens.insert(cacheKey) }
-        }
-    }
+    func clearTokens(for profileScope: String) -> Bool { pairs.clear(for: profileScope) }
 }
 
 final class WeTrakrMemoryTokenStorage: WeTrakrTokenStorage {
@@ -303,6 +250,7 @@ enum WeTrakrAuthStore {
         return value
     }
 
+    @discardableResult
     static func saveToken(
         _ accessToken: String,
         refreshToken: String? = nil,
@@ -311,26 +259,32 @@ enum WeTrakrAuthStore {
         profileScope: String,
         store defaults: UserDefaults,
         tokenStorage: WeTrakrTokenStorage,
-        isNewLogin: Bool = true
-    ) {
+        isNewLogin: Bool = true,
+        notify: Bool = true
+    ) -> Bool {
+        guard tokenStorage.saveTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            for: profileScope
+        ) else { return false }
+
         if isNewLogin {
             defaults.set(UUID().uuidString, forKey: Key.accountBindingID)
         } else {
             _ = accountBindingID(in: defaults)
         }
-        tokenStorage.setAccessToken(accessToken, for: profileScope)
-        if let refreshToken {
-            tokenStorage.setRefreshToken(refreshToken, for: profileScope)
-        }
         if let expiresIn {
             let expiresAt = Date().timeIntervalSince1970 * 1000.0 + Double(expiresIn * 1000)
             defaults.set(expiresAt, forKey: Key.tokenExpiresAt)
+        } else if isNewLogin {
+            defaults.removeObject(forKey: Key.tokenExpiresAt)
         }
         defaults.set(true, forKey: Key.hasAccessToken)
         defaults.set(clientID, forKey: Key.credentialClientID)
-        if isNewLogin {
+        if isNewLogin && notify {
             NotificationCenter.default.post(name: changedNotification, object: nil)
         }
+        return true
     }
 
     static func saveUser(
@@ -372,13 +326,13 @@ enum WeTrakrAuthStore {
         }
     }
 
+    @discardableResult
     static func clearAuth(
         profileScope: String,
         store defaults: UserDefaults,
         tokenStorage: WeTrakrTokenStorage
-    ) {
-        tokenStorage.setAccessToken(nil, for: profileScope)
-        tokenStorage.setRefreshToken(nil, for: profileScope)
+    ) -> Bool {
+        let tokensCleared = tokenStorage.clearTokens(for: profileScope)
         [
             Key.accountBindingID, Key.username, Key.displayName, Key.accountID, Key.accountPlan, Key.avatarURL,
             Key.deviceCode, Key.userCode, Key.verificationURI,
@@ -389,6 +343,7 @@ enum WeTrakrAuthStore {
         NotificationCenter.default.post(name: changedNotification, object: nil)
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
         RemoteTrackingState.normalizeLibrarySource(in: defaults)
+        return tokensCleared
     }
 
     private static func setOptional(_ value: String?, forKey key: String, defaults: UserDefaults) {
@@ -562,20 +517,25 @@ final class WeTrakrAuthService {
         )
         let response = try result.valueOrThrow()
 
-        WeTrakrAuthStore.clearDeviceFlow(store: store)
-        // A fresh device authorization may connect a different WeTrakr user.
-        // Until settings for the new token are verified, the old account ID
-        // must not authorize queued completions.
-        WeTrakrAuthStore.clearCachedUser(store: store)
-        WeTrakrAuthStore.saveToken(
+        guard WeTrakrAuthStore.saveToken(
             response.accessToken,
             refreshToken: response.refreshToken,
             expiresIn: response.expiresIn,
             clientID: clientID,
             profileScope: profileScope,
             store: store,
-            tokenStorage: tokenStorage
-        )
+            tokenStorage: tokenStorage,
+            notify: false
+        ) else {
+            throw WeTrakrServiceError.message("Unable to securely save the WeTrakr login. Try connecting again.")
+        }
+
+        WeTrakrAuthStore.clearDeviceFlow(store: store)
+        // A fresh device authorization may connect a different WeTrakr user.
+        // Until settings for the new token are verified, the old account ID
+        // must not authorize queued completions.
+        WeTrakrAuthStore.clearCachedUser(store: store)
+        NotificationCenter.default.post(name: WeTrakrAuthStore.changedNotification, object: nil)
 
         // Automatically fetch profile information after token is received
         Task { [weak self] in
@@ -609,7 +569,7 @@ final class WeTrakrAuthService {
             throw WeTrakrServiceError.message("WeTrakr account changed during token refresh.")
         }
 
-        WeTrakrAuthStore.saveToken(
+        guard WeTrakrAuthStore.saveToken(
             response.accessToken,
             refreshToken: response.refreshToken ?? refreshToken,
             expiresIn: response.expiresIn,
@@ -618,7 +578,9 @@ final class WeTrakrAuthService {
             store: store,
             tokenStorage: tokenStorage,
             isNewLogin: false
-        )
+        ) else {
+            throw WeTrakrServiceError.message("Unable to securely save the WeTrakr token refresh. Try again.")
+        }
         return response.accessToken
     }
 
@@ -742,7 +704,8 @@ final class WeTrakrAuthService {
         return stats
     }
 
-    func disconnect() {
+    @discardableResult
+    func disconnect() -> Bool {
         WeTrakrAuthStore.clearAuth(profileScope: profileScope, store: store, tokenStorage: tokenStorage)
     }
 }
@@ -938,14 +901,15 @@ final class WeTrakrSettingsViewModel: ObservableObject {
         connectionTask?.cancel()
         pollTask?.cancel()
         isPolling = false
-        service.disconnect()
+        let cleared = service.disconnect()
         username = nil
         displayName = nil
         accountPlan = nil
         accountID = nil
         avatarURL = nil
         connectedStats = nil
-        statusMessage = "Disconnected from WeTrakr."
+        statusMessage = cleared ? "Disconnected from WeTrakr." : nil
+        errorMessage = cleared ? nil : "Unable to securely disconnect from WeTrakr. Try again."
         reload()
     }
 }

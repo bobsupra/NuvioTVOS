@@ -91,14 +91,17 @@ final class WeTrakrAuthServiceTests: XCTestCase {
     private final class FakeCredentialKeychain: ProviderCredentialKeychain {
         var values: [String: String] = [:]
         var failReads = false
+        var failWrites = false
+        var failedReadAccounts: Set<String> = []
 
         private func key(_ service: String, _ account: String) -> String { "\(service)|\(account)" }
         func read(service: String, account: String) -> ProviderCredentialKeychainRead {
-            if failReads { return .failed }
+            if failReads || failedReadAccounts.contains(key(service, account)) { return .failed }
             guard let value = values[key(service, account)] else { return .missing }
             return .value(value)
         }
         func write(_ value: String, service: String, account: String) -> Bool {
+            guard !failWrites else { return false }
             values[key(service, account)] = value
             return true
         }
@@ -126,17 +129,87 @@ final class WeTrakrAuthServiceTests: XCTestCase {
         profileStore.set("legacy-token", forKey: SettingsKey.wetrakrRefreshToken)
 
         XCTAssertEqual(storage.refreshToken(for: scope), "legacy-token")
-        XCTAssertEqual(keychain.values["com.nuvio.tv.wetrakr.auth|refreshToken.\(scope)"], "legacy-token")
-        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrRefreshToken))
+        XCTAssertNil(keychain.values["com.nuvio.tv.wetrakr.auth|refreshToken.\(scope)"])
+        XCTAssertNil(keychain.values["com.nuvio.tv.wetrakr.auth|credentialPair.\(scope)"], "a refresh-only legacy source is not migrated as an incomplete bundle")
+        XCTAssertEqual(profileStore.string(forKey: SettingsKey.wetrakrRefreshToken), "legacy-token")
 
         profileStore.set("stale-mirror", forKey: SettingsKey.wetrakrAccessToken)
         keychain.values["com.nuvio.tv.wetrakr.auth|accessToken.\(scope)"] = "secure-token"
         XCTAssertEqual(storage.accessToken(for: scope), "secure-token")
         XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrAccessToken))
+        let bundleData = keychain.values["com.nuvio.tv.wetrakr.auth|credentialPair.\(scope)"]?.data(using: .utf8)
+        let bundle = bundleData.flatMap { try? JSONDecoder().decode(ProviderOAuthTokenPair.self, from: $0) }
+        XCTAssertEqual(bundle, ProviderOAuthTokenPair(accessToken: "secure-token", refreshToken: "legacy-token"))
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrRefreshToken))
 
         storage.setAccessToken("new-token", for: scope)
         XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrAccessToken))
         XCTAssertEqual(storage.accessToken(for: scope), "new-token")
+    }
+
+    func testWeTrakrPairMigrationRecoversAfterTransientLegacyReadFailure() {
+        let scope = "wetrakr-recovery-\(UUID().uuidString)"
+        let profileStore = ProfileSettings.store(for: scope)
+        let keychain = FakeCredentialKeychain()
+        let storage = WeTrakrKeychainTokenStorage(keychain: keychain)
+        profileStore.set("legacy-access", forKey: SettingsKey.wetrakrAccessToken)
+        profileStore.set("legacy-refresh", forKey: SettingsKey.wetrakrRefreshToken)
+        let refreshAccount = "com.nuvio.tv.wetrakr.auth|refreshToken.\(scope)"
+        keychain.failedReadAccounts.insert(refreshAccount)
+
+        XCTAssertEqual(storage.accessToken(for: scope), "legacy-access")
+        XCTAssertEqual(storage.refreshToken(for: scope), "legacy-refresh")
+        XCTAssertNil(keychain.values["com.nuvio.tv.wetrakr.auth|credentialPair.\(scope)"])
+        XCTAssertEqual(profileStore.string(forKey: SettingsKey.wetrakrAccessToken), "legacy-access")
+        XCTAssertEqual(profileStore.string(forKey: SettingsKey.wetrakrRefreshToken), "legacy-refresh")
+
+        keychain.failedReadAccounts.remove(refreshAccount)
+        XCTAssertEqual(storage.accessToken(for: scope), "legacy-access")
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrAccessToken))
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.wetrakrRefreshToken))
+        XCTAssertNotNil(keychain.values["com.nuvio.tv.wetrakr.auth|credentialPair.\(scope)"])
+    }
+
+    func testWeTrakrFailedPairReplacementPreservesTokensAndLoginMetadata() {
+        let keychain = FakeCredentialKeychain()
+        let storage = WeTrakrKeychainTokenStorage(keychain: keychain)
+        let scope = "wetrakr-pair-\(UUID().uuidString)"
+
+        XCTAssertTrue(WeTrakrAuthStore.saveToken(
+            "old-access", refreshToken: "old-refresh", expiresIn: 3_600,
+            clientID: "old-client", profileScope: scope, store: store,
+            tokenStorage: storage
+        ))
+        let oldBinding = WeTrakrAuthStore.accountBindingID(in: store)
+        let oldState = WeTrakrAuthStore.state(in: store, profileScope: scope, tokenStorage: storage)
+        let oldBundle = keychain.values["com.nuvio.tv.wetrakr.auth|credentialPair.\(scope)"]
+        keychain.failWrites = true
+
+        XCTAssertFalse(WeTrakrAuthStore.saveToken(
+            "new-access", refreshToken: nil, expiresIn: 60,
+            clientID: "new-client", profileScope: scope, store: store,
+            tokenStorage: storage
+        ))
+
+        let afterFailure = WeTrakrAuthStore.state(in: store, profileScope: scope, tokenStorage: storage)
+        XCTAssertEqual(afterFailure.accessToken, "old-access")
+        XCTAssertEqual(afterFailure.refreshToken, "old-refresh")
+        XCTAssertEqual(afterFailure.tokenExpiresAt, oldState.tokenExpiresAt)
+        XCTAssertEqual(afterFailure.credentialClientID, "old-client")
+        XCTAssertEqual(WeTrakrAuthStore.accountBindingID(in: store), oldBinding)
+        XCTAssertEqual(keychain.values["com.nuvio.tv.wetrakr.auth|credentialPair.\(scope)"], oldBundle)
+
+        keychain.failWrites = false
+        XCTAssertTrue(WeTrakrAuthStore.saveToken(
+            "new-access", refreshToken: nil, expiresIn: nil,
+            clientID: "new-client", profileScope: scope, store: store,
+            tokenStorage: storage
+        ))
+        let replaced = WeTrakrAuthStore.state(in: store, profileScope: scope, tokenStorage: storage)
+        XCTAssertEqual(replaced.accessToken, "new-access")
+        XCTAssertNil(replaced.refreshToken, "a login without a refresh token clears the previous one")
+        XCTAssertNil(replaced.tokenExpiresAt)
+        XCTAssertEqual(replaced.credentialClientID, "new-client")
     }
 
     override func setUp() {

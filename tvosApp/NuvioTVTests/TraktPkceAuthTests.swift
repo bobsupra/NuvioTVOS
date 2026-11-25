@@ -336,7 +336,25 @@ final class TraktPkceAuthTests: XCTestCase {
 
     // MARK: - Keychain & Update Persistence Tests
 
-    func testTraktCredentialsAndTokensPersistAcrossStoreResetViaKeychain() {
+    func testTraktCredentialsAndTokensPersistAcrossStoreResetViaKeychain() throws {
+        let keychain = TraktKeychainStorage.shared
+        let sessionSeed = TraktStoredSession(
+            accessToken: "keychain-seed",
+            refreshToken: "keychain-refresh-seed",
+            tokenType: "Bearer",
+            createdAt: 0,
+            expiresIn: 60,
+            username: nil,
+            displayName: nil,
+            userSlug: nil,
+            credentialClientID: "keychain-seed",
+            accountBindingID: nil
+        )
+        guard keychain.setClientID("keychain-seed", for: profileID),
+              keychain.saveSession(sessionSeed, for: profileID) else {
+            throw XCTSkip("The test host cannot seed durable Trakt Keychain credentials.")
+        }
+
         let testClientID = "my-trakt-client-id"
         let testClientSecret = "my-trakt-secret"
         let testRedirectURI = "https://my.app/callback"

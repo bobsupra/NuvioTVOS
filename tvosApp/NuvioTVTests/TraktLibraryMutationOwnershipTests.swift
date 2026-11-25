@@ -59,14 +59,15 @@ final class TraktLibraryMutationOwnershipTests: XCTestCase {
         let probe = observeNotifications()
         // MDBList is authenticated so the old generic usesRemoteLibrary guard
         // would have allowed the Trakt removal into this provider's items.
-        _ = MdbListKeychainTokenStorage().save(
+        let storage = MdbListKeychainTokenStorage(keychain: InMemoryProviderCredentialKeychain())
+        XCTAssertTrue(storage.save(
             MdbListStoredTokens(
                 accessToken: "test-token",
                 refreshToken: "test-refresh",
                 expiresAtMillis: Date().timeIntervalSince1970 * 1_000 + 3_600_000
             ),
             for: ProfileSettings.activeProfileScope
-        )
+        ))
         ProfileSettings.current.set("test-key", forKey: SettingsKey.mdbListApiKey)
         ProfileSettings.current.set(TraktLibrarySourceMode.mdblist.rawValue,
                                     forKey: SettingsKey.traktLibrarySourceMode)

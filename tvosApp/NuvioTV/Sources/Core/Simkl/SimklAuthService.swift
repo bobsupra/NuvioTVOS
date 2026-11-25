@@ -71,105 +71,250 @@ protocol SimklTokenStorage: AnyObject {
     func setAccessToken(_ token: String?, for profileScope: String)
     func refreshToken(for profileScope: String) -> String?
     func setRefreshToken(_ token: String?, for profileScope: String)
+    func saveTokens(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool
+    func clearTokens(for profileScope: String) -> Bool
 }
 
 extension SimklTokenStorage {
     func refreshToken(for profileScope: String) -> String? { nil }
     func setRefreshToken(_ token: String?, for profileScope: String) {}
+
+    func saveTokens(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool {
+        guard !accessToken.isEmpty else { return false }
+        setAccessToken(accessToken, for: profileScope)
+        setRefreshToken(refreshToken, for: profileScope)
+        return true
+    }
+
+    func clearTokens(for profileScope: String) -> Bool {
+        setAccessToken(nil, for: profileScope)
+        setRefreshToken(nil, for: profileScope)
+        return true
+    }
 }
 
-/// Long-lived Simkl access and refresh tokens live in the Keychain, namespaced by profile.
-/// ProfileSettings is read only as a migration source for older installs.
-final class SimklKeychainTokenStorage: SimklTokenStorage {
-    private let service = "com.nuvio.tv.simkl.auth"
+/// The pair is one Keychain value so a failed replacement cannot leave an access token
+/// from one login beside a refresh token from another. Empty pairs are durable logout markers.
+struct ProviderOAuthTokenPair: Codable, Equatable {
+    var accessToken: String?
+    var refreshToken: String?
+
+    static let loggedOut = ProviderOAuthTokenPair(accessToken: nil, refreshToken: nil)
+}
+
+final class ProviderOAuthTokenPairStorage {
+    private let service: String
     private let keychain: ProviderCredentialKeychain
+    private let accessMirrorKey: String
+    private let refreshMirrorKey: String
     private static let lock = NSRecursiveLock()
-    private static var tokenCache: [String: String] = [:]
-    private static var deletedTokens: Set<String> = []
-    private static var pendingWrites: [String: String] = [:]
+    private static var cachedPairs: [String: ProviderOAuthTokenPair] = [:]
+    private static var bundleSeen: Set<String> = []
+    private static var loggedOutScopes: Set<String> = []
+    private static var unavailableScopes: Set<String> = []
 
-    init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
+    init(service: String, keychain: ProviderCredentialKeychain, accessMirrorKey: String, refreshMirrorKey: String) {
+        self.service = service
         self.keychain = keychain
+        self.accessMirrorKey = accessMirrorKey
+        self.refreshMirrorKey = refreshMirrorKey
     }
 
-    func accessToken(for profileScope: String) -> String? {
-        readToken(accountType: "accessToken", profileScope: profileScope, fallbackKey: SettingsKey.simklAccessToken)
-    }
-
-    func setAccessToken(_ token: String?, for profileScope: String) {
-        writeToken(token, accountType: "accessToken", profileScope: profileScope, mirrorKey: SettingsKey.simklAccessToken)
-    }
-
-    func refreshToken(for profileScope: String) -> String? {
-        readToken(accountType: "refreshToken", profileScope: profileScope, fallbackKey: SettingsKey.simklRefreshToken)
-    }
-
-    func setRefreshToken(_ token: String?, for profileScope: String) {
-        writeToken(token, accountType: "refreshToken", profileScope: profileScope, mirrorKey: SettingsKey.simklRefreshToken)
-    }
-
-    private func readToken(accountType: String, profileScope: String, fallbackKey: String) -> String? {
+    func tokens(for profileScope: String) -> ProviderOAuthTokenPair {
         Self.lock.lock()
         defer { Self.lock.unlock() }
-        let cacheKey = "\(accountType):\(profileScope)"
-        if Self.deletedTokens.contains(cacheKey) {
-            if keychain.delete(service: service, account: "\(accountType).\(profileScope)") {
-                Self.deletedTokens.remove(cacheKey)
-            }
-            return nil
+        let cacheKey = "\(service)|\(profileScope)"
+        let bundleAccount = "credentialPair.\(profileScope)"
+        let logoutMarkerKey = Self.logoutMarkerKey(for: service, profileScope: profileScope)
+
+        if UserDefaults.standard.bool(forKey: logoutMarkerKey) || Self.loggedOutScopes.contains(cacheKey) {
+            Self.cachedPairs[cacheKey] = .loggedOut
+            return .loggedOut
         }
-        if let cached = Self.tokenCache[cacheKey], !cached.isEmpty {
-            if Self.pendingWrites[cacheKey] == cached,
-               keychain.write(cached, service: service, account: "\(accountType).\(profileScope)") {
-                Self.pendingWrites.removeValue(forKey: cacheKey)
-                ProfileSettings.store(for: profileScope).removeObject(forKey: fallbackKey)
-            }
+        if Self.bundleSeen.contains(cacheKey), let cached = Self.cachedPairs[cacheKey] {
             return cached
         }
-        let keychainRead = keychain.read(service: service, account: "\(accountType).\(profileScope)")
-        switch keychainRead {
-        case let .value(token) where !token.isEmpty:
-            Self.tokenCache[cacheKey] = token
-            ProfileSettings.store(for: profileScope).removeObject(forKey: fallbackKey)
-            return token
-        case .value, .missing, .failed:
-            break
+
+        switch keychain.read(service: service, account: bundleAccount) {
+        case let .value(encoded):
+            guard let data = encoded.data(using: .utf8),
+                  let pair = try? JSONDecoder().decode(ProviderOAuthTokenPair.self, from: data) else {
+                return Self.cachedPairs[cacheKey] ?? .loggedOut
+            }
+            Self.cachedPairs[cacheKey] = pair
+            Self.bundleSeen.insert(cacheKey)
+            Self.unavailableScopes.remove(cacheKey)
+            if (pair.accessToken ?? "").isEmpty {
+                Self.loggedOutScopes.insert(cacheKey)
+                cleanupLegacy(profileScope: profileScope)
+                return .loggedOut
+            }
+            Self.loggedOutScopes.remove(cacheKey)
+            cleanupLegacy(profileScope: profileScope)
+            return pair
+
+        case .failed:
+            Self.unavailableScopes.insert(cacheKey)
+            return .loggedOut
+
+        case .missing:
+            if Self.bundleSeen.contains(cacheKey) || Self.loggedOutScopes.contains(cacheKey) {
+                Self.cachedPairs.removeValue(forKey: cacheKey)
+                Self.loggedOutScopes.insert(cacheKey)
+                return .loggedOut
+            }
         }
 
-        let store = ProfileSettings.store(for: profileScope)
-        if let mirrored = store.string(forKey: fallbackKey), !mirrored.isEmpty {
-            if case .missing = keychainRead,
-               keychain.write(mirrored, service: service, account: "\(accountType).\(profileScope)") {
-                store.removeObject(forKey: fallbackKey)
-                Self.deletedTokens.remove(cacheKey)
-                Self.tokenCache[cacheKey] = mirrored
-            }
-            return mirrored
+        let profileStore = ProfileSettings.store(for: profileScope)
+        let legacyAccess = keychain.read(service: service, account: "accessToken.\(profileScope)")
+        let legacyRefresh = keychain.read(service: service, account: "refreshToken.\(profileScope)")
+        let accessMirror = profileStore.string(forKey: accessMirrorKey)
+        let refreshMirror = profileStore.string(forKey: refreshMirrorKey)
+        let access = legacyValue(legacyAccess, mirror: accessMirror)
+        let refresh = legacyValue(legacyRefresh, mirror: refreshMirror)
+        let pair = ProviderOAuthTokenPair(accessToken: access.value, refreshToken: refresh.value)
+        let mayMigrate = !access.failed && !refresh.failed && !(pair.accessToken ?? "").isEmpty
+
+        if mayMigrate {
+            Self.unavailableScopes.remove(cacheKey)
+        } else if access.failed || refresh.failed {
+            Self.unavailableScopes.insert(cacheKey)
         }
-        return nil
+        if mayMigrate,
+           let data = try? JSONEncoder().encode(pair),
+           let encoded = String(data: data, encoding: .utf8),
+           keychain.write(encoded, service: service, account: bundleAccount) {
+            Self.cachedPairs[cacheKey] = pair
+            Self.bundleSeen.insert(cacheKey)
+            Self.loggedOutScopes.remove(cacheKey)
+            Self.unavailableScopes.remove(cacheKey)
+            cleanupLegacy(profileScope: profileScope)
+            return pair
+        }
+
+        // Legacy credentials remain usable when migration is incomplete; they are already
+        // durable in their original location. Never cache them as an authoritative bundle.
+        return pair
     }
 
-    private func writeToken(_ token: String?, accountType: String, profileScope: String, mirrorKey: String) {
+    @discardableResult
+    func save(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool {
+        guard !accessToken.isEmpty else { return false }
         Self.lock.lock()
         defer { Self.lock.unlock() }
-        let cacheKey = "\(accountType):\(profileScope)"
-        let store = ProfileSettings.store(for: profileScope)
-        if let token, !token.isEmpty {
-            let saved = keychain.write(token, service: service, account: "\(accountType).\(profileScope)")
-            Self.deletedTokens.remove(cacheKey)
-            Self.tokenCache[cacheKey] = token
-            if saved { Self.pendingWrites.removeValue(forKey: cacheKey) }
-            else { Self.pendingWrites[cacheKey] = token }
-            if saved { store.removeObject(forKey: mirrorKey) }
-        } else {
-            store.removeObject(forKey: mirrorKey)
-            let deleted = keychain.delete(service: service, account: "\(accountType).\(profileScope)")
-            Self.tokenCache.removeValue(forKey: cacheKey)
-            Self.pendingWrites.removeValue(forKey: cacheKey)
-            if deleted { Self.deletedTokens.remove(cacheKey) }
-            else { Self.deletedTokens.insert(cacheKey) }
+        let cacheKey = "\(service)|\(profileScope)"
+        let pair = ProviderOAuthTokenPair(accessToken: accessToken, refreshToken: refreshToken)
+        guard let data = try? JSONEncoder().encode(pair),
+              let encoded = String(data: data, encoding: .utf8),
+              keychain.write(encoded, service: service, account: "credentialPair.\(profileScope)") else {
+            return false
+        }
+        Self.cachedPairs[cacheKey] = pair
+        Self.bundleSeen.insert(cacheKey)
+        Self.loggedOutScopes.remove(cacheKey)
+        Self.unavailableScopes.remove(cacheKey)
+        removeLogoutMarker(for: profileScope)
+        cleanupLegacy(profileScope: profileScope)
+        return true
+    }
+
+    @discardableResult
+    func clear(for profileScope: String) -> Bool {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let cacheKey = "\(service)|\(profileScope)"
+        Self.cachedPairs[cacheKey] = .loggedOut
+        Self.loggedOutScopes.insert(cacheKey)
+        UserDefaults.standard.set(true, forKey: Self.logoutMarkerKey(for: service, profileScope: profileScope))
+        guard let data = try? JSONEncoder().encode(ProviderOAuthTokenPair.loggedOut),
+              let encoded = String(data: data, encoding: .utf8),
+              keychain.write(encoded, service: service, account: "credentialPair.\(profileScope)") else {
+            Self.cachedPairs[cacheKey] = .loggedOut
+            return false
+        }
+        Self.cachedPairs[cacheKey] = .loggedOut
+        Self.bundleSeen.insert(cacheKey)
+        Self.unavailableScopes.remove(cacheKey)
+        cleanupLegacy(profileScope: profileScope)
+        return true
+    }
+
+    func set(_ token: String?, accountType: String, for profileScope: String) {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let cacheKey = "\(service)|\(profileScope)"
+        let current = tokens(for: profileScope)
+        guard !Self.unavailableScopes.contains(cacheKey) else { return }
+        let nextAccess = accountType == "accessToken" ? token : current.accessToken
+        let nextRefresh = accountType == "refreshToken" ? token : current.refreshToken
+        if let nextAccess, !nextAccess.isEmpty {
+            _ = save(accessToken: nextAccess, refreshToken: nextRefresh, for: profileScope)
+        } else if accountType == "accessToken" {
+            _ = clear(for: profileScope)
+        } else if token == nil {
+            Self.lock.lock()
+            defer { Self.lock.unlock() }
+            _ = keychain.delete(service: service, account: "refreshToken.\(profileScope)")
+            ProfileSettings.store(for: profileScope).removeObject(forKey: refreshMirrorKey)
+        } else if let token, !token.isEmpty {
+            _ = keychain.write(token, service: service, account: "refreshToken.\(profileScope)")
         }
     }
+
+    private func cleanupLegacy(profileScope: String) {
+        _ = keychain.delete(service: service, account: "accessToken.\(profileScope)")
+        _ = keychain.delete(service: service, account: "refreshToken.\(profileScope)")
+        let profileStore = ProfileSettings.store(for: profileScope)
+        if profileStore.object(forKey: accessMirrorKey) != nil {
+            profileStore.removeObject(forKey: accessMirrorKey)
+        }
+        if profileStore.object(forKey: refreshMirrorKey) != nil {
+            profileStore.removeObject(forKey: refreshMirrorKey)
+        }
+    }
+
+    private func removeLogoutMarker(for profileScope: String) {
+        let key = Self.logoutMarkerKey(for: service, profileScope: profileScope)
+        if UserDefaults.standard.object(forKey: key) != nil {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+    }
+
+    private static func logoutMarkerKey(for service: String, profileScope: String) -> String {
+        "nuvio.tv.oauthPair.logoutPending.\(service).\(profileScope)"
+    }
+
+    private func legacyValue(_ read: ProviderCredentialKeychainRead, mirror: String?) -> (value: String?, failed: Bool) {
+        switch read {
+        case let .value(value): return (value.isEmpty ? nil : value, false)
+        case .missing: return (mirror.flatMap { $0.isEmpty ? nil : $0 }, false)
+        case .failed: return (mirror.flatMap { $0.isEmpty ? nil : $0 }, true)
+        }
+    }
+}
+
+/// Long-lived Simkl access and refresh tokens live in one profile-scoped Keychain item.
+/// ProfileSettings and the former per-token items are read only as migration sources.
+final class SimklKeychainTokenStorage: SimklTokenStorage {
+    private let pairs: ProviderOAuthTokenPairStorage
+
+    init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
+        pairs = ProviderOAuthTokenPairStorage(
+            service: "com.nuvio.tv.simkl.auth",
+            keychain: keychain,
+            accessMirrorKey: SettingsKey.simklAccessToken,
+            refreshMirrorKey: SettingsKey.simklRefreshToken
+        )
+    }
+
+    func accessToken(for profileScope: String) -> String? { pairs.tokens(for: profileScope).accessToken }
+    func setAccessToken(_ token: String?, for profileScope: String) { pairs.set(token, accountType: "accessToken", for: profileScope) }
+    func refreshToken(for profileScope: String) -> String? { pairs.tokens(for: profileScope).refreshToken }
+    func setRefreshToken(_ token: String?, for profileScope: String) { pairs.set(token, accountType: "refreshToken", for: profileScope) }
+    func saveTokens(accessToken: String, refreshToken: String?, for profileScope: String) -> Bool {
+        pairs.save(accessToken: accessToken, refreshToken: refreshToken, for: profileScope)
+    }
+    func clearTokens(for profileScope: String) -> Bool { pairs.clear(for: profileScope) }
 }
 
 /// In-memory token storage for unit tests.
@@ -291,6 +436,7 @@ enum SimklAuthStore {
         return value
     }
 
+    @discardableResult
     static func saveToken(
         _ accessToken: String,
         refreshToken: String? = nil,
@@ -300,25 +446,30 @@ enum SimklAuthStore {
         store defaults: UserDefaults,
         tokenStorage: SimklTokenStorage,
         isNewLogin: Bool = true
-    ) {
+    ) -> Bool {
+        guard tokenStorage.saveTokens(
+            accessToken: accessToken,
+            refreshToken: refreshToken,
+            for: profileScope
+        ) else { return false }
+
         if isNewLogin {
             defaults.set(UUID().uuidString, forKey: Key.accountBindingID)
         } else {
             _ = accountBindingID(in: defaults)
         }
-        tokenStorage.setAccessToken(accessToken, for: profileScope)
-        if let refreshToken {
-            tokenStorage.setRefreshToken(refreshToken, for: profileScope)
-        }
         if let expiresIn {
             let expiresAt = Date().timeIntervalSince1970 * 1000.0 + Double(expiresIn * 1000)
             defaults.set(expiresAt, forKey: Key.tokenExpiresAt)
+        } else if isNewLogin {
+            defaults.removeObject(forKey: Key.tokenExpiresAt)
         }
         defaults.set(true, forKey: Key.hasAccessToken)
         defaults.set(clientID, forKey: Key.credentialClientID)
         if isNewLogin {
             NotificationCenter.default.post(name: changedNotification, object: nil)
         }
+        return true
     }
 
     static func saveUser(
@@ -366,13 +517,13 @@ enum SimklAuthStore {
         }
     }
 
+    @discardableResult
     static func clearAuth(
         profileScope: String,
         store defaults: UserDefaults,
         tokenStorage: SimklTokenStorage
-    ) {
-        tokenStorage.setAccessToken(nil, for: profileScope)
-        tokenStorage.setRefreshToken(nil, for: profileScope)
+    ) -> Bool {
+        let tokensCleared = tokenStorage.clearTokens(for: profileScope)
         [
             Key.accountBindingID, Key.username, Key.accountID, Key.accountPlan, Key.avatarURL,
             Key.deviceCode, Key.userCode, Key.verificationURI, Key.verificationURIComplete,
@@ -384,6 +535,7 @@ enum SimklAuthStore {
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
         RemoteTrackingState.normalizeLibrarySource(in: defaults)
         RemoteTrackingState.normalizeMoreLikeThisSource(in: defaults)
+        return tokensCleared
     }
 
     /// Clears auth when the settings Client ID no longer matches the one that
@@ -397,7 +549,7 @@ enum SimklAuthStore {
     ) -> Bool {
         let bound = defaults.string(forKey: Key.credentialClientID)
         guard let bound, bound != currentClientID else { return false }
-        clearAuth(profileScope: profileScope, store: defaults, tokenStorage: tokenStorage)
+        _ = clearAuth(profileScope: profileScope, store: defaults, tokenStorage: tokenStorage)
         return true
     }
 
@@ -875,7 +1027,7 @@ final class SimklAuthService {
                 guard let body = response.value, !body.accessToken.isEmpty else {
                     return .failed("Simkl returned an empty token response.")
                 }
-                SimklAuthStore.saveToken(
+                guard SimklAuthStore.saveToken(
                     body.accessToken,
                     refreshToken: body.refreshToken,
                     expiresIn: body.expiresIn,
@@ -883,7 +1035,7 @@ final class SimklAuthService {
                     profileScope: profileScope,
                     store: store,
                     tokenStorage: tokenStorage
-                )
+                ) else { return .failed("Unable to securely save the Simkl login. Try connecting again.") }
                 guard currentState().accessToken == body.accessToken else {
                     return .failed("Unable to securely save the Simkl login. Try connecting again.")
                 }
@@ -912,11 +1064,11 @@ final class SimklAuthService {
                 if response.oauthError == "invalid_client" {
                     return .failed(response.errorMessage ?? "Invalid Simkl Client ID.")
                 }
-                SimklAuthStore.clearAuth(
+                guard SimklAuthStore.clearAuth(
                     profileScope: profileScope,
                     store: store,
                     tokenStorage: tokenStorage
-                )
+                ) else { return .failed("Unable to securely clear the Simkl login. Try connecting again.") }
                 return .revoked
 
             case 429:
@@ -964,13 +1116,13 @@ final class SimklAuthService {
                     return .originalCodeGone
                 }
                 if let token = body.accessToken, !token.isEmpty, body.result?.uppercased() == "OK" {
-                    SimklAuthStore.saveToken(
+                    guard SimklAuthStore.saveToken(
                         token,
                         clientID: requestedClientID,
                         profileScope: profileScope,
                         store: store,
                         tokenStorage: tokenStorage
-                    )
+                    ) else { return .failed("Unable to securely save the Simkl login. Try connecting again.") }
                     guard currentState().accessToken == token else {
                         return .failed("Unable to securely save the Simkl login. Try connecting again.")
                     }
@@ -985,11 +1137,11 @@ final class SimklAuthService {
                 }
                 return .pending
             case 401:
-                SimklAuthStore.clearAuth(
+                guard SimklAuthStore.clearAuth(
                     profileScope: profileScope,
                     store: store,
                     tokenStorage: tokenStorage
-                )
+                ) else { return .failed("Unable to securely clear the Simkl login. Try connecting again.") }
                 return .revoked
             case 403, 412:
                 return .failed(
@@ -1078,7 +1230,7 @@ final class SimklAuthService {
                 return false
             }
 
-            SimklAuthStore.saveToken(
+            guard SimklAuthStore.saveToken(
                 token.accessToken,
                 refreshToken: token.refreshToken ?? refreshToken,
                 expiresIn: token.expiresIn,
@@ -1087,7 +1239,7 @@ final class SimklAuthService {
                 store: store,
                 tokenStorage: tokenStorage,
                 isNewLogin: false
-            )
+            ) else { return false }
             didRefreshToken(token.accessToken)
             return true
         } catch {

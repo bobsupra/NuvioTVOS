@@ -13,10 +13,11 @@ final class SimklAuthServiceTests: XCTestCase {
         var failReads = false
         var failWrites = false
         var failDeletes = false
+        var failedReadAccounts: Set<String> = []
 
         private func key(_ service: String, _ account: String) -> String { "\(service)|\(account)" }
         func read(service: String, account: String) -> ProviderCredentialKeychainRead {
-            if failReads { return .failed }
+            if failReads || failedReadAccounts.contains(key(service, account)) { return .failed }
             guard let value = values[key(service, account)] else { return .missing }
             return .value(value)
         }
@@ -1432,7 +1433,11 @@ final class SimklAuthServiceTests: XCTestCase {
         profileStore.removeObject(forKey: SettingsKey.simklAccessToken)
         profileStore.set("legacy-token", forKey: SettingsKey.simklAccessToken)
         XCTAssertEqual(storage.accessToken(for: testScope), "legacy-token")
-        XCTAssertEqual(keychain.values["com.nuvio.tv.simkl.auth|accessToken.\(testScope)"], "legacy-token")
+        let bundleKey = "com.nuvio.tv.simkl.auth|credentialPair.\(testScope)"
+        let bundle = keychain.values[bundleKey].flatMap { $0.data(using: .utf8) }
+            .flatMap { try? JSONDecoder().decode(ProviderOAuthTokenPair.self, from: $0) }
+        XCTAssertEqual(bundle, ProviderOAuthTokenPair(accessToken: "legacy-token", refreshToken: nil))
+        XCTAssertNil(keychain.values["com.nuvio.tv.simkl.auth|accessToken.\(testScope)"])
         XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
 
         storage.setAccessToken("test-token-12345", for: testScope)
@@ -1442,6 +1447,11 @@ final class SimklAuthServiceTests: XCTestCase {
         storage.setAccessToken(nil, for: testScope)
         XCTAssertNil(storage.accessToken(for: testScope))
         XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
+        XCTAssertEqual(
+            keychain.values[bundleKey].flatMap { $0.data(using: .utf8) }
+                .flatMap { try? JSONDecoder().decode(ProviderOAuthTokenPair.self, from: $0) },
+            .loggedOut
+        )
     }
 
     func testSimklKeychainTokenStoragePrefersKeychainAndKeepsLegacyFallbackDuringReadFailure() {
@@ -1458,10 +1468,68 @@ final class SimklAuthServiceTests: XCTestCase {
         let secondScope = "test-profile-\(UUID().uuidString)"
         let secondStore = ProfileSettings.store(for: secondScope)
         secondStore.set("legacy-token", forKey: SettingsKey.simklRefreshToken)
-        keychain.failReads = true
+        keychain.failedReadAccounts.insert("com.nuvio.tv.simkl.auth|refreshToken.\(secondScope)")
         XCTAssertEqual(storage.refreshToken(for: secondScope), "legacy-token")
         XCTAssertEqual(secondStore.string(forKey: SettingsKey.simklRefreshToken), "legacy-token")
         XCTAssertNil(keychain.values["com.nuvio.tv.simkl.auth|refreshToken.\(secondScope)"])
+        XCTAssertNil(keychain.values["com.nuvio.tv.simkl.auth|credentialPair.\(secondScope)"])
+
+        let recoveryScope = "test-profile-\(UUID().uuidString)"
+        let recoveryStore = ProfileSettings.store(for: recoveryScope)
+        recoveryStore.set("legacy-access", forKey: SettingsKey.simklAccessToken)
+        recoveryStore.set("legacy-refresh", forKey: SettingsKey.simklRefreshToken)
+        keychain.failedReadAccounts.insert("com.nuvio.tv.simkl.auth|refreshToken.\(recoveryScope)")
+        XCTAssertEqual(storage.accessToken(for: recoveryScope), "legacy-access")
+        XCTAssertEqual(storage.refreshToken(for: recoveryScope), "legacy-refresh")
+        XCTAssertEqual(recoveryStore.string(forKey: SettingsKey.simklAccessToken), "legacy-access")
+        XCTAssertEqual(recoveryStore.string(forKey: SettingsKey.simklRefreshToken), "legacy-refresh")
+        XCTAssertNil(keychain.values["com.nuvio.tv.simkl.auth|credentialPair.\(recoveryScope)"])
+
+        keychain.failedReadAccounts.remove("com.nuvio.tv.simkl.auth|refreshToken.\(recoveryScope)")
+        XCTAssertEqual(storage.accessToken(for: recoveryScope), "legacy-access")
+        XCTAssertNil(recoveryStore.string(forKey: SettingsKey.simklAccessToken))
+        XCTAssertNil(recoveryStore.string(forKey: SettingsKey.simklRefreshToken))
+        XCTAssertNotNil(keychain.values["com.nuvio.tv.simkl.auth|credentialPair.\(recoveryScope)"])
+    }
+
+    func testSimklFailedPairReplacementPreservesTokensAndLoginMetadata() {
+        let keychain = FakeCredentialKeychain()
+        let storage = SimklKeychainTokenStorage(keychain: keychain)
+        let scope = "simkl-pair-\(UUID().uuidString)"
+
+        XCTAssertTrue(SimklAuthStore.saveToken(
+            "old-access", refreshToken: "old-refresh", expiresIn: 3_600,
+            clientID: "old-client", profileScope: scope, store: defaults,
+            tokenStorage: storage
+        ))
+        let oldBinding = SimklAuthStore.accountBindingID(in: defaults)
+        let oldState = SimklAuthStore.state(in: defaults, profileScope: scope, tokenStorage: storage)
+        keychain.failWrites = true
+
+        XCTAssertFalse(SimklAuthStore.saveToken(
+            "new-access", refreshToken: nil, expiresIn: 60,
+            clientID: "new-client", profileScope: scope, store: defaults,
+            tokenStorage: storage
+        ))
+
+        let afterFailure = SimklAuthStore.state(in: defaults, profileScope: scope, tokenStorage: storage)
+        XCTAssertEqual(afterFailure.accessToken, "old-access")
+        XCTAssertEqual(afterFailure.refreshToken, "old-refresh")
+        XCTAssertEqual(afterFailure.tokenExpiresAt, oldState.tokenExpiresAt)
+        XCTAssertEqual(afterFailure.credentialClientID, "old-client")
+        XCTAssertEqual(SimklAuthStore.accountBindingID(in: defaults), oldBinding)
+
+        keychain.failWrites = false
+        XCTAssertTrue(SimklAuthStore.saveToken(
+            "new-access", refreshToken: nil, expiresIn: nil,
+            clientID: "new-client", profileScope: scope, store: defaults,
+            tokenStorage: storage
+        ))
+        let replaced = SimklAuthStore.state(in: defaults, profileScope: scope, tokenStorage: storage)
+        XCTAssertEqual(replaced.accessToken, "new-access")
+        XCTAssertNil(replaced.refreshToken, "a login without a refresh token clears the previous one")
+        XCTAssertNil(replaced.tokenExpiresAt)
+        XCTAssertEqual(replaced.credentialClientID, "new-client")
     }
 
     @MainActor
