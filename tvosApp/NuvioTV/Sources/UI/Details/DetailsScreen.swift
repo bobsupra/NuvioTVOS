@@ -13845,9 +13845,7 @@ private struct TvStreamCard: View {
         let nameLines = expanded ? nil : style.nameLines
         let descriptionLines = expanded ? nil : style.descriptionLines
 
-        Menu {
-            playWithMenu
-        } label: {
+        Button(action: action) {
             // The badge row spans the whole card, under the add-on logo too.
             VStack(alignment: .leading, spacing: metrics.lineSpacing) {
                 if showImportedBadges && badgePlacement == .top {
@@ -13945,32 +13943,23 @@ private struct TvStreamCard: View {
                         lineWidth: looksFocused ? AppFocusOutline.width : 1
                     )
             )
-        } primaryAction: {
-            action()
         }
-        // A Menu, not a context menu: tvOS draws an enlarged copy of a view
-        // under its context menu, and the card's mostly transparent fill showed
-        // through that copy. A Menu opens beside the card and draws no copy.
-        .menuStyle(.button)
-        .buttonStyle(PosterCardButtonStyle())
+        .buttonStyle(TvStreamCardButtonStyle(isFocused: isFocused))
         .focused($isFocused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: focusID))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(looksFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-    }
-
-    /// Press-and-hold opens this list; a click plays the source.
-    @ViewBuilder
-    private var playWithMenu: some View {
-        Section(L10n.string("details_play_with", fallback: "Play with")) {
-            ForEach(ExternalPlayer.allCases) { player in
-                Button {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                        onSelectPlayer?(player)
+        .contextMenu {
+            Section(L10n.string("details_play_with", fallback: "Play with")) {
+                ForEach(ExternalPlayer.allCases) { player in
+                    Button {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            onSelectPlayer?(player)
+                        }
+                    } label: {
+                        Label(player.rawValue, systemImage: player.systemImage)
                     }
-                } label: {
-                    Label(player.rawValue, systemImage: player.systemImage)
                 }
             }
         }
@@ -14022,6 +14011,57 @@ private struct TvStreamCard: View {
         } else {
             fallback.frame(width: size, height: size)
         }
+    }
+}
+
+/// PosterCardButtonStyle for a source card, with an opaque fill once the card
+/// is held long enough to open its "Play with" menu.
+///
+/// When the menu opens, tvOS draws an enlarged copy of the card over the card
+/// and keeps it there while the menu is up. The copy is a snapshot taken as the
+/// menu opens. The card's own fill is mostly transparent, so a transparent copy
+/// let the card show through it, and the two sets of text overlapped. The fill
+/// appears a quarter of a second into a press, before tvOS takes the snapshot,
+/// so the copy is opaque and hides the card. A click is shorter, so it looks as
+/// before. tvOS leaves the card pressed after Back until focus moves; the fill
+/// goes as soon as the card has its focus again.
+private struct TvStreamCardButtonStyle: ButtonStyle {
+    let isFocused: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        TvStreamCardPressBody(configuration: configuration, isFocused: isFocused)
+    }
+}
+
+private struct TvStreamCardPressBody: View {
+    let configuration: ButtonStyleConfiguration
+    let isFocused: Bool
+    /// Pressed for longer than a click.
+    @State private var isHeld = false
+    /// Focus came back from the menu while tvOS still reports the card pressed.
+    @State private var isBackFromMenu = false
+
+    var body: some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color(white: 0.12))
+                    .opacity(isHeld && !isBackFromMenu ? 1 : 0)
+            )
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
+            .task(id: configuration.isPressed) {
+                guard configuration.isPressed else {
+                    isHeld = false
+                    isBackFromMenu = false
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(250))
+                if !Task.isCancelled { isHeld = true }
+            }
+            .onChange(of: isFocused) { _, focused in
+                if focused, isHeld { isBackFromMenu = true }
+            }
     }
 }
 
