@@ -142,6 +142,7 @@ let appTarget: Target = .target(
         "NuvioTV/Resources/AudioLicenses/*.txt",
         "NuvioTV/Fonts/inter_variable.ttf",
         "NuvioTV/SplashScreen.storyboard",
+        "NuvioTV/NuvioLaunchBanner.png",
         "NuvioTV/Resources/SceneModels/SFace.mlpackage",
         "NuvioTV/Resources/SceneModels/YuNet.mlpackage",
         "NuvioTV/Resources/SceneModels/SFace-LICENSE.txt",
@@ -179,6 +180,9 @@ let appTarget: Target = .target(
     settings: .settings(
         base: [
             "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
+            // Settings > Look > Appearance > App Icon: the six Nuvio icons, used
+            // while Nuvio Branding is on (`NuvioAppIcon`).
+            "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES": "NuvioIconOriginal NuvioIconArcticBlue NuvioIconEmerald NuvioIconRoseGold NuvioIconCopper NuvioIconGraphite",
             "ENABLE_BITCODE": "NO",
             "FRAMEWORK_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],

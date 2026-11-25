@@ -72,6 +72,7 @@ struct NuvioTVApp: App {
                 ContentView()
                     .environmentObject(atvloadlyService)
                     .overlay { CardDisintegrationOverlay() }
+                    .overlay { LaunchSplashOverlay() }
             }
         }
     }
@@ -649,6 +650,9 @@ struct ContentView: View {
     @State private var partyLaunchID = UUID()
     @State private var partyDetailsOrigin: PartyDetailsOrigin?
     @State private var resolvedInitialScreen = false
+    /// Settings > Look > Appearance > Nuvio Branding: the Nuvio sign-in and
+    /// profile loading screens in place of the app's own.
+    @AppStorage(NuvioBranding.key, store: .standard) private var nuvioBranding = false
     /// `nil` until tvOS has actually backgrounded the app, so the initial
     /// `.active` callback is never treated as a resume.
     @State private var backgroundedAt: Date?
@@ -779,7 +783,7 @@ struct ContentView: View {
                 // bootstrap and raised the "Syncing your account" gate on every
                 // single relaunch, not just on a real sign-in.
                 if resolvedInitialScreen {
-                    LoginView(auth: authManager) {
+                    let onLoginContinue: () -> Void = {
                         // Successful authentication owns the initial account pull.
                         // Profile selection remains a later, deliberate switch and
                         // is no longer needed to kick-start a missed bootstrap.
@@ -789,6 +793,14 @@ struct ContentView: View {
                         withAnimation(.easeInOut(duration: 0.28)) {
                             awaitingPostLoginSync = syncManager.isPullingAccountProfiles
                             activeScreen = .profileSelection
+                        }
+                    }
+
+                    Group {
+                        if nuvioBranding {
+                            NuvioLoginView(auth: authManager, onContinue: onLoginContinue)
+                        } else {
+                            LoginView(auth: authManager, onContinue: onLoginContinue)
                         }
                     }
                     .transition(.opacity)
@@ -854,12 +866,24 @@ struct ContentView: View {
             // can settle before the user sees it. This applies equally to an
             // automatic cold launch and a newly selected profile.
             if isPreparingProfile {
-                ZStack {
-                    ProfileScopedRootBackground()
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .tint(.white)
-                        .scaleEffect(1.8)
+                Group {
+                    if nuvioBranding {
+                        let profile = profileViewModel.activeProfile
+                        ProfileLoadingSplash(
+                            profile: profile,
+                            profileColor: profile.map {
+                                UserProfileView.profileColor(for: $0, in: profileViewModel.profiles)
+                            } ?? Color(hex: "#1E88E5")
+                        )
+                    } else {
+                        ZStack {
+                            ProfileScopedRootBackground()
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(.white)
+                                .scaleEffect(1.8)
+                        }
+                    }
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
