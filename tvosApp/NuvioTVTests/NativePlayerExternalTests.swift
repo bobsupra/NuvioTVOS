@@ -42,6 +42,40 @@ final class NativePlayerExternalTests: XCTestCase {
         XCTAssertFalse(launch.absoluteString.contains("position="))
     }
 
+    func testTheTitleNamesTheEpisode() {
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "Who Is Alive?"),
+            "Severance · S2 · E3 · Who Is Alive?"
+        )
+        // The episode line Nuvio passes can already carry the code.
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "S2 · E3 · Who Is Alive?"),
+            "Severance · S2 · E3 · Who Is Alive?"
+        )
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "Episode 3"),
+            "Severance · S2 · E3"
+        )
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: nil),
+            "Severance · S2 · E3"
+        )
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Arrival", season: nil, episode: nil, episodeTitle: nil),
+            "Arrival"
+        )
+    }
+
+    func testNativePlayerGetsTheEpisodeInItsTitle() {
+        let launch = ExternalPlayer.nativePlayer.launchURL(
+            for: URL(string: "https://cdn.example/episode.mkv")!,
+            title: ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "Who Is Alive?")
+        )!
+        let name = URLComponents(url: launch, resolvingAgainstBaseURL: false)?.queryItems?
+            .first { $0.name == "name" }?.value
+        XCTAssertEqual(name, "Severance · S2 · E3 · Who Is Alive?")
+    }
+
     func testNativePlayerFallsBackForUnsupportedVideoURLs() {
         let file = URL(fileURLWithPath: "/tmp/movie.mp4")
         let magnet = URL(string: "magnet:?xt=urn:btih:0123456789")!
