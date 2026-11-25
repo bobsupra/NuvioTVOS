@@ -13967,14 +13967,25 @@ private struct TvStreamCard: View {
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .contextMenu {
             Section(L10n.string("details_play_with", fallback: "Play with")) {
+                // Every player with its app icon. The ones not installed on
+                // this Apple TV are greyed out and can't be picked.
                 ForEach(ExternalPlayer.allCases) { player in
                     Button {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                             onSelectPlayer?(player)
                         }
                     } label: {
-                        Label(player.rawValue, systemImage: player.systemImage)
+                        if let icon = player.menuIcon {
+                            Label {
+                                Text(player.rawValue)
+                            } icon: {
+                                Image(uiImage: icon)
+                            }
+                        } else {
+                            Label(player.rawValue, systemImage: player.systemImage)
+                        }
                     }
+                    .disabled(!player.isInstalled)
                 }
             }
         }

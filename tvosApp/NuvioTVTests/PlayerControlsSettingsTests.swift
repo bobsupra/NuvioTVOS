@@ -3437,6 +3437,36 @@ final class ExternalPlayerTests: XCTestCase {
         XCTAssertEqual(ExternalPlayer.from(nil), .builtIn)
     }
 
+    func testExternalPlayersListTheBuiltInPlayerFirstThenTheAppsAToZ() {
+        XCTAssertEqual(ExternalPlayer.allCases.first, .builtIn)
+        let apps = ExternalPlayer.allCases.dropFirst().map(\.rawValue)
+        XCTAssertEqual(apps, apps.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending })
+        XCTAssertEqual(apps, ["Infuse", "Native Player", "nPlayer", "Outplayer", "SenPlayer", "VidHub", "VLC"])
+        XCTAssertEqual(ExternalPlayer.settingsOptions, ExternalPlayer.allCases.map(\.rawValue))
+    }
+
+    func testExternalPlayerProbeSchemesAreListedInInfoPlist() {
+        let queryable = Bundle.main.object(forInfoDictionaryKey: "LSApplicationQueriesSchemes") as? [String] ?? []
+        XCTAssertFalse(queryable.isEmpty)
+        for player in ExternalPlayer.allCases {
+            guard let scheme = player.probeScheme else {
+                XCTAssertEqual(player, .builtIn)
+                continue
+            }
+            XCTAssertTrue(queryable.contains(scheme), "\(scheme) is missing from LSApplicationQueriesSchemes")
+        }
+    }
+
+    @MainActor
+    func testExternalPlayerIconsComeFromTheAssetCatalog() {
+        for player in ExternalPlayer.allCases {
+            XCTAssertNotNil(UIImage(named: player.iconAssetName), player.rawValue)
+            // A faded copy when the app is missing, the icon itself otherwise.
+            XCTAssertNotNil(player.menuIcon, player.rawValue)
+        }
+        XCTAssertTrue(ExternalPlayer.builtIn.isInstalled)
+    }
+
     func testSubtitleMenuFormatterExternalLabels() {
         // Standard external subtitle with distinct release label:
         // release label becomes primary title, add-on name becomes secondary subtitle.
