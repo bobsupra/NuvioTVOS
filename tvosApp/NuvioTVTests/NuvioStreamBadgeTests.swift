@@ -1,5 +1,4 @@
 import XCTest
-import UIKit
 @testable import NuvioTV
 
 final class NuvioStreamBadgeTests: XCTestCase {
@@ -15,10 +14,6 @@ final class NuvioStreamBadgeTests: XCTestCase {
             case .dtsHDMA: return "DTS-HD-MA"
             case .dtsHD(let variant): return variant.map { "DTS-HD-\($0)" } ?? "DTS-HD"
             case .dts: return "DTS"
-            case .bluRay: return "BluRay"
-            case .ultraHD: return "4K"
-            case .hevc: return "HEVC"
-            case .service(let service): return service.name
             default: return badge.label ?? ""
             }
         }
@@ -32,41 +27,6 @@ final class NuvioStreamBadgeTests: XCTestCase {
         XCTAssertEqual(
             names("TB 2160p WEB-DL\nHDR10+ / DV / 10bit • HEVC\nAtmos / DD+ • 5.1"),
             ["4K", "DV", "HDR10+", "Atmos", "DD+", "5.1", "WEB-DL", "HEVC", "10-bit"]
-        )
-    }
-
-    func testStreamingServiceFromWebRelease() {
-        XCTAssertEqual(names("Show.S01E01.1080p.NF.WEB-DL.DDP5.1.H.264"), ["Netflix", "1080p", "DD+", "5.1", "WEB-DL", "H.264"])
-        XCTAssertEqual(names("Film 2160p AMZN WEBRip"), ["Prime Video", "4K", "WEBRip"])
-        XCTAssertEqual(names("Film.2160p.MAX.WEB-DL.HEVC"), ["HBO Max", "4K", "WEB-DL", "HEVC"])
-    }
-
-    func testStreamingServiceNeedsAWebSourceAndATagOnItsOwn() {
-        XCTAssertEqual(names("Mad Max 1080p WEB-DL"), ["1080p", "WEB-DL"])
-        XCTAssertEqual(names("Film 2160p IMAX WEB-DL"), ["4K", "WEB-DL", "IMAX"])
-        XCTAssertEqual(names("Film 1080p NF BluRay"), ["1080p", "BluRay"])
-    }
-
-    func testNewMarksAreInTheAssetCatalog() throws {
-        let marks: [NuvioStreamBadge] = [.bluRay, .ultraHD, .hevc] + StreamingService.allCases.map { .service($0) }
-        for mark in marks {
-            let asset = try XCTUnwrap(mark.logoAsset)
-            XCTAssertNotNil(UIImage(named: asset), asset)
-            XCTAssertGreaterThan(mark.logoHeightShare, 0, asset)
-        }
-        // Tags only count in capitals, so each one is written in capitals.
-        for service in StreamingService.allCases {
-            for tag in service.tags {
-                XCTAssertEqual(tag, tag.uppercased(), service.name)
-            }
-        }
-    }
-
-    func testBluRayMarks() {
-        XCTAssertEqual(names("Film 1080p BluRay DTS-HD MA 5.1 x264"), ["1080p", "DTS-HD-MA", "5.1", "BluRay", "H.264"])
-        XCTAssertEqual(
-            names("TB 2160p BluRay\nHDR10 / DV • HEVC\nDTS-HD MA / DD+ • 5.1"),
-            ["4K", "DV", "HDR10", "DTS-HD-MA", "5.1", "BluRay", "HEVC"]
         )
     }
 

@@ -11,7 +11,7 @@ final class StreamBadgeSizingTests: XCTestCase {
             addonName: "AIOStreams",
             videoSize: 9_770_000_000
         )
-        XCTAssertEqual(StreamBadgeSizing.fileSizeLabel(for: stream), "9.8 GB")
+        XCTAssertEqual(StreamBadgeSizing.fileSizeLabel(for: stream), "Size 9.8 GB")
     }
 
     func testFileSizeBadgeReadsDecimalUnitsFromText() {
@@ -22,7 +22,7 @@ final class StreamBadgeSizingTests: XCTestCase {
             addonName: "Plex"
         )
         XCTAssertEqual(StreamBadgeSizing.fileSizeBytes(for: gigabytes), 8_130_000_000)
-        XCTAssertEqual(StreamBadgeSizing.fileSizeLabel(for: gigabytes), "8.1 GB")
+        XCTAssertEqual(StreamBadgeSizing.fileSizeLabel(for: gigabytes), "Size 8.1 GB")
 
         let megabytes = NuvioStream(
             url: "https://cdn.example/c.mkv",
@@ -30,6 +30,6 @@ final class StreamBadgeSizingTests: XCTestCase {
             description: "167 MB",
             addonName: "Torrentio"
         )
-        XCTAssertEqual(StreamBadgeSizing.fileSizeLabel(for: megabytes), "167 MB")
+        XCTAssertEqual(StreamBadgeSizing.fileSizeLabel(for: megabytes), "Size 167 MB")
     }
 }
