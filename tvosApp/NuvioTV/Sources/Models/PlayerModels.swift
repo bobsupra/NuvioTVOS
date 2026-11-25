@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 enum PlayerStatus: Equatable {
     case idle
@@ -187,19 +190,75 @@ enum QualityOption: Identifiable, Equatable {
 /// engine. `.builtIn` plays in-app; the rest build a deep link that opens an
 /// installed tvOS app with the stream URL (and optional subtitle URLs).
 enum ExternalPlayer: String, CaseIterable, Identifiable {
+    // The built-in player first, then the apps from A to Z. This is the order
+    // of the Play with menu and of Settings > External Player. Settings store
+    // the raw value, so the order can change without touching saved choices.
     case builtIn = "Nuvio (Built-in)"
     case infuse = "Infuse"
-    case vlc = "VLC"
-    case outplayer = "Outplayer"
-    case nplayer = "nPlayer"
-    case vidhub = "VidHub"
-    case senplayer = "SenPlayer"
     case nativePlayer = "Native Player"
+    case nplayer = "nPlayer"
+    case outplayer = "Outplayer"
+    case senplayer = "SenPlayer"
+    case vidhub = "VidHub"
+    case vlc = "VLC"
 
     var id: String { rawValue }
 
     /// Every option's display label, in the order shown in Settings.
     static var settingsOptions: [String] { allCases.map(\.rawValue) }
+
+    /// The player's app icon in Images.xcassets. The built-in player shows
+    /// Nuvio's Home Screen icon.
+    var iconAssetName: String {
+        switch self {
+        case .builtIn: return "player_nuvio"
+        case .infuse: return "player_infuse"
+        case .nativePlayer: return "player_nativeplayer"
+        case .nplayer: return "player_nplayer"
+        case .outplayer: return "player_outplayer"
+        case .senplayer: return "player_senplayer"
+        case .vidhub: return "player_vidhub"
+        case .vlc: return "player_vlc"
+        }
+    }
+
+    /// A URL scheme the player's app registers, used to check whether the app
+    /// is installed. `canOpenURL` answers only for schemes listed under
+    /// LSApplicationQueriesSchemes in Info.plist. Nil for the built-in player.
+    var probeScheme: String? {
+        switch self {
+        case .builtIn: return nil
+        case .infuse: return "infuse"
+        case .nativePlayer: return "nativeplayer"
+        case .nplayer: return "nplayer-http"
+        case .outplayer: return "outplayer"
+        case .senplayer: return "senplayer"
+        case .vidhub: return "vidhub"
+        case .vlc: return "vlc"
+        }
+    }
+
+    #if canImport(UIKit)
+    /// Whether the player's app is on this Apple TV. The built-in player
+    /// always is.
+    @MainActor var isInstalled: Bool {
+        guard let scheme = probeScheme, let url = URL(string: "\(scheme)://") else { return true }
+        return UIApplication.shared.canOpenURL(url)
+    }
+
+    /// The icon for the Play with menu, faded when the player's app is not on
+    /// this Apple TV. The fade is drawn into the image, because tvOS menus
+    /// draw an item's image without its view modifiers.
+    @MainActor var menuIcon: UIImage? {
+        guard let icon = UIImage(named: iconAssetName) else { return nil }
+        guard !isInstalled else { return icon.withRenderingMode(.alwaysOriginal) }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = icon.scale
+        return UIGraphicsImageRenderer(size: icon.size, format: format).image { _ in
+            icon.draw(at: .zero, blendMode: .normal, alpha: 0.35)
+        }.withRenderingMode(.alwaysOriginal)
+    }
+    #endif
 
     /// System SF Symbol icon name for the player option.
     var systemImage: String {

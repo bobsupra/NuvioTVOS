@@ -12687,6 +12687,11 @@ private struct PlaybackSettingsView: View {
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
     private let externalPlayers = ExternalPlayer.settingsOptions
+    /// Players whose app is not on this Apple TV. The External Player row
+    /// skips them.
+    private var uninstalledExternalPlayers: Set<String> {
+        Set(ExternalPlayer.allCases.filter { !$0.isInstalled }.map(\.rawValue))
+    }
     private let frameRateModes = ["Off", "On start/stop", "Always"]
     /// Buffer profiles: Auto scales to RAM; Conservative/Large match product names;
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
@@ -12821,6 +12826,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     selection: $externalPlayer,
                     options: externalPlayers,
+                    disabledOptions: uninstalledExternalPlayers,
                     accentColor: accentColor
                 )
 
@@ -24033,6 +24039,9 @@ private struct SettingsOptionRow: View {
     let subtitle: String
     @Binding var selection: String
     let options: [String]
+    /// Options that can't be picked, such as players not installed on this
+    /// Apple TV. Clicking the row skips them.
+    var disabledOptions: Set<String> = []
     let accentColor: Color
     var optionLabel: (String) -> String = { L10n.optionLabel($0) }
 
@@ -24072,7 +24081,14 @@ private struct SettingsOptionRow: View {
     private func selectNext() {
         guard !options.isEmpty else { return }
         let currentIndex = options.firstIndex(of: currentStored) ?? 0
-        selection = options[(currentIndex + 1) % options.count]
+        // The next option that can be picked, wrapping around the list.
+        for step in 1...options.count {
+            let option = options[(currentIndex + step) % options.count]
+            if !disabledOptions.contains(option) {
+                selection = option
+                return
+            }
+        }
     }
 }
 
