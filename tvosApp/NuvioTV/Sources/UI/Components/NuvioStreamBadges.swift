@@ -1,8 +1,10 @@
 import SwiftUI
 
-/// Stream badges drawn by the app instead of an imported badge pack: the
-/// official Dolby, DTS and HDR10+ marks in white, and plain labels for the
-/// rest, all on the same translucent pill as the file size badge.
+/// Stream badges drawn by the app instead of an imported badge pack, all on
+/// the same translucent pill as the file size badge. The official Dolby,
+/// DTS, HDR10+ and Blu-ray Disc marks and the logo of the service a WEB
+/// release came from are drawn in white, as are the 4K Ultra HD and HEVC
+/// marks made for the app. The rest are plain labels.
 /// Settings > Layout > Stream List > Nuvio Badges.
 enum NuvioStreamBadge: Hashable {
     case resolution(String)
@@ -25,7 +27,15 @@ enum NuvioStreamBadge: Hashable {
     case audio(String)
     case channels(String)
     case source(String)
+    /// The Blu-ray Disc mark.
+    case bluRay
+    /// 4K, as a 4K Ultra HD mark drawn for the app.
+    case ultraHD
     case codec(String)
+    /// HEVC, as an HEVC / H.265 mark drawn for the app.
+    case hevc
+    /// The streaming service a WEB release was taken from, by its logo.
+    case service(StreamingService)
     case bitDepth(String)
     /// IMAX, 3D.
     case edition(String)
@@ -41,6 +51,10 @@ enum NuvioStreamBadge: Hashable {
         case .dtsX: return "badge_dts_x"
         case .dtsHDMA: return "badge_dts_hd_ma"
         case .dts, .dtsHD: return "badge_dts"
+        case .bluRay: return "badge_bluray"
+        case .ultraHD: return "badge_ultra_hd"
+        case .hevc: return "badge_hevc"
+        case .service(let service): return service.logoAsset
         default: return nil
         }
     }
@@ -72,6 +86,11 @@ enum NuvioStreamBadge: Hashable {
         case .hdr10Plus: return 0.72
         case .dtsX: return 0.66
         case .dts, .dtsHD: return 0.6
+        case .bluRay: return 0.72
+        // Drawn so the boxed letters are 64 of 152 units tall: at 0.8 they
+        // match the cap height of the plain labels.
+        case .ultraHD, .hevc: return 0.8
+        case .service(let service): return service.logoHeightShare
         default: return 0
         }
     }
@@ -87,6 +106,10 @@ enum NuvioStreamBadge: Hashable {
         case .dtsHDMA: return "DTS-HD Master Audio"
         case .dtsHD(let variant): return ["DTS-HD", variant].compactMap { $0 }.joined(separator: " ")
         case .dts: return "DTS"
+        case .bluRay: return "Blu-ray"
+        case .ultraHD: return "4K Ultra HD"
+        case .hevc: return "HEVC"
+        case .service(let service): return service.name
         case .audio(let text): return text == "DD" ? "Dolby Digital" : text
         default: return label ?? ""
         }
@@ -110,7 +133,7 @@ enum NuvioStreamBadge: Hashable {
         var result: [NuvioStreamBadge] = []
 
         if has(#"\b(2160p|4k|uhd)\b"#) {
-            result.append(.resolution("4K"))
+            result.append(.ultraHD)
         } else if has(#"\b1440p\b"#) {
             result.append(.resolution("1440p"))
         } else if has(#"\b1080[pi]\b"#) {
@@ -181,11 +204,13 @@ enum NuvioStreamBadge: Hashable {
         if has(#"\bremux\b"#) {
             result.append(.source("REMUX"))
         } else if has(#"\b(blu[ ._-]?ray|bdrip|brrip)\b"#) {
-            result.append(.source("BluRay"))
+            result.append(.bluRay)
         } else if has(#"\bweb[ ._-]?dl\b"#) {
             result.append(.source("WEB-DL"))
+            if let service = StreamingService.named(in: original) { result.append(.service(service)) }
         } else if has(#"\bweb[ ._-]?rip\b"#) {
             result.append(.source("WEBRip"))
+            if let service = StreamingService.named(in: original) { result.append(.service(service)) }
         } else if has(#"\bhdtv\b"#) {
             result.append(.source("HDTV"))
         } else if has(#"\bdvd(rip)?\b"#) {
@@ -195,7 +220,7 @@ enum NuvioStreamBadge: Hashable {
         if has(#"\bav1\b"#) {
             result.append(.codec("AV1"))
         } else if has(#"\b(hevc|[hx][ ._]?265)\b"#) {
-            result.append(.codec("HEVC"))
+            result.append(.hevc)
         } else if has(#"\b(avc|[hx][ ._]?264)\b"#) {
             result.append(.codec("H.264"))
         }
@@ -208,6 +233,10 @@ enum NuvioStreamBadge: Hashable {
 
         if has(#"\bimax\b"#) { result.append(.edition("IMAX")) }
         if has(#"\b3d\b"#) { result.append(.edition("3D")) }
+        // The service a WEB release came from leads the row.
+        if let index = result.firstIndex(where: { if case .service = $0 { return true } else { return false } }) {
+            result.insert(result.remove(at: index), at: 0)
+        }
         return result
     }
 }
@@ -243,5 +272,73 @@ struct NuvioStreamBadgeView: View {
         .overlay(Capsule().stroke(Color.white.opacity(0.20), lineWidth: 1))
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(badge.accessibilityName)
+    }
+}
+
+/// Services whose tag a WEB release names, as in "Show.S01E01.1080p.NF.WEB-DL".
+/// Read only beside a WEB source, and only as an upper-case word on its own,
+/// so "Max" in a title or "IMAX" never counts.
+enum StreamingService: String, CaseIterable, Hashable {
+    case netflix, primeVideo, disneyPlus, appleTV, hboMax, hulu, peacock, paramountPlus
+
+    var tags: [String] {
+        switch self {
+        case .netflix: return ["NF"]
+        case .primeVideo: return ["AMZN"]
+        case .disneyPlus: return ["DSNP"]
+        case .appleTV: return ["ATVP"]
+        case .hboMax: return ["HMAX", "MAX"]
+        case .hulu: return ["HULU"]
+        case .peacock: return ["PCOK"]
+        case .paramountPlus: return ["PMTP"]
+        }
+    }
+
+    var name: String {
+        switch self {
+        case .netflix: return "Netflix"
+        case .primeVideo: return "Prime Video"
+        case .disneyPlus: return "Disney+"
+        case .appleTV: return "Apple TV"
+        case .hboMax: return "HBO Max"
+        case .hulu: return "Hulu"
+        case .peacock: return "Peacock"
+        case .paramountPlus: return "Paramount+"
+        }
+    }
+
+    var logoAsset: String {
+        switch self {
+        case .netflix: return "badge_service_netflix"
+        case .primeVideo: return "badge_service_prime"
+        case .disneyPlus: return "badge_service_disney"
+        case .appleTV: return "badge_service_appletv"
+        case .hboMax: return "badge_service_hbomax"
+        case .hulu: return "badge_service_hulu"
+        case .peacock: return "badge_service_peacock"
+        case .paramountPlus: return "badge_service_paramount"
+        }
+    }
+
+    /// Sized so each logo's main lettering is about as tall as the plain labels.
+    var logoHeightShare: CGFloat {
+        switch self {
+        case .netflix: return 0.36
+        case .primeVideo: return 0.74
+        case .disneyPlus: return 0.72
+        case .appleTV: return 0.5
+        case .hboMax: return 0.62
+        case .hulu: return 0.4
+        case .peacock: return 0.42
+        case .paramountPlus: return 0.5
+        }
+    }
+
+    static func named(in original: String) -> StreamingService? {
+        allCases.first { service in
+            service.tags.contains { tag in
+                original.range(of: "(?<![A-Za-z0-9])\(tag)(?![A-Za-z0-9])", options: .regularExpression) != nil
+            }
+        }
     }
 }
