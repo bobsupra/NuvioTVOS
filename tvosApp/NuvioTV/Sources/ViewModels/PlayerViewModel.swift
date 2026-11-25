@@ -1502,7 +1502,7 @@ class PlayerViewModel: ObservableObject {
             if let provider {
                 await MainActor.run {
                     guard self.sessionCoordinator.loadGeneration == activeGen else { return }
-                    self.sessionCoordinator.setExternalTrickplayProvider(provider)
+                    self.installExternalTrickplayProvider(provider)
                 }
                 return
             }
@@ -1518,7 +1518,7 @@ class PlayerViewModel: ObservableObject {
             )
             guard let seekr, !Task.isCancelled,
                   self.sessionCoordinator.loadGeneration == activeGen else { return }
-            self.sessionCoordinator.setExternalTrickplayProvider(seekr)
+            self.installExternalTrickplayProvider(seekr)
         }
         // The coordinator owns initial seek and subtitle registration on both
         // backends; later progressive subtitle results still flow through the
@@ -5189,6 +5189,14 @@ class PlayerViewModel: ObservableObject {
         chapterThumbnailFocusIndex = id.flatMap { id in chapters.firstIndex { $0.id == id } }
     }
 
+    func installExternalTrickplayProvider(_ provider: any TrickplayProviding) {
+        sessionCoordinator.setExternalTrickplayProvider(provider)
+        if chapterThumbnailTask == nil, !chapters.isEmpty, !isChaptersTabHidden,
+           canShowChapterThumbnails, isChaptersTabOpen || chapterThumbnailsAutoStarted {
+            startChapterThumbnails()
+        }
+    }
+
     /// With the panel closed, stills load only while they cannot cost playback its bandwidth.
     private var chapterThumbnailsMayLoadInBackground: Bool {
         if status == .paused { return true }
@@ -8501,12 +8509,15 @@ class PlayerViewModel: ObservableObject {
         let audioSpatialFormat = audioPresentation.spatialFormat
         let audioDecoder = audioPresentation.pipeline
 
+        let upscaling = reportedValue([debug?.videoUpscaling])
+
         return ScenePlaybackInfo(
             engine: engineName,
             version: engineVer,
             videoCodec: videoCodec,
             resolution: resolution,
             frameRate: frameRate,
+            upscaling: upscaling,
             dynamicRange: dynamicRange,
             dolbyVisionProfile: dvProfile,
             videoBitrate: videoBitrate,

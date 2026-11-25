@@ -465,9 +465,36 @@ private final class UnavailableChapterThumbnailProvider: ScrubThumbnailProviding
     func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage? { nil }
     func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
         chapterRequests += 1
-        chapterThumbnailsUnavailableForCurrentSource = true
+        if !chapterThumbnailsUnavailableForCurrentSource {
+            chapterThumbnailsUnavailableForCurrentSource = true
+            return nil
+        }
         return nil
     }
+}
+
+@MainActor
+private final class FallbackChapterThumbnailProvider: ScrubThumbnailProviding {
+    var supportsScrubThumbnails = true
+    var hasExternalTrickplay = false
+    let image: CGImage
+    var chapterThumbnailsUnavailableForCurrentSource: Bool { !hasExternalTrickplay }
+    private(set) var chapterRequests = 0
+
+    init(image: CGImage) { self.image = image }
+
+    func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? { nil }
+    func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage? { nil }
+    func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        chapterRequests += 1
+        return hasExternalTrickplay ? image : nil
+    }
+}
+
+private final class StubTrickplayProvider: TrickplayProviding, @unchecked Sendable {
+    let image: CGImage
+    init(image: CGImage) { self.image = image }
+    func thumbnail(at seconds: Double) async -> CGImage? { image }
 }
 
 extension SeekPreviewLaneTests {
@@ -543,4 +570,151 @@ extension SeekPreviewLaneTests {
 
         XCTAssertEqual(provider.chapterRequests, 1, "Chapter thumbnail loader must stop after permanent codec failure rather than looping over remaining chapters")
     }
+
+    @MainActor
+    func testChapterStillDecodes4KHEVCOverPreviewLane() async throws {
+        let hevc4K = try XCTUnwrap(Data(base64Encoded: Self.hevc4KFixtureBase64, options: .ignoreUnknownCharacters))
+        let host = "hevc4k-chapter.test"
+        let origin = URL(string: "https://\(host)/movie.mp4")!
+        SeekPreviewStubProtocol.install(.ranges(hevc4K), forHost: host)
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [SeekPreviewStubProtocol.self]
+        let lane = SeekPreviewLane(
+            originURL: origin,
+            headers: [:],
+            diskKey: "test-hevc4k-\(UUID().uuidString)",
+            admission: { _ in .allowed },
+            localFrame: { _, _ in nil },
+            configuration: configuration
+        )
+        let image = await lane.image(at: 0, duration: 1, purpose: .chapter)
+        XCTAssertNotNil(image, "4K HEVC chapter still must decode via hardware decode rather than failing as unsupportedCodec")
+        XCTAssertFalse(lane.isDecodeDisabled)
+        lane.shutdown()
+    }
+
+    @MainActor
+    func testChapterThumbnailsRestartWhenExternalTrickplayProviderArrives() async throws {
+        let defaults = ProfileSettings.current
+        let prevPreview = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        let prevScene = defaults.object(forKey: SettingsKey.sceneFeatureEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.sceneFeatureEnabled)
+        defer {
+            defaults.set(prevPreview, forKey: SettingsKey.seekPreviewEnabled)
+            defaults.set(prevScene, forKey: SettingsKey.sceneFeatureEnabled)
+        }
+
+        let image = makeImage()
+        let provider = FallbackChapterThumbnailProvider(image: image)
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator, scrubThumbnailProvider: provider)
+        defer { coordinator.stopAll() }
+        model.status = .paused
+        model.clock.duration = 1_200
+        model.chapters = PlaybackChapters.chapters(
+            from: [
+                (id: 1, name: "Chapter 1", start: 0, duration: 600),
+                (id: 2, name: "Chapter 2", start: 600, duration: 600),
+            ],
+            totalDuration: 1_200
+        )
+        model.showScenePanel = true
+        model.sceneViewModel.selectTab(.chapters)
+
+        model.startChapterThumbnails()
+        for _ in 0..<40 where provider.chapterRequests == 0 {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        try await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertTrue(model.chapterThumbnails.images.isEmpty)
+
+        provider.hasExternalTrickplay = true
+        model.installExternalTrickplayProvider(StubTrickplayProvider(image: image))
+        for _ in 0..<60 where model.chapterThumbnails.images.count < 2 {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        XCTAssertEqual(model.chapterThumbnails.images.count, 2)
+    }
+
+    /// One 3840x2160 HEVC keyframe in MP4 (`ffmpeg -f lavfi -i color=c=blue:s=3840x2160:r=1:d=1
+    /// -c:v libx265 -preset ultrafast -pix_fmt yuv420p -movflags +faststart`).
+    private static let hevc4KFixtureBase64 = """
+        AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAADHxtb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAD6AABAAABAAAAAAAA
+        AAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAALpnRy
+        YWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAD6AAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAA
+        AAAAAAAAAEAAAAAPAAAACHAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAA+gAAAAAAAEAAAAACx5tZGlhAAAAIG1kaGQAAAAA
+        AAAAAAAAAAAAAEAAAABAAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAArJbWluZgAA
+        ABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAAKiXN0YmwAAAolc3RzZAAAAAAA
+        AAABAAAKFWhldjEAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAPAAhwAEgAAABIAAAAAAAAAAEVTGF2YzYyLjI4LjEwMiBsaWJ4MjY1
+        AAAAAAAAAAAAAAAY//8AAAmRaHZjQwEBYAAAAJAAAAAAAJbwAPz9+PgAAA8EIAABABhAAQwB//8BYAAAAwCQAAADAAADAJaVlAkh
+        AAEALEIBAQFgAAADAJAAAAMAAAMAlqAB4CACHFllZUpMLwFoCAAAAwAIAAADAAhAIgABAAZEAcBzwYknAAEJFE4BBf//////////
+        /w8sot4JtRdH27tVpP5/wvxOeDI2NSAoYnVpbGQgMjE2KSAtIDQuMisxLWU0NDQ3NDQ6W01hYyBPUyBYXVtjbGFuZyAyMS4wLjBd
+        WzY0IGJpdF0gOGJpdCsxMGJpdCsxMmJpdCAtIEguMjY1L0hFVkMgY29kZWMgLSBDb3B5cmlnaHQgMjAxMy0yMDE4IChjKSBNdWx0
+        aWNvcmV3YXJlLCBJbmMgLSBodHRwOi8veDI2NS5vcmcgLSBvcHRpb25zOiBjcHVpZD0zNCBmcmFtZS10aHJlYWRzPTMgd3BwIG5v
+        LXBtb2RlIG5vLXBtZSBuby1wc25yIG5vLXNzaW0gbG9nLWxldmVsPS0xIGJpdGRlcHRoPTggaW5wdXQtY3NwPTEgZnBzPTEvMSBp
+        bnB1dC1yZXM9Mzg0MHgyMTYwIGludGVybGFjZT0wIHRvdGFsLWZyYW1lcz0wIGxldmVsLWlkYz0wIGhpZ2gtdGllcj0xIHVoZC1i
+        ZD0wIHJlZj0xIG5vLWFsbG93LW5vbi1jb25mb3JtYW5jZSBuby1yZXBlYXQtaGVhZGVycyBhbm5leGIgbm8tYXVkIG5vLWVvYiBu
+        by1lb3Mgbm8taHJkIGluZm8gaGFzaD0wIHRlbXBvcmFsLWxheWVycz0wIG9wZW4tZ29wIG1pbi1rZXlpbnQ9MSBrZXlpbnQ9MjUw
+        IGdvcC1sb29rYWhlYWQ9MCBiZnJhbWVzPTMgYi1hZGFwdD0wIGItcHlyYW1pZCBiZnJhbWUtYmlhcz0wIHJjLWxvb2thaGVhZD01
+        IGxvb2thaGVhZC1zbGljZXM9OCBzY2VuZWN1dD0wIG5vLWhpc3Qtc2NlbmVjdXQgcmFkbD0wIG5vLXNwbGljZSBuby1pbnRyYS1y
+        ZWZyZXNoIGN0dT0zMiBtaW4tY3Utc2l6ZT0xNiBuby1yZWN0IG5vLWFtcCBtYXgtdHUtc2l6ZT0zMiB0dS1pbnRlci1kZXB0aD0x
+        IHR1LWludHJhLWRlcHRoPTEgbGltaXQtdHU9MCByZG9xLWxldmVsPTAgZHluYW1pYy1yZD0wLjAwIG5vLXNzaW0tcmQgbm8tc2ln
+        bmhpZGUgbm8tdHNraXAgbnItaW50cmE9MCBuci1pbnRlcj0wIG5vLWNvbnN0cmFpbmVkLWludHJhIHN0cm9uZy1pbnRyYS1zbW9v
+        dGhpbmcgbWF4LW1lcmdlPTIgbGltaXQtcmVmcz0wIG5vLWxpbWl0LW1vZGVzIG1lPTAgc3VibWU9MCBtZXJhbmdlPTU3IHRlbXBv
+        cmFsLW12cCBuby1mcmFtZS1kdXAgbm8taG1lIG5vLXdlaWdodHAgbm8td2VpZ2h0YiBuby1hbmFseXplLXNyYy1waWNzIGRlYmxv
+        Y2s9MDowIG5vLXNhbyBuby1zYW8tbm9uLWRlYmxvY2sgcmQ9MiBzZWxlY3RpdmUtc2FvPTAgZWFybHktc2tpcCByc2tpcCBmYXN0
+        LWludHJhIG5vLXRza2lwLWZhc3Qgbm8tY3UtbG9zc2xlc3Mgbm8tYi1pbnRyYSBuby1zcGxpdHJkLXNraXAgcmRwZW5hbHR5PTAg
+        cHN5LXJkPTIuMDAgcHN5LXJkb3E9MC4wMCBuby1yZC1yZWZpbmUgbm8tbG9zc2xlc3MgY2JxcG9mZnM9MCBjcnFwb2Zmcz0wIHJj
+        PWNyZiBjcmY9MjguMCBxY29tcD0wLjYwIHFwc3RlcD00IHN0YXRzLXdyaXRlPTAgc3RhdHMtcmVhZD0wIGlwcmF0aW89MS40MCBw
+        YnJhdGlvPTEuMzAgYXEtbW9kZT0xIGFxLXN0cmVuZ3RoPTAuMDAgY3V0cmVlIHpvbmUtY291bnQ9MCBuby1zdHJpY3QtY2JyIHFn
+        LXNpemU9MzIgbm8tcmMtZ3JhaW4gcXBtYXg9NjkgcXBtaW49MCBuby1jb25zdC12YnYgc2FyPTEgb3ZlcnNjYW49MCB2aWRlb2Zv
+        cm1hdD01IHJhbmdlPTAgY29sb3JwcmltPTIgdHJhbnNmZXI9MiBjb2xvcm1hdHJpeD0yIGNocm9tYWxvYz0wIGRpc3BsYXktd2lu
+        ZG93PTAgY2xsPTAsMCBtaW4tbHVtYT0wIG1heC1sdW1hPTI1NSBsb2cyLW1heC1wb2MtbHNiPTggdnVpLXRpbWluZy1pbmZvIHZ1
+        aS1ocmQtaW5mbyBzbGljZXM9MSBuby1vcHQtcXAtcHBzIG5vLW9wdC1yZWYtbGlzdC1sZW5ndGgtcHBzIG5vLW11bHRpLXBhc3Mt
+        b3B0LXJwcyBzY2VuZWN1dC1iaWFzPTAuMDUgbm8tb3B0LWN1LWRlbHRhLXFwIG5vLWFxLW1vdGlvbiBuby1oZHIxMCBuby1oZHIx
+        MC1vcHQgbm8tZGhkcjEwLW9wdCBuby1pZHItcmVjb3Zlcnktc2VpIGFuYWx5c2lzLXJldXNlLWxldmVsPTAgYW5hbHlzaXMtc2F2
+        ZS1yZXVzZS1sZXZlbD0wIGFuYWx5c2lzLWxvYWQtcmV1c2UtbGV2ZWw9MCBzY2FsZS1mYWN0b3I9MCByZWZpbmUtaW50cmE9MCBy
+        ZWZpbmUtaW50ZXI9MCByZWZpbmUtbXY9MSByZWZpbmUtY3R1LWRpc3RvcnRpb249MCBuby1saW1pdC1zYW8gY3R1LWluZm89MCBu
+        by1sb3dwYXNzLWRjdCByZWZpbmUtYW5hbHlzaXMtdHlwZT0wIGNvcHktcGljPTEgbWF4LWF1c2l6ZS1mYWN0b3I9MS4wIG5vLWR5
+        bmFtaWMtcmVmaW5lIG5vLXNpbmdsZS1zZWkgbm8taGV2Yy1hcSBuby1zdnQgbm8tZmllbGQgcXAtYWRhcHRhdGlvbi1yYW5nZT0x
+        LjAwIHNjZW5lY3V0LWF3YXJlLXFwPTBjb25mb3JtYW5jZS13aW5kb3ctb2Zmc2V0cyByaWdodD0wIGJvdHRvbT0wIGRlY29kZXIt
+        bWF4LXJhdGU9MCBuby12YnYtbGl2ZS1tdWx0aS1wYXNzIG5vLW1jc3RmIG5vLXNicmMgbm8tZnJhbWUtcmOAAAAACmZpZWwBAAAA
+        ABBwYXNwAAAAAQAAAAEAAAAUYnRydAAAAAAAAD/wAAAAAAAAABhzdHRzAAAAAAAAAAEAAAABAABAAAAAABxzdHNjAAAAAAAAAAEA
+        AAABAAAAAQAAAAEAAAAUc3RzegAAAAAAAAf+AAAAAQAAABRzdGNvAAAAAAAAAAEAAAyoAAAAYnVkdGEAAABabWV0YQAAAAAAAAAh
+        aGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAtaWxzdAAAACWpdG9vAAAAHWRhdGEAAAABAAAAAExhdmY2Mi4xMi4xMDIA
+        AAAIZnJlZQAACAZtZGF0AAAH+igBrEwIhsZpY44oYIHnnXXXXG2222222mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm
+        oMz//+V1Ff5kavx+nCWgLdobSgWAAAADAAADAAADAAADAAADAAADAAADAAADAAADAA3YVqWQQt3aUCwAAAMAAAMAAAMAAAMAAAMA
+        AAMAAAMAAAMAAAMAABWwBHpkKvJYAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAm4Hy0oFgAAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAAAwAAAwAAGhAIUEAAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMASkALQAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAAAwAkYAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAC0gAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMA
+        AsIAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMARcAAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAQkAAADAAADAAAD
+        AAADAAADAAADAAADAAADAAADAAAqYAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwABmQAAAwAAAwAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAJ6AAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAnoAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwCXgAAAAwAAAwAA
+        AwAAAwAAAwAAAwAAAwAAAwAAAwHXAAADAAADAAADAAADAAADAAADAAADAAADAAAFFAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAA
+        DEgAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAABiQAAADAAADAAADAAADAAADAAADAAADAAADAAAwIAAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAAAwAAUUAAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAAMAAIGAAAADAAADAAADAAADAAADAAADAAADAAADAADEgAAAAwAAAwAA
+        AwAAAwAAAwAAAwAAAwAAAwABFwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwABdwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAB3wAA
+        AwAAAwAAAwAAAwAAAwAAAwAAAwAAAwACUgAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAC0gAAAwAAAwAAAwAAAwAAAwAAAwAAAwAA
+        AwADMgAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwADhgAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAD0gAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAAAwAEDAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAERAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEXAAAAwAAAwAAAwAA
+        AwAAAwAAAwAAAwAAAwAEdAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAA
+        AwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAE
+        jAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAA
+        AwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAA
+        AwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAA
+        AwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAA
+        AwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAA
+        AwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAA
+        AwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAA
+        AwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAE
+        jAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjAAAAwAAAwAAAwAAAwAAAwAAAwAAAwAAAwAEjLD4AAADAAADAAADAAADAAADAAAD
+        AAADAAADAAADAAADAAADAAADAAADAAADAAADAAADAAADABDQ
+        """
 }

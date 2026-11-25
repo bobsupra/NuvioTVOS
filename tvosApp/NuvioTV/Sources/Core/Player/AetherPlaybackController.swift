@@ -4183,6 +4183,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             dynamicRange: range,
             resolution: resolutionStr,
             frameRate: fpsStr,
+            videoUpscaling: Self.upscaleSummary(engine.activeUpscale),
             audio: audioFormatted,
             audioSourceCodec: audioSource.codec,
             audioSourceChannels: audioSource.channels,
@@ -4261,6 +4262,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             .store(in: &cancellables)
         #if os(tvOS) || os(iOS)
         self.engine.ownsVideoNowPlayingSession = true
+        self.engine.nativeAudioSessionActivationEnabled = true
         #endif
         subtitleTranslationState.onCueTranslationResolved = { [weak self] cueID in
             self?.releaseAISubtitleStartupHold(for: cueID)
@@ -5393,18 +5395,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             request.videoURL.scheme?.lowercased() ?? "")
         let prefersHDR10PlusForThisLoad = !panelPresentsDV
             && !isLive && !isRemoteHLS && sourceSupportsHDR10PlusPreflight
-        let upscaleScalerChoice = ProfileSettings.current.string(forKey: SettingsKey.upscaleScaler) ?? "smart"
+        let upscaleScalerChoice = ProfileSettings.current.string(forKey: SettingsKey.upscaleScaler)
         let lowResUpscalingSetting = ProfileSettings.current.object(forKey: SettingsKey.lowResUpscaling) as? Bool ?? true
-        let upscalesLowResolutionVideo = lowResUpscalingSetting && upscaleScalerChoice != "off"
-        let upscaleScaler: UpscaleScaler
-        switch upscaleScalerChoice {
-        case "lineArt":
-            upscaleScaler = .lineArt
-        case "automatic":
-            upscaleScaler = .automatic
-        default:
-            upscaleScaler = request.isAnime ? .lineArt : .automatic
-        }
+        let upscaleConfig = Self.resolvedUpscaleConfiguration(
+            choice: upscaleScalerChoice,
+            lowResEnabled: lowResUpscalingSetting,
+            isAnime: request.isAnime
+        )
+        let upscalesLowResolutionVideo = upscaleConfig.upscalesLowResolutionVideo
+        let upscaleScaler = upscaleConfig.scaler
+        let upscalesFullHDVideo = upscaleConfig.upscalesFullHDVideo
         let losslessAudioBridge = ProfileSettings.current.bool(forKey: SettingsKey.losslessAudioBridge)
         let initialAudioShaping = currentAudioShaping()
         // Bound find_stream_info probe budget for remote VOD streams (#68, #461).
@@ -5431,6 +5431,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             foldsDolbyVisionFEL: foldsDolbyVisionFEL,
             upscalesLowResolutionVideo: upscalesLowResolutionVideo,
             upscaleScaler: upscaleScaler,
+            upscalesFullHDVideo: upscalesFullHDVideo,
             matchContentEnabled: matchContent,
             panelIsInHDRMode: panelInHDR,
             panelPresentsDolbyVision: panelPresentsDV,
@@ -5465,6 +5466,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             externalSubtitles: externalRegistration.tracks,
             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments(isBackedByHybridDiskCache: isLocalPlaybackCache),
             sessionCacheFreeReserveBytes: 2 * 1024 * 1024 * 1024,
+            retainsSessionCacheAfterStop: !isLive && !isRemoteHLS && !forceSequentialOrigin && !request.forceSequentialOrigin,
             progressiveSegmentDelivery: !isLive && !isRemoteHLS,
             autoplay: request.autoplay,
             audioDelaySeconds: request.audioDelaySeconds,
@@ -6138,5 +6140,70 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             return sourceTimeSeconds
         }
         return lastKnownSourceTimeSeconds
+    }
+
+    /// Resolves the upscaling flags from the user's selected mode and content type.
+    /// In Auto (`"smart"`), animation uses Anime4K while non-anime gets MetalFX below 1080p and Lanczos-3 at 1080p.
+    nonisolated static func resolvedUpscaleConfiguration(
+        choice: String?,
+        lowResEnabled: Bool,
+        isAnime: Bool
+    ) -> (upscalesLowResolutionVideo: Bool, scaler: UpscaleScaler, upscalesFullHDVideo: Bool) {
+        let normalized = choice ?? "smart"
+        let upscalesLowRes = lowResEnabled && normalized != "off"
+        let scaler: UpscaleScaler
+        switch normalized {
+        case "lineArt":
+            scaler = .lineArt
+        case "automatic":
+            scaler = .automatic
+        default:
+            scaler = isAnime ? .lineArt : .automatic
+        }
+        let upscalesFullHD = upscalesLowRes && normalized == "smart"
+        return (upscalesLowRes, scaler, upscalesFullHD)
+    }
+
+    nonisolated static func upscaleSummary(_ status: UpscaleStatus?) -> String? {
+        guard let status else { return nil }
+        return formatUpscaleSummary(
+            scaler: status.scaler,
+            mlScale: status.mlScale,
+            sourceSize: status.sourceSize,
+            targetSize: status.targetSize,
+            degraded: status.degraded,
+            disabledReason: status.disabledReason
+        )
+    }
+
+    nonisolated static func formatUpscaleSummary(
+        scaler: UpscaleScaler,
+        mlScale: Float?,
+        sourceSize: CGSize,
+        targetSize: CGSize,
+        degraded: Bool,
+        disabledReason: String?
+    ) -> String {
+        if let disabledReason, !disabledReason.isEmpty {
+            return "Disabled (\(disabledReason))"
+        }
+        let scalerName: String
+        switch scaler {
+        case .lineArt:
+            scalerName = "Anime4K"
+        case .lanczos:
+            scalerName = "Lanczos-3"
+        case .automatic:
+            scalerName = mlScale != nil ? "VT Super Res + MetalFX" : "MetalFX"
+        }
+        let fallbackSuffix = degraded ? " (Fallback)" : ""
+        let srcW = Int(sourceSize.width)
+        let srcH = Int(sourceSize.height)
+        let dstW = Int(targetSize.width)
+        let dstH = Int(targetSize.height)
+        if srcW > 0, srcH > 0, dstW > 0, dstH > 0 {
+            return "\(scalerName)\(fallbackSuffix) · \(srcW)×\(srcH) → \(dstW)×\(dstH)"
+        }
+        return "\(scalerName)\(fallbackSuffix)"
     }
 }

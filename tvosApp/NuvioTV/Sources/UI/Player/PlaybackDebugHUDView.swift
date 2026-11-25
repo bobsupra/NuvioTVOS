@@ -147,6 +147,14 @@ struct PlaybackDebugHUDView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 hudRow(label: "Video", value: info.video.isEmpty ? "Unavailable" : info.video)
+                if let upscaling = info.videoUpscaling, !upscaling.isEmpty {
+                    hudRow(
+                        label: "Upscaling",
+                        value: upscaling,
+                        hasDot: true,
+                        dotColor: upscaling.hasPrefix("Disabled") ? .yellow : .green
+                    )
+                }
                 hudRow(label: "HDR", value: info.hdr.isEmpty ? "Unavailable" : info.hdr)
                 hudRow(label: "V bitrate", value: info.vBitrate.isEmpty ? "Unavailable" : info.vBitrate)
                 hudRow(

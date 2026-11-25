@@ -526,6 +526,9 @@ struct ScenePanelView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         infoRow(label: "Codec", value: info.videoCodec)
                         infoRow(label: "Resolution", value: info.resolution)
+                        if let upscaling = info.upscaling, !upscaling.isEmpty {
+                            infoRow(label: "Upscaling", value: upscaling)
+                        }
                         infoRow(label: "Frame Rate", value: info.frameRate)
                         infoRow(label: "Dynamic Range", value: info.dynamicRange)
                         if let profile = info.dolbyVisionProfile, !profile.isEmpty {
