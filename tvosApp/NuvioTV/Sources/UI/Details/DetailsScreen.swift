@@ -4270,7 +4270,8 @@ enum StreamPickerListBuilder {
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
         return displayedStreams(
-            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: selectionMode),
+            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: selectionMode,
+                                ownedLibraries: ownedLibraryNames(in: groups)),
             sortOption: sortOption,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
@@ -4327,7 +4328,8 @@ enum StreamPickerListBuilder {
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: nil)
         let displayed = displayedStreams(
-            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: .automatic),
+            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: .automatic,
+                                ownedLibraries: ownedLibraryNames(in: groups)),
             sortOption: sortOption,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
@@ -4352,16 +4354,31 @@ enum StreamPickerListBuilder {
         return result
     }
 
+    /// The viewer's own libraries: network shares, Jellyfin and Plex.
+    static let ownedLibraryAddonIds: Set<String> = ["local.smb", "local.jellyfin", "local.plex"]
+
+    /// Add-on names of the library groups in `groups`.
+    static func ownedLibraryNames(in groups: [AddonStreamGroup]) -> Set<String> {
+        Set(groups.filter { ownedLibraryAddonIds.contains($0.addonId) }.map(\.displayName))
+    }
+
     private static func episodeTiers(
         from source: [NuvioStream],
         target: StreamEpisodeTarget?,
-        selectionMode: SelectionMode
+        selectionMode: SelectionMode,
+        ownedLibraries: Set<String> = []
     ) -> [[NuvioStream]] {
         guard let target else { return [source] }
         var confirmed: [NuvioStream] = []
         var unknown: [NuvioStream] = []
         var mismatch: [NuvioStream] = []
         for stream in source {
+            // A library stream comes from the library's own entry for this
+            // episode, though its label ("720p WEB-DL") rarely names it.
+            if ownedLibraries.contains(stream.addonName ?? "") {
+                confirmed.append(stream)
+                continue
+            }
             switch target.match(for: stream) {
             case .confirmed:
                 confirmed.append(stream)
