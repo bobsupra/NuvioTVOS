@@ -11,6 +11,16 @@ final class RemoteBackGuardTests: XCTestCase {
         XCTAssertFalse(BackGuardHostView.shouldSwallow(nothingFocused: false, sincePreviousBack: 2, sinceLastSwallow: .infinity))
     }
 
+    @MainActor
+    func testEveryBackGoesThroughWhileTheExitReminderWaits() {
+        defer { BackGuardHostView.passBackUntil = -.infinity }
+        BackGuardHostView.passBackUntil = 100
+        XCTAssertTrue(BackGuardHostView.isPassingBack(at: 99.5))
+        XCTAssertFalse(BackGuardHostView.isPassingBack(at: 100))
+        BackGuardHostView.passBackUntil = -.infinity
+        XCTAssertFalse(BackGuardHostView.isPassingBack(at: 0))
+    }
+
     func testABackRightAfterASwallowedOneGoesThrough() {
         XCTAssertFalse(BackGuardHostView.shouldSwallow(nothingFocused: true, sincePreviousBack: 0.4, sinceLastSwallow: 0.4))
         XCTAssertTrue(BackGuardHostView.shouldSwallow(nothingFocused: true, sincePreviousBack: 2, sinceLastSwallow: 2))

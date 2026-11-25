@@ -5163,6 +5163,81 @@ private struct TVSidebarWatchdogView: View {
 }
 #endif
 
+/// Settings → Appearance → Sidebar → Press Back Twice to Exit. A Back press
+/// that nothing on screen handles reaches this handler, and without one tvOS
+/// leaves the app. The first press shows a reminder. While it shows, the
+/// handler is off, so a second press leaves the usual way and tvOS keeps the
+/// app's state. The state lives here, so a press redraws the reminder and not
+/// the tab view this wraps: until that redraw, the handler stays on and would
+/// take the second press too.
+private struct TVExitGuard: ViewModifier {
+    /// How long the reminder shows and waits for the second press.
+    private static let seconds: Double = 3
+
+    let isEnabled: Bool
+    @State private var isHintVisible = false
+    @State private var hideTask: Task<Void, Never>?
+    @Environment(\.scenePhase) private var scenePhase
+
+    func body(content: Content) -> some View {
+        content
+            .onExitCommand(perform: isEnabled && !isHintVisible ? showHint : nil)
+            .overlay(alignment: .bottom) {
+                if isHintVisible {
+                    TVExitHint()
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { hideHint() }
+            }
+            .onChange(of: isEnabled) { _, enabled in
+                if !enabled { hideHint() }
+            }
+    }
+
+    private func showHint() {
+        hideTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) { isHintVisible = true }
+        // RemoteBackGuard swallows a Back that comes right after another, and
+        // the second press of a double press does. It lets Back through while
+        // the reminder shows.
+        BackGuardHostView.passBackUntil = CACurrentMediaTime() + Self.seconds
+        UIAccessibility.post(notification: .announcement, argument: TVExitHint.message)
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.seconds))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) { isHintVisible = false }
+        }
+    }
+
+    private func hideHint() {
+        hideTask?.cancel()
+        hideTask = nil
+        isHintVisible = false
+        BackGuardHostView.passBackUntil = -.infinity
+    }
+}
+
+/// The reminder for Settings → Appearance → Sidebar → Press Back Twice to Exit.
+private struct TVExitHint: View {
+    static var message: String {
+        L10n.string("tvos_exit_press_back_again", fallback: "Press Back again to exit")
+    }
+
+    var body: some View {
+        Text(Self.message)
+            .font(.appFont(size: 26, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 34)
+            .padding(.vertical, 18)
+            .background(Capsule().fill(Color.black.opacity(0.72)))
+            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+            .padding(.bottom, 64)
+            .allowsHitTesting(false)
+    }
+}
+
 private struct TVMainTabSettings: Equatable {
     let profileID: String?
     let amoled: Bool
@@ -5172,6 +5247,7 @@ private struct TVMainTabSettings: Equatable {
     let showSurpriseMeTab: Bool
     let useTopNavigation: Bool
     let useNuvioRail: Bool
+    let doubleBackToExit: Bool
     let showWatchPartyTab: Bool
     let nativeIPTVEnabled: Bool
     let searchStyle: String
@@ -5189,6 +5265,7 @@ private struct TVMainTabSettings: Equatable {
             showSurpriseMeTab: defaults.object(forKey: SettingsKey.showSurpriseMeTab) as? Bool ?? false,
             useTopNavigation: defaults.object(forKey: SettingsKey.useTopNavigation) as? Bool ?? false,
             useNuvioRail: defaults.object(forKey: SettingsKey.useNuvioRail) as? Bool ?? false,
+            doubleBackToExit: defaults.object(forKey: SettingsKey.doubleBackToExit) as? Bool ?? false,
             showWatchPartyTab: defaults.object(forKey: SettingsKey.showWatchPartyTab) as? Bool ?? true,
             nativeIPTVEnabled: defaults.object(forKey: SettingsKey.nativeIPTVEnabled) as? Bool ?? false,
             searchStyle: defaults.string(forKey: SettingsKey.searchStyle) ?? "Netflix",
@@ -5223,6 +5300,7 @@ private struct TVMainTabSettingsObserver: View {
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.doubleBackToExit) private var doubleBackToExit = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
@@ -5239,6 +5317,7 @@ private struct TVMainTabSettingsObserver: View {
             showSurpriseMeTab: showSurpriseMeTab,
             useTopNavigation: useTopNavigation,
             useNuvioRail: useNuvioRail,
+            doubleBackToExit: doubleBackToExit,
             showWatchPartyTab: showWatchPartyTab,
             nativeIPTVEnabled: nativeIPTVEnabled,
             searchStyle: searchStyle,
@@ -5355,6 +5434,7 @@ private struct TVMainTabView: View {
     private var showSurpriseMeTab: Bool { tabSettings.showSurpriseMeTab }
     private var useTopNavigation: Bool { tabSettings.useTopNavigation }
     private var useNuvioRail: Bool { tabSettings.useNuvioRail }
+    private var doubleBackToExit: Bool { tabSettings.doubleBackToExit }
     private var showWatchPartyTab: Bool { tabSettings.showWatchPartyTab }
     private var nativeIPTVEnabled: Bool { tabSettings.nativeIPTVEnabled }
     private var searchStyle: String { tabSettings.searchStyle }
@@ -5413,6 +5493,10 @@ private struct TVMainTabView: View {
         .onChange(of: nativeIPTVEnabled) { _, enabled in
             if !enabled, selectedTab == .liveTV { selectedTab = .home }
         }
+        // Settings → Appearance → Sidebar → Press Back Twice to Exit. Not
+        // with the top tab bar: there tvOS moves focus to the bar on Back,
+        // and the guard would take that press too.
+        .modifier(TVExitGuard(isEnabled: doubleBackToExit && !useTopNavigation && !isFullScreenOverlayPresented))
     }
 
     /// Search screen chosen in Settings → Layout & Discovery → Search Style.
