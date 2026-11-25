@@ -13845,7 +13845,9 @@ private struct TvStreamCard: View {
         let nameLines = expanded ? nil : style.nameLines
         let descriptionLines = expanded ? nil : style.descriptionLines
 
-        Button(action: action) {
+        Menu {
+            playWithMenu
+        } label: {
             // The badge row spans the whole card, under the add-on logo too.
             VStack(alignment: .leading, spacing: metrics.lineSpacing) {
                 if showImportedBadges && badgePlacement == .top {
@@ -13943,23 +13945,32 @@ private struct TvStreamCard: View {
                         lineWidth: looksFocused ? AppFocusOutline.width : 1
                     )
             )
+        } primaryAction: {
+            action()
         }
-        .buttonStyle(TvStreamCardButtonStyle(isFocused: isFocused))
+        // A Menu, not a context menu: tvOS draws an enlarged copy of a view
+        // under its context menu, and the card's mostly transparent fill showed
+        // through that copy. A Menu opens beside the card and draws no copy.
+        .menuStyle(.button)
+        .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: focusID))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(looksFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-        .contextMenu {
-            Section(L10n.string("details_play_with", fallback: "Play with")) {
-                ForEach(ExternalPlayer.allCases) { player in
-                    Button {
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                            onSelectPlayer?(player)
-                        }
-                    } label: {
-                        Label(player.rawValue, systemImage: player.systemImage)
+    }
+
+    /// Press-and-hold opens this list; a click plays the source.
+    @ViewBuilder
+    private var playWithMenu: some View {
+        Section(L10n.string("details_play_with", fallback: "Play with")) {
+            ForEach(ExternalPlayer.allCases) { player in
+                Button {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        onSelectPlayer?(player)
                     }
+                } label: {
+                    Label(player.rawValue, systemImage: player.systemImage)
                 }
             }
         }
@@ -14011,30 +14022,6 @@ private struct TvStreamCard: View {
         } else {
             fallback.frame(width: size, height: size)
         }
-    }
-}
-
-/// PosterCardButtonStyle for a source card, with an opaque fill while the
-/// card is held down after focus has moved to its "Play with" menu.
-///
-/// Holding Select opens the menu: tvOS draws a slightly enlarged copy of the
-/// held card over the card itself. The card's fill is mostly transparent, so
-/// the card showed through that copy, shrunk by the press effect, and the two
-/// sets of text overlapped. The fill only shows while the menu has focus: a
-/// quick press is still focused, and tvOS leaves the card pressed after Back
-/// until focus moves, by which time the card has its focus again.
-private struct TvStreamCardButtonStyle: ButtonStyle {
-    let isFocused: Bool
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(Color(white: 0.12))
-                    .opacity(configuration.isPressed && !isFocused ? 1 : 0)
-            )
-            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
-            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
     }
 }
 
