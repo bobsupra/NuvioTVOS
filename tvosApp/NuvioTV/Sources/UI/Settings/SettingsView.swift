@@ -4358,7 +4358,7 @@ private struct StreamListStyleEditor: View {
 
         SettingsToggleRow(
             title: L10n.string("tvos_settings_nuvio_badges", fallback: "Nuvio Badges"),
-            subtitle: L10n.string("tvos_settings_nuvio_badges_subtitle", fallback: "Draw quality badges with the official Dolby, DTS, HDR10+ and Blu-ray marks and streaming service logos instead of the badge pack's images"),
+            subtitle: L10n.string("tvos_settings_nuvio_badges_subtitle", fallback: "Draw quality badges with the official Dolby, DTS and HDR10+ marks instead of the badge pack's images"),
             isOn: Binding(
                 get: { nuvioBadges },
                 set: { newValue in
@@ -15800,7 +15800,7 @@ private struct LicensesAttributionsSheet: View {
         LicenseEntry(
             id: "stream-badge-marks",
             title: "Stream badge marks",
-            body: "The Dolby, DTS, HDR10+ and Blu-ray Disc marks and the streaming service logos on Nuvio Badges, from Wikimedia Commons. The DTS:X mark is by CinemaLover24680, changed to a single color. The 4K Ultra HD and HEVC marks are drawn for the app. All marks are trademarks of their owners and only name a stream's format or the service it came from.",
+            body: "The Dolby, DTS and HDR10+ marks on Nuvio Badges, from Wikimedia Commons. The DTS:X mark is by CinemaLover24680, changed to a single color. All marks are trademarks of their owners and only name the format a stream has.",
             license: "CC BY-SA 4.0 (DTS:X), public domain (others)"
         )
     ]
