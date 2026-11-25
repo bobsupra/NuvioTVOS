@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 import UIKit
 @testable import NuvioTV
 
@@ -82,5 +83,28 @@ final class CardAppearanceTests: XCTestCase {
         let cgImage = try XCTUnwrap(blurred.cgImage)
         XCTAssertEqual(cgImage.width, 640)
         XCTAssertEqual(cgImage.height, 360)
+    }
+
+    func testIPTVLiveAppearanceTracksAppBackgroundAndAmoledSettings() {
+        XCTAssertEqual(
+            UIColor(IPTVLiveView.backgroundColor(amoled: false, bodyColor: SettingsBackground.ocean.rawValue)),
+            UIColor(SettingsBackground.ocean.color)
+        )
+        XCTAssertEqual(
+            UIColor(IPTVLiveView.backgroundColor(amoled: false, bodyColor: SettingsBackground.crimson.rawValue)),
+            UIColor(SettingsBackground.crimson.color)
+        )
+        XCTAssertEqual(
+            UIColor(IPTVLiveView.backgroundColor(amoled: true, bodyColor: SettingsBackground.ocean.rawValue)),
+            UIColor(Color.black)
+        )
+        XCTAssertEqual(
+            UIColor(IPTVLiveView.surfaceFill(amoled: true, amoledSurfaces: true)),
+            UIColor(Color.black)
+        )
+        XCTAssertEqual(
+            UIColor(IPTVLiveView.surfaceFill(amoled: true, amoledSurfaces: false)),
+            UIColor(Color.white.opacity(0.045))
+        )
     }
 }

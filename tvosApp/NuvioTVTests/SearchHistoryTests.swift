@@ -1215,9 +1215,11 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
     }
 
     func testSearchKeepsFastAddonWhenAnotherManifestExceedsDiscoveryDeadline() async throws {
-        let defaults = ProfileSettings.current
-        let previousPreferences = CinemetaCatalogRepository.configuredStreamAddonPreferences(in: defaults)
-        let previousCinemetaDisabled = defaults.object(forKey: SettingsKey.cinemetaDisabled)
+        let previousProfileID = ProfileSettings.activeProfileID
+        let previousProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        let testProfileID = "search-deadline-\(UUID().uuidString)"
+        ProfileSettings.setActiveProfile(testProfileID, isPrimary: false)
+        let defaults = ProfileSettings.store(for: testProfileID)
         let fastManifestURL = URL(string: "https://fast-addon.invalid/manifest.json")!
         let slowManifestURL = URL(string: "https://slow-addon.invalid/manifest.json")!
         let sessionConfiguration = URLSessionConfiguration.ephemeral
@@ -1231,7 +1233,8 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
                 StreamAddonPreference(url: fastManifestURL.absoluteString, enabled: true),
                 StreamAddonPreference(url: slowManifestURL.absoluteString, enabled: true)
             ],
-            in: defaults
+            in: defaults,
+            isLocalEdit: false
         )
         CinemetaCatalogRepository.setCinemetaDisabled(true, in: defaults)
         XCTAssertFalse(CinemetaCatalogRepository.isCinemetaEnabled)
@@ -1249,11 +1252,11 @@ final class SearchAndDiscoverLifecycleTests: XCTestCase {
             SearchManifestFixtureURLProtocol.reset()
             CinemetaCatalogRepository.setNetworkSessionForTesting(nil)
             fixtureSession.invalidateAndCancel()
-            CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(previousPreferences, in: defaults)
-            if let previousCinemetaDisabled {
-                defaults.set(previousCinemetaDisabled, forKey: SettingsKey.cinemetaDisabled)
+            UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(testProfileID)")
+            if let previousProfileID {
+                ProfileSettings.setActiveProfile(previousProfileID, isPrimary: previousProfileIsPrimary)
             } else {
-                defaults.removeObject(forKey: SettingsKey.cinemetaDisabled)
+                ProfileSettings.clearActiveProfile()
             }
         }
 

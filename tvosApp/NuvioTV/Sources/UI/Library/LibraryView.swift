@@ -290,9 +290,6 @@ public struct LibraryView: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
-    @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
-    @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
-    @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
 
     init(
         viewModel: LibraryViewModel,

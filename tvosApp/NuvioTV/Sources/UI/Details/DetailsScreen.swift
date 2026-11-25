@@ -100,9 +100,7 @@ struct DetailsScreen: View {
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
-    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
-    @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
     @AppStorage(SettingsKey.backgroundStreamPreFetch) private var backgroundStreamPreFetch = true
     @State private var preResolvedStream: NuvioStream? = nil
     @State private var preResolvedURL: URL? = nil
