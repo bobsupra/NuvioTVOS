@@ -148,7 +148,7 @@ struct VC1ParserExtradataTests {
         ctx.pointee.extradata = buffer.assumingMemoryBound(to: UInt8.self)
         ctx.pointee.extradata_size = Int32(blob.count)
 
-        guard let parser = av_parser_init(Int32(AV_CODEC_ID_VC1.rawValue)) else {
+        guard let parser = parserInit(AV_CODEC_ID_VC1) else {
             Issue.record("vc1 parser unavailable")
             return (0, 0)
         }
@@ -190,7 +190,7 @@ struct VC1ParserExtradataTests {
     func landingWithSequenceHeaderControl() {
         guard let codec = avcodec_find_decoder(AV_CODEC_ID_VC1),
               let ctx = avcodec_alloc_context3(codec),
-              let parser = av_parser_init(Int32(AV_CODEC_ID_VC1.rawValue)) else {
+              let parser = parserInit(AV_CODEC_ID_VC1) else {
             Issue.record("vc1 parser or decoder unavailable")
             return
         }
@@ -213,4 +213,24 @@ struct VC1ParserExtradataTests {
         #expect(ctx.pointee.width == 1920, "the synthetic BDUs themselves are broken")
         #expect(ctx.pointee.height == 1080)
     }
+}
+
+/// `av_parser_init` for either libavcodec signature: an `int` up to major 62 (FFmpeg 8), an
+/// `enum AVCodecID` from major 63 (FFmpeg 9, `FF_API_PARSER_CODECID` gone). Swift imports the two as
+/// different parameter types, so overload resolution on the function reference picks whichever one
+/// the headers declare and this file compiles against both. AetherEngine has the same helper.
+private func parserInit(_ codecID: AVCodecID) -> UnsafeMutablePointer<AVCodecParserContext>? {
+    callParserInit(av_parser_init, codecID)
+}
+
+private func callParserInit(
+    _ initialise: (Int32) -> UnsafeMutablePointer<AVCodecParserContext>?, _ codecID: AVCodecID
+) -> UnsafeMutablePointer<AVCodecParserContext>? {
+    initialise(Int32(codecID.rawValue))
+}
+
+private func callParserInit(
+    _ initialise: (AVCodecID) -> UnsafeMutablePointer<AVCodecParserContext>?, _ codecID: AVCodecID
+) -> UnsafeMutablePointer<AVCodecParserContext>? {
+    initialise(codecID)
 }

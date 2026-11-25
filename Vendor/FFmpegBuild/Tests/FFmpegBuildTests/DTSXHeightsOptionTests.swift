@@ -1,9 +1,11 @@
 import Testing
+import Foundation
 import AetherLibavcodec
 import AetherLibavutil
 
 /// Proves the DTS:X height patch (build.sh `patch_ffmpeg_dca_x_heights`,
-/// patches/dca-xll-x-heights.patch) is in the shipped libavcodec.
+/// patches/dca-xll-x-heights.patch) is in the shipped libavcodec, or that it is not,
+/// when the build ran with `--without-dtsx-heights` (FFmpegBuild#12).
 ///
 /// The patch adds the `dca` decoder option `x_heights`, off by default. With it the
 /// decoder reads the height channel set of DTS:X's standard presentation and outputs
@@ -11,9 +13,23 @@ import AetherLibavutil
 /// dictionary it was handed, so a build without the patch is told apart by that alone.
 /// The decode itself is measured in AetherEngine against real DTS:X streams, which
 /// cannot be committed here.
+///
+/// Which build to expect comes from BUILD-INFO.txt, written by the same build.sh run.
+/// A record without the line predates the switch and always applied the patch.
 struct DTSXHeightsOptionTests {
 
-    @Test("the dca decoder takes x_heights, and it is off by default")
+    private static let patchLeftOut: Bool = {
+        let record = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()   // FFmpegBuildTests
+            .deletingLastPathComponent()   // Tests
+            .deletingLastPathComponent()   // repo root
+            .appendingPathComponent("BUILD-INFO.txt")
+        let text = (try? String(contentsOf: record, encoding: .utf8)) ?? ""
+        return text.contains("DTS:X heights patch left out")
+    }()
+
+    @Test("the dca decoder takes x_heights, and it is off by default",
+          .enabled(if: !patchLeftOut))
     func optionExists() throws {
         let codec = try #require(avcodec_find_decoder(AV_CODEC_ID_DTS))
         var context = avcodec_alloc_context3(codec)
@@ -31,7 +47,8 @@ struct DTSXHeightsOptionTests {
         #expect(value == 1)
     }
 
-    @Test("the dca decoder exports x_presentation, read-only and 0 before any heights decoded")
+    @Test("the dca decoder exports x_presentation, read-only and 0 before any heights decoded",
+          .enabled(if: !patchLeftOut))
     func presentationIsExported() throws {
         let codec = try #require(avcodec_find_decoder(AV_CODEC_ID_DTS))
         var context = avcodec_alloc_context3(codec)
@@ -41,5 +58,22 @@ struct DTSXHeightsOptionTests {
         #expect(av_opt_get_int(context!.pointee.priv_data, "x_presentation", 0, &value) >= 0)
         #expect(value == 0)
         #expect(av_opt_set_int(context!.pointee.priv_data, "x_presentation", 1, 0) < 0, "read-only")
+    }
+
+    @Test("a build with --without-dtsx-heights has neither option, and dca still opens",
+          .enabled(if: patchLeftOut))
+    func optionAbsent() throws {
+        let codec = try #require(avcodec_find_decoder(AV_CODEC_ID_DTS))
+        var context = avcodec_alloc_context3(codec)
+        defer { avcodec_free_context(&context) }
+        var value: Int64 = -1
+        #expect(av_opt_get_int(context!.pointee.priv_data, "x_heights", 0, &value) < 0)
+        #expect(av_opt_get_int(context!.pointee.priv_data, "x_presentation", 0, &value) < 0)
+
+        var options: OpaquePointer?
+        av_dict_set(&options, "x_heights", "1", 0)
+        defer { av_dict_free(&options) }
+        #expect(avcodec_open2(context, codec, &options) >= 0)
+        #expect(av_dict_get(options, "x_heights", nil, 0) != nil, "the decoder left the option unread")
     }
 }

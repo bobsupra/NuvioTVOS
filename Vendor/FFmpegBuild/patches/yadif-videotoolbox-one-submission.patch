@@ -1,0 +1,245 @@
+avfilter/vf_yadif_videotoolbox: one command buffer per frame
+
+The filter committed a command buffer and waited for it once per plane,
+so an NV12 or P010 frame went to the GPU twice and the calling thread
+waited twice. The planes are now dispatches on one compute encoder in one
+command buffer, with one commit and one wait per frame. The parameters go
+by value through setBytes, so the shared parameter buffer is gone: two
+planes in one submission could not share it.
+
+The output is unchanged. framemd5 of NV12 and P010, send_field and
+send_frame, TFF and BFF, matches the per-plane filter frame for frame. On
+an M1, 1200 fields of 1080p59.94 took 2.34 ms per field before and 1.86 ms
+after, and the system time of the run fell by 27%.
+
+Two fixes ride along, because the rewrite owns these lines:
+
+- commandBuffer and computeCommandEncoder return autoreleased (+0)
+  objects, and FFmpeg builds Objective-C without ARC, but upstream also
+  released them by hand. That over-release crashes a host app whose GCD
+  queue pops its autorelease pool when the work block ends. The per-frame
+  @autoreleasepool is now their only release. (Until now FFmpegBuild fixed
+  this with an inline perl edit in build.sh.)
+- ff_metal_texture_from_pixbuf returns NULL when the texture cache fails,
+  and that NULL went into CFRelease. The filter now stops at that plane,
+  as it already did for an unsupported pixel format; planes encoded before
+  it still run.
+
+A missing command buffer or encoder and a command buffer that ends in
+error are logged now; both went out as a frame without a word before.
+
+Proposed in AetherEngine issue 1101.
+---
+--- a/libavfilter/vf_yadif_videotoolbox.m
++++ b/libavfilter/vf_yadif_videotoolbox.m
+@@ -44,7 +44,6 @@
+     id<MTLCommandQueue> mtlQueue;
+     id<MTLComputePipelineState> mtlPipeline;
+     id<MTLFunction> mtlFunction;
+-    id<MTLBuffer> mtlParamsBuffer;
+ 
+     CVMetalTextureCacheRef textureCache;
+ } YADIFVTContext API_AVAILABLE(macos(10.11), ios(8.0));
+@@ -52,7 +51,7 @@
+ // Using sizeof(YADIFVTContext) outside of an availability check will error
+ // if we're targeting an older OS version, so we need to calculate the size ourselves
+ // (we'll statically verify it's correct in yadif_videotoolbox_init behind a check)
+-#define YADIF_VT_CTX_SIZE (sizeof(YADIFContext) + sizeof(void*) * 10)
++#define YADIF_VT_CTX_SIZE (sizeof(YADIFContext) + sizeof(void*) * 9)
+ 
+ struct mtlYadifParams {
+     uint channels;
+@@ -63,20 +62,20 @@
+     int field_mode;
+ };
+ 
+-static void call_kernel(AVFilterContext *ctx,
+-                        id<MTLTexture> dst,
+-                        id<MTLTexture> prev,
+-                        id<MTLTexture> cur,
+-                        id<MTLTexture> next,
+-                        int channels,
+-                        int parity,
+-                        int tff) API_AVAILABLE(macos(10.11), ios(8.0))
++// The planes of a frame are dispatches on one encoder in one command buffer, so the
++// frame goes to the GPU once and waits once, instead of once per plane.
++static void encode_plane(AVFilterContext *ctx,
++                         id<MTLComputeCommandEncoder> encoder,
++                         id<MTLTexture> dst,
++                         id<MTLTexture> prev,
++                         id<MTLTexture> cur,
++                         id<MTLTexture> next,
++                         int channels,
++                         int parity,
++                         int tff) API_AVAILABLE(macos(10.11), ios(8.0))
+ {
+     YADIFVTContext *s = ctx->priv;
+-    id<MTLCommandBuffer> buffer = s->mtlQueue.commandBuffer;
+-    id<MTLComputeCommandEncoder> encoder = buffer.computeCommandEncoder;
+-    struct mtlYadifParams *params = (struct mtlYadifParams *)s->mtlParamsBuffer.contents;
+-    *params = (struct mtlYadifParams){
++    struct mtlYadifParams params = {
+         .channels = channels,
+         .parity = parity,
+         .tff = tff,
+@@ -89,15 +88,8 @@
+     [encoder setTexture:prev atIndex:1];
+     [encoder setTexture:cur  atIndex:2];
+     [encoder setTexture:next atIndex:3];
+-    [encoder setBuffer:s->mtlParamsBuffer offset:0 atIndex:4];
++    [encoder setBytes:&params length:sizeof(params) atIndex:4];
+     ff_metal_compute_encoder_dispatch(s->mtlDevice, s->mtlPipeline, encoder, dst.width, dst.height);
+-    [encoder endEncoding];
+-
+-    [buffer commit];
+-    [buffer waitUntilCompleted];
+-
+-    ff_objc_release(&encoder);
+-    ff_objc_release(&buffer);
+ }
+ 
+ static void filter(AVFilterContext *ctx, AVFrame *dst,
+@@ -105,13 +97,27 @@
+ {
+     YADIFVTContext *s = ctx->priv;
+     YADIFContext *y = &s->yadif;
++    // Four textures per plane, at most four planes. The GPU reads them after the
++    // loop, so they are released after the wait.
++    CVMetalTextureRef textures[16] = { NULL };
++    int nb_textures = 0, nb_planes = 0, failed = 0;
+     int i;
+ 
+-    for (i = 0; i < y->csp->nb_components; i++) {
++    // commandBuffer and computeCommandEncoder return autoreleased (+0) objects and
++    // this file is built without ARC, so the pool pop is their only release.
++    @autoreleasepool {
++    id<MTLCommandBuffer> buffer = s->mtlQueue.commandBuffer;
++    id<MTLComputeCommandEncoder> encoder = buffer.computeCommandEncoder;
++
++    if (!buffer || !encoder) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command buffer or encoder\n");
++        failed = 1;
++    }
++
++    for (i = 0; i < y->csp->nb_components && !failed; i++) {
+         int pixel_size, channels;
+         const AVComponentDescriptor *comp = &y->csp->comp[i];
+-        CVMetalTextureRef prev, cur, next, dest;
+-        id<MTLTexture> tex_prev, tex_cur, tex_next, tex_dest;
++        CVMetalTextureRef *tex = &textures[nb_textures];
+         MTLPixelFormat format;
+ 
+         if (comp->plane < i) {
+@@ -124,7 +130,8 @@
+         channels = comp->step / pixel_size;
+         if (pixel_size > 2 || channels > 2) {
+             av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n", y->csp->name);
+-            goto exit;
++            failed = 1;
++            break;
+         }
+         switch (pixel_size) {
+         case 1:
+@@ -135,39 +142,60 @@
+             break;
+         default:
+             av_log(ctx, AV_LOG_ERROR, "Unsupported pixel format: %s\n", y->csp->name);
+-            goto exit;
++            failed = 1;
++            break;
+         }
++        if (failed)
++            break;
+         av_log(ctx, AV_LOG_TRACE,
+                "Deinterlacing plane %d: pixel_size: %d channels: %d\n",
+                comp->plane, pixel_size, channels);
+ 
+-        prev = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)y->prev->data[3], i, format);
+-        cur  = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)y->cur->data[3], i, format);
+-        next = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)y->next->data[3], i, format);
+-        dest = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)dst->data[3], i, format);
++        tex[0] = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)y->prev->data[3], i, format);
++        tex[1] = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)y->cur->data[3], i, format);
++        tex[2] = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)y->next->data[3], i, format);
++        tex[3] = ff_metal_texture_from_pixbuf(ctx, s->textureCache, (CVPixelBufferRef)dst->data[3], i, format);
++        nb_textures += 4;
++        // The helper has logged the failure.
++        if (!tex[0] || !tex[1] || !tex[2] || !tex[3]) {
++            failed = 1;
++            break;
++        }
+ 
+-        tex_prev = CVMetalTextureGetTexture(prev);
+-        tex_cur  = CVMetalTextureGetTexture(cur);
+-        tex_next = CVMetalTextureGetTexture(next);
+-        tex_dest = CVMetalTextureGetTexture(dest);
++        encode_plane(ctx, encoder,
++                     CVMetalTextureGetTexture(tex[3]),
++                     CVMetalTextureGetTexture(tex[0]),
++                     CVMetalTextureGetTexture(tex[1]),
++                     CVMetalTextureGetTexture(tex[2]),
++                     channels, parity, tff);
++        nb_planes++;
++    }
+ 
+-        call_kernel(ctx, tex_dest, tex_prev, tex_cur, tex_next,
+-                         channels, parity, tff);
++    [encoder endEncoding];
++    // Planes encoded before a failure still run, as they did with one
++    // submission per plane.
++    if (nb_planes) {
++        [buffer commit];
++        [buffer waitUntilCompleted];
++        if (buffer.status == MTLCommandBufferStatusError) {
++            av_log(ctx, AV_LOG_ERROR, "Metal command buffer failed: %s\n",
++                   buffer.error.description.UTF8String);
++            failed = 1;
++        }
++    }
++    }
+ 
+-        CFRelease(prev);
+-        CFRelease(cur);
+-        CFRelease(next);
+-        CFRelease(dest);
++    for (i = 0; i < nb_textures; i++) {
++        if (textures[i])
++            CFRelease(textures[i]);
+     }
+ 
+-    CVBufferPropagateAttachments((CVPixelBufferRef)y->cur->data[3], (CVPixelBufferRef)dst->data[3]);
++    if (!failed)
++        CVBufferPropagateAttachments((CVPixelBufferRef)y->cur->data[3], (CVPixelBufferRef)dst->data[3]);
+ 
+     if (y->current_field == YADIF_FIELD_END) {
+         y->current_field = YADIF_FIELD_NORMAL;
+     }
+-
+-exit:
+-    return;
+ }
+ 
+ static av_cold void do_uninit(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
+@@ -180,7 +208,6 @@
+     av_buffer_unref(&s->input_frames_ref);
+     s->input_frames = NULL;
+ 
+-    ff_objc_release(&s->mtlParamsBuffer);
+     ff_objc_release(&s->mtlFunction);
+     ff_objc_release(&s->mtlPipeline);
+     ff_objc_release(&s->mtlQueue);
+@@ -245,14 +272,6 @@
+         error:&err];
+     if (err) {
+         av_log(ctx, AV_LOG_ERROR, "Failed to create Metal compute pipeline: %s\n", err.description.UTF8String);
+-        goto fail;
+-    }
+-
+-    s->mtlParamsBuffer = [s->mtlDevice
+-        newBufferWithLength:sizeof(struct mtlYadifParams)
+-        options:MTLResourceStorageModeShared];
+-    if (!s->mtlParamsBuffer) {
+-        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal buffer for parameters\n");
+         goto fail;
+     }
+ 

@@ -1,0 +1,2189 @@
+diff --git a/configure b/configure
+index 6be807a..ec6008d 100755
+--- a/configure
++++ b/configure
+@@ -4111,6 +4111,7 @@ coreimagesrc_filter_deps="coreimage appkit"
+ coreimagesrc_filter_extralibs="-framework OpenGL"
+ cover_rect_filter_deps="avcodec avformat gpl"
+ cropdetect_filter_deps="gpl"
++decimate_videotoolbox_filter_deps="metal corevideo videotoolbox"
+ deinterlace_qsv_filter_deps="libmfx"
+ deinterlace_qsv_filter_select="qsvvpp"
+ deinterlace_vaapi_filter_deps="vaapi"
+@@ -4129,6 +4130,7 @@ drawvg_filter_deps="cairo"
+ elbg_filter_deps="avcodec"
+ eq_filter_deps="gpl"
+ erosion_opencl_filter_deps="opencl"
++fieldmatch_videotoolbox_filter_deps="metal corevideo videotoolbox"
+ find_rect_filter_deps="avcodec avformat gpl"
+ flip_vulkan_filter_deps="vulkan spirv_library"
+ flite_filter_deps="libflite threads"
+diff --git a/libavfilter/Makefile b/libavfilter/Makefile
+index 0b6e4c3..b82a64c 100644
+--- a/libavfilter/Makefile
++++ b/libavfilter/Makefile
+@@ -275,6 +275,9 @@ OBJS-$(CONFIG_DCTDNOIZ_FILTER)               += vf_dctdnoiz.o
+ OBJS-$(CONFIG_DEBAND_FILTER)                 += vf_deband.o
+ OBJS-$(CONFIG_DEBLOCK_FILTER)                += vf_deblock.o
+ OBJS-$(CONFIG_DECIMATE_FILTER)               += vf_decimate.o
++OBJS-$(CONFIG_DECIMATE_VIDEOTOOLBOX_FILTER)  += vf_decimate_videotoolbox.o \
++                                                metal/vf_decimate_videotoolbox.metallib.o \
++                                                metal/utils.o
+ OBJS-$(CONFIG_DERAIN_FILTER)                 += vf_derain.o
+ OBJS-$(CONFIG_DECONVOLVE_FILTER)             += vf_convolve.o framesync.o
+ OBJS-$(CONFIG_DEDOT_FILTER)                  += vf_dedot.o
+@@ -322,6 +325,9 @@ OBJS-$(CONFIG_FFTFILT_FILTER)                += vf_fftfilt.o
+ OBJS-$(CONFIG_FIELD_FILTER)                  += vf_field.o
+ OBJS-$(CONFIG_FIELDHINT_FILTER)              += vf_fieldhint.o
+ OBJS-$(CONFIG_FIELDMATCH_FILTER)             += vf_fieldmatch.o
++OBJS-$(CONFIG_FIELDMATCH_VIDEOTOOLBOX_FILTER) += vf_fieldmatch_videotoolbox.o \
++                                                metal/vf_fieldmatch_videotoolbox.metallib.o \
++                                                metal/utils.o
+ OBJS-$(CONFIG_FIELDORDER_FILTER)             += vf_fieldorder.o
+ OBJS-$(CONFIG_FILLBORDERS_FILTER)            += vf_fillborders.o
+ OBJS-$(CONFIG_FIND_RECT_FILTER)              += vf_find_rect.o lavfutils.o
+diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
+index 1f62658..26a2194 100644
+--- a/libavfilter/allfilters.c
++++ b/libavfilter/allfilters.c
+@@ -248,6 +248,7 @@ extern const FFFilter ff_vf_dctdnoiz;
+ extern const FFFilter ff_vf_deband;
+ extern const FFFilter ff_vf_deblock;
+ extern const FFFilter ff_vf_decimate;
++extern const FFFilter ff_vf_decimate_videotoolbox;
+ extern const FFFilter ff_vf_deconvolve;
+ extern const FFFilter ff_vf_dedot;
+ extern const FFFilter ff_vf_deflate;
+@@ -292,6 +293,7 @@ extern const FFFilter ff_vf_fftfilt;
+ extern const FFFilter ff_vf_field;
+ extern const FFFilter ff_vf_fieldhint;
+ extern const FFFilter ff_vf_fieldmatch;
++extern const FFFilter ff_vf_fieldmatch_videotoolbox;
+ extern const FFFilter ff_vf_fieldorder;
+ extern const FFFilter ff_vf_fillborders;
+ extern const FFFilter ff_vf_find_rect;
+diff --git a/libavfilter/metal/vf_decimate_videotoolbox.metal b/libavfilter/metal/vf_decimate_videotoolbox.metal
+new file mode 100644
+index 0000000..7ca60df
+--- /dev/null
++++ b/libavfilter/metal/vf_decimate_videotoolbox.metal
+@@ -0,0 +1,69 @@
++/*
++ * Frame decimation for VideoToolbox frames, Metal compute kernel.
++ *
++ * The metric of libavfilter/vf_decimate.c (calc_diffs): the sum of absolute
++ * differences between two frames over each half-block. The filter adds the
++ * half-blocks into vf_decimate.c's blocks on the CPU and runs its decision
++ * code unchanged.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <metal_stdlib>
++#include <metal_integer>
++#include <metal_texture>
++
++using namespace metal;
++
++typedef texture2d<uint, access::read> utex;
++
++/* Must match struct dmvt_block_diff_params in vf_decimate_videotoolbox.m. */
++struct block_diff_params {
++    uint width;     /* plane width in texels */
++    uint height;    /* plane height in rows */
++    uint channels;  /* 1 (Y) or 2 (UV: U and V both add into the same half-block) */
++    uint hblockx;   /* half-block size on this plane */
++    uint hblocky;
++    uint ncx, ncy;  /* half-blocks on this plane */
++    uint stride;    /* half-blocks per row of the output, vf_decimate.c's nxblocks */
++};
++
++/* One half-block of one plane. Its sum is at most 256 * 256 * 255 * 2, which
++ * fits in 32 bits; the filter adds the planes in 64 bits, as calc_diffs does. */
++kernel void block_diff(utex a [[texture(0)]],
++                       utex b [[texture(1)]],
++                       device uint *out [[buffer(0)]],
++                       constant block_diff_params &p [[buffer(1)]],
++                       uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.ncx || gid.y >= p.ncy)
++        return;
++    const uint x0 = gid.x * p.hblockx, x1 = min(x0 + p.hblockx, p.width);
++    const uint y0 = gid.y * p.hblocky, y1 = min(y0 + p.hblocky, p.height);
++    uint sum = 0;
++
++    for (uint y = y0; y < y1; y++) {
++        for (uint x = x0; x < x1; x++) {
++            const uint4 va = a.read(uint2(x, y));
++            const uint4 vb = b.read(uint2(x, y));
++            sum += uint(abs(int(va.x) - int(vb.x)));
++            if (p.channels > 1)
++                sum += uint(abs(int(va.y) - int(vb.y)));
++        }
++    }
++    out[gid.y * p.stride + gid.x] = sum;
++}
+diff --git a/libavfilter/metal/vf_fieldmatch_videotoolbox.metal b/libavfilter/metal/vf_fieldmatch_videotoolbox.metal
+new file mode 100644
+index 0000000..cbeee54
+--- /dev/null
++++ b/libavfilter/metal/vf_fieldmatch_videotoolbox.metal
+@@ -0,0 +1,336 @@
++/*
++ * Field matching for VideoToolbox frames, Metal compute kernels.
++ *
++ * Every kernel here is one loop of libavfilter/vf_fieldmatch.c (Fredrik Mellbin,
++ * Clement Boesch), done over the same 8-bit samples with the same integer
++ * arithmetic. The kernels only measure. The filter adds their per-thread
++ * partial sums on the CPU in 64 bits and runs vf_fieldmatch.c's decision code
++ * on the totals, so the matches it makes are the CPU filter's matches.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include <metal_stdlib>
++#include <metal_integer>
++#include <metal_texture>
++
++using namespace metal;
++
++/* Planes are read as unsigned integer textures (R8Uint, RG8Uint), so there is
++ * no float conversion and the sample is the value. A two-channel plane (NV12's UV) carries
++ * U in .x and V in .y; the CPU filter treats them as two planes, so each lane
++ * is computed on its own and the lanes only meet in the sums. */
++typedef texture2d<uint, access::read> utex;
++typedef texture2d<uint, access::write> wtex;
++
++static inline int px(utex t, int x, int y, uint lane)
++{
++    uint4 v = t.read(uint2(uint(x), uint(y)));
++    return int(lane ? v.y : v.x);
++}
++
++/* Must match struct fmvt_diff_map_params in vf_fieldmatch_videotoolbox.m. */
++struct diff_map_params {
++    uint width;     /* plane width in texels */
++    uint height;    /* plane height in rows */
++    uint channels;  /* 1 or 2 */
++    uint pbase;     /* first row of the match1 field the absolute difference starts at */
++    uint nbase;     /* the same for match2 */
++    uint nk;        /* iterations of build_diff_map's y loop: y = 2, 4, ... < height - 2 */
++};
++
++/* One row of build_abs_diff_mask's tbuffer: |prv - nxt| on every other row. */
++static inline int absdiff(utex a, utex b, constant diff_map_params &p, int j, int x, uint lane)
++{
++    return abs(px(a, x, int(p.pbase) + 2 * j, lane) - px(b, x, int(p.nbase) + 2 * j, lane));
++}
++
++/* build_diff_map for one texel. k is the iteration of the y loop; the tbuffer
++ * row it centres on (dp) is k + 1. The loops, their early exits and their
++ * bounds are vf_fieldmatch.c's, line for line. */
++static inline uint diff_map_value(utex a, utex b, constant diff_map_params &p,
++                                  int k, int x, uint lane)
++{
++    const int width = int(p.width);
++    const int height = int(p.height);
++    const int y = 2 + 2 * k;
++    uint m = 0;
++    int u, count;
++    int diff = absdiff(a, b, p, k + 1, x, lane);
++
++    if (diff > 3) {
++        for (count = 0, u = x - 1; u < x + 2 && count < 2; u++) {
++            count += absdiff(a, b, p, k,     u, lane) > 3;
++            count += absdiff(a, b, p, k + 1, u, lane) > 3;
++            count += absdiff(a, b, p, k + 2, u, lane) > 3;
++        }
++        if (count > 1) {
++            m = 1;
++            if (diff > 19) {
++                int upper = 0, lower = 0;
++                for (count = 0, u = x - 1; u < x + 2 && count < 6; u++) {
++                    if (absdiff(a, b, p, k,     u, lane) > 19) { count++; upper = 1; }
++                    if (absdiff(a, b, p, k + 1, u, lane) > 19)   count++;
++                    if (absdiff(a, b, p, k + 2, u, lane) > 19) { count++; lower = 1; }
++                }
++                if (count > 3) {
++                    if (upper && lower) {
++                        m |= 1 << 1;
++                    } else {
++                        int upper2 = 0, lower2 = 0;
++                        for (u = max(x - 4, 0); u < min(x + 5, width); u++) {
++                            if (y != 2 &&          absdiff(a, b, p, k - 1, u, lane) > 19) upper2 = 1;
++                            if (                   absdiff(a, b, p, k,     u, lane) > 19) upper  = 1;
++                            if (                   absdiff(a, b, p, k + 2, u, lane) > 19) lower  = 1;
++                            if (y != height - 4 && absdiff(a, b, p, k + 3, u, lane) > 19) lower2 = 1;
++                        }
++                        if ((upper && (lower || upper2)) ||
++                            (lower && (upper || lower2)))
++                            m |= 1 << 1;
++                        else if (count > 5)
++                            m |= 1 << 2;
++                    }
++                }
++            }
++        }
++    }
++    return m;
++}
++
++/* The whole map plane, as compare_fields leaves it: zero (fill_buf) except on
++ * the rows build_diff_map writes, which are pbase + 2 + 2k, columns 1 to width - 2. */
++kernel void diff_map(utex prv [[texture(0)]],
++                     utex nxt [[texture(1)]],
++                     device uchar *map [[buffer(0)]],
++                     constant diff_map_params &p [[buffer(1)]],
++                     uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.width || gid.y >= p.height)
++        return;
++    const int x = int(gid.x), y = int(gid.y);
++    const int d = y - int(p.pbase) - 2;
++    const bool row = d >= 0 && (d & 1) == 0 && (d >> 1) < int(p.nk);
++    const bool col = x >= 1 && x < int(p.width) - 1;
++
++    for (uint lane = 0; lane < p.channels; lane++) {
++        uint m = row && col ? diff_map_value(prv, nxt, p, d >> 1, x, lane) : 0;
++        map[(gid.y * p.width + gid.x) * p.channels + lane] = uchar(m);
++    }
++}
++
++/* Must match struct fmvt_match_sums_params in vf_fieldmatch_videotoolbox.m. */
++struct match_sums_params {
++    uint width;
++    uint channels;
++    uint fbase1;    /* get_field_base(match1, field) */
++    uint fbase2;    /* get_field_base(match2, field) */
++    uint nk;
++    uint startx, stopx;
++    int y0a, y1a;
++    uint seg;       /* columns per thread */
++    uint nseg;
++};
++
++/* The accumulation loop of compare_fields. Each thread takes one y iteration
++ * and up to seg columns, and writes its six sums (Pc, Pm, Pml, Nc, Nm, Nml).
++ * A sum of at most seg * 1530 * 2 fits easily in 32 bits; the filter adds
++ * the partials in 64 bits, as the CPU's uint64_t accumulators do. */
++kernel void match_sums(utex src [[texture(0)]],
++                       utex prv [[texture(1)]],
++                       utex nxt [[texture(2)]],
++                       device const uchar *map [[buffer(0)]],
++                       device uint *out [[buffer(1)]],
++                       constant match_sums_params &p [[buffer(2)]],
++                       uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.nseg || gid.y >= p.nk)
++        return;
++    const int k = int(gid.y);
++    const int y = 2 + 2 * k;
++    uint aPc = 0, aPm = 0, aPml = 0, aNc = 0, aNm = 0, aNml = 0;
++
++    if (p.y0a == p.y1a || y < p.y0a || y > p.y1a) {
++        const int sf  = int(p.fbase1) + 1 + 2 * k;  /* srcf  */
++        const int pf  = int(p.fbase1) + 2 * k;      /* prvpf */
++        const int nf  = int(p.fbase2) + 2 * k;      /* nxtpf */
++        const int mr0 = int(p.fbase1) + 2 * k;      /* mapp */
++        const int x0 = int(p.startx + gid.x * p.seg);
++        const int x1 = min(x0 + int(p.seg), int(p.stopx));
++
++        for (int x = x0; x < x1; x++) {
++            for (uint lane = 0; lane < p.channels; lane++) {
++                const uint m0 = map[(uint(mr0)     * p.width + uint(x)) * p.channels + lane];
++                const uint m1 = map[(uint(mr0 + 2) * p.width + uint(x)) * p.channels + lane];
++                if (m0 > 0 || m1 > 0) {
++                    const int temp1 = px(src, x, sf - 2, lane) + (px(src, x, sf, lane) << 2)
++                                    + px(src, x, sf + 2, lane); /* [1 4 1] */
++                    int temp2 = abs(3 * (px(prv, x, pf, lane) + px(prv, x, pf + 2, lane)) - temp1);
++                    if (temp2 > 23 && ((m0 & 1) || (m1 & 1)))
++                        aPc += uint(temp2);
++                    if (temp2 > 42) {
++                        if ((m0 & 2) || (m1 & 2))
++                            aPm += uint(temp2);
++                        if ((m0 & 4) || (m1 & 4))
++                            aPml += uint(temp2);
++                    }
++
++                    temp2 = abs(3 * (px(nxt, x, nf, lane) + px(nxt, x, nf + 2, lane)) - temp1);
++                    if (temp2 > 23 && ((m0 & 1) || (m1 & 1)))
++                        aNc += uint(temp2);
++                    if (temp2 > 42) {
++                        if ((m0 & 2) || (m1 & 2))
++                            aNm += uint(temp2);
++                        if ((m0 & 4) || (m1 & 4))
++                            aNml += uint(temp2);
++                    }
++                }
++            }
++        }
++    }
++
++    device uint *o = out + (gid.y * p.nseg + gid.x) * 6;
++    o[0] = aPc; o[1] = aPm; o[2] = aPml;
++    o[3] = aNc; o[4] = aNm; o[5] = aNml;
++}
++
++/* Must match struct fmvt_comb_params in vf_fieldmatch_videotoolbox.m. */
++struct comb_params {
++    uint width;
++    uint height;
++    uint alt_parity;  /* rows with (y & 1) == alt_parity come from alt, the rest from src */
++    int cthresh;
++    uint xhalf, yhalf;
++    uint nhx, nhy;
++};
++
++/* A row of the candidate frame create_weave_frame would build, read in place. */
++static inline int wv(utex src, utex alt, constant comb_params &p, int x, int y)
++{
++    return (uint(y) & 1) == p.alt_parity ? px(alt, x, y, 0) : px(src, x, y, 0);
++}
++
++/* The first half of calc_combed_score on the luma plane: the [1 -3 4 -3 1]
++ * vertical test, with vf_fieldmatch.c's special cases for the two rows at
++ * each edge. mask is 1 where the CPU writes 0xff. */
++kernel void comb_mask(utex src [[texture(0)]],
++                      utex alt [[texture(1)]],
++                      device uchar *mask [[buffer(0)]],
++                      constant comb_params &p [[buffer(1)]],
++                      uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.width || gid.y >= p.height)
++        return;
++    const int x = int(gid.x), y = int(gid.y), h = int(p.height);
++    const int cthresh = p.cthresh, cthresh6 = cthresh * 6;
++    uchar m = 0;
++
++    if (cthresh < 0) {
++        m = 1;
++    } else {
++        const int c = wv(src, alt, p, x, y);
++#define S(dy) wv(src, alt, p, x, y + (dy))
++#define FILTER(xm2, xm1, xp1, xp2) \
++        (abs(4 * c - 3 * (S(xm1) + S(xp1)) + (S(xm2) + S(xp2))) > cthresh6)
++        if (y == 0) {
++            const int s1 = abs(c - S(1));
++            m = s1 > cthresh && FILTER(2, 1, 1, 2);
++        } else if (y == 1) {
++            const int s1 = abs(c - S(-1));
++            const int s2 = abs(c - S(1));
++            m = s1 > cthresh && s2 > cthresh && FILTER(2, -1, 1, 2);
++        } else if (y < h - 2) {
++            const int s1 = abs(c - S(-1));
++            const int s2 = abs(c - S(1));
++            m = s1 > cthresh && s2 > cthresh && FILTER(-2, -1, 1, 2);
++        } else if (y == h - 2) {
++            const int s1 = abs(c - S(-1));
++            const int s2 = abs(c - S(1));
++            m = s1 > cthresh && s2 > cthresh && FILTER(-2, -1, 1, -2);
++        } else {
++            const int s1 = abs(c - S(-1));
++            m = s1 > cthresh && FILTER(-2, -1, -1, -2);
++        }
++#undef FILTER
++#undef S
++    }
++    mask[gid.y * p.width + gid.x] = m;
++}
++
++/* The second half of calc_combed_score: how many pixels in each half-block
++ * (xhalf by yhalf) are combed on their own row and the rows above and below,
++ * over rows 1 to height - 2. The filter adds the half-blocks into
++ * vf_fieldmatch.c's overlapping blocks (C_ARRAY_ADD) and takes the maximum. */
++kernel void comb_count(device const uchar *mask [[buffer(0)]],
++                       device uint *out [[buffer(1)]],
++                       constant comb_params &p [[buffer(2)]],
++                       uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.nhx || gid.y >= p.nhy)
++        return;
++    const uint x0 = gid.x * p.xhalf, x1 = min(x0 + p.xhalf, p.width);
++    const uint y0 = max(gid.y * p.yhalf, 1u), y1 = min(gid.y * p.yhalf + p.yhalf, p.height - 1);
++    uint sum = 0;
++
++    for (uint y = y0; y < y1; y++)
++        for (uint x = x0; x < x1; x++)
++            sum += mask[(y - 1) * p.width + x] && mask[y * p.width + x] && mask[(y + 1) * p.width + x];
++    out[gid.y * p.nhx + gid.x] = sum;
++}
++
++/* Must match struct fmvt_luma_diff_params in vf_fieldmatch_videotoolbox.m. */
++struct luma_diff_params {
++    uint width;
++    uint height;
++    uint seg;
++    uint nseg;
++};
++
++/* luma_abs_diff, for the scene change check of combmatch=sc. */
++kernel void luma_diff(utex a [[texture(0)]],
++                      utex b [[texture(1)]],
++                      device uint *out [[buffer(0)]],
++                      constant luma_diff_params &p [[buffer(1)]],
++                      uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.nseg || gid.y >= p.height)
++        return;
++    const int x0 = int(gid.x * p.seg), x1 = min(x0 + int(p.seg), int(p.width));
++    uint sum = 0;
++    for (int x = x0; x < x1; x++)
++        sum += uint(abs(px(a, x, int(gid.y), 0) - px(b, x, int(gid.y), 0)));
++    out[gid.y * p.nseg + gid.x] = sum;
++}
++
++/* Must match struct fmvt_weave_params in vf_fieldmatch_videotoolbox.m. */
++struct weave_params {
++    uint width;
++    uint height;
++    uint alt_parity;
++};
++
++/* create_weave_frame: rows of one parity from alt, the others from src. */
++kernel void weave(utex src [[texture(0)]],
++                  utex alt [[texture(1)]],
++                  wtex dst [[texture(2)]],
++                  constant weave_params &p [[buffer(0)]],
++                  uint2 gid [[thread_position_in_grid]])
++{
++    if (gid.x >= p.width || gid.y >= p.height)
++        return;
++    uint4 v = (gid.y & 1) == p.alt_parity ? alt.read(gid) : src.read(gid);
++    dst.write(v, gid);
++}
+diff --git a/libavfilter/vf_decimate_videotoolbox.m b/libavfilter/vf_decimate_videotoolbox.m
+new file mode 100644
+index 0000000..7bf3899
+--- /dev/null
++++ b/libavfilter/vf_decimate_videotoolbox.m
+@@ -0,0 +1,655 @@
++/*
++ * Frame decimation for VideoToolbox frames, using Metal compute.
++ *
++ * A port of libavfilter/vf_decimate.c (Fredrik Mellbin 2012, Clement Boesch
++ * 2013) for AV_PIX_FMT_VIDEOTOOLBOX frames. Only the frame metric runs on the
++ * GPU (metal/vf_decimate_videotoolbox.metal); the queue, the choice of the
++ * frame to drop and the timestamps are vf_decimate.c's code. Frames are passed
++ * on by reference, so the output is the CPU filter's output.
++ *
++ * vf_decimate.c reads the metrics only once a cycle is complete, so each
++ * frame's metric is committed to the GPU without waiting, and the filter waits
++ * once per cycle, before it decides.
++ *
++ * Supported: NV12 (8-bit 4:2:0). Refused: ppsrc.
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "avfilter.h"
++#include "filters.h"
++#include "metal/utils.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_videotoolbox.h"
++#include "libavutil/mem.h"
++#include "libavutil/objc.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++
++extern char ff_vf_decimate_videotoolbox_metallib_data[];
++extern unsigned int ff_vf_decimate_videotoolbox_metallib_len;
++
++/* Must match struct block_diff_params in metal/vf_decimate_videotoolbox.metal. */
++struct dmvt_block_diff_params {
++    uint32_t width, height, channels, hblockx, hblocky, ncx, ncy, stride;
++};
++
++struct qitem {
++    AVFrame *frame;
++    int64_t maxbdiff;
++    int64_t totdiff;
++    /* the GPU work measuring this frame against the one before it */
++    int pending;
++    id cmdbuf;                      ///< id<MTLCommandBuffer>, retained
++    id out[2];                      ///< id<MTLBuffer> per plane, half-block sums
++    CVMetalTextureRef tex[4];       ///< both frames' planes, held until the GPU is done
++};
++
++typedef struct DecimateVTContext {
++    const AVClass *class;
++    struct qitem *queue;    ///< window of cycle frames and the associated data diff
++    int fid;                ///< current frame id in the queue
++    AVFrame *last;          ///< last frame from the previous queue
++    int got_frame;          ///< frame request flag
++    int64_t last_pts;       ///< last output timestamp
++    int64_t last_duration;  ///< last output duration
++    int64_t start_pts;      ///< base for output timestamps
++    uint32_t eof;           ///< end of stream
++    int failed;             ///< a GPU step failed; the queue is no longer consistent
++    int hsub, vsub;         ///< chroma subsampling values
++    int depth;
++    int nxblocks, nyblocks;
++    int bdiffsize;
++    int64_t *bdiffs;
++    int nb_planes;
++    int pw[2], ph[2], hbx[2], hby[2], ncx[2], ncy[2];
++    AVRational in_tb;       // input time-base
++    AVRational nondec_tb;   // non-decimated time-base
++    AVRational dec_tb;      // decimated time-base
++
++    /* options, the same names and defaults as decimate */
++    int cycle;
++    double dupthresh_flt;
++    double scthresh_flt;
++    int64_t dupthresh;
++    int64_t scthresh;
++    int blockx, blocky;
++    int ppsrc;
++    int chroma;
++    int mixed;
++
++    id mtlDevice;
++    id mtlLibrary;
++    id mtlQueue;
++    id mtlPipeline;
++    void *textureCache;     ///< CVMetalTextureCacheRef
++} DecimateVTContext;
++
++#define OFFSET(x) offsetof(DecimateVTContext, x)
++#define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
++
++static const AVOption decimate_videotoolbox_options[] = {
++    { "cycle",     "set the number of frame from which one will be dropped", OFFSET(cycle), AV_OPT_TYPE_INT, {.i64 = 5}, 2, 25, FLAGS },
++    { "dupthresh", "set duplicate threshold",    OFFSET(dupthresh_flt), AV_OPT_TYPE_DOUBLE, {.dbl =  1.1}, 0, 100, FLAGS },
++    { "scthresh",  "set scene change threshold", OFFSET(scthresh_flt),  AV_OPT_TYPE_DOUBLE, {.dbl = 15.0}, 0, 100, FLAGS },
++    { "blockx",    "set the size of the x-axis blocks used during metric calculations", OFFSET(blockx), AV_OPT_TYPE_INT, {.i64 = 32}, 4, 1<<9, FLAGS },
++    { "blocky",    "set the size of the y-axis blocks used during metric calculations", OFFSET(blocky), AV_OPT_TYPE_INT, {.i64 = 32}, 4, 1<<9, FLAGS },
++    { "ppsrc",     "mark main input as a pre-processed input and activate clean source input stream", OFFSET(ppsrc), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
++    { "chroma",    "set whether or not chroma is considered in the metric calculations", OFFSET(chroma), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1, FLAGS },
++    { "mixed",     "set whether or not the input only partially contains content to be decimated", OFFSET(mixed), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(decimate_videotoolbox);
++
++static void release_slot(struct qitem *q)
++{
++    for (int i = 0; i < 4; i++) {
++        if (q->tex[i]) {
++            CFRelease(q->tex[i]);
++            q->tex[i] = NULL;
++        }
++    }
++    ff_objc_release((NSObject **)&q->cmdbuf);
++    q->pending = 0;
++}
++
++/* Commits calc_diffs(prv, in) for one queue slot. The result is read by
++ * collect_metrics() once the cycle is complete. */
++static int submit_diffs(AVFilterContext *ctx, struct qitem *q,
++                        const AVFrame *f1, const AVFrame *f2) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    DecimateVTContext *dm = ctx->priv;
++    CVMetalTextureCacheRef cache = (CVMetalTextureCacheRef)dm->textureCache;
++    static const MTLPixelFormat formats[2] = { MTLPixelFormatR8Uint, MTLPixelFormatRG8Uint };
++    int ret = 0;
++
++    for (int p = 0; p < dm->nb_planes; p++) {
++        q->tex[p * 2    ] = ff_metal_texture_from_pixbuf(ctx, cache, (CVPixelBufferRef)f1->data[3], p, formats[p]);
++        q->tex[p * 2 + 1] = ff_metal_texture_from_pixbuf(ctx, cache, (CVPixelBufferRef)f2->data[3], p, formats[p]);
++        if (!q->tex[p * 2] || !q->tex[p * 2 + 1]) {
++            release_slot(q);
++            return AVERROR_EXTERNAL;
++        }
++    }
++
++    @autoreleasepool {
++        id<MTLCommandBuffer> buffer = ((id<MTLCommandQueue>)dm->mtlQueue).commandBuffer;
++        id<MTLComputeCommandEncoder> enc = buffer.computeCommandEncoder;
++        if (!buffer || !enc) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command buffer or encoder\n");
++            ret = AVERROR_EXTERNAL;
++        } else {
++            for (int p = 0; p < dm->nb_planes; p++) {
++                struct dmvt_block_diff_params bp = {
++                    .width = dm->pw[p], .height = dm->ph[p], .channels = p ? 2 : 1,
++                    .hblockx = dm->hbx[p], .hblocky = dm->hby[p],
++                    .ncx = dm->ncx[p], .ncy = dm->ncy[p], .stride = dm->nxblocks,
++                };
++                [enc setTexture:CVMetalTextureGetTexture(q->tex[p * 2    ]) atIndex:0];
++                [enc setTexture:CVMetalTextureGetTexture(q->tex[p * 2 + 1]) atIndex:1];
++                [enc setBuffer:(id<MTLBuffer>)q->out[p] offset:0 atIndex:0];
++                [enc setBytes:&bp length:sizeof(bp) atIndex:1];
++                ff_metal_compute_encoder_dispatch((id<MTLDevice>)dm->mtlDevice,
++                                                  (id<MTLComputePipelineState>)dm->mtlPipeline,
++                                                  enc, bp.ncx, bp.ncy);
++            }
++            [enc endEncoding];
++            [buffer commit];
++            /* The command buffer is autoreleased; keep it until collect_metrics() waits on it. */
++            q->cmdbuf = [buffer retain];
++            q->pending = 1;
++        }
++    }
++    if (ret < 0)
++        release_slot(q);
++    return ret;
++}
++
++/* Waits for one slot's GPU work and turns its half-block sums into
++ * calc_diffs' maxbdiff and totdiff. */
++static int collect_metrics(AVFilterContext *ctx, struct qitem *q) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    DecimateVTContext *dm = ctx->priv;
++    id<MTLCommandBuffer> buffer = (id<MTLCommandBuffer>)q->cmdbuf;
++    int64_t maxdiff = -1;
++    int64_t *bdiffs = dm->bdiffs;
++    int failed = 0;
++
++    if (!q->pending)
++        return 0;
++    [buffer waitUntilCompleted];
++    if (buffer.status == MTLCommandBufferStatusError) {
++        av_log(ctx, AV_LOG_ERROR, "Metal command buffer failed: %s\n",
++               buffer.error.description.UTF8String);
++        failed = 1;
++    }
++    release_slot(q);
++    if (failed)
++        return AVERROR_EXTERNAL;
++
++    memset(bdiffs, 0, dm->bdiffsize * sizeof(*bdiffs));
++    for (int p = 0; p < dm->nb_planes; p++) {
++        const uint32_t *half = ((id<MTLBuffer>)q->out[p]).contents;
++        for (int cy = 0; cy < dm->ncy[p]; cy++)
++            for (int cx = 0; cx < dm->ncx[p]; cx++)
++                bdiffs[cy * dm->nxblocks + cx] += half[cy * dm->nxblocks + cx];
++    }
++
++    for (int i = 0; i < dm->nyblocks - 1; i++) {
++        for (int j = 0; j < dm->nxblocks - 1; j++) {
++            int64_t tmp = bdiffs[      i * dm->nxblocks + j    ]
++                        + bdiffs[      i * dm->nxblocks + j + 1]
++                        + bdiffs[(i + 1) * dm->nxblocks + j    ]
++                        + bdiffs[(i + 1) * dm->nxblocks + j + 1];
++            if (tmp > maxdiff)
++                maxdiff = tmp;
++        }
++    }
++
++    q->totdiff = 0;
++    for (int i = 0; i < dm->bdiffsize; i++)
++        q->totdiff += bdiffs[i];
++    q->maxbdiff = maxdiff;
++    return 0;
++}
++
++/* Waits for every slot still on the GPU, without using the results. */
++static void drain_slots(DecimateVTContext *dm) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    if (!dm->queue)
++        return;
++    for (int i = 0; i < dm->cycle; i++) {
++        if (dm->queue[i].pending)
++            [(id<MTLCommandBuffer>)dm->queue[i].cmdbuf waitUntilCompleted];
++        release_slot(&dm->queue[i]);
++    }
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    int scpos = -1, duppos = -1;
++    int drop = INT_MIN, i, lowest = 0, ret;
++    AVFilterContext *ctx  = inlink->dst;
++    AVFilterLink *outlink = ctx->outputs[0];
++    DecimateVTContext *dm = ctx->priv;
++    AVFrame *prv;
++
++    /* After a GPU failure fid may equal cycle and a slot may hold a frame that was never
++     * measured, so nothing more goes into the queue. The queued frames are freed at uninit. */
++    if (dm->failed) {
++        av_frame_free(&in);
++        return AVERROR_EXTERNAL;
++    }
++
++    /* update frames queue */
++    dm->queue[dm->fid].frame = in;
++
++    if (in) {
++        /* update frame metrics */
++        prv = dm->fid ? dm->queue[dm->fid - 1].frame : dm->last;
++        if (!prv) {
++            dm->queue[dm->fid].maxbdiff = INT64_MAX;
++            dm->queue[dm->fid].totdiff  = INT64_MAX;
++        } else {
++            ret = submit_diffs(ctx, &dm->queue[dm->fid], prv, in);
++            if (ret < 0) {
++                dm->failed = 1;
++                return ret;
++            }
++        }
++        if (++dm->fid != dm->cycle)
++            return 0;
++
++        /* The cycle is complete. One wait covers the whole cycle's metrics. */
++        for (i = 0; i < dm->cycle; i++) {
++            ret = collect_metrics(ctx, &dm->queue[i]);
++            if (ret < 0) {
++                dm->failed = 1;
++                return ret;
++            }
++        }
++
++        av_frame_free(&dm->last);
++        dm->last = av_frame_clone(in);
++        dm->fid = 0;
++
++        /* we have a complete cycle, select the frame to drop */
++        lowest = 0;
++        for (i = 0; i < dm->cycle; i++) {
++            if (dm->queue[i].totdiff > dm->scthresh)
++                scpos = i;
++            if (dm->queue[i].maxbdiff < dm->queue[lowest].maxbdiff)
++                lowest = i;
++        }
++        if (dm->queue[lowest].maxbdiff < dm->dupthresh)
++            duppos = lowest;
++
++        if (dm->mixed && duppos < 0) {
++            drop = -1; // no drop if mixed content + no frame in cycle below threshold
++        } else {
++            drop = scpos >= 0 && duppos < 0 ? scpos : lowest;
++        }
++    } else {
++        /* End of stream: the partial cycle goes out undecimated. Its metrics are
++         * still read, because vf_decimate.c has them by now and logs them. */
++        for (i = 0; i < dm->cycle; i++) {
++            ret = collect_metrics(ctx, &dm->queue[i]);
++            if (ret < 0) {
++                dm->failed = 1;
++                return ret;
++            }
++        }
++    }
++
++    /* metrics debug */
++    if (av_log_get_level() >= AV_LOG_DEBUG) {
++        av_log(ctx, AV_LOG_DEBUG, "1/%d frame drop:\n", dm->cycle);
++        for (i = 0; i < dm->cycle && dm->queue[i].frame; i++) {
++            av_log(ctx, AV_LOG_DEBUG,"  #%d: totdiff=%08"PRIx64" maxbdiff=%08"PRIx64"%s%s%s%s\n",
++                   i + 1, dm->queue[i].totdiff, dm->queue[i].maxbdiff,
++                   i == scpos  ? " sc"     : "",
++                   i == duppos ? " dup"    : "",
++                   i == lowest ? " lowest" : "",
++                   i == drop   ? " [DROP]" : "");
++        }
++    }
++
++    /* push all frames except the drop */
++    ret = 0;
++    for (i = 0; i < dm->cycle && dm->queue[i].frame; i++) {
++        if (i == drop) {
++            av_frame_free(&dm->queue[i].frame);
++        } else {
++            AVFrame *frame = dm->queue[i].frame;
++            dm->queue[i].frame = NULL;
++            if (frame->pts != AV_NOPTS_VALUE && dm->start_pts == AV_NOPTS_VALUE)
++                dm->start_pts = av_rescale_q(frame->pts, dm->in_tb, outlink->time_base);
++
++            frame->pts = dm->last_duration ? dm->last_pts + dm->last_duration :
++                         (dm->start_pts == AV_NOPTS_VALUE ? 0 : dm->start_pts);
++            frame->duration = dm->mixed ? av_div_q(drop < 0 ? dm->nondec_tb : dm->dec_tb, outlink->time_base).num : 1;
++            dm->last_duration = frame->duration;
++            dm->last_pts = frame->pts;
++            ret = ff_filter_frame(outlink, frame);
++            if (ret < 0)
++                break;
++        }
++    }
++
++    return ret;
++}
++
++static int activate(AVFilterContext *ctx)
++{
++    DecimateVTContext *dm = ctx->priv;
++    AVFilterLink *inlink = ctx->inputs[0];
++    AVFrame *frame = NULL;
++    int ret = 0, status;
++    int64_t pts;
++
++    FF_FILTER_FORWARD_STATUS_BACK_ALL(ctx->outputs[0], ctx);
++
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        if (!dm->eof && (ret = ff_inlink_consume_frame(inlink, &frame)) > 0) {
++            ret = filter_frame(inlink, frame);
++            if (ret < 0)
++                return ret;
++        }
++        if (ret < 0) {
++            return ret;
++        } else if (dm->eof) {
++            ff_outlink_set_status(ctx->outputs[0], AVERROR_EOF, dm->last_pts);
++            return 0;
++        } else if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
++            if (status == AVERROR_EOF) { // flushing
++                dm->eof = 1;
++                filter_frame(inlink, NULL);
++                ff_outlink_set_status(ctx->outputs[0], AVERROR_EOF, dm->last_pts);
++                return 0;
++            }
++        }
++
++        if (ff_inlink_queued_frames(inlink) > 0) {
++            ff_filter_set_ready(ctx, 100);
++        } else if (ff_outlink_frame_wanted(ctx->outputs[0])) {
++            ff_inlink_request_frame(inlink);
++        }
++        return 0;
++    }
++    return AVERROR(ENOSYS);
++}
++
++static av_cold void do_uninit(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    DecimateVTContext *dm = ctx->priv;
++
++    drain_slots(dm);
++    av_frame_free(&dm->last);
++    av_freep(&dm->bdiffs);
++    if (dm->queue) {
++        for (int i = 0; i < dm->cycle; i++) {
++            av_frame_free(&dm->queue[i].frame);
++            ff_objc_release((NSObject **)&dm->queue[i].out[0]);
++            ff_objc_release((NSObject **)&dm->queue[i].out[1]);
++        }
++    }
++    av_freep(&dm->queue);
++
++    ff_objc_release((NSObject **)&dm->mtlPipeline);
++    ff_objc_release((NSObject **)&dm->mtlQueue);
++    ff_objc_release((NSObject **)&dm->mtlLibrary);
++    ff_objc_release((NSObject **)&dm->mtlDevice);
++    if (dm->textureCache) {
++        CFRelease(dm->textureCache);
++        dm->textureCache = NULL;
++    }
++}
++
++static av_cold void decimate_videotoolbox_uninit(AVFilterContext *ctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        do_uninit(ctx);
++    }
++}
++
++static av_cold int do_init(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    DecimateVTContext *dm = ctx->priv;
++    id<MTLDevice> device;
++    id<MTLFunction> function;
++    NSError *err = nil;
++    CVMetalTextureCacheRef cache = NULL;
++    CVReturn cvret;
++
++    if (dm->ppsrc) {
++        av_log(ctx, AV_LOG_ERROR, "ppsrc is not supported\n");
++        return AVERROR(ENOSYS);
++    }
++    if ((dm->blockx & (dm->blockx - 1)) ||
++        (dm->blocky & (dm->blocky - 1))) {
++        av_log(ctx, AV_LOG_ERROR, "blockx and blocky settings must be power of two\n");
++        return AVERROR(EINVAL);
++    }
++
++    dm->start_pts = AV_NOPTS_VALUE;
++    dm->last_duration = 0;
++
++    device = MTLCreateSystemDefaultDevice();
++    dm->mtlDevice = device;
++    if (!device) {
++        av_log(ctx, AV_LOG_ERROR, "Unable to find Metal device\n");
++        goto fail;
++    }
++    av_log(ctx, AV_LOG_INFO, "Using Metal device: %s\n", device.name.UTF8String);
++
++    dispatch_data_t libData = dispatch_data_create(
++        ff_vf_decimate_videotoolbox_metallib_data,
++        ff_vf_decimate_videotoolbox_metallib_len,
++        nil,
++        nil);
++    dm->mtlLibrary = [device newLibraryWithData:libData error:&err];
++    dispatch_release(libData);
++    libData = nil;
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to load Metal library: %s\n", err.description.UTF8String);
++        goto fail;
++    }
++
++    function = [(id<MTLLibrary>)dm->mtlLibrary newFunctionWithName:@"block_diff"];
++    if (!function) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal function!\n");
++        goto fail;
++    }
++    dm->mtlPipeline = [device newComputePipelineStateWithFunction:function error:&err];
++    [function release];
++    if (err || !dm->mtlPipeline) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal compute pipeline: %s\n",
++               err ? err.description.UTF8String : "unknown");
++        goto fail;
++    }
++
++    dm->mtlQueue = device.newCommandQueue;
++    if (!dm->mtlQueue) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command queue!\n");
++        goto fail;
++    }
++
++    cvret = CVMetalTextureCacheCreate(NULL, NULL, device, NULL, &cache);
++    if (cvret != kCVReturnSuccess) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create CVMetalTextureCache: %d\n", cvret);
++        goto fail;
++    }
++    dm->textureCache = cache;
++
++    return 0;
++fail:
++    decimate_videotoolbox_uninit(ctx);
++    return AVERROR_EXTERNAL;
++}
++
++static av_cold int decimate_videotoolbox_init(AVFilterContext *ctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_init(ctx);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int do_config_output(AVFilterLink *outlink) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FilterLink *outl     = ff_filter_link(outlink);
++    AVFilterContext *ctx = outlink->src;
++    DecimateVTContext *dm = ctx->priv;
++    const AVFilterLink *inlink = ctx->inputs[0];
++    FilterLink *inl = ff_filter_link(ctx->inputs[0]);
++    id<MTLDevice> device = (id<MTLDevice>)dm->mtlDevice;
++    AVRational fps = inl->frame_rate;
++    const AVHWFramesContext *frames;
++    const AVPixFmtDescriptor *pix_desc;
++    int max_value;
++    const int w = inlink->w;
++    const int h = inlink->h;
++
++    if (!inl->hw_frames_ctx) {
++        av_log(ctx, AV_LOG_ERROR, "A hardware frames reference is "
++               "required to associate the processing device.\n");
++        return AVERROR(EINVAL);
++    }
++    frames = (const AVHWFramesContext *)inl->hw_frames_ctx->data;
++    if (frames->sw_format != AV_PIX_FMT_NV12) {
++        av_log(ctx, AV_LOG_ERROR, "Pixel format %s is not supported, only nv12\n",
++               av_get_pix_fmt_name(frames->sw_format));
++        return AVERROR(ENOSYS);
++    }
++    pix_desc = av_pix_fmt_desc_get(frames->sw_format);
++
++    dm->hsub      = pix_desc->log2_chroma_w;
++    dm->vsub      = pix_desc->log2_chroma_h;
++    if (dm->chroma && ((dm->blockx / 2) >> dm->hsub == 0 || (dm->blocky / 2) >> dm->vsub == 0)) {
++        av_log(ctx, AV_LOG_ERROR, "blockx and blocky must be at least one chroma sample\n");
++        return AVERROR(EINVAL);
++    }
++    dm->depth     = pix_desc->comp[0].depth;
++    max_value     = (1 << dm->depth) - 1;
++    dm->scthresh  = (int64_t)(((int64_t)max_value *          w * h          * dm->scthresh_flt)  / 100);
++    dm->dupthresh = (int64_t)(((int64_t)max_value * dm->blockx * dm->blocky * dm->dupthresh_flt) / 100);
++    dm->nxblocks  = (w + dm->blockx/2 - 1) / (dm->blockx/2);
++    dm->nyblocks  = (h + dm->blocky/2 - 1) / (dm->blocky/2);
++    dm->bdiffsize = dm->nxblocks * dm->nyblocks;
++    dm->bdiffs    = av_malloc_array(dm->bdiffsize, sizeof(*dm->bdiffs));
++    dm->queue     = av_calloc(dm->cycle, sizeof(*dm->queue));
++    dm->in_tb     = inlink->time_base;
++    dm->nondec_tb = av_inv_q(fps);
++    dm->dec_tb    = av_mul_q(dm->nondec_tb, (AVRational){dm->cycle, dm->cycle - 1});
++
++    if (!dm->bdiffs || !dm->queue)
++        return AVERROR(ENOMEM);
++
++    /* calc_diffs' plane geometry: half-blocks of blockx/2 by blocky/2 on luma,
++     * shifted by the subsampling on chroma, all adding into the same array. */
++    dm->nb_planes = dm->chroma ? 2 : 1;
++    for (int p = 0; p < dm->nb_planes; p++) {
++        dm->pw[p]  = p ? AV_CEIL_RSHIFT(w, dm->hsub) : w;
++        dm->ph[p]  = p ? AV_CEIL_RSHIFT(h, dm->vsub) : h;
++        dm->hbx[p] = p ? (dm->blockx / 2) >> dm->hsub : dm->blockx / 2;
++        dm->hby[p] = p ? (dm->blocky / 2) >> dm->vsub : dm->blocky / 2;
++        dm->ncx[p] = (dm->pw[p] + dm->hbx[p] - 1) / dm->hbx[p];
++        dm->ncy[p] = (dm->ph[p] + dm->hby[p] - 1) / dm->hby[p];
++        if (dm->ncx[p] > dm->nxblocks || dm->ncy[p] > dm->nyblocks) {
++            av_log(ctx, AV_LOG_ERROR, "Unsupported frame geometry %dx%d\n", w, h);
++            return AVERROR(EINVAL);
++        }
++    }
++    for (int i = 0; i < dm->cycle; i++) {
++        for (int p = 0; p < dm->nb_planes; p++) {
++            dm->queue[i].out[p] = [device newBufferWithLength:dm->bdiffsize * sizeof(uint32_t)
++                                                      options:MTLResourceStorageModeShared];
++            if (!dm->queue[i].out[p])
++                return AVERROR(ENOMEM);
++        }
++    }
++
++    if (!fps.num || !fps.den) {
++        av_log(ctx, AV_LOG_ERROR, "The input needs a constant frame rate; "
++               "current rate of %d/%d is invalid\n", fps.num, fps.den);
++        return AVERROR(EINVAL);
++    }
++
++    /* Frames go out by reference, so the output shares the input's frames context. */
++    av_buffer_unref(&outl->hw_frames_ctx);
++    outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
++    if (!outl->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++
++    if (dm->mixed) {
++        outlink->time_base = av_gcd_q(dm->nondec_tb, dm->dec_tb, AV_TIME_BASE / 2, AV_TIME_BASE_Q);
++        av_log(ctx, AV_LOG_VERBOSE, "FPS: %d/%d -> VFR (use %d/%d if CFR required)\n",
++            fps.num, fps.den, outlink->time_base.den, outlink->time_base.num);
++    } else {
++        outlink->time_base = dm->dec_tb;
++        outl->frame_rate = av_inv_q(outlink->time_base);
++        av_log(ctx, AV_LOG_VERBOSE, "FPS: %d/%d -> %d/%d\n",
++            fps.num, fps.den, outl->frame_rate.num, outl->frame_rate.den);
++    }
++    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++    outlink->w = inlink->w;
++    outlink->h = inlink->h;
++    return 0;
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    AVFilterContext *ctx = outlink->src;
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_config_output(outlink);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static const AVFilterPad decimate_videotoolbox_inputs[] = {
++    {
++        .name          = "main",
++        .type          = AVMEDIA_TYPE_VIDEO,
++    },
++};
++
++static const AVFilterPad decimate_videotoolbox_outputs[] = {
++    {
++        .name          = "default",
++        .type          = AVMEDIA_TYPE_VIDEO,
++        .config_props  = config_output,
++    },
++};
++
++const FFFilter ff_vf_decimate_videotoolbox = {
++    .p.name        = "decimate_videotoolbox",
++    .p.description = NULL_IF_CONFIG_SMALL("Decimate VideoToolbox frames (post field matching filter) using Metal compute"),
++    .p.priv_class  = &decimate_videotoolbox_class,
++    .init          = decimate_videotoolbox_init,
++    .activate      = activate,
++    .uninit        = decimate_videotoolbox_uninit,
++    .priv_size     = sizeof(DecimateVTContext),
++    FILTER_INPUTS(decimate_videotoolbox_inputs),
++    FILTER_OUTPUTS(decimate_videotoolbox_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VIDEOTOOLBOX),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};
+diff --git a/libavfilter/vf_fieldmatch_videotoolbox.m b/libavfilter/vf_fieldmatch_videotoolbox.m
+new file mode 100644
+index 0000000..20d69a0
+--- /dev/null
++++ b/libavfilter/vf_fieldmatch_videotoolbox.m
+@@ -0,0 +1,1041 @@
++/*
++ * Field matching for VideoToolbox frames, using Metal compute.
++ *
++ * A port of libavfilter/vf_fieldmatch.c (Fredrik Mellbin 2012, Clement Boesch
++ * 2013) for AV_PIX_FMT_VIDEOTOOLBOX frames. The passes over pixels run as the
++ * Metal kernels in metal/vf_fieldmatch_videotoolbox.metal; everything that
++ * decides (the match, the combed flag, the scene change) is vf_fieldmatch.c's
++ * code, run on the same totals. The output is the CPU filter's output.
++ *
++ * Supported: NV12 (8-bit 4:2:0, what hwupload makes of yuv420p), modes pc,
++ * pc_n and pc_u, combmatch none/sc/full, chroma=0. Refused at configuration:
++ * ppsrc, combdbg, chroma=1, the pcn and ub modes, and
++ * planes with an odd number of rows (vf_fieldmatch.c reads a row it never
++ * wrote there, so its result cannot be reproduced).
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#include "avfilter.h"
++#include "filters.h"
++#include "video.h"
++#include "metal/utils.h"
++#include "libavutil/avassert.h"
++#include "libavutil/hwcontext.h"
++#include "libavutil/hwcontext_videotoolbox.h"
++#include "libavutil/mem.h"
++#include "libavutil/objc.h"
++#include "libavutil/opt.h"
++#include "libavutil/pixdesc.h"
++#include "libavutil/timestamp.h"
++
++extern char ff_vf_fieldmatch_videotoolbox_metallib_data[];
++extern unsigned int ff_vf_fieldmatch_videotoolbox_metallib_len;
++
++enum fieldmatch_parity {
++    FM_PARITY_AUTO   = -1,
++    FM_PARITY_BOTTOM =  0,
++    FM_PARITY_TOP    =  1,
++};
++
++enum matching_mode {
++    MODE_PC,
++    MODE_PC_N,
++    MODE_PC_U,
++    MODE_PC_N_UB,
++    MODE_PCN,
++    MODE_PCN_UB,
++    NB_MODE
++};
++
++enum comb_matching_mode {
++    COMBMATCH_NONE,
++    COMBMATCH_SC,
++    COMBMATCH_FULL,
++    NB_COMBMATCH
++};
++
++enum { mP, mC, mN, mB, mU };
++
++enum {
++    K_DIFF_MAP,
++    K_MATCH_SUMS,
++    K_COMB_MASK,
++    K_COMB_COUNT,
++    K_LUMA_DIFF,
++    K_WEAVE,
++    NB_KERNELS
++};
++
++static NSString *const kernel_names[NB_KERNELS] = {
++    @"diff_map", @"match_sums", @"comb_mask", @"comb_count", @"luma_diff", @"weave",
++};
++
++/* Columns each partial-sum thread covers. */
++#define SEG 64
++/* At most three candidates are scored per frame: mC, fxo[mP] and the third
++ * match of pc_n or pc_u. */
++#define MAX_CAND 3
++
++/* The structs below must match the kernel parameter structs in
++ * metal/vf_fieldmatch_videotoolbox.metal. */
++struct fmvt_diff_map_params {
++    uint32_t width, height, channels, pbase, nbase, nk;
++};
++
++struct fmvt_match_sums_params {
++    uint32_t width, channels, fbase1, fbase2, nk, startx, stopx;
++    int32_t y0a, y1a;
++    uint32_t seg, nseg;
++};
++
++struct fmvt_comb_params {
++    uint32_t width, height, alt_parity;
++    int32_t cthresh;
++    uint32_t xhalf, yhalf, nhx, nhy;
++};
++
++struct fmvt_luma_diff_params {
++    uint32_t width, height, seg, nseg;
++};
++
++struct fmvt_weave_params {
++    uint32_t width, height, alt_parity;
++};
++
++/* The geometry of one plane of the input. */
++typedef struct FMVTPlane {
++    int w, h;          ///< in texels
++    int channels;      ///< 1 (Y) or 2 (UV)
++    int startx, stopx; ///< compare_fields' column range
++    int nk;            ///< iterations of the compare_fields / build_diff_map y loop
++    int nseg;          ///< partial-sum threads per row
++} FMVTPlane;
++
++/* Metal objects are kept as plain id (this file is built without ARC) and
++ * cast where they are used, so the context itself needs no availability guard. */
++typedef struct FMVTContext {
++    const AVClass *class;
++
++    AVFrame *prv, *src, *nxt;       ///< sliding window of 3 frames
++    int got_frame;
++    int vsub;
++    uint32_t eof;
++    int64_t lastscdiff;
++    int64_t lastn;
++
++    /* options, the same names and defaults as fieldmatch */
++    int order;
++    int ppsrc;
++    int mode;
++    int field;
++    int mchroma;
++    int y0, y1;
++    int64_t scthresh;
++    double scthresh_flt;
++    int combmatch;
++    int combdbg;
++    int cthresh;
++    int chroma;
++    int blockx, blocky;
++    int combpel;
++
++    FMVTPlane plane[2];
++    int *c_array;
++    int c_array_size;
++    int xblocks4;
++    int nhx, nhy;
++    int luma_nseg;
++
++    id mtlDevice;
++    id mtlLibrary;
++    id mtlQueue;
++    id mtlPipeline[NB_KERNELS];
++    id mapBuf[2];                   ///< diff map per plane
++    id maskBuf[MAX_CAND];           ///< comb mask per candidate
++    id matchBuf[2];                 ///< match_sums partials per plane
++    id combBuf[MAX_CAND];           ///< comb_count half-blocks per candidate
++    id lumaBuf[2];                  ///< luma_diff partials: prv-src, src-nxt
++    void *textureCache;             ///< CVMetalTextureCacheRef
++} FMVTContext;
++
++#define OFFSET(x) offsetof(FMVTContext, x)
++#define FLAGS AV_OPT_FLAG_VIDEO_PARAM|AV_OPT_FLAG_FILTERING_PARAM
++
++static const AVOption fieldmatch_videotoolbox_options[] = {
++    { "order", "specify the assumed field order", OFFSET(order), AV_OPT_TYPE_INT, {.i64=FM_PARITY_AUTO}, -1, 1, FLAGS, .unit = "order" },
++        { "auto", "auto detect parity",        0, AV_OPT_TYPE_CONST, {.i64=FM_PARITY_AUTO},    INT_MIN, INT_MAX, FLAGS, .unit = "order" },
++        { "bff",  "assume bottom field first", 0, AV_OPT_TYPE_CONST, {.i64=FM_PARITY_BOTTOM},  INT_MIN, INT_MAX, FLAGS, .unit = "order" },
++        { "tff",  "assume top field first",    0, AV_OPT_TYPE_CONST, {.i64=FM_PARITY_TOP},     INT_MIN, INT_MAX, FLAGS, .unit = "order" },
++    { "mode", "set the matching mode or strategy to use", OFFSET(mode), AV_OPT_TYPE_INT, {.i64=MODE_PC_N}, MODE_PC, NB_MODE-1, FLAGS, .unit = "mode" },
++        { "pc",      "2-way match (p/c)",                                                                    0, AV_OPT_TYPE_CONST, {.i64=MODE_PC},      INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
++        { "pc_n",    "2-way match + 3rd match on combed (p/c + u)",                                          0, AV_OPT_TYPE_CONST, {.i64=MODE_PC_N},    INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
++        { "pc_u",    "2-way match + 3rd match (same order) on combed (p/c + u)",                             0, AV_OPT_TYPE_CONST, {.i64=MODE_PC_U},    INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
++        { "pc_n_ub", "2-way match + 3rd match on combed + 4th/5th matches if still combed (p/c + u + u/b)",  0, AV_OPT_TYPE_CONST, {.i64=MODE_PC_N_UB}, INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
++        { "pcn",     "3-way match (p/c/n)",                                                                  0, AV_OPT_TYPE_CONST, {.i64=MODE_PCN},     INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
++        { "pcn_ub",  "3-way match + 4th/5th matches on combed (p/c/n + u/b)",                                0, AV_OPT_TYPE_CONST, {.i64=MODE_PCN_UB},  INT_MIN, INT_MAX, FLAGS, .unit = "mode" },
++    { "ppsrc", "mark main input as a pre-processed input and activate clean source input stream", OFFSET(ppsrc), AV_OPT_TYPE_BOOL, {.i64=0}, 0, 1, FLAGS },
++    { "field", "set the field to match from", OFFSET(field), AV_OPT_TYPE_INT, {.i64=FM_PARITY_AUTO}, -1, 1, FLAGS, .unit = "field" },
++        { "auto",   "automatic (same value as 'order')",    0, AV_OPT_TYPE_CONST, {.i64=FM_PARITY_AUTO},    INT_MIN, INT_MAX, FLAGS, .unit = "field" },
++        { "bottom", "bottom field",                         0, AV_OPT_TYPE_CONST, {.i64=FM_PARITY_BOTTOM},  INT_MIN, INT_MAX, FLAGS, .unit = "field" },
++        { "top",    "top field",                            0, AV_OPT_TYPE_CONST, {.i64=FM_PARITY_TOP},     INT_MIN, INT_MAX, FLAGS, .unit = "field" },
++    { "mchroma", "set whether or not chroma is included during the match comparisons", OFFSET(mchroma), AV_OPT_TYPE_BOOL, {.i64=1}, 0, 1,  FLAGS },
++    { "y0", "define an exclusion band which excludes the lines between y0 and y1 from the field matching decision", OFFSET(y0), AV_OPT_TYPE_INT, {.i64=0}, 0, INT_MAX, FLAGS },
++    { "y1", "define an exclusion band which excludes the lines between y0 and y1 from the field matching decision", OFFSET(y1), AV_OPT_TYPE_INT, {.i64=0}, 0, INT_MAX, FLAGS },
++    { "scthresh", "set scene change detection threshold", OFFSET(scthresh_flt), AV_OPT_TYPE_DOUBLE, {.dbl=12}, 0, 100, FLAGS },
++    { "combmatch", "set combmatching mode", OFFSET(combmatch), AV_OPT_TYPE_INT, {.i64=COMBMATCH_SC}, COMBMATCH_NONE, NB_COMBMATCH-1, FLAGS, .unit = "combmatching" },
++        { "none", "disable combmatching",                     0, AV_OPT_TYPE_CONST, {.i64=COMBMATCH_NONE}, INT_MIN, INT_MAX, FLAGS, .unit = "combmatching" },
++        { "sc",   "enable combmatching only on scene change", 0, AV_OPT_TYPE_CONST, {.i64=COMBMATCH_SC},   INT_MIN, INT_MAX, FLAGS, .unit = "combmatching" },
++        { "full", "enable combmatching all the time",         0, AV_OPT_TYPE_CONST, {.i64=COMBMATCH_FULL}, INT_MIN, INT_MAX, FLAGS, .unit = "combmatching" },
++    { "combdbg",   "enable comb debug", OFFSET(combdbg), AV_OPT_TYPE_INT, {.i64=0}, 0, 2, FLAGS, .unit = "dbglvl" },
++        { "none",  "no forced calculation", 0, AV_OPT_TYPE_CONST, {.i64=0}, INT_MIN, INT_MAX, FLAGS, .unit = "dbglvl" },
++        { "pcn",   "calculate p/c/n",       0, AV_OPT_TYPE_CONST, {.i64=1}, INT_MIN, INT_MAX, FLAGS, .unit = "dbglvl" },
++        { "pcnub", "calculate p/c/n/u/b",   0, AV_OPT_TYPE_CONST, {.i64=2}, INT_MIN, INT_MAX, FLAGS, .unit = "dbglvl" },
++    { "cthresh", "set the area combing threshold used for combed frame detection",       OFFSET(cthresh), AV_OPT_TYPE_INT, {.i64= 9}, -1, 0xff, FLAGS },
++    { "chroma",  "set whether or not chroma is considered in the combed frame decision", OFFSET(chroma),  AV_OPT_TYPE_BOOL,{.i64= 0},  0,    1, FLAGS },
++    { "blockx",  "set the x-axis size of the window used during combed frame detection", OFFSET(blockx),  AV_OPT_TYPE_INT, {.i64=16},  4, 1<<9, FLAGS },
++    { "blocky",  "set the y-axis size of the window used during combed frame detection", OFFSET(blocky),  AV_OPT_TYPE_INT, {.i64=16},  4, 1<<9, FLAGS },
++    { "combpel", "set the number of combed pixels inside any of the blocky by blockx size blocks on the frame for the frame to be detected as combed", OFFSET(combpel), AV_OPT_TYPE_INT, {.i64=80}, 0, INT_MAX, FLAGS },
++    { NULL }
++};
++
++AVFILTER_DEFINE_CLASS(fieldmatch_videotoolbox);
++
++static int get_field_base(int match, int field)
++{
++    return match < 3 ? 2 - field : 1 + field;
++}
++
++static AVFrame *select_frame(FMVTContext *fm, int match)
++{
++    if      (match == mP || match == mB) return fm->prv;
++    else if (match == mN || match == mU) return fm->nxt;
++    else  /* match == mC */              return fm->src;
++}
++
++/* The rows create_weave_frame takes from the frame that is not src, and that frame. */
++static int weave_alt_parity(int match, int field)
++{
++    return (match == mP || match == mN) ? field : 1 - field;
++}
++
++/* The textures of one frame's two planes, as unsigned integers. */
++static int frame_textures(AVFilterContext *ctx, const AVFrame *frame,
++                          CVMetalTextureRef tex[2]) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FMVTContext *fm = ctx->priv;
++    CVPixelBufferRef pixbuf = (CVPixelBufferRef)frame->data[3];
++
++    tex[0] = ff_metal_texture_from_pixbuf(ctx, (CVMetalTextureCacheRef)fm->textureCache,
++                                          pixbuf, 0, MTLPixelFormatR8Uint);
++    tex[1] = ff_metal_texture_from_pixbuf(ctx, (CVMetalTextureCacheRef)fm->textureCache,
++                                          pixbuf, 1, MTLPixelFormatRG8Uint);
++    return tex[0] && tex[1] ? 0 : AVERROR_EXTERNAL;
++}
++
++static void release_textures(CVMetalTextureRef *tex, int nb)
++{
++    for (int i = 0; i < nb; i++) {
++        if (tex[i]) {
++            CFRelease(tex[i]);
++            tex[i] = NULL;
++        }
++    }
++}
++
++static id<MTLTexture> T(CVMetalTextureRef t) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    return CVMetalTextureGetTexture(t);
++}
++
++/* What one frame's measuring pass produces. */
++typedef struct FMVTMetrics {
++    uint64_t accum[6];          ///< Pc, Pm, Pml, Nc, Nm, Nml of compare_fields(mC, fxo[mP])
++    int combs[5];               ///< calc_combed_score per match, -1 if not computed
++    int64_t diff_prv_src;       ///< luma_abs_diff(prv, src), when computed
++    int64_t diff_src_nxt;       ///< luma_abs_diff(src, nxt), when computed
++} FMVTMetrics;
++
++/* compare_fields after its loops: the totals decide, exactly as in vf_fieldmatch.c. */
++static int compare_fields_decide(const uint64_t accum[6], int match1, int match2)
++{
++    uint64_t accumPc = accum[0], accumPm = accum[1], accumPml = accum[2];
++    uint64_t accumNc = accum[3], accumNm = accum[4], accumNml = accum[5];
++    int norm1, norm2, mtn1, mtn2;
++    float c1, c2, mr;
++    int ret;
++
++    if (accumPm < 500 && accumNm < 500 && (accumPml >= 500 || accumNml >= 500) &&
++        FFMAX(accumPml,accumNml) > 3*FFMIN(accumPml,accumNml)) {
++        accumPm = accumPml;
++        accumNm = accumNml;
++    }
++
++    norm1 = (int)((accumPc / 6.0f) + 0.5f);
++    norm2 = (int)((accumNc / 6.0f) + 0.5f);
++    mtn1  = (int)((accumPm / 6.0f) + 0.5f);
++    mtn2  = (int)((accumNm / 6.0f) + 0.5f);
++    c1 = ((float)FFMAX(norm1,norm2)) / ((float)FFMAX(FFMIN(norm1,norm2),1));
++    c2 = ((float)FFMAX(mtn1, mtn2))  / ((float)FFMAX(FFMIN(mtn1, mtn2), 1));
++    mr = ((float)FFMAX(mtn1, mtn2))  / ((float)FFMAX(FFMAX(norm1,norm2),1));
++    if (((mtn1 >=  500 || mtn2 >=  500) && (mtn1*2 < mtn2*1 || mtn2*2 < mtn1*1)) ||
++        ((mtn1 >= 1000 || mtn2 >= 1000) && (mtn1*3 < mtn2*2 || mtn2*3 < mtn1*2)) ||
++        ((mtn1 >= 2000 || mtn2 >= 2000) && (mtn1*5 < mtn2*4 || mtn2*5 < mtn1*4)) ||
++        ((mtn1 >= 4000 || mtn2 >= 4000) && c2 > c1))
++        ret = mtn1 > mtn2 ? match2 : match1;
++    else if (mr > 0.005 && FFMAX(mtn1, mtn2) > 150 && (mtn1*2 < mtn2*1 || mtn2*2 < mtn1*1))
++        ret = mtn1 > mtn2 ? match2 : match1;
++    else
++        ret = norm1 > norm2 ? match2 : match1;
++    return ret;
++}
++
++/* calc_combed_score after its loops: the half-block counts go into the
++ * overlapping blocks the way C_ARRAY_ADD adds them, then the largest wins.
++ * blockx and blocky are even, so every pixel of a half-block lands in the
++ * same four blocks as the half-block's first pixel. */
++static int combed_score(FMVTContext *fm, const uint32_t *half)
++{
++    int max_v = 0;
++
++    memset(fm->c_array, 0, fm->c_array_size * sizeof(*fm->c_array));
++    for (int hy = 0; hy < fm->nhy; hy++) {
++        const int temp1 = (hy >> 1) * fm->xblocks4;
++        const int temp2 = ((hy + 1) >> 1) * fm->xblocks4;
++        for (int hx = 0; hx < fm->nhx; hx++) {
++            const int v = half[hy * fm->nhx + hx];
++            const int box1 = (hx >> 1) * 4;
++            const int box2 = ((hx + 1) >> 1) * 4;
++            if (!v)
++                continue;
++            fm->c_array[temp1 + box1    ] += v;
++            fm->c_array[temp1 + box2 + 1] += v;
++            fm->c_array[temp2 + box1 + 2] += v;
++            fm->c_array[temp2 + box2 + 3] += v;
++        }
++    }
++    for (int x = 0; x < fm->c_array_size; x++)
++        if (fm->c_array[x] > max_v)
++            max_v = fm->c_array[x];
++    return max_v;
++}
++
++static void dispatch(FMVTContext *fm, id<MTLComputeCommandEncoder> encoder,
++                     int kernel, NSUInteger w, NSUInteger h) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    ff_metal_compute_encoder_dispatch((id<MTLDevice>)fm->mtlDevice,
++                                      (id<MTLComputePipelineState>)fm->mtlPipeline[kernel],
++                                      encoder, w, h);
++}
++
++/*
++ * One frame's measuring pass: everything the decision code may read, in one
++ * command buffer with one wait. Two encoders, because the second reads what
++ * the first writes (the diff maps and the comb masks).
++ *
++ * The CPU scores candidates lazily (checkmm). Here every candidate that the
++ * mode could ask for is scored up front, so the decision never needs a second
++ * round trip. The extra scores cannot change a result: the decision code reads
++ * only the scores the CPU filter would have computed.
++ */
++static int measure(AVFilterContext *ctx, int field, const int *fxo, const int *cand, int nb_cand,
++                   int want_luma, FMVTMetrics *mt) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FMVTContext *fm = ctx->priv;
++    CVMetalTextureRef tex[6] = { NULL };     /* prv Y/UV, src Y/UV, nxt Y/UV */
++    id<MTLTexture> t[3][2];
++    const int match1 = fxo[mC], match2 = fxo[mP];
++    const int fbase1 = get_field_base(match1, field);
++    const int fbase2 = get_field_base(match2, field);
++    const int prvbranch = (match1 >= 3 && field == 1) || (match1 < 3 && field != 1);
++    const int nb_planes = fm->mchroma ? 2 : 1;
++    int ret = 0;
++
++    if ((ret = frame_textures(ctx, fm->prv, &tex[0])) < 0 ||
++        (ret = frame_textures(ctx, fm->src, &tex[2])) < 0 ||
++        (ret = frame_textures(ctx, fm->nxt, &tex[4])) < 0)
++        goto end;
++    for (int f = 0; f < 3; f++)
++        for (int p = 0; p < 2; p++)
++            t[f][p] = T(tex[f * 2 + p]);
++
++#define FRAME_OF(match) ((match) == mP || (match) == mB ? 0 : (match) == mC ? 1 : 2)
++
++    @autoreleasepool {
++        id<MTLCommandBuffer> buffer = ((id<MTLCommandQueue>)fm->mtlQueue).commandBuffer;
++        id<MTLComputeCommandEncoder> enc;
++
++        if (!buffer) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command buffer\n");
++            ret = AVERROR_EXTERNAL;
++            goto pool_end;
++        }
++
++        /* Stage 1: the diff maps, the comb masks and the luma differences. */
++        enc = buffer.computeCommandEncoder;
++        if (!enc) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal compute encoder\n");
++            ret = AVERROR_EXTERNAL;
++            goto pool_end;
++        }
++        for (int p = 0; p < nb_planes; p++) {
++            const FMVTPlane *pl = &fm->plane[p];
++            struct fmvt_diff_map_params dp = {
++                .width = pl->w, .height = pl->h, .channels = pl->channels,
++                .pbase = prvbranch ? fbase1 - 2 : fbase1,
++                .nbase = prvbranch ? fbase2 - 2 : fbase2,
++                .nk = pl->nk,
++            };
++            [enc setTexture:t[FRAME_OF(match1)][p] atIndex:0];
++            [enc setTexture:t[FRAME_OF(match2)][p] atIndex:1];
++            [enc setBuffer:(id<MTLBuffer>)fm->mapBuf[p] offset:0 atIndex:0];
++            [enc setBytes:&dp length:sizeof(dp) atIndex:1];
++            dispatch(fm, enc, K_DIFF_MAP, pl->w, pl->h);
++        }
++        for (int c = 0; c < nb_cand; c++) {
++            const int m = cand[c];
++            struct fmvt_comb_params cp = {
++                .width = fm->plane[0].w, .height = fm->plane[0].h,
++                .alt_parity = m == mC ? 0 : weave_alt_parity(m, field),
++                .cthresh = fm->cthresh,
++                .xhalf = fm->blockx / 2, .yhalf = fm->blocky / 2,
++                .nhx = fm->nhx, .nhy = fm->nhy,
++            };
++            [enc setTexture:t[1][0] atIndex:0];
++            [enc setTexture:t[FRAME_OF(m)][0] atIndex:1];
++            [enc setBuffer:(id<MTLBuffer>)fm->maskBuf[c] offset:0 atIndex:0];
++            [enc setBytes:&cp length:sizeof(cp) atIndex:1];
++            dispatch(fm, enc, K_COMB_MASK, cp.width, cp.height);
++        }
++        if (want_luma) {
++            struct fmvt_luma_diff_params lp = {
++                .width = fm->plane[0].w, .height = fm->plane[0].h,
++                .seg = SEG, .nseg = fm->luma_nseg,
++            };
++            for (int i = 0; i < 2; i++) {
++                [enc setTexture:t[i][0] atIndex:0];
++                [enc setTexture:t[i + 1][0] atIndex:1];
++                [enc setBuffer:(id<MTLBuffer>)fm->lumaBuf[i] offset:0 atIndex:0];
++                [enc setBytes:&lp length:sizeof(lp) atIndex:1];
++                dispatch(fm, enc, K_LUMA_DIFF, lp.nseg, lp.height);
++            }
++        }
++        [enc endEncoding];
++
++        /* Stage 2: the match sums and the comb counts. A nil encoder here would
++         * commit stage 1 alone and leave the previous frame's sums in the buffers. */
++        enc = buffer.computeCommandEncoder;
++        if (!enc) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal compute encoder\n");
++            ret = AVERROR_EXTERNAL;
++            goto pool_end;
++        }
++        for (int p = 0; p < nb_planes; p++) {
++            const FMVTPlane *pl = &fm->plane[p];
++            const int vsub = p ? fm->vsub : 0;
++            struct fmvt_match_sums_params mp = {
++                .width = pl->w, .channels = pl->channels,
++                .fbase1 = fbase1, .fbase2 = fbase2,
++                .nk = pl->nk, .startx = pl->startx, .stopx = pl->stopx,
++                .y0a = fm->y0 >> vsub, .y1a = fm->y1 >> vsub,
++                .seg = SEG, .nseg = pl->nseg,
++            };
++            if (!pl->nseg || !pl->nk)
++                continue;
++            [enc setTexture:t[1][p] atIndex:0];
++            [enc setTexture:t[FRAME_OF(match1)][p] atIndex:1];
++            [enc setTexture:t[FRAME_OF(match2)][p] atIndex:2];
++            [enc setBuffer:(id<MTLBuffer>)fm->mapBuf[p] offset:0 atIndex:0];
++            [enc setBuffer:(id<MTLBuffer>)fm->matchBuf[p] offset:0 atIndex:1];
++            [enc setBytes:&mp length:sizeof(mp) atIndex:2];
++            dispatch(fm, enc, K_MATCH_SUMS, pl->nseg, pl->nk);
++        }
++        for (int c = 0; c < nb_cand; c++) {
++            struct fmvt_comb_params cp = {
++                .width = fm->plane[0].w, .height = fm->plane[0].h,
++                .xhalf = fm->blockx / 2, .yhalf = fm->blocky / 2,
++                .nhx = fm->nhx, .nhy = fm->nhy,
++            };
++            [enc setBuffer:(id<MTLBuffer>)fm->maskBuf[c] offset:0 atIndex:0];
++            [enc setBuffer:(id<MTLBuffer>)fm->combBuf[c] offset:0 atIndex:1];
++            [enc setBytes:&cp length:sizeof(cp) atIndex:2];
++            dispatch(fm, enc, K_COMB_COUNT, fm->nhx, fm->nhy);
++        }
++        [enc endEncoding];
++
++        [buffer commit];
++        [buffer waitUntilCompleted];
++        if (buffer.status == MTLCommandBufferStatusError) {
++            av_log(ctx, AV_LOG_ERROR, "Metal command buffer failed: %s\n",
++                   buffer.error.description.UTF8String);
++            ret = AVERROR_EXTERNAL;
++        }
++pool_end:;
++    }
++    if (ret < 0)
++        goto end;
++
++    memset(mt->accum, 0, sizeof(mt->accum));
++    for (int p = 0; p < nb_planes; p++) {
++        const FMVTPlane *pl = &fm->plane[p];
++        const uint32_t *part = ((id<MTLBuffer>)fm->matchBuf[p]).contents;
++        if (!pl->nseg || !pl->nk)
++            continue;
++        for (int i = 0; i < pl->nk * pl->nseg; i++)
++            for (int j = 0; j < 6; j++)
++                mt->accum[j] += part[i * 6 + j];
++    }
++    for (int i = 0; i < 5; i++)
++        mt->combs[i] = -1;
++    for (int c = 0; c < nb_cand; c++)
++        mt->combs[cand[c]] = combed_score(fm, ((id<MTLBuffer>)fm->combBuf[c]).contents);
++    if (want_luma) {
++        int64_t *d[2] = { &mt->diff_prv_src, &mt->diff_src_nxt };
++        for (int i = 0; i < 2; i++) {
++            const uint32_t *part = ((id<MTLBuffer>)fm->lumaBuf[i]).contents;
++            *d[i] = 0;
++            for (int j = 0; j < fm->luma_nseg * fm->plane[0].h; j++)
++                *d[i] += part[j];
++        }
++    }
++
++end:
++    release_textures(tex, 6);
++#undef FRAME_OF
++    return ret;
++}
++
++/* create_weave_frame for a match other than mC, on the GPU. */
++static int weave_frame(AVFilterContext *ctx, int match, int field, AVFrame **out) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FMVTContext *fm = ctx->priv;
++    AVFilterLink *outlink = ctx->outputs[0];
++    const AVFrame *alt = select_frame(fm, match);
++    CVMetalTextureRef tex[6] = { NULL };     /* src Y/UV, alt Y/UV, dst Y/UV */
++    AVFrame *dst;
++    int failed = 0;
++
++    dst = ff_get_video_buffer(outlink, outlink->w, outlink->h);
++    if (!dst)
++        return AVERROR(ENOMEM);
++    av_frame_copy_props(dst, fm->src);
++
++    if (frame_textures(ctx, fm->src, &tex[0]) < 0 ||
++        frame_textures(ctx, alt, &tex[2]) < 0 ||
++        frame_textures(ctx, dst, &tex[4]) < 0) {
++        failed = 1;
++        goto end;
++    }
++
++    @autoreleasepool {
++        id<MTLCommandBuffer> buffer = ((id<MTLCommandQueue>)fm->mtlQueue).commandBuffer;
++        id<MTLComputeCommandEncoder> enc = buffer.computeCommandEncoder;
++        if (!buffer || !enc) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command buffer or encoder\n");
++            failed = 1;
++        } else {
++            for (int p = 0; p < 2; p++) {
++                struct fmvt_weave_params wp = {
++                    .width = fm->plane[p].w, .height = fm->plane[p].h,
++                    .alt_parity = weave_alt_parity(match, field),
++                };
++                [enc setTexture:T(tex[p])     atIndex:0];
++                [enc setTexture:T(tex[2 + p]) atIndex:1];
++                [enc setTexture:T(tex[4 + p]) atIndex:2];
++                [enc setBytes:&wp length:sizeof(wp) atIndex:0];
++                dispatch(fm, enc, K_WEAVE, wp.width, wp.height);
++            }
++            [enc endEncoding];
++            [buffer commit];
++            [buffer waitUntilCompleted];
++            if (buffer.status == MTLCommandBufferStatusError) {
++                av_log(ctx, AV_LOG_ERROR, "Metal command buffer failed: %s\n",
++                       buffer.error.description.UTF8String);
++                failed = 1;
++            }
++        }
++    }
++
++end:
++    release_textures(tex, 6);
++    if (failed) {
++        av_frame_free(&dst);
++        return AVERROR_EXTERNAL;
++    }
++    CVBufferPropagateAttachments((CVPixelBufferRef)fm->src->data[3], (CVPixelBufferRef)dst->data[3]);
++    *out = dst;
++    return 0;
++}
++
++static const int fxo0m[] = { mP, mC, mN, mB, mU };
++static const int fxo1m[] = { mN, mC, mP, mU, mB };
++
++/* checkmm, reading scores measure() already computed. A score is copied into
++ * combs only where vf_fieldmatch.c would have computed it (LOAD_COMB), so the
++ * debug line shows the same values. */
++static int checkmm(const FMVTContext *fm, int *combs, const int *scores, int m1, int m2)
++{
++    if (combs[m1] < 0)
++        combs[m1] = scores[m1];
++    if (combs[m2] < 0)
++        combs[m2] = scores[m2];
++    av_assert0(combs[m1] >= 0 && combs[m2] >= 0);
++    if ((combs[m2] * 3 < combs[m1] || (combs[m2] * 2 < combs[m1] && combs[m1] > fm->combpel)) &&
++        abs(combs[m2] - combs[m1]) >= 30 && combs[m2] < fm->combpel)
++        return m2;
++    else
++        return m1;
++}
++
++static int filter_frame(AVFilterLink *inlink, AVFrame *in) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    AVFilterContext *ctx  = inlink->dst;
++    AVFilterLink *outlink = ctx->outputs[0];
++    FilterLink      *outl = ff_filter_link(outlink);
++    FMVTContext *fm = ctx->priv;
++    FMVTMetrics mt;
++    int combs[] = { -1, -1, -1, -1, -1 };
++    int cand[MAX_CAND], nb_cand = 0;
++    int order, field, match, interlaced_frame, sc = 0, ret = 0, want_combs, want_luma;
++    const int *fxo;
++    AVFrame *dst = NULL;
++
++    /* update frames queue */
++    if (fm->prv != fm->src) /* 2nd loop exception (1st has prv==src and we don't want to loose src) */
++        av_frame_free(&fm->prv);
++    fm->prv = fm->src;
++    fm->src = fm->nxt;
++    if (in)
++        fm->nxt = in;
++    if (!fm->prv)
++        fm->prv = fm->src;
++    if (!fm->prv) /* received only one frame at that point */
++        return 0;
++    av_assert0(fm->prv && fm->src && fm->nxt);
++    in = fm->src;
++
++    /* parity */
++    order = fm->order != FM_PARITY_AUTO ? fm->order : ((in->flags & AV_FRAME_FLAG_INTERLACED) ?
++                                                       !!(in->flags & AV_FRAME_FLAG_TOP_FIELD_FIRST) : 1);
++    field = fm->field != FM_PARITY_AUTO ? fm->field : order;
++    av_assert0(order == 0 || order == 1 || field == 0 || field == 1);
++    fxo = field ^ order ? fxo1m : fxo0m;
++
++    /* Everything the decision below may read, measured at once. */
++    want_combs = fm->combmatch != COMBMATCH_NONE;
++    want_luma  = fm->combmatch == COMBMATCH_SC;
++    if (want_combs) {
++        cand[nb_cand++] = mC;
++        cand[nb_cand++] = fxo[mP];
++        if (fm->mode == MODE_PC_N)
++            cand[nb_cand++] = fxo[mN];
++        else if (fm->mode == MODE_PC_U)
++            cand[nb_cand++] = fxo[mU];
++    }
++    ret = measure(ctx, field, fxo, cand, nb_cand, want_luma, &mt);
++    if (ret < 0)
++        return ret;
++
++    /* p/c selection */
++    match = compare_fields_decide(mt.accum, fxo[mC], fxo[mP]);
++
++    /* scene change check */
++    if (fm->combmatch == COMBMATCH_SC) {
++        if (fm->lastn == outl->frame_count_in - 1) {
++            if (fm->lastscdiff > fm->scthresh)
++                sc = 1;
++        } else if (mt.diff_prv_src > fm->scthresh) {
++            sc = 1;
++        }
++
++        if (!sc) {
++            fm->lastn = outl->frame_count_in;
++            fm->lastscdiff = mt.diff_src_nxt;
++            sc = fm->lastscdiff > fm->scthresh;
++        }
++    }
++
++    if (fm->combmatch == COMBMATCH_FULL || (fm->combmatch == COMBMATCH_SC && sc)) {
++        switch (fm->mode) {
++        /* 2-way p/c matches */
++        case MODE_PC:
++            match = checkmm(fm, combs, mt.combs, match, match == fxo[mP] ? fxo[mC] : fxo[mP]);
++            break;
++        case MODE_PC_N:
++            match = checkmm(fm, combs, mt.combs, match, fxo[mN]);
++            break;
++        case MODE_PC_U:
++            match = checkmm(fm, combs, mt.combs, match, fxo[mU]);
++            break;
++        default:
++            av_assert0(0);
++        }
++    }
++
++    /* keep fields as-is if not matched properly */
++    interlaced_frame = combs[match] >= fm->combpel;
++    if (interlaced_frame && fm->combmatch == COMBMATCH_FULL) {
++        match = mC;
++    }
++
++    /* get output frame and drop the others */
++    if (match == mC) {
++        dst = av_frame_clone(fm->src);
++        if (!dst)
++            return AVERROR(ENOMEM);
++    } else if ((ret = weave_frame(ctx, match, field, &dst)) < 0) {
++        return ret;
++    }
++
++    /* mark the frame we are unable to match properly as interlaced so a proper
++     * de-interlacer can take the relay */
++    if (interlaced_frame) {
++        dst->flags |= AV_FRAME_FLAG_INTERLACED;
++        av_log(ctx, AV_LOG_WARNING, "Frame #%"PRId64" at %s is still interlaced\n",
++               outl->frame_count_in, av_ts2timestr(in->pts, &inlink->time_base));
++        if (field)
++            dst->flags |= AV_FRAME_FLAG_TOP_FIELD_FIRST;
++        else
++            dst->flags &= ~AV_FRAME_FLAG_TOP_FIELD_FIRST;
++    } else
++        dst->flags &= ~AV_FRAME_FLAG_INTERLACED;
++
++    av_log(ctx, AV_LOG_DEBUG, "SC:%d | COMBS: %3d %3d %3d %3d %3d (combpel=%d)"
++           " match=%d combed=%s\n", sc, combs[0], combs[1], combs[2], combs[3], combs[4],
++           fm->combpel, match, (dst->flags & AV_FRAME_FLAG_INTERLACED) ? "YES" : "NO");
++
++    return ff_filter_frame(outlink, dst);
++}
++
++static int activate(AVFilterContext *ctx)
++{
++    AVFilterLink *inlink = ctx->inputs[0];
++    AVFrame *frame = NULL;
++    int ret = 0, status;
++    int64_t pts;
++
++    FF_FILTER_FORWARD_STATUS_BACK_ALL(ctx->outputs[0], ctx);
++
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        if ((ret = ff_inlink_consume_frame(inlink, &frame)) > 0) {
++            ret = filter_frame(inlink, frame);
++            if (ret < 0)
++                return ret;
++        }
++        if (ret < 0) {
++            return ret;
++        } else if (ff_inlink_acknowledge_status(inlink, &status, &pts)) {
++            if (status == AVERROR_EOF) // flushing
++                ret = filter_frame(inlink, NULL);
++            ff_outlink_set_status(ctx->outputs[0], status, pts);
++            return ret;
++        } else {
++            FF_FILTER_FORWARD_WANTED(ctx->outputs[0], inlink);
++            return 0;
++        }
++    }
++    return AVERROR(ENOSYS);
++}
++
++static av_cold void do_uninit(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FMVTContext *fm = ctx->priv;
++
++    if (fm->prv != fm->src)
++        av_frame_free(&fm->prv);
++    if (fm->nxt != fm->src)
++        av_frame_free(&fm->nxt);
++    av_frame_free(&fm->src);
++    av_freep(&fm->c_array);
++
++    for (int i = 0; i < 2; i++) {
++        ff_objc_release((NSObject **)&fm->mapBuf[i]);
++        ff_objc_release((NSObject **)&fm->matchBuf[i]);
++        ff_objc_release((NSObject **)&fm->lumaBuf[i]);
++    }
++    for (int i = 0; i < MAX_CAND; i++) {
++        ff_objc_release((NSObject **)&fm->maskBuf[i]);
++        ff_objc_release((NSObject **)&fm->combBuf[i]);
++    }
++    for (int i = 0; i < NB_KERNELS; i++)
++        ff_objc_release((NSObject **)&fm->mtlPipeline[i]);
++    ff_objc_release((NSObject **)&fm->mtlQueue);
++    ff_objc_release((NSObject **)&fm->mtlLibrary);
++    ff_objc_release((NSObject **)&fm->mtlDevice);
++
++    if (fm->textureCache) {
++        CFRelease(fm->textureCache);
++        fm->textureCache = NULL;
++    }
++}
++
++static av_cold void fieldmatch_videotoolbox_uninit(AVFilterContext *ctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        do_uninit(ctx);
++    }
++}
++
++static av_cold int do_init(AVFilterContext *ctx) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FMVTContext *fm = ctx->priv;
++    id<MTLDevice> device;
++    NSError *err = nil;
++    CVMetalTextureCacheRef cache = NULL;
++    CVReturn ret;
++
++    /* What this port does not carry, refused before anything is allocated. */
++    if (fm->ppsrc) {
++        av_log(ctx, AV_LOG_ERROR, "ppsrc is not supported\n");
++        return AVERROR(ENOSYS);
++    }
++    if (fm->combdbg) {
++        av_log(ctx, AV_LOG_ERROR, "combdbg is not supported\n");
++        return AVERROR(ENOSYS);
++    }
++    if (fm->chroma) {
++        av_log(ctx, AV_LOG_ERROR, "chroma=1 is not supported\n");
++        return AVERROR(ENOSYS);
++    }
++    if (fm->mode != MODE_PC && fm->mode != MODE_PC_N && fm->mode != MODE_PC_U) {
++        av_log(ctx, AV_LOG_ERROR, "Only modes pc, pc_n and pc_u are supported\n");
++        return AVERROR(ENOSYS);
++    }
++    /* The same two checks as fieldmatch_init, so both filters take the same options. */
++    if ((fm->blockx & (fm->blockx - 1)) ||
++        (fm->blocky & (fm->blocky - 1))) {
++        av_log(ctx, AV_LOG_ERROR, "blockx and blocky settings must be power of two\n");
++        return AVERROR(EINVAL);
++    }
++    if (fm->combpel > fm->blockx * fm->blocky) {
++        av_log(ctx, AV_LOG_ERROR, "Combed pixel should not be larger than blockx x blocky\n");
++        return AVERROR(EINVAL);
++    }
++
++    device = MTLCreateSystemDefaultDevice();
++    fm->mtlDevice = device;
++    if (!device) {
++        av_log(ctx, AV_LOG_ERROR, "Unable to find Metal device\n");
++        goto fail;
++    }
++    av_log(ctx, AV_LOG_INFO, "Using Metal device: %s\n", device.name.UTF8String);
++
++    dispatch_data_t libData = dispatch_data_create(
++        ff_vf_fieldmatch_videotoolbox_metallib_data,
++        ff_vf_fieldmatch_videotoolbox_metallib_len,
++        nil,
++        nil);
++    fm->mtlLibrary = [device newLibraryWithData:libData error:&err];
++    dispatch_release(libData);
++    libData = nil;
++    if (err) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to load Metal library: %s\n", err.description.UTF8String);
++        goto fail;
++    }
++
++    for (int i = 0; i < NB_KERNELS; i++) {
++        id<MTLFunction> function = [(id<MTLLibrary>)fm->mtlLibrary
++            newFunctionWithName:kernel_names[i]];
++        if (!function) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal function %s\n", kernel_names[i].UTF8String);
++            goto fail;
++        }
++        fm->mtlPipeline[i] = [device newComputePipelineStateWithFunction:function error:&err];
++        [function release];
++        if (err || !fm->mtlPipeline[i]) {
++            av_log(ctx, AV_LOG_ERROR, "Failed to create Metal compute pipeline %s: %s\n",
++                   kernel_names[i].UTF8String, err ? err.description.UTF8String : "unknown");
++            goto fail;
++        }
++    }
++
++    fm->mtlQueue = device.newCommandQueue;
++    if (!fm->mtlQueue) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create Metal command queue!\n");
++        goto fail;
++    }
++
++    ret = CVMetalTextureCacheCreate(NULL, NULL, device, NULL, &cache);
++    if (ret != kCVReturnSuccess) {
++        av_log(ctx, AV_LOG_ERROR, "Failed to create CVMetalTextureCache: %d\n", ret);
++        goto fail;
++    }
++    fm->textureCache = cache;
++
++    return 0;
++fail:
++    fieldmatch_videotoolbox_uninit(ctx);
++    return AVERROR_EXTERNAL;
++}
++
++static av_cold int fieldmatch_videotoolbox_init(AVFilterContext *ctx)
++{
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_init(ctx);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int do_config_input(AVFilterLink *inlink) API_AVAILABLE(macos(10.11), ios(8.0))
++{
++    FilterLink *l = ff_filter_link(inlink);
++    AVFilterContext *ctx = inlink->dst;
++    FMVTContext *fm = ctx->priv;
++    id<MTLDevice> device = (id<MTLDevice>)fm->mtlDevice;
++    const AVHWFramesContext *frames;
++    const AVPixFmtDescriptor *desc;
++    const int w = inlink->w, h = inlink->h;
++    int xblocks, yblocks;
++
++    if (!l->hw_frames_ctx) {
++        av_log(ctx, AV_LOG_ERROR, "A hardware frames reference is "
++               "required to associate the processing device.\n");
++        return AVERROR(EINVAL);
++    }
++    frames = (const AVHWFramesContext *)l->hw_frames_ctx->data;
++
++    /* Refuse what the kernels cannot run before anything is allocated, so the
++     * graph fails at configuration instead of on every frame. */
++    if (frames->sw_format != AV_PIX_FMT_NV12) {
++        av_log(ctx, AV_LOG_ERROR, "Pixel format %s is not supported, only nv12\n",
++               av_get_pix_fmt_name(frames->sw_format));
++        return AVERROR(ENOSYS);
++    }
++    desc = av_pix_fmt_desc_get(frames->sw_format);
++    /* vf_fieldmatch.c reads one row past what it wrote on a plane with an odd
++     * number of rows, so only even plane heights are reproducible. */
++    if (h % 4) {
++        av_log(ctx, AV_LOG_ERROR, "Frame height %d is not a multiple of 4, which is not supported\n", h);
++        return AVERROR(ENOSYS);
++    }
++    if (w < 32 || h < 16) {
++        av_log(ctx, AV_LOG_ERROR, "Video smaller than 32x16 is not supported\n");
++        return AVERROR(EINVAL);
++    }
++
++    fm->vsub = desc->log2_chroma_h;
++    fm->scthresh = (int64_t)((w * h * 255.0 * fm->scthresh_flt) / 100.0);
++
++    for (int p = 0; p < 2; p++) {
++        FMVTPlane *pl = &fm->plane[p];
++        pl->w = p ? AV_CEIL_RSHIFT(w, desc->log2_chroma_w) : w;
++        pl->h = p ? AV_CEIL_RSHIFT(h, desc->log2_chroma_h) : h;
++        pl->channels = p ? 2 : 1;
++        pl->startx = p ? 8 >> desc->log2_chroma_w : 8;
++        pl->stopx = pl->w - pl->startx;
++        pl->nk = (pl->h - 3) / 2;
++        pl->nseg = pl->stopx > pl->startx ? (pl->stopx - pl->startx + SEG - 1) / SEG : 0;
++    }
++    fm->luma_nseg = (w + SEG - 1) / SEG;
++
++    /* calc_combed_score's block array, sized as vf_fieldmatch.c sizes it. */
++    xblocks = ((w + fm->blockx / 2) / fm->blockx) + 1;
++    yblocks = ((h + fm->blocky / 2) / fm->blocky) + 1;
++    fm->xblocks4 = xblocks << 2;
++    fm->c_array_size = (xblocks * yblocks) << 2;
++    fm->c_array = av_malloc_array(fm->c_array_size, sizeof(*fm->c_array));
++    fm->nhx = (w + fm->blockx / 2 - 1) / (fm->blockx / 2);
++    fm->nhy = (h + fm->blocky / 2 - 1) / (fm->blocky / 2);
++    if (!fm->c_array)
++        return AVERROR(ENOMEM);
++
++    for (int p = 0; p < 2; p++) {
++        const FMVTPlane *pl = &fm->plane[p];
++        fm->mapBuf[p] = [device newBufferWithLength:pl->w * pl->h * pl->channels
++                                            options:MTLResourceStorageModePrivate];
++        fm->matchBuf[p] = [device newBufferWithLength:FFMAX(pl->nk * pl->nseg, 1) * 6 * sizeof(uint32_t)
++                                              options:MTLResourceStorageModeShared];
++        fm->lumaBuf[p] = [device newBufferWithLength:fm->luma_nseg * h * sizeof(uint32_t)
++                                             options:MTLResourceStorageModeShared];
++        if (!fm->mapBuf[p] || !fm->matchBuf[p] || !fm->lumaBuf[p])
++            return AVERROR(ENOMEM);
++    }
++    for (int c = 0; c < MAX_CAND; c++) {
++        fm->maskBuf[c] = [device newBufferWithLength:w * h options:MTLResourceStorageModePrivate];
++        fm->combBuf[c] = [device newBufferWithLength:fm->nhx * fm->nhy * sizeof(uint32_t)
++                                             options:MTLResourceStorageModeShared];
++        if (!fm->maskBuf[c] || !fm->combBuf[c])
++            return AVERROR(ENOMEM);
++    }
++
++    return 0;
++}
++
++static int config_input(AVFilterLink *inlink)
++{
++    AVFilterContext *ctx = inlink->dst;
++    if (@available(macOS 10.11, iOS 8.0, *)) {
++        return do_config_input(inlink);
++    } else {
++        av_log(ctx, AV_LOG_ERROR, "Metal is not available on this OS version\n");
++        return AVERROR(ENOSYS);
++    }
++}
++
++static int config_output(AVFilterLink *outlink)
++{
++    FilterLink     *outl  = ff_filter_link(outlink);
++    AVFilterContext *ctx  = outlink->src;
++    AVFilterLink *inlink  = ctx->inputs[0];
++    FilterLink      *inl  = ff_filter_link(inlink);
++
++    /* Matched frames are either the input frame itself or a new frame of the
++     * same pool, so the output shares the input's frames context. */
++    av_buffer_unref(&outl->hw_frames_ctx);
++    outl->hw_frames_ctx = av_buffer_ref(inl->hw_frames_ctx);
++    if (!outl->hw_frames_ctx)
++        return AVERROR(ENOMEM);
++
++    outlink->time_base = inlink->time_base;
++    outlink->sample_aspect_ratio = inlink->sample_aspect_ratio;
++    outl->frame_rate = inl->frame_rate;
++    outlink->w = inlink->w;
++    outlink->h = inlink->h;
++    return 0;
++}
++
++static const AVFilterPad fieldmatch_videotoolbox_inputs[] = {
++    {
++        .name          = "main",
++        .type          = AVMEDIA_TYPE_VIDEO,
++        .config_props  = config_input,
++    },
++};
++
++static const AVFilterPad fieldmatch_videotoolbox_outputs[] = {
++    {
++        .name          = "default",
++        .type          = AVMEDIA_TYPE_VIDEO,
++        .config_props  = config_output,
++    },
++};
++
++const FFFilter ff_vf_fieldmatch_videotoolbox = {
++    .p.name         = "fieldmatch_videotoolbox",
++    .p.description  = NULL_IF_CONFIG_SMALL("Field matching for inverse telecine of VideoToolbox frames using Metal compute"),
++    .p.priv_class   = &fieldmatch_videotoolbox_class,
++    .priv_size      = sizeof(FMVTContext),
++    .init           = fieldmatch_videotoolbox_init,
++    .activate       = activate,
++    .uninit         = fieldmatch_videotoolbox_uninit,
++    FILTER_INPUTS(fieldmatch_videotoolbox_inputs),
++    FILTER_OUTPUTS(fieldmatch_videotoolbox_outputs),
++    FILTER_SINGLE_PIXFMT(AV_PIX_FMT_VIDEOTOOLBOX),
++    .flags_internal = FF_FILTER_FLAG_HWFRAME_AWARE,
++};

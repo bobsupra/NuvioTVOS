@@ -35,11 +35,31 @@ struct FilterAvailabilityTests {
         #expect(avfilter_get_by_name("yadif") != nil)
     }
 
+    @Test("GPU deinterlacers are available")
+    func gpuDeinterlacersAvailable() {
+        // AetherEngine deinterlaces VideoToolbox frames with bwdif_videotoolbox
+        // (patches/bwdif-videotoolbox.patch) and falls back to yadif_videotoolbox;
+        // hwupload gets the frames there.
+        for name in ["bwdif_videotoolbox", "yadif_videotoolbox", "hwupload"] {
+            #expect(avfilter_get_by_name(name) != nil, "\(name) missing")
+        }
+    }
+
     @Test("inverse telecine filters are available")
     func inverseTelecineAvailable() {
         // AetherEngine#853 detects telecine with idet and undoes it with
         // fieldmatch + decimate; without them 3:2 film stays at 29.97.
         for name in ["idet", "fieldmatch", "decimate"] {
+            #expect(avfilter_get_by_name(name) != nil, "\(name) missing")
+        }
+    }
+
+    @Test("GPU inverse telecine filters are available")
+    func gpuInverseTelecineAvailable() {
+        // fieldmatch_videotoolbox and decimate_videotoolbox
+        // (patches/ivtc-videotoolbox.patch, AetherEngine#1108) run the inverse
+        // telecine of AetherEngine#853 on VideoToolbox frames.
+        for name in ["fieldmatch_videotoolbox", "decimate_videotoolbox"] {
             #expect(avfilter_get_by_name(name) != nil, "\(name) missing")
         }
     }

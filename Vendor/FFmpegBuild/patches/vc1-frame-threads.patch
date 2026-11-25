@@ -1,0 +1,610 @@
+diff --git a/libavcodec/vc1.h b/libavcodec/vc1.h
+index f2a52c1..fcf83e6 100644
+--- a/libavcodec/vc1.h
++++ b/libavcodec/vc1.h
+@@ -27,6 +27,7 @@
+ #include "get_bits.h"
+ #include "h264chroma.h"
+ #include "mpegvideo.h"
++#include "threadprogress.h"
+ #include "intrax8.h"
+ #include "vc1_common.h"
+ #include "vc1dsp.h"
+@@ -353,6 +354,14 @@ typedef struct VC1Context{
+     uint8_t *blk_mv_type_base, *blk_mv_type;    ///< 0: frame MV, 1: field MV (interlaced frame)
+     uint8_t *mv_f_base, *mv_f[2];               ///< 0: MV obtained from same field, 1: opposite field
+     uint8_t *mv_f_next_base, *mv_f_next[2];
++    size_t mv_f_size;       ///< bytes in each of mv_f_base and mv_f_next_base
++    /**
++     * Field flags of reference field pictures. Each one writes mv_f[0] into a
++     * buffer of its own, which B field pictures then read as mv_f_next[0],
++     * so a later frame thread can read it while it is still being written.
++     */
++    struct AVRefStructPool *mv_f_pool;
++    uint8_t *mv_f_next_ref;     ///< RefStruct reference: the buffer mv_f_next[0] points into, if any
+     int field_mode;         ///< 1 for interlaced field pictures
+     int fptype;
+     int second_field;
+@@ -440,4 +449,55 @@ void ff_vc1_mc_4mv_chroma4(VC1Context *v, int dir, int dir2, int avg);
+ 
+ void ff_vc1_interp_mc(VC1Context *v);
+ 
++/**
++ * Frame threading. A reference picture reports its progress in macroblock
++ * rows of the frame (16 luma lines); a picture that reads it waits for the
++ * rows it is about to touch. A field picture reports while it decodes its
++ * second field, when the rows of both fields are there.
++ */
++
++/**
++ * Rows behind the row being decoded that a picture still changes: its pixels
++ * are put one row behind, once the overlap filter has run, and the loop
++ * filter runs behind that. In a field picture these are field rows.
++ */
++#define VC1_PROGRESS_LAG 3
++
++/** Report the rows the macroblock row just decoded has made final. */
++static av_always_inline void ff_vc1_report_row(const VC1Context *v)
++{
++    const MpegEncContext *s = &v->s;
++
++    int row;
++
++    /* Error concealment rewrites the picture at its end, so a damaged
++     * picture is only reported then, as in the H.263 decoder. */
++    if (!s->cur_pic.reference || s->er.error_occurred ||
++        s->mb_y < VC1_PROGRESS_LAG)
++        return;
++    if (!v->field_mode)
++        row = s->mb_y - VC1_PROGRESS_LAG;
++    else if (v->second_field) // field row y covers frame rows 2y and 2y + 1
++        row = 2 * (s->mb_y - VC1_PROGRESS_LAG) + 1;
++    else
++        return;
++    ff_thread_progress_report(&s->cur_pic.ptr->progress, row);
++}
++
++/**
++ * Wait until a reference picture is final down to a line.
++ * @param last_line lowest luma line about to be read, as the current picture
++ *                  addresses it (a field line in a field picture)
++ */
++static av_always_inline void ff_vc1_await_ref(const VC1Context *v,
++                                              const MPVWorkPicture *ref,
++                                              int last_line)
++{
++    if (ref->ptr == v->s.cur_pic.ptr) // second field reading the first one
++        return;
++    if (v->field_mode)
++        last_line = 2 * last_line + 1;
++    ff_thread_progress_await(&ref->ptr->progress, last_line >> 4);
++}
++
+ #endif /* AVCODEC_VC1_H */
+diff --git a/libavcodec/vc1_block.c b/libavcodec/vc1_block.c
+index a84c853..0c4ba0f 100644
+--- a/libavcodec/vc1_block.c
++++ b/libavcodec/vc1_block.c
+@@ -2607,6 +2607,7 @@ static void vc1_decode_i_blocks(VC1Context *v)
+         }
+ 
+         s->first_slice_line = 0;
++        ff_vc1_report_row(v);
+     }
+ 
+     /* This is intentionally mb_height and not end_mb_y - unlike in advanced
+@@ -2740,6 +2741,7 @@ static int vc1_decode_i_blocks_adv(VC1Context *v)
+             inc_blk_idx(v->cur_blk_idx);
+         }
+         s->first_slice_line = 0;
++        ff_vc1_report_row(v);
+     }
+ 
+     ff_er_add_slice(&s->er, 0, s->start_mb_y << v->field_mode, s->mb_width - 1,
+@@ -2831,6 +2833,7 @@ static void vc1_decode_p_blocks(VC1Context *v)
+                 v->luma_mv - s->mb_stride,
+                 sizeof(v->luma_mv_base[0]) * 2 * s->mb_stride);
+         s->first_slice_line = 0;
++        ff_vc1_report_row(v);
+     }
+     ff_er_add_slice(&s->er, 0, s->start_mb_y << v->field_mode, s->mb_width - 1,
+                     (s->end_mb_y << v->field_mode) - 1, ER_MB_END);
+@@ -2869,6 +2872,11 @@ static void vc1_decode_b_blocks(VC1Context *v)
+     for (s->mb_y = s->start_mb_y; s->mb_y < s->end_mb_y; s->mb_y++) {
+         s->mb_x = 0;
+         init_block_index(v);
++        /* Direct mode reads the co-located motion vectors of the next picture,
++         * and in a field picture its field flags: field direct mode needs the
++         * next picture to be a field picture, so it wrote mv_f_next. */
++        if (s->next_pic.ptr)
++            ff_vc1_await_ref(v, &s->next_pic, s->mb_y * 16 + 15);
+         for (; s->mb_x < s->mb_width; s->mb_x++) {
+             update_block_index(s);
+ 
+@@ -2927,10 +2935,12 @@ static void vc1_decode_skip_blocks(VC1Context *v)
+         s->mb_x = 0;
+         init_block_index(v);
+         update_block_index(s);
++        ff_vc1_await_ref(v, &s->last_pic, s->mb_y * 16 + 15);
+         memcpy(s->dest[0], s->last_pic.data[0] + s->mb_y * 16 * s->linesize,   s->linesize   * 16);
+         memcpy(s->dest[1], s->last_pic.data[1] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
+         memcpy(s->dest[2], s->last_pic.data[2] + s->mb_y *  8 * s->uvlinesize, s->uvlinesize *  8);
+         s->first_slice_line = 0;
++        ff_vc1_report_row(v);
+     }
+ }
+ 
+diff --git a/libavcodec/vc1_mc.c b/libavcodec/vc1_mc.c
+index db19d95..dda25c0 100644
+--- a/libavcodec/vc1_mc.c
++++ b/libavcodec/vc1_mc.c
+@@ -178,6 +178,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
+     int v_edge_pos = s->v_edge_pos >> v->field_mode;
+     int i;
+     const uint8_t (*luty)[256], (*lutuv)[256];
++    const MPVWorkPicture *ref;
+     int use_ic;
+     int interlace;
+     int linesize, uvlinesize;
+@@ -219,6 +220,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
+     }
+     if (!dir) {
+         if (v->field_mode && (v->cur_field_type != v->ref_field_type[dir]) && v->second_field) {
++            ref  = &s->cur_pic;
+             srcY = s->cur_pic.data[0];
+             srcU = s->cur_pic.data[1];
+             srcV = s->cur_pic.data[2];
+@@ -227,6 +229,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
+             use_ic = *v->curr_use_ic;
+             interlace = 1;
+         } else {
++            ref  = &s->last_pic;
+             srcY = s->last_pic.data[0];
+             srcU = s->last_pic.data[1];
+             srcV = s->last_pic.data[2];
+@@ -236,6 +239,7 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
+             interlace = v->last_interlaced;
+         }
+     } else {
++        ref  = &s->next_pic;
+         srcY = s->next_pic.data[0];
+         srcU = s->next_pic.data[1];
+         srcV = s->next_pic.data[2];
+@@ -272,6 +276,9 @@ void ff_vc1_mc_1mv(VC1Context *v, int dir)
+         }
+     }
+ 
++    /* the 16 luma lines plus filter taps, the 8 chroma lines plus one */
++    ff_vc1_await_ref(v, ref, FFMAX(src_y + 20, 2 * uvsrc_y + 22));
++
+     srcY += src_y   * s->linesize   + src_x;
+     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
+     srcV += uvsrc_y * s->uvlinesize + uvsrc_x;
+@@ -458,6 +465,7 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
+     int fieldmv = (v->fcm == ILACE_FRAME) ? v->blk_mv_type[s->block_index[n]] : 0;
+     int v_edge_pos = s->v_edge_pos >> v->field_mode;
+     const uint8_t (*luty)[256];
++    const MPVWorkPicture *ref;
+     int use_ic;
+     int interlace;
+     int linesize;
+@@ -474,17 +482,20 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
+ 
+     if (!dir) {
+         if (v->field_mode && (v->cur_field_type != v->ref_field_type[dir]) && v->second_field) {
++            ref  = &s->cur_pic;
+             srcY = s->cur_pic.data[0];
+             luty = v->curr_luty;
+             use_ic = *v->curr_use_ic;
+             interlace = 1;
+         } else {
++            ref  = &s->last_pic;
+             srcY = s->last_pic.data[0];
+             luty = v->last_luty;
+             use_ic = v->last_use_ic;
+             interlace = v->last_interlaced;
+         }
+     } else {
++        ref  = &s->next_pic;
+         srcY = s->next_pic.data[0];
+         luty = v->next_luty;
+         use_ic = v->next_use_ic;
+@@ -553,6 +564,9 @@ void ff_vc1_mc_4mv_luma(VC1Context *v, int n, int dir, int avg)
+             src_y = av_clip(src_y, -18, s->avctx->coded_height + 1);
+     }
+ 
++    /* 8 lines plus filter taps, every other line for a field MV */
++    ff_vc1_await_ref(v, ref, src_y + (13 << fieldmv) + 2);
++
+     srcY += src_y * s->linesize + src_x;
+     if (v->field_mode && v->ref_field_type[dir])
+         srcY += linesize;
+@@ -641,6 +655,7 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
+     int chroma_ref_type;
+     int v_edge_pos = s->v_edge_pos >> v->field_mode;
+     const uint8_t (*lutuv)[256];
++    const MPVWorkPicture *ref;
+     int use_ic;
+     int interlace;
+     int uvlinesize;
+@@ -698,12 +713,14 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
+ 
+     if (!dir) {
+         if (v->field_mode && (v->cur_field_type != chroma_ref_type) && v->second_field) {
++            ref  = &s->cur_pic;
+             srcU = s->cur_pic.data[1];
+             srcV = s->cur_pic.data[2];
+             lutuv = v->curr_lutuv;
+             use_ic = *v->curr_use_ic;
+             interlace = 1;
+         } else {
++            ref  = &s->last_pic;
+             srcU = s->last_pic.data[1];
+             srcV = s->last_pic.data[2];
+             lutuv = v->last_lutuv;
+@@ -711,6 +728,7 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
+             interlace = v->last_interlaced;
+         }
+     } else {
++        ref  = &s->next_pic;
+         srcU = s->next_pic.data[1];
+         srcV = s->next_pic.data[2];
+         lutuv = v->next_lutuv;
+@@ -723,6 +741,8 @@ void ff_vc1_mc_4mv_chroma(VC1Context *v, int dir)
+         return;
+     }
+ 
++    ff_vc1_await_ref(v, ref, 2 * uvsrc_y + 22);
++
+     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
+     srcV += uvsrc_y * s->uvlinesize + uvsrc_x;
+ 
+@@ -852,6 +872,7 @@ void ff_vc1_mc_4mv_chroma4(VC1Context *v, int dir, int dir2, int avg)
+     int interlace;
+     int uvlinesize;
+     const uint8_t (*lutuv)[256];
++    const MPVWorkPicture *ref;
+ 
+     if (CONFIG_GRAY && s->avctx->flags & AV_CODEC_FLAG_GRAY)
+         return;
+@@ -880,12 +901,14 @@ void ff_vc1_mc_4mv_chroma4(VC1Context *v, int dir, int dir2, int avg)
+         else
+             uvsrc_y = av_clip(uvsrc_y, -8, s->avctx->coded_height >> 1);
+         if (i < 2 ? dir : dir2) {
++            ref = &s->next_pic;
+             srcU = s->next_pic.data[1];
+             srcV = s->next_pic.data[2];
+             lutuv  = v->next_lutuv;
+             use_ic = v->next_use_ic;
+             interlace = v->next_interlaced;
+         } else {
++            ref = &s->last_pic;
+             srcU = s->last_pic.data[1];
+             srcV = s->last_pic.data[2];
+             lutuv  = v->last_lutuv;
+@@ -894,6 +917,8 @@ void ff_vc1_mc_4mv_chroma4(VC1Context *v, int dir, int dir2, int avg)
+         }
+         if (!srcU)
+             return;
++        /* 4 chroma lines plus one, every other line for a field MV */
++        ff_vc1_await_ref(v, ref, 2 * uvsrc_y + (12 << fieldmv) + 2);
+         srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
+         srcV += uvsrc_y * s->uvlinesize + uvsrc_x;
+         uvmx_field[i] = (uvmx_field[i] & 3) << 1;
+@@ -1056,6 +1081,8 @@ void ff_vc1_interp_mc(VC1Context *v)
+         }
+     }
+ 
++    ff_vc1_await_ref(v, &s->next_pic, FFMAX(src_y + 20, 2 * uvsrc_y + 22));
++
+     srcY += src_y   * s->linesize   + src_x;
+     srcU += uvsrc_y * s->uvlinesize + uvsrc_x;
+     srcV += uvsrc_y * s->uvlinesize + uvsrc_x;
+diff --git a/libavcodec/vc1dec.c b/libavcodec/vc1dec.c
+index 12b1e09..882f376 100644
+--- a/libavcodec/vc1dec.c
++++ b/libavcodec/vc1dec.c
+@@ -42,6 +42,7 @@
+ #include "msmpeg4_vc1_data.h"
+ #include "profiles.h"
+ #include "simple_idct.h"
++#include "thread.h"
+ #include "vc1.h"
+ #include "vc1data.h"
+ #include "vc1_vlc_data.h"
+@@ -49,6 +50,7 @@
+ #include "libavutil/avassert.h"
+ #include "libavutil/imgutils.h"
+ #include "libavutil/mem.h"
++#include "libavutil/refstruct.h"
+ #include "libavutil/thread.h"
+ 
+ 
+@@ -403,16 +405,22 @@ static av_cold int vc1_decode_init_alloc_tables(VC1Context *v)
+     if (!v->blk_mv_type_base)
+         return AVERROR(ENOMEM);
+     v->blk_mv_type      = v->blk_mv_type_base + s->b8_stride + 1;
+-    v->mv_f_base        = av_mallocz(2 * (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2));
++    v->mv_f_size        = 2 * (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
++    v->mv_f_base        = av_mallocz(v->mv_f_size);
+     if (!v->mv_f_base)
+         return AVERROR(ENOMEM);
+     v->mv_f[0]          = v->mv_f_base + s->b8_stride + 1;
+     v->mv_f[1]          = v->mv_f[0] + (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
+-    v->mv_f_next_base   = av_mallocz(2 * (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2));
++    v->mv_f_next_base   = av_mallocz(v->mv_f_size);
+     if (!v->mv_f_next_base)
+         return AVERROR(ENOMEM);
+     v->mv_f_next[0]     = v->mv_f_next_base + s->b8_stride + 1;
+     v->mv_f_next[1]     = v->mv_f_next[0] + (s->b8_stride * (mb_height * 2 + 1) + s->mb_stride * (mb_height + 1) * 2);
++    /* the same layout as the first half of mv_f_base */
++    v->mv_f_pool        = av_refstruct_pool_alloc(v->mv_f_size / 2 + s->b8_stride + 1,
++                                                  AV_REFSTRUCT_POOL_FLAG_ZERO_EVERY_TIME);
++    if (!v->mv_f_pool)
++        return AVERROR(ENOMEM);
+ 
+     if (s->avctx->codec_id == AV_CODEC_ID_WMV3IMAGE || s->avctx->codec_id == AV_CODEC_ID_VC1IMAGE) {
+         for (i = 0; i < 4; i++)
+@@ -448,7 +456,11 @@ static enum AVPixelFormat vc1_get_format(AVCodecContext *avctx)
+ 
+ static void vc1_decode_reset(AVCodecContext *avctx);
+ 
+-av_cold int ff_vc1_decode_init(AVCodecContext *avctx)
++/**
++ * @param negotiate_format 0 keeps avctx->pix_fmt: a frame thread copy takes
++ *                         it from the thread before it
++ */
++static av_cold int vc1_init_context(AVCodecContext *avctx, int negotiate_format)
+ {
+     VC1Context *const v = avctx->priv_data;
+     MpegEncContext *const s = &v->s;
+@@ -462,7 +474,8 @@ av_cold int ff_vc1_decode_init(AVCodecContext *avctx)
+     if (ret < 0)
+         return ret;
+ 
+-    avctx->pix_fmt = vc1_get_format(avctx);
++    if (negotiate_format)
++        avctx->pix_fmt = vc1_get_format(avctx);
+ 
+     ret = ff_mpv_common_init(s);
+     if (ret < 0)
+@@ -476,6 +489,11 @@ av_cold int ff_vc1_decode_init(AVCodecContext *avctx)
+     return 0;
+ }
+ 
++av_cold int ff_vc1_decode_init(AVCodecContext *avctx)
++{
++    return vc1_init_context(avctx, 1);
++}
++
+ av_cold void ff_vc1_init_transposed_scantables(VC1Context *v)
+ {
+     int i;
+@@ -768,7 +786,12 @@ static av_cold int vc1_decode_init(AVCodecContext *avctx)
+             return AVERROR_PATCHWELCOME;
+         }
+     }
+-    return 0;
++
++    /* The picture pool is shared by all frame threads and is only handed to
++     * a thread copy while the codec opens, so create it here rather than
++     * with the rest of the context on the first picture. It comes last, as
++     * nothing frees it when the open fails. */
++    return ff_mpv_decode_init(s, avctx);
+ }
+ 
+ static av_cold void vc1_decode_reset(AVCodecContext *avctx)
+@@ -792,6 +815,8 @@ static av_cold void vc1_decode_reset(AVCodecContext *avctx)
+     av_freep(&v->blk_mv_type_base);
+     av_freep(&v->mv_f_base);
+     av_freep(&v->mv_f_next_base);
++    av_refstruct_unref(&v->mv_f_next_ref);
++    av_refstruct_pool_uninit(&v->mv_f_pool);
+     av_freep(&v->block);
+     av_freep(&v->cbp_base);
+     av_freep(&v->ttblk_base);
+@@ -809,6 +834,92 @@ av_cold int ff_vc1_decode_end(AVCodecContext *avctx)
+     return ff_mpv_decode_close(avctx);
+ }
+ 
++#if HAVE_THREADS
++static int vc1_update_thread_context(AVCodecContext *dst,
++                                     const AVCodecContext *src)
++{
++    VC1Context *const v              = dst->priv_data;
++    const VC1Context *const v1       = src->priv_data;
++    MpegEncContext *const s          = &v->s;
++    const MpegEncContext *const s1   = &v1->s;
++    int ret;
++
++    if (dst == src)
++        return 0;
++
++    /* Only state the source no longer changes is read here: the source may
++     * still be decoding (see ff_thread_finish_setup() in vc1_decode_frame()).
++     * After setup, a B picture's second field header, its blocks and the
++     * doubled field linesize keep changing its context, and so do the blocks
++     * of a frame or interlaced frame reference picture. */
++
++    /* sequence header and entry point */
++    memcpy(&v->res_sprite, &v1->res_sprite,
++           (const char *)&v1->finterpflag + sizeof(v1->finterpflag) -
++           (const char *)&v1->res_sprite);
++    v->zz_8x4                = v1->zz_8x4;
++    v->zz_4x8                = v1->zz_4x8;
++    v->hrd_num_leaky_buckets = v1->hrd_num_leaky_buckets;
++    v->resync_marker         = v1->resync_marker;
++    v->broken_link           = v1->broken_link;
++    v->closed_entry          = v1->closed_entry;
++    v->range_mapy_flag       = v1->range_mapy_flag;
++    v->range_mapuv_flag      = v1->range_mapuv_flag;
++    v->range_mapy            = v1->range_mapy;
++    v->range_mapuv           = v1->range_mapuv;
++
++    /* the source dropped its context, with its reference pictures */
++    if (!s1->context_initialized) {
++        if (s->context_initialized)
++            vc1_decode_reset(dst);
++        return 0;
++    }
++
++    if (s->context_initialized &&
++        (s->width != s1->width || s->height != s1->height))
++        vc1_decode_reset(dst);
++    if (!s->context_initialized) {
++        ret = vc1_init_context(dst, 0);
++        if (ret < 0)
++            return ret;
++    }
++    s->h_edge_pos      = s1->h_edge_pos;
++    s->v_edge_pos      = s1->v_edge_pos;
++    s->low_delay       = s1->low_delay;
++    s->workaround_bugs = s1->workaround_bugs;
++
++    ff_mpv_replace_picture(&s->last_pic, &s1->last_pic);
++    ff_mpv_replace_picture(&s->next_pic, &s1->next_pic);
++
++    /* carried from picture to picture */
++    if (v1->profile < PROFILE_ADVANCED) // Advanced codes it in every header
++        v->rnd = v1->rnd;
++    v->refdist     = v1->refdist;       // a B field picture reads its anchor's
++    v->last_use_ic = v1->last_use_ic;
++    v->next_use_ic = v1->next_use_ic;
++    v->aux_use_ic  = v1->aux_use_ic;
++    memcpy(v->last_luty,  v1->last_luty,  sizeof(v->last_luty));
++    memcpy(v->last_lutuv, v1->last_lutuv, sizeof(v->last_lutuv));
++    memcpy(v->aux_luty,   v1->aux_luty,   sizeof(v->aux_luty));
++    memcpy(v->aux_lutuv,  v1->aux_lutuv,  sizeof(v->aux_lutuv));
++    memcpy(v->next_luty,  v1->next_luty,  sizeof(v->next_luty));
++    memcpy(v->next_lutuv, v1->next_lutuv, sizeof(v->next_lutuv));
++    v->curr_use_ic = !v1->curr_use_ic ? NULL :
++                     v1->curr_use_ic == &v1->aux_use_ic ? &v->aux_use_ic : &v->next_use_ic;
++    v->curr_luty   = !v1->curr_luty ? NULL :
++                     v1->curr_luty == v1->aux_luty ? v->aux_luty : v->next_luty;
++    v->curr_lutuv  = !v1->curr_lutuv ? NULL :
++                     v1->curr_lutuv == v1->aux_lutuv ? v->aux_lutuv : v->next_lutuv;
++
++    /* field flags of the last reference field picture (B field direct mode) */
++    av_refstruct_replace(&v->mv_f_next_ref, v1->mv_f_next_ref);
++    v->mv_f_next[0] = (v->mv_f_next_ref ? v->mv_f_next_ref : v->mv_f_next_base) +
++                      s->b8_stride + 1;
++
++    return 0;
++}
++#endif
++
+ /** Decode a VC1/WMV3 frame
+  * @todo TODO: Handle VC-1 IDUs (Transport level?)
+  */
+@@ -830,6 +941,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+         int raw_size;
+     } *slices = NULL, *tmp;
+     unsigned slices_allocated = 0;
++    int setup_finished = 0, frame_started = 0;
+ 
+     v->second_field = 0;
+ 
+@@ -1069,6 +1181,7 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+         goto end;
+     }
+ 
++    frame_started = 1;
+     if ((ret = ff_mpv_frame_start(s, avctx)) < 0) {
+         goto err;
+     }
+@@ -1090,6 +1203,36 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+         s->cur_pic.ptr->f->repeat_pict = v->rptfrm * 2;
+     }
+ 
++    /* A reference field picture writes its field flags into a buffer of its
++     * own, which B field pictures read as mv_f_next until the next one; any
++     * other picture writes them into scratch space. */
++    if (v->field_mode && s->pict_type != AV_PICTURE_TYPE_B && !avctx->hwaccel) {
++        uint8_t *mv_f = av_refstruct_pool_get(v->mv_f_pool);
++        if (!mv_f) {
++            ret = AVERROR(ENOMEM);
++            goto err;
++        }
++        av_refstruct_unref(&v->mv_f_next_ref);
++        v->mv_f_next_ref = mv_f;
++        v->mv_f[0]       = mv_f + s->b8_stride + 1;
++        v->mv_f_next[0]  = v->mv_f[0];
++    } else {
++        v->mv_f[0] = v->mv_f_base + s->b8_stride + 1;
++    }
++
++    /* Let the next frame thread start once everything it reads is final.
++     * A B picture changes nothing a later picture reads. A frame or
++     * interlaced frame reference picture without slices has nothing left
++     * to change either: later pictures wait for its rows as they need them.
++     * A reference field picture finishes setup once its second field header
++     * is parsed, which can change the intensity compensation tables. With
++     * slices, the frame thread code does it when the decode has returned,
++     * since a slice may repeat the picture header. */
++    if (s->pict_type == AV_PICTURE_TYPE_B || (!v->field_mode && !n_slices)) {
++        ff_thread_finish_setup(avctx);
++        setup_finished = 1;
++    }
++
+     if (avctx->hwaccel) {
+         const FFHWAccel *hwaccel = ffhwaccel(avctx->hwaccel);
+         s->mb_y = 0;
+@@ -1281,6 +1424,10 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+                             goto err;
+                         continue;
+                     }
++                    if (!setup_finished && n_slices == 1) {
++                        ff_thread_finish_setup(avctx);
++                        setup_finished = 1;
++                    }
+                 } else if (get_bits1(&v->gb)) {
+                     v->pic_header_flag = 1;
+                     if ((header_ret = ff_vc1_parse_frame_header_adv(v, &v->gb)) < 0) {
+@@ -1326,10 +1473,8 @@ static int vc1_decode_frame(AVCodecContext *avctx, AVFrame *pict,
+             s->cur_pic.linesize[2] >>= 1;
+             s->linesize                      >>= 1;
+             s->uvlinesize                    >>= 1;
+-            if (v->s.pict_type != AV_PICTURE_TYPE_BI && v->s.pict_type != AV_PICTURE_TYPE_B) {
+-                FFSWAP(uint8_t *, v->mv_f_next[0], v->mv_f[0]);
++            if (v->s.pict_type != AV_PICTURE_TYPE_BI && v->s.pict_type != AV_PICTURE_TYPE_B)
+                 FFSWAP(uint8_t *, v->mv_f_next[1], v->mv_f[1]);
+-            }
+         }
+         ff_dlog(s->avctx, "Consumed %i/%i bits\n",
+                 get_bits_count(&v->gb), v->gb.size_in_bits);
+@@ -1382,6 +1527,11 @@ image:
+ end:
+     ret = buf_size;
+ err:
++    /* A reference picture that fails after it started, in ff_mpv_frame_start()
++     * or later, is never finished by ff_mpv_frame_end(), so a frame thread
++     * waiting for its rows would wait forever. Let it read what is there. */
++    if (ret < 0 && frame_started && s->cur_pic.ptr && s->cur_pic.reference)
++        ff_thread_progress_report(&s->cur_pic.ptr->progress, INT_MAX);
+     av_free(buf2);
+     for (i = 0; i < n_slices; i++)
+         av_free(slices[i].buf);
+@@ -1399,8 +1549,10 @@ const FFCodec ff_vc1_decoder = {
+     .init           = vc1_decode_init,
+     .close          = ff_vc1_decode_end,
+     FF_CODEC_DECODE_CB(vc1_decode_frame),
++    UPDATE_THREAD_CONTEXT(vc1_update_thread_context),
+     .flush          = ff_mpeg_flush,
+-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
++                      AV_CODEC_CAP_FRAME_THREADS,
+     .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+ #if CONFIG_VC1_DXVA2_HWACCEL
+                         HWACCEL_DXVA2(vc1),
+@@ -1438,8 +1590,10 @@ const FFCodec ff_wmv3_decoder = {
+     .init           = vc1_decode_init,
+     .close          = ff_vc1_decode_end,
+     FF_CODEC_DECODE_CB(vc1_decode_frame),
++    UPDATE_THREAD_CONTEXT(vc1_update_thread_context),
+     .flush          = ff_mpeg_flush,
+-    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY,
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY |
++                      AV_CODEC_CAP_FRAME_THREADS,
+     .hw_configs     = (const AVCodecHWConfigInternal *const []) {
+ #if CONFIG_WMV3_DXVA2_HWACCEL
+                         HWACCEL_DXVA2(wmv3),
