@@ -191,6 +191,21 @@ final class AIOStreamsHostTests: XCTestCase {
         )
     }
 
+    func testConfigurationPairingURLKeepsExistingPathBehindFreshSetupToken() throws {
+        let manifest = "http://127.0.0.1:\(AIOStreamsHost.aioPort)/stremio/12345678-1234-1234-1234-1234567890ab/enc%2Bpass/manifest.json"
+        let pairing = try XCTUnwrap(AIOStreamsHost.configurationSetupURL(
+            host: "192.168.1.50", manifestURL: manifest, token: "fresh-setup-token"
+        ))
+        let components = try XCTUnwrap(URLComponents(string: pairing))
+        XCTAssertEqual(components.path, "/__nuvio/aio/setup")
+        XCTAssertEqual(components.queryItems?.first(where: { $0.name == "token" })?.value, "fresh-setup-token")
+        XCTAssertEqual(components.queryItems?.first(where: { $0.name == "path" })?.value,
+                       "/stremio/12345678-1234-1234-1234-1234567890ab/enc%2Bpass/configure")
+        let create = try XCTUnwrap(AIOStreamsHost.configurationSetupURL(host: "192.168.1.50", manifestURL: nil, token: "t"))
+        let createComponents = try XCTUnwrap(URLComponents(string: create))
+        XCTAssertEqual(createComponents.queryItems?.first(where: { $0.name == "path" })?.value, "/stremio/configure")
+    }
+
     /// Two answers merged: what the second repeats is left out, nothing of the first.
     func testMergingTwoAnswersKeepsEachStreamOnce() {
         let hash = "abcdef0123456789abcdef0123456789abcdef01"

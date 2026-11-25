@@ -49,6 +49,7 @@ final class AIOStreamsHost: ObservableObject {
     private nonisolated static let manifestKey = "aio.experiment.manifest"
     nonisolated static let detailedLogKey = "aio.experiment.detailedLog"
     private nonisolated static let backupDefaultsKey = "aio.experiment.backup"
+    private nonisolated static let keychainService = "nuvio.aio.experiment"
     nonisolated static let sourceKey = "aio.experiment.source"
     private nonisolated static let usePreviousKey = "aio.experiment.usePrevious"
     private nonisolated static let versionKey = "aio.experiment.version"
@@ -170,6 +171,16 @@ final class AIOStreamsHost: ObservableObject {
     private var checkingConfiguration = false
     private var warmingUp = false
     private var backgroundSince: Date?
+    /// A phone may configure AIOStreams only while this sheet is open and Nuvio is active.
+    private var configurationSheetVisible = false
+    private var configurationSheetActive = false
+    private var setupEligible = false
+    private var setupGeneration: UInt64 = 0
+    private var setupCloseRevisionSent: UInt64?
+    private var setupLifecycleTask: Task<Void, Never>?
+    @Published private(set) var setupPairingToken: String?
+    private var setupActivationInFlight = false
+    private var setupRenewalTimer: Timer?
     /// The addon address last seen in the state file (the page's doing).
     private var lastStateManifest: String?
     /// Nuvio's memory in the log while AIOStreams runs (`MemoryLog`).
@@ -179,7 +190,7 @@ final class AIOStreamsHost: ObservableObject {
         autoStart = UserDefaults.standard.bool(forKey: Self.autoStartKey)
         addonEnabled = UserDefaults.standard.object(forKey: Self.addonKey) as? Bool ?? true
         detailedLog = UserDefaults.standard.bool(forKey: Self.detailedLogKey)
-        manifestURL = UserDefaults.standard.string(forKey: Self.manifestKey)
+        manifestURL = Self.loadManifest()
         source = UserDefaults.standard.string(forKey: Self.sourceKey) ?? Self.defaultSource
         packageVersion = UserDefaults.standard.string(forKey: Self.versionKey) ?? ""
         usePreviousAtNextStart = UserDefaults.standard.bool(forKey: Self.usePreviousKey)
@@ -430,8 +441,9 @@ final class AIOStreamsHost: ObservableObject {
     /// URL when one is already saved (so scanning opens it to edit instead of
     /// starting a new configuration), else `/stremio/configure`.
     var configurationPageURL: String? {
-        guard let host = Self.localIPv4Address() else { return nil }
-        return Self.configurationPageURL(host: host, manifestURL: manifestURL)
+        guard configurationSheetVisible, phase == .running,
+              let token = setupPairingToken, let host = Self.localIPv4Address() else { return nil }
+        return Self.configurationSetupURL(host: host, manifestURL: manifestURL, token: token)
     }
 
     nonisolated static func configurationPageURL(host: String, manifestURL: String?) -> String {
@@ -444,6 +456,109 @@ final class AIOStreamsHost: ObservableObject {
             }
         }
         return "http://\(host):\(Self.lanPort)/stremio/configure"
+    }
+
+    /// The QR URL exchanges a fresh, short lived setup token for a browser cookie,
+    /// then redirects to the existing create or edit path without carrying the token.
+    nonisolated static func configurationSetupURL(host: String, manifestURL: String?, token: String) -> String? {
+        guard let cleanURL = URLComponents(string: configurationPageURL(host: host, manifestURL: manifestURL)),
+              !cleanURL.percentEncodedPath.isEmpty else { return nil }
+        let cleanPath = cleanURL.percentEncodedPath
+        var components = URLComponents()
+        components.scheme = "http"
+        components.host = host
+        components.port = lanPort
+        components.path = "/__nuvio/aio/setup"
+        components.queryItems = [
+            URLQueryItem(name: "token", value: token),
+            URLQueryItem(name: "path", value: cleanPath),
+        ]
+        return components.string
+    }
+
+    func setConfigurationSheetVisible(_ visible: Bool) {
+        guard configurationSheetVisible != visible else { return }
+        configurationSheetVisible = visible
+        configurationSheetActive = visible
+        setupGeneration &+= 1
+        reconcileConfigurationSetup()
+    }
+
+    func configurationSheetSceneChanged(isActive: Bool) {
+        let active = configurationSheetVisible && isActive
+        guard configurationSheetActive != active else { return }
+        configurationSheetActive = active
+        setupGeneration &+= 1
+        reconcileConfigurationSetup()
+    }
+
+    private func reconcileConfigurationSetup() {
+        let eligible = configurationSheetVisible && configurationSheetActive && phase == .running
+        if setupEligible != eligible {
+            setupEligible = eligible
+            setupGeneration &+= 1
+            setupPairingToken = nil
+        }
+        guard eligible else {
+            setupRenewalTimer?.invalidate()
+            setupRenewalTimer = nil
+            setupPairingToken = nil
+            queueConfigurationSetupClose()
+            return
+        }
+        guard setupPairingToken == nil, !setupActivationInFlight else { return }
+        queueConfigurationSetupActivation()
+    }
+
+    private func queueConfigurationSetupClose() {
+        guard setupGeneration > 0, setupCloseRevisionSent != setupGeneration else { return }
+        let revision = setupGeneration
+        setupCloseRevisionSent = revision
+        let previous = setupLifecycleTask
+        setupLifecycleTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            let response = await self.control("POST", "/setup/close", timeout: 5, setupRevision: revision)
+            if response == nil, self.setupCloseRevisionSent == revision {
+                self.setupCloseRevisionSent = nil
+            }
+        }
+    }
+
+    private func queueConfigurationSetupActivation() {
+        guard setupEligible, setupPairingToken == nil, !setupActivationInFlight else { return }
+        setupActivationInFlight = true
+        let revision = setupGeneration
+        let previous = setupLifecycleTask
+        setupLifecycleTask = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self else { return }
+            await self.activateConfigurationSetup(revision: revision)
+        }
+    }
+
+    private func activateConfigurationSetup(revision: UInt64) async {
+        defer {
+            setupActivationInFlight = false
+            if setupGeneration != revision { reconcileConfigurationSetup() }
+        }
+        guard setupEligible, revision == setupGeneration,
+              let answer = await control("POST", "/setup", timeout: 5, setupRevision: revision),
+              let token = answer["token"] as? String, !token.isEmpty else { return }
+        guard setupEligible, revision == setupGeneration else { return }
+        setupPairingToken = token
+        let expiresIn = (answer["expiresIn"] as? NSNumber)?.doubleValue ?? 15 * 60 * 1000
+        let refreshAfter = max(30, expiresIn / 1000 - 30)
+        setupRenewalTimer?.invalidate()
+        setupRenewalTimer = Timer.scheduledTimer(withTimeInterval: refreshAfter, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, self.setupEligible else { return }
+                self.setupPairingToken = nil
+                self.setupGeneration &+= 1
+                self.setupCloseRevisionSent = nil
+                self.reconcileConfigurationSetup()
+            }
+        }
     }
 
     /// The installer in the app (AIOStreams itself is downloaded).
@@ -518,6 +633,10 @@ final class AIOStreamsHost: ObservableObject {
         }
         Self.wakeFile = wakeFile
 
+        guard let secret = Self.secret() else {
+            phase = .unavailable("AIOStreams could not securely access its signing key.")
+            return
+        }
         let host = Self.localIPv4Address() ?? "127.0.0.1"
         let environment: [String: String] = [
             "HOME": dataDirectory.path,
@@ -534,7 +653,7 @@ final class AIOStreamsHost: ObservableObject {
             "BASE_URL": "http://\(host):\(Self.lanPort)",
             "DATABASE_URI": "sqlite://" + (dataDirectory.appendingPathComponent("db.sqlite").path.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? ""),
             "DISK_CACHE_DIR": cache.path,
-            "SECRET_KEY": Self.secret(),
+            "SECRET_KEY": secret,
             "ANIME_DB_LEVEL_OF_DETAIL": "required",
             // Everything Nuvio asks comes from 127.0.0.1, one address for AIOStreams' limits
             // (15 metadata requests in 5 s, …): a busy search would answer "rate limit exceeded".
@@ -632,6 +751,7 @@ final class AIOStreamsHost: ObservableObject {
             Task { @MainActor in
                 let shared = AIOStreamsHost.shared
                 shared.phase = .exited(status)
+                shared.reconcileConfigurationSetup()
                 shared.refreshLog()
                 shared.publishAddon()
             }
@@ -695,7 +815,7 @@ final class AIOStreamsHost: ObservableObject {
             // Created or loaded on the page just now: it exists.
             lastStateManifest = manifest
             manifestURL = manifest
-            UserDefaults.standard.set(manifest, forKey: Self.manifestKey)
+            if !Self.storeManifest(manifest) { Self.note("could not store the AIOStreams addon address in Keychain") }
             configurationVerified = true
             notice = nil
             publishAddon()
@@ -719,6 +839,7 @@ final class AIOStreamsHost: ObservableObject {
                 Task { await refreshVersions() }
             }
         }
+        reconcileConfigurationSetup()
         publishAddon()
     }
 
@@ -835,7 +956,7 @@ final class AIOStreamsHost: ObservableObject {
         updated["uuid"] = restored.uuid
         if let data = try? JSONSerialization.data(withJSONObject: updated) { Self.saveBackup(data) }
         manifestURL = restored.manifest
-        UserDefaults.standard.set(restored.manifest, forKey: Self.manifestKey)
+        if !Self.storeManifest(restored.manifest) { Self.note("could not store the restored AIOStreams addon address in Keychain") }
         configurationVerified = true
         notice = nil
         publishAddon()
@@ -845,19 +966,21 @@ final class AIOStreamsHost: ObservableObject {
     private func forgetConfiguration() {
         manifestURL = nil
         configurationVerified = false
-        UserDefaults.standard.removeObject(forKey: Self.manifestKey)
+        if !Self.removeManifest() { Self.note("could not remove the AIOStreams addon address from Keychain") }
         publishAddon()
     }
 
     /// The backup nuvio-main.mjs wrote moves to the Keychain.
     private func takeBackup(from file: URL) {
         guard let data = try? Data(contentsOf: file) else { return }
-        try? FileManager.default.removeItem(at: file)
-        if Self.saveBackup(data) {
-            hasBackup = true
-            // The account sync notices it (when this Apple TV keeps AIOStreams there).
-            AIOSettingsSync.noteNewBackup()
+        guard Self.saveBackup(data) else {
+            Self.note("could not securely store the AIOStreams backup; the handoff file was kept")
+            return
         }
+        try? FileManager.default.removeItem(at: file)
+        hasBackup = true
+        // The account sync notices it (when this Apple TV keeps AIOStreams there).
+        AIOSettingsSync.noteNewBackup()
     }
 
     // MARK: - From the Nuvio account (AIOSettingsSync)
@@ -891,9 +1014,9 @@ final class AIOStreamsHost: ObservableObject {
     func applySyncedBackup() async -> Bool {
         let defaults = UserDefaults.standard
         guard defaults.bool(forKey: AIOSettingsSync.pendingBackupKey), phase == .running, !checkingConfiguration else { return false }
-        defaults.removeObject(forKey: AIOSettingsSync.pendingBackupKey)
         guard let backup = Self.loadBackup(), let config = backup["config"],
               let password = backup["password"] as? String else { return false }
+        defaults.removeObject(forKey: AIOSettingsSync.pendingBackupKey)
         checkingConfiguration = true
         publishAddon()
         defer {
@@ -913,7 +1036,7 @@ final class AIOStreamsHost: ObservableObject {
             updated["uuid"] = created.uuid
             if let data = try? JSONSerialization.data(withJSONObject: updated) { Self.saveBackup(data) }
             manifestURL = created.manifest
-            defaults.set(created.manifest, forKey: Self.manifestKey)
+            if !Self.storeManifest(created.manifest) { Self.note("could not store the synced AIOStreams addon address in Keychain") }
         }
         configurationVerified = true
         notice = nil
@@ -984,55 +1107,123 @@ final class AIOStreamsHost: ObservableObject {
         return (uuid, manifest)
     }
 
-    // The backup (configuration and its password) lives in the Keychain; a
-    // build without Keychain access (unsigned simulator tests) keeps it in
-    // the user defaults instead.
-    private nonisolated static var backupQuery: [String: Any] {
+    // AIOStreams credentials and addon URLs use distinct accounts in one service.
+    private nonisolated static func keychainQuery(account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: "nuvio.aio.experiment",
-            kSecAttrAccount as String: "configuration",
+            kSecAttrService as String: keychainService,
+            kSecAttrAccount as String: account,
         ]
+    }
+
+    private nonisolated static func keychainData(account: String) -> (OSStatus, Data?) {
+        var query = keychainQuery(account: account)
+        query[kSecReturnData as String] = true
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        return (status, status == errSecSuccess ? item as? Data : nil)
+    }
+
+    /// Update an existing item in place, or add it only when no item exists.
+    private nonisolated static func storeKeychainData(_ data: Data, account: String) -> Bool {
+        let query = keychainQuery(account: account)
+        let attributes: [String: Any] = [kSecValueData as String: data]
+        let status = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        if status == errSecSuccess { return true }
+        guard status == errSecItemNotFound else { return false }
+        var item = query
+        item[kSecValueData as String] = data
+        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
+        return SecItemAdd(item as CFDictionary, nil) == errSecSuccess
+    }
+
+    @discardableResult
+    private nonisolated static func removeKeychainData(account: String) -> Bool {
+        let status = SecItemDelete(keychainQuery(account: account) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
     }
 
     @discardableResult
     nonisolated static func saveBackup(_ data: Data) -> Bool {
         let stored = (try? (data as NSData).compressed(using: .zlib) as Data) ?? data
-        SecItemDelete(backupQuery as CFDictionary)
-        var item = backupQuery
-        item[kSecValueData as String] = stored
-        item[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlock
-        if SecItemAdd(item as CFDictionary, nil) == errSecSuccess {
-            UserDefaults.standard.removeObject(forKey: backupDefaultsKey)
-            return true
-        }
-        UserDefaults.standard.set(stored, forKey: backupDefaultsKey)
+        guard storeKeychainData(stored, account: "configuration") else { return false }
+        UserDefaults.standard.removeObject(forKey: backupDefaultsKey)
         return true
     }
 
     nonisolated static func loadBackup() -> [String: Any]? {
-        var query = backupQuery
-        query[kSecReturnData as String] = true
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        var stored: Data?
-        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess {
-            stored = item as? Data
+        let (status, stored) = keychainData(account: "configuration")
+        if status == errSecSuccess {
+            guard let stored else { return nil }
+            guard let backup = backupObject(stored) else { return nil }
+            UserDefaults.standard.removeObject(forKey: backupDefaultsKey)
+            return backup
         }
-        if stored == nil { stored = UserDefaults.standard.data(forKey: backupDefaultsKey) }
-        guard let stored else { return nil }
-        let data = (try? (stored as NSData).decompressed(using: .zlib) as Data) ?? stored
-        return try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        guard let legacy = UserDefaults.standard.data(forKey: backupDefaultsKey) else { return nil }
+        let data = backupData(legacy)
+        guard let backup = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        if status == errSecItemNotFound, saveBackup(data) { return backup }
+        if status == errSecItemNotFound {
+            note("could not migrate the saved AIOStreams backup to Keychain; it remains available for another attempt")
+        }
+        // A pre-existing backup remains usable for restore when Keychain is
+        // transiently unavailable; never create a new defaults copy.
+        return backup
+    }
+
+    private nonisolated static func backupData(_ stored: Data) -> Data {
+        (try? (stored as NSData).decompressed(using: .zlib) as Data) ?? stored
+    }
+
+    private nonisolated static func backupObject(_ stored: Data) -> [String: Any]? {
+        try? JSONSerialization.jsonObject(with: backupData(stored)) as? [String: Any]
+    }
+
+    private nonisolated static func loadManifest() -> String? {
+        let defaults = UserDefaults.standard
+        let (status, data) = keychainData(account: "manifest")
+        if status == errSecSuccess, let data, let saved = String(data: data, encoding: .utf8), !saved.isEmpty {
+            defaults.removeObject(forKey: manifestKey)
+            return saved
+        }
+        guard let legacy = defaults.string(forKey: manifestKey), !legacy.isEmpty else { return nil }
+        if status == errSecItemNotFound, storeKeychainData(Data(legacy.utf8), account: "manifest") {
+            defaults.removeObject(forKey: manifestKey)
+        }
+        return legacy
+    }
+
+    @discardableResult
+    private nonisolated static func storeManifest(_ manifest: String) -> Bool {
+        guard !manifest.isEmpty, storeKeychainData(Data(manifest.utf8), account: "manifest") else { return false }
+        UserDefaults.standard.removeObject(forKey: manifestKey)
+        return true
+    }
+
+    @discardableResult
+    private nonisolated static func removeManifest() -> Bool {
+        let removed = removeKeychainData(account: "manifest")
+        UserDefaults.standard.removeObject(forKey: manifestKey)
+        return removed
     }
 
     // MARK: - Versions (nuvio-main.mjs, Nuvio's own port)
 
-    private func control(_ method: String, _ path: String, timeout: TimeInterval = 30) async -> [String: Any]? {
+    private func control(
+        _ method: String,
+        _ path: String,
+        timeout: TimeInterval = 30,
+        setupRevision: UInt64? = nil
+    ) async -> [String: Any]? {
         guard let url = URL(string: "http://127.0.0.1:\(Self.controlPort)\(path)") else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = timeout
         request.setValue(controlToken, forHTTPHeaderField: "x-nuvio-token")
+        if let setupRevision {
+            request.setValue(String(setupRevision), forHTTPHeaderField: "x-nuvio-setup-generation")
+        }
         guard let (data, _) = try? await URLSession.shared.data(for: request) else { return nil }
         return (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
     }
@@ -1559,13 +1750,33 @@ final class AIOStreamsHost: ObservableObject {
     out('done');
     """#
 
-    private nonisolated static func secret() -> String {
-        if let saved = UserDefaults.standard.string(forKey: secretKey), saved.count == 64 { return saved }
+    private nonisolated static func secret() -> String? {
+        let defaults = UserDefaults.standard
+        let (status, stored) = keychainData(account: "secret")
+        if status == errSecSuccess {
+            guard let stored, let saved = String(data: stored, encoding: .utf8), isSecret(saved) else { return nil }
+            defaults.removeObject(forKey: secretKey)
+            return saved
+        }
+        if let legacy = defaults.string(forKey: secretKey), isSecret(legacy) {
+            if status == errSecItemNotFound, storeKeychainData(Data(legacy.utf8), account: "secret") {
+                defaults.removeObject(forKey: secretKey)
+            }
+            // Keep using the existing identity on a transient Keychain failure;
+            // the next start retries migration instead of rotating SECRET_KEY.
+            return legacy
+        }
+        guard status == errSecItemNotFound else { return nil }
         var bytes = [UInt8](repeating: 0, count: 32)
-        _ = SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes)
+        guard SecRandomCopyBytes(kSecRandomDefault, bytes.count, &bytes) == errSecSuccess else { return nil }
         let secret = bytes.map { String(format: "%02x", $0) }.joined()
-        UserDefaults.standard.set(secret, forKey: secretKey)
+        guard storeKeychainData(Data(secret.utf8), account: "secret") else { return nil }
+        defaults.removeObject(forKey: secretKey)
         return secret
+    }
+
+    private nonisolated static func isSecret(_ value: String) -> Bool {
+        value.utf8.count == 64 && value.utf8.allSatisfy { (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0) }
     }
 
     nonisolated static func appFootprintMB() -> Int? {
