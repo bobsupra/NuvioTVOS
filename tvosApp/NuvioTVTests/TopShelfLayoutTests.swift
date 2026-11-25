@@ -126,6 +126,28 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertNotEqual(enabled, disabled)
     }
 
+    /// `ProviderCredentialStore` writes UserDefaults while it holds its lock, and the ratings
+    /// observer reads the MDBList key through that store. An observer on the main queue made
+    /// a writer on another thread wait for the main thread, which was waiting for that lock.
+    /// The test host installs the observer at launch (`TopShelfRatingsBridge.install()`).
+    func testUserDefaultsWriteOffTheMainThreadDoesNotWaitForTheMainThread() {
+        let suiteName = "TopShelfRatingsObserver-\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let written = DispatchSemaphore(value: 0)
+
+        DispatchQueue.global().async {
+            defaults.set(true, forKey: "written")
+            written.signal()
+        }
+
+        // The main thread stays busy here, as it does while it waits for the store's lock.
+        XCTAssertEqual(
+            written.wait(timeout: .now() + 2), .success,
+            "A UserDefaults observer made a write on another thread wait for the main thread"
+        )
+    }
+
     // MARK: Carousel
 
     func testCarouselGivesEverySourceItsShareThenTopsUpInTurn() {
