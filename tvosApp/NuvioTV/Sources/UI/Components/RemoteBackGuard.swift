@@ -35,6 +35,15 @@ final class BackGuardHostView: UIView, UIGestureRecognizerDelegate {
     static let passAfterSwallowWithin: CFTimeInterval = 1.5
     /// A Back this soon after the previous one lands while what that one closed is still closing.
     static let closingWithin: CFTimeInterval = 1.0
+    /// Until this time every Back goes through. Settings → Appearance → Sidebar → Press Back
+    /// Twice to Exit sets it while its reminder waits for the second press, which usually
+    /// comes within `closingWithin` of the first.
+    static var passBackUntil: CFTimeInterval = -.infinity
+
+    /// Whether a Back at `now` goes through for the exit reminder.
+    static func isPassingBack(at now: CFTimeInterval) -> Bool {
+        now < passBackUntil
+    }
 
     /// A guarded window and its tap. The window is held weakly: tvOS shows a short-lived
     /// `_UISnapshotWindow` on every tab switch, and holding those strongly kept each one, with
@@ -131,6 +140,10 @@ final class BackGuardHostView: UIView, UIGestureRecognizerDelegate {
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
         guard press.type == .menu, let window = gestureRecognizer.view as? UIWindow else { return false }
         let now = CACurrentMediaTime()
+        if Self.isPassingBack(at: now) {
+            lastBack = now
+            return false
+        }
         let focused = window.windowScene?.focusSystem?.focusedItem
         let sincePrevious = now - lastBack
         lastBack = now

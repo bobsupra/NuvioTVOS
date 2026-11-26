@@ -44,6 +44,12 @@ final class PlexPlaybackSync {
         }
     }
     var now: () -> Date = Date.init
+    /// Waits until a server has a connected client, for up to five minutes:
+    /// Plex connects after the SMB and Jellyfin sources, which can take
+    /// minutes when one of them is offline. Replaced in tests.
+    var serverReady: (String) async -> Bool = { serverID in
+        await PlexSessionManager.shared.waitForClient(serverID: serverID, timeout: 300)
+    }
 
     nonisolated static let heartbeatInterval: TimeInterval = 10
 
@@ -204,6 +210,31 @@ final class PlexPlaybackSync {
         session.lastState = nil
         sessions[item] = session
         report(state == .paused ? .paused : .playing, url: url, currentTime: currentTime, duration: duration)
+    }
+
+    /// An external player (Infuse, SenPlayer, Native Player) stopped at
+    /// `position`. Plex heard nothing while that app played, so this
+    /// reports one stop there, as a play of its own. Plex's own length for
+    /// the item comes first, then `duration`.
+    func externalPlaybackEnded(url: String, position: TimeInterval, duration: TimeInterval?) async {
+        guard let item = item(forString: url) else { return }
+        // A return link that launched Nuvio arrives before the server is
+        // connected. Without a client the stop would be lost after the
+        // local copy of Plex's state had moved, so wait for one.
+        guard await serverReady(item.serverID) else { return }
+        // A newer play of the same item started while this waited. Its own
+        // reports win.
+        if let state = sessions[item]?.lastState, state == .playing || state == .paused { return }
+        // Forget an earlier play of the same item, such as one in the
+        // built-in player that already stopped.
+        sessions[item] = nil
+        let length = item.durationMs.flatMap { $0 > 0 ? TimeInterval($0) / 1000 : nil } ?? duration ?? 0
+        report(.stopped, url: url, currentTime: position, duration: length)
+    }
+
+    /// The length Plex has for the item `url` plays, in seconds.
+    func duration(for url: URL) -> TimeInterval? {
+        item(for: url)?.durationMs.flatMap { $0 > 0 ? TimeInterval($0) / 1000 : nil }
     }
 
     /// Mirrors what the server will save, so a replay before the next read of

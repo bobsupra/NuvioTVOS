@@ -772,6 +772,8 @@ enum SettingsKey {
     static let aiCatalogAnimeSeries = "nuvio.tv.settings.integrations.aiCatalogAnimeSeries"
     static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     static let useNuvioRail = "nuvio.tv.settings.layout.useNuvioRail"
+    /// Settings → Appearance → Sidebar → Press Back Twice to Exit.
+    static let doubleBackToExit = "nuvio.tv.settings.layout.doubleBackToExit"
     static let continueWatchingPerishAnimation = "nuvio.tv.settings.appearance.continueWatchingPerishAnimation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
@@ -1139,6 +1141,9 @@ enum SettingsKey {
         // sidebar or perish animation. They are still in `all`, so a new profile's settings copy
         // and Reset include it.
         useNuvioRail, continueWatchingPerishAnimation,
+        // How Back leaves the app belongs to this Apple TV. The other apps
+        // have no such setting.
+        doubleBackToExit,
         aniListClientID, malClientID, animeSkipClientID,
         // Says a choice was made on this Apple TV, so it stays here.
         customPosterScreensChosenHere,
@@ -4104,7 +4109,11 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.doubleBackToExit) private var doubleBackToExit = false
     @AppStorage(SettingsKey.continueWatchingPerishAnimation) private var continueWatchingPerishAnimation = false
+    // Kept on this Apple TV, outside profiles and sync (`NuvioBranding`).
+    @AppStorage(NuvioBranding.key, store: .standard) private var nuvioBranding = false
+    @AppStorage(NuvioBranding.appIconKey, store: .standard) private var appIcon = NuvioAppIcon.original.rawValue
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @State private var confirmingSurpriseMeTab = false
@@ -4312,6 +4321,18 @@ private struct AppearanceSettingsView: View {
                     ))
                 }
                 .settingsLeaf(.lay, section: "NAVIGATION BAR")
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_double_back_to_exit", fallback: "Press Back Twice to Exit"),
+                    subtitle: L10n.string(
+                        "tvos_settings_double_back_to_exit_subtitle",
+                        fallback: "When Back would leave Nuvio, the first press shows a reminder. Press Back again within 3 seconds to leave."
+                    ),
+                    isOn: $doubleBackToExit,
+                    accentColor: accentColor
+                )
+                .opacity(useTopNavigation ? 0.46 : 1)
+                .disabled(useTopNavigation)
+                .settingsLeaf(.lay, section: "NAVIGATION BAR")
             }
             .settingsPlaces([SettingsPlace(.lay, "NAVIGATION BAR")])
 
@@ -4343,6 +4364,34 @@ private struct AppearanceSettingsView: View {
                     isOn: $continueWatchingPerishAnimation,
                     accentColor: accentColor
                 )
+                .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_nuvio_branding", fallback: "Nuvio Branding"),
+                    subtitle: L10n.string(
+                        "tvos_settings_nuvio_branding_subtitle",
+                        fallback: "The Nuvio app icon, launch banner, sign-in screen and profile loading screen, as on Android TV. Kept on this Apple TV."
+                    ),
+                    isOn: $nuvioBranding,
+                    accentColor: accentColor
+                )
+                .onChange(of: nuvioBranding) { _, _ in NuvioBranding.applyIcon() }
+                .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
+
+                SettingsAppIconRow(
+                    selection: $appIcon,
+                    accentColor: accentColor,
+                    title: L10n.string("tvos_settings_app_icon", fallback: "App Icon"),
+                    subtitle: nuvioBranding
+                        ? (NuvioAppIcon(rawValue: appIcon) ?? .original).label
+                        : L10n.string(
+                            "tvos_settings_app_icon_branding_off",
+                            fallback: "Turn on Nuvio Branding to use one of the Nuvio icons"
+                        )
+                )
+                .disabled(!nuvioBranding)
+                .opacity(nuvioBranding ? 1 : 0.46)
+                .onChange(of: appIcon) { _, _ in NuvioBranding.applyIcon() }
                 .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
             }
             .settingsPlaces([SettingsPlace(.app, "NUVIO ANDROID TV STYLING")])
@@ -18278,6 +18327,7 @@ private struct AdvancedSettingsView: View {
                     value: NuvioSyncManager.addonSyncDiagnostic,
                     isDiagnostic: true
                 )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
                 // Reports how many synced rows arrived versus how many could be
                 // rendered. A large "awaiting metadata" count means add-ons could
@@ -27940,6 +27990,99 @@ private struct SettingsSwatchRow: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The App Icon choices as a row of icon tiles, drawn like the theme swatches.
+private struct SettingsAppIconRow: View {
+    @Binding var selection: String
+    let accentColor: Color
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            SettingsRowText(title: title, subtitle: subtitle)
+            HStack(spacing: 22) {
+                ForEach(NuvioAppIcon.allCases) { icon in
+                    SettingsAppIconButton(
+                        icon: icon,
+                        isSelected: selection == icon.rawValue,
+                        accentColor: accentColor
+                    ) {
+                        selection = icon.rawValue
+                    }
+                }
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.07))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+        }
+    }
+}
+
+private struct SettingsAppIconButton: View {
+    let icon: NuvioAppIcon
+    let isSelected: Bool
+    let accentColor: Color
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                Image(icon.previewImageName)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(12)
+                    .frame(width: 84, height: 84)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.black)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .strokeBorder(ringColor, lineWidth: isFocused ? AppFocusOutline.width : (isSelected ? 4 : 0))
+                            .padding(-4)
+                    )
+                    .overlay(alignment: .topTrailing) {
+                        if isSelected {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 22, weight: .bold))
+                                .foregroundStyle(.black, .white)
+                                .offset(x: 8, y: -8)
+                        }
+                    }
+
+                Text(icon.label)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.white.opacity(isFocused || isSelected ? 1 : 0.65))
+                    .lineLimit(1)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.12 : 1.0)
+        .zIndex(isFocused ? 1 : 0)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+    }
+
+    private var ringColor: Color {
+        if isFocused { return AppFocusOutline.color }
+        return isSelected ? accentColor : .clear
     }
 }
 

@@ -192,7 +192,7 @@ public struct UserProfileView: View {
     private func updateFocusedColor(for itemId: String?) {
         guard let itemId else {
             if let first = viewModel.profiles.first {
-                focusedColor = profileColor(for: first)
+                focusedColor = Self.profileColor(for: first, in: viewModel.profiles)
                 focusedBackgroundUrl = first.profileBackgroundUrl
                 focusedBackgroundId = first.profileBackgroundId
             }
@@ -205,13 +205,13 @@ public struct UserProfileView: View {
             return
         }
         if let profile = viewModel.profiles.first(where: { $0.id == itemId }) {
-            focusedColor = profileColor(for: profile)
+            focusedColor = Self.profileColor(for: profile, in: viewModel.profiles)
             focusedBackgroundUrl = profile.profileBackgroundUrl
             focusedBackgroundId = profile.profileBackgroundId
         }
     }
 
-    private func profileColor(for profile: Profile) -> Color {
+    static func profileColor(for profile: Profile, in profiles: [Profile]) -> Color {
         if let item = AvatarCatalogStore.shared.item(for: profile.avatarId),
            let bgHex = item.bgColor, !bgHex.isEmpty {
             return Color(hex: bgHex)
@@ -224,7 +224,7 @@ public struct UserProfileView: View {
             Color(hex: "#8E24AA"),
             Color(hex: "#00ACC1")
         ]
-        if let idx = viewModel.profiles.firstIndex(where: { $0.id == profile.id }) {
+        if let idx = profiles.firstIndex(where: { $0.id == profile.id }) {
             return palette[idx % palette.count]
         }
         return Color(hex: "#1E88E5")

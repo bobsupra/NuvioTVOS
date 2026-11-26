@@ -127,6 +127,17 @@ final class PlexSessionManager: ObservableObject {
         return clients[serverID]
     }
 
+    /// Waits until `serverID` has a connected client, or `timeout` passes.
+    /// True when there is one.
+    func waitForClient(serverID: String, timeout: TimeInterval) async -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while client(forServerID: serverID) == nil {
+            guard Date() < deadline, !Task.isCancelled else { return false }
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        return true
+    }
+
     // MARK: - Account
 
     /// Re-reads the account's servers from plex.tv, adding new ones.

@@ -481,12 +481,15 @@ private final class TopShelfRatingsConfigurationObserver: @unchecked Sendable {
         ) { [weak self] _ in
             self?.settingsDidChange()
         }
+        // UserDefaults writes can hold a store lock; this Task hops to MainActor without blocking the posting thread.
         let defaultsObserver = center.addObserver(
             forName: UserDefaults.didChangeNotification,
             object: nil,
-            queue: .main
+            queue: nil
         ) { [weak self] _ in
-            self?.settingsDidChange()
+            Task { @MainActor [weak self] in
+                self?.settingsDidChange()
+            }
         }
         lock.withLock { observers = [configurationObserver, defaultsObserver] }
         // Refresh once after the bridge is installed so records written by the previous

@@ -2941,8 +2941,7 @@ struct TraktProgressService {
     }
 
     fileprivate static func scrobbleMedia(for meta: NuvioMeta) -> TraktScrobbleMedia? {
-        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-        let imdb = meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil)
+        let imdb = TraktMetaIDs.imdb(for: meta)
         let tmdb = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
             ? Int(meta.id.dropFirst("tmdb:".count))
             : nil)
@@ -3712,6 +3711,18 @@ struct TraktHistoryService {
                 $0.accountID != expectedAccountID || $0.profileID != profileId
             }
         let service = TraktAuthService(session: session, store: store)
+        // Home shows Trakt's Continue Watching. Once this pass has changed Trakt, Home reloads
+        // it, as after a direct history write. Before, it caught up only on the next launch.
+        var sentToTrakt = false
+        defer {
+            if sentToTrakt {
+                NotificationCenter.default.post(
+                    name: TraktSettingsStore.continueWatchingChangedNotification,
+                    object: nil
+                )
+                TraktSettingsStore.notifyContinueWatchingSourceInvalidated(for: .trakt, in: store)
+            }
+        }
         for write in orderedWrites {
             guard isCurrentTraktAccount(
                 store: store,
@@ -3720,7 +3731,18 @@ struct TraktHistoryService {
             ) else { return false }
             switch write {
             case .mutation(let mutation):
+                // A mark Trakt has no id for can never be sent. Waiting on it held
+                // back every write queued after it, for good, so it is dropped.
+                guard historyIDs(for: mutation.meta) != nil else {
+                    guard WatchedStore.acknowledgeProviderMutation(
+                        id: mutation.id,
+                        provider: .trakt,
+                        profileId: profileId
+                    ) else { return false }
+                    continue
+                }
                 guard await uploadManualMutation(mutation, using: service) else { return false }
+                sentToTrakt = true
                 guard isCurrentTraktAccount(
                     store: store,
                     profileId: profileId,
@@ -3733,6 +3755,16 @@ struct TraktHistoryService {
                 ) else { return false }
 
             case .completion(let completion):
+                // The same for a finished playback Trakt has no id for.
+                guard historyIDs(for: completion.meta) != nil else {
+                    guard WatchedStore.acknowledgePlaybackCompletion(
+                        completionID: completion.completionID,
+                        provider: .trakt,
+                        accountID: expectedAccountID,
+                        profileId: profileId
+                    ) else { return false }
+                    continue
+                }
                 guard await uploadPlaybackCompletion(
                     completion,
                     using: service,
@@ -3740,6 +3772,7 @@ struct TraktHistoryService {
                     profileId: profileId,
                     expectedAccountID: expectedAccountID
                 ) else { return false }
+                sentToTrakt = true
 
             case .libraryMutation(let mutation):
                 guard await uploadLibraryMutation(mutation, using: service) else {
@@ -3751,6 +3784,7 @@ struct TraktHistoryService {
                     )
                     return false
                 }
+                sentToTrakt = true
                 guard isCurrentTraktAccount(
                     store: store,
                     profileId: profileId,
@@ -3948,6 +3982,15 @@ struct TraktHistoryService {
     }
 
     private static func completionMatches(show: TraktProgressMediaDTO, expected: NuvioMeta) -> Bool {
+        // The ids a completion is sent with find it again, also for an add-on id
+        // ("cotonet:tt16418808") that as a whole matches no Trakt id. Missed, the
+        // next attempt would send the same play again.
+        if let ids = historyIDs(for: expected), let remote = show.ids {
+            if let imdb = ids.imdb, let remoteIMDb = remote.imdb,
+               imdb.caseInsensitiveCompare(remoteIMDb) == .orderedSame { return true }
+            if let tmdb = ids.tmdb, tmdb == remote.tmdb { return true }
+            if let trakt = ids.trakt, trakt == remote.trakt { return true }
+        }
         guard let contentID = historyContentID(from: show.ids) else { return false }
         let remote = historyMeta(from: show, contentID: contentID, type: expected.isSeries ? "series" : "movie")
         return WatchedStore.sameContent(remote, expected)
@@ -4240,6 +4283,20 @@ struct TraktHistoryService {
         }
     }
 
+    /// The ids Trakt can find `meta` by, or nil when it has none of them, so no
+    /// history request for it can ever work.
+    private static func historyIDs(for meta: NuvioMeta) -> TraktHistoryIDs? {
+        let ids = TraktHistoryIDs(
+            trakt: meta.id.hasPrefix("trakt:") ? Int(meta.id.dropFirst("trakt:".count)) : nil,
+            imdb: TraktMetaIDs.imdb(for: meta),
+            tmdb: meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
+                ? Int(meta.id.dropFirst("tmdb:".count))
+                : nil)
+        )
+        guard ids.trakt != nil || ids.imdb != nil || ids.tmdb != nil else { return nil }
+        return ids
+    }
+
     /// `episodes` carries every episode being marked in one season, so a whole
     /// season is one request rather than one per episode.
     private static func mutation(
@@ -4248,15 +4305,7 @@ struct TraktHistoryService {
         episodes: [Int],
         watchedAt: String?
     ) -> TraktHistoryMutation? {
-        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-        let ids = TraktHistoryIDs(
-            trakt: meta.id.hasPrefix("trakt:") ? Int(meta.id.dropFirst("trakt:".count)) : nil,
-            imdb: meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil),
-            tmdb: meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
-                ? Int(meta.id.dropFirst("tmdb:".count))
-                : nil)
-        )
-        guard ids.trakt != nil || ids.imdb != nil || ids.tmdb != nil else { return nil }
+        guard let ids = historyIDs(for: meta) else { return nil }
 
         if meta.isSeries {
             let seasons: [TraktHistorySeason]?
@@ -4554,6 +4603,25 @@ private struct TraktHistoryEpisode: Encodable {
     enum CodingKeys: String, CodingKey {
         case number
         case watchedAt = "watched_at"
+    }
+}
+
+/// The ids a Trakt request finds a title by.
+enum TraktMetaIDs {
+    /// The title's IMDb id. Some add-ons put their own prefix in front of it
+    /// ("cotonet:tt16418808") instead of starting the id with it, so a later part
+    /// of the id counts too when it is an IMDb id.
+    static func imdb(for meta: NuvioMeta) -> String? {
+        if let imdb = meta.imdbId { return imdb }
+        let parts = meta.id.split(separator: ":").map(String.init)
+        if let first = parts.first, first.hasPrefix("tt") { return first }
+        return parts.dropFirst().first(where: isIMDbID)
+    }
+
+    private static func isIMDbID(_ part: String) -> Bool {
+        part.count > 2
+            && part.hasPrefix("tt")
+            && part.dropFirst(2).allSatisfy { $0.isASCII && $0.isNumber }
     }
 }
 
@@ -4931,8 +4999,7 @@ struct TraktLibraryService {
     }
 
     private static func watchlistMutation(for meta: NuvioMeta) -> TraktWatchlistMutation? {
-        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-        let imdb = meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil)
+        let imdb = TraktMetaIDs.imdb(for: meta)
         let tmdb = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
             ? Int(meta.id.dropFirst("tmdb:".count))
             : nil)

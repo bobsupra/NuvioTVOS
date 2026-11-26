@@ -167,6 +167,33 @@ final class MdbListScrobbleTests: XCTestCase {
         }
     }
 
+    /// Some add-ons put their own prefix in front of the IMDb id ("cotonet:tt16418808").
+    /// Read only from the start of the id, it was missed, and the scrobble had no ids.
+    func testScrobbleSendsTheIMDbIDAfterAnAddonPrefix() async throws {
+        var requests: [URLRequest] = []
+        MdbListURLProtocolStub.handler = { request in
+            requests.append(request)
+            return Self.response(for: request, json: #"{"action":"pause","progress":50}"#)
+        }
+
+        let result = await MdbListProgressService.reportPlayback(
+            meta: Self.meta(id: "cotonet:tt16418808", type: "movie"),
+            position: 50,
+            duration: 100,
+            season: nil,
+            episode: nil,
+            action: .pause,
+            store: defaults,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertTrue(result)
+        let movie = try XCTUnwrap(Self.jsonBody(try XCTUnwrap(requests.first))["movie"] as? [String: Any])
+        XCTAssertEqual(movie["ids"] as? [String: Any] as? [String: String], ["imdb": "tt16418808"])
+    }
+
     func testPlaybackSnapshotMapsMovieAndEpisodeAndUsesRuntime() async throws {
         defaults.set(TraktDefaults.continueWatchingDaysCapAll, forKey: SettingsKey.traktContinueWatchingDaysCap)
         MdbListURLProtocolStub.handler = { request in
