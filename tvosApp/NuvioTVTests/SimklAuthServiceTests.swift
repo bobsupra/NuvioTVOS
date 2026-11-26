@@ -894,6 +894,39 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertEqual(seenIDs?["kitsu"] as? Int, 1376)
     }
 
+    /// Some add-ons put their own prefix in front of the IMDb id ("cotonet:tt16418808").
+    /// Read only from the start of the id, it was missed, and the scrobble was skipped.
+    func testIMDbIDAfterAnAddonPrefixIsSentToSimkl() async throws {
+        authorize()
+        defaults.set(
+            TraktWatchProgressSource.simkl.rawValue,
+            forKey: SettingsKey.traktWatchProgressSource
+        )
+        var seenIDs: [String: Any]?
+        SimklURLProtocolStub.handler = { request in
+            let json = try Self.jsonBody(request)
+            let show = try XCTUnwrap(json["show"] as? [String: Any])
+            seenIDs = show["ids"] as? [String: Any]
+            return Self.response(for: request, status: 201, json: "{}")
+        }
+
+        let result = await SimklProgressService.reportPlayback(
+            meta: NuvioMeta(id: "cotonet:tt16418808", name: "Example Show", type: "series", year: 2026),
+            position: 600,
+            duration: 1_400,
+            season: 1,
+            episode: 3,
+            action: .pause,
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertTrue(result, "diagnostic: \(SimklProgressService.scrobbleDiagnostic)")
+        XCTAssertEqual(seenIDs?["imdb"] as? String, "tt16418808")
+    }
+
     /// Simkl accepts at most two decimals on `progress`.
     func testScrobbleRoundsProgressToTwoDecimals() async throws {
         authorize()
