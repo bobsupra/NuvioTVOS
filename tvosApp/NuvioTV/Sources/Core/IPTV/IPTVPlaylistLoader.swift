@@ -35,20 +35,25 @@ struct IPTVPlaylistLoader {
         try Task.checkCancellation()
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("NuvioTV", forHTTPHeaderField: "User-Agent")
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse, let finalURL = http.url, Self.isWebURL(finalURL) else {
+        let response: IPTVBoundedDownloadResponse
+        do {
+            response = try await IPTVBoundedDataDownloader.download(
+                request,
+                in: session,
+                maximumBytes: Self.maximumBytes
+            )
+        } catch IPTVBoundedDownloadError.invalidResponse {
+            throw IPTVPlaylistLoadError.invalidResponse
+        } catch IPTVBoundedDownloadError.httpStatus(let code) {
+            throw IPTVPlaylistLoadError.httpStatus(code)
+        } catch IPTVBoundedDownloadError.tooLarge {
+            throw IPTVPlaylistLoadError.tooLarge
+        }
+        guard let finalURL = response.httpResponse.url, Self.isWebURL(finalURL) else {
             throw IPTVPlaylistLoadError.invalidResponse
         }
-        guard (200..<300).contains(http.statusCode) else { throw IPTVPlaylistLoadError.httpStatus(http.statusCode) }
-        if http.expectedContentLength > Int64(Self.maximumBytes) { throw IPTVPlaylistLoadError.tooLarge }
-        var data = Data()
-        for try await byte in bytes {
-            if data.count.isMultiple(of: 4096) { try Task.checkCancellation() }
-            guard data.count < Self.maximumBytes else { throw IPTVPlaylistLoadError.tooLarge }
-            data.append(byte)
-        }
         try Task.checkCancellation()
-        return try Self.parsePlaylist(data: data, sourceID: sourceID, baseURL: finalURL)
+        return try Self.parsePlaylist(data: response.data, sourceID: sourceID, baseURL: finalURL)
     }
 
     static func parse(data: Data, sourceID: String, baseURL: URL) throws -> [IPTVChannel] {
@@ -91,5 +96,198 @@ struct IPTVPlaylistLoader {
         guard let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
               let host = url.host, !host.isEmpty else { return false }
         return true
+    }
+}
+
+enum IPTVBoundedDownloadError: Error, Equatable {
+    case invalidResponse
+    case httpStatus(Int)
+    case tooLarge
+}
+
+struct IPTVBoundedDownloadResponse: Sendable {
+    let data: Data
+    let httpResponse: HTTPURLResponse
+}
+
+/// Downloads a bounded HTTP body chunk-by-chunk via `URLSessionDataDelegate`
+/// instead of byte-by-byte async iteration. Leaves redirect handling to the
+/// session delegate so origin guards remain active.
+final class IPTVBoundedDataDownloader: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private static let initialReserveCap = 8 * 1024 * 1024
+    private let maximumBytes: Int
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<IPTVBoundedDownloadResponse, Error>?
+    private weak var task: URLSessionDataTask?
+    private var data = Data()
+    private var httpResponse: HTTPURLResponse?
+    private var finished = false
+
+    private init(maximumBytes: Int) {
+        self.maximumBytes = maximumBytes
+    }
+
+    static func download(
+        _ request: URLRequest,
+        in session: URLSession,
+        maximumBytes: Int
+    ) async throws -> IPTVBoundedDownloadResponse {
+        let receiver = IPTVBoundedDataDownloader(maximumBytes: maximumBytes)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                receiver.start(request, in: session, continuation: continuation)
+            }
+        } onCancel: {
+            DispatchQueue.global(qos: .utility).async { receiver.cancel() }
+        }
+    }
+
+    private func start(
+        _ request: URLRequest,
+        in session: URLSession,
+        continuation: CheckedContinuation<IPTVBoundedDownloadResponse, Error>
+    ) {
+        guard !Task.isCancelled else {
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            continuation.resume(throwing: CancellationError())
+            return
+        }
+        self.continuation = continuation
+        lock.unlock()
+
+        let task = session.dataTask(with: request)
+        task.delegate = self
+
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        self.task = task
+        lock.unlock()
+        task.resume()
+    }
+
+    private func cancel() {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        let (continuation, task) = finishLocked()
+        lock.unlock()
+
+        task?.cancel()
+        continuation?.resume(throwing: CancellationError())
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse else {
+            finish(with: IPTVBoundedDownloadError.invalidResponse)
+            completionHandler(.cancel)
+            return
+        }
+        guard (200..<300).contains(http.statusCode) else {
+            finish(with: IPTVBoundedDownloadError.httpStatus(http.statusCode))
+            completionHandler(.cancel)
+            return
+        }
+        guard http.expectedContentLength <= Int64(maximumBytes) else {
+            finish(with: IPTVBoundedDownloadError.tooLarge)
+            completionHandler(.cancel)
+            return
+        }
+
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            completionHandler(.cancel)
+            return
+        }
+        httpResponse = http
+        if http.expectedContentLength > 0 {
+            let reserve = min(Int(http.expectedContentLength), min(maximumBytes, Self.initialReserveCap))
+            data.reserveCapacity(reserve)
+        }
+        lock.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive incomingData: Data) {
+        lock.lock()
+        guard !finished else {
+            let task = self.task
+            lock.unlock()
+            task?.cancel()
+            return
+        }
+        guard incomingData.count <= maximumBytes - data.count else {
+            let (continuation, task) = finishLocked()
+            lock.unlock()
+
+            task?.cancel()
+            continuation?.resume(throwing: IPTVBoundedDownloadError.tooLarge)
+            return
+        }
+        data.append(incomingData)
+        lock.unlock()
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            finish(with: error)
+            return
+        }
+
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        let result: Result<IPTVBoundedDownloadResponse, Error>
+        if let httpResponse {
+            result = .success(IPTVBoundedDownloadResponse(data: data, httpResponse: httpResponse))
+        } else {
+            result = .failure(IPTVBoundedDownloadError.invalidResponse)
+        }
+        let (continuation, _) = finishLocked()
+        lock.unlock()
+
+        continuation?.resume(with: result)
+    }
+
+    private func finish(with error: Error) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        let (continuation, task) = finishLocked()
+        lock.unlock()
+
+        task?.cancel()
+        continuation?.resume(throwing: error)
+    }
+
+    private func finishLocked() -> (CheckedContinuation<IPTVBoundedDownloadResponse, Error>?, URLSessionDataTask?) {
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        let task = self.task
+        self.task = nil
+        httpResponse = nil
+        data.removeAll(keepingCapacity: false)
+        return (continuation, task)
     }
 }

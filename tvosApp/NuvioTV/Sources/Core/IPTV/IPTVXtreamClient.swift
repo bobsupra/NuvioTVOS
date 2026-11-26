@@ -72,18 +72,19 @@ struct IPTVXtreamClient {
         guard let url = Self.apiURL(credentials: credentials, action: action) else { throw IPTVXtreamError.invalidConfiguration }
         var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         request.setValue("NuvioTV", forHTTPHeaderField: "User-Agent")
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse else { throw IPTVXtreamError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else { throw IPTVXtreamError.httpStatus(http.statusCode) }
-        guard http.expectedContentLength <= Int64(Self.maxBytes) else { throw IPTVXtreamError.tooLarge }
-        var data = Data()
-        for try await byte in bytes {
-            if data.count.isMultiple(of: 4096) { try Task.checkCancellation() }
-            guard data.count < Self.maxBytes else { throw IPTVXtreamError.tooLarge }
-            data.append(byte)
+        do {
+            return try await IPTVBoundedDataDownloader.download(
+                request,
+                in: session,
+                maximumBytes: Self.maxBytes
+            ).data
+        } catch IPTVBoundedDownloadError.invalidResponse {
+            throw IPTVXtreamError.invalidResponse
+        } catch IPTVBoundedDownloadError.httpStatus(let status) {
+            throw IPTVXtreamError.httpStatus(status)
+        } catch IPTVBoundedDownloadError.tooLarge {
+            throw IPTVXtreamError.tooLarge
         }
-        try Task.checkCancellation()
-        return data
     }
 
     static func apiURL(credentials: IPTVXtreamCredentials, action: String?) -> URL? {

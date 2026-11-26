@@ -19,6 +19,7 @@ import AetherEngine
 @main
 struct NuvioTVApp: App {
     init() {
+        TVHomeDebugTrace.enabled = ProcessInfo.processInfo.arguments.contains("-TVHomeDebugTrace")
         let totalRam = ProcessInfo.processInfo.physicalMemory
         let isLegacyDevice = totalRam <= 2_500_000_000 // <= 2.5 GB (Apple TV HD)
         let memCapacity = isLegacyDevice ? (12 * 1024 * 1024) : (32 * 1024 * 1024)
@@ -687,6 +688,7 @@ struct ContentView: View {
     @State private var playbackCurrentEpisode: NuvioVideo?
     @State private var playbackIsActionPlaybackSession = false
     @State private var playbackOrigin: PlaybackOrigin = .main
+    @State private var playbackLiveProgrammes: [IPTVProgramme] = []
     @State private var playerDismissalHandoffGeneration: UInt = 0
     @State private var playerDismissalHandoffTarget: TVScreen?
     @State private var playbackLibraryWatchedContext: LibraryWatchedContext?
@@ -1846,9 +1848,48 @@ struct ContentView: View {
                 TVHomeDebugTrace.log("profileGate.liftTask aborted: readiness still waiting gen=\(generation)")
                 return
             }
+            await waitForSidebarCollapseIfNeeded()
+            guard !Task.isCancelled,
+                  isPreparingProfile,
+                  generation == profileGateGeneration,
+                  identity == currentHomeContentIdentity,
+                  profileGateReadinessIdentity == identity else {
+                return
+            }
             TVHomeDebugTrace.log("profileGate.liftTask executing normal lift for gen=\(generation)")
             liftProfileGate(generation: generation)
         }
+    }
+
+    /// Waits briefly (up to 0.45s) for tvOS 27's `TabView(.sidebarAdaptable)`
+    /// sidebar collapse animation to finish so the profile curtain never lifts
+    /// while the sidebar is still mid-collapse.
+    private func waitForSidebarCollapseIfNeeded() async {
+        let deadline = Date().addingTimeInterval(0.45)
+        while Date() < deadline {
+            guard !Task.isCancelled else { return }
+            let isExpanded = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap(\.windows)
+                .first(where: \.isKeyWindow)
+                .map { Self.hasExpandedAdaptiveSidebar(in: $0) } ?? false
+            if !isExpanded { return }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+    }
+
+    private static func hasExpandedAdaptiveSidebar(in root: UIView) -> Bool {
+        var stack: [UIView] = [root]
+        while let view = stack.popLast() {
+            let name = String(describing: type(of: view))
+            if name.contains("ListRepresentable") {
+                if !view.isHidden && view.alpha > 0.01 && view.bounds.width > 1 {
+                    return true
+                }
+            }
+            stack.append(contentsOf: view.subviews)
+        }
+        return false
     }
 
     /// Used when the user backs out or the scoped deadline reaches an empty load.
@@ -2221,7 +2262,8 @@ struct ContentView: View {
         startupBenchmarkToken: UUID? = nil,
         sourceID: String? = nil,
         collectionContext: CollectionPlaybackContext? = nil,
-        isActionPlaybackSession: Bool = false
+        isActionPlaybackSession: Bool = false,
+        liveProgrammes: [IPTVProgramme] = []
     ) {
         // Usenet streams arrive as nuvio-usenet:// URLs: start the local
         // engine first, then play its 127.0.0.1 URL like any other stream.
@@ -2234,7 +2276,8 @@ struct ContentView: View {
                         resumeFrom: resumeFrom, httpHeaders: httpHeaders, origin: origin, customPlayer: customPlayer,
                         cacheFileIdentity: cacheFileIdentity, filename: filename, videoSize: videoSize,
                         videoHash: videoHash, startupBenchmarkToken: startupBenchmarkToken, sourceID: sourceID,
-                        collectionContext: collectionContext, isActionPlaybackSession: isActionPlaybackSession
+                        collectionContext: collectionContext, isActionPlaybackSession: isActionPlaybackSession,
+                        liveProgrammes: liveProgrammes
                     )
                 } catch {
                     PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
@@ -2357,7 +2400,8 @@ struct ContentView: View {
             videoHash: videoHash,
             startupBenchmarkToken: startupBenchmarkToken,
             sourceID: sourceID,
-            collectionContext: provenance
+            collectionContext: provenance,
+            liveProgrammes: liveProgrammes
         )
     }
 
@@ -2863,7 +2907,8 @@ struct ContentView: View {
         startupBenchmarkToken: UUID? = nil,
         sourceID: String? = nil,
         collectionContext: CollectionPlaybackContext? = nil,
-        party: WatchPartyAppOwner.Presentation? = nil
+        party: WatchPartyAppOwner.Presentation? = nil,
+        liveProgrammes: [IPTVProgramme] = []
     ) {
         if party == nil {
             partyLaunchID = UUID()
@@ -2879,6 +2924,7 @@ struct ContentView: View {
             PictureInPictureManager.shared.invalidateSession()
         }
         playbackOrigin = origin
+        playbackLiveProgrammes = liveProgrammes
         playbackCollectionContext = collectionContext
         playbackLibraryWatchedContext = DetailsNavigationContextTransition.playbackContext(
             origin: origin,
@@ -2934,6 +2980,9 @@ struct ContentView: View {
                 self.playbackIsActionPlaybackSession = false
                 self.playerSurfaceID = UUID()
                 self.playbackOrigin = context.playbackOrigin
+                if context.playbackOrigin != .liveTV {
+                    self.playbackLiveProgrammes = []
+                }
                 self.playbackCollectionContext = self.collectionContext(
                     id: context.meta.id, type: context.meta.type, resuming: true
                 )
@@ -3430,11 +3479,20 @@ struct ContentView: View {
                     filename: meta.name
                 )
             },
-            onPlayLiveChannel: { url, meta, headers in
+            onPlayLiveChannel: { url, meta, headers, liveProgrammes in
                 playbackEpisodes = []
                 playbackCurrentEpisode = nil
-                presentPlayback(url: url, meta: meta, subtitle: "", externalSubtitles: [],
-                                resumeFrom: nil, httpHeaders: headers, origin: .liveTV, filename: meta.name)
+                presentPlayback(
+                    url: url,
+                    meta: meta,
+                    subtitle: "",
+                    externalSubtitles: [],
+                    resumeFrom: nil,
+                    httpHeaders: headers,
+                    origin: .liveTV,
+                    filename: meta.name,
+                    liveProgrammes: liveProgrammes
+                )
             },
             onOpenCalendarEntry: { entry in
                 openCalendarEntry(entry)
@@ -4161,6 +4219,7 @@ struct ContentView: View {
             sourceID: isStandalonePlaybackSession ? nil : playbackSourceID,
             episodes: isStandalonePlaybackSession ? [] : playbackEpisodes,
             currentEpisode: isStandalonePlaybackSession ? nil : playbackCurrentEpisode,
+            liveProgrammes: isStandalonePlaybackSession ? [] : playbackLiveProgrammes,
             initialStartupBenchmarkToken: startupBenchmarkToken,
             autoPlayNextEnabled: party == nil && autoPlayNext,
             autoPlayNextCountdownSeconds: autoPlayNextCountdown,
@@ -5316,7 +5375,7 @@ private struct TVMainTabView: View {
     let onLongPressContinueWatching: (ContinueWatchingItem) -> Void
     let onOpenCloudLibrary: () -> Void
     let onPlayCloudFile: (URL, NuvioMeta) -> Void
-    let onPlayLiveChannel: (URL, NuvioMeta, [String: String]) -> Void
+    let onPlayLiveChannel: (URL, NuvioMeta, [String: String], [IPTVProgramme]) -> Void
     var onOpenCalendarEntry: ((CalendarEntry) -> Void)? = nil
     @State private var observedTabSettings: TVMainTabSettings?
     @State private var tabSettingsReadThrough = TVMainTabSettingsReadThrough()
@@ -5334,6 +5393,7 @@ private struct TVMainTabView: View {
     @State private var showingReauthSheet = false
     @State private var liveTVLoadedCache = IPTVLiveView.LoadedCache()
     @State private var lastNonHomeTab: TVTab?
+    @Environment(\.isEnabled) private var tabViewIsEnabled
 
     private var displayedProfile: Profile? {
         activeProfile
@@ -5536,6 +5596,14 @@ private struct TVMainTabView: View {
             .id(activeProfile?.id ?? "none")
         )
         .equatable()
+        // tvOS 27.2+ TabView(.sidebarAdaptable) injects isEnabled=false into tab
+        // content while the sidebar starts open, preventing @FocusState from
+        // moving focus to Home. Forward tabViewIsEnabled instead so ContentView's
+        // modal/notice/rail disable locks still apply without stalling startup focus.
+        .environment(
+            \.isEnabled,
+            tabViewIsEnabled && (!useNuvioRail || selectedTab == .home || selectedTab == .profile)
+        )
     }
 
     private var libraryTabContent: some View {
@@ -5867,6 +5935,7 @@ private struct TVMainTabView: View {
                 selection: selectedTab,
                 focus: $railFocus,
                 profileFocus: $railProfileFocus,
+                isDisabled: isProfileFocusPending,
                 avatarId: displayedProfile?.avatarId ?? ProfileAvatarCatalog.defaultId,
                 profileName: profileTabTitle,
                 profiles: profiles,
@@ -5884,6 +5953,18 @@ private struct TVMainTabView: View {
                     onPickProfile(profile)
                 }
             )
+            .onAppear {
+                if isProfileFocusPending {
+                    railFocus = nil
+                    railProfileFocus = nil
+                }
+            }
+            .onChange(of: isProfileFocusPending) { _, pending in
+                if pending {
+                    railFocus = nil
+                    railProfileFocus = nil
+                }
+            }
         }
     }
 
@@ -6029,6 +6110,7 @@ private struct TVNuvioRail: View {
     let selection: TVTab
     var focus: FocusState<TVTab?>.Binding
     var profileFocus: FocusState<String?>.Binding
+    var isDisabled: Bool = false
     let avatarId: String
     let profileName: String
     let profiles: [Profile]
@@ -6151,18 +6233,19 @@ private struct TVNuvioRail: View {
         // item, so from the top of a page it would not reach the sidebar. This
         // full-height strip is level with everything. It takes the focus and
         // passes it to the current section.
+        .disabled(isDisabled)
         .background(alignment: .leading) {
             Color.clear
                 .frame(width: 80)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
-                .focusable(!hasFocus)
+                .focusable(!hasFocus && !isDisabled)
                 .focused($entryStripFocused)
                 .focusEffectDisabledIfAvailable()
                 .accessibilityHidden(true)
         }
         .onChange(of: entryStripFocused) { _, focused in
-            guard focused, let landingTab else { return }
+            guard focused, !isDisabled, let landingTab else { return }
             cameFromContent = false
             DispatchQueue.main.async { focus.wrappedValue = landingTab }
         }
@@ -6175,9 +6258,10 @@ private struct TVNuvioRail: View {
         .animation(Self.motion, value: isExpanded)
         .animation(Self.motion, value: showsProfiles)
         .focusSection()
-        .defaultFocus(focus, landingTab, priority: .userInitiated)
         // tvOS moves focus to the row nearest the one it came from. Arriving
         // from the content, it goes to the current section instead.
+        // Do NOT attach `.defaultFocus(..., priority: .userInitiated)` here: on a
+        // fresh launch that steals initial focus from Home and pops the sidebar open.
         .onChange(of: hasFocus) { _, isInside in
             guard !isInside else { return }
             // Focus is briefly nowhere while it moves between rows, so only a
@@ -7535,6 +7619,10 @@ struct TVHomeView: View {
     @State private var isGridHeroFocused = false
     @State private var nativeProfileFocusedCardKey: String?
     @State private var didNativeFocusGridHero = false
+    /// Becomes true once any Home card or hero receives native focus (or Home
+    /// yields to another tab/overlay), preventing startup sidebar handoff from
+    /// ever fighting manual sidebar access later.
+    @State private var hasReceivedNativeHomeFocusSinceLaunch = false
     @State private var gridHeroFocusRequestGeneration = 0
     /// Suppress the one focus/layout animation caused by returning to Home from
     /// another tab. Normal left/right focus animations remain enabled.
@@ -7618,15 +7706,38 @@ struct TVHomeView: View {
         rowFocusRequest = TVHomeRowFocusRequest(cardKey: key, generation: rowFocusRequest.generation &+ 1)
     }
 
+    /// Forces a fresh native focus request for `key` even when SwiftUI's focus
+    /// state already holds `key` (for example, while the tvOS sidebar still
+    /// owns UIKit focus on initial launch).
+    private func forceSetFocusedCardID(_ key: String) {
+        if usesRowFocus {
+            rowFocusRequest = TVHomeRowFocusRequest(
+                cardKey: key,
+                generation: rowFocusRequest.generation &+ 1
+            )
+        } else if focusedCardID == key {
+            focusedCardID = nil
+            DispatchQueue.main.async {
+                if focusedCardID == nil {
+                    focusedCardID = key
+                }
+            }
+        } else {
+            focusedCardID = key
+        }
+    }
+
     /// A card's focus callback, where Home's focus state already says so (with the rows' focus,
     /// nothing to do: `noteRowCardFocus` has it).
     private func noteCardFocusEcho(_ key: String) {
+        hasReceivedNativeHomeFocusSinceLaunch = true
         guard !usesRowFocus else { return }
         focusedCardID = key
     }
 
     /// A row's card took focus. Does what a change of Home's focus state did.
     private func noteRowCardFocus(_ key: String) {
+        hasReceivedNativeHomeFocusSinceLaunch = true
         guard usesRowFocus else { return }
         focusWork.rowFocusBlurGeneration &+= 1
         let old = focusWork.rowFocusedCardID
@@ -7770,7 +7881,7 @@ struct TVHomeView: View {
                         // an explicit default target during the initial focus
                         // pass. The async write below remains a fallback.
                         .focusSection()
-                        .defaultFocusIfAvailable($isLoadingFocusActive, enabled: !useTopNavigation)
+                        .defaultFocusIfAvailable($isLoadingFocusActive, enabled: !useTopNavigation, priority: .userInitiated)
                         .onAppear {
                             if !useTopNavigation {
                                 requestLoadingFocus()
@@ -8503,15 +8614,22 @@ struct TVHomeView: View {
         .onChange(of: profileGateGeneration) { _, _ in
             nativeProfileFocusedCardKey = nil
             didNativeFocusGridHero = false
+            hasReceivedNativeHomeFocusSinceLaunch = false
             reportProfileGateReadiness()
         }
-        .onChange(of: contentIdentity) { _, _ in
+        .onChange(of: contentIdentity) { oldIdentity, newIdentity in
             if observedHomeSettings?.profileID != settingsProfileID { observedHomeSettings = nil }
             nativeProfileFocusedCardKey = nil
             didNativeFocusGridHero = false
+            if oldIdentity.profileId != newIdentity.profileId {
+                hasReceivedNativeHomeFocusSinceLaunch = false
+            }
             reportProfileGateReadiness()
         }
         .onChange(of: isFullScreenOverlayPresented) { oldVal, isPresented in
+            if isPresented {
+                hasReceivedNativeHomeFocusSinceLaunch = true
+            }
             if oldVal && !isPresented && isActive {
                 handleMainHomePublication()
                 if !schedulePendingManualCatalogRefresh() { checkAndTriggerAutoRefresh() }
@@ -8529,6 +8647,9 @@ struct TVHomeView: View {
             }
         }
         .onChange(of: isActive) { oldVal, active in
+            if !active {
+                hasReceivedNativeHomeFocusSinceLaunch = true
+            }
             if !oldVal && active && !isFullScreenOverlayPresented {
                 handleMainHomePublication()
                 if !schedulePendingManualCatalogRefresh() {
@@ -8850,6 +8971,7 @@ struct TVHomeView: View {
                             onFocusChange: { isFocused in
                                 isGridHeroFocused = isFocused
                                 if isFocused {
+                                    hasReceivedNativeHomeFocusSinceLaunch = true
                                     focusedCardID = nil
                                     focusedSectionId = nil
                                     let animation = (isFastScrolling || fastNavigation)
@@ -9770,6 +9892,13 @@ struct TVHomeView: View {
         return nil
     }
 
+    private var isStartupSidebarFocusHandoffPending: Bool {
+        !useTopNavigation
+            && isActive
+            && !isFullScreenOverlayPresented
+            && (isProfileFocusPending || !hasReceivedNativeHomeFocusSinceLaunch)
+    }
+
     private var profileGateReadiness: TVProfileGateReadiness {
         guard isProfileFocusPending else {
             return .waiting(hasFocusableContent: false, targetSignature: nil)
@@ -9777,6 +9906,12 @@ struct TVHomeView: View {
         if isFullScreenOverlayPresented { return .overlay }
         let target = profileGateStartupFocusTarget
         if let target {
+            if !useTopNavigation && !hasNativeProfileFocus(for: target) {
+                return .waiting(
+                    hasFocusableContent: true,
+                    targetSignature: target.signature
+                )
+            }
             return .ready(
                 targetSignature: target.signature,
                 storeLoaded: store.isLoaded(for: contentIdentity)
@@ -9794,7 +9929,7 @@ struct TVHomeView: View {
     }
 
     private var profileGateFocusRequestSignature: String {
-        "\(isProfileFocusPending)|\(isActive)|\(profileGateGeneration)|\(contentIdentity.profileId)|"
+        "\(isStartupSidebarFocusHandoffPending)|\(isProfileFocusPending)|\(isActive)|\(profileGateGeneration)|\(contentIdentity.profileId)|"
             + "\(contentIdentity.catalogRevision)|\(store.isLoaded(for: contentIdentity))|"
             + "\(profileGateFailedLoadIdentity == contentIdentity)|\(isLoading)|"
             + "\(profileGateStartupFocusTarget?.signature ?? "none")|\(isFullScreenOverlayPresented)"
@@ -9807,6 +9942,7 @@ struct TVHomeView: View {
     }
 
     private func acknowledgeNativeProfileCardFocus(_ cardKey: String) {
+        hasReceivedNativeHomeFocusSinceLaunch = true
         guard isProfileFocusPending else { return }
         didNativeFocusGridHero = false
         nativeProfileFocusedCardKey = cardKey
@@ -9832,7 +9968,7 @@ struct TVHomeView: View {
         case .card(let key, _, _):
             return nativeProfileFocusedCardKey == key
         case .gridHero:
-            return didNativeFocusGridHero
+            return didNativeFocusGridHero || isGridHeroFocused
         }
     }
 
@@ -9840,12 +9976,11 @@ struct TVHomeView: View {
         for sections: [TVHomeSection],
         using proxy: ScrollViewProxy
     ) async {
-        guard isProfileFocusPending,
-              isActive,
-              !isFullScreenOverlayPresented,
+        guard isStartupSidebarFocusHandoffPending,
               let target = profileGateStartupFocusTarget else {
             TVHomeDebugTrace.log(
-                "home.maintainProfileGateFocus skip isProfileFocusPending=\(isProfileFocusPending) "
+                "home.maintainProfileGateFocus skip handoffPending=\(isStartupSidebarFocusHandoffPending) "
+                    + "isProfileFocusPending=\(isProfileFocusPending) "
                     + "isActive=\(isActive) overlayPresented=\(isFullScreenOverlayPresented) "
                     + "target=\(profileGateStartupFocusTarget?.signature ?? "nil")"
             )
@@ -9856,21 +9991,25 @@ struct TVHomeView: View {
         TVHomeDebugTrace.log("home.maintainProfileGateFocus start identity=\(identity.profileId):\(identity.catalogRevision) gen=\(gateGeneration) target=\(target.signature)")
         await Task.yield()
         var attempt = 0
+        var postGateAttempts = 0
         while !Task.isCancelled {
             guard !Task.isCancelled,
-                  isProfileFocusPending,
-                  isActive,
+                  isStartupSidebarFocusHandoffPending,
                   contentIdentity == identity,
                   profileGateGeneration == gateGeneration,
-                  !isFullScreenOverlayPresented,
                   profileGateStartupFocusTarget == target else {
-                TVHomeDebugTrace.log("home.maintainProfileGateFocus loop end attempt=\(attempt) pending=\(isProfileFocusPending) active=\(isActive) targetMatch=\(profileGateStartupFocusTarget == target)")
+                TVHomeDebugTrace.log("home.maintainProfileGateFocus loop end attempt=\(attempt) handoff=\(isStartupSidebarFocusHandoffPending) active=\(isActive) targetMatch=\(profileGateStartupFocusTarget == target)")
                 return
             }
-            if hasNativeProfileFocus(for: target) {
+            if hasNativeProfileFocus(for: target) || (!isProfileFocusPending && hasReceivedNativeHomeFocusSinceLaunch) {
                 TVHomeDebugTrace.log("home.maintainProfileGateFocus target acknowledged attempt=\(attempt) target=\(target.signature)")
+                if !isProfileFocusPending { return }
                 try? await Task.sleep(nanoseconds: 600_000_000)
                 continue
+            }
+            if !isProfileFocusPending {
+                guard postGateAttempts < 12 else { return }
+                postGateAttempts += 1
             }
 
             switch target {
@@ -9894,13 +10033,11 @@ struct TVHomeView: View {
                 focusedRowIndex = sectionIndex
                 focusedSectionId = sectionID
                 rowScrollStore.setIndex(0, for: sectionID)
-                if currentFocusedCardID != key {
-                    var transaction = Transaction()
-                    transaction.animation = nil
-                    withTransaction(transaction) {
-                        proxy.scrollTo(sectionID, anchor: .top)
-                        setFocusedCardID(key)
-                    }
+                var transaction = Transaction()
+                transaction.animation = nil
+                withTransaction(transaction) {
+                    proxy.scrollTo(sectionID, anchor: .top)
+                    forceSetFocusedCardID(key)
                 }
             }
 
