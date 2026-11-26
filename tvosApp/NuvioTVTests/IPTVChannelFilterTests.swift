@@ -184,4 +184,86 @@ final class IPTVChannelFilterTests: XCTestCase {
             .liveEdge(elapsedSeconds: 125, bufferedAheadSeconds: 8)
         )
     }
+
+    @MainActor
+    func testSceneViewModelExcludesInSightTabWhenDisabledForLivePlayback() {
+        final class DummyFrameProvider: SceneFrameProviding {
+            var isSupported: Bool { false }
+            var capabilityMessage: String? { nil }
+            func captureCurrentFrame(maxWidth: Int, context: SceneContext) async -> SceneFrame? { nil }
+        }
+
+        let coordinator = SceneCoordinator(frameProvider: DummyFrameProvider())
+        let viewModel = SceneViewModel(coordinator: coordinator)
+        viewModel.setMetadata(
+            title: "BBC One",
+            year: nil,
+            overview: nil,
+            runtime: nil,
+            nextEpisode: nil,
+            playbackInfo: ScenePlaybackInfo(engine: "AVPlayer"),
+            hasChapters: false,
+            hasAutoSync: false,
+            includeSceneTab: false
+        )
+        viewModel.open()
+
+        XCTAssertEqual(viewModel.availableTabs, [.info])
+        XCTAssertEqual(viewModel.selectedTab, .info)
+        XCTAssertFalse(coordinator.isPanelOpen)
+    }
+
+    func testInlinePreviewPolicySelectsAetherForStalkerAndMPEGTSAndAVPlayerForHLS() {
+        let hlsURL = URL(string: "https://example.com/live/stream.m3u8")!
+        let tsURL = URL(string: "http://example.com/live/user/pass/1234.ts")!
+        let extensionlessURL = URL(string: "http://portal.example.com:8080/play/live.php?stream=42&play_token=abc")!
+
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: hlsURL, sourceKind: .m3u, xtreamOutput: nil),
+            .avPlayer
+        )
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: hlsURL, sourceKind: .stalker, xtreamOutput: nil),
+            .avPlayer
+        )
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: hlsURL, sourceKind: .xtream, xtreamOutput: .hls),
+            .avPlayer
+        )
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: tsURL, sourceKind: .m3u, xtreamOutput: nil),
+            .aether
+        )
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: extensionlessURL, sourceKind: .xtream, xtreamOutput: .mpegTS),
+            .aether
+        )
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: extensionlessURL, sourceKind: .stalker, xtreamOutput: nil),
+            .aether
+        )
+        XCTAssertEqual(
+            IPTVInlinePreviewPolicy.backend(for: extensionlessURL, sourceKind: .m3u, xtreamOutput: nil),
+            .avPlayer
+        )
+    }
+
+    func testSelectedSourceStoreRoundTripsAndClears() {
+        let suite = "IPTVSelectedSourceStoreTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        XCTAssertNil(IPTVSelectedSourceStore.load(defaults: defaults))
+
+        let first = UUID()
+        IPTVSelectedSourceStore.save(first, defaults: defaults)
+        XCTAssertEqual(IPTVSelectedSourceStore.load(defaults: defaults), first)
+
+        let second = UUID()
+        IPTVSelectedSourceStore.save(second, defaults: defaults)
+        XCTAssertEqual(IPTVSelectedSourceStore.load(defaults: defaults), second)
+
+        IPTVSelectedSourceStore.save(nil, defaults: defaults)
+        XCTAssertNil(IPTVSelectedSourceStore.load(defaults: defaults))
+    }
 }

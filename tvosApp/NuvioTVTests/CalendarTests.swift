@@ -244,7 +244,7 @@ final class CalendarBuilderTests: XCTestCase {
 
     func testEpisodeEntriesStayInsideThePeriod() {
         let item = CalendarItem(id: "tt1", kind: .series, name: "Library Name")
-        let details = CalendarTmdb.TvDetails(id: 7, name: "TMDB Name", posterPath: "/p.jpg")
+        let details = CalendarTmdb.TvDetails(id: 7, name: "TMDB Name", posterPath: "/p.jpg", backdropPath: "/bg.jpg")
         let episodes = [
             ep(2, 1, "2026-08-31"),
             ep(2, 2, "2026-09-01"),
@@ -258,6 +258,7 @@ final class CalendarBuilderTests: XCTestCase {
         XCTAssertEqual(entries.map(\.episodeNumber), [2, 3])
         XCTAssertEqual(entries.first?.title, "Library Name")
         XCTAssertEqual(entries.first?.posterURL?.absoluteString, "https://image.tmdb.org/t/p/w342/p.jpg")
+        XCTAssertEqual(entries.first?.backdropURL?.absoluteString, "https://image.tmdb.org/t/p/w1280/bg.jpg")
     }
 
     func testReleaseKinds() {
@@ -291,11 +292,11 @@ final class CalendarBuilderTests: XCTestCase {
             [.digital]
         )
 
-        let bare = CalendarTmdb.MovieDetails(id: 9, title: "Film", releaseDate: "2026-11-01")
-        XCTAssertEqual(
-            CalendarBuilder.movieEntries(item: item, details: bare, region: "CZ", first: periodFirst, last: periodLast).map(\.date.iso),
-            ["2026-11-01"]
-        )
+        let bare = CalendarTmdb.MovieDetails(id: 9, title: "Film", backdropPath: "/movie-bg.jpg", releaseDate: "2026-11-01")
+        let bareEntries = CalendarBuilder.movieEntries(item: item, details: bare, region: "CZ", first: periodFirst, last: periodLast)
+        XCTAssertEqual(bareEntries.map(\.date.iso), ["2026-11-01"])
+        XCTAssertEqual(bareEntries.first?.stillURL?.absoluteString, "https://image.tmdb.org/t/p/w500/movie-bg.jpg")
+        XCTAssertEqual(bareEntries.first?.backdropURL?.absoluteString, "https://image.tmdb.org/t/p/w1280/movie-bg.jpg")
     }
 
     func testGroupingSortsDaysAndTitles() {
@@ -310,11 +311,12 @@ final class CalendarBuilderTests: XCTestCase {
 
     func testDecodesTmdbPayloads() throws {
         let tv = #"""
-        {"id":1396,"name":"Show","poster_path":"/x.jpg","status":"Returning Series",
+        {"id":1396,"name":"Show","poster_path":"/x.jpg","backdrop_path":"/tv-bg.jpg","status":"Returning Series",
          "next_episode_to_air":{"air_date":"2026-10-25","episode_number":5,"season_number":2,"still_path":null,"episode_type":"standard","id":1},
          "last_episode_to_air":null,"seasons":[{"air_date":"2026-09-01","episode_count":10,"season_number":2,"id":5}],"extra":true}
         """#
         let details = try JSONDecoder().decode(CalendarTmdb.TvDetails.self, from: Data(tv.utf8))
+        XCTAssertEqual(details.backdropPath, "/tv-bg.jpg")
         XCTAssertEqual(details.nextEpisodeToAir?.episodeNumber, 5)
         XCTAssertNil(details.lastEpisodeToAir)
 

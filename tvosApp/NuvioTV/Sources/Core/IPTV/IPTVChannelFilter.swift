@@ -228,3 +228,51 @@ enum IPTVChannelGuideLookup {
         return low
     }
 }
+
+enum IPTVInlinePreviewBackend: Equatable {
+    case avPlayer
+    case aether
+}
+
+enum IPTVInlinePreviewPolicy {
+    /// Picks the initial inline preview backend for a resolved HTTP/HTTPS live stream.
+    /// Native HLS stays on `AVPlayer` so fullscreen handoff remains instantaneous; raw MPEG-TS
+    /// and non-HLS Stalker/Xtream streams route straight to `AetherEngine` so we don't fail on
+    /// tvOS AVPlayer or burn single-use portal play tokens.
+    static func backend(
+        for url: URL,
+        sourceKind: IPTVSource.Kind?,
+        xtreamOutput: IPTVXtreamOutput?
+    ) -> IPTVInlinePreviewBackend {
+        if PlaybackBackendPolicy.isHLS(url.absoluteString) {
+            return .avPlayer
+        }
+        if url.pathExtension.lowercased() == "ts" {
+            return .aether
+        }
+        if sourceKind == .xtream && xtreamOutput == .mpegTS {
+            return .aether
+        }
+        if sourceKind == .stalker {
+            return .aether
+        }
+        return .avPlayer
+    }
+}
+
+enum IPTVSelectedSourceStore {
+    private static let key = "iptv_selected_source_id"
+
+    static func load(defaults: UserDefaults) -> UUID? {
+        guard let raw = defaults.string(forKey: key) else { return nil }
+        return UUID(uuidString: raw)
+    }
+
+    static func save(_ sourceID: UUID?, defaults: UserDefaults) {
+        if let sourceID {
+            defaults.set(sourceID.uuidString, forKey: key)
+        } else {
+            defaults.removeObject(forKey: key)
+        }
+    }
+}

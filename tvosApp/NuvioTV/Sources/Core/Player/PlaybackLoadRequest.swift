@@ -31,6 +31,7 @@ struct PlaybackLoadRequest: Equatable {
     var preferredAudioLanguages: [String]
     var preferredSubtitleLanguages: [String]
     var preferExternalSubtitles: Bool = false
+    var preferredSubtitleFormat: SubtitleFormatPreference = .auto
     /// Settings → Frame Rate Matching / Match Content. `false` when Off.
     var matchContentEnabled: Bool
     var cacheProfile: PlaybackCacheProfile
@@ -77,6 +78,7 @@ struct PlaybackLoadRequest: Equatable {
         preferredAudioLanguages: [String] = [],
         preferredSubtitleLanguages: [String] = [],
         preferExternalSubtitles: Bool = false,
+        preferredSubtitleFormat: SubtitleFormatPreference = .auto,
         matchContentEnabled: Bool = true,
         cacheProfile: PlaybackCacheProfile = .auto,
         assMode: PlaybackASSMode = .off,
@@ -109,6 +111,7 @@ struct PlaybackLoadRequest: Equatable {
         self.preferredAudioLanguages = preferredAudioLanguages
         self.preferredSubtitleLanguages = preferredSubtitleLanguages
         self.preferExternalSubtitles = preferExternalSubtitles
+        self.preferredSubtitleFormat = preferredSubtitleFormat
         self.matchContentEnabled = matchContentEnabled
         self.cacheProfile = cacheProfile
         self.assMode = assMode

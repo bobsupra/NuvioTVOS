@@ -301,6 +301,42 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         ), "A stopped coordinator load cannot receive grace")
     }
 
+    @MainActor
+    func testLoopbackStreamSourceURLReceivesStartupWatchdogGraceOnlyWhenOwnedBySession() {
+        let coordinator = PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        defer { coordinator.stopAll() }
+
+        let localStreamURL = URL(string: "http://127.0.0.1:8888/stream/session-1")!
+        let unrelatedLoopbackURL = URL(string: "http://127.0.0.1:8888/stream/other-session")!
+        let witness = coordinator.mpvController.loadfileOpenWitness
+
+        // Unowned loopback URL keeps the no-grace policy.
+        coordinator.load(PlaybackLoadRequest(videoURL: unrelatedLoopbackURL))
+        witness.reset()
+        witness.arm(entryID: 50)
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: coordinator.loadGeneration,
+            graceAlreadyGranted: false
+        ), "Unrelated 127.0.0.1 URLs without local stream ownership must not receive startup grace")
+
+        // Owned local torrent/Usenet loopback URL gets startup grace like remote HTTP.
+        coordinator.torrentStreamSourceURL = localStreamURL
+        coordinator.load(PlaybackLoadRequest(videoURL: localStreamURL))
+        witness.reset()
+        witness.arm(entryID: 51)
+        XCTAssertTrue(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: coordinator.loadGeneration,
+            graceAlreadyGranted: false
+        ), "Owned local torrent/Usenet loopback stream must receive startup watchdog grace")
+        XCTAssertFalse(coordinator.shouldGrantStartupWatchdogGrace(
+            generation: coordinator.loadGeneration,
+            graceAlreadyGranted: true
+        ), "One load can receive only one coordinator grace window")
+    }
+
     func testDebridAndTorrentAcceptISOExtensions() {
         XCTAssertTrue(DebridVideo.isPlayable("Movie.1080p.BluRay.iso"))
         XCTAssertTrue(DebridVideo.isPlayable("Disc.IMG"))
@@ -3023,6 +3059,288 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             XCTAssertFalse(PlayerViewModel.isForcedSubtitleLabel(label), label)
         }
         XCTAssertFalse(PlayerViewModel.isForcedSubtitleLabel(nil))
+    }
+
+    @MainActor
+    func testPreferredSubtitleFormatPicksSRTAheadOfPGSAndRespectsLanguageAndForcedPolicies() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedAudioLanguage = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        let savedPreferExternal = ProfileSettings.current.object(forKey: SettingsKey.preferExternalSubtitles)
+        let savedFormat = ProfileSettings.current.string(forKey: SettingsKey.preferredSubtitleFormat)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedAudioLanguage {
+                ProfileSettings.current.set(savedAudioLanguage, forKey: SettingsKey.audioLanguage)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.audioLanguage)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+            if let savedPreferExternal {
+                ProfileSettings.current.set(savedPreferExternal, forKey: SettingsKey.preferExternalSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.preferExternalSubtitles)
+            }
+            if let savedFormat {
+                ProfileSettings.current.set(savedFormat, forKey: SettingsKey.preferredSubtitleFormat)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.preferredSubtitleFormat)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("Japanese", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(false, forKey: SettingsKey.forcedSubtitles)
+        ProfileSettings.current.set(false, forKey: SettingsKey.preferExternalSubtitles)
+        ProfileSettings.current.set(SubtitleFormatPreference.srt.rawValue, forKey: SettingsKey.preferredSubtitleFormat)
+
+        let pgsTrack = SubtitleTrack(id: "2", name: "English", language: "eng", isSelected: false, codec: "hdmv_pgs_subtitle")
+        let srtTrack = SubtitleTrack(id: "3", name: "English", language: "eng", isSelected: false, codec: "subrip")
+        let assTrack = SubtitleTrack(id: "4", name: "English", language: "eng", isSelected: false, codec: "ass")
+
+        // Format classifier coverage
+        XCTAssertTrue(SubtitleFormatPreference.srt.matches(srtTrack))
+        XCTAssertFalse(SubtitleFormatPreference.srt.matches(pgsTrack))
+        XCTAssertTrue(SubtitleFormatPreference.text.matches(srtTrack))
+        XCTAssertTrue(SubtitleFormatPreference.text.matches(assTrack))
+        XCTAssertFalse(SubtitleFormatPreference.text.matches(pgsTrack))
+        XCTAssertTrue(SubtitleFormatPreference.pgs.matches(pgsTrack))
+
+        // SRT is picked ahead of PGS even if backend auto-selected PGS first (exercising syncTracks + PlaybackTrackInfo.detail -> SubtitleTrack.codec).
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/format-srt-over-pgs.mkv")!))
+        coordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "Japanese", lang: "jpn", selected: true, externalFilename: "")
+        ]
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "English", lang: "eng", selected: true, externalFilename: "", detail: "hdmv_pgs_subtitle"),
+            PlaybackTrackInfo(index: 1, id: 3, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "", detail: "subrip")
+        ]
+        model.syncTracks()
+        XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "3")
+
+        // Falls back normally when SRT is unavailable.
+        let fallbackCoordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let fallbackModel = PlayerViewModel(sessionCoordinator: fallbackCoordinator)
+        defer {
+            fallbackModel.shutdown()
+            fallbackCoordinator.stopAll()
+        }
+        fallbackCoordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/format-fallback.mkv")!))
+        fallbackCoordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "Japanese", lang: "jpn", selected: true, externalFilename: "")
+        ]
+        fallbackCoordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "", detail: "hdmv_pgs_subtitle")
+        ]
+        fallbackModel.syncTracks()
+        XCTAssertEqual(fallbackModel.subtitles.first(where: { $0.isSelected })?.id, "2")
+
+        // Respects language priority over format preference (Czech PGS beats English SRT).
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["Czech", "English"]), forKey: SettingsKey.subtitleLanguages)
+        let langPriorityCoordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let langPriorityModel = PlayerViewModel(sessionCoordinator: langPriorityCoordinator)
+        defer {
+            langPriorityModel.shutdown()
+            langPriorityCoordinator.stopAll()
+        }
+        langPriorityCoordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/format-lang-priority.mkv")!))
+        langPriorityCoordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "Japanese", lang: "jpn", selected: true, externalFilename: "")
+        ]
+        langPriorityCoordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 3, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "", detail: "subrip"),
+            PlaybackTrackInfo(index: 1, id: 5, type: "sub", title: "Czech", lang: "cze", selected: false, externalFilename: "", detail: "pgssub")
+        ]
+        langPriorityModel.syncTracks()
+        XCTAssertEqual(langPriorityModel.subtitles.first(where: { $0.isSelected })?.id, "5")
+
+        // Respects forced-subtitle policy (forced SRT beats forced PGS; never picks full SRT).
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("English", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.forcedSubtitles)
+        let forcedCoordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let forcedModel = PlayerViewModel(sessionCoordinator: forcedCoordinator)
+        defer {
+            forcedModel.shutdown()
+            forcedCoordinator.stopAll()
+        }
+        forcedCoordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/format-forced.mkv")!))
+        forcedCoordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "English", lang: "eng", selected: true, externalFilename: "")
+        ]
+        forcedCoordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 3, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "", isForced: false, detail: "subrip"),
+            PlaybackTrackInfo(index: 1, id: 6, type: "sub", title: "English Forced", lang: "eng", selected: false, externalFilename: "", isForced: true, detail: "hdmv_pgs_subtitle"),
+            PlaybackTrackInfo(index: 2, id: 7, type: "sub", title: "English Forced", lang: "eng", selected: false, externalFilename: "", isForced: true, detail: "subrip")
+        ]
+        forcedModel.syncTracks()
+        XCTAssertEqual(forcedModel.subtitles.first(where: { $0.isSelected })?.id, "7")
+
+        // Preloading external subtitles also honors preferred format.
+        let extVTT = NuvioSubtitle(url: "https://example.test/en.vtt", language: "eng", label: "English")
+        let extSRT = NuvioSubtitle(url: "https://example.test/en.srt", language: "eng", label: "English")
+        XCTAssertEqual(
+            PlayerViewModel.smartMatchedSubtitles(in: [extVTT, extSRT], preferredFormat: .srt).map(\.url),
+            [extSRT.url]
+        )
+    }
+
+    @MainActor
+    func testForcedSubtitlePolicyAppliesWithUntaggedAudioAndEarlyExternalSubtitles() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedAudioLanguage = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        let savedPreferExternal = ProfileSettings.current.object(forKey: SettingsKey.preferExternalSubtitles)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedAudioLanguage {
+                ProfileSettings.current.set(savedAudioLanguage, forKey: SettingsKey.audioLanguage)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.audioLanguage)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+            if let savedPreferExternal {
+                ProfileSettings.current.set(savedPreferExternal, forKey: SettingsKey.preferExternalSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.preferExternalSubtitles)
+            }
+        }
+
+        // 1. Untagged ("und") audio track uses content metadata language so preferred-language films get forced subs instead of full.
+        let untaggedAudio = AudioTrack(id: "1", name: "AAC 5.1", language: "und", isSelected: true)
+        XCTAssertEqual(
+            PlayerViewModel.automaticSubtitlePolicy(
+                selectedAudio: untaggedAudio,
+                preferredAudioLanguage: "English",
+                preferredSubtitleLanguages: ["English"],
+                allowForcedSubtitles: true,
+                contentLanguage: "en"
+            ),
+            .forced(language: "English")
+        )
+        // Foreign content language still receives full subtitles when audio is untagged.
+        XCTAssertEqual(
+            PlayerViewModel.automaticSubtitlePolicy(
+                selectedAudio: untaggedAudio,
+                preferredAudioLanguage: "English",
+                preferredSubtitleLanguages: ["English"],
+                allowForcedSubtitles: true,
+                contentLanguage: "ja"
+            ),
+            .preferredLanguages(["English"])
+        )
+
+        // 2. Even if an add-on full subtitle queued before audioTracks with Original audio, once English audio + forced subtitle arrive, forced wins over full.
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("Original", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(true, forKey: SettingsKey.forcedSubtitles)
+        ProfileSettings.current.set(false, forKey: SettingsKey.preferExternalSubtitles)
+
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/forced-early-ext.mkv")!))
+        model.activeMeta = NuvioMeta(id: "tt-forced-early-ext", name: "English Movie", type: "movie")
+
+        let fullAddon = NuvioSubtitle(url: "https://example.test/en-full.srt", language: "eng", label: "English")
+        model.mergeExternalSubtitles([fullAddon])
+
+        coordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "English", lang: "eng", selected: true, externalFilename: "")
+        ]
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "English", lang: "eng", selected: true, externalFilename: "", isForced: false),
+            PlaybackTrackInfo(index: 1, id: 3, type: "sub", title: "English Forced", lang: "eng", selected: false, externalFilename: "", isForced: true)
+        ]
+        model.syncTracks()
+
+        XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "3")
+        XCTAssertFalse(model.isExternalSubtitleSelected(fullAddon))
+
+        // 3. If no forced track exists while an early external full subtitle is still pending, forced policy clears the pending external selection and keeps subtitles off.
+        let noForcedCoordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let noForcedModel = PlayerViewModel(sessionCoordinator: noForcedCoordinator)
+        defer {
+            noForcedModel.shutdown()
+            noForcedCoordinator.stopAll()
+        }
+        noForcedCoordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/forced-no-forced-track.mkv")!))
+        noForcedModel.activeMeta = NuvioMeta(id: "tt-forced-no-track", name: "English Movie", type: "movie")
+        noForcedModel.mergeExternalSubtitles([fullAddon])
+
+        noForcedCoordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "English", lang: "eng", selected: true, externalFilename: "")
+        ]
+        noForcedCoordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "", isForced: false)
+        ]
+        noForcedModel.syncTracks()
+
+        XCTAssertEqual(noForcedModel.subtitles.first(where: { $0.isSelected })?.id, "off")
+        XCTAssertFalse(noForcedModel.hasSelectedExternalSubtitle)
     }
 
     @MainActor
@@ -7588,11 +7906,9 @@ final class LibraryStoreSyncTests: XCTestCase {
         ProfileSettings.current.set(true, forKey: SettingsKey.forcedSubtitles)
         ProfileSettings.current.set(false, forKey: SettingsKey.preferExternalSubtitles)
 
-        let aether = try XCTUnwrap(AetherPlaybackController())
         let coordinator = PlaybackSessionCoordinator(
-            aetherController: aether,
-            aetherControllerFactory: { aether },
-            engineSettingProvider: { "Auto" },
+            aetherControllerFactory: { nil },
+            engineSettingProvider: { "MPVKit" },
             loadDispatcher: { _, _, _ in }
         )
         let model = PlayerViewModel(sessionCoordinator: coordinator)
@@ -7608,10 +7924,11 @@ final class LibraryStoreSyncTests: XCTestCase {
         model.mergeExternalSubtitles([englishAddon])
 
         // Demuxer opens with Japanese audio and only a non-English embedded subtitle.
-        model.audioTracks = [AudioTrack(id: "1", name: "Japanese", language: "jpn", isSelected: true)]
-        model.subtitles = [
-            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true),
-            SubtitleTrack(id: "2", name: "Spanish", language: "spa", isSelected: false)
+        coordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "Japanese", lang: "jpn", selected: true, externalFilename: "")
+        ]
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "Spanish", lang: "spa", selected: false, externalFilename: "")
         ]
 
         // Running preference matching must pick up the already-fetched English external subtitle instead of locking to Off.

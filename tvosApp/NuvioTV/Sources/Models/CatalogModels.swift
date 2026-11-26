@@ -932,6 +932,8 @@ enum CustomPosterScreen: String, CaseIterable, Hashable, Identifiable, Sendable 
 
     var id: String { rawValue }
 
+    static let tvOSScreens: [CustomPosterScreen] = allCases.filter { $0 != .tvRecommendations }
+
     var title: String {
         switch self {
         case .home: return "Home"
@@ -14114,6 +14116,8 @@ struct DetailsUiState {
     /// An anime's reviews from AniList and MAL (`AnimeReviews`), shown with the comments.
     var aniListReviews: [TraktCommentReview] = []
     var malReviews: [TraktCommentReview] = []
+    /// IMDb parental guide advisories (violence, profanity, nudity, etc.), loaded when enabled in Details Page settings.
+    var parentalGuide: [PlayerContentWarning] = []
     var isLoadingEnrichment: Bool = false
 }
 

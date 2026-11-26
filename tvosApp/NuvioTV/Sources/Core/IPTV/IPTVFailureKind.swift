@@ -42,6 +42,30 @@ enum IPTVFailureKind: Equatable {
         return .other
     }
 
+    var localizationKey: String {
+        switch self {
+        case .invalidAddress: return "iptv_error_address"
+        case .authentication: return "iptv_error_auth"
+        case .invalidContent: return "iptv_error_content"
+        case .tooLarge: return "iptv_error_size"
+        case .storage: return "iptv_error_storage"
+        case .network: return "iptv_error_network"
+        case .other: return "iptv_load_error"
+        }
+    }
+
+    var fallbackMessage: String {
+        switch self {
+        case .invalidAddress: return "Check the source address and account details."
+        case .authentication: return "The provider rejected access. Check your account details."
+        case .invalidContent: return "The provider returned data that Live TV could not read."
+        case .tooLarge: return "This source is too large to load."
+        case .storage: return "Could not save this source securely on this device."
+        case .network: return "Could not reach the provider. Check your connection and try again."
+        case .other: return "Could not load this source. Please try again."
+        }
+    }
+
     private static func status(_ code: Int) -> Self {
         code == 401 || code == 403 ? .authentication : .network
     }

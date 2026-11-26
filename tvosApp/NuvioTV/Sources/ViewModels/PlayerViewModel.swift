@@ -773,6 +773,10 @@ class PlayerViewModel: ObservableObject {
     private var scrubEngagedThisStroke = false
     private var suppressMoveUntil = Date.distantPast
     var moveSuppressed: Bool { Date() < suppressMoveUntil }
+    private var suppressTimelineDownUntil = Date.distantPast
+    var isTimelineDownSuppressed: Bool { Date() < suppressTimelineDownUntil }
+    private var suppressTransportUpUntil = Date.distantPast
+    var isTransportUpSuppressed: Bool { Date() < suppressTransportUpUntil }
     private enum TouchIntent { case undecided, scrub, consumed }
     private var touchIntent: TouchIntent = .undecided
     private var touchBeganWhileStatus: PlayerStatus?
@@ -866,6 +870,12 @@ class PlayerViewModel: ObservableObject {
     private var loadWatchdogGraceGranted = false
     /// A source that hasn't started within this long is treated as dead.
     private let loadTimeoutSeconds: UInt64 = 30
+    /// Test hook to override the watchdog window sleep duration without changing reported seconds.
+    var loadWatchdogSleepNanosecondsOverride: UInt64?
+    /// Upper bound on cumulative startup waiting while an active P2P torrent swarm makes progress.
+    var loadWatchdogMaxTorrentTimeoutSeconds: UInt64 = TorrentStartupWatchdogTracker.defaultMaxTotalTimeoutSeconds
+    /// Test hook for reading live P2P torrent stats for a stream URL (`nil` for non-torrent streams).
+    var activeTorrentWatchdogStatsProvider: ((String?) -> SwarmStats?)?
 
     init(
         sessionCoordinator suppliedCoordinator: PlaybackSessionCoordinator? = nil,
@@ -1467,6 +1477,7 @@ class PlayerViewModel: ObservableObject {
             preferredAudioLanguages: preferredAudioLanguageCodes(),
             preferredSubtitleLanguages: preferredSubtitleLanguageCodes(),
             preferExternalSubtitles: Self.prefersExternalSubtitles,
+            preferredSubtitleFormat: Self.preferredSubtitleFormat,
             matchContentEnabled: matchContent,
             cacheProfile: PlaybackCacheProfile.fromSettings(
                 ProfileSettings.current.string(forKey: SettingsKey.networkCache)
@@ -1987,14 +1998,17 @@ class PlayerViewModel: ObservableObject {
               pendingTrackSelection?.subtitle == nil,
               SubtitleLanguagePreferences.smartMatchingEnabled() else { return }
 
+        let effectiveAudio = audioTracks.first(where: { $0.isSelected }) ?? audioTracks.first
         let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
         let allowForcedSubtitles = Self.allowsAutomaticForcedSubtitles
         let preferExternal = Self.prefersExternalSubtitles
+        let preferredFormat = Self.preferredSubtitleFormat
         guard let policy = Self.automaticSubtitlePolicy(
-            selectedAudio: audioTracks.first(where: { $0.isSelected }),
+            selectedAudio: effectiveAudio,
             preferredAudioLanguage: SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta),
             preferredSubtitleLanguages: preferredLanguages,
-            allowForcedSubtitles: allowForcedSubtitles
+            allowForcedSubtitles: allowForcedSubtitles,
+            contentLanguage: activeMeta?.language
         ) else { return }
 
         didApplySubtitlePreference = false
@@ -2006,12 +2020,14 @@ class PlayerViewModel: ObservableObject {
 
         case .forced(let language):
             let selectedTrack = subtitles.first(where: { $0.isSelected })
+            let selectedMatchesFormat = preferredFormat == .auto
+                || (selectedTrack.map { preferredFormat.matches($0) } ?? false)
             let shouldPreserveSelected = Self.shouldPreserveBackendSubtitleSelection(
                 selectedTrack,
                 preferredLanguages: [language],
                 allowForcedSubtitles: true,
                 requireForcedSubtitle: true
-            ) && (!preferExternal || !(selectedTrack?.externalFilename.isEmpty ?? true))
+            ) && (!preferExternal || !(selectedTrack?.externalFilename.isEmpty ?? true)) && selectedMatchesFormat
             guard !shouldPreserveSelected else { return }
 
             let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
@@ -2022,10 +2038,13 @@ class PlayerViewModel: ObservableObject {
             }
             guard !hasPendingForcedSubtitle else { return }
 
-            guard let best = availableExternalSubtitles.first(where: {
+            let forcedCandidates = availableExternalSubtitles.filter {
                 !failedExternalSubtitleURLs.contains($0.url) &&
                 Self.externalSubtitle($0, matches: language, forcedOnly: true)
-            }),
+            }
+            guard let best = (preferredFormat == .auto
+                    ? forcedCandidates.first
+                    : forcedCandidates.first(where: { preferredFormat.matches($0) }) ?? forcedCandidates.first),
             !addedExternalSubtitleURLs.contains(best.url),
             !pendingExternalSubtitles.contains(where: { $0.url == best.url }) else { return }
 
@@ -2034,7 +2053,8 @@ class PlayerViewModel: ObservableObject {
 
         case .preferredLanguages(let preferredLanguages):
             // An add-on's subtitle replaces an automatic choice of a language ranked below it
-            // (or an embedded subtitle of the same rank when Prefer External Subtitles is enabled).
+            // (or an embedded subtitle of the same rank when Prefer External Subtitles is enabled,
+            // or a track of the same rank when a preferred format matches).
             let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
             guard let best = Self.betterRankedAddonSubtitle(
                 selected: subtitles.first(where: { $0.isSelected }),
@@ -2042,6 +2062,7 @@ class PlayerViewModel: ObservableObject {
                 onTheirWay: pendingExternalSubtitles.filter { !loadedExternalURLs.contains($0.url) },
                 preferredLanguages: preferredLanguages,
                 preferExternal: preferExternal,
+                preferredFormat: preferredFormat,
                 excluding: failedExternalSubtitleURLs
             ) else { return }
             if let track = subtitles.first(where: { $0.externalFilename == best.url }) {
@@ -3203,6 +3224,16 @@ class PlayerViewModel: ObservableObject {
 
     // MARK: Load timeout watchdog
 
+    private func activeTorrentWatchdogStats(for urlString: String?) -> SwarmStats? {
+        if let provider = activeTorrentWatchdogStatsProvider {
+            return provider(urlString)
+        }
+        guard TorrentEngineManager.shared.isActiveStreamURL(urlString) else {
+            return nil
+        }
+        return TorrentEngineManager.shared.activeStats
+    }
+
     private func startLoadWatchdog() {
         loadWatchdogTask?.cancel()
         loadWatchdogTask = nil
@@ -3217,21 +3248,45 @@ class PlayerViewModel: ObservableObject {
             loadWatchdogGraceGranted = false
         }
         let timeoutSeconds = loadTimeoutSeconds
+        let sleepNanoseconds = loadWatchdogSleepNanosecondsOverride ?? (timeoutSeconds * 1_000_000_000)
+        let torrentTracker = activeTorrentWatchdogStats(for: targetURL).map {
+            TorrentStartupWatchdogTracker(
+                initialDownloadedBytes: $0.downloadedBytes,
+                maxTotalTimeoutSeconds: loadWatchdogMaxTorrentTimeoutSeconds
+            )
+        }
         loadWatchdogTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-            guard !Task.isCancelled, let self,
-                  self.sessionCoordinator.loadGeneration == targetGeneration,
-                  self.sessionCoordinator.lastLoadError == nil,
-                  !self.currentLoadStarted,
-                  !self.hasRenderedFirstFrame,
-                  !self.livePlaybackHasStarted,
-                  !self.hasProducedMidFilePosition,
-                  !self.didShutdown,
-                  !self.isFailingOver,
-                  self.activeStreamURL == targetURL
-            else { return }
+            @MainActor func isStillPending(_ vm: PlayerViewModel) -> Bool {
+                !Task.isCancelled
+                    && vm.sessionCoordinator.loadGeneration == targetGeneration
+                    && vm.sessionCoordinator.lastLoadError == nil
+                    && !vm.currentLoadStarted
+                    && !vm.hasRenderedFirstFrame
+                    && !vm.livePlaybackHasStarted
+                    && !vm.hasProducedMidFilePosition
+                    && !vm.didShutdown
+                    && !vm.isFailingOver
+                    && vm.activeStreamURL == targetURL
+            }
+
+            try? await Task.sleep(nanoseconds: sleepNanoseconds)
+            guard let self, isStillPending(self) else { return }
             var elapsedTimeout = timeoutSeconds
-            if self.sessionCoordinator.shouldGrantStartupWatchdogGrace(
+
+            if var tracker = torrentTracker {
+                var keepWaiting = true
+                while keepWaiting, let torrentStats = self.activeTorrentWatchdogStats(for: targetURL) {
+                    switch tracker.evaluateWindow(windowSeconds: timeoutSeconds, stats: torrentStats) {
+                    case .waitAnotherWindow(let reason):
+                        elapsedTimeout += timeoutSeconds
+                        print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] P2P torrent startup is still in progress (\(reason)). Allowing an additional \(timeoutSeconds)s (\(elapsedTimeout)s total).")
+                        try? await Task.sleep(nanoseconds: sleepNanoseconds)
+                        guard isStillPending(self) else { return }
+                    case .timeOut:
+                        keepWaiting = false
+                    }
+                }
+            } else if self.sessionCoordinator.shouldGrantStartupWatchdogGrace(
                 generation: targetGeneration,
                 graceAlreadyGranted: self.loadWatchdogGraceGranted
             ) {
@@ -3239,18 +3294,8 @@ class PlayerViewModel: ObservableObject {
                 elapsedTimeout += timeoutSeconds
                 let backend = self.sessionCoordinator.activeBackend.rawValue
                 print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] Remote \(backend) startup is still in progress. Allowing an additional \(timeoutSeconds)s (\(elapsedTimeout)s total).")
-                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
-                guard !Task.isCancelled,
-                      self.sessionCoordinator.loadGeneration == targetGeneration,
-                      self.sessionCoordinator.lastLoadError == nil,
-                      !self.currentLoadStarted,
-                      !self.hasRenderedFirstFrame,
-                      !self.livePlaybackHasStarted,
-                      !self.hasProducedMidFilePosition,
-                      !self.didShutdown,
-                      !self.isFailingOver,
-                      self.activeStreamURL == targetURL
-                else { return }
+                try? await Task.sleep(nanoseconds: sleepNanoseconds)
+                guard isStillPending(self) else { return }
             }
             let memReport = TVMemoryDiagnostic.detailedReport(label: "LOAD_WATCHDOG_TIMEOUT")
             let diagnosticURL = targetURL.flatMap { URL(string: $0) }.map {
@@ -4431,7 +4476,8 @@ class PlayerViewModel: ObservableObject {
                 isSelected: track.selected,
                 externalFilename: track.externalFilename,
                 isForced: track.isForced || Self.isForcedSubtitleLabel(title),
-                isNativelyRenderedSubtitle: track.isNativelyRenderedSubtitle
+                isNativelyRenderedSubtitle: track.isNativelyRenderedSubtitle,
+                codec: track.detail
             )
         }
         subs = SubtitleAutoSyncTracks.present(
@@ -5602,6 +5648,14 @@ class PlayerViewModel: ObservableObject {
         suppressMoveUntil = max(suppressMoveUntil, Date().addingTimeInterval(duration))
     }
 
+    func suppressTimelineDownBriefly(_ duration: TimeInterval = 0.35) {
+        suppressTimelineDownUntil = max(suppressTimelineDownUntil, Date().addingTimeInterval(duration))
+    }
+
+    func suppressTransportUpBriefly(_ duration: TimeInterval = 0.35) {
+        suppressTransportUpUntil = max(suppressTransportUpUntil, Date().addingTimeInterval(duration))
+    }
+
     private func publishScrub(_ value: Double) {
         scrubValue = value
         let now = Date()
@@ -6177,6 +6231,10 @@ class PlayerViewModel: ObservableObject {
                     touchIntent = .consumed
                     revealControls()
                 } else if dy > 0 {
+                    if showControls && isTimelineFocused && isTimelineDownSuppressed {
+                        touchIntent = .consumed
+                        return
+                    }
                     suppressMoveBriefly()
                     touchIntent = .consumed
                     if isSceneEnabled {
@@ -7081,19 +7139,24 @@ class PlayerViewModel: ObservableObject {
     /// at most one non-forced subtitle matching the highest-priority preference.
     static func smartMatchedSubtitles(
         in subtitles: [NuvioSubtitle],
-        excluding failedURLs: Set<String> = []
+        excluding failedURLs: Set<String> = [],
+        preferredFormat: SubtitleFormatPreference? = nil
     ) -> [NuvioSubtitle] {
         guard !subtitles.isEmpty,
               SubtitleLanguagePreferences.smartMatchingEnabled() else {
             return []
         }
+        let format = preferredFormat ?? preferredSubtitleFormat
         for language in SubtitleLanguagePreferences.orderedFromDefaults() {
-            if let match = subtitles.first(where: { subtitle in
+            let candidates = subtitles.filter { subtitle in
                 !failedURLs.contains(subtitle.url) &&
                 !isForcedSubtitleLabel(subtitle.label) &&
                 (SubtitleLanguagePreferences.matches(subtitle.language, target: language) ||
                  SubtitleLanguagePreferences.matches(subtitle.label, target: language))
-            }) {
+            }
+            if let match = (format == .auto
+                ? candidates.first
+                : candidates.first(where: { format.matches($0) }) ?? candidates.first) {
                 return [match]
             }
         }
@@ -7219,33 +7282,51 @@ class PlayerViewModel: ObservableObject {
         selectedAudio: AudioTrack?,
         preferredAudioLanguage: String?,
         preferredSubtitleLanguages: [String],
-        allowForcedSubtitles: Bool
+        allowForcedSubtitles: Bool,
+        contentLanguage: String? = nil
     ) -> AutomaticSubtitlePolicy? {
-        let audioToMatch = selectedAudio ?? preferredAudioLanguage.map { AudioTrack(id: "", name: $0, language: $0, isSelected: true) }
-        let nativeAudioMatchesPreferred = audioToMatch != nil && preferredAudioLanguage != nil && selectedAudioTrack(audioToMatch!, matches: preferredAudioLanguage!)
+        let matchesAudioLanguage: (String) -> Bool = { language in
+            if let selectedAudio {
+                if selectedAudioTrack(selectedAudio, matches: language) {
+                    return true
+                }
+                if !audioTrackHasKnownLanguage(selectedAudio),
+                   let contentLanguage,
+                   SubtitleLanguagePreferences.matches(contentLanguage, target: language) {
+                    return true
+                }
+                return false
+            }
+            if let preferredAudioLanguage {
+                return SubtitleLanguagePreferences.matches(preferredAudioLanguage, target: language)
+            }
+            return false
+        }
 
         if !preferredSubtitleLanguages.isEmpty {
             if allowForcedSubtitles,
-               let primaryLanguage = preferredSubtitleLanguages.first {
-                if let selectedAudio, selectedAudioTrack(selectedAudio, matches: primaryLanguage) {
-                    return .forced(language: primaryLanguage)
-                }
-                if selectedAudio == nil,
-                   let prefAudio = preferredAudioLanguage,
-                   SubtitleLanguagePreferences.matches(prefAudio, target: primaryLanguage) {
-                    return .forced(language: primaryLanguage)
-                }
+               let primaryLanguage = preferredSubtitleLanguages.first,
+               matchesAudioLanguage(primaryLanguage) {
+                return .forced(language: primaryLanguage)
             }
             return .preferredLanguages(preferredSubtitleLanguages)
         }
 
-        if nativeAudioMatchesPreferred {
+        if let preferredAudioLanguage, matchesAudioLanguage(preferredAudioLanguage) {
             if allowForcedSubtitles {
-                return .forced(language: preferredAudioLanguage!)
+                return .forced(language: preferredAudioLanguage)
             }
             return .off
         }
         return nil
+    }
+
+    private static func audioTrackHasKnownLanguage(_ track: AudioTrack) -> Bool {
+        let code = track.language.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !code.isEmpty && code.lowercased() != "und" {
+            return true
+        }
+        return detectedLanguage(for: track) != nil
     }
 
     private static func selectedAudioTrack(_ track: AudioTrack, matches language: String) -> Bool {
@@ -7258,6 +7339,7 @@ class PlayerViewModel: ObservableObject {
         _ pendingURL: String,
         selectedTrack: SubtitleTrack?,
         preferredLanguages: [String],
+        preferredFormat: SubtitleFormatPreference,
         startingAt rank: Int
     ) {
         let needsFallback = selectedTrack == nil
@@ -7265,7 +7347,7 @@ class PlayerViewModel: ObservableObject {
             || (selectedTrack.map(Self.isForcedSubtitle) ?? false)
         if needsFallback,
            let fallbackTrack = preferredLanguages[rank...].lazy.compactMap({
-               Self.matchingPreferredFullSubtitle(in: self.subtitles, language: $0)
+               Self.matchingPreferredFullSubtitle(in: self.subtitles, language: $0, preferredFormat: preferredFormat)
            }).first {
             selectSubtitle(fallbackTrack, persist: false)
             pendingSelectedExternalSubtitleURL = pendingURL
@@ -7287,6 +7369,7 @@ class PlayerViewModel: ObservableObject {
     private func pendingOrAvailableExternalMatch(
         language: String,
         forcedOnly: Bool,
+        preferredFormat: SubtitleFormatPreference,
         loadedExternalURLs: Set<String>
     ) -> (pending: NuvioSubtitle?, available: NuvioSubtitle?) {
         let matchesCandidate: (NuvioSubtitle) -> Bool = { subtitle in
@@ -7295,14 +7378,18 @@ class PlayerViewModel: ObservableObject {
             (SubtitleLanguagePreferences.matches(subtitle.language, target: language) ||
              SubtitleLanguagePreferences.matches(subtitle.label, target: language))
         }
-        let pending = pendingExternalSubtitles.first {
-            !loadedExternalURLs.contains($0.url) && matchesCandidate($0)
+        let pickBest: ([NuvioSubtitle]) -> NuvioSubtitle? = { list in
+            guard preferredFormat != .auto else { return list.first }
+            return list.first(where: { preferredFormat.matches($0) }) ?? list.first
         }
-        let available = availableExternalSubtitles.first {
+        let pending = pickBest(pendingExternalSubtitles.filter {
+            !loadedExternalURLs.contains($0.url) && matchesCandidate($0)
+        })
+        let available = pickBest(availableExternalSubtitles.filter {
             !loadedExternalURLs.contains($0.url) &&
             !addedExternalSubtitleURLs.contains($0.url) &&
             matchesCandidate($0)
-        }
+        })
         return (pending, available)
     }
 
@@ -7315,12 +7402,14 @@ class PlayerViewModel: ObservableObject {
         let effectiveAudio = audioTracks.first(where: { $0.isSelected }) ?? audioTracks.first
         let allowForcedSubtitles = Self.allowsAutomaticForcedSubtitles
         let preferExternal = Self.prefersExternalSubtitles
+        let preferredFormat = Self.preferredSubtitleFormat
         let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
         guard let policy = Self.automaticSubtitlePolicy(
             selectedAudio: effectiveAudio,
             preferredAudioLanguage: SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta),
             preferredSubtitleLanguages: preferredLanguages,
-            allowForcedSubtitles: allowForcedSubtitles
+            allowForcedSubtitles: allowForcedSubtitles,
+            contentLanguage: activeMeta?.language
         ) else {
             didApplySubtitlePreference = true
             return
@@ -7331,33 +7420,38 @@ class PlayerViewModel: ObservableObject {
         switch policy {
         case .off:
             guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
+            let hadPendingExternal = pendingSelectedExternalSubtitleURL != nil
             pendingSelectedExternalSubtitleURL = nil
             didApplySubtitlePreference = true
-            if !off.isSelected { selectSubtitle(off, persist: false) }
+            if hadPendingExternal || !off.isSelected {
+                selectSubtitle(off, persist: false)
+            }
             return
 
         case .forced(let language):
             let selectedTrack = subtitles.first(where: { $0.isSelected })
+            let selectedMatchesFormat = preferredFormat == .auto
+                || (selectedTrack.map { preferredFormat.matches($0) } ?? false)
             let shouldPreserveSelected = Self.shouldPreserveBackendSubtitleSelection(
                 selectedTrack,
                 preferredLanguages: [language],
                 allowForcedSubtitles: true,
                 requireForcedSubtitle: true
-            ) && (!preferExternal || !(selectedTrack?.externalFilename.isEmpty ?? true))
+            ) && (!preferExternal || !(selectedTrack?.externalFilename.isEmpty ?? true)) && selectedMatchesFormat
             if shouldPreserveSelected {
                 didApplySubtitlePreference = true
                 return
             }
 
             if preferExternal,
-               let forcedExternal = Self.matchingForcedExternalSubtitle(in: subtitles, language: language) {
+               let forcedExternal = Self.matchingForcedExternalSubtitle(in: subtitles, language: language, preferredFormat: preferredFormat) {
                 didApplySubtitlePreference = true
                 selectSubtitle(forcedExternal, persist: false)
                 return
             }
 
             if !preferExternal,
-               let forcedTrack = Self.matchingForcedSubtitle(in: subtitles, language: language) {
+               let forcedTrack = Self.matchingForcedSubtitle(in: subtitles, language: language, preferredFormat: preferredFormat) {
                 didApplySubtitlePreference = true
                 selectSubtitle(forcedTrack, persist: false)
                 return
@@ -7366,6 +7460,7 @@ class PlayerViewModel: ObservableObject {
             let externalMatch = pendingOrAvailableExternalMatch(
                 language: language,
                 forcedOnly: true,
+                preferredFormat: preferredFormat,
                 loadedExternalURLs: loadedExternalURLs
             )
             if let pendingForced = externalMatch.pending {
@@ -7386,7 +7481,7 @@ class PlayerViewModel: ObservableObject {
             }
 
             if preferExternal,
-               let forcedTrack = Self.matchingForcedSubtitle(in: subtitles, language: language) {
+               let forcedTrack = Self.matchingForcedSubtitle(in: subtitles, language: language, preferredFormat: preferredFormat) {
                 didApplySubtitlePreference = true
                 selectSubtitle(forcedTrack, persist: false)
                 return
@@ -7395,44 +7490,49 @@ class PlayerViewModel: ObservableObject {
             guard subtitles.contains(where: { $0.id != "off" }) else { return }
 
             guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
+            let hadPendingExternal = pendingSelectedExternalSubtitleURL != nil
             pendingSelectedExternalSubtitleURL = nil
             didApplySubtitlePreference = true
-            if !off.isSelected { selectSubtitle(off, persist: false) }
+            if hadPendingExternal || !off.isSelected {
+                selectSubtitle(off, persist: false)
+            }
             return
 
         case .preferredLanguages(let preferredLanguages):
             // Both playback backends can resolve the preference during load. Keep
             // that selection instead of replacing it with the first matching row,
-            // unless a language ranked above it is loaded or still loading (or an
-            // external subtitle of the same rank is preferred and available).
+            // unless a language ranked above it is loaded or still loading, an
+            // external subtitle of the same rank is preferred, or a preferred
+            // subtitle format matches another track of the same rank.
             let selectedTrack = subtitles.first(where: { $0.isSelected })
             let keptRank = Self.preferredSubtitleRank(
                 of: selectedTrack,
                 in: preferredLanguages
             )
             let keptIsExternal = !(selectedTrack?.externalFilename.isEmpty ?? true)
+            let keptMatchesFormat = preferredFormat == .auto
+                || (selectedTrack.map { preferredFormat.matches($0) } ?? false)
 
             for (rank, language) in preferredLanguages.enumerated() {
                 if let keptRank {
-                    if preferExternal && !keptIsExternal {
-                        if rank > keptRank {
-                            didApplySubtitlePreference = true
-                            return
-                        }
-                    } else if rank >= keptRank {
+                    if rank > keptRank {
+                        didApplySubtitlePreference = true
+                        return
+                    }
+                    if rank == keptRank && keptMatchesFormat && (!preferExternal || keptIsExternal) {
                         didApplySubtitlePreference = true
                         return
                     }
                 }
 
                 if preferExternal,
-                   let externalTrack = Self.matchingPreferredFullExternalSubtitle(in: subtitles, language: language) {
+                   let externalTrack = Self.matchingPreferredFullExternalSubtitle(in: subtitles, language: language, preferredFormat: preferredFormat) {
                     didApplySubtitlePreference = true
                     selectSubtitle(externalTrack, persist: false)
                     return
                 }
                 if !preferExternal,
-                   let matchingTrack = Self.matchingPreferredFullSubtitle(in: subtitles, language: language) {
+                   let matchingTrack = Self.matchingPreferredFullSubtitle(in: subtitles, language: language, preferredFormat: preferredFormat) {
                     didApplySubtitlePreference = true
                     selectSubtitle(matchingTrack, persist: false)
                     return
@@ -7441,6 +7541,7 @@ class PlayerViewModel: ObservableObject {
                 let externalMatch = pendingOrAvailableExternalMatch(
                     language: language,
                     forcedOnly: false,
+                    preferredFormat: preferredFormat,
                     loadedExternalURLs: loadedExternalURLs
                 )
                 if let queuedExternal = externalMatch.pending ?? externalMatch.available {
@@ -7451,13 +7552,14 @@ class PlayerViewModel: ObservableObject {
                         queuedExternal.url,
                         selectedTrack: selectedTrack,
                         preferredLanguages: preferredLanguages,
+                        preferredFormat: preferredFormat,
                         startingAt: rank
                     )
                     return
                 }
 
                 if preferExternal,
-                   let matchingTrack = Self.matchingPreferredFullSubtitle(in: subtitles, language: language) {
+                   let matchingTrack = Self.matchingPreferredFullSubtitle(in: subtitles, language: language, preferredFormat: preferredFormat) {
                     didApplySubtitlePreference = true
                     if selectedTrack?.id != matchingTrack.id {
                         selectSubtitle(matchingTrack, persist: false)
@@ -7804,55 +7906,108 @@ class PlayerViewModel: ObservableObject {
         onTheirWay: [NuvioSubtitle],
         preferredLanguages: [String],
         preferExternal: Bool = false,
+        preferredFormat: SubtitleFormatPreference = .auto,
         excluding failedURLs: Set<String> = []
     ) -> NuvioSubtitle? {
-        var best: (subtitle: NuvioSubtitle, rank: Int)?
+        var best: (subtitle: NuvioSubtitle, rank: Int, matchesFormat: Bool)?
         for subtitle in available {
             guard !failedURLs.contains(subtitle.url) else { continue }
             guard let rank = preferredSubtitleRank(of: subtitle, in: preferredLanguages) else { continue }
-            if let current = best, current.rank <= rank { continue }
-            best = (subtitle, rank)
+            let matchesFormat = preferredFormat != .auto && preferredFormat.matches(subtitle)
+            if let current = best {
+                if current.rank < rank { continue }
+                if current.rank == rank && (current.matchesFormat || !matchesFormat) { continue }
+            }
+            best = (subtitle, rank, matchesFormat)
         }
         guard let best else { return nil }
         if let selectedRank = preferredSubtitleRank(of: selected, in: preferredLanguages) {
+            let selectedMatchesFormat = preferredFormat != .auto
+                && (selected.map { preferredFormat.matches($0) } ?? false)
             let selectedIsExternal = !(selected?.externalFilename.isEmpty ?? true)
-            if preferExternal && !selectedIsExternal {
-                if selectedRank < best.rank { return nil }
-            } else if selectedRank <= best.rank {
+            let selectedScore = (
+                selectedRank,
+                preferredFormat == .auto ? 0 : (selectedMatchesFormat ? 0 : 1),
+                preferExternal ? (selectedIsExternal ? 0 : 1) : 0
+            )
+            let bestScore = (
+                best.rank,
+                preferredFormat == .auto ? 0 : (best.matchesFormat ? 0 : 1),
+                0
+            )
+            if selectedScore <= bestScore {
                 return nil
             }
         }
         let betterOnItsWay = onTheirWay.contains { subtitle in
-            !failedURLs.contains(subtitle.url) &&
-            (preferredSubtitleRank(of: subtitle, in: preferredLanguages).map { $0 <= best.rank } ?? false)
+            guard !failedURLs.contains(subtitle.url),
+                  let rank = preferredSubtitleRank(of: subtitle, in: preferredLanguages) else { return false }
+            if rank < best.rank { return true }
+            if rank > best.rank { return false }
+            let matchesFormat = preferredFormat != .auto && preferredFormat.matches(subtitle)
+            return !best.matchesFormat || matchesFormat
         }
         return betterOnItsWay ? nil : best.subtitle
     }
 
-    static func matchingPreferredFullSubtitle(in tracks: [SubtitleTrack], language: String) -> SubtitleTrack? {
-        tracks.first { track in
+    static func matchingPreferredFullSubtitle(
+        in tracks: [SubtitleTrack],
+        language: String,
+        preferredFormat: SubtitleFormatPreference = .auto
+    ) -> SubtitleTrack? {
+        let matching = tracks.filter { track in
             track.id != "off" &&
             !isForcedSubtitle(track) &&
             (SubtitleLanguagePreferences.matches(track.language, target: language) ||
              SubtitleLanguagePreferences.matches(track.name, target: language))
         }
+        if preferredFormat != .auto,
+           let formatMatch = matching.first(where: { preferredFormat.matches($0) }) {
+            return formatMatch
+        }
+        return matching.first
     }
 
-    static func matchingPreferredFullExternalSubtitle(in tracks: [SubtitleTrack], language: String) -> SubtitleTrack? {
-        matchingPreferredFullSubtitle(in: tracks.filter { !$0.externalFilename.isEmpty }, language: language)
+    static func matchingPreferredFullExternalSubtitle(
+        in tracks: [SubtitleTrack],
+        language: String,
+        preferredFormat: SubtitleFormatPreference = .auto
+    ) -> SubtitleTrack? {
+        matchingPreferredFullSubtitle(
+            in: tracks.filter { !$0.externalFilename.isEmpty },
+            language: language,
+            preferredFormat: preferredFormat
+        )
     }
 
-    static func matchingForcedSubtitle(in tracks: [SubtitleTrack], language: String) -> SubtitleTrack? {
-        tracks.first { track in
+    static func matchingForcedSubtitle(
+        in tracks: [SubtitleTrack],
+        language: String,
+        preferredFormat: SubtitleFormatPreference = .auto
+    ) -> SubtitleTrack? {
+        let matching = tracks.filter { track in
             track.id != "off" &&
             isForcedSubtitle(track) &&
             (SubtitleLanguagePreferences.matches(track.language, target: language) ||
              SubtitleLanguagePreferences.matches(track.name, target: language))
         }
+        if preferredFormat != .auto,
+           let formatMatch = matching.first(where: { preferredFormat.matches($0) }) {
+            return formatMatch
+        }
+        return matching.first
     }
 
-    static func matchingForcedExternalSubtitle(in tracks: [SubtitleTrack], language: String) -> SubtitleTrack? {
-        matchingForcedSubtitle(in: tracks.filter { !$0.externalFilename.isEmpty }, language: language)
+    static func matchingForcedExternalSubtitle(
+        in tracks: [SubtitleTrack],
+        language: String,
+        preferredFormat: SubtitleFormatPreference = .auto
+    ) -> SubtitleTrack? {
+        matchingForcedSubtitle(
+            in: tracks.filter { !$0.externalFilename.isEmpty },
+            language: language,
+            preferredFormat: preferredFormat
+        )
     }
 
     private static func externalSubtitle(
@@ -7871,6 +8026,12 @@ class PlayerViewModel: ObservableObject {
 
     static var prefersExternalSubtitles: Bool {
         ProfileSettings.current.object(forKey: SettingsKey.preferExternalSubtitles) as? Bool ?? false
+    }
+
+    static var preferredSubtitleFormat: SubtitleFormatPreference {
+        SubtitleFormatPreference.fromStored(
+            ProfileSettings.current.string(forKey: SettingsKey.preferredSubtitleFormat)
+        )
     }
 
     static func isForcedSubtitleLabel(_ label: String?) -> Bool {
@@ -8417,7 +8578,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func prewarmSceneIfNeeded(meta: NuvioMeta, isTrailerPlayback: Bool) {
-        guard isSceneEnabled, !isTrailerPlayback else { return }
+        guard isSceneEnabled, !isTrailerPlayback, !isLiveStream else { return }
         let context = buildSceneContext(meta: meta)
         sceneCoordinator.prewarm(context: context)
         if !availableExternalSubtitles.isEmpty {
@@ -8791,11 +8952,13 @@ class PlayerViewModel: ObservableObject {
             setControlsAutoHideSuspended(true)
         }
         
-        let context = buildSceneContext()
-        sceneAudioTapBroker.updateEngine(aetherController?.engine)
-        sceneCoordinator.updateContext(context)
-        if !availableExternalSubtitles.isEmpty {
-            sceneCoordinator.updateAvailableSubtitles(availableExternalSubtitles)
+        if !isLiveStream {
+            let context = buildSceneContext()
+            sceneAudioTapBroker.updateEngine(aetherController?.engine)
+            sceneCoordinator.updateContext(context)
+            if !availableExternalSubtitles.isEmpty {
+                sceneCoordinator.updateAvailableSubtitles(availableExternalSubtitles)
+            }
         }
         let playbackInfo = buildScenePlaybackInfo()
         sceneViewModel.setMetadata(
@@ -8806,7 +8969,8 @@ class PlayerViewModel: ObservableObject {
             nextEpisode: nextEpisode,
             playbackInfo: playbackInfo,
             hasChapters: !chapters.isEmpty,
-            hasAutoSync: !availableExternalSubtitles.isEmpty && !isLiveStream && !isTrailerPlaybackSession
+            hasAutoSync: !availableExternalSubtitles.isEmpty && !isLiveStream && !isTrailerPlaybackSession,
+            includeSceneTab: !isLiveStream
         )
         sceneViewModel.open()
     }

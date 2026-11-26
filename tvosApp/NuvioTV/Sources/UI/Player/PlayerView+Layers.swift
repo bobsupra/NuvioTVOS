@@ -14,6 +14,51 @@ enum PlayerWindowInputCapturePolicy {
     }
 }
 
+enum PlayerControlsVerticalNavigationPolicy {
+    /// Moving up from the timeline always lands on the transport circle buttons first,
+    /// even while a skip-intro/recap prompt is visible above them.
+    static func timelineUpTarget(transportFocusOrder: [PlayerControlFocus]) -> PlayerControlFocus {
+        transportFocusOrder.first ?? .settings
+    }
+
+    /// Down from the timeline only opens InSight once focus was already settled on the
+    /// timeline (not on the same Down press that just arrived from Skip Intro or transport).
+    static func canOpenSceneOnTimelineDown(
+        isSceneEnabled: Bool,
+        isTimelineFocused: Bool,
+        isTimelineDownSuppressed: Bool,
+        isAuxiliaryCardFocused: Bool,
+        isMoveSuppressed: Bool
+    ) -> Bool {
+        isSceneEnabled
+            && isTimelineFocused
+            && !isTimelineDownSuppressed
+            && !isAuxiliaryCardFocused
+            && !isMoveSuppressed
+    }
+
+    /// Up from a transport circle button only promotes to auxiliary cards (Skip / Next Episode)
+    /// once focus was already resting on the transport row rather than hopping straight through
+    /// from the timeline on a single Up press.
+    static func canPromoteFromTransportUp(
+        isTimelineFocused: Bool,
+        isTransportUpSuppressed: Bool
+    ) -> Bool {
+        !isTimelineFocused && !isTransportUpSuppressed
+    }
+
+    /// Keep the skip-segment card out of the spatial focus graph while the timeline holds focus
+    /// so pressing Up from the progress bar cannot spatially jump past the circle buttons.
+    static func shouldDisableSkipSegmentForTimelineFocus(
+        isQuickMenuPresented: Bool,
+        showControls: Bool,
+        isTimelineFocused: Bool,
+        isSkipSegmentFocused: Bool
+    ) -> Bool {
+        isQuickMenuPresented || (showControls && isTimelineFocused && !isSkipSegmentFocused)
+    }
+}
+
 // Keep each PlayerView layer in a named property so the ZStack order stays explicit.
 extension PlayerView {
     var arePlaybackControlsVisible: Bool {
@@ -270,11 +315,9 @@ extension PlayerView {
             onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
             onEnded: { dx, dy in
                 if viewModel.showControls && viewModel.isTimelineFocused && !viewModel.isScrubbing && dy < -15 && abs(dy) > abs(dx) {
-                    if viewModel.showSkipSegmentCard {
-                        focusSkipSegment()
-                    } else {
-                        requestedControlFocus = .firstTransportButton
-                    }
+                    viewModel.suppressTransportUpBriefly()
+                    skipSegmentFocused = false
+                    requestedControlFocus = .firstTransportButton
                 }
                 viewModel.remoteTouchEnded(dx: dx, dy: dy)
             }
@@ -332,11 +375,9 @@ extension PlayerView {
                 if canRevealControlsFromRemotePress {
                     viewModel.revealControls()
                 } else if canFocusTransportFromTimeline {
-                    if viewModel.showSkipSegmentCard {
-                        focusSkipSegment()
-                    } else {
-                        requestedControlFocus = .firstTransportButton
-                    }
+                    viewModel.suppressTransportUpBriefly()
+                    skipSegmentFocused = false
+                    requestedControlFocus = .firstTransportButton
                 }
             },
             canHandleDown: {
@@ -369,13 +410,18 @@ extension PlayerView {
             && viewModel.sidePanel == nil
             && !viewModel.postPlayState.isVisible
             && viewModel.showControls
-            && viewModel.isTimelineFocused
             && !viewModel.isScrubbing
             && !viewModel.isHoldingSeek
             && viewModel.pendingSeekDelta == 0
             && !viewModel.controlsAutoHideSuspended
             && !isGestureCaptureActive
-            && viewModel.isSceneEnabled
+            && PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: viewModel.isSceneEnabled,
+                isTimelineFocused: viewModel.isTimelineFocused,
+                isTimelineDownSuppressed: viewModel.isTimelineDownSuppressed,
+                isAuxiliaryCardFocused: skipSegmentFocused || nextEpisodeFocused || cancelAutoPlayFocused,
+                isMoveSuppressed: viewModel.moveSuppressed
+            )
     }
 
     private var canOpenSceneWhenControlsHidden: Bool {
@@ -393,6 +439,10 @@ extension PlayerView {
             && !viewModel.postPlayState.isVisible
             && viewModel.showControls
             && viewModel.isTimelineFocused
+            && !skipSegmentFocused
+            && !nextEpisodeFocused
+            && !cancelAutoPlayFocused
+            && !viewModel.moveSuppressed
             && !viewModel.isScrubbing
             && !viewModel.isHoldingSeek
             && viewModel.pendingSeekDelta == 0
@@ -590,7 +640,7 @@ extension PlayerView {
                         viewModel.playNextEpisode()
                     }
                 },
-                watchPartyContent: WatchPartyConfiguration.isEnabled && watchPartyOwner?.service != nil && !isStandalonePlaybackSession
+                watchPartyContent: WatchPartyConfiguration.isEnabled && watchPartyOwner?.service != nil && !isStandalonePlaybackSession && playbackOrigin != .liveTV && !meta.id.lowercased().hasPrefix("iptv:")
                     ? { focus, focusContext in
                         guard let owner = watchPartyOwner, let service = owner.service else {
                             return AnyView(EmptyView())
@@ -712,7 +762,14 @@ extension PlayerView {
             .buttonStyle(PosterCardButtonStyle())
             .focusEffectDisabledIfAvailable()
             .focused($skipSegmentFocused)
-            .disabled(isPlayerQuickMenuPresented)
+            .disabled(
+                PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                    isQuickMenuPresented: isPlayerQuickMenuPresented,
+                    showControls: viewModel.showControls,
+                    isTimelineFocused: viewModel.isTimelineFocused,
+                    isSkipSegmentFocused: skipSegmentFocused
+                )
+            )
             .onMoveCommand { direction in
                 guard !isWakingFromBackground else { return }
                 switch direction {
@@ -728,15 +785,17 @@ extension PlayerView {
                             skipSegmentFocused = false
                             viewModel.openScene()
                         } else {
+                            viewModel.suppressTimelineDownBriefly()
                             withAnimation(.playerControls) {
                                 viewModel.revealControls()
                             }
                             skipSegmentFocused = false
-                            requestedControlFocus = .timeline
+                            requestedControlFocus = viewModel.isLiveStream ? .firstTransportButton : .timeline
                         }
                     } else {
+                        viewModel.suppressTimelineDownBriefly()
                         skipSegmentFocused = false
-                        requestedControlFocus = .timeline
+                        requestedControlFocus = viewModel.isLiveStream ? .firstTransportButton : .timeline
                     }
                 case .right:
                     if viewModel.showNextEpisodeCard {

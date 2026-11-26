@@ -1678,20 +1678,36 @@ struct AetherExternalSubtitleRegistration {
     func preferredInitialTrackID(
         for preferredLanguages: [String],
         preferExternalSubtitles: Bool,
+        preferredSubtitleFormat: SubtitleFormatPreference = .auto,
         preferredAudioLanguages: [String]
     ) -> Int? {
         guard preferExternalSubtitles, let primary = preferredLanguages.first else { return nil }
         let mayPreferForcedOnly = PlayerViewModel.allowsAutomaticForcedSubtitles
             && preferredAudioLanguages.contains { SubtitleLanguagePreferences.matches($0, target: primary) }
         guard !mayPreferForcedOnly else { return nil }
+        var firstMatchID: Int?
         for (offset, track) in tracks.enumerated() {
             if !PlayerViewModel.isForcedSubtitleLabel(track.name),
                (SubtitleLanguagePreferences.matches(track.language, target: primary) ||
                 SubtitleLanguagePreferences.matches(track.name, target: primary)) {
-                return AetherEngine.externalSubtitleTrackIDBase + offset
+                let id = AetherEngine.externalSubtitleTrackIDBase + offset
+                if preferredSubtitleFormat != .auto {
+                    let candidate = SubtitleTrack(
+                        id: "\(id)",
+                        name: track.name ?? "",
+                        language: track.language ?? "",
+                        isSelected: false,
+                        externalFilename: track.url.absoluteString,
+                        codec: track.formatHint ?? ""
+                    )
+                    if preferredSubtitleFormat.matches(candidate) {
+                        return id
+                    }
+                }
+                if firstMatchID == nil { firstMatchID = id }
             }
         }
-        return nil
+        return firstMatchID
     }
 
     /// Reuse video request headers only for subtitles on that same HTTP origin.
@@ -2724,7 +2740,8 @@ enum AetherDiscStartupWatchdogGracePolicy {
         loadGeneration: UInt64,
         dispatchedLoadGeneration: UInt64?,
         progress: AetherStartupLoadCheckpointWitness?,
-        graceAlreadyGranted: Bool
+        graceAlreadyGranted: Bool,
+        localStreamSourceURL: URL? = nil
     ) -> Bool {
         guard !graceAlreadyGranted,
               backend == .aether,
@@ -2732,7 +2749,10 @@ enum AetherDiscStartupWatchdogGracePolicy {
               let request,
               !request.isLiveStream,
               !request.isSports,
-              PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString),
+              PlaybackSessionCoordinator.isWatchdogGraceEligibleURL(
+                request.videoURL,
+                localStreamSourceURL: localStreamSourceURL
+              ),
               PlaybackBackendPolicy.isDiscImage(request.videoURL.absoluteString, filename: request.filename),
               let progress,
               progress.ownerLoadGeneration == loadGeneration,
@@ -5487,6 +5507,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             initialSubtitleTrackID: externalRegistration.preferredInitialTrackID(
                 for: request.preferredSubtitleLanguages,
                 preferExternalSubtitles: request.preferExternalSubtitles,
+                preferredSubtitleFormat: request.preferredSubtitleFormat,
                 preferredAudioLanguages: request.preferredAudioLanguages
             ),
             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments(isBackedByHybridDiskCache: isLocalPlaybackCache),

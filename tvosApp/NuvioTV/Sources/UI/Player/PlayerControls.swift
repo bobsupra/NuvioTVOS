@@ -173,14 +173,18 @@ struct PlayerControls: View {
                 let resolvedTarget: PlayerControlFocus
                 if target == .firstTransportButton {
                     resolvedTarget = transportFocusOrder.first ?? .settings
-                } else if target == .timeline && !didReportPlaybackStarted {
-                    resolvedTarget = .settings
+                } else if target == .timeline && (!didReportPlaybackStarted || viewModel.isLiveStream) {
+                    resolvedTarget = viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .settings
                 } else {
                     resolvedTarget = target
                 }
                 if resolvedTarget == .timeline {
+                    viewModel.suppressTimelineDownBriefly()
                     focusedControl = .timeline
                 } else {
+                    if focusedControl == .timeline || viewModel.isTimelineFocused {
+                        viewModel.suppressTransportUpBriefly()
+                    }
                     focusedControl = isTransportButtonFocusable(resolvedTarget) ? resolvedTarget : (transportFocusOrder.first ?? .settings)
                 }
                 requestedFocus = nil
@@ -350,6 +354,11 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: focusedControl) { oldControl, newControl in
+            if oldControl != .timeline && newControl == .timeline {
+                viewModel.suppressTimelineDownBriefly()
+            } else if oldControl == .timeline, let newControl, newControl != .timeline {
+                viewModel.suppressTransportUpBriefly()
+            }
             if newControl != nil {
                 isAuxiliaryCardFocusActive = false
             }
@@ -1174,11 +1183,14 @@ struct PlayerControls: View {
         case .up:
             viewModel.cancelMoveSeekTracking()
             if origin == .timeline {
-                if viewModel.showSkipSegmentCard {
-                    onFocusSkipSegment()
-                } else {
-                    moveFocus(to: transportFocusOrder.first ?? .settings)
-                }
+                viewModel.suppressTransportUpBriefly()
+                moveFocus(to: PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: transportFocusOrder))
+            } else if !PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: viewModel.isTimelineFocused,
+                isTransportUpSuppressed: viewModel.isTransportUpSuppressed
+            ) {
+                viewModel.suppressTransportUpBriefly()
+                moveFocus(to: origin)
             } else if viewModel.showNextEpisodeCard {
                 onFocusNextEpisode()
             } else if viewModel.showSkipSegmentCard {
@@ -1190,10 +1202,26 @@ struct PlayerControls: View {
             viewModel.cancelMoveSeekTracking()
             if origin != .timeline, !viewModel.isLiveStream {
                 if didReportPlaybackStarted {
+                    viewModel.suppressTimelineDownBriefly()
                     moveFocus(to: .timeline)
                 }
-            } else if origin == .timeline, viewModel.isSceneEnabled {
-                viewModel.openScene()
+            } else if origin != .timeline, viewModel.isLiveStream {
+                if viewModel.isSceneEnabled {
+                    viewModel.openScene()
+                }
+            } else if origin == .timeline {
+                if PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                    isSceneEnabled: viewModel.isSceneEnabled,
+                    isTimelineFocused: viewModel.isTimelineFocused,
+                    isTimelineDownSuppressed: viewModel.isTimelineDownSuppressed,
+                    isAuxiliaryCardFocused: isAuxiliaryCardFocusActive || isSkipSegmentFocused || isNextEpisodeFocused,
+                    isMoveSuppressed: viewModel.moveSuppressed
+                ) {
+                    viewModel.openScene()
+                } else {
+                    viewModel.suppressTimelineDownBriefly()
+                    moveFocus(to: .timeline)
+                }
             }
         case .left:
             if origin == .timeline, !viewModel.isLiveStream {

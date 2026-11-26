@@ -1,5 +1,6 @@
 import XCTest
 import SwiftUI
+import Combine
 @testable import NuvioTV
 
 final class HomeLayoutSettingsTests: XCTestCase {
@@ -2613,6 +2614,25 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.detailsSectionDisabled))
     }
 
+    func testDetailsParentalGuideSettingDefaultsOffAndPersists() {
+        XCTAssertEqual(SettingsKey.detailsShowParentalGuide, "nuvio.tv.settings.layout.detailsShowParentalGuide")
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.detailsShowParentalGuide))
+
+        let suiteName = "DetailsParentalGuideSettingTest_\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defaults.removePersistentDomain(forName: suiteName)
+
+        XCTAssertFalse(DetailsParentalGuideSettings.isEnabled(in: defaults))
+
+        defaults.set(true, forKey: SettingsKey.detailsShowParentalGuide)
+        XCTAssertTrue(DetailsParentalGuideSettings.isEnabled(in: defaults))
+
+        defaults.set(false, forKey: SettingsKey.detailsShowParentalGuide)
+        XCTAssertFalse(DetailsParentalGuideSettings.isEnabled(in: defaults))
+
+        defaults.removePersistentDomain(forName: suiteName)
+    }
+
     func testFocusedPosterExpandingToBackdropPrefersBackgroundOverLandscapePoster() {
         let meta = NuvioMeta(
             id: "tt0903747",
@@ -2697,6 +2717,80 @@ final class HomeLayoutSettingsTests: XCTestCase {
         // The screen's hero backdrop still uses the clean background fanart.
         let heroBackdrop = TVHomeView.preferredBackdropURL(for: meta)
         XCTAssertEqual(heroBackdrop, "https://example.com/clean-backdrop.jpg")
+    }
+
+    func testCalendarTodayBackdropDefersPortraitPosterFlashUntilEnrichmentFinishes() {
+        let unenrichedTodayMeta = NuvioMeta(
+            id: "tt1234567",
+            name: "Airing Today Show",
+            posterUrl: "https://example.com/portrait-poster.jpg",
+            backgroundUrl: nil,
+            type: "series"
+        )
+        let fallbackHero = NuvioMeta(
+            id: "tt9999999",
+            name: "Fallback Hero",
+            posterUrl: "https://example.com/hero-poster.jpg",
+            backgroundUrl: "https://example.com/hero-backdrop.jpg",
+            type: "series"
+        )
+
+        // While enrichment is in flight for a Today card with only a portrait poster,
+        // hold the current backdrop (nil) instead of flashing a zoomed portrait poster.
+        XCTAssertTrue(
+            TVHomeView.shouldDeferPosterBackdropFallback(
+                for: unenrichedTodayMeta,
+                in: TVHomeSection.calendarTodayId
+            )
+        )
+        XCTAssertFalse(
+            TVHomeView.shouldDeferPosterBackdropFallback(
+                for: unenrichedTodayMeta,
+                in: TVHomeSection.upcomingId
+            )
+        )
+        XCTAssertNil(
+            TVHomeView.resolvedHomeBackdropURL(
+                focusedMeta: unenrichedTodayMeta,
+                fallbackHero: fallbackHero,
+                deferringPosterFallbackForMetaID: unenrichedTodayMeta.id
+            )
+        )
+
+        // Once the Today card already carries a dedicated backdrop (from CalendarEntry,
+        // Continue Watching, or completed enrichment), show it immediately.
+        let enrichedTodayMeta = NuvioMeta(
+            id: "tt1234567",
+            name: "Airing Today Show",
+            posterUrl: "https://example.com/portrait-poster.jpg",
+            backgroundUrl: "https://example.com/show-backdrop.jpg",
+            type: "series"
+        )
+        XCTAssertFalse(
+            TVHomeView.shouldDeferPosterBackdropFallback(
+                for: enrichedTodayMeta,
+                in: TVHomeSection.calendarTodayId
+            )
+        )
+        XCTAssertEqual(
+            TVHomeView.resolvedHomeBackdropURL(
+                focusedMeta: enrichedTodayMeta,
+                fallbackHero: fallbackHero,
+                deferringPosterFallbackForMetaID: enrichedTodayMeta.id
+            ),
+            "https://example.com/show-backdrop.jpg"
+        )
+
+        // If enrichment finishes without finding any backdrop, fall back to the poster
+        // just like Continue Watching / Upcoming.
+        XCTAssertEqual(
+            TVHomeView.resolvedHomeBackdropURL(
+                focusedMeta: unenrichedTodayMeta,
+                fallbackHero: fallbackHero,
+                deferringPosterFallbackForMetaID: nil
+            ),
+            "https://example.com/portrait-poster.jpg"
+        )
     }
 
     func testTVTabOrderHasHomeFirstAndProfileNotSelectableTab() {
@@ -3014,6 +3108,232 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertTrue(result.jf?.posterUrl?.contains("ptag") == true)
         XCTAssertEqual(result.plex?.runtime, "2h 0m")
         XCTAssertEqual(result.merged.map(\.meta.id), ["plex-p1-101"])
+    }
+}
+
+private final class ParentalGuideDetailsRepository: MockCatalogRepository {
+    override func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: id,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: ContentWarningsRepository.normalizedIMDbID(id),
+            tmdbId: nil,
+            type: type
+        )
+    }
+
+    override func getStreams(id: String, type: String) async throws -> [NuvioStream] {
+        []
+    }
+}
+
+@MainActor
+final class DetailsParentalGuideTests: XCTestCase {
+    private var cancellables = Set<AnyCancellable>()
+
+    override func tearDown() {
+        cancellables.removeAll()
+        ProfileSettings.clearActiveProfile()
+        super.tearDown()
+    }
+
+    func testContentWarningsDecodeDominantSeverityAndSortOrder() throws {
+        let json = """
+        {
+          "parentsGuide": [
+            {
+              "category": "SEXUAL_CONTENT",
+              "severityBreakdowns": [
+                { "severityLevel": "none", "voteCount": 14 },
+                { "severityLevel": "mild", "voteCount": 9 }
+              ]
+            },
+            {
+              "category": "PROFANITY",
+              "severityBreakdowns": [
+                { "severityLevel": "none", "voteCount": 2 },
+                { "severityLevel": "mild", "voteCount": 5 },
+                { "severityLevel": "moderate", "voteCount": 11 }
+              ]
+            },
+            {
+              "category": "VIOLENCE",
+              "severityBreakdowns": [
+                { "severityLevel": "none", "voteCount": 1 },
+                { "severityLevel": "moderate", "voteCount": 8 },
+                { "severityLevel": "severe", "voteCount": 19 }
+              ]
+            },
+            {
+              "category": "ALCOHOL_DRUGS",
+              "severityBreakdowns": [
+                { "severityLevel": "none", "voteCount": 3 },
+                { "severityLevel": "mild", "voteCount": 6 }
+              ]
+            }
+          ]
+        }
+        """
+
+        let warnings = try ContentWarningsRepository.decodeWarnings(from: Data(json.utf8))
+        XCTAssertEqual(warnings, [
+            PlayerContentWarning(category: .violence, severity: "severe"),
+            PlayerContentWarning(category: .profanity, severity: "moderate"),
+            PlayerContentWarning(category: .alcohol, severity: "mild")
+        ])
+        XCTAssertEqual(warnings[0].severityLevel, .severe)
+        XCTAssertEqual(warnings[1].severityLevel, .moderate)
+        XCTAssertEqual(warnings[2].severityLevel, .mild)
+    }
+
+    func testContentWarningsIDExtractionHandlesPrefixedAndTMDBIDs() {
+        let meta = NuvioMeta(
+            id: "series:tt15398776:1:2",
+            name: "Example",
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "TT15398776",
+            tmdbId: 872585,
+            type: "movie"
+        )
+        XCTAssertEqual(ContentWarningsRepository.directIMDbIDs(for: meta), ["tt15398776"])
+        XCTAssertEqual(ContentWarningsRepository.tmdbIDs(for: meta), [872585])
+
+        let tmdbOnly = NuvioMeta(
+            id: "tmdb:12345",
+            name: "TMDB Title",
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: nil,
+            tmdbId: nil,
+            type: "movie"
+        )
+        XCTAssertTrue(ContentWarningsRepository.directIMDbIDs(for: tmdbOnly).isEmpty)
+        XCTAssertEqual(ContentWarningsRepository.tmdbIDs(for: tmdbOnly), [12345])
+    }
+
+    func testParentalGuideSkippedWhenSettingDisabled() async {
+        let repo = ParentalGuideDetailsRepository()
+        var loaderCallCount = 0
+        let vm = DetailsViewModel(
+            repository: repo,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: {},
+            enrichmentStarter: { _, _ in },
+            isParentalGuideEnabled: { false },
+            parentalGuideLoader: { _ in
+                loaderCallCount += 1
+                return [PlayerContentWarning(category: .violence, severity: "moderate")]
+            }
+        )
+
+        await vm.loadDetails(id: "tt0468569", type: "movie").value
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(loaderCallCount, 0)
+        XCTAssertTrue(vm.uiState.parentalGuide.isEmpty)
+    }
+
+    func testParentalGuideLoadsWhenEnabledAndRespondsToSettingToggle() async {
+        let repo = ParentalGuideDetailsRepository()
+        var settingEnabled = false
+        var loaderCallCount = 0
+        let expected = [
+            PlayerContentWarning(category: .violence, severity: "moderate"),
+            PlayerContentWarning(category: .profanity, severity: "mild")
+        ]
+        let loaded = expectation(description: "parental guide loaded")
+
+        let vm = DetailsViewModel(
+            repository: repo,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: {},
+            enrichmentStarter: { _, _ in },
+            isParentalGuideEnabled: { settingEnabled },
+            parentalGuideLoader: { _ in
+                loaderCallCount += 1
+                return expected
+            }
+        )
+
+        var didFulfillLoaded = false
+        vm.$uiState
+            .sink { state in
+                if !didFulfillLoaded && state.parentalGuide == expected {
+                    didFulfillLoaded = true
+                    loaded.fulfill()
+                }
+            }
+            .store(in: &cancellables)
+
+        await vm.loadDetails(id: "tt0468569", type: "movie").value
+        XCTAssertEqual(loaderCallCount, 0)
+        XCTAssertTrue(vm.uiState.parentalGuide.isEmpty)
+
+        // Turning the option ON fetches and displays the parental guide.
+        settingEnabled = true
+        vm.refreshParentalGuideVisibility()
+        await fulfillment(of: [loaded], timeout: 2.0)
+        XCTAssertEqual(loaderCallCount, 1)
+        XCTAssertEqual(vm.uiState.parentalGuide, expected)
+
+        // Turning the option OFF clears the parental guide immediately.
+        settingEnabled = false
+        vm.refreshParentalGuideVisibility()
+        XCTAssertTrue(vm.uiState.parentalGuide.isEmpty)
+    }
+
+    func testStaleParentalGuideResponseIsIgnoredAfterTitleSwitch() async {
+        let repo = ParentalGuideDetailsRepository()
+        let firstEntered = expectation(description: "first parental guide started")
+        let secondLoaded = expectation(description: "second parental guide loaded")
+        let firstGate = AsyncStream<Void>.makeStream()
+        let firstWarnings = [PlayerContentWarning(category: .nudity, severity: "severe")]
+        let secondWarnings = [PlayerContentWarning(category: .profanity, severity: "mild")]
+
+        let vm = DetailsViewModel(
+            repository: repo,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: {},
+            enrichmentStarter: { _, _ in },
+            isParentalGuideEnabled: { true },
+            parentalGuideLoader: { meta in
+                if meta.id == "tt1111111" {
+                    firstEntered.fulfill()
+                    for await _ in firstGate.stream { break }
+                    return firstWarnings
+                }
+                return secondWarnings
+            }
+        )
+
+        var didFulfillSecond = false
+        vm.$uiState
+            .sink { state in
+                if !didFulfillSecond && state.meta?.id == "tt2222222" && state.parentalGuide == secondWarnings {
+                    didFulfillSecond = true
+                    secondLoaded.fulfill()
+                }
+            }
+            .store(in: &cancellables)
+
+        await vm.loadDetails(id: "tt1111111", type: "movie").value
+        await fulfillment(of: [firstEntered], timeout: 2.0)
+
+        await vm.loadDetails(id: "tt2222222", type: "movie").value
+        await fulfillment(of: [secondLoaded], timeout: 2.0)
+
+        firstGate.continuation.yield(())
+        firstGate.continuation.finish()
+        try? await Task.sleep(nanoseconds: 50_000_000)
+
+        XCTAssertEqual(vm.uiState.meta?.id, "tt2222222")
+        XCTAssertEqual(vm.uiState.parentalGuide, secondWarnings)
     }
 }
 

@@ -3878,7 +3878,16 @@ struct ContentView: View {
                         break
                     }
                 }
-                if resolvedURL == nil, TorrentSettings.isEnabled(), let infoHash = candidate.effectiveInfoHash, !infoHash.isEmpty {
+                if resolvedURL == nil,
+                   TorrentSettings.isEnabled(),
+                   let infoHash = candidate.effectiveInfoHash,
+                   !infoHash.isEmpty,
+                   !TorrentEngineManager.isExcluded(
+                       infoHash: infoHash,
+                       fileIdx: candidate.effectiveFileIdx,
+                       filename: candidate.filename,
+                       excludedPlaybackURLs: excludingURLs
+                   ) {
                     do {
                         resolvedURL = try await TorrentEngineManager.shared.startStream(
                             infoHash: infoHash,
@@ -7661,6 +7670,10 @@ struct TVHomeView: View {
     /// Row the settled focus lives in; the hero only shows Continue Watching
     /// context (episode line, time left) for cards focused in that row.
     @State private var focusedSectionId: String?
+    /// Today card whose hero metadata enrichment is in flight without a dedicated
+    /// landscape backdrop yet; holds the previous backdrop instead of flashing a
+    /// zoomed portrait poster until enrichment resolves.
+    @State private var heroBackdropEnrichmentPendingMetaID: String?
     @State private var landscapeFocusedId: String?
     @State private var lastAccountRefreshRequestedAt: Date?
     @State private var focusWork = TVHomeFocusWork()
@@ -9813,6 +9826,7 @@ struct TVHomeView: View {
                     let folder = section.collectionFolders[folderIndex]
                     focusedCollectionFolder = folder
                     focusedMeta = nil
+                    heroBackdropEnrichmentPendingMetaID = nil
                     focusWork.pendingFocusedFolder = folder
                     focusWork.pendingFocusedMeta = nil
                     rowScrollStore.setIndex(folderIndex, for: section.id)
@@ -9823,14 +9837,21 @@ struct TVHomeView: View {
                     TVHomeCardIdentity.key(rowID: section.id, item: $0) == target
                 }) {
                     let item = section.items[itemIndex]
-                    let settledMeta = collectionHome?.preparedHero(for: item) ?? item
+                    let prepared = collectionHome?.preparedHero(for: item) ?? item
+                    let settledMeta = cachedEnrichedHeroMeta(for: prepared)
                     focusedMeta = settledMeta
                     focusedCollectionFolder = nil
                     focusWork.pendingFocusedMeta = settledMeta
                     focusWork.pendingFocusedFolder = nil
                     rowScrollStore.setIndex(itemIndex, for: section.id)
                     if settledMeta.needsHeroMetadataEnrichment {
+                        heroBackdropEnrichmentPendingMetaID = Self.shouldDeferPosterBackdropFallback(
+                            for: settledMeta,
+                            in: section.id
+                        ) ? settledMeta.id : nil
                         enrichSettledCatalogMeta(settledMeta, in: section.id)
+                    } else {
+                        heroBackdropEnrichmentPendingMetaID = nil
                     }
                     scheduleLandscapeFocus(cardKey: target)
                     return
@@ -11191,6 +11212,14 @@ struct TVHomeView: View {
             && usesRemoteProgress
             && !didRemoteContinueWatchingAnswer
             && continueWatching.isEmpty
+        let resolvedCalendarTodayMetas: [NuvioMeta] = homeCalendarToday
+            ? calendarToday.metas.map { meta in
+                if let cwMeta = continueWatchingByMetaId[meta.id]?.meta {
+                    return meta.fillingMissingHeroMetadata(from: cwMeta)
+                }
+                return meta
+            }
+            : []
         let signature = TVHomeFocusWork.VisibleSectionsSignature(
             cwVisible: continueWatchingVisible,
             cwPlaceholder: showsResumePlaceholder,
@@ -11205,7 +11234,7 @@ struct TVHomeView: View {
             hideUnreleased: hideUnreleased,
             cwLandscape: continueWatchingLandscape,
             landscapePosters: landscapePosters,
-            calendarToday: homeCalendarToday ? calendarToday.metas : []
+            calendarToday: resolvedCalendarTodayMetas
         )
 
         if let cached = focusWork.cachedVisibleSections, cached.signature == signature {
@@ -11228,13 +11257,13 @@ struct TVHomeView: View {
         let calendarTodaySection = TVHomeSection(
             id: TVHomeSection.calendarTodayId,
             title: L10n.string("calendar_home_today_row", fallback: "Today"),
-            items: calendarToday.metas,
+            items: resolvedCalendarTodayMetas,
             posterShape: continueWatchingLandscape ? "landscape" : "poster"
         )
         let showsResumeSection = continueWatchingVisible && (!continueWatching.isEmpty || showsResumePlaceholder)
         let pinnedSections = (showsResumeSection ? [resumeSection] : [])
             + ((upcomingMetas.isEmpty || !continueWatchingVisible) ? [] : [upcomingSection])
-            + ((calendarToday.isEmpty || !homeCalendarToday) ? [] : [calendarTodaySection])
+            + ((resolvedCalendarTodayMetas.isEmpty || !homeCalendarToday) ? [] : [calendarTodaySection])
             + [localTitlesSection].compactMap { $0 }
             + jellyfinSections
             + plexSections
@@ -11386,7 +11415,43 @@ struct TVHomeView: View {
             return folder.preferredHeroBackdropURLString
                 ?? preferredBackdropURL(for: visibleHero)
         }
-        return preferredBackdropURL(for: visibleFocusedMeta) ?? preferredBackdropURL(for: visibleHero)
+        return Self.resolvedHomeBackdropURL(
+            focusedMeta: visibleFocusedMeta,
+            fallbackHero: visibleHero,
+            deferringPosterFallbackForMetaID: heroBackdropEnrichmentPendingMetaID
+        )
+    }
+
+    nonisolated static func hasDedicatedBackdrop(for meta: NuvioMeta) -> Bool {
+        for candidate in [meta.backgroundUrl, meta.landscapePosterUrl] {
+            let url = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !url.isEmpty { return true }
+        }
+        return false
+    }
+
+    nonisolated static func shouldDeferPosterBackdropFallback(
+        for meta: NuvioMeta,
+        in sectionId: String
+    ) -> Bool {
+        guard sectionId == TVHomeSection.calendarTodayId,
+              meta.needsHeroMetadataEnrichment else {
+            return false
+        }
+        return !hasDedicatedBackdrop(for: meta)
+    }
+
+    nonisolated static func resolvedHomeBackdropURL(
+        focusedMeta: NuvioMeta?,
+        fallbackHero: NuvioMeta?,
+        deferringPosterFallbackForMetaID: String?
+    ) -> String? {
+        if let focusedMeta,
+           deferringPosterFallbackForMetaID == focusedMeta.id,
+           !hasDedicatedBackdrop(for: focusedMeta) {
+            return nil
+        }
+        return preferredBackdropURL(for: focusedMeta) ?? preferredBackdropURL(for: fallbackHero)
     }
 
     nonisolated static func preferredBackdropURL(for meta: NuvioMeta?) -> String? {
@@ -11746,6 +11811,7 @@ struct TVHomeView: View {
               store.lastFocusedCardID == nil else { return }
         focusedMeta = store.hero
         focusedCollectionFolder = nil
+        heroBackdropEnrichmentPendingMetaID = nil
         focusWork.pendingFocusedMeta = focusedMeta
         landscapeFocusedId = nil
         focusWork.pendingLandscapeFocusedId = nil
@@ -11888,6 +11954,7 @@ struct TVHomeView: View {
                 if focusedMeta != nil {
                     focusedMeta = nil
                 }
+                heroBackdropEnrichmentPendingMetaID = nil
                 TVHomeDebugTrace.log(
                     "hero.publish folder=\(folder.id) elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
                 )
@@ -11898,7 +11965,8 @@ struct TVHomeView: View {
                   pendingMeta.id == targetMetaId,
                   focusWork.pendingSectionId == targetSectionId else { return }
 
-            let settledMeta = collectionHome?.preparedHero(for: pendingMeta) ?? pendingMeta
+            let prepared = collectionHome?.preparedHero(for: pendingMeta) ?? pendingMeta
+            let settledMeta = cachedEnrichedHeroMeta(for: prepared)
             focusWork.pendingFocusedMeta = settledMeta
 
             // Leaving a folder hero: clear only after settle so backdrop stays frozen.
@@ -11906,7 +11974,8 @@ struct TVHomeView: View {
             if focusedCollectionFolder != nil {
                 focusedCollectionFolder = nil
             }
-            if focusedMeta?.id != settledMeta.id {
+            if focusedMeta?.id != settledMeta.id
+                || (focusedMeta?.backgroundUrl == nil && settledMeta.backgroundUrl != nil) {
                 focusedMeta = settledMeta
             }
 
@@ -11916,7 +11985,14 @@ struct TVHomeView: View {
                     + "elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
             )
 
-            guard isActive, !isFullScreenOverlayPresented else { return }
+            guard isActive, !isFullScreenOverlayPresented else {
+                heroBackdropEnrichmentPendingMetaID = nil
+                return
+            }
+            heroBackdropEnrichmentPendingMetaID = Self.shouldDeferPosterBackdropFallback(
+                for: settledMeta,
+                in: targetSectionId
+            ) ? settledMeta.id : nil
             if focusWork.isWithinStartupGrace || isFastScrolling {
                 focusWork.deferredPostGraceSettledWork = true
                 return
@@ -12176,6 +12252,20 @@ struct TVHomeView: View {
         }
     }
 
+    @MainActor
+    private func cachedEnrichedHeroMeta(for meta: NuvioMeta) -> NuvioMeta {
+        let metadataContext = CinemetaCatalogRepository.metadataCacheContext
+        if AnimeSource.isAnimeTitleID(meta.id) {
+            let enrichmentKey = "\(metadataContext)\u{1f}anilist\u{1f}\(meta.id)"
+            return focusWork.enrichedHeroMetadata[enrichmentKey] ?? meta
+        }
+        let enrichmentKey = "\(metadataContext)\u{1f}\(meta.type.lowercased())\u{1f}\(meta.id)"
+        if let cached = focusWork.enrichedHeroMetadata[enrichmentKey] {
+            return meta.fillingMissingHeroMetadata(from: cached)
+        }
+        return meta
+    }
+
     /// Fetches (or reuses the cached) full `/meta` record for a catalog card
     /// focus has rested on and merges the missing fields into it. Debounced by
     /// `scheduleHeroSettle`, so rapid navigation never generates a request per
@@ -12194,6 +12284,9 @@ struct TVHomeView: View {
         let metadataContext = CinemetaCatalogRepository.metadataCacheContext
         let enrichmentKey = "\(metadataContext)\u{1f}\(settledMeta.type.lowercased())\u{1f}\(settledMeta.id)"
         if let cached = focusWork.enrichedHeroMetadata[enrichmentKey] {
+            if heroBackdropEnrichmentPendingMetaID == settledMeta.id {
+                heroBackdropEnrichmentPendingMetaID = nil
+            }
             let merged = settledMeta.fillingMissingHeroMetadata(from: cached)
             guard focusWork.pendingFocusedMeta?.id == settledMeta.id,
                   focusWork.pendingSectionId == sectionId,
@@ -12211,18 +12304,20 @@ struct TVHomeView: View {
         let targetType = settledMeta.type
         focusWork.heroEnrichmentTask?.cancel()
         focusWork.heroEnrichmentTask = Task { @MainActor in
-            guard let fetched = await Task.detached(priority: .utility, operation: {
+            let fetched = await Task.detached(priority: .utility, operation: {
                 await Self.fetchMetadataWithTimeout(
                     repository: repository,
                     id: targetId,
                     type: targetType,
                     timeoutSeconds: 2.0
                 )
-            }).value else {
-                return
-            }
+            }).value
             guard !Task.isCancelled,
                   metadataContext == CinemetaCatalogRepository.metadataCacheContext else { return }
+            if heroBackdropEnrichmentPendingMetaID == settledMeta.id {
+                heroBackdropEnrichmentPendingMetaID = nil
+            }
+            guard let fetched else { return }
             focusWork.enrichedHeroMetadata[enrichmentKey] = fetched
             let merged = settledMeta.fillingMissingHeroMetadata(from: fetched)
             guard focusWork.pendingFocusedMeta?.id == settledMeta.id,
@@ -12241,14 +12336,21 @@ struct TVHomeView: View {
         let metadataContext = CinemetaCatalogRepository.metadataCacheContext
         let enrichmentKey = "\(metadataContext)\u{1f}anilist\u{1f}\(settledMeta.id)"
         if let cached = focusWork.enrichedHeroMetadata[enrichmentKey] {
+            if heroBackdropEnrichmentPendingMetaID == settledMeta.id {
+                heroBackdropEnrichmentPendingMetaID = nil
+            }
             publishAniListHero(cached, for: settledMeta, in: sectionId)
             return
         }
         focusWork.heroEnrichmentTask?.cancel()
         focusWork.heroEnrichmentTask = Task { @MainActor in
-            guard let artwork = await AniListService.heroArtwork(for: settledMeta),
-                  !Task.isCancelled,
+            let artwork = await AniListService.heroArtwork(for: settledMeta)
+            guard !Task.isCancelled,
                   metadataContext == CinemetaCatalogRepository.metadataCacheContext else { return }
+            if heroBackdropEnrichmentPendingMetaID == settledMeta.id {
+                heroBackdropEnrichmentPendingMetaID = nil
+            }
+            guard let artwork else { return }
             let hero = AniListMetaBuilder.applying(artwork, to: settledMeta)
             focusWork.enrichedHeroMetadata[enrichmentKey] = hero
             publishAniListHero(hero, for: settledMeta, in: sectionId)

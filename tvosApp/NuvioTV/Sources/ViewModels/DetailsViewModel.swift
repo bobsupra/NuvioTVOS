@@ -452,6 +452,7 @@ enum DetailsStreamDiscoveryMode: Equatable {
 class DetailsViewModel: ObservableObject {
     typealias AsyncDelay = () async throws -> Void
     typealias EnrichmentStarter = @MainActor (NuvioMeta, UInt64) -> Void
+    typealias ParentalGuideLoader = (NuvioMeta) async -> [PlayerContentWarning]
 
     @Published private(set) var uiState = DetailsUiState()
     private(set) var didLoadMetadataSuccessfully = false
@@ -477,6 +478,9 @@ class DetailsViewModel: ObservableObject {
     private var relatedPicturesRequest: String?
     /// The anime reviews asked for this title (`loadAnimeReviews`).
     private var animeReviewsRequest: String?
+    /// IMDb parental guide advisories asked for this title (`loadParentalGuide`).
+    private var parentalGuideTask: Task<Void, Never>?
+    private var parentalGuideRequest: String?
     private(set) var watchlistMutationTask: Task<Void, Never>?
     /// Invalidates every asynchronous completion from an older details load.
     /// This is intentionally separate from the content id: the same title can
@@ -488,6 +492,8 @@ class DetailsViewModel: ObservableObject {
     private var lastAppliedStreamsRevision: UInt64?
     private let deferredPreparationDelay: AsyncDelay
     private let injectedEnrichmentStarter: EnrichmentStarter?
+    private let isParentalGuideEnabled: @MainActor () -> Bool
+    private let parentalGuideLoader: ParentalGuideLoader
     private let watchlistContext: @MainActor () -> SelectedLibraryMutationContext?
     private let remoteWatchlistMutation: @MainActor (NuvioMeta, Bool, SelectedLibraryMutationContext) async -> Bool
 
@@ -498,6 +504,12 @@ class DetailsViewModel: ObservableObject {
             try await Task.sleep(nanoseconds: 350_000_000)
         },
         enrichmentStarter: EnrichmentStarter? = nil,
+        isParentalGuideEnabled: @escaping @MainActor () -> Bool = {
+            DetailsParentalGuideSettings.isEnabled()
+        },
+        parentalGuideLoader: @escaping ParentalGuideLoader = { meta in
+            await ContentWarningsRepository.shared.warnings(for: meta)
+        },
         watchlistContext: @escaping @MainActor () -> SelectedLibraryMutationContext? = {
             SelectedLibraryMutationContext()
         },
@@ -509,6 +521,8 @@ class DetailsViewModel: ObservableObject {
         self.streamDiscoveryMode = streamDiscoveryMode
         self.deferredPreparationDelay = deferredPreparationDelay
         self.injectedEnrichmentStarter = enrichmentStarter
+        self.isParentalGuideEnabled = isParentalGuideEnabled
+        self.parentalGuideLoader = parentalGuideLoader
         self.watchlistContext = watchlistContext
         self.remoteWatchlistMutation = remoteWatchlistMutation
     }
@@ -530,6 +544,9 @@ class DetailsViewModel: ObservableObject {
         deferredLoadTask?.cancel()
         streamObserveTask?.cancel()
         enrichmentTask?.cancel()
+        parentalGuideTask?.cancel()
+        parentalGuideTask = nil
+        parentalGuideRequest = nil
         uiState.isLoadingEnrichment = false
         prefetchedStreamId = nil
         prefetchedEpisode = nil
@@ -635,6 +652,7 @@ class DetailsViewModel: ObservableObject {
                 self.fillMALRelatedPictures(for: resolvedMeta, generation: requestGeneration)
                 // And an anime's reviews by the full title's ids (a Cinemeta card may lack them).
                 self.loadAnimeReviews(for: resolvedMeta, generation: requestGeneration)
+                self.loadParentalGuide(for: resolvedMeta, generation: requestGeneration)
 
                 // If streams were previously requested or prefetched for a non-canonical id ("tmdb:..."),
                 // reload them immediately with the resolved canonical stream id.
@@ -727,6 +745,9 @@ class DetailsViewModel: ObservableObject {
         relatedPicturesTask = nil
         relatedPicturesRequest = nil
         animeReviewsRequest = nil
+        parentalGuideTask?.cancel()
+        parentalGuideTask = nil
+        parentalGuideRequest = nil
         uiState.isLoadingEnrichment = false
         prefetchedStreamId = nil
         prefetchedEpisode = nil
@@ -918,6 +939,7 @@ class DetailsViewModel: ObservableObject {
             TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
             // AniList's and MAL's reviews of an anime, whichever source the title is from.
             self.loadAnimeReviews(for: meta, generation: generation)
+            self.loadParentalGuide(for: meta, generation: generation)
             self.uiState.isLoadingEnrichment = true
             defer {
                 if self.detailsRequestGeneration == generation {
@@ -1139,6 +1161,48 @@ class DetailsViewModel: ObservableObject {
             }
             if !found.aniList.isEmpty { self.uiState.aniListReviews = found.aniList }
             if !found.mal.isEmpty { self.uiState.malReviews = found.mal }
+        }
+    }
+
+    /// Reconciles parental guide state when the Details Page setting toggles while Details is open.
+    func refreshParentalGuideVisibility() {
+        guard isParentalGuideEnabled() else {
+            parentalGuideTask?.cancel()
+            parentalGuideTask = nil
+            parentalGuideRequest = nil
+            if !uiState.parentalGuide.isEmpty {
+                uiState.parentalGuide = []
+            }
+            return
+        }
+        guard let meta = uiState.meta else { return }
+        loadParentalGuide(for: meta, generation: detailsRequestGeneration)
+    }
+
+    private func loadParentalGuide(for meta: NuvioMeta, generation: UInt64) {
+        guard isParentalGuideEnabled() else { return }
+        let request = [
+            String(generation),
+            meta.id.lowercased(),
+            meta.imdbId ?? "",
+            meta.tmdbId.map(String.init) ?? "",
+        ].joined(separator: "|")
+        guard parentalGuideRequest != request else { return }
+        parentalGuideTask?.cancel()
+        parentalGuideRequest = request
+        let loader = parentalGuideLoader
+        parentalGuideTask = Task { @MainActor [weak self] in
+            let warnings = await loader(meta)
+            guard let self, self.isCurrentRequest(metaId: meta.id, generation: generation) else { return }
+            guard self.parentalGuideRequest == request else { return }
+            self.parentalGuideTask = nil
+            guard self.isParentalGuideEnabled() else {
+                self.uiState.parentalGuide = []
+                return
+            }
+            if !warnings.isEmpty {
+                self.uiState.parentalGuide = warnings
+            }
         }
     }
 

@@ -102,6 +102,7 @@ struct DetailsScreen: View {
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
     @AppStorage(SettingsKey.backgroundStreamPreFetch) private var backgroundStreamPreFetch = true
+    @AppStorage(SettingsKey.detailsShowParentalGuide) private var detailsShowParentalGuide = false
     @State private var preResolvedStream: NuvioStream? = nil
     @State private var preResolvedURL: URL? = nil
     @State private var preResolvedFilename: String? = nil
@@ -539,6 +540,9 @@ struct DetailsScreen: View {
                 resetPreResolutionCandidate()
                 streamDiscoveryDuration = nil
             }
+        }
+        .onChange(of: detailsShowParentalGuide) { _, _ in
+            viewModel.refreshParentalGuideVisibility()
         }
         .onChange(of: viewModel.uiState.isLoading) { _, isLoading in
             if !isLoading {
@@ -4706,11 +4710,26 @@ struct StreamPickerListCacheKey: Equatable {
 private enum TvDetailsFocusSection: Hashable {
     case actions
     case episodes
+    case parentalGuide
     case cast
     case related
     case network
     case production
     case comments
+}
+
+private enum TvDetailsLowerSection: Hashable {
+    case configured(TVDetailsSection)
+    case parentalGuide
+
+    var scrollTopKey: String {
+        switch self {
+        case .configured(let section):
+            return String(describing: section)
+        case .parentalGuide:
+            return "parentalGuide"
+        }
+    }
 }
 
 private final class TvDetailsEpisodeFocusMemory {
@@ -4761,6 +4780,7 @@ struct TvDetailsContent: View {
     let onBack: () -> Void
 
     @FocusState private var actionFocus: DetailsActionFocus?
+    @FocusState private var parentalGuideFocus: String?
     @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
     @FocusState private var collectionCardFocus: String?
     @FocusState private var relatedCardFocus: String?
@@ -4843,6 +4863,7 @@ struct TvDetailsContent: View {
     @AppStorage(SettingsKey.trailerSource) private var trailerSourceRaw = TrailerSourceMode.auto.rawValue
     @AppStorage(SettingsKey.trailerLanguage) private var trailerLanguageRaw = TrailerLanguagePreference.autoValue
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @AppStorage(SettingsKey.detailsShowParentalGuide) private var detailsShowParentalGuide = false
     /// The sections below the first screen (episodes, cast, more like this…) are built a moment
     /// after Details opens, once its transition is over: the top part fills the first screen,
     /// and building everything at once held the opening transition up for 150-250 ms. Opened
@@ -4870,6 +4891,23 @@ struct TvDetailsContent: View {
 
     private var activeDetailsSections: [TVDetailsSection] {
         configuredDetailsSections.filter { !disabledDetailsSections.contains($0) }
+    }
+
+    private var hasParentalGuide: Bool {
+        detailsShowParentalGuide && !uiState.parentalGuide.isEmpty
+    }
+
+    private var activeLowerSections: [TvDetailsLowerSection] {
+        var sections = activeDetailsSections.map(TvDetailsLowerSection.configured)
+        guard hasParentalGuide else { return sections }
+        if let castIndex = sections.firstIndex(of: .configured(.cast)) {
+            sections.insert(.parentalGuide, at: castIndex)
+        } else if let episodesIndex = sections.firstIndex(of: .configured(.episodes)) {
+            sections.insert(.parentalGuide, at: episodesIndex + 1)
+        } else {
+            sections.insert(.parentalGuide, at: 0)
+        }
+        return sections
     }
     /// The background trailer's player, made once. As `@State private var trailerPlayer = AVPlayer()`
     /// a new player was made (and thrown away) every time Details' content was rebuilt, trailers
@@ -5862,23 +5900,51 @@ struct TvDetailsContent: View {
                             let productionCompanies = uiState.companies.filter { $0.kind == .production && $0.tmdbId != nil }
                             let networks = uiState.companies.filter { $0.kind == .network && $0.tmdbId != nil }
 
-                            let lowerSections = activeDetailsSections
+                            let lowerSections = activeLowerSections
                             let builtSections = (initialFocusEpisode != nil || initialFocusTarget != nil) ? lowerSections.count : builtLowerSectionCount
                             if builtSections > 0 {
-                                ForEach(Array(lowerSections.prefix(builtSections)), id: \.self) { section in
-                                    renderDetailsSection(
-                                        section,
-                                        meta: meta,
-                                        episodes: episodes,
-                                        episodeGuide: episodeGuide,
-                                        episodePresentation: episodePresentation,
-                                        continueItem: continueItem,
-                                        networks: networks,
-                                        productionCompanies: productionCompanies,
-                                        scrollProxy: scrollProxy
-                                    )
+                                ForEach(Array(lowerSections.prefix(builtSections)), id: \.self) { lowerSection in
+                                    Group {
+                                        switch lowerSection {
+                                        case .configured(let section):
+                                            renderDetailsSection(
+                                                section,
+                                                meta: meta,
+                                                episodes: episodes,
+                                                episodeGuide: episodeGuide,
+                                                episodePresentation: episodePresentation,
+                                                continueItem: continueItem,
+                                                networks: networks,
+                                                productionCompanies: productionCompanies,
+                                                scrollProxy: scrollProxy
+                                            )
+                                        case .parentalGuide:
+                                            if hasParentalGuide {
+                                                TvDetailsParentalGuideSection(
+                                                    warnings: uiState.parentalGuide,
+                                                    maxRowWidth: max(proxy.size.width - 112, 1180),
+                                                    entryLocked: focusedDetailsSection != .parentalGuide,
+                                                    externalFocus: $parentalGuideFocus,
+                                                    onBack: handleDetailsBack,
+                                                    onFocus: {
+                                                        guard focusRestoreAttemptTarget == nil else { return }
+                                                        cancelPendingFocusHandoff()
+                                                        if focusedDetailsSection != .parentalGuide {
+                                                            focusedDetailsSection = .parentalGuide
+                                                        }
+                                                    }
+                                                )
+                                                .padding(.top, 34)
+                                                .id(TvDetailsScrollID.parentalGuideSection)
+                                                .disabled(
+                                                    restoreEpisodeKey != nil
+                                                        || !isDetailsFocusReachable(.parentalGuide)
+                                                )
+                                            }
+                                        }
+                                    }
                                     .modifier(TVScrollTopReader(
-                                        key: String(describing: section),
+                                        key: lowerSection.scrollTopKey,
                                         tops: detailsSectionTops,
                                         space: "tv-details-content"
                                     ))
@@ -5902,7 +5968,7 @@ struct TvDetailsContent: View {
                                 // nothing below Play and was lost, and it took two.
                                 buildLowerSections(upTo: 1)
                                 await waitForActionFocusToSettle()
-                                let count = activeDetailsSections.count
+                                let count = activeLowerSections.count
                                 for built in 2..<max(count, 2) {
                                     await waitForFocusToRest()
                                     guard !Task.isCancelled else { return }
@@ -5917,6 +5983,12 @@ struct TvDetailsContent: View {
                             .onChange(of: focusedDetailsSection) { _, section in
                                 moveDetails(to: section)
                                 buildSectionBelow(section)
+                            }
+                            .onChange(of: hasParentalGuide) { _, available in
+                                if !available && focusedDetailsSection == .parentalGuide {
+                                    focusedDetailsSection = .actions
+                                    actionFocus = .play
+                                }
                             }
                             // Inset and layout metrics matching Android TV.
                             .padding(.leading, 56)
@@ -6353,6 +6425,7 @@ struct TvDetailsContent: View {
         switch section {
         case .actions: return TvDetailsScrollID.topSection
         case .episodes: return TvDetailsScrollID.episodesSection
+        case .parentalGuide: return TvDetailsScrollID.parentalGuideSection
         case .cast: return TvDetailsScrollID.castSection
         case .related: return TvDetailsScrollID.moreLikeThisSection
         case .network: return TvDetailsScrollID.networkSection
@@ -6587,7 +6660,7 @@ struct TvDetailsContent: View {
         if section == .actions {
             key = "actions"
         } else if let below = Self.lowerSection(for: section) {
-            key = String(describing: below)
+            key = below.scrollTopKey
         } else {
             return
         }
@@ -6633,19 +6706,20 @@ struct TvDetailsContent: View {
         let order = detailsFocusOrder
         guard let index = order.firstIndex(of: section), index + 1 < order.count,
               let below = Self.lowerSection(for: order[index + 1]),
-              let position = activeDetailsSections.firstIndex(of: below) else { return }
+              let position = activeLowerSections.firstIndex(of: below) else { return }
         buildLowerSections(upTo: position + 1)
     }
 
-    private static func lowerSection(for section: TvDetailsFocusSection) -> TVDetailsSection? {
+    private static func lowerSection(for section: TvDetailsFocusSection) -> TvDetailsLowerSection? {
         switch section {
         case .actions: return nil
-        case .episodes: return .episodes
-        case .cast: return .cast
-        case .related: return .related
-        case .network: return .network
-        case .production: return .production
-        case .comments: return .comments
+        case .episodes: return .configured(.episodes)
+        case .parentalGuide: return .parentalGuide
+        case .cast: return .configured(.cast)
+        case .related: return .configured(.related)
+        case .network: return .configured(.network)
+        case .production: return .configured(.production)
+        case .comments: return .configured(.comments)
         }
     }
 
@@ -6712,6 +6786,20 @@ struct TvDetailsContent: View {
         }
     }
 
+    private func focusParentalGuideFromEpisodes() {
+        guard hasParentalGuide, let firstID = uiState.parentalGuide.first?.id else { return }
+        detailsFocusMoveGeneration &+= 1
+        let generation = detailsFocusMoveGeneration
+        pendingPlayFocusGeneration = nil
+        focusedDetailsSection = .parentalGuide
+        parentalGuideFocus = firstID
+
+        DispatchQueue.main.async {
+            guard detailsFocusMoveGeneration == generation else { return }
+            parentalGuideFocus = firstID
+        }
+    }
+
     private func handleMoveUpFromEpisodes() {
         guard let currentIndex = detailsFocusOrder.firstIndex(of: .episodes), currentIndex > 0 else {
             focusPlayFromEpisodes()
@@ -6721,6 +6809,8 @@ struct TvDetailsContent: View {
         switch targetSection {
         case .actions:
             focusPlayFromEpisodes()
+        case .parentalGuide:
+            focusParentalGuideFromEpisodes()
         case .cast:
             focusCastHeaderFromEpisodes()
         default:
@@ -6737,6 +6827,8 @@ struct TvDetailsContent: View {
         }
         let targetSection = detailsFocusOrder[currentIndex + 1]
         switch targetSection {
+        case .parentalGuide:
+            focusParentalGuideFromEpisodes()
         case .cast:
             focusCastHeaderFromEpisodes()
         case .actions:
@@ -6891,31 +6983,38 @@ struct TvDetailsContent: View {
     /// the focus graph so tvOS cannot skip Cast and land two rows away.
     private var detailsFocusOrder: [TvDetailsFocusSection] {
         var order: [TvDetailsFocusSection] = [.actions]
-        for section in activeDetailsSections {
-            switch section {
-            case .episodes:
-                if let meta = uiState.meta, !(meta.videos ?? []).isEmpty {
-                    order.append(.episodes)
+        for lowerSection in activeLowerSections {
+            switch lowerSection {
+            case .parentalGuide:
+                if hasParentalGuide {
+                    order.append(.parentalGuide)
                 }
-            case .cast:
-                if hasCastOrTrailer {
-                    order.append(.cast)
-                }
-            case .related:
-                if !relatedRowsAreEmpty(meta: uiState.meta) {
-                    order.append(.related)
-                }
-            case .network:
-                if uiState.companies.contains(where: { $0.kind == .network && $0.tmdbId != nil }) {
-                    order.append(.network)
-                }
-            case .production:
-                if uiState.companies.contains(where: { $0.kind == .production && $0.tmdbId != nil }) {
-                    order.append(.production)
-                }
-            case .comments:
-                if hasCommentRows {
-                    order.append(.comments)
+            case .configured(let section):
+                switch section {
+                case .episodes:
+                    if let meta = uiState.meta, !(meta.videos ?? []).isEmpty {
+                        order.append(.episodes)
+                    }
+                case .cast:
+                    if hasCastOrTrailer {
+                        order.append(.cast)
+                    }
+                case .related:
+                    if !relatedRowsAreEmpty(meta: uiState.meta) {
+                        order.append(.related)
+                    }
+                case .network:
+                    if uiState.companies.contains(where: { $0.kind == .network && $0.tmdbId != nil }) {
+                        order.append(.network)
+                    }
+                case .production:
+                    if uiState.companies.contains(where: { $0.kind == .production && $0.tmdbId != nil }) {
+                        order.append(.production)
+                    }
+                case .comments:
+                    if hasCommentRows {
+                        order.append(.comments)
+                    }
                 }
             }
         }
@@ -7054,6 +7153,7 @@ private enum TvDetailsFocusActivity {
 
 private enum TvDetailsScrollID {
     static let topSection = "tv-details-top-section"
+    static let parentalGuideSection = "tv-details-parental-guide-section"
     static let castSection = "tv-details-cast-section"
     static let episodesSection = "tv-details-episodes-section"
     static let moreLikeThisSection = "tv-details-more-like-this"
@@ -8230,6 +8330,192 @@ private struct TvDetailsRatingsRow: View {
     }
 }
 
+private struct TvDetailsParentalGuideSection: View {
+    let warnings: [PlayerContentWarning]
+    var maxRowWidth: CGFloat? = nil
+    let entryLocked: Bool
+    var externalFocus: FocusState<String?>.Binding? = nil
+    var onBack: (() -> Void)? = nil
+    let onFocus: () -> Void
+
+    @State private var rememberedIndex = 0
+
+    private var entryIndex: Int {
+        warnings.indices.contains(rememberedIndex) ? rememberedIndex : 0
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text(L10n.string("details_parental_guide", fallback: "Parental Guide"))
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundColor(.white.opacity(0.9))
+
+            TvDetailsParentalGuideLayout(
+                horizontalSpacing: 14,
+                verticalSpacing: 12,
+                maxRowWidth: maxRowWidth
+            ) {
+                ForEach(Array(warnings.enumerated()), id: \.element.id) { index, warning in
+                    TvDetailsParentalGuidePill(
+                        warning: warning,
+                        externalFocus: externalFocus,
+                        onFocus: {
+                            if rememberedIndex != index { rememberedIndex = index }
+                            onFocus()
+                        },
+                        onBack: onBack
+                    )
+                    .disabled(entryLocked && index != entryIndex)
+                }
+            }
+            .padding(.vertical, 6)
+        }
+        .focusSection()
+        .onExitCommand {
+            onBack?()
+        }
+    }
+}
+
+private struct TvDetailsParentalGuidePill: View {
+    let warning: PlayerContentWarning
+    var externalFocus: FocusState<String?>.Binding? = nil
+    let onFocus: () -> Void
+    var onBack: (() -> Void)? = nil
+
+    @FocusState private var isFocused: Bool
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private var showsFocusedAppearance: Bool {
+        isFocused || externalFocus?.wrappedValue == warning.id
+    }
+
+    var body: some View {
+        Button(action: {}) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(severityColor)
+                    .frame(width: 11, height: 11)
+
+                Text(warning.localizedCategoryLabel)
+                    .font(.appFont(size: 22, weight: .semibold))
+                    .foregroundColor(.white.opacity(showsFocusedAppearance ? 1 : 0.92))
+                    .lineLimit(1)
+
+                Text(warning.localizedSeverityLabel)
+                    .font(.appFont(size: 22, weight: .regular))
+                    .foregroundColor(.white.opacity(showsFocusedAppearance ? 0.80 : 0.60))
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+            .background(
+                Capsule()
+                    .fill(Color.white.opacity(showsFocusedAppearance ? 0.20 : 0.11))
+            )
+            .overlay(
+                Capsule()
+                    .stroke(
+                        showsFocusedAppearance ? AppFocusOutline.color : Color.white.opacity(0.14),
+                        lineWidth: showsFocusedAppearance
+                            ? (focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
+                            : 1
+                    )
+            )
+            .fixedSize(horizontal: true, vertical: false)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: warning.id))
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(showsFocusedAppearance ? 1.04 : 1)
+        .animation(.easeOut(duration: 0.14), value: showsFocusedAppearance)
+        .onChange(of: showsFocusedAppearance) { _, focused in
+            if focused { onFocus() }
+        }
+        .onExitCommand {
+            onBack?()
+        }
+    }
+
+    private var severityColor: Color {
+        switch warning.severityLevel {
+        case .severe:
+            return Color(red: 0.94, green: 0.28, blue: 0.28)
+        case .moderate:
+            return Color(red: 0.97, green: 0.58, blue: 0.16)
+        case .mild:
+            return Color(red: 0.95, green: 0.80, blue: 0.22)
+        case nil:
+            return Color.white.opacity(0.45)
+        }
+    }
+}
+
+private struct TvDetailsParentalGuideLayout: Layout {
+    var horizontalSpacing: CGFloat = 12
+    var verticalSpacing: CGFloat = 10
+    var maxRowWidth: CGFloat? = nil
+
+    func sizeThatFits(
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) -> CGSize {
+        let maxWidth = maxRowWidth ?? proposal.width ?? .greatestFiniteMagnitude
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        var totalWidth: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX > 0 && currentX + horizontalSpacing + size.width > maxWidth {
+                currentX = 0
+                currentY += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            let originX = currentX == 0 ? 0 : currentX + horizontalSpacing
+            currentX = originX + size.width
+            rowHeight = max(rowHeight, size.height)
+            totalWidth = max(totalWidth, currentX)
+        }
+
+        return CGSize(
+            width: min(totalWidth, maxWidth),
+            height: currentY + rowHeight
+        )
+    }
+
+    func placeSubviews(
+        in bounds: CGRect,
+        proposal: ProposedViewSize,
+        subviews: Subviews,
+        cache: inout ()
+    ) {
+        let maxWidth = maxRowWidth ?? (bounds.width > 0 ? bounds.width : .greatestFiniteMagnitude)
+        var currentX: CGFloat = 0
+        var currentY: CGFloat = 0
+        var rowHeight: CGFloat = 0
+
+        for subview in subviews {
+            let size = subview.sizeThatFits(.unspecified)
+            if currentX > 0 && currentX + horizontalSpacing + size.width > maxWidth {
+                currentX = 0
+                currentY += rowHeight + verticalSpacing
+                rowHeight = 0
+            }
+            let originX = currentX == 0 ? 0 : currentX + horizontalSpacing
+            subview.place(
+                at: CGPoint(x: bounds.minX + originX, y: bounds.minY + currentY),
+                proposal: ProposedViewSize(size)
+            )
+            currentX = originX + size.width
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
 enum DetailsCastHeaderLabel {
     static func localizationKey(for type: String) -> String {
         let normalized = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -8959,7 +9245,6 @@ private struct CommentDetailOverlay: View {
 private enum TvDetailsTrailerControlFocus: Hashable {
     case timeline
     case pip
-    case playPause
     case subtitles
     case audio
     case wake
@@ -9117,7 +9402,11 @@ struct AVPlayerFullscreenOverlay: View {
 
     @FocusState private var focusedControl: TvDetailsTrailerControlFocus?
     @StateObject private var liveClock = PlaybackClock()
+    @StateObject private var liveSceneViewModel = SceneViewModel(
+        coordinator: SceneCoordinator(frameProvider: LiveOverlayNoopSceneFrameProvider())
+    )
     @State private var fallbackLiveStartedAt = Date()
+    @State private var showLiveInfoPanel = false
     @State private var isPlaying = true
     @State private var isSurfaceReady = false
     @State private var currentTime: Double = 0
@@ -9134,14 +9423,18 @@ struct AVPlayerFullscreenOverlay: View {
     @State private var controlsHideTask: Task<Void, Never>? = nil
     @State private var seekDebounceTask: Task<Void, Never>? = nil
     @State private var mediaSelectionLoadTask: Task<Void, Never>? = nil
+    @State private var liveTelemetryTask: Task<Void, Never>? = nil
     @State private var timeObserverToken: Any? = nil
+
+    private var isSceneEnabled: Bool {
+        (ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool)
+            ?? (UserDefaults.standard.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool)
+            ?? true
+    }
 
     private var transportFocusOrder: [TvDetailsTrailerControlFocus] {
         guard isLive else { return [.subtitles, .audio] }
-        return (pipController != nil ? [.pip] : [])
-            + [.playPause]
-            + (subtitleOptions.isEmpty ? [] : [.subtitles])
-            + (audioOptions.isEmpty ? [] : [.audio])
+        return (pipController != nil ? [.pip] : []) + [.subtitles, .audio]
     }
 
     private func isTransportButtonFocusable(_ key: TvDetailsTrailerControlFocus) -> Bool {
@@ -9155,7 +9448,7 @@ struct AVPlayerFullscreenOverlay: View {
     }
 
     private var primaryControlFocus: TvDetailsTrailerControlFocus {
-        isLive ? .playPause : .timeline
+        isLive ? (transportFocusOrder.first ?? .subtitles) : .timeline
     }
 
     private var isPlaybackActive: Bool {
@@ -9194,9 +9487,9 @@ struct AVPlayerFullscreenOverlay: View {
                         player: player,
                         videoGravity: .resizeAspect,
                         onLayerAvailable: { layer in
-                            if AVPictureInPictureController.isPictureInPictureSupported() {
-                                pipController = AVPictureInPictureController(playerLayer: layer)
-                            }
+                            guard AVPictureInPictureController.isPictureInPictureSupported(),
+                                  pipController?.playerLayer !== layer else { return }
+                            pipController = AVPictureInPictureController(playerLayer: layer)
                         }
                     ) {
                         withAnimation(.easeOut(duration: 0.2)) {
@@ -9209,9 +9502,9 @@ struct AVPlayerFullscreenOverlay: View {
                         player: player,
                         videoGravity: .resizeAspect,
                         onLayerAvailable: { layer in
-                            if AVPictureInPictureController.isPictureInPictureSupported() {
-                                pipController = AVPictureInPictureController(playerLayer: layer)
-                            }
+                            guard AVPictureInPictureController.isPictureInPictureSupported(),
+                                  pipController?.playerLayer !== layer else { return }
+                            pipController = AVPictureInPictureController(playerLayer: layer)
                         }
                     ) {
                         withAnimation(.easeOut(duration: 0.2)) {
@@ -9222,10 +9515,14 @@ struct AVPlayerFullscreenOverlay: View {
                 }
             }
             .ignoresSafeArea()
+            .zIndex(0)
 
             PlayerBottomFade()
-                .opacity(showControls ? 1 : 0)
-                .animation(.easeInOut(duration: 0.2), value: showControls)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .ignoresSafeArea()
+                .opacity(showControls || showLiveInfoPanel ? 1 : 0)
+                .animation(.easeInOut(duration: 0.2), value: showControls || showLiveInfoPanel)
+                .zIndex(1)
 
             // 3. Loading Indicator if preparing
             if !isReady && !isSurfaceReady {
@@ -9240,10 +9537,11 @@ struct AVPlayerFullscreenOverlay: View {
                 .padding(32)
                 .modifier(TvDetailsGlassBackground(filled: false, shape: RoundedRectangle(cornerRadius: 24, style: .continuous)))
                 .transition(.opacity)
+                .zIndex(4)
             }
 
             // 4. Remote wake surface when chrome is hidden
-            if !showControls {
+            if !showControls && !showLiveInfoPanel {
                 Button {
                     revealControls()
                 } label: {
@@ -9254,10 +9552,15 @@ struct AVPlayerFullscreenOverlay: View {
                 .nuvioFocusEffectDisabledIfAvailable()
                 .onExitCommand(perform: onDismiss)
                 .onPlayPauseCommand(perform: togglePlayPause)
-                .onMoveCommand { _ in
-                    revealControls()
+                .onMoveCommand { direction in
+                    if isLive, direction == .down, isSceneEnabled {
+                        openLiveInfoPanel()
+                    } else {
+                        revealControls()
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .zIndex(2)
             }
 
             // 5. Aether-style Player Controls Overlay
@@ -9269,12 +9572,25 @@ struct AVPlayerFullscreenOverlay: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .onExitCommand(perform: handleControlsExit)
             }
-            .opacity(showControls ? 1 : 0)
-            .allowsHitTesting(showControls)
-            .disabled(!showControls)
-            .accessibilityHidden(!showControls)
+            .opacity(showControls && !showLiveInfoPanel ? 1 : 0)
+            .allowsHitTesting(showControls && !showLiveInfoPanel)
+            .disabled(!showControls || showLiveInfoPanel)
+            .accessibilityHidden(!showControls || showLiveInfoPanel)
             .animation(.easeInOut(duration: 0.2), value: showControls)
+            .animation(.easeInOut(duration: 0.2), value: showLiveInfoPanel)
+            .zIndex(3)
+
+            // 6. Live IPTV Info Menu (ScenePanelView with InSight & Watch Party disabled)
+            if isLive && showLiveInfoPanel {
+                ScenePanelView(
+                    viewModel: liveSceneViewModel,
+                    onDismiss: closeLiveInfoPanel
+                )
+                .transition(.move(edge: .bottom).combined(with: .opacity))
+                .zIndex(5)
+            }
         }
+        .animation(.easeInOut(duration: 0.2), value: showLiveInfoPanel)
         .onAppear {
             setupTimeObserver()
             loadMediaSelectionGroups()
@@ -9300,11 +9616,12 @@ struct AVPlayerFullscreenOverlay: View {
             }
         }
         .onChange(of: showControls) { _, visible in
-            guard isLive else { return }
+            guard isLive, !showLiveInfoPanel else { return }
             DispatchQueue.main.async {
+                guard !showLiveInfoPanel else { return }
                 if visible {
                     if focusedControl == .wake {
-                        focusedControl = .playPause
+                        focusedControl = primaryControlFocus
                     }
                 } else {
                     focusedControl = .wake
@@ -9315,7 +9632,7 @@ struct AVPlayerFullscreenOverlay: View {
             if newControl == .timeline {
                 controlsAutoHideSuspended = false
                 scheduleControlsHide(after: 5.0)
-            } else if newControl == .subtitles || newControl == .audio || newControl == .playPause {
+            } else if newControl == .subtitles || newControl == .audio || newControl == .pip {
                 controlsAutoHideSuspended = false
                 scheduleControlsHide(after: 10.0)
             } else if newControl == .wake {
@@ -9333,8 +9650,8 @@ struct AVPlayerFullscreenOverlay: View {
             teardownTimeObserver()
         }
         .onExitCommand {
-            if isLive {
-                onDismiss()
+            if showLiveInfoPanel {
+                closeLiveInfoPanel()
             } else if showControls {
                 handleControlsExit()
             } else {
@@ -9438,55 +9755,35 @@ struct AVPlayerFullscreenOverlay: View {
                 .accessibilityLabel(L10n.string("player_pip", fallback: "Picture in Picture"))
             }
 
-            if isLive {
-                glassIconButton(
-                    size: 70,
-                    iconSize: 28,
-                    focusKey: .playPause,
-                    isFocused: focusedControl == .playPause,
-                    action: togglePlayPause
-                ) {
-                    Image(systemName: isPlaying ? "pause.fill" : "play.fill")
+            TrailerSubtitleMenuButton(
+                noneOption: subtitleNoneOption,
+                options: subtitleOptions,
+                isFocused: focusedControl == .subtitles,
+                onSelect: { opt in
+                    selectSubtitleOption(opt)
                 }
-                .accessibilityLabel(L10n.string(
-                    isPlaying ? "action_pause" : "action_play",
-                    fallback: isPlaying ? "Pause" : "Play"
-                ))
+            )
+            .equatable()
+            .focused($focusedControl, equals: .subtitles)
+            .disabled(!isTransportButtonFocusable(.subtitles))
+            .onExitCommand(perform: handleControlsExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .subtitles)
             }
 
-            if !isLive || !subtitleOptions.isEmpty {
-                TrailerSubtitleMenuButton(
-                    noneOption: subtitleNoneOption,
-                    options: subtitleOptions,
-                    isFocused: focusedControl == .subtitles,
-                    onSelect: { opt in
-                        selectSubtitleOption(opt)
-                    }
-                )
-                .equatable()
-                .focused($focusedControl, equals: .subtitles)
-                .disabled(!isTransportButtonFocusable(.subtitles))
-                .onExitCommand(perform: handleControlsExit)
-                .onMoveCommand { direction in
-                    handleMove(direction, from: .subtitles)
+            TrailerAudioMenuButton(
+                options: audioOptions,
+                isFocused: focusedControl == .audio,
+                onSelect: { opt in
+                    selectAudioOption(opt)
                 }
-            }
-
-            if !isLive || !audioOptions.isEmpty {
-                TrailerAudioMenuButton(
-                    options: audioOptions,
-                    isFocused: focusedControl == .audio,
-                    onSelect: { opt in
-                        selectAudioOption(opt)
-                    }
-                )
-                .equatable()
-                .focused($focusedControl, equals: .audio)
-                .disabled(!isTransportButtonFocusable(.audio))
-                .onExitCommand(perform: handleControlsExit)
-                .onMoveCommand { direction in
-                    handleMove(direction, from: .audio)
-                }
+            )
+            .equatable()
+            .focused($focusedControl, equals: .audio)
+            .disabled(!isTransportButtonFocusable(.audio))
+            .onExitCommand(perform: handleControlsExit)
+            .onMoveCommand { direction in
+                handleMove(direction, from: .audio)
             }
         }
         .onExitCommand(perform: handleControlsExit)
@@ -9642,7 +9939,11 @@ struct AVPlayerFullscreenOverlay: View {
                 focusedControl = transportFocusOrder.first ?? .subtitles
             }
         case .down:
-            if !isLive && origin != .timeline {
+            if isLive {
+                if isSceneEnabled {
+                    openLiveInfoPanel()
+                }
+            } else if origin != .timeline {
                 focusedControl = .timeline
             }
         case .left:
@@ -9706,7 +10007,7 @@ struct AVPlayerFullscreenOverlay: View {
                 showControls = true
             }
             if isLive {
-                focusedControl = .playPause
+                focusedControl = primaryControlFocus
             }
             controlsHideTask?.cancel()
         } else {
@@ -9716,7 +10017,7 @@ struct AVPlayerFullscreenOverlay: View {
                 showControls = true
             }
             if isLive {
-                focusedControl = .playPause
+                focusedControl = primaryControlFocus
             }
             scheduleControlsHide(after: focusedControl == .timeline ? 5.0 : 10.0)
         }
@@ -9753,7 +10054,7 @@ struct AVPlayerFullscreenOverlay: View {
             if isLive, showControls,
                let currentControl = focusedControl,
                !transportFocusOrder.contains(currentControl) {
-                focusedControl = .playPause
+                focusedControl = primaryControlFocus
             }
         }
     }
@@ -9828,9 +10129,7 @@ struct AVPlayerFullscreenOverlay: View {
     }
 
     private func handleControlsExit() {
-        if isLive {
-            onDismiss()
-        } else if pendingSeekDelta != 0 {
+        if !isLive && pendingSeekDelta != 0 {
             cancelPendingSeek()
             scheduleControlsHide(after: 5.0)
         } else {
@@ -9882,9 +10181,11 @@ struct AVPlayerFullscreenOverlay: View {
                         let pos = min(max(cur - start, 0), dur)
                         let loadedEnd = item.loadedTimeRanges.last?.timeRangeValue.end.seconds ?? cur
                         let buf = loadedEnd.isFinite ? min(max(loadedEnd - start, pos), dur) : pos
-                        if liveClock.livePosition != pos { liveClock.livePosition = pos }
-                        if liveClock.liveDuration != dur { liveClock.liveDuration = dur }
-                        if liveClock.liveBuffered != buf { liveClock.liveBuffered = buf }
+                        MainActor.assumeIsolated {
+                            if liveClock.livePosition != pos { liveClock.livePosition = pos }
+                            if liveClock.liveDuration != dur { liveClock.liveDuration = dur }
+                            if liveClock.liveBuffered != buf { liveClock.liveBuffered = buf }
+                        }
                     }
                 }
             } else {
@@ -9929,6 +10230,238 @@ struct AVPlayerFullscreenOverlay: View {
         }
     }
 
+    private func openLiveInfoPanel() {
+        guard isLive, isSceneEnabled else { return }
+        controlsHideTask?.cancel()
+        controlsHideTask = nil
+        controlsAutoHideSuspended = true
+        let initialInfo = immediateAVPlayerPlaybackInfo()
+        liveSceneViewModel.setMetadata(
+            title: title,
+            year: nil,
+            overview: nil,
+            runtime: nil,
+            nextEpisode: nil,
+            playbackInfo: initialInfo,
+            hasChapters: false,
+            hasAutoSync: false,
+            includeSceneTab: false
+        )
+        liveSceneViewModel.open()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showControls = false
+            showLiveInfoPanel = true
+        }
+        refreshLiveAVPlayerPlaybackInfo(base: initialInfo)
+    }
+
+    private func closeLiveInfoPanel() {
+        liveTelemetryTask?.cancel()
+        liveTelemetryTask = nil
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showLiveInfoPanel = false
+            controlsAutoHideSuspended = false
+        }
+        liveSceneViewModel.close()
+        DispatchQueue.main.async {
+            guard !showControls && !showLiveInfoPanel else { return }
+            focusedControl = .wake
+        }
+    }
+
+    private func immediateAVPlayerPlaybackInfo() -> ScenePlaybackInfo {
+        let item = player.currentItem
+        let accessEvent = item?.accessLog()?.events.last
+
+        let resolution: String
+        if let size = item?.presentationSize, size.width > 0, size.height > 0 {
+            resolution = "\(Int(size.width.rounded())) × \(Int(size.height.rounded()))"
+        } else {
+            resolution = "—"
+        }
+
+        let bitrateBps: Double = {
+            if let indicated = accessEvent?.indicatedBitrate, indicated > 0 { return indicated }
+            if let observed = accessEvent?.observedBitrate, observed > 0 { return observed }
+            return 0
+        }()
+        let videoBitrate = bitrateBps > 0 ? Self.formatBitrate(bitrateBps) : "—"
+
+        let container: String = {
+            let ext = ((item?.asset as? AVURLAsset)?.url.pathExtension ?? "").lowercased()
+            switch ext {
+            case "m3u8", "m3u": return "HLS"
+            case "ts", "m2ts": return "MPEG-TS"
+            case "mp4", "m4v": return "MP4"
+            default:
+                return accessEvent != nil ? "HLS" : "Live Stream"
+            }
+        }()
+
+        let audioLanguage: String = {
+            if let group = audibleGroup,
+               let selected = item?.currentMediaSelection.selectedMediaOption(in: group) ?? group.defaultOption {
+                if !selected.displayName.isEmpty { return selected.displayName }
+                if let id = selected.locale?.identifier,
+                   let localized = selected.locale?.localizedString(forIdentifier: id), !localized.isEmpty {
+                    return localized
+                }
+            }
+            return "—"
+        }()
+
+        return ScenePlaybackInfo(
+            engine: "AVPlayer",
+            version: "tvOS \(UIDevice.current.systemVersion)",
+            videoCodec: "—",
+            resolution: resolution,
+            frameRate: "—",
+            dynamicRange: "SDR",
+            videoBitrate: videoBitrate,
+            container: container,
+            videoDecoder: "VideoToolbox (Hardware)",
+            audioCodec: "—",
+            audioChannels: "—",
+            audioLanguage: audioLanguage,
+            audioBitrate: "—",
+            audioSpatialFormat: "Standard",
+            audioDecoder: "AVFoundation (Native)"
+        )
+    }
+
+    private func refreshLiveAVPlayerPlaybackInfo(base: ScenePlaybackInfo) {
+        liveTelemetryTask?.cancel()
+        guard let item = player.currentItem else { return }
+        let asset = item.asset
+        liveTelemetryTask = Task { @MainActor in
+            var info = base
+            if let videoTracks = try? await asset.loadTracks(withMediaType: .video),
+               let track = videoTracks.first {
+                if let size = try? await track.load(.naturalSize),
+                   size.width > 0, size.height > 0, info.resolution == "—" {
+                    info.resolution = "\(Int(size.width.rounded())) × \(Int(size.height.rounded()))"
+                }
+                if let fps = try? await track.load(.nominalFrameRate), fps.isFinite, fps > 0 {
+                    let rounded = fps.rounded()
+                    info.frameRate = abs(fps - rounded) < 0.05
+                        ? "\(Int(rounded)) fps"
+                        : String(format: "%.2f fps", fps)
+                }
+                if info.videoBitrate == "—",
+                   let rate = try? await track.load(.estimatedDataRate), rate.isFinite, rate > 0 {
+                    info.videoBitrate = Self.formatBitrate(Double(rate))
+                }
+                if let descs = try? await track.load(.formatDescriptions),
+                   let desc = descs.first {
+                    let subtype = CMFormatDescriptionGetMediaSubType(desc)
+                    if let codec = Self.videoCodecName(for: subtype) {
+                        info.videoCodec = codec
+                    }
+                    if let dynamicRange = Self.dynamicRangeName(for: desc) {
+                        info.dynamicRange = dynamicRange
+                    }
+                }
+            }
+
+            if let audioTracks = try? await asset.loadTracks(withMediaType: .audio),
+               let track = audioTracks.first {
+                if let rate = try? await track.load(.estimatedDataRate), rate.isFinite, rate > 0 {
+                    info.audioBitrate = Self.formatBitrate(Double(rate))
+                }
+                if info.audioLanguage == "—",
+                   let lang = try? await track.load(.languageCode), !lang.isEmpty {
+                    info.audioLanguage = Locale.current.localizedString(forLanguageCode: lang)?.capitalized ?? lang.uppercased()
+                }
+                if let descs = try? await track.load(.formatDescriptions),
+                   let desc = descs.first {
+                    let subtype = CMFormatDescriptionGetMediaSubType(desc)
+                    if let codec = Self.audioCodecName(for: subtype) {
+                        info.audioCodec = codec
+                    }
+                    if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(desc)?.pointee {
+                        info.audioChannels = Self.channelLayoutLabel(for: Int(asbd.mChannelsPerFrame))
+                    }
+                }
+            }
+
+            guard !Task.isCancelled, showLiveInfoPanel else { return }
+            liveSceneViewModel.updatePlaybackInfo(info)
+        }
+    }
+
+    private static func formatBitrate(_ bps: Double) -> String {
+        if bps >= 1_000_000 {
+            return String(format: "%.1f Mbps", bps / 1_000_000)
+        }
+        return "\(Int((bps / 1_000).rounded())) kbps"
+    }
+
+    private static func videoCodecName(for subtype: FourCharCode) -> String? {
+        switch subtype {
+        case kCMVideoCodecType_HEVC, kCMVideoCodecType_HEVCWithAlpha, 0x68657631, 0x68766331:
+            return "HEVC"
+        case kCMVideoCodecType_H264, 0x61766331, 0x61766333:
+            return "H.264"
+        case 0x61763031:
+            return "AV1"
+        case 0x76703039:
+            return "VP9"
+        case kCMVideoCodecType_MPEG2Video:
+            return "MPEG-2"
+        default:
+            let chars = [
+                Character(UnicodeScalar((subtype >> 24) & 0xff)!),
+                Character(UnicodeScalar((subtype >> 16) & 0xff)!),
+                Character(UnicodeScalar((subtype >> 8) & 0xff)!),
+                Character(UnicodeScalar(subtype & 0xff)!)
+            ]
+            let raw = String(chars).trimmingCharacters(in: .whitespacesAndNewlines)
+            return raw.isEmpty ? nil : raw.uppercased()
+        }
+    }
+
+    private static func dynamicRangeName(for desc: CMFormatDescription) -> String? {
+        guard let ext = CMFormatDescriptionGetExtensions(desc) as? [CFString: Any] else { return nil }
+        if let transfer = ext[kCMFormatDescriptionExtension_TransferFunction] as? String {
+            if transfer == (kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String) {
+                return "HDR10"
+            }
+            if transfer == (kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG as String) {
+                return "HLG"
+            }
+        }
+        return "SDR"
+    }
+
+    private static func audioCodecName(for subtype: FourCharCode) -> String? {
+        switch subtype {
+        case kAudioFormatMPEG4AAC, kAudioFormatMPEG4AAC_HE, kAudioFormatMPEG4AAC_HE_V2:
+            return "AAC"
+        case kAudioFormatAC3:
+            return "AC-3"
+        case kAudioFormatEnhancedAC3:
+            return "E-AC-3"
+        case kAudioFormatOpus:
+            return "Opus"
+        case kAudioFormatFLAC:
+            return "FLAC"
+        case kAudioFormatMPEGLayer3:
+            return "MP3"
+        default:
+            return nil
+        }
+    }
+
+    private static func channelLayoutLabel(for channels: Int) -> String {
+        switch channels {
+        case 1: return "1.0 Mono"
+        case 2: return "2.0 Stereo"
+        case 6: return "5.1"
+        case 8: return "7.1"
+        default: return channels > 0 ? "\(channels) ch" : "—"
+        }
+    }
+
     private func teardownTimeObserver() {
         controlsHideTask?.cancel()
         controlsHideTask = nil
@@ -9936,11 +10469,20 @@ struct AVPlayerFullscreenOverlay: View {
         seekDebounceTask = nil
         mediaSelectionLoadTask?.cancel()
         mediaSelectionLoadTask = nil
+        liveTelemetryTask?.cancel()
+        liveTelemetryTask = nil
         if let timeObserverToken {
             player.removeTimeObserver(timeObserverToken)
             self.timeObserverToken = nil
         }
     }
+}
+
+@MainActor
+private final class LiveOverlayNoopSceneFrameProvider: SceneFrameProviding {
+    var isSupported: Bool { false }
+    var capabilityMessage: String? { nil }
+    func captureCurrentFrame(maxWidth: Int, context: SceneContext) async -> SceneFrame? { nil }
 }
 
 actor PersonProfileImageCache {

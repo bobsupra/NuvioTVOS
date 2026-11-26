@@ -771,6 +771,135 @@ final class PlayerControlsSettingsTests: XCTestCase {
         ), "The skip-segment prompt must keep the window catcher from consuming input")
     }
 
+    @MainActor
+    func testVerticalNavigationFromTimelineAndSkipSegment() {
+        XCTAssertEqual(
+            PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: [.episodes, .subtitles, .settings]),
+            .episodes,
+            "Pressing Up from the timeline must land on the first transport circle button, not skip straight to Skip Intro"
+        )
+        XCTAssertEqual(
+            PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: []),
+            .settings
+        )
+
+        XCTAssertTrue(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: true,
+                isTimelineFocused: true,
+                isSkipSegmentFocused: false
+            ),
+            "Skip segment card must stay out of the spatial focus graph while the progress bar owns focus"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: true,
+                isTimelineFocused: false,
+                isSkipSegmentFocused: false
+            ),
+            "Skip segment card must be focusable once focus moves up to the transport circle buttons"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: true,
+                isTimelineFocused: true,
+                isSkipSegmentFocused: true
+            ),
+            "Skip segment card must remain enabled while it already holds focus"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: false,
+                isTimelineFocused: false,
+                isSkipSegmentFocused: false
+            ),
+            "Skip segment card must remain focusable while playback controls are hidden"
+        )
+
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: true,
+                isTimelineDownSuppressed: true,
+                isAuxiliaryCardFocused: false,
+                isMoveSuppressed: false
+            ),
+            "Landing on the timeline from Skip Intro/Recap must not open InSight on the same Down press"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: false,
+                isTimelineDownSuppressed: false,
+                isAuxiliaryCardFocused: false,
+                isMoveSuppressed: false
+            ),
+            "Down before timeline focus settles must not open InSight"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: true,
+                isTimelineDownSuppressed: false,
+                isAuxiliaryCardFocused: true,
+                isMoveSuppressed: false
+            ),
+            "Auxiliary card focus must block timeline Down from opening InSight"
+        )
+        XCTAssertTrue(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: true,
+                isTimelineDownSuppressed: false,
+                isAuxiliaryCardFocused: false,
+                isMoveSuppressed: false
+            ),
+            "Down while resting on the timeline must still open InSight"
+        )
+
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: true,
+                isTransportUpSuppressed: false
+            ),
+            "An Up press originating from the timeline must stop on the circle buttons"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: false,
+                isTransportUpSuppressed: true
+            ),
+            "The transport-up cooldown must prevent a single Up press from hopping through to Skip Intro"
+        )
+        XCTAssertTrue(
+            PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: false,
+                isTransportUpSuppressed: false
+            ),
+            "Pressing Up while resting on the circle buttons must still reach Skip Intro / Next Episode"
+        )
+
+        let viewModel = PlayerViewModel()
+        defer { viewModel.shutdown() }
+        viewModel.status = .paused
+        viewModel.showControls = true
+        viewModel.isTimelineFocused = true
+        viewModel.suppressTimelineDownBriefly(0.35)
+        XCTAssertTrue(viewModel.isTimelineDownSuppressed)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: 35)
+        XCTAssertFalse(viewModel.showScenePanel, "Suppressed timeline Down must not open InSight via trackpad")
+        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+
+        viewModel.suppressTransportUpBriefly(0.35)
+        XCTAssertTrue(viewModel.isTransportUpSuppressed)
+    }
+
     func testPlayerControlsSettingsSyncMappings() {
         let localMappings = Dictionary(uniqueKeysWithValues: PlayerSettingsSyncMapper.localToRemoteKeyMappings)
         XCTAssertEqual(localMappings[SettingsKey.playerShowPiP], "player_show_pip")

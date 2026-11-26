@@ -3025,7 +3025,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                                          channelCount: 0, fallback: "Subtitle \(subIdx + 1)")
                 subs.append(PlaybackTrackInfo(index: subIdx, id: id, type: type, title: display, lang: lang,
                                       selected: selected, externalFilename: externalFilename,
-                                      isForced: isForced))
+                                      isForced: isForced, detail: codec))
                 subIdx += 1
             }
         }

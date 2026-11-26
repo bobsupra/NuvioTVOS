@@ -57,13 +57,25 @@ final class CardAppearanceTests: XCTestCase {
         XCTAssertTrue(appearance.hideUnwatchedEpisodeDescriptions)
     }
 
-    func testCustomPosterArtworkAppliesToAllScreensWhenURLIsPresent() {
+    func testCustomPosterEnabledScreensArePreservedWhenURLIsPresent() {
         let suite = "nuvio.tests.cardAppearance.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
 
         defaults.set("https://example.com/poster?id={id}", forKey: SettingsKey.customPosterURLPattern)
-        defaults.set("home", forKey: SettingsKey.customPosterEnabledScreens)
+        defaults.set("home,library", forKey: SettingsKey.customPosterEnabledScreens)
+
+        let appearance = CardAppearance.stored(in: defaults)
+        XCTAssertEqual(appearance.customPosterURLPattern, "https://example.com/poster?id={id}")
+        XCTAssertEqual(appearance.customPosterEnabledScreens, "home,library")
+    }
+
+    func testCustomPosterEnabledScreensDefaultToAllWhenUnset() {
+        let suite = "nuvio.tests.cardAppearance.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        defer { defaults.removePersistentDomain(forName: suite) }
+
+        defaults.set("https://example.com/poster?id={id}", forKey: SettingsKey.customPosterURLPattern)
 
         let appearance = CardAppearance.stored(in: defaults)
         XCTAssertEqual(appearance.customPosterURLPattern, "https://example.com/poster?id={id}")

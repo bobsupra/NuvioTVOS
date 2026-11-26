@@ -1,6 +1,7 @@
 import SwiftUI
 import Combine
 import AVKit
+import AetherEngine
 import Darwin
 import ImageIO
 import OSLog
@@ -71,6 +72,11 @@ struct IPTVLiveView: View {
     @State private var inlinePreviewIsReady = false
     @State private var inlinePreviewChannelID: String?
     @State private var inlinePreviewStartedAt: Date?
+    @State private var inlinePreviewTarget: IPTVInlinePreviewTarget?
+    @State private var inlinePreviewFailureObserver: NSKeyValueObservation?
+    @State private var stalkerPreviewTask: Task<Void, Never>?
+    @State private var inlineAetherPreviewController: IPTVInlineAetherPreviewController?
+    @State private var inlineAetherPreviewIsReady = false
     @State private var fullscreenPreview: IPTVFullscreenPreview?
     @State private var isFullscreenPreviewTransitionActive = false
     @State private var fullscreenReturnChannelID: String?
@@ -341,7 +347,7 @@ struct IPTVLiveView: View {
     var body: some View {
         let activeChannel = activeSelectedChannel
         let activeEPG = activeChannel.map { epgSnapshot(for: $0) }
-        let previewURL = activeChannel.flatMap { eligibleInlinePreviewURL(for: $0) }
+        let previewRequest = activeChannel.flatMap { eligibleInlinePreviewRequest(for: $0) }
         let activeCategoryLabel = activeChannel.map { categoryPreferences.customNames[$0.group] ?? $0.category }
 
         return ZStack {
@@ -402,7 +408,7 @@ struct IPTVLiveView: View {
                             onResetGuideNow: { guidePageStartOverride = nil },
                             onRetryGuide: retryGuide,
                             onTuneChannel: { channel in
-                                selectChannelForPreview(channel)
+                                selectChannelForPreview(channel, openFullscreenIfAlreadyPreviewing: false)
                                 activeSidebarItem = .liveTV
                                 selectedGuideProgramme = nil
                                 selectedGuideChannelID = nil
@@ -452,7 +458,7 @@ struct IPTVLiveView: View {
                                 onMoveCategory: moveCategory,
                                 onSetCategoryHidden: setCategoryHidden,
                                 onBeginCategoryRename: beginCategoryRename,
-                                onSelectChannel: selectChannelForPreview,
+                                onSelectChannel: { channel in selectChannelForPreview(channel) },
                                 onPlayChannel: playChannel,
                                 onToggleFavorite: toggleFavorite,
                                 onMoveFavorite: moveFavorite
@@ -467,6 +473,8 @@ struct IPTVLiveView: View {
                                     activeEPG: activeEPG,
                                     categoryLabel: activeCategoryLabel,
                                     inlinePreviewPlayer: inlinePreviewPlayer,
+                                    inlineAetherPreviewController: inlineAetherPreviewController,
+                                    inlineAetherPreviewIsReady: inlineAetherPreviewIsReady,
                                     isFullscreenPreviewTransitionActive: isFullscreenPreviewTransitionActive,
                                     loading: loading,
                                     sourcesIsEmpty: sources.isEmpty,
@@ -477,7 +485,7 @@ struct IPTVLiveView: View {
                                     onPlay: playChannel,
                                     onMarkInlinePreviewReady: markInlinePreviewReady,
                                     onOpenCredentials: {
-                                        if sources.isEmpty { editingID = nil }
+                                        resetSourceEditor()
                                         showingCredentialsModal = true
                                     }
                                 )
@@ -511,7 +519,9 @@ struct IPTVLiveView: View {
             // A local full-screen player can cause this view to reappear while
             // its inline AVPlayer session is still alive. Keep that session and
             // its source state intact on the way back.
-            guard !isFullscreenPreviewTransitionActive, inlinePreviewPlayer == nil else { return }
+            guard !isFullscreenPreviewTransitionActive,
+                  inlinePreviewPlayer == nil,
+                  inlineAetherPreviewController?.activeChannelID == nil else { return }
             restoreSources()
         }
         .onChange(of: selectedID) { _, sourceID in
@@ -535,23 +545,13 @@ struct IPTVLiveView: View {
             }
             refreshGuideIfDue(now: now)
         }
-        .onChange(of: previewURL, initial: true) { _, url in
-            if let url, let player = inlinePreviewPlayer,
-               inlinePreviewItemIsForSameURL(player, url: url) { return }
-            stopInlinePreview()
-            guard let url else { return }
-            let player = AVPlayer(url: url)
-            PlaybackAudioSession.activateMoviePlayback()
-            player.isMuted = false
-            inlinePreviewIsReady = false
-            inlinePreviewStartedAt = Date()
-            inlinePreviewPlayer = player
-            player.play()
+        .onChange(of: previewRequest, initial: true) { _, request in
+            updateInlinePreview(for: request)
         }
         .onDisappear {
             if isFullscreenPreviewTransitionActive && isActive && scenePhase == .active { return }
             inlinePreviewChannelID = nil
-            stopInlinePreview()
+            stopInlinePreview(releaseAetherEngine: true)
             cancelSourceAndGuideWork()
         }
         .onChange(of: isActive) { _, active in
@@ -582,7 +582,6 @@ struct IPTVLiveView: View {
                 onTrailerReady: {},
                 onDismiss: requestFullscreenPreviewDismissal
             )
-            .ignoresSafeArea()
         }
     }
 
@@ -673,6 +672,7 @@ struct IPTVLiveView: View {
         case .settings:
             recomputeCategories()
             recomputeVisibleChannels()
+            resetSourceEditor()
             showingCredentialsModal = true
         }
     }
@@ -861,6 +861,15 @@ struct IPTVLiveView: View {
                             showingCredentialsModal = false
                         }
 
+                        if editingID != nil {
+                            IPTVDialogButton(
+                                title: L10n.string("iptv_add_new_source", fallback: "Add new"),
+                                isPrimary: false
+                            ) {
+                                resetSourceEditor()
+                            }
+                        }
+
                         Spacer()
 
                         IPTVDialogButton(
@@ -879,13 +888,14 @@ struct IPTVLiveView: View {
                     if !sources.isEmpty {
                         IPTVSettingsGroup(
                             title: L10n.string("iptv_configured_sources", fallback: "Configured sources"),
-                            subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")
+                            subtitle: L10n.string("iptv_switch_source_subtitle", fallback: "Select a source to switch portals, or edit and remove saved sources.")
                         ) {
                             ForEach(sources) { src in
                                 IPTVConfiguredSourceRow(
                                     source: src,
                                     kindLabel: sourceKindLabel(src.kind),
                                     isActiveSource: src.id == selectedID,
+                                    onSelect: { selectSource(src) },
                                     onEdit: { edit(src) },
                                     onDelete: { remove(src) }
                                 )
@@ -1210,7 +1220,18 @@ struct IPTVLiveView: View {
     }
 
     // MARK: - Playback Execution
-    private func selectChannelForPreview(_ channel: IPTVBaseChannel) {
+    private var activeSourceRecord: IPTVSource? {
+        sources.first(where: { $0.id == selectedID }) ?? successfullyLoadedSource
+    }
+
+    private func selectChannelForPreview(_ channel: IPTVBaseChannel, openFullscreenIfAlreadyPreviewing: Bool = true) {
+        if openFullscreenIfAlreadyPreviewing,
+           selectedChannelID == channel.id,
+           inlinePreviewChannelID == channel.id,
+           channel.streamURL != nil {
+            playChannel(channel)
+            return
+        }
         selectedChannelID = channel.id
         inlinePreviewChannelID = channel.streamURL == nil ? nil : channel.id
         if inlinePreviewIsReady,
@@ -1258,33 +1279,160 @@ struct IPTVLiveView: View {
         }
     }
 
-    private func eligibleInlinePreviewURL(for channel: IPTVBaseChannel) -> URL? {
+    private func eligibleInlinePreviewRequest(for channel: IPTVBaseChannel) -> IPTVInlinePreviewRequestKey? {
         guard isActive, !loading, inlinePreviewChannelID == channel.id,
               selectedChannelID == channel.id, scenePhase == .active, !showingCredentialsModal,
               let url = channel.streamURL,
-              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else { return nil }
-        return url
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" || scheme == "stalker" else { return nil }
+        return IPTVInlinePreviewRequestKey(channelID: channel.id, streamURL: url, sourceID: selectedID)
+    }
+
+    private func updateInlinePreview(for request: IPTVInlinePreviewRequestKey?) {
+        guard let request else {
+            stopInlinePreview()
+            return
+        }
+        if inlinePreviewTarget?.channelID == request.channelID,
+           (inlinePreviewPlayer != nil || inlineAetherPreviewController?.activeChannelID == request.channelID) {
+            return
+        }
+        if stalkerPreviewTask != nil, inlinePreviewChannelID == request.channelID,
+           request.streamURL.scheme?.lowercased() == "stalker" {
+            return
+        }
+
+        stopInlinePreview()
+        let scheme = request.streamURL.scheme?.lowercased()
+        if scheme == "http" || scheme == "https" {
+            let source = activeSourceRecord
+            let backend = IPTVInlinePreviewPolicy.backend(
+                for: request.streamURL,
+                sourceKind: source?.kind,
+                xtreamOutput: source?.xtreamOutput
+            )
+            startInlinePreview(
+                channelID: request.channelID,
+                url: request.streamURL,
+                headers: [:],
+                backend: backend
+            )
+            return
+        }
+
+        guard scheme == "stalker",
+              let stalker = stalkerChannels.first(where: { $0.id == request.channelID }),
+              let client = stalkerClient else { return }
+
+        let targetChannelID = request.channelID
+        stalkerPreviewTask = Task { @MainActor in
+            defer {
+                if inlinePreviewChannelID == targetChannelID {
+                    stalkerPreviewTask = nil
+                }
+            }
+            do {
+                let playback = try await client.resolve(stalker)
+                guard !Task.isCancelled,
+                      isActive,
+                      !loading,
+                      scenePhase == .active,
+                      !showingCredentialsModal,
+                      selectedChannelID == targetChannelID,
+                      inlinePreviewChannelID == targetChannelID else { return }
+                let backend = IPTVInlinePreviewPolicy.backend(
+                    for: playback.url,
+                    sourceKind: .stalker,
+                    xtreamOutput: nil
+                )
+                startInlinePreview(
+                    channelID: targetChannelID,
+                    url: playback.url,
+                    headers: playback.headers,
+                    backend: backend
+                )
+            } catch {
+                return
+            }
+        }
+    }
+
+    private func startInlinePreview(
+        channelID: String,
+        url: URL,
+        headers: [String: String],
+        backend: IPTVInlinePreviewBackend
+    ) {
+        inlinePreviewFailureObserver?.invalidate()
+        inlinePreviewFailureObserver = nil
+        inlinePreviewPlayer?.pause()
+        inlinePreviewPlayer?.replaceCurrentItem(with: nil)
+        inlinePreviewPlayer = nil
+        inlinePreviewIsReady = false
+        inlineAetherPreviewController?.stop()
+        inlineAetherPreviewIsReady = false
+
+        inlinePreviewTarget = IPTVInlinePreviewTarget(
+            channelID: channelID,
+            url: url,
+            headers: headers,
+            backend: backend
+        )
+        inlinePreviewStartedAt = Date()
+
+        switch backend {
+        case .avPlayer:
+            let assetOptions: [String: Any]? = headers.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": headers]
+            let asset = AVURLAsset(url: url, options: assetOptions)
+            let item = AVPlayerItem(asset: asset)
+            let player = AVPlayer(playerItem: item)
+            PlaybackAudioSession.activateMoviePlayback()
+            player.isMuted = false
+            inlinePreviewPlayer = player
+            inlinePreviewFailureObserver = item.observe(\.status, options: [.new]) { observedItem, _ in
+                guard observedItem.status == .failed else { return }
+                Task { @MainActor in
+                    guard inlinePreviewPlayer === player,
+                          inlinePreviewChannelID == channelID,
+                          selectedChannelID == channelID,
+                          isActive,
+                          scenePhase == .active,
+                          !showingCredentialsModal else { return }
+                    startInlinePreview(
+                        channelID: channelID,
+                        url: url,
+                        headers: headers,
+                        backend: .aether
+                    )
+                }
+            }
+            player.play()
+
+        case .aether:
+            let controller = inlineAetherPreviewController ?? IPTVInlineAetherPreviewController()
+            guard let controller else { return }
+            inlineAetherPreviewController = controller
+            controller.load(url: url, headers: headers, channelID: channelID) {
+                guard inlinePreviewChannelID == channelID,
+                      selectedChannelID == channelID,
+                      inlineAetherPreviewController === controller else { return }
+                inlineAetherPreviewIsReady = true
+                recordRecent(channelID: channelID)
+            }
+        }
     }
 
     private func inlinePreviewItemMatches(for channel: IPTVBaseChannel, player: AVPlayer) -> Bool {
         guard inlinePreviewPlayer === player,
               inlinePreviewChannelID == channel.id,
               selectedChannelID == channel.id,
-              let expectedURL = eligibleInlinePreviewURL(for: channel),
+              eligibleInlinePreviewRequest(for: channel) != nil,
+              let expectedURL = inlinePreviewTarget?.channelID == channel.id ? inlinePreviewTarget?.url : channel.streamURL,
               let item = player.currentItem,
               item.status == .readyToPlay,
               item.error == nil,
               let asset = item.asset as? AVURLAsset,
               asset.url == expectedURL else { return false }
-        return true
-    }
-
-    private func inlinePreviewItemIsForSameURL(_ player: AVPlayer, url: URL) -> Bool {
-        guard let item = player.currentItem,
-              item.status != .failed,
-              item.error == nil,
-              let asset = item.asset as? AVURLAsset,
-              asset.url == url else { return false }
         return true
     }
 
@@ -1343,14 +1491,24 @@ struct IPTVLiveView: View {
     private func discardInlinePreviewForExternalExit() {
         fullscreenPreview = nil
         inlinePreviewChannelID = nil
-        stopInlinePreview()
+        stopInlinePreview(releaseAetherEngine: true)
     }
 
-    private func stopInlinePreview() {
+    private func stopInlinePreview(releaseAetherEngine: Bool = false) {
+        stalkerPreviewTask?.cancel()
+        stalkerPreviewTask = nil
+        inlinePreviewFailureObserver?.invalidate()
+        inlinePreviewFailureObserver = nil
+        inlinePreviewTarget = nil
         inlinePreviewPlayer?.pause()
         inlinePreviewPlayer?.replaceCurrentItem(with: nil)
         inlinePreviewPlayer = nil
         inlinePreviewIsReady = false
+        inlineAetherPreviewController?.stop()
+        if releaseAetherEngine {
+            inlineAetherPreviewController = nil
+        }
+        inlineAetherPreviewIsReady = false
         inlinePreviewStartedAt = nil
     }
 
@@ -1450,9 +1608,14 @@ struct IPTVLiveView: View {
 
             let now = Date()
             let cached = loadedCache.validEntry(profileID: profileID, sources: sources, now: now)
+            let savedSourceID = IPTVSelectedSourceStore.load(defaults: ProfileSettings.store(for: profileID))
             if loadingSource != nil, loadTask != nil { return }
-            if let source = cached?.source ?? sources.first(where: { $0.id == selectedID }) ?? sources.first {
+            if let source = sources.first(where: { $0.id == selectedID })
+                ?? cached?.source
+                ?? sources.first(where: { $0.id == savedSourceID })
+                ?? sources.first {
                 selectedID = source.id
+                IPTVSelectedSourceStore.save(source.id, defaults: ProfileSettings.store(for: profileID))
                 if successfullyLoadedSource == source,
                    let successfullyLoadedAt,
                    now.timeIntervalSince(successfullyLoadedAt) < LoadedCache.lineupLifetime {
@@ -1503,8 +1666,9 @@ struct IPTVLiveView: View {
         loadedCache.clear()
         clearLoadedContent()
         inlinePreviewChannelID = nil
-        stopInlinePreview()
+        stopInlinePreview(releaseAetherEngine: true)
         selectedID = nil
+        IPTVSelectedSourceStore.save(nil, defaults: ProfileSettings.store(for: profileID))
         selectedChannelID = nil
         loadCategoryPreferences(for: nil)
     }
@@ -1708,6 +1872,7 @@ struct IPTVLiveView: View {
                 selectedGuideProgramme = nil
                 selectedGuideChannelID = nil
                 selectedID = source.id
+                IPTVSelectedSourceStore.save(source.id, defaults: ProfileSettings.store(for: profileID))
                 favoriteKeys = lineup.favoriteKeys
                 let favoriteStore = IPTVFavoritesStore(defaults: ProfileSettings.store(for: profileID))
                 favoriteOrder = favoriteStore.reconciledOrder(favoriteOrder, playlistOrder: lineup.orderedFavoriteKeys, favorites: favorites)
@@ -1723,7 +1888,8 @@ struct IPTVLiveView: View {
                 }
             } catch {
                 guard !Task.isCancelled, requestID == token else { return }
-                errorMessage = L10n.string("iptv_load_error", fallback: "Could not load this source. Please try again.")
+                let failure = IPTVFailureKind.classify(error)
+                errorMessage = L10n.string(failure.localizationKey, fallback: failure.fallbackMessage)
 #if NUVIO_SIDEBAR_WATCHDOG
                 Self.sidebarLogger.warning("playlist load failed kind=\(source.kind.rawValue, privacy: .public) durationMs=\(Int((ProcessInfo.processInfo.systemUptime - startedAt) * 1000))")
 #endif
@@ -1759,6 +1925,7 @@ struct IPTVLiveView: View {
                 resetLoadedStateForEmptySources()
                 if let nextSource = updated.first {
                     selectedID = nextSource.id
+                    IPTVSelectedSourceStore.save(nextSource.id, defaults: ProfileSettings.store(for: profileID))
                     loadCategoryPreferences(for: nextSource.id)
                     load(nextSource)
                 }
@@ -1766,6 +1933,36 @@ struct IPTVLiveView: View {
         } catch {
             errorMessage = L10n.string("iptv_delete_error", fallback: "Could not delete this source.")
         }
+    }
+
+    private func selectSource(_ source: IPTVSource) {
+        showingCredentialsModal = false
+        resetSourceEditor()
+        if selectedID == source.id,
+           successfullyLoadedSource == source,
+           !loading {
+            return
+        }
+        cancelSourceAndGuideWork()
+        loadedCache.clear()
+        clearLoadedContent()
+        inlinePreviewChannelID = nil
+        stopInlinePreview(releaseAetherEngine: true)
+        selectedID = source.id
+        IPTVSelectedSourceStore.save(source.id, defaults: ProfileSettings.store(for: profileID))
+        loadCategoryPreferences(for: source.id)
+        load(source)
+    }
+
+    private func resetSourceEditor() {
+        editingID = nil
+        sourceName = ""
+        sourceURL = ""
+        sourceKind = .xtream
+        username = ""
+        password = ""
+        mac = ""
+        xtreamOutput = .mpegTS
     }
 
     private func edit(_ source: IPTVSource) {
@@ -2305,10 +2502,12 @@ private struct IPTVChannelListCard: View {
                         .font(.system(size: 23, weight: .bold))
                         .foregroundColor(.white)
                     Text(isChoosingCategory
-                        ? L10n.format("iptv_categories_count", fallback: "%d categories", categoryChooserGroups.count)
+                        ? "\(L10n.format("iptv_categories_count", fallback: "%d categories", categoryChooserGroups.count)) • \(L10n.string("iptv_category_manage_hint", fallback: "Hold Select to hide or reorder"))"
                         : L10n.format("iptv_channels_count", fallback: "%d channels", totalVisibleCount))
                         .font(.system(size: 16))
                         .foregroundColor(Color.white.opacity(0.5))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
                 }
                 Spacer()
                 if isChoosingCategory && hasHiddenCategoryGroups {
@@ -2673,6 +2872,8 @@ private struct IPTVLivePreviewCard: View {
     let activeEPG: IPTVChannelEPGSnapshot?
     let categoryLabel: String?
     let inlinePreviewPlayer: AVPlayer?
+    let inlineAetherPreviewController: IPTVInlineAetherPreviewController?
+    let inlineAetherPreviewIsReady: Bool
     let isFullscreenPreviewTransitionActive: Bool
     let loading: Bool
     let sourcesIsEmpty: Bool
@@ -2724,6 +2925,14 @@ private struct IPTVLivePreviewCard: View {
                             .id(ObjectIdentifier(player))
                             .accessibilityHidden(true)
                             .allowsHitTesting(false)
+                        } else if !isFullscreenPreviewTransitionActive,
+                                  let aetherController = inlineAetherPreviewController,
+                                  aetherController.activeChannelID == active.id {
+                            IPTVAetherVideoSurface(controller: aetherController)
+                                .frame(width: geo.size.width, height: geo.size.height)
+                                .opacity(inlineAetherPreviewIsReady ? 1 : 0)
+                                .accessibilityHidden(true)
+                                .allowsHitTesting(false)
                         }
 
                         LinearGradient(
@@ -3699,6 +3908,118 @@ private struct IPTVFullscreenPreview: Identifiable {
     let startedAt: Date
 }
 
+private struct IPTVInlinePreviewRequestKey: Equatable {
+    let channelID: String
+    let streamURL: URL
+    let sourceID: UUID?
+}
+
+private struct IPTVInlinePreviewTarget: Equatable {
+    let channelID: String
+    let url: URL
+    let headers: [String: String]
+    let backend: IPTVInlinePreviewBackend
+}
+
+@MainActor
+private final class IPTVInlineAetherPreviewController {
+    let engine: AetherEngine
+    let playerView: AetherPlayerView
+
+    private(set) var activeChannelID: String?
+    private var loadTask: Task<Void, Never>?
+    private var readinessCancellable: AnyCancellable?
+    private var generation: UInt64 = 0
+
+    init?() {
+        guard let engine = try? AetherEngine() else { return nil }
+        self.engine = engine
+        self.playerView = AetherPlayerView()
+        self.playerView.backgroundColor = .clear
+        self.playerView.clipsToBounds = true
+        self.engine.ownsVideoNowPlayingSession = false
+        self.engine.nativeAudioSessionActivationEnabled = true
+        self.engine.videoGravity = .resizeAspectFill
+        self.engine.bind(view: self.playerView)
+    }
+
+    func rebindSurface() {
+        engine.videoGravity = .resizeAspectFill
+        engine.bind(view: playerView)
+    }
+
+    func load(url: URL, headers: [String: String], channelID: String, onFirstFrame: @escaping () -> Void) {
+        stop()
+        generation &+= 1
+        let gen = generation
+        activeChannelID = channelID
+
+        rebindSurface()
+        PlaybackAudioSession.activateMoviePlayback()
+
+        var didNotify = false
+        readinessCancellable = engine.$hasFirstFrameReadyForDisplay
+            .removeDuplicates()
+            .sink { [weak self] isReady in
+                guard let self, self.generation == gen, isReady, !didNotify else { return }
+                didNotify = true
+                onFirstFrame()
+            }
+
+        let options = LoadOptions(
+            displayCriteriaOwner: .host,
+            httpHeaders: headers,
+            matchContentEnabled: false,
+            isLive: true,
+            liveJoinProfile: .fastZap,
+            liveStartupGraceSeconds: 0.5,
+            liveStartupSingleSegmentMinimumSeconds: 1.5,
+            liveEdgeCushionSeconds: 3.0,
+            liveJoinStartsImmediately: true,
+            nativeRemoteHLS: false,
+            generatesBackgroundScrubPreviews: false,
+            confirmAtmos: false,
+            retainsSessionCacheAfterStop: false,
+            progressiveSegmentDelivery: false,
+            autoplay: true
+        )
+
+        loadTask = Task { @MainActor [weak self] in
+            guard let self, !Task.isCancelled, self.generation == gen else { return }
+            do {
+                _ = try await self.engine.load(url: url, options: options)
+                guard !Task.isCancelled, self.generation == gen else { return }
+                self.engine.play()
+            } catch {
+                return
+            }
+        }
+    }
+
+    func stop() {
+        generation &+= 1
+        loadTask?.cancel()
+        loadTask = nil
+        readinessCancellable?.cancel()
+        readinessCancellable = nil
+        activeChannelID = nil
+        engine.stop(resetDisplayCriteria: false)
+    }
+}
+
+private struct IPTVAetherVideoSurface: UIViewRepresentable {
+    let controller: IPTVInlineAetherPreviewController
+
+    func makeUIView(context: Context) -> AetherPlayerView {
+        controller.rebindSurface()
+        return controller.playerView
+    }
+
+    func updateUIView(_ uiView: AetherPlayerView, context: Context) {
+        controller.rebindSurface()
+    }
+}
+
 struct IPTVVideoSurface: UIViewRepresentable {
     let player: AVPlayer
     var videoGravity: AVLayerVideoGravity = .resizeAspectFill
@@ -3713,7 +4034,12 @@ struct IPTVVideoSurface: UIViewRepresentable {
         let view = TrailerPlayerLayerView()
         view.playerLayer.videoGravity = videoGravity
         view.playerLayer.player = player
-        onLayerAvailable?(view.playerLayer)
+        if let onLayerAvailable {
+            let layer = view.playerLayer
+            DispatchQueue.main.async {
+                onLayerAvailable(layer)
+            }
+        }
         context.coordinator.observe(view.playerLayer, player: player)
         return view
     }
@@ -3971,15 +4297,17 @@ private struct IPTVConfiguredSourceRow: View {
     let source: IPTVSource
     let kindLabel: String
     let isActiveSource: Bool
+    let onSelect: () -> Void
     let onEdit: () -> Void
     let onDelete: () -> Void
 
     @FocusState private var isRowFocused: Bool
+    @FocusState private var isEditFocused: Bool
     @FocusState private var isDeleteFocused: Bool
 
     var body: some View {
         HStack(spacing: 14) {
-            Button(action: onEdit) {
+            Button(action: onSelect) {
                 IPTVRowShell(isFocused: isRowFocused) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(source.name)
@@ -4000,19 +4328,34 @@ private struct IPTVConfiguredSourceRow: View {
                             Circle()
                                 .fill(Color.green)
                                 .frame(width: 10, height: 10)
+                            Text(L10n.string("iptv_source_active", fallback: "Active"))
+                                .font(.appFont(size: 19, weight: .bold))
+                                .foregroundColor(.white)
+                        } else {
+                            Text(L10n.string("iptv_source_switch", fallback: "Switch"))
+                                .font(.appFont(size: 19, weight: .bold))
+                                .foregroundColor(.white)
+                            Image(systemName: "arrow.left.arrow.right")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white.opacity(0.75))
                         }
-                        Text(L10n.string("iptv_edit", fallback: "Edit"))
-                            .font(.appFont(size: 19, weight: .bold))
-                            .foregroundColor(.white)
-                        Image(systemName: "chevron.right")
-                            .font(.system(size: 17, weight: .bold))
-                            .foregroundColor(.white.opacity(0.7))
                     }
                 }
             }
             .buttonStyle(PosterCardButtonStyle())
             .focused($isRowFocused)
             .focusEffectDisabledIfAvailable()
+
+            Button(action: onEdit) {
+                Image(systemName: isEditFocused ? "pencil.circle.fill" : "pencil.circle")
+                    .font(.system(size: 32))
+                    .foregroundColor(isEditFocused ? .white : .white.opacity(0.6))
+                    .frame(width: 60, height: 60)
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isEditFocused)
+            .focusEffectDisabledIfAvailable()
+            .accessibilityLabel(L10n.string("iptv_edit", fallback: "Edit"))
 
             Button(role: .destructive, action: onDelete) {
                 Image(systemName: isDeleteFocused ? "trash.circle.fill" : "trash.circle")
@@ -4023,6 +4366,7 @@ private struct IPTVConfiguredSourceRow: View {
             .buttonStyle(PosterCardButtonStyle())
             .focused($isDeleteFocused)
             .focusEffectDisabledIfAvailable()
+            .accessibilityLabel(L10n.string("action_delete", fallback: "Delete"))
         }
     }
 }
@@ -4162,7 +4506,11 @@ private struct HiddenIPTVTextField: UIViewRepresentable {
         } else if !isEditing {
             context.coordinator.cancelPendingActivation()
             if uiView.isFirstResponder {
-                uiView.resignFirstResponder()
+                DispatchQueue.main.async {
+                    if uiView.isFirstResponder {
+                        uiView.resignFirstResponder()
+                    }
+                }
             }
         }
     }
