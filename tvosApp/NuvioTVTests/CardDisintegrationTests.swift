@@ -109,6 +109,22 @@ final class CardDisintegrationTests: XCTestCase {
         CardDisintegration.shared.setFrame(nil, for: "tt-disabled")
     }
 
+    /// The switch saves to the profile's settings, not to the standard
+    /// defaults, so a value in the standard defaults alone doesn't count.
+    func testPerishAnimationFollowsTheProfileSettings() {
+        let suiteName = "CardDisintegrationTests.profile"
+        let profile = UserDefaults(suiteName: suiteName)!
+        profile.removePersistentDomain(forName: suiteName)
+        UserDefaults.standard.set(true, forKey: SettingsKey.continueWatchingPerishAnimation)
+        defer {
+            profile.removePersistentDomain(forName: suiteName)
+            UserDefaults.standard.removeObject(forKey: SettingsKey.continueWatchingPerishAnimation)
+        }
+        XCTAssertFalse(CardDisintegration.perishAnimationEnabled(in: profile))
+        profile.set(true, forKey: SettingsKey.continueWatchingPerishAnimation)
+        XCTAssertTrue(CardDisintegration.perishAnimationEnabled(in: profile))
+    }
+
     func testDissolveCardRunsImmediatelyWhenExplicitlySetToFalse() {
         let defaults = UserDefaults.standard
         defaults.set(false, forKey: SettingsKey.continueWatchingPerishAnimation)
