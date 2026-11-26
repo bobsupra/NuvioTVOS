@@ -178,6 +178,18 @@ final class UsenetCoreTests: XCTestCase {
         XCTAssertEqual(framer.pendingCount, 0)
     }
 
+    func testTakenDownArticlesCountAsMissing() {
+        // 451: an article taken down (DMCA), which some providers answer on BODY only.
+        for code in [420, 423, 430, 451] {
+            XCTAssertTrue(UsenetNNTPConnection.missingArticleCodes.contains(code), "\(code)")
+        }
+        // Connection and login problems are not missing articles.
+        for code in [205, 400, 480, 481, 500, 502, 503] {
+            XCTAssertFalse(UsenetNNTPConnection.missingArticleCodes.contains(code), "\(code)")
+        }
+        XCTAssertFalse(UsenetNNTPError.articleUnavailable(code: 451).isTransient)
+    }
+
     func testTransientErrors() {
         XCTAssertTrue(UsenetNNTPError.timeout.isTransient)
         XCTAssertTrue(UsenetNNTPError.connectionClosed.isTransient)
