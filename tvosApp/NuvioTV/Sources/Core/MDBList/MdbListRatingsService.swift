@@ -188,7 +188,7 @@ enum MdbListRatingsService {
             if let imdb = meta.imdbId { return imdb }
             if prefix == "imdb" { return value }
             if prefix?.hasPrefix("tt") == true { return meta.id }
-            return nil
+            return NuvioMeta.imdbIDAfterAddonPrefix(in: meta.id)
         }()
         if let imdbCandidate,
            let imdb = NuvioMeta.canonicalImdbID(from: imdbCandidate) {

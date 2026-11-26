@@ -350,6 +350,13 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable, Sendable {
         return "tt\(candidate.dropFirst(2))"
     }
 
+    /// The IMDb id some add-ons put after their own prefix ("cotonet:tt16418808"): the
+    /// first segment of the colon-separated id, after the first one, that is as a whole an
+    /// IMDb id. A leading IMDb id is left to the caller's own rules.
+    static func imdbIDAfterAddonPrefix(in id: String) -> String? {
+        id.split(separator: ":").dropFirst().lazy.compactMap { canonicalImdbID(from: String($0)) }.first
+    }
+
     /// Canonical stream lookup id: the additive-imdb id when known (what stream
     /// add-ons declare in their `idPrefixes`), otherwise the meta id. Items can
     /// carry non-canonical ids ("tmdb:123", "simkl:42") which stream add-ons do
