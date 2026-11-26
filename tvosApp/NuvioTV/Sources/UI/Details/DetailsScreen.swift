@@ -14899,6 +14899,14 @@ private struct TvStreamAvailabilityLine: View {
             }
             return L10n.format("usenet_check_partial_nzb", fallback: "Mostly available: the NZB lacks %d articles", report.nzbGaps)
         case .incomplete:
+            switch report.playbackProblem {
+            case .wouldNotStart?:
+                return L10n.string("usenet_check_incomplete_start", fallback: "Incomplete: it wouldn't start on your servers")
+            case .damaged?:
+                return L10n.string("usenet_check_incomplete_damaged", fallback: "Incomplete: too damaged when it played")
+            case nil:
+                break
+            }
             if report.missingVolumes > 0 {
                 return L10n.format("usenet_check_incomplete_volumes", fallback: "Incomplete: %d archive volumes missing from the NZB", report.missingVolumes)
             }

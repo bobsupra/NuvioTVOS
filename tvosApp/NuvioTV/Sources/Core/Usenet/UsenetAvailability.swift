@@ -4,9 +4,10 @@ import Combine
 // MARK: - What a check finds
 
 /// What checking a Usenet stream before playing it found: the NZB read for what it
-/// lacks itself, and a sample of its articles asked about on the servers (`STAT`,
-/// nothing downloaded), the way playback checks a release when it starts.
-struct UsenetAvailabilityReport: Sendable, Equatable {
+/// lacks itself, and a sample of its articles asked about on the servers (`STAT`, a
+/// couple of them downloaded: `BODY`), the way playback checks a release when it
+/// starts. Or what playing it showed (`playbackProblem`).
+struct UsenetAvailabilityReport: Sendable, Equatable, Codable {
     enum Verdict: String, Sendable, Equatable {
         /// Every sampled article is on the servers.
         case available
@@ -25,13 +26,26 @@ struct UsenetAvailabilityReport: Sendable, Equatable {
     var nzbGaps: Int
     /// Volumes missing from a numbered RAR set.
     var missingVolumes: Int
+    /// Of the articles asked about, the ones downloaded (`BODY`) rather than only asked
+    /// about: a provider can still answer `STAT` for an article taken down.
+    var downloaded = 0
+
+    /// What playing the stream showed, which makes it incomplete whatever a check found.
+    enum PlaybackProblem: String, Sendable, Equatable, Codable {
+        /// Playback couldn't start: its first article is gone.
+        case wouldNotStart
+        /// It started, then turned out too damaged to go on.
+        case damaged
+    }
+    var playbackProblem: PlaybackProblem?
 
     /// Damage this long a run stops playback (`UsenetStreamSession.damageConsecutiveMissing`).
     static let nzbGapsLimit = 3
 
     var verdict: Verdict {
         let health = UsenetHealthCheck.Result(checked: checked, missing: missing, tailMissing: tailMissing)
-        if !UsenetHealthCheck.isPlayable(health) || missingVolumes > 0 || nzbGaps >= Self.nzbGapsLimit {
+        if playbackProblem != nil || !UsenetHealthCheck.isPlayable(health)
+            || missingVolumes > 0 || nzbGaps >= Self.nzbGapsLimit {
             return .incomplete
         }
         return missing > 0 || nzbGaps > 0 ? .partial : .available
@@ -46,11 +60,16 @@ enum UsenetAvailability {
     struct Plan: Sendable, Equatable {
         /// Message IDs to ask about, spread over the release, its last article last.
         var samples: [String]
+        /// The ones among them to download instead (`BODY`), inside the release.
+        var downloads: Set<String> = []
         /// The NZB lacks the release's last article: nothing to ask, it's missing.
         var tailMissingInNZB: Bool
         var nzbGaps: Int
         var missingVolumes: Int
     }
+
+    /// Articles of the sample downloaded rather than only asked about (about 1.5 MB).
+    static let bodyProbes = 2
 
     static func plan(for nzb: UsenetNZB, mustInclude: String? = nil,
                      sampleCount: Int = UsenetHealthCheck.sampleCount) -> Plan {
@@ -62,6 +81,14 @@ enum UsenetAvailability {
             let position = count == 1 ? ids.count - 1 : step * (ids.count - 1) / (count - 1)
             samples.append(ids[position])
         }
+        // Two from inside the release are downloaded: a provider can answer STAT for an
+        // article taken down (DMCA) that BODY then refuses (451).
+        var downloads = Set<String>()
+        if samples.count >= 3 {
+            for step in 1...bodyProbes {
+                downloads.insert(samples[step * (samples.count - 1) / (bodyProbes + 1)])
+            }
+        }
         var tailMissing = false
         if let last = files.last, let declared = declaredSegments(inSubject: last.subject),
            let lastNumber = last.segments.last?.number, lastNumber < declared {
@@ -69,6 +96,7 @@ enum UsenetAvailability {
         }
         return Plan(
             samples: samples,
+            downloads: downloads,
             tailMissingInNZB: tailMissing,
             nzbGaps: files.reduce(0) { $0 + gaps(in: $1) },
             missingVolumes: missingVolumes(in: files.map(\.name))
@@ -163,11 +191,21 @@ enum UsenetAvailability {
         }
     }
 
-    /// Asks the servers about the plan's articles, in order (any server that has one counts).
+    /// Asks the servers about the plan's articles, and downloads the ones it says to (any
+    /// server that has one counts).
     static func ask(_ plan: Plan, pool: UsenetConnectionPool) async throws -> UsenetAvailabilityReport {
         let found = try await withThrowingTaskGroup(of: (String, Bool).self, returning: [String: Bool].self) { group in
             for id in Set(plan.samples) {
-                group.addTask { (id, try await pool.exists(messageID: id)) }
+                if plan.downloads.contains(id) {
+                    group.addTask {
+                        switch try await pool.fetch(messageID: id) {
+                        case .body(let body): return (id, !body.isEmpty)
+                        case .missing: return (id, false)
+                        }
+                    }
+                } else {
+                    group.addTask { (id, try await pool.exists(messageID: id)) }
+                }
             }
             var results: [String: Bool] = [:]
             for try await answer in group { results[answer.0] = answer.1 }
@@ -180,7 +218,8 @@ enum UsenetAvailability {
             missing: missing,
             tailMissing: tailMissing,
             nzbGaps: plan.nzbGaps,
-            missingVolumes: plan.missingVolumes
+            missingVolumes: plan.missingVolumes,
+            downloaded: plan.downloads.count
         )
     }
 }
@@ -195,6 +234,12 @@ enum UsenetAvailability {
 /// doesn't download it again; the indexer still counts it as a download. Two checks run
 /// at once, over connections of their own (two per server), closed once the checks are
 /// done, so playback keeps its own.
+///
+/// A stream found incomplete, by a check or by playing it (it wouldn't start, or turned
+/// out too damaged), is remembered on this Apple TV for `rememberedLifetime`: its card
+/// says so the next time and failover passes it by. A check that finds it available
+/// clears what a check found; what playing it showed stays until it expires. Kept by a
+/// hash of the NZB URL, which can carry an indexer key, never by the URL itself.
 @MainActor
 final class UsenetAvailabilityChecker: ObservableObject {
     static let shared = UsenetAvailabilityChecker()
@@ -217,20 +262,77 @@ final class UsenetAvailabilityChecker: ObservableObject {
     /// articles can still go missing later (takedowns), so not for longer.
     static let resultLifetime: TimeInterval = 6 * 60 * 60
 
+    static let rememberedKey = "nuvio.tv.usenet.rememberedIncomplete"
+    static let rememberedLifetime: TimeInterval = 14 * 24 * 60 * 60
+    static let rememberedLimit = 300
+
+    struct Remembered: Codable, Equatable {
+        var report: UsenetAvailabilityReport
+        var at: Date
+    }
+
     private var checkedAt: [URL: Date] = [:]
     private var queue: [UsenetStreamSpec] = []
     private var running = 0
     private var pools: [[UsenetServerConfig]: UsenetConnectionPool] = [:]
     private var poolShutdown: Task<Void, Never>?
+    /// Incomplete streams by `memoryKey(_:)`.
+    @Published private var remembered: [String: Remembered] = [:]
+    private let defaults: UserDefaults
 
-    private init() {}
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        if let data = defaults.data(forKey: Self.rememberedKey),
+           let saved = try? JSONDecoder().decode([String: Remembered].self, from: data) {
+            let now = Date()
+            remembered = saved.filter { now.timeIntervalSince($0.value.at) < Self.rememberedLifetime }
+        }
+    }
 
     nonisolated static func spec(for stream: NuvioStream) -> UsenetStreamSpec? {
         stream.directURL.flatMap(URL.init(string:)).flatMap(UsenetStreamSpec.init(url:))
     }
 
     func state(for stream: NuvioStream) -> State? {
-        Self.spec(for: stream).flatMap { states[$0.nzbURL] }
+        Self.spec(for: stream).flatMap { self.state(for: $0) }
+    }
+
+    /// This session's check, else what was remembered.
+    func state(for spec: UsenetStreamSpec) -> State? {
+        if let state = states[spec.nzbURL] { return state }
+        return remembered[Self.memoryKey(spec)].map { .checked($0.report) }
+    }
+
+    /// A hash of the NZB URL, and the episode of a pack.
+    nonisolated static func memoryKey(_ spec: UsenetStreamSpec) -> String {
+        var key = UsenetNZBCache.key(for: spec.nzbURL)
+        if let file = spec.fileMustInclude, !file.isEmpty { key += "|" + file.lowercased() }
+        if let index = spec.fileIdx { key += "|#\(index)" }
+        return key
+    }
+
+    /// Playback found the stream incomplete: when it started (its check of the release,
+    /// or its first article gone) or while it played (too damaged to go on).
+    func recordPlayback(_ spec: UsenetStreamSpec, report: UsenetAvailabilityReport) {
+        states[spec.nzbURL] = .checked(report)
+        checkedAt[spec.nzbURL] = Date()
+        remember(spec, report)
+    }
+
+    private func remember(_ spec: UsenetStreamSpec, _ report: UsenetAvailabilityReport) {
+        let key = Self.memoryKey(spec)
+        if report.verdict == .incomplete {
+            remembered[key] = Remembered(report: report, at: Date())
+            if remembered.count > Self.rememberedLimit,
+               let oldest = remembered.min(by: { $0.value.at < $1.value.at })?.key {
+                remembered[oldest] = nil
+            }
+        } else if remembered[key] != nil {
+            remembered[key] = nil
+        } else {
+            return
+        }
+        defaults.set(try? JSONEncoder().encode(remembered), forKey: Self.rememberedKey)
     }
 
     /// Checked and found incomplete: failover to another Usenet stream passes it by.
@@ -254,6 +356,8 @@ final class UsenetAvailabilityChecker: ObservableObject {
             if states[url]?.isPending == true { continue }
             if !force, case .checked? = states[url], let at = checkedAt[url],
                Date().timeIntervalSince(at) < Self.resultLifetime { continue }
+            // Remembered incomplete: only a check asked for looks again.
+            if !force, states[url] == nil, remembered[Self.memoryKey(spec)] != nil { continue }
             states[url] = .queued
             queue.append(spec)
         }
@@ -282,15 +386,25 @@ final class UsenetAvailabilityChecker: ObservableObject {
                 } catch {
                     state = .failed(error.localizedDescription)
                 }
-                self.finish(spec.nzbURL, state)
+                self.finish(spec, state)
             }
         }
         if running == 0, queue.isEmpty, !pools.isEmpty { schedulePoolShutdown() }
     }
 
-    private func finish(_ url: URL, _ state: State) {
+    private func finish(_ spec: UsenetStreamSpec, _ state: State) {
+        let url = spec.nzbURL
         states[url] = state
-        if case .checked = state { checkedAt[url] = Date() }
+        if case .checked(var report) = state {
+            // What playing it showed outweighs a sample: a check doesn't clear it.
+            if report.playbackProblem == nil,
+               let problem = remembered[Self.memoryKey(spec)]?.report.playbackProblem {
+                report.playbackProblem = problem
+                states[url] = .checked(report)
+            }
+            checkedAt[url] = Date()
+            remember(spec, report)
+        }
         running -= 1
         pump()
     }
@@ -329,7 +443,7 @@ final class UsenetAvailabilityChecker: ObservableObject {
         let report = try await UsenetAvailability.ask(plan, pool: pool)
         let done = clock.now
         let name = nzb.title ?? UsenetAvailability.contentFiles(of: nzb, mustInclude: spec.fileMustInclude).first?.name ?? "release"
-        usenetLog.notice("usenet: check \(name, privacy: .public) — \(report.verdict.rawValue, privacy: .public), \(report.missing)/\(report.checked) sampled articles missing, NZB gaps \(report.nzbGaps), missing volumes \(report.missingVolumes); NZB \(Self.milliseconds(loaded - started)) ms, servers \(Self.milliseconds(done - loaded)) ms")
+        usenetLog.notice("usenet: check \(name, privacy: .public) — \(report.verdict.rawValue, privacy: .public), \(report.missing)/\(report.checked) sampled articles missing (\(report.downloaded) downloaded), NZB gaps \(report.nzbGaps), missing volumes \(report.missingVolumes); NZB \(Self.milliseconds(loaded - started)) ms, servers \(Self.milliseconds(done - loaded)) ms")
         return report
     }
 

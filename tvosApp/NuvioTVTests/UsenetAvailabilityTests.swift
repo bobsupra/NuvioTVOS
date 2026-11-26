@@ -91,6 +91,22 @@ final class UsenetAvailabilityTests: XCTestCase {
         XCTAssertEqual(plan.nzbGaps, 1)
     }
 
+    func testTwoArticlesFromInsideTheReleaseAreDownloaded() {
+        let plan = UsenetAvailability.plan(for: nzb([
+            file("x.part01.rar", segments: 40), file("x.part02.rar", segments: 40),
+        ]))
+        XCTAssertEqual(plan.downloads.count, UsenetAvailability.bodyProbes)
+        XCTAssertEqual(plan.downloads, [plan.samples[3], plan.samples[7]])
+        XCTAssertFalse(plan.downloads.contains(plan.samples.first!))
+        XCTAssertFalse(plan.downloads.contains(plan.samples.last!))
+    }
+
+    func testAReleaseOfTwoArticlesIsOnlyAskedAbout() {
+        let plan = UsenetAvailability.plan(for: nzb([file("a.mkv", segments: 2)]))
+        XCTAssertEqual(plan.samples.count, 2)
+        XCTAssertTrue(plan.downloads.isEmpty)
+    }
+
     // MARK: The verdict
 
     private func report(missing: Int = 0, tail: Bool = false, gaps: Int = 0, volumes: Int = 0) -> UsenetAvailabilityReport {
@@ -107,6 +123,103 @@ final class UsenetAvailabilityTests: XCTestCase {
         // Whole parts missing.
         XCTAssertEqual(report(volumes: 1).verdict, .incomplete)
         XCTAssertEqual(report(gaps: UsenetAvailabilityReport.nzbGapsLimit).verdict, .incomplete)
+    }
+
+    func testWhatPlaybackShowedMakesItIncomplete() {
+        var played = report()
+        played.playbackProblem = .damaged
+        XCTAssertEqual(played.verdict, .incomplete)
+        played.playbackProblem = .wouldNotStart
+        XCTAssertEqual(played.verdict, .incomplete)
+    }
+
+    func testAReportSurvivesBeingSaved() throws {
+        var saved = report(missing: 3, tail: true, gaps: 1, volumes: 2)
+        saved.downloaded = 2
+        saved.playbackProblem = .damaged
+        let data = try JSONEncoder().encode(saved)
+        XCTAssertEqual(try JSONDecoder().decode(UsenetAvailabilityReport.self, from: data), saved)
+    }
+
+    // MARK: Failed starts
+
+    func testAFailedReleaseCheckKeepsItsNumbers() {
+        let health = UsenetHealthCheck.Result(checked: 12, missing: 4, tailMissing: false)
+        let failed = UsenetEngineManager.startFailureReport(UsenetError.releaseIncomplete, health: health)
+        XCTAssertEqual(failed?.missing, 4)
+        XCTAssertEqual(failed?.checked, 12)
+        XCTAssertNil(failed?.playbackProblem)
+        XCTAssertEqual(failed?.verdict, .incomplete)
+    }
+
+    func testAStartWithoutItsFirstArticleWouldNotStart() {
+        let failed = UsenetEngineManager.startFailureReport(UsenetError.firstSegmentUnavailable, health: nil)
+        XCTAssertEqual(failed?.playbackProblem, .wouldNotStart)
+        // Its first articles gone after a release check that passed.
+        let passed = UsenetHealthCheck.Result(checked: 12, missing: 0, tailMissing: false)
+        XCTAssertEqual(UsenetEngineManager.startFailureReport(UsenetError.releaseIncomplete, health: passed)?.playbackProblem, .wouldNotStart)
+    }
+
+    func testOtherFailedStartsAreNotHeldAgainstTheRelease() {
+        XCTAssertNil(UsenetEngineManager.startFailureReport(UsenetError.noServers, health: nil))
+        XCTAssertNil(UsenetEngineManager.startFailureReport(UsenetError.nzbDownloadFailed(503), health: nil))
+        XCTAssertNil(UsenetEngineManager.startFailureReport(URLError(.timedOut), health: nil))
+    }
+
+    // MARK: Remembered
+
+    private func defaults() -> (UserDefaults, String) {
+        let suite = "usenet-remembered-\(UUID().uuidString)"
+        return (UserDefaults(suiteName: suite)!, suite)
+    }
+
+    private let spec = UsenetStreamSpec(nzbURL: URL(string: "https://indexer.example/api?t=get&id=42&apikey=SECRETKEY")!)
+
+    @MainActor
+    func testAStreamThatPlayedDamagedIsRememberedOnThisDevice() {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        var damaged = report()
+        damaged.playbackProblem = .damaged
+        UsenetAvailabilityChecker(defaults: store).recordPlayback(spec, report: damaged)
+
+        let later = UsenetAvailabilityChecker(defaults: store)
+        XCTAssertEqual(later.state(for: spec), .checked(damaged))
+        // Another episode of the same pack is its own.
+        var episode = spec
+        episode.fileMustInclude = "S01E02"
+        XCTAssertNil(later.state(for: episode))
+    }
+
+    @MainActor
+    func testTheNZBURLIsNotSaved() throws {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        UsenetAvailabilityChecker(defaults: store).recordPlayback(spec, report: report(missing: 5))
+        let data = try XCTUnwrap(store.data(forKey: UsenetAvailabilityChecker.rememberedKey))
+        let saved = try XCTUnwrap(String(data: data, encoding: .utf8))
+        XCTAssertFalse(saved.contains("SECRETKEY"))
+        XCTAssertFalse(saved.contains("indexer.example"))
+    }
+
+    @MainActor
+    func testFoundAvailableItIsForgotten() {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        let checker = UsenetAvailabilityChecker(defaults: store)
+        checker.recordPlayback(spec, report: report(missing: 5))
+        checker.recordPlayback(spec, report: report())
+        XCTAssertNil(UsenetAvailabilityChecker(defaults: store).state(for: spec))
+    }
+
+    @MainActor
+    func testWhatWasRememberedExpires() throws {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        let old = Date().addingTimeInterval(-UsenetAvailabilityChecker.rememberedLifetime - 60)
+        let saved = [UsenetAvailabilityChecker.memoryKey(spec): UsenetAvailabilityChecker.Remembered(report: report(missing: 5), at: old)]
+        store.set(try JSONEncoder().encode(saved), forKey: UsenetAvailabilityChecker.rememberedKey)
+        XCTAssertNil(UsenetAvailabilityChecker(defaults: store).state(for: spec))
     }
 
     // MARK: Settings
