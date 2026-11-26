@@ -1491,7 +1491,9 @@ struct DetailsScreen: View {
         var seen = Set(chosenNZB.map { [$0] } ?? [])
         var result: [NuvioStream] = []
         for candidate in all[start...] where result.count < 2 {
+            // A stream a check found incomplete would fail too (UsenetAvailabilityChecker).
             guard candidate.unavailabilityReason == nil,
+                  !UsenetAvailabilityChecker.shared.isIncomplete(candidate),
                   let raw = candidate.directURL, let url = URL(string: raw),
                   let spec = UsenetStreamSpec(url: url),
                   seen.insert(spec.nzbURL).inserted else { continue }
@@ -12829,11 +12831,13 @@ private struct TvStreamPickerOverlay: View {
     @State private var ratingOrderRevision: UInt64 = 0
     @State private var showingP2PConsent = false
     @State private var pendingTorrentSelection: (stream: NuvioStream, player: ExternalPlayer?)? = nil
+    @ObservedObject private var usenetAvailability = UsenetAvailabilityChecker.shared
 
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
     private let refreshKey = "filter::refresh"
+    private let usenetCheckKey = "filter::usenet-check-streams"
 
     private func filterKey(_ addonId: String) -> String { "filter::\(addonId)" }
 
@@ -13121,6 +13125,28 @@ private struct TvStreamPickerOverlay: View {
 
     private var activeSourceRows: [NuvioStream] {
         activeSourceRowsWithFocusIDs.map(\.stream)
+    }
+
+    /// The Usenet streams the list shows (the selected add-on's, or all), for the check
+    /// button beside the sort button.
+    private var usenetStreamsToCheck: [NuvioStream] {
+        activeSourceRows.filter { UsenetAvailabilityChecker.spec(for: $0) != nil }
+    }
+
+    /// The first of them, checked by themselves (Settings → Usenet → Check Streams
+    /// Automatically); none while that is off.
+    private var usenetStreamsToAutoCheck: [NuvioStream] {
+        let count = UsenetSettings.autoCheckCount()
+        guard count != 0 else { return [] }
+        let streams = usenetStreamsToCheck
+        return count < 0 ? streams : Array(streams.prefix(count))
+    }
+
+    /// A Usenet stream's card menu checks it; other cards have no such item.
+    private func usenetCheckAction(for stream: NuvioStream) -> (() -> Void)? {
+        guard UsenetAvailabilityChecker.spec(for: stream) != nil else { return nil }
+        let checker = usenetAvailability
+        return { checker.check([stream], force: true) }
     }
 
     private var activeSourceRowFocusIDs: [String] {
@@ -13556,6 +13582,20 @@ private struct TvStreamPickerOverlay: View {
                 .animation(.easeOut(duration: 0.2), value: filterRowEdges)
             )
 
+            // Checks the Usenet streams the list shows on the servers, only while it has
+            // any (UsenetAvailabilityChecker); each card then shows what was found.
+            if !usenetStreamsToCheck.isEmpty {
+                TvStreamIconButton(
+                    systemImage: "checkmark.shield",
+                    accessibilityLabel: L10n.string("usenet_check_streams", fallback: "Check Usenet Streams"),
+                    showsDot: false,
+                    showsProgress: usenetAvailability.isChecking(usenetStreamsToCheck),
+                    focusBinding: $focusedItem,
+                    focusValue: usenetCheckKey,
+                    action: { usenetAvailability.check(usenetStreamsToCheck, force: true) }
+                )
+            }
+
             // Sort and the cached-only filter share one round button pinned
             // to the trailing edge, like the refresh button on Android TV, so
             // the add-on pills keep the rest of the row.
@@ -13592,6 +13632,13 @@ private struct TvStreamPickerOverlay: View {
         }
         .padding(.vertical, 4)
         .focusSection()
+        // Check Streams Automatically: the first Usenet streams, again as the list changes
+        // (streams checked lately are skipped).
+        .task(id: usenetStreamsToAutoCheck.map(\.id)) {
+            let streams = usenetStreamsToAutoCheck
+            guard !streams.isEmpty else { return }
+            usenetAvailability.check(streams, force: false)
+        }
     }
 
     private func sortMenuTitle(_ title: String, selected: Bool) -> String {
@@ -13681,7 +13728,9 @@ private struct TvStreamPickerOverlay: View {
                                     lastPlayedAt: lastPlayedAt,
                                     externalFocus: $focusedItem,
                                     action: { select(lastPlayedStream, player: nil) },
-                                    onSelectPlayer: { player in select(lastPlayedStream, player: player) }
+                                    onSelectPlayer: { player in select(lastPlayedStream, player: player) },
+                                    availability: usenetAvailability.state(for: lastPlayedStream),
+                                    onCheckAvailability: usenetCheckAction(for: lastPlayedStream)
                                 )
                                 .id(lastPlayedRowFocusID)
                             }
@@ -13746,7 +13795,9 @@ private struct TvStreamPickerOverlay: View {
                                         ? lastPlayedSourceMatch?.updatedAt : nil,
                                     externalFocus: $focusedItem,
                                     action: { select(stream, player: nil) },
-                                    onSelectPlayer: { player in select(stream, player: player) }
+                                    onSelectPlayer: { player in select(stream, player: player) },
+                                    availability: usenetAvailability.state(for: stream),
+                                    onCheckAvailability: usenetCheckAction(for: stream)
                                 )
                                 .id(rowFocusID)
                                 .onAppear {
@@ -14139,6 +14190,8 @@ private struct TvStreamIconButton: View {
     let accessibilityLabel: String
     let showsDot: Bool
     var isSpinning = false
+    /// A progress indicator in place of the symbol, for work that isn't a refresh.
+    var showsProgress = false
     let focusBinding: FocusState<String?>.Binding
     let focusValue: String
     let action: () -> Void
@@ -14147,14 +14200,21 @@ private struct TvStreamIconButton: View {
 
     var body: some View {
         Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 26, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white.opacity(0.85))
-                .rotationEffect(.degrees(isSpinning ? 360 : 0))
-                .animation(
-                    isSpinning ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default,
-                    value: isSpinning
-                )
+            Group {
+                if showsProgress {
+                    ProgressView()
+                        .tint(isFocused ? .black : .white)
+                } else {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white.opacity(0.85))
+                        .rotationEffect(.degrees(isSpinning ? 360 : 0))
+                        .animation(
+                            isSpinning ? .linear(duration: 0.9).repeatForever(autoreverses: false) : .default,
+                            value: isSpinning
+                        )
+                }
+            }
                 .frame(width: 58, height: 58)
                 .modifier(TvDetailsGlassBackground(filled: isFocused, shape: Circle()))
                 .overlay(alignment: .topTrailing) {
@@ -14503,6 +14563,10 @@ private struct TvStreamCard: View {
     let externalFocus: FocusState<String?>.Binding
     let action: () -> Void
     var onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
+    /// A Usenet stream's check on the servers (`UsenetAvailabilityChecker`), and the menu
+    /// item that starts one; nil for other streams.
+    var availability: UsenetAvailabilityChecker.State? = nil
+    var onCheckAvailability: (() -> Void)? = nil
 
     /// Local focus drives appearance only for this card, so focus moves do not
     /// push `isFocused` through the parent ForEach for every sibling.
@@ -14522,9 +14586,13 @@ private struct TvStreamCard: View {
         previewFocused: Bool = false,
         externalFocus: FocusState<String?>.Binding,
         action: @escaping () -> Void,
-        onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
+        onSelectPlayer: ((ExternalPlayer) -> Void)? = nil,
+        availability: UsenetAvailabilityChecker.State? = nil,
+        onCheckAvailability: (() -> Void)? = nil
     ) {
         self.stream = stream
+        self.availability = availability
+        self.onCheckAvailability = onCheckAvailability
         self.focusID = focusID ?? stream.id
         self.lastPlayedAt = lastPlayedAt
         self.style = style
@@ -14630,6 +14698,10 @@ private struct TvStreamCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                         }
 
+                        if let availability {
+                            TvStreamAvailabilityLine(state: availability, fontSize: style.detailFont(22))
+                        }
+
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -14703,6 +14775,17 @@ private struct TvStreamCard: View {
                     .disabled(!player.isInstalled)
                 }
             }
+            if let onCheckAvailability {
+                Section(L10n.string("usenet_group_title", fallback: "Usenet")) {
+                    Button {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            onCheckAvailability()
+                        }
+                    } label: {
+                        Label(L10n.string("usenet_check_stream", fallback: "Check Availability"), systemImage: "checkmark.shield")
+                    }
+                }
+            }
         }
     }
 
@@ -14751,6 +14834,81 @@ private struct TvStreamCard: View {
             .frame(width: size, height: size)
         } else {
             fallback.frame(width: size, height: size)
+        }
+    }
+}
+
+/// A Usenet stream card's line for its check on the servers: under way, what was found,
+/// or why it couldn't be checked.
+private struct TvStreamAvailabilityLine: View {
+    let state: UsenetAvailabilityChecker.State
+    let fontSize: CGFloat
+
+    private static let green = Color(red: 0.33, green: 0.80, blue: 0.47)
+    private static let amber = Color(red: 0.98, green: 0.73, blue: 0.27)
+    private static let red = Color(red: 0.96, green: 0.38, blue: 0.36)
+
+    var body: some View {
+        HStack(spacing: 10) {
+            switch state {
+            case .queued, .checking:
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(0.55)
+                    .frame(width: fontSize, height: fontSize)
+                Text(L10n.string("usenet_check_checking", fallback: "Checking on your Usenet servers…"))
+            case .checked(let report):
+                Image(systemName: Self.symbol(report.verdict))
+                    .foregroundColor(Self.color(report.verdict))
+                Text(Self.text(report))
+            case .failed(let message):
+                Image(systemName: "exclamationmark.circle")
+                    .foregroundColor(.white.opacity(0.6))
+                Text(L10n.format("usenet_check_failed", fallback: "Couldn't check: %@", message))
+            }
+        }
+        .font(.system(size: fontSize, weight: .medium))
+        .foregroundColor(.white.opacity(0.72))
+        .lineLimit(1)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private static func symbol(_ verdict: UsenetAvailabilityReport.Verdict) -> String {
+        switch verdict {
+        case .available: return "checkmark.circle.fill"
+        case .partial: return "exclamationmark.triangle.fill"
+        case .incomplete: return "xmark.octagon.fill"
+        }
+    }
+
+    private static func color(_ verdict: UsenetAvailabilityReport.Verdict) -> Color {
+        switch verdict {
+        case .available: return green
+        case .partial: return amber
+        case .incomplete: return red
+        }
+    }
+
+    static func text(_ report: UsenetAvailabilityReport) -> String {
+        switch report.verdict {
+        case .available:
+            return L10n.string("usenet_check_available", fallback: "Available on your Usenet servers")
+        case .partial:
+            if report.missing > 0 {
+                return L10n.format("usenet_check_partial", fallback: "Mostly available: %d of %d sampled articles missing", report.missing, report.checked)
+            }
+            return L10n.format("usenet_check_partial_nzb", fallback: "Mostly available: the NZB lacks %d articles", report.nzbGaps)
+        case .incomplete:
+            if report.missingVolumes > 0 {
+                return L10n.format("usenet_check_incomplete_volumes", fallback: "Incomplete: %d archive volumes missing from the NZB", report.missingVolumes)
+            }
+            if report.tailMissing {
+                return L10n.string("usenet_check_incomplete_end", fallback: "Incomplete: the end of the release is missing")
+            }
+            if report.missing >= 2 {
+                return L10n.format("usenet_check_incomplete", fallback: "Incomplete: %d of %d sampled articles missing", report.missing, report.checked)
+            }
+            return L10n.format("usenet_check_incomplete_nzb", fallback: "Incomplete: the NZB lacks %d articles", report.nzbGaps)
         }
     }
 }

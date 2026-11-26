@@ -25346,6 +25346,7 @@ private struct UsenetSettingsSection: View {
     @State private var profile = UsenetSettings.profile().rawValue
     @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
     @State private var speedLimit = String(UsenetSettings.speedLimitMbps())
+    @State private var autoCheck = String(UsenetSettings.autoCheckCount())
     @State private var syncToAccount = UsenetSettings.syncChoice() ?? false
 
     var body: some View {
@@ -25395,6 +25396,26 @@ private struct UsenetSettingsSection: View {
 
             UsenetDiskReadAheadRows(accentColor: accentColor)
 
+            SettingsChoiceRow(
+                title: L10n.string("usenet_auto_check_title", fallback: "Check Streams Automatically"),
+                subtitle: L10n.string(
+                    "usenet_auto_check_subtitle",
+                    fallback: "When the stream list opens, check the first Usenet streams on your servers, as the button beside the sort button does. Each check downloads the stream's NZB, which the indexer counts as a download."
+                ),
+                selection: $autoCheck,
+                options: UsenetSettings.autoCheckOptions.map(String.init),
+                optionLabels: Dictionary(uniqueKeysWithValues: UsenetSettings.autoCheckOptions.map { count -> (String, String) in
+                    let label: String
+                    switch count {
+                    case 0: label = L10n.string("usenet_auto_check_off", fallback: "Off")
+                    case -1: label = L10n.string("usenet_auto_check_all", fallback: "All")
+                    default: label = L10n.format("usenet_auto_check_first", fallback: "First %d", count)
+                    }
+                    return (String(count), label)
+                }),
+                accentColor: accentColor
+            )
+
             SettingsToggleRow(
                 title: L10n.string("usenet_prefer_own_title", fallback: "Always Use My Servers"),
                 subtitle: L10n.string("usenet_prefer_own_subtitle", fallback: "Ignore servers an add-on sends with its streams. When off, yours are the fallback."),
@@ -25428,6 +25449,9 @@ private struct UsenetSettingsSection: View {
         }
         .onChange(of: speedLimit) { _, value in
             UsenetSettings.setSpeedLimitMbps(Int(value) ?? 0)
+        }
+        .onChange(of: autoCheck) { _, value in
+            UsenetSettings.setAutoCheckCount(Int(value) ?? 0)
         }
         .onReceive(NotificationCenter.default.publisher(for: .usenetServersChanged)) { _ in
             model.reload()
