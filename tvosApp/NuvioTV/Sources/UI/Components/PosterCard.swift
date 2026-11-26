@@ -241,7 +241,6 @@ struct PosterCard: View {
     var isWatched: Bool? = nil
     let onClick: () -> Void
 
-    private let landscapeTransitionDuration: TimeInterval = 0.3
     @Environment(\.cardAppearance) private var cardAppearance
     private var customPosterURLPattern: String { cardAppearance.customPosterURLPattern }
     private var customPosterEnabledScreens: String { cardAppearance.customPosterEnabledScreens }
@@ -395,10 +394,10 @@ struct PosterCard: View {
             isEnabled: isEffectivelyAlwaysLandscape
         )
         .zIndex(showsFocusedAppearance ? 1 : 0)
-        // Critically damped — no overshoot when expanding to landscape on Home.
+        // Critically damped, no overshoot, and the row's own curve for the same change.
         .animation(
             effectiveSmoothFocus
-                ? .spring(response: landscapeTransitionDuration, dampingFraction: 1.0)
+                ? TVHomeLayout.backdropAnimation(expanding: effectiveLandscape)
                 : nil,
             value: effectiveLandscape
         )
