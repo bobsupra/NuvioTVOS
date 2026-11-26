@@ -712,6 +712,7 @@ extension PlayerView {
             .buttonStyle(PosterCardButtonStyle())
             .focusEffectDisabledIfAvailable()
             .focused($skipSegmentFocused)
+            .disabled(isPlayerQuickMenuPresented)
             .onMoveCommand { direction in
                 guard !isWakingFromBackground else { return }
                 switch direction {
@@ -791,6 +792,7 @@ extension PlayerView {
                 .buttonStyle(PosterCardButtonStyle())
                 .focusEffectDisabledIfAvailable()
                 .focused($nextEpisodeFocused)
+                .disabled(isPlayerQuickMenuPresented)
                 .onMoveCommand { direction in
                     guard !isWakingFromBackground else { return }
                     switch direction {
@@ -849,6 +851,7 @@ extension PlayerView {
                     }
                     .buttonStyle(.plain)
                     .focused($cancelAutoPlayFocused)
+                    .disabled(isPlayerQuickMenuPresented)
                     .onMoveCommand { direction in
                         guard !isWakingFromBackground else { return }
                         switch direction {
@@ -906,6 +909,8 @@ extension PlayerView {
                 didReportPlaybackStarted: didReportPlaybackStarted,
                 isSkipSegmentFocused: skipSegmentFocused,
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
+                isQuickMenuPresented: $isPlayerQuickMenuPresented,
+                isControlsLayerVisible: shouldShowControls,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
                 onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) },

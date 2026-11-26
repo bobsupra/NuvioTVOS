@@ -4145,3 +4145,179 @@ c5zbnOZfPla58rXPla50K3Oc25zm3Oc1DMrXPla58rXPlVAifc5zbnObcyZbJlsytc+VUCFQIn3O
 c1HA
 """
 }
+
+@MainActor
+final class PlayerQuickMenuPanelTests: XCTestCase {
+    private func makeSnapshot(
+        pageID: String = "speed.root",
+        header: String = "Playback Speed",
+        rows: [PlayerQuickMenuRow],
+        canPopBack: Bool = false,
+        initialFocusID: String? = nil,
+        actions: [String: () -> Void] = [:]
+    ) -> PlayerQuickMenuSnapshot {
+        PlayerQuickMenuSnapshot(
+            content: PlayerQuickMenuContent(
+                pageID: pageID,
+                header: header,
+                items: rows.map(PlayerQuickMenuItem.row),
+                canPopBack: canPopBack,
+                initialFocusID: initialFocusID
+            ),
+            actions: actions
+        )
+    }
+
+    func testQuickMenuPopupHugsShortRowsAndCapsLongListsWithScroll() {
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 1920, height: 1080))
+        let triggerFrame = CGRect(x: 1620, y: 920, width: 70, height: 70)
+
+        let shortRows = [
+            PlayerQuickMenuRow(id: "r1", title: "0.75x", subtitle: nil, isSelected: false, isDisabled: false, showsChevron: false, closesMenu: true),
+            PlayerQuickMenuRow(id: "r2", title: "1x (Normal)", subtitle: nil, isSelected: true, isDisabled: false, showsChevron: false, closesMenu: true),
+            PlayerQuickMenuRow(id: "r3", title: "1.25x", subtitle: nil, isSelected: false, isDisabled: false, showsChevron: false, closesMenu: true),
+        ]
+        let shortList = PlayerQuickMenuListView(snapshot: makeSnapshot(rows: shortRows, initialFocusID: "r2"))
+        let shortPanel = PlayerQuickMenuPanelView.present(
+            listView: shortList,
+            in: container,
+            triggerFrame: triggerFrame,
+            animated: false
+        )
+
+        XCTAssertEqual(shortPanel.bounds.width, PlayerQuickMenuListView.menuWidth, accuracy: 0.5)
+        XCTAssertEqual(shortPanel.bounds.width, 450, accuracy: 0.5)
+        XCTAssertEqual(shortPanel.backgroundEffectView.layer.cornerRadius, PlayerQuickMenuPanelView.Metrics.cornerRadius, accuracy: 0.5)
+        XCTAssertEqual(
+            shortPanel.bounds.height,
+            PlayerQuickMenuListView.Metrics.headerHeight + 3 * PlayerQuickMenuListView.Metrics.rowHeight + PlayerQuickMenuListView.Metrics.bottomInset,
+            accuracy: 1.0
+        )
+        XCTAssertEqual(shortPanel.frame.maxY, triggerFrame.minY - PlayerQuickMenuPanelView.Metrics.buttonGap, accuracy: 0.5)
+
+        shortPanel.dismissPanel(notify: false, animated: false)
+
+        let longRows = (0..<12).map { index in
+            PlayerQuickMenuRow(
+                id: "track-\(index)",
+                title: "Language \(index)",
+                subtitle: "SubRip External Track \(index)",
+                isSelected: index == 0,
+                isDisabled: false,
+                showsChevron: false,
+                closesMenu: true
+            )
+        }
+        let longList = PlayerQuickMenuListView(snapshot: makeSnapshot(pageID: "sub.root", header: "Subtitles", rows: longRows))
+        let longPanel = PlayerQuickMenuPanelView.present(
+            listView: longList,
+            in: container,
+            triggerFrame: triggerFrame,
+            animated: false
+        )
+
+        XCTAssertEqual(longPanel.bounds.height, PlayerQuickMenuPanelView.Metrics.maxHeight, accuracy: 1.0)
+        XCTAssertGreaterThan(longList.scrollView.contentSize.height, longList.scrollView.bounds.height)
+    }
+
+    func testFocusedRowUsesBlackTextOnWhitePillAndUnfocusedRestoresWhiteText() {
+        let row = PlayerQuickMenuRow(
+            id: "eng",
+            title: "English",
+            subtitle: "Dolby Atmos",
+            isSelected: true,
+            isDisabled: false,
+            showsChevron: true,
+            closesMenu: false
+        )
+        let button = PlayerQuickMenuRowButton(row: row)
+        button.frame = CGRect(x: 0, y: 0, width: 408, height: 86)
+        button.layoutIfNeeded()
+
+        XCTAssertEqual(button.titleLabel.textColor, .white)
+        XCTAssertEqual(button.checkmarkView.tintColor, .white)
+        XCTAssertEqual(button.pill.backgroundColor, .clear)
+        XCTAssertEqual(button.pill.layer.shadowOpacity, 0)
+
+        button.applyFocus(true)
+        XCTAssertEqual(button.titleLabel.textColor, .black)
+        XCTAssertEqual(button.checkmarkView.tintColor, .black)
+        XCTAssertEqual(button.chevronView.tintColor, .black)
+        XCTAssertEqual(button.pill.backgroundColor, .white)
+        XCTAssertEqual(
+            button.pill.layer.cornerRadius,
+            PlayerQuickMenuListView.Metrics.rowRadius + PlayerQuickMenuListView.Metrics.focusGrowth,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(button.pill.frame, button.bounds.insetBy(dx: -4, dy: -4))
+        XCTAssertEqual(button.pill.layer.shadowOpacity, 0.3, accuracy: 0.01)
+
+        button.applyFocus(false)
+        XCTAssertEqual(button.titleLabel.textColor, .white)
+        XCTAssertEqual(button.pill.backgroundColor, .clear)
+        XCTAssertEqual(button.pill.layer.shadowOpacity, 0)
+    }
+
+    func testMenuPressPopsSubmenuBeforeDismissingAndSkipsDisabledRows() {
+        let rows = [
+            PlayerQuickMenuRow(id: "status", title: "Checking…", subtitle: nil, isSelected: false, isDisabled: true, showsChevron: false, closesMenu: false),
+            PlayerQuickMenuRow(id: "style", title: "Subtitle Style", subtitle: "Classic", isSelected: false, isDisabled: false, showsChevron: true, closesMenu: false),
+        ]
+        var backPopCount = 0
+        let list = PlayerQuickMenuListView(snapshot: makeSnapshot(
+            pageID: "subtitles.style",
+            header: "Subtitle Style",
+            rows: rows,
+            canPopBack: true,
+            initialFocusID: "status"
+        ))
+        list.onMenuBack = { backPopCount += 1 }
+
+        XCTAssertFalse(list.rowButtons[0].canBecomeFocused)
+        XCTAssertTrue(list.rowButtons[1].canBecomeFocused)
+        XCTAssertTrue(list.preferredFocusEnvironments.first === list.rowButtons[1])
+
+        XCTAssertTrue(list.handleMenuPress())
+        XCTAssertEqual(backPopCount, 1)
+
+        list.update(with: makeSnapshot(
+            pageID: "subtitles.root",
+            header: "Subtitles",
+            rows: rows,
+            canPopBack: false,
+            initialFocusID: "style"
+        ))
+        XCTAssertFalse(list.handleMenuPress())
+        XCTAssertEqual(backPopCount, 1)
+    }
+
+    func testQuickMenuSnapshotsBuildForSubtitlesAudioAndSpeedWithoutExclusivityViolation() {
+        let model = PlayerViewModel(sessionCoordinator: PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        ))
+        defer { model.shutdown() }
+        model.subtitles = [
+            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true),
+            SubtitleTrack(id: "1", name: "English", language: "en", isSelected: false),
+        ]
+        model.audioTracks = [
+            AudioTrack(id: "1", name: "English 5.1", language: "en", isSelected: true, languageName: "English"),
+        ]
+
+        let controls = PlayerControls(
+            viewModel: model,
+            didReportPlaybackStarted: true,
+            isQuickMenuPresented: .constant(true),
+            requestedFocus: .constant(nil)
+        )
+
+        let subtitles = controls.buildQuickMenuSnapshot(for: .subtitles)
+        let audio = controls.buildQuickMenuSnapshot(for: .audio)
+        let speed = controls.buildQuickMenuSnapshot(for: .speed)
+
+        XCTAssertFalse(subtitles.content.items.isEmpty)
+        XCTAssertFalse(audio.content.items.isEmpty)
+        XCTAssertEqual(speed.content.items.count, PlaybackSpeed.allCases.count)
+    }
+}

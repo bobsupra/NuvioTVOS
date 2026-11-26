@@ -7370,4 +7370,275 @@ final class LibraryStoreSyncTests: XCTestCase {
         XCTAssertEqual(selectedSub?.name, "Spanish")
         XCTAssertEqual(selectedSub?.id, "7")
     }
+
+    @MainActor
+    func testLateExternalEnglishSubtitlesBeforeAudioTracksAreSelectedWhenForeignAudioArrives() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedAudioLanguage = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        let savedPreferExternal = ProfileSettings.current.object(forKey: SettingsKey.preferExternalSubtitles)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedAudioLanguage {
+                ProfileSettings.current.set(savedAudioLanguage, forKey: SettingsKey.audioLanguage)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.audioLanguage)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+            if let savedPreferExternal {
+                ProfileSettings.current.set(savedPreferExternal, forKey: SettingsKey.preferExternalSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.preferExternalSubtitles)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("English", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(true, forKey: SettingsKey.forcedSubtitles)
+        ProfileSettings.current.set(false, forKey: SettingsKey.preferExternalSubtitles)
+
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/early-ext-before-audio.mkv")!))
+        model.activeMeta = NuvioMeta(id: "tt-early-ext", name: "Early Ext", type: "movie")
+
+        // External subtitles arrive before the demuxer publishes audio tracks.
+        let englishAddon = NuvioSubtitle(url: "https://example.test/en.srt", language: "eng", label: "English")
+        model.mergeExternalSubtitles([englishAddon])
+
+        // Demuxer opens with Japanese audio and only a non-English embedded subtitle.
+        model.audioTracks = [AudioTrack(id: "1", name: "Japanese", language: "jpn", isSelected: true)]
+        model.subtitles = [
+            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true),
+            SubtitleTrack(id: "2", name: "Spanish", language: "spa", isSelected: false)
+        ]
+
+        // Running preference matching must pick up the already-fetched English external subtitle instead of locking to Off.
+        model.syncTracks()
+
+        XCTAssertTrue(model.isExternalSubtitleSelected(englishAddon))
+        XCTAssertTrue(model.pendingExternalSubtitles.contains(where: { $0.url == englishAddon.url }))
+    }
+
+    @MainActor
+    func testHandoffBeforeSubtitleSelectionDoesNotLockMPVToOff() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedAudioLanguage = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedAudioLanguage {
+                ProfileSettings.current.set(savedAudioLanguage, forKey: SettingsKey.audioLanguage)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.audioLanguage)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set("Japanese", forKey: SettingsKey.audioLanguage)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(false, forKey: SettingsKey.forcedSubtitles)
+
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/handoff-no-sub.mkv")!))
+        model.subtitles = [SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true)]
+
+        coordinator.handoffToMPV(reason: "Fallback before sub selection", resumeSeconds: 0)
+
+        coordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "Japanese", lang: "jpn", selected: true, externalFilename: "")
+        ]
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "")
+        ]
+
+        model.syncTracks()
+
+        XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "2")
+    }
+
+    @MainActor
+    func testFailedExternalSubtitleFallsBackToNextCandidate() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(false, forKey: SettingsKey.forcedSubtitles)
+
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+
+        let badSub = NuvioSubtitle(url: "https://example.test/broken.srt", language: "eng", label: "English 1")
+        let goodSub = NuvioSubtitle(url: "https://example.test/working.srt", language: "eng", label: "English 2")
+        model.audioTracks = [AudioTrack(id: "1", name: "Japanese", language: "jpn", isSelected: true)]
+        model.subtitles = [SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true)]
+        model.mergeExternalSubtitles([badSub, goodSub])
+        XCTAssertTrue(model.isExternalSubtitleSelected(badSub))
+
+        model.handleExternalSubtitleLoadFailed(badSub.url)
+
+        XCTAssertTrue(model.failedExternalSubtitleURLs.contains(badSub.url))
+        XCTAssertFalse(model.isExternalSubtitleSelected(badSub))
+        XCTAssertTrue(model.isExternalSubtitleSelected(goodSub))
+    }
+
+    @MainActor
+    func testPreferExternalSubtitlesChoosesExternalOverEmbeddedOfSameLanguage() throws {
+        let savedSubtitleLanguages = ProfileSettings.current.string(forKey: SettingsKey.subtitleLanguages)
+        let savedSmartMatching = ProfileSettings.current.object(forKey: SettingsKey.smartSubtitleMatching)
+        let savedForcedSubtitles = ProfileSettings.current.object(forKey: SettingsKey.forcedSubtitles)
+        let savedPreferExternal = ProfileSettings.current.object(forKey: SettingsKey.preferExternalSubtitles)
+        addTeardownBlock {
+            if let savedSubtitleLanguages {
+                ProfileSettings.current.set(savedSubtitleLanguages, forKey: SettingsKey.subtitleLanguages)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.subtitleLanguages)
+            }
+            if let savedSmartMatching {
+                ProfileSettings.current.set(savedSmartMatching, forKey: SettingsKey.smartSubtitleMatching)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.smartSubtitleMatching)
+            }
+            if let savedForcedSubtitles {
+                ProfileSettings.current.set(savedForcedSubtitles, forKey: SettingsKey.forcedSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.forcedSubtitles)
+            }
+            if let savedPreferExternal {
+                ProfileSettings.current.set(savedPreferExternal, forKey: SettingsKey.preferExternalSubtitles)
+            } else {
+                ProfileSettings.current.removeObject(forKey: SettingsKey.preferExternalSubtitles)
+            }
+        }
+
+        ProfileSettings.current.set(SubtitleLanguagePreferences.encode(["English"]), forKey: SettingsKey.subtitleLanguages)
+        ProfileSettings.current.set(true, forKey: SettingsKey.smartSubtitleMatching)
+        ProfileSettings.current.set(false, forKey: SettingsKey.forcedSubtitles)
+        ProfileSettings.current.set(true, forKey: SettingsKey.preferExternalSubtitles)
+
+        let fileEnglish = SubtitleTrack(id: "2", name: "English", language: "eng", isSelected: true)
+        let extEnglish = NuvioSubtitle(url: "https://example.test/ext-en.srt", language: "eng", label: "English")
+
+        XCTAssertEqual(
+            PlayerViewModel.betterRankedAddonSubtitle(
+                selected: fileEnglish,
+                available: [extEnglish],
+                onTheirWay: [],
+                preferredLanguages: ["English"],
+                preferExternal: true
+            )?.url,
+            extEnglish.url
+        )
+
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/prefer-external.mkv")!))
+        model.activeMeta = NuvioMeta(id: "tt-prefer-ext", name: "Prefer Ext", type: "movie")
+        model.audioTracks = [AudioTrack(id: "1", name: "Japanese", language: "jpn", isSelected: true)]
+        model.subtitles = [SubtitleTrack(id: "off", name: "Off", language: "", isSelected: false), fileEnglish]
+
+        model.mergeExternalSubtitles([extEnglish])
+        XCTAssertTrue(model.isExternalSubtitleSelected(extEnglish))
+
+        let reg = AetherExternalSubtitleRegistration.make(subtitles: [extEnglish])
+        XCTAssertEqual(
+            reg.preferredInitialTrackID(
+                for: ["English"],
+                preferExternalSubtitles: true,
+                preferredAudioLanguages: ["Japanese"]
+            ),
+            AetherEngine.externalSubtitleTrackIDBase
+        )
+        XCTAssertNil(
+            reg.preferredInitialTrackID(
+                for: ["English"],
+                preferExternalSubtitles: false,
+                preferredAudioLanguages: ["Japanese"]
+            )
+        )
+    }
 }
