@@ -60,15 +60,17 @@ struct CalendarHomeToday: Equatable {
         return L10n.string("calendar_home_today_badge", fallback: "AIRING TODAY")
     }
 
-    /// A compact card; Home fills in the hero's details once it is focused,
-    /// as for add-on catalogs. The show's backdrop is left to that too: the
-    /// episode's picture would be a spoiler there.
+    /// A compact card; Home fills in the remaining hero details once focused,
+    /// as for add-on catalogs. Carry the show/movie's own backdrop (never the
+    /// episode's still, which would be a spoiler) so focusing a Today card goes
+    /// straight to the backdrop without flashing a zoomed portrait poster.
     private static func meta(for entry: CalendarEntry) -> NuvioMeta {
         let imdb = entry.itemId.hasPrefix("tt") ? String(entry.itemId.prefix { $0 != ":" }) : nil
         return NuvioMeta(
             id: entry.itemId,
             name: entry.title,
             posterUrl: entry.posterURL?.absoluteString,
+            backgroundUrl: entry.backdropURL?.absoluteString,
             imdbId: imdb,
             tmdbId: entry.isFromAniList ? nil : entry.tmdbId,
             type: entry.itemType.isEmpty ? (entry.kind == .series ? "series" : "movie") : entry.itemType

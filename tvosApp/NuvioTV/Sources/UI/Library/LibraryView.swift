@@ -1133,20 +1133,14 @@ struct LibraryItemButton: View {
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
-    @AppStorage(SettingsKey.customPosterScreensChosenHere) private var customPosterScreensChosenHere = false
     @Environment(\.cardAppearance) private var cardAppearance
 
     private var customPosterArtworkURL: String? {
-        let screens = CustomPosterScreen.effectiveStorageValue(
-            stored: customPosterEnabledScreens,
-            pattern: customPosterURLPattern,
-            chosenHere: customPosterScreensChosenHere
-        )
-        return CustomPosterURLResolver.resolve(
+        CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: item.asNuvioMeta,
             screen: .library,
-            enabledScreens: screens,
+            enabledScreens: customPosterEnabledScreens,
             shape: "poster"
         )
     }

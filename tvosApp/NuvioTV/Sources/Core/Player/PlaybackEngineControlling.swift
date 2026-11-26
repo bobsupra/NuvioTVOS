@@ -221,6 +221,7 @@ protocol PlaybackEngineControlling: AnyObject {
     var onPlaybackSuspended: ((Int64, Int64) -> Void)? { get set }
     var onFirstFrameReady: (() -> Void)? { get set }
     var onAwaitingDisplaySwitchChanged: ((Bool) -> Void)? { get set }
+    var onExternalSubtitleLoadFailed: ((String) -> Void)? { get set }
 
     var audioTracks: [PlaybackTrackInfo] { get }
     var subtitleTracks: [PlaybackTrackInfo] { get }
@@ -280,6 +281,10 @@ extension PlaybackEngineControlling {
     var selectedDiscTitleId: Int? { nil }
     var isAwaitingDisplaySwitch: Bool { false }
     var onAwaitingDisplaySwitchChanged: ((Bool) -> Void)? {
+        get { nil }
+        set {}
+    }
+    var onExternalSubtitleLoadFailed: ((String) -> Void)? {
         get { nil }
         set {}
     }

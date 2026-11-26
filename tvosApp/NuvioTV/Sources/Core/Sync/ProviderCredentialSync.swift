@@ -79,6 +79,7 @@ enum ProviderCredentialStore {
     private static let standardDefaults = UserDefaults.standard
     private static let cacheLimit = 128
     private static var cachedValues: [String: String] = [:]
+    private static var missingAccounts: Set<String> = []
     private static var inProgressAccounts: Set<String> = []
     static let keys: Set<String> = [
         SettingsKey.tmdbApiKey,
@@ -108,6 +109,7 @@ enum ProviderCredentialStore {
         lock.lock()
         defer { lock.unlock() }
         let account = account(forKey: key, in: store, profileScope: profileScope)
+        let missingKey = missingCacheKey(account: account, keychain: keychain)
         if inProgressAccounts.contains(account) { return cachedValues[account] }
         inProgressAccounts.insert(account)
         defer { inProgressAccounts.remove(account) }
@@ -143,24 +145,31 @@ enum ProviderCredentialStore {
             ?? ((isPrimaryProfile && store !== standardDefaults)
                 ? standardDefaults.string(forKey: key)
                 : nil)
+        if legacyValue == nil && missingAccounts.contains(missingKey) {
+            return nil
+        }
         switch keychain.read(service: service, account: account) {
         case .value(let value):
             cacheValue(value, for: account)
+            missingAccounts.remove(missingKey)
             removeLegacyMirrors(forKey: key, in: store, isPrimaryProfile: isPrimaryProfile)
             return value
         case .missing:
             guard let legacyValue, !legacyValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                cacheMissing(missingKey)
                 return nil
             }
             if keychain.write(legacyValue, service: service, account: account),
                case .value(let persistedValue) = keychain.read(service: service, account: account),
                persistedValue == legacyValue {
                 cacheValue(persistedValue, for: account)
+                missingAccounts.remove(missingKey)
                 removeLegacyMirrors(forKey: key, in: store, isPrimaryProfile: isPrimaryProfile)
             }
             return legacyValue
         case .failed:
             cachedValues.removeValue(forKey: account)
+            missingAccounts.remove(missingKey)
             // Keep the legacy value readable if Keychain is temporarily
             // unavailable. It is never rewritten to defaults.
             return legacyValue
@@ -215,6 +224,7 @@ enum ProviderCredentialStore {
         lock.lock()
         defer { lock.unlock() }
         let account = account(forKey: key, in: store, profileScope: profileScope)
+        let missingKey = missingCacheKey(account: account, keychain: keychain)
         guard !inProgressAccounts.contains(account) else { return false }
         inProgressAccounts.insert(account)
         defer { inProgressAccounts.remove(account) }
@@ -233,10 +243,12 @@ enum ProviderCredentialStore {
                   case .value(let persistedValue) = keychain.read(service: service, account: account),
                   persistedValue == value else { return false }
             cacheValue(value, for: account)
+            missingAccounts.remove(missingKey)
             removeDefaultsValue(forKey: deletionMarker, from: standardDefaults)
             removeDefaultsValue(forKey: clearMarker, from: standardDefaults)
         } else {
             cachedValues.removeValue(forKey: account)
+            missingAccounts.remove(missingKey)
             setFlagIfNeeded(clearMarker)
             setFlagIfNeeded(deletionMarker)
             guard keychain.delete(service: service, account: account) else {
@@ -244,6 +256,7 @@ enum ProviderCredentialStore {
                 // before Keychain becomes available to finish the deletion.
                 return false
             }
+            cacheMissing(missingKey)
             removeDefaultsValue(forKey: deletionMarker, from: standardDefaults)
         }
         removeLegacyMirrors(forKey: key, in: store, isPrimaryProfile: isPrimaryProfile)
@@ -364,6 +377,18 @@ enum ProviderCredentialStore {
     private static func removeDefaultsValue(forKey key: String, from store: UserDefaults) {
         guard store.object(forKey: key) != nil else { return }
         store.removeObject(forKey: key)
+    }
+
+    private static func missingCacheKey(account: String, keychain: ProviderCredentialKeychain) -> String {
+        "\(ObjectIdentifier(keychain))|\(account)"
+    }
+
+    private static func cacheMissing(_ key: String) {
+        if !missingAccounts.contains(key), missingAccounts.count >= cacheLimit,
+           let evicted = missingAccounts.first {
+            missingAccounts.remove(evicted)
+        }
+        missingAccounts.insert(key)
     }
 
     private static func cacheValue(_ value: String, for account: String) {

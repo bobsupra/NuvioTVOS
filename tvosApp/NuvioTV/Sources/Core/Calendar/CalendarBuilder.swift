@@ -76,6 +76,7 @@ enum CalendarBuilder {
             ?? libraryName ?? nonEmpty(details.name) ?? item.id
         let poster = CalendarTmdb.imageURL(details.posterPath, size: "w342")
             ?? item.posterURL.flatMap(URL.init(string:))
+        let backdrop = CalendarTmdb.imageURL(details.backdropPath, size: "w1280")
         var seen = Set<String>()
         var result: [CalendarEntry] = []
         for episode in episodes {
@@ -97,7 +98,8 @@ enum CalendarBuilder {
                 episodeName: nonEmpty(episode.name).flatMap { CalendarText.isNonLatin($0) ? nil : $0 },
                 overview: nonEmpty(episode.overview),
                 posterURL: poster,
-                stillURL: CalendarTmdb.imageURL(episode.stillPath, size: "w500")
+                stillURL: CalendarTmdb.imageURL(episode.stillPath, size: "w500"),
+                backdropURL: backdrop
             )
             entry.isAnime = details.isJapaneseAnime
             if seen.insert(entry.id).inserted {
@@ -152,7 +154,8 @@ enum CalendarBuilder {
         let title = CalendarText.readableLibraryTitle(item.name) ?? nonEmpty(details.title) ?? item.id
         let poster = CalendarTmdb.imageURL(details.posterPath, size: "w342")
             ?? item.posterURL.flatMap(URL.init(string:))
-        let backdrop = CalendarTmdb.imageURL(details.backdropPath, size: "w500")
+        let still = CalendarTmdb.imageURL(details.backdropPath, size: "w500")
+        let backdrop = CalendarTmdb.imageURL(details.backdropPath, size: "w1280")
         var seen = Set<String>()
         var result: [CalendarEntry] = []
         for (day, kind) in candidates.sorted(by: { $0.0 < $1.0 }) where day >= first && day <= last {
@@ -166,7 +169,8 @@ enum CalendarBuilder {
                 releaseKind: kind,
                 overview: nonEmpty(details.overview),
                 posterURL: poster,
-                stillURL: backdrop
+                stillURL: still,
+                backdropURL: backdrop
             )
             if seen.insert(entry.id).inserted {
                 result.append(entry)

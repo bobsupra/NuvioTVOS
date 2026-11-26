@@ -21,7 +21,30 @@ final class IPTVPlaylistTests: XCTestCase {
         XCTAssertThrowsError(try IPTVPlaylistParser(string: "#EXTM3U\n#EXT-X-TARGETDURATION:10\nsegment.ts").parse()) {
             XCTAssertEqual($0 as? IPTVPlaylistParser.ParserError, .hlsPlaylist)
         }
+        XCTAssertThrowsError(try IPTVPlaylistParser(string: "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=800000\nvariant.m3u8").parse()) {
+            XCTAssertEqual($0 as? IPTVPlaylistParser.ParserError, .hlsPlaylist)
+        }
+        XCTAssertThrowsError(try IPTVPlaylistParser(string: "#EXTM3U\n#ext-x-endlist").parse()) {
+            XCTAssertEqual($0 as? IPTVPlaylistParser.ParserError, .hlsPlaylist)
+        }
         XCTAssertThrowsError(try IPTVPlaylistParser(string: "not a playlist").parse())
+    }
+
+    func testIgnoresCustomExtXMetadataTagsSuchAsEPGeniusCredentials() throws {
+        let input = """
+        #EXTM3U url-tvg="https://example.test/epg.xml.gz"
+        #EXT-X-CREDENTIALS:[{"provider": "strong", "dns": "example.test", "username": "u", "password": "p"}]
+        #EXT-X-SESSION-DATA:DATA-ID="com.example.meta",VALUE="curated"
+        #EXTINF:0 CUID="0" tvg-name="BBC One" tvg-id="bbcone.uk" group-title="UK",BBC One
+        https://example.test/live/u/p/1.ts
+        """
+        let playlist = try XCTUnwrap(IPTVPlaylistParser(string: input).parse().first)
+        XCTAssertEqual(playlist.tvgURL, "https://example.test/epg.xml.gz")
+        XCTAssertEqual(playlist.streams.count, 1)
+        XCTAssertEqual(playlist.streams[0].title, "BBC One")
+        XCTAssertEqual(playlist.streams[0].tvgID, "bbcone.uk")
+        XCTAssertEqual(playlist.streams[0].groupTitle, "UK")
+        XCTAssertEqual(playlist.streams[0].url, "https://example.test/live/u/p/1.ts")
     }
 
     func testSkipsUnpairedEntriesAndPreservesPlaylistOrder() throws {

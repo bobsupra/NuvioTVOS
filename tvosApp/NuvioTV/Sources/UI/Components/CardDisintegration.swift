@@ -47,6 +47,13 @@ final class CardDisintegration: ObservableObject {
     /// draws from it.
     private var cardFrames: [String: CGRect] = [:]
 
+    /// Settings → Appearance → Continue Watching Perish Animation. The switch
+    /// saves to the active profile's settings, like the other Appearance
+    /// switches, so it is read from there.
+    static func perishAnimationEnabled(in defaults: UserDefaults = ProfileSettings.current) -> Bool {
+        defaults.bool(forKey: SettingsKey.continueWatchingPerishAnimation)
+    }
+
     /// Records where the card for `contentId` is, or forgets it with `nil`.
     func setFrame(_ frame: CGRect?, for contentId: String) {
         cardFrames[contentId] = frame
@@ -58,7 +65,7 @@ final class CardDisintegration: ObservableObject {
     /// When `continueWatchingPerishAnimation` is disabled (the default),
     /// removal runs immediately.
     func dissolveCard(contentId: String, removal: @escaping () -> Void) {
-        guard UserDefaults.standard.bool(forKey: SettingsKey.continueWatchingPerishAnimation) else {
+        guard Self.perishAnimationEnabled() else {
             removal()
             return
         }

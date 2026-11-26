@@ -512,20 +512,14 @@ private struct DiscoverCard: View {
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
-    @AppStorage(SettingsKey.customPosterScreensChosenHere) private var customPosterScreensChosenHere = false
     @Environment(\.cardAppearance) private var cardAppearance
 
     private var customPosterArtworkURL: String? {
-        let screens = CustomPosterScreen.effectiveStorageValue(
-            stored: customPosterEnabledScreens,
-            pattern: customPosterURLPattern,
-            chosenHere: customPosterScreensChosenHere
-        )
-        return CustomPosterURLResolver.resolve(
+        CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: meta,
             screen: .search,
-            enabledScreens: screens,
+            enabledScreens: customPosterEnabledScreens,
             shape: meta.tileShape == .square ? "square" : "poster"
         )
     }

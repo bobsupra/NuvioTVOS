@@ -47,6 +47,8 @@ struct PlayerView: View {
     /// Episode context for the in-player Next Episode card. Empty for movies/trailers.
     var episodes: [NuvioVideo] = []
     var currentEpisode: NuvioVideo? = nil
+    /// Live EPG programme schedule for IPTV channels (used by the live progress bar).
+    var liveProgrammes: [IPTVProgramme] = []
     var initialStartupBenchmarkToken: UUID? = nil
     var autoPlayNextEnabled: Bool = true
     var autoPlayNextCountdownSeconds: Int = 10
@@ -109,6 +111,7 @@ struct PlayerView: View {
         trickplayURL: URL? = nil,
         episodes: [NuvioVideo] = [],
         currentEpisode: NuvioVideo? = nil,
+        liveProgrammes: [IPTVProgramme] = [],
         initialStartupBenchmarkToken: UUID? = nil,
         autoPlayNextEnabled: Bool = true,
         autoPlayNextCountdownSeconds: Int = 10,
@@ -160,6 +163,7 @@ struct PlayerView: View {
         self.trickplayURL = trickplayURL
         self.episodes = episodes
         self.currentEpisode = currentEpisode
+        self.liveProgrammes = liveProgrammes
         self.initialStartupBenchmarkToken = initialStartupBenchmarkToken
         self.autoPlayNextEnabled = autoPlayNextEnabled
         self.allowsManualEpisodeSelection = allowsManualEpisodeSelection
@@ -186,6 +190,7 @@ struct PlayerView: View {
     @State var didReportPlaybackStarted = false
     @State var lastBecameActiveAt: Date = Date()
     @State var requestedControlFocus: PlayerControlFocus? = nil
+    @State var isPlayerQuickMenuPresented = false
     @FocusState var remoteInputFocused: Bool
     @FocusState var nextEpisodeFocused: Bool
     @FocusState var cancelAutoPlayFocused: Bool

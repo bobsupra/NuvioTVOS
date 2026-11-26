@@ -16,7 +16,8 @@ enum UsenetNNTPError: Error, Sendable, Equatable {
     case badGreeting(Int)
     /// AUTHINFO USER/PASS rejected.
     case authenticationFailed(Int)
-    /// BODY/ARTICLE returned a 4xx/5xx — typically 430 (no such article / taken down).
+    /// BODY/ARTICLE said the article is gone (`UsenetNNTPConnection.missingArticleCodes`) —
+    /// typically 430 (no such article) or 451 (taken down).
     case articleUnavailable(code: Int)
     /// The server closed the stream mid-response.
     case connectionClosed
@@ -167,6 +168,10 @@ actor UsenetNNTPConnection {
     /// Hard cap on a single line so a misbehaving server that never sends a newline can't grow
     /// memory without bound. NNTP status/yEnc lines are short; 4 MB is a very generous ceiling.
     private static let maxLineBytes = 4 * 1024 * 1024
+    /// Answers for an article that is gone: 420/423 (no current article / none with that
+    /// number), 430 (no such article) and 451, which some providers give for an article
+    /// taken down (DMCA), often on BODY only, after STAT still said 223.
+    static let missingArticleCodes: Set<Int> = [420, 423, 430, 451]
 
     private var connection: NWConnection?
     private var framer = UsenetLineFramer()
@@ -272,9 +277,9 @@ actor UsenetNNTPConnection {
         switch status.code {
         case 222:
             return try await readBodyRaw()
-        case 420, 423, 430:
-            // No such article / no article with that number — genuinely, permanently missing.
-            throw UsenetNNTPError.articleUnavailable(code: status.code)
+        case let code where Self.missingArticleCodes.contains(code):
+            // No such article / no article with that number / taken down — permanently missing.
+            throw UsenetNNTPError.articleUnavailable(code: code)
         case 480, 481, 482, 483, 502:
             // Authentication or permission problem — a per-segment retry won't help; surface it
             // so the job fails cleanly instead of silently punching holes.
@@ -296,7 +301,7 @@ actor UsenetNNTPConnection {
         switch status.code {
         case 223:
             return true
-        case 420, 423, 430:
+        case let code where Self.missingArticleCodes.contains(code):
             return false
         case 480, 481, 482, 483, 502:
             throw UsenetNNTPError.authenticationFailed(status.code)

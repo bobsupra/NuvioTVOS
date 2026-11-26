@@ -741,8 +741,17 @@ struct TVCatalogRow: View {
     }
 
     private func applyFocusRequest(_ request: TVHomeRowFocusRequest?) {
-        guard ownsCardFocus, let key = request?.cardKey, ownCardFocus != key else { return }
-        ownCardFocus = key
+        guard ownsCardFocus, let key = request?.cardKey else { return }
+        if ownCardFocus == key {
+            ownCardFocus = nil
+            DispatchQueue.main.async {
+                if ownCardFocus == nil {
+                    ownCardFocus = key
+                }
+            }
+        } else {
+            ownCardFocus = key
+        }
     }
 
     /// True while a Continue Watching card is shown as dust instead of itself.
@@ -1749,8 +1758,17 @@ struct TVCollectionFolderRow: View {
     }
 
     private func applyFocusRequest(_ request: TVHomeRowFocusRequest?) {
-        guard ownsCardFocus, let key = request?.cardKey, ownCardFocus != key else { return }
-        ownCardFocus = key
+        guard ownsCardFocus, let key = request?.cardKey else { return }
+        if ownCardFocus == key {
+            ownCardFocus = nil
+            DispatchQueue.main.async {
+                if ownCardFocus == nil {
+                    ownCardFocus = key
+                }
+            }
+        } else {
+            ownCardFocus = key
+        }
     }
 
     private var effectiveScrollIndex: Int {

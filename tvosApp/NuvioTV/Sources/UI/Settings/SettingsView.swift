@@ -789,6 +789,8 @@ enum SettingsKey {
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
     static let detailsActionsBelowInfo = "nuvio.tv.settings.layout.detailsActionsBelowInfo"
+    /// Settings → Layout → Details Page → IMDb Parental Guide.
+    static let detailsShowParentalGuide = "nuvio.tv.settings.layout.detailsShowParentalGuide"
     /// JSON `[String]` of Details page section IDs in the user's preferred order.
     static let detailsSectionOrder = "nuvio.tv.settings.layout.detailsSectionOrder"
     /// JSON `[String]` of Details page section IDs hidden from Details view.
@@ -853,6 +855,7 @@ enum SettingsKey {
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
     static let debridEnabled = "nuvio.tv.settings.integrations.debridEnabled"
     static let p2pEnabled = "nuvio.tv.settings.integrations.p2pEnabled"
+    /// Settings → Appearance → Sidebar → Live TV.
     static let nativeIPTVEnabled = "nuvio.tv.settings.integrations.nativeIPTVEnabled"
     /// Device/profile-local acknowledgement for direct peer-to-peer playback.
     static let p2pConsentAccepted = "nuvio.tv.settings.integrations.p2pConsentAccepted"
@@ -964,6 +967,8 @@ enum SettingsKey {
     static let subtitleLanguageSecondary = "nuvio.tv.settings.playback.subtitleLanguage.secondary"
     static let subtitleLanguageTertiary = "nuvio.tv.settings.playback.subtitleLanguage.tertiary"
     static let forcedSubtitles = "nuvio.tv.settings.playback.forcedSubtitles"
+    static let preferExternalSubtitles = "nuvio.tv.settings.playback.preferExternalSubtitles"
+    static let preferredSubtitleFormat = "nuvio.tv.settings.playback.preferredSubtitleFormat"
     static let subtitleSize = "nuvio.tv.settings.playback.subtitleSize"
     static let frameRateMatching = "nuvio.tv.settings.playback.frameRateMatching"
     static let networkCache = "nuvio.tv.settings.playback.networkCache"
@@ -1061,9 +1066,6 @@ enum SettingsKey {
     static let resumePromptOnLaunch = "nuvio.tv.settings.layout.resumePromptOnLaunch"
     /// Animated GIF posters play on the focused card (see `AnimatedArtworkMode`).
     static let animatedArtwork = "nuvio.tv.settings.layout.animatedArtwork"
-    /// "Apply custom posters to" was used on this Apple TV. Until then every
-    /// screen shows custom posters, as before the rows existed.
-    static let customPosterScreensChosenHere = "nuvio.tv.settings.layout.customPosterScreensChosenHere"
     /// Card depth effect (see `CardDepthStyle`): off by default.
     static let cardDepthEnabled = "nuvio.tv.settings.layout.cardDepthEnabled"
     static let cardDepthEdge = "nuvio.tv.settings.layout.cardDepthEdge"
@@ -1145,8 +1147,6 @@ enum SettingsKey {
         // have no such setting.
         doubleBackToExit,
         aniListClientID, malClientID, animeSkipClientID,
-        // Says a choice was made on this Apple TV, so it stays here.
-        customPosterScreensChosenHere,
         // Keyed by this Apple TV's audio outputs.
         audioDelayByDevice
     ])
@@ -1170,7 +1170,7 @@ enum SettingsKey {
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
         showCalendarTab, showSurpriseMeTab, surpriseMeUseTMDB, surpriseMeUseTrackers, surpriseMeContent, surpriseMeAIProvider, surpriseMeAIModel, aiCatalogMovies, aiCatalogSeries, aiCatalogAnimeMovies, aiCatalogAnimeSeries, showWatchPartyTab, useTopNavigation, useNuvioRail, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
         cardCornerRadius, cardSize, liquidGlassCards,
-        hideUnreleased, showFullDates, detailsActionsBelowInfo,
+        hideUnreleased, showFullDates, detailsActionsBelowInfo, detailsShowParentalGuide,
         detailsSectionOrder, detailsSectionDisabled,
         blurUnwatchedEpisodes, hideUnwatchedEpisodeDescriptions, hideUnwatchedEpisodeTitles, revealNextEpisodeSpoilers,
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI,
@@ -1216,7 +1216,7 @@ enum SettingsKey {
         autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerSound, trailerDelay, trailerSource, trailerLanguage,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
-        forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
+        forcedSubtitles, preferExternalSubtitles, preferredSubtitleFormat, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
         playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerShowSpeed, playerShowFinishTime, shuffleAllSeries, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
         timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
@@ -1229,7 +1229,7 @@ enum SettingsKey {
         streamSelectionTimeout, streamAutoPlaySourceScope, streamAutoPlayAllowedAddons, streamAutoPlayAllowedPlugins,
         audioLanguageSecondary, holdToSpeedEnabled, holdToSpeedValue, animeSkipEnabled, animeSkipClientID,
         subtitleStripSDH, subtitleOnlyPreferredLanguages,
-        customAccent, resumePromptOnLaunch, animatedArtwork, customPosterScreensChosenHere,
+        customAccent, resumePromptOnLaunch, animatedArtwork,
         cardDepthEnabled, cardDepthEdge, cardDepthSheen, cardDepthCoverage,
         cardDepthPosters, cardDepthContinueWatching, cardDepthEpisodes, cardDepthCast,
         streamBadgesInPlayer, streamPlayerBadgeSource, detailsBackgroundMode, episodeRatingsHideUnwatched,
@@ -2188,6 +2188,9 @@ enum AISubtitleProvider: String, CaseIterable, Identifiable {
 /// preferences remain per-profile in UserDefaults, while keys stay in Keychain.
 enum AISubtitleKeyStore {
     private static let service = "com.nuvio.tv.ai-subtitles"
+    private static let lock = NSLock()
+    private static var cachedValues: [String: String] = [:]
+    private static var missingAccounts: Set<String> = []
 
     static func apiKey(
         for provider: AISubtitleProvider,
@@ -2206,7 +2209,9 @@ enum AISubtitleKeyStore {
     @discardableResult
     static func migrateLegacyKey(from defaults: UserDefaults, profileScope: String) -> String {
         if let secureKey = read(for: .gemini, profileScope: profileScope) {
-            defaults.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
+            if defaults.object(forKey: SettingsKey.aiSubtitlesGeminiAPIKey) != nil {
+                defaults.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
+            }
             return secureKey
         }
         let legacyKey = (defaults.string(forKey: SettingsKey.aiSubtitlesGeminiAPIKey) ?? "")
@@ -2228,18 +2233,28 @@ enum AISubtitleKeyStore {
             return remove(for: provider, profileScope: profileScope)
         }
 
+        let account = accountKey(for: provider, profileScope: profileScope)
         let data = Data(trimmed.utf8)
         var addQuery = keychainQuery(for: provider, profileScope: profileScope)
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         addQuery[kSecValueData as String] = data
         let status = SecItemAdd(addQuery as CFDictionary, nil)
+        let succeeded: Bool
         if status == errSecDuplicateItem {
-            return SecItemUpdate(
+            succeeded = SecItemUpdate(
                 keychainQuery(for: provider, profileScope: profileScope) as CFDictionary,
                 [kSecValueData as String: data] as CFDictionary
             ) == errSecSuccess
+        } else {
+            succeeded = status == errSecSuccess
         }
-        return status == errSecSuccess
+        if succeeded {
+            lock.withLock {
+                cachedValues[account] = trimmed
+                missingAccounts.remove(account)
+            }
+        }
+        return succeeded
     }
 
     @discardableResult
@@ -2247,8 +2262,16 @@ enum AISubtitleKeyStore {
         for provider: AISubtitleProvider,
         profileScope: String = ProfileSettings.activeProfileScope
     ) -> Bool {
+        let account = accountKey(for: provider, profileScope: profileScope)
         let status = SecItemDelete(keychainQuery(for: provider, profileScope: profileScope) as CFDictionary)
-        return status == errSecSuccess || status == errSecItemNotFound
+        let succeeded = status == errSecSuccess || status == errSecItemNotFound
+        if succeeded {
+            lock.withLock {
+                cachedValues.removeValue(forKey: account)
+                missingAccounts.insert(account)
+            }
+        }
+        return succeeded
     }
 
     @discardableResult
@@ -2258,15 +2281,42 @@ enum AISubtitleKeyStore {
         }
     }
 
+    private static func accountKey(for provider: AISubtitleProvider, profileScope: String) -> String {
+        "\(provider.rawValue.lowercased()).\(profileScope)"
+    }
+
     private static func read(for provider: AISubtitleProvider, profileScope: String) -> String? {
+        let account = accountKey(for: provider, profileScope: profileScope)
+        if let cached = lock.withLock({ () -> String?? in
+            if let value = cachedValues[account] { return .some(value) }
+            if missingAccounts.contains(account) { return .some(nil) }
+            return nil
+        }) {
+            return cached
+        }
         var query = keychainQuery(for: provider, profileScope: profileScope)
         query[kSecReturnData as String] = kCFBooleanTrue
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        if status == errSecItemNotFound {
+            lock.withLock {
+                cachedValues.removeValue(forKey: account)
+                missingAccounts.insert(account)
+            }
+            return nil
+        }
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let trimmed = String(data: data, encoding: .utf8)?
+                  .trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return nil
+        }
+        lock.withLock {
+            cachedValues[account] = trimmed
+            missingAccounts.remove(account)
+        }
+        return trimmed
     }
 
     private static func keychainQuery(
@@ -2276,7 +2326,7 @@ enum AISubtitleKeyStore {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: "\(provider.rawValue.lowercased()).\(profileScope)"
+            kSecAttrAccount as String: accountKey(for: provider, profileScope: profileScope)
         ]
     }
 }
@@ -2635,6 +2685,9 @@ struct SettingsView: View {
     /// Page sections with no row to show (every row hidden by a condition),
     /// drawn without their heading and card.
     @State private var emptySections: Set<String> = []
+    /// Generation counter so rapid page open/close transitions don't let an
+    /// earlier timer clear `pageOpening` or move focus for a newer one.
+    @State private var pageTransitionGeneration: UInt = 0
     @FocusState private var focusedLanguagePreference: LanguagePickerKind?
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -2910,17 +2963,33 @@ struct SettingsView: View {
     /// move the focus to the sidebar, so it is sent to the page's back button.
     private func openLeaf(_ leaf: SettingsLeaf) {
         leafPath.append(leaf)
+        pageTransitionGeneration &+= 1
+        let generation = pageTransitionGeneration
         pageOpening = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { pageBackFocused = true }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { pageOpening = false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            guard generation == pageTransitionGeneration else { return }
+            pageBackFocused = true
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard generation == pageTransitionGeneration else { return }
+            pageOpening = false
+        }
     }
 
     /// Closes the open page and returns focus to the row that opened it.
     private func closeLeaf() {
         guard let closed = leafPath.popLast() else { return }
+        pageTransitionGeneration &+= 1
+        let generation = pageTransitionGeneration
         pageOpening = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { focusedLeafRow = closed }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { pageOpening = false }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            guard generation == pageTransitionGeneration else { return }
+            focusedLeafRow = closed
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+            guard generation == pageTransitionGeneration else { return }
+            pageOpening = false
+        }
     }
 
     /// The detail pane of grouped Settings: the group's pages, or the open
@@ -4117,13 +4186,24 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @State private var confirmingSurpriseMeTab = false
+    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
-    @AppStorage(SettingsKey.customPosterScreensChosenHere) private var customPosterScreensChosenHere = false
-    @State private var customPosterURLDraft = ""
+    @State private var showingCustomPosterSettings = false
     @ObservedObject private var localeManager = AppLocaleManager.shared
 
     private let cardRadiusOptions = CardCornerRadiusOption.allCases.map(\.rawValue)
+
+    private var customPosterStatusSummary: String {
+        let trimmedPattern = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPattern.isEmpty else {
+            return "Not configured"
+        }
+        let enabledScreens = CustomPosterScreen.fromStorageValue(customPosterEnabledScreens)
+        let availableScreens = CustomPosterScreen.tvOSScreens
+        let activeCount = availableScreens.filter { enabledScreens.contains($0) }.count
+        return "\(activeCount) of \(availableScreens.count) screens active"
+    }
 
     private var accentSwatches: [SettingsSwatch] {
         SettingsAccent.allCases.map { SettingsSwatch(id: $0.rawValue, label: $0.rawValue, color: $0.color) }
@@ -4231,38 +4311,18 @@ private struct AppearanceSettingsView: View {
                     ProfileSettings.notifySettingsChanged()
                 }
                 .settingsLeaf(.poster, section: "POSTER CARD STYLE")
-
-                SettingsTextFieldRow(
-                    title: "Custom Poster URL",
-                    subtitle: "Leave blank to use provider artwork. Supports {id}, {id_type}, {typed_id}, {type}, {shape}, and ID types ({imdb_id}, {tmdb_id}, {tvdb_id}, etc.).",
-                    placeholder: "https://example.com/poster?id={id}&id_type={id_type}&type={type}",
-                    text: $customPosterURLDraft,
-                    fieldWidth: 650,
-                    onCommit: {
-                        let committedPattern = CustomPosterURLResolver.sanitizePattern(customPosterURLDraft)
-                        customPosterURLDraft = committedPattern
-                        customPosterURLPattern = committedPattern
-                        // Once "Apply custom posters to" has been used here, its choice is kept.
-                        if !committedPattern.isEmpty, !customPosterScreensChosenHere {
-                            customPosterEnabledScreens = "all"
-                        }
-                    }
-                )
-                // The screens value is written only when an address is typed
-                // here. Opening this page, or an address arriving from another
-                // device, must not send "all" over a choice made elsewhere.
-                // Until the toggles are used here every screen applies anyway.
-                .onAppear {
-                    customPosterURLDraft = customPosterURLPattern
-                }
-                .onChange(of: customPosterURLPattern) { _, newPattern in
-                    customPosterURLDraft = newPattern
-                }
-                .settingsLeaf(.poster, section: "CUSTOM POSTER SOURCE")
-
-                CustomPosterScreenToggles(accentColor: accentColor)
             }
-            .settingsPlaces([SettingsPlace(.poster, "POSTER CARD STYLE"), SettingsPlace(.poster, "CUSTOM POSTER SOURCE")])
+            .settingsPlaces([SettingsPlace(.poster, "POSTER CARD STYLE")])
+
+            SettingsFeatureSummaryCard(
+                featureName: "Custom Poster URL",
+                status: customPosterStatusSummary,
+                actionSubtitle: "Paste a custom poster URL and choose which screens use it",
+                accentColor: accentColor
+            ) {
+                showingCustomPosterSettings = true
+            }
+            .settingsLeaf(.poster, section: "CUSTOM POSTER SOURCE")
 
             CardDepthSettingsGroup(accentColor: accentColor)
 
@@ -4320,6 +4380,16 @@ private struct AppearanceSettingsView: View {
                         fallback: "Surprise Me learns your tastes from this profile's watch history, library and Continue Watching, including what your connected trackers (Trakt, Simkl, MDBList, WeTrakr) report, and suggests movies and series you haven't seen. Your tastes are worked out on your devices from data that already syncs with your Nuvio account, so you keep them on every device. Nothing is shared with anyone else unless you add an AI key below. A Surprise Me tab will be added to the menu."
                     ))
                 }
+                .settingsLeaf(.lay, section: "NAVIGATION BAR")
+                SettingsToggleRow(
+                    title: L10n.string("nav_live_tv", fallback: "Live TV"),
+                    subtitle: L10n.string(
+                        "iptv_enable_subtitle",
+                        fallback: "Show Live TV in navigation"
+                    ),
+                    isOn: $nativeIPTVEnabled,
+                    accentColor: accentColor
+                )
                 .settingsLeaf(.lay, section: "NAVIGATION BAR")
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_double_back_to_exit", fallback: "Press Back Twice to Exit"),
@@ -4605,6 +4675,113 @@ private struct AppearanceSettingsView: View {
             }
             ProfileSettings.notifySettingsChanged()
         }
+        .fullScreenCover(isPresented: $showingCustomPosterSettings) {
+            SettingsFeatureSettingsSheet(
+                title: "Custom Poster URL",
+                subtitle: "Paste a custom poster URL template and choose where custom posters are applied"
+            ) {
+                CustomPosterSettingsSection(
+                    accentColor: accentColor,
+                    cornerRadiusOption: CardCornerRadiusOption.from(rawValue: cardCornerRadius),
+                    isLiquidGlass: liquidGlassCards
+                )
+            }
+            .defaultAppStorage(ProfileSettings.current)
+            .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+}
+
+private struct CustomPosterSettingsSection: View {
+    let accentColor: Color
+    let cornerRadiusOption: CardCornerRadiusOption
+    let isLiquidGlass: Bool
+
+    @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
+    @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @State private var customPosterURLDraft = ""
+
+    private var hasConfiguredURL: Bool {
+        !customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 28) {
+            SettingsGroup(
+                title: "Poster URL",
+                subtitle: "Leave blank to use provider artwork. Supports {id}, {id_type}, {typed_id}, {type}, {shape}, and ID types ({imdb_id}, {tmdb_id}, {tvdb_id}, etc.)."
+            ) {
+                CardStyleLivePreview(
+                    customPosterURLPattern: customPosterURLPattern,
+                    cornerRadiusOption: cornerRadiusOption,
+                    isLiquidGlass: isLiquidGlass
+                )
+                .id(customPosterURLPattern)
+
+                SettingsTextFieldRow(
+                    title: "Custom Poster URL",
+                    subtitle: "Paste a custom poster URL template (e.g. RPDB, Top Posters, or Pictorium)",
+                    placeholder: "https://example.com/poster?id={id}&id_type={id_type}&type={type}",
+                    text: $customPosterURLDraft,
+                    fieldWidth: 560,
+                    onCommit: {
+                        let committedPattern = CustomPosterURLResolver.sanitizePattern(customPosterURLDraft)
+                        customPosterURLDraft = committedPattern
+                        customPosterURLPattern = committedPattern
+                    }
+                )
+                .settingsEntryAnchor()
+
+                if hasConfiguredURL {
+                    SettingsActionRow(
+                        title: "Clear Custom Poster URL",
+                        subtitle: "Remove the custom poster URL and return to provider artwork",
+                        value: "Clear",
+                        accentColor: accentColor
+                    ) {
+                        customPosterURLDraft = ""
+                        customPosterURLPattern = ""
+                    }
+                }
+            }
+
+            SettingsGroup(
+                title: "Where to Apply",
+                subtitle: "Choose which screens use custom poster artwork"
+            ) {
+                ForEach(CustomPosterScreen.tvOSScreens) { screen in
+                    SettingsToggleRow(
+                        title: "Apply to \(screen.title)",
+                        subtitle: "Use custom poster artwork on \(screen.title.lowercased()) cards.",
+                        isOn: customPosterScreenBinding(for: screen),
+                        accentColor: accentColor
+                    )
+                }
+            }
+        }
+        .onAppear {
+            customPosterURLDraft = customPosterURLPattern
+        }
+        .onChange(of: customPosterURLPattern) { _, newPattern in
+            customPosterURLDraft = newPattern
+        }
+    }
+
+    private func customPosterScreenBinding(for screen: CustomPosterScreen) -> Binding<Bool> {
+        Binding(
+            get: {
+                CustomPosterScreen.fromStorageValue(customPosterEnabledScreens).contains(screen)
+            },
+            set: { isEnabled in
+                var screens = CustomPosterScreen.fromStorageValue(customPosterEnabledScreens)
+                if isEnabled {
+                    screens.insert(screen)
+                } else {
+                    screens.remove(screen)
+                }
+                customPosterEnabledScreens = CustomPosterScreen.storageValue(for: screens)
+            }
+        )
     }
 }
 
@@ -6193,73 +6370,6 @@ private struct AnimatedArtworkSettingsRow: View {
     }
 }
 
-/// Settings → Poster Card Style → Apply custom posters to. Shown while a
-/// custom poster address is set.
-private struct CustomPosterScreenToggles: View {
-    let accentColor: Color
-    @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
-    @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
-    @AppStorage(SettingsKey.customPosterScreensChosenHere) private var customPosterScreensChosenHere = false
-
-    private struct Entry: Identifiable {
-        let screen: CustomPosterScreen
-        let key: String
-        let name: String
-        var id: String { screen.rawValue }
-    }
-
-    /// The screens the desktop app lists, in its order.
-    private static let entries = [
-        Entry(screen: .home, key: "settings_custom_poster_screen_home", name: "Home"),
-        Entry(screen: .continueWatching, key: "settings_custom_poster_screen_continue_watching", name: "Continue Watching"),
-        Entry(screen: .collections, key: "settings_custom_poster_screen_collections", name: "Collections"),
-        Entry(screen: .library, key: "settings_custom_poster_screen_library", name: "Library"),
-        Entry(screen: .search, key: "settings_custom_poster_screen_search", name: "Search"),
-        Entry(screen: .details, key: "settings_custom_poster_screen_details", name: "Details Screen")
-    ]
-
-    /// The screens in use: every screen until a row here is first used.
-    private var enabledScreens: Set<CustomPosterScreen> {
-        CustomPosterScreen.fromStorageValue(
-            CustomPosterScreen.effectiveStorageValue(
-                stored: customPosterEnabledScreens,
-                pattern: customPosterURLPattern,
-                chosenHere: customPosterScreensChosenHere
-            )
-        )
-    }
-
-    private func binding(for screen: CustomPosterScreen) -> Binding<Bool> {
-        Binding(
-            get: { enabledScreens.contains(screen) },
-            set: { isOn in
-                var screens = enabledScreens
-                if isOn { screens.insert(screen) } else { screens.remove(screen) }
-                customPosterScreensChosenHere = true
-                customPosterEnabledScreens = CustomPosterScreen.storageValue(for: screens)
-            }
-        )
-    }
-
-    var body: some View {
-        if !customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            ForEach(Self.entries) { entry in
-                SettingsToggleRow(
-                    title: L10n.string("settings_custom_poster_apply_to", fallback: "Apply custom posters to")
-                        + ": " + L10n.string(entry.key, fallback: entry.name),
-                    subtitle: L10n.string(
-                        "tvos_settings_custom_poster_screen_subtitle",
-                        fallback: "Use the custom poster address for cards on this screen"
-                    ),
-                    isOn: binding(for: entry.screen),
-                    accentColor: accentColor
-                )
-                .settingsLeaf(.poster, section: "CUSTOM POSTER SOURCE")
-            }
-        }
-    }
-}
-
 /// Settings → Poster Card Style → Card depth effect.
 private struct CardDepthSettingsGroup: View {
     let accentColor: Color
@@ -6620,6 +6730,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @AppStorage(SettingsKey.detailsShowParentalGuide) private var detailsShowParentalGuide = false
     @State private var showingHomeCatalogOrderSettings = false
     @State private var showingCollectionsSettings = false
     @State private var showingDetailsSectionsSettings = false
@@ -7192,6 +7303,20 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Place the Play and action button row below the movie information and synopsis"
                     ),
                     isOn: $detailsActionsBelowInfo,
+                    accentColor: accentColor
+                )
+                .settingsLeaf(.detail, section: "APPEARANCE")
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_details_parental_guide",
+                        fallback: "IMDb Parental Guide"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_details_parental_guide_subtitle",
+                        fallback: "Show IMDb content advisories (violence, profanity, nudity, alcohol & drugs) on Details screens"
+                    ),
+                    isOn: $detailsShowParentalGuide,
                     accentColor: accentColor
                 )
                 .settingsLeaf(.detail, section: "APPEARANCE")
@@ -8348,7 +8473,6 @@ private struct IntegrationSettingsView: View {
     @State private var debridApiKey = ""
     @AppStorage(SettingsKey.debridEnabled) private var debridEnabled = true
     @AppStorage(SettingsKey.cloudLibraryEnabled) private var cloudLibraryEnabled = true
-    @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @State private var torboxAccessToken = ""
     @State private var premiumizeAccessToken = ""
     @State private var realDebridAccessToken = ""
@@ -8382,6 +8506,7 @@ private struct IntegrationSettingsView: View {
     @State private var pluginSummaryCount = 0
     @State private var addonSummaryCount = 0
     @State private var addonSummarySyncedAddons: [SyncedAddon]? = nil
+    @State private var didAppearOnce = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
@@ -8726,9 +8851,15 @@ private struct IntegrationSettingsView: View {
                 .settingsLeaf(.wetrakr, section: "ACCOUNT")
 
                 SettingsTextFieldRow(
-                    title: "WeTrakr Client ID",
-                    subtitle: "Your app key from WeTrakr Settings API — stored only on this Apple TV",
-                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    title: WeTrakrConfig.defaultClientID.isEmpty
+                        ? "WeTrakr Client ID"
+                        : "WeTrakr Client ID (Optional)",
+                    subtitle: WeTrakrConfig.defaultClientID.isEmpty
+                        ? "Your app key from WeTrakr Settings API — stored only on this Apple TV"
+                        : "Leave blank to use Nuvio's built-in key, or enter a custom key — stored only on this Apple TV",
+                    placeholder: WeTrakrConfig.defaultClientID.isEmpty
+                        ? L10n.string("debrid_not_set", fallback: "Not set")
+                        : "Using built-in key",
                     text: $wetrakrClientIDDraft,
                     onCommit: {
                         wetrakrClientID = wetrakrClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -8843,15 +8974,6 @@ private struct IntegrationSettingsView: View {
                 .settingsLeaf(.int, section: "INTEGRATIONS")
             }
             .settingsPlaces([SettingsPlace(.int, "INTEGRATIONS")])
-
-            SettingsGroup(title: L10n.string("iptv_settings_title", fallback: "Live TV"),
-                          subtitle: L10n.string("iptv_settings_subtitle", fallback: "Add your own IPTV sources")) {
-                SettingsToggleRow(title: L10n.string("iptv_enable_title", fallback: "Native IPTV"),
-                                  subtitle: L10n.string("iptv_enable_subtitle", fallback: "Show Live TV in navigation"),
-                                  isOn: $nativeIPTVEnabled, accentColor: accentColor)
-                .settingsLeaf(.cd, section: "SOURCES")
-            }
-            .settingsPlaces([SettingsPlace(.cd, "SOURCES")])
 
             SettingsGroup(
                 title: L10n.string("tvos_integrations_debrid", fallback: "Debrid"),
@@ -9023,17 +9145,25 @@ private struct IntegrationSettingsView: View {
             .settingsPlaces([SettingsPlace(.servers, "PLEX")])
         }
         .onAppear {
+            let isRepeatAppear = didAppearOnce
+            didAppearOnce = true
             refreshDebridCredentials()
             refreshAddonSummaryCount()
+            let previousProgressSource = TraktSettingsStore.watchProgressSource(in: profileStore)
+            let previousLibrarySource = TraktSettingsStore.librarySourceMode(in: profileStore)
             RemoteTrackingState.normalizeWatchProgressSource()
             RemoteTrackingState.normalizeLibrarySource()
             RemoteTrackingState.normalizeMoreLikeThisSource()
-            traktViewModel.reload()
+            let sourcesNormalized = previousProgressSource != TraktSettingsStore.watchProgressSource(in: profileStore)
+                || previousLibrarySource != TraktSettingsStore.librarySourceMode(in: profileStore)
+            if isRepeatAppear || sourcesNormalized {
+                traktViewModel.reload()
+                simklViewModel.reload()
+                mdbListViewModel.reload()
+                wetrakrViewModel.reload()
+            }
             traktViewModel.loadConnectedData()
-            simklViewModel.reload()
             simklViewModel.loadConnectedData()
-            mdbListViewModel.reload()
-            wetrakrViewModel.reload()
             wetrakrViewModel.loadConnectedData()
         }
         .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification).receive(on: RunLoop.main)) { _ in
@@ -9314,13 +9444,20 @@ private struct IntegrationSettingsView: View {
     private func refreshDebridCredentials() {
         let store = ProfileSettings.current
         let profileScope = ProfileSettings.activeProfileScope
-        tmdbApiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store, profileScope: profileScope) ?? ""
-        mdbListApiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store, profileScope: profileScope) ?? ""
-        torboxAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.torboxAccessToken, in: store, profileScope: profileScope) ?? ""
-        premiumizeAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.premiumizeAccessToken, in: store, profileScope: profileScope) ?? ""
-        realDebridAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.realDebridAccessToken, in: store, profileScope: profileScope) ?? ""
-        debridApiKey = ProviderCredentialStore.string(forKey: SettingsKey.debridApiKey, in: store, profileScope: profileScope) ?? ""
-        debridProvider = store.string(forKey: SettingsKey.debridProvider) ?? "None"
+        let nextTmdbApiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store, profileScope: profileScope) ?? ""
+        if tmdbApiKey != nextTmdbApiKey { tmdbApiKey = nextTmdbApiKey }
+        let nextMdbListApiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store, profileScope: profileScope) ?? ""
+        if mdbListApiKey != nextMdbListApiKey { mdbListApiKey = nextMdbListApiKey }
+        let nextTorboxAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.torboxAccessToken, in: store, profileScope: profileScope) ?? ""
+        if torboxAccessToken != nextTorboxAccessToken { torboxAccessToken = nextTorboxAccessToken }
+        let nextPremiumizeAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.premiumizeAccessToken, in: store, profileScope: profileScope) ?? ""
+        if premiumizeAccessToken != nextPremiumizeAccessToken { premiumizeAccessToken = nextPremiumizeAccessToken }
+        let nextRealDebridAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.realDebridAccessToken, in: store, profileScope: profileScope) ?? ""
+        if realDebridAccessToken != nextRealDebridAccessToken { realDebridAccessToken = nextRealDebridAccessToken }
+        let nextDebridApiKey = ProviderCredentialStore.string(forKey: SettingsKey.debridApiKey, in: store, profileScope: profileScope) ?? ""
+        if debridApiKey != nextDebridApiKey { debridApiKey = nextDebridApiKey }
+        let nextDebridProvider = store.string(forKey: SettingsKey.debridProvider) ?? "None"
+        if debridProvider != nextDebridProvider { debridProvider = nextDebridProvider }
     }
 
     private func receiveSyncedAddonSummary(_ syncedAddons: [SyncedAddon]) {
@@ -9454,6 +9591,7 @@ private struct IntegrationSettingsView: View {
 
     private var wetrakrCredentialsReady: Bool {
         !wetrakrClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || WeTrakrConfig.isConfigured(in: profileStore)
     }
 
     private func connectWeTrakr() {
@@ -14929,6 +15067,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
     @AppStorage(SettingsKey.forcedSubtitles) private var forcedSubtitles = true
+    @AppStorage(SettingsKey.preferExternalSubtitles) private var preferExternalSubtitles = false
+    @AppStorage(SettingsKey.preferredSubtitleFormat) private var preferredSubtitleFormat = SubtitleFormatPreference.auto.rawValue
     @AppStorage(SettingsKey.frameRateMatching) private var frameRateMatching = "Always"
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
     @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Off"
@@ -16222,6 +16362,30 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .settingsLeaf(.pbSubs, section: "SUBTITLES")
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_playback_prefer_external_subtitles", fallback: "Prefer External Subtitles"),
+                    subtitle: L10n.string(
+                        "tvos_playback_prefer_external_subtitles_subtitle",
+                        fallback: "Prefer add-on subtitles over embedded file subtitles when matching your preferred language"
+                    ),
+                    isOn: $preferExternalSubtitles,
+                    accentColor: accentColor
+                )
+
+                SettingsChoiceRow(
+                    title: L10n.string("tvos_playback_preferred_subtitle_format", fallback: "Preferred Subtitle Format"),
+                    subtitle: L10n.string(
+                        "tvos_playback_preferred_subtitle_format_subtitle",
+                        fallback: "Prefer a subtitle format when multiple tracks match your language. Falls back if unavailable."
+                    ),
+                    selection: $preferredSubtitleFormat,
+                    options: SubtitleFormatPreference.allCases.map(\.rawValue),
+                    optionLabels: Dictionary(
+                        uniqueKeysWithValues: SubtitleFormatPreference.allCases.map { ($0.rawValue, $0.displayTitle) }
+                    ),
+                    accentColor: accentColor
+                )
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_ass_ssa_override", fallback: "ASS/SSA Override"),
@@ -19299,6 +19463,7 @@ private struct SMBRowButton: View {
         .buttonStyle(PosterCardButtonStyle())
         .focusEffectDisabledIfAvailable()
         .focused($isFocused)
+        .entryLockable()
         .disabled(!enabled)
         .opacity(enabled ? 1 : 0.5)
     }
@@ -19320,6 +19485,7 @@ private struct SMBDeleteButton: View {
         .buttonStyle(PosterCardButtonStyle())
         .focusEffectDisabledIfAvailable()
         .focused($isFocused)
+        .entryLockable()
     }
 }
 
@@ -27801,7 +27967,11 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
                 uiView.becomeFirstResponder()
             }
         } else if !isEditing && uiView.isFirstResponder {
-            uiView.resignFirstResponder()
+            DispatchQueue.main.async {
+                if uiView.isFirstResponder {
+                    uiView.resignFirstResponder()
+                }
+            }
         }
     }
 

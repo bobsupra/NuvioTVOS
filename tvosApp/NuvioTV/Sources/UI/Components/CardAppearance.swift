@@ -34,11 +34,6 @@ struct CardAppearance: Equatable {
         var appearance = CardAppearance()
         if let value = defaults.string(forKey: SettingsKey.customPosterURLPattern) { appearance.customPosterURLPattern = value }
         if let value = defaults.string(forKey: SettingsKey.customPosterEnabledScreens) { appearance.customPosterEnabledScreens = value }
-        appearance.customPosterEnabledScreens = CustomPosterScreen.effectiveStorageValue(
-            stored: appearance.customPosterEnabledScreens,
-            pattern: appearance.customPosterURLPattern,
-            chosenHere: defaults.bool(forKey: SettingsKey.customPosterScreensChosenHere)
-        )
         if let value = defaults.object(forKey: SettingsKey.trailersEnabled) as? Bool { appearance.trailersEnabled = value }
         if let value = defaults.object(forKey: SettingsKey.trailerDelay) as? Int { appearance.trailerDelay = value }
         if let value = defaults.string(forKey: SettingsKey.cardCornerRadius) { appearance.cardCornerRadius = value }
@@ -62,17 +57,6 @@ struct CardAppearance: Equatable {
     }
 }
 
-extension CustomPosterScreen {
-    /// The "Apply custom posters to" value the cards use. Until its rows are
-    /// used on this Apple TV, a custom poster address applies to every
-    /// screen, as it did before the rows existed, whatever is stored.
-    static func effectiveStorageValue(stored: String, pattern: String, chosenHere: Bool) -> String {
-        if chosenHere || pattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            return stored
-        }
-        return "all"
-    }
-}
 
 /// Settings → Poster Card Style → Animated artwork. The desktop app's
 /// "Always" is left out: on Apple TV only the focused card animates.
@@ -265,7 +249,6 @@ struct CardAppearanceProvider: ViewModifier {
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
     @AppStorage(SettingsKey.landscapeAlwaysBackdropLogo) private var landscapeAlwaysBackdropLogo = false
     @AppStorage(SettingsKey.trailerStartSeconds) private var trailerStartSeconds = 0
-    @AppStorage(SettingsKey.customPosterScreensChosenHere) private var customPosterScreensChosenHere = false
     @AppStorage(SettingsKey.animatedArtwork) private var animatedArtwork = AnimatedArtworkMode.off
     @AppStorage(SettingsKey.cardDepthEnabled) private var cardDepthEnabled = false
     @AppStorage(SettingsKey.cardDepthEdge) private var cardDepthEdge = CardDepthStyle.defaultEdge
@@ -277,16 +260,11 @@ struct CardAppearanceProvider: ViewModifier {
     @AppStorage(SettingsKey.cardDepthCast) private var cardDepthCast = true
 
     func body(content: Content) -> some View {
-        let effectiveScreens = CustomPosterScreen.effectiveStorageValue(
-            stored: customPosterEnabledScreens,
-            pattern: customPosterURLPattern,
-            chosenHere: customPosterScreensChosenHere
-        )
         content.environment(
             \.cardAppearance,
             CardAppearance(
                 customPosterURLPattern: customPosterURLPattern,
-                customPosterEnabledScreens: effectiveScreens,
+                customPosterEnabledScreens: customPosterEnabledScreens,
                 trailersEnabled: trailersEnabled,
                 trailerDelay: trailerDelay,
                 cardCornerRadius: cardCornerRadius,

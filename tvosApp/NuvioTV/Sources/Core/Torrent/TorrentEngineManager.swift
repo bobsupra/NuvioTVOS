@@ -14,10 +14,57 @@ final class TorrentEngineManager: ObservableObject {
 
     private var activeSession: TorrentSession?
     private(set) var activeStreamURL: URL?
+    private(set) var activeIdentity: TorrentStreamIdentity?
     private var statsTimer: AnyCancellable?
     private var startGeneration = 0
 
+    private nonisolated static let historyLock = NSLock()
+    private nonisolated(unsafe) static var identityByPlaybackURL: [String: TorrentStreamIdentity] = [:]
+
     private init() {}
+
+    func isActiveStreamURL(_ urlString: String?) -> Bool {
+        guard isStreaming, let urlString, let activeStreamURL else { return false }
+        return activeStreamURL.absoluteString == urlString
+    }
+
+    nonisolated static func shouldReuseActiveSession(
+        isStreaming: Bool,
+        hasActiveSession: Bool,
+        activeIdentity: TorrentStreamIdentity?,
+        activeStreamURL: URL?,
+        requestedIdentity: TorrentStreamIdentity
+    ) -> URL? {
+        guard isStreaming,
+              hasActiveSession,
+              let activeStreamURL,
+              activeIdentity == requestedIdentity else {
+            return nil
+        }
+        return activeStreamURL
+    }
+
+    nonisolated static func remember(identity: TorrentStreamIdentity, playbackURL: String) {
+        historyLock.lock()
+        defer { historyLock.unlock() }
+        if identityByPlaybackURL.count > 64 { identityByPlaybackURL.removeAll() }
+        identityByPlaybackURL[playbackURL] = identity
+    }
+
+    /// Failover excludes the local playback URLs that failed; each torrent
+    /// start gets a fresh session token URL, so match them back to the torrent identity.
+    nonisolated static func isExcluded(
+        infoHash: String,
+        fileIdx: Int?,
+        filename: String?,
+        excludedPlaybackURLs: Set<String>
+    ) -> Bool {
+        guard !excludedPlaybackURLs.isEmpty else { return false }
+        let identity = TorrentStreamIdentity(infoHash: infoHash, fileIdx: fileIdx, filename: filename)
+        historyLock.lock()
+        defer { historyLock.unlock() }
+        return excludedPlaybackURLs.contains { identityByPlaybackURL[$0] == identity }
+    }
 
     /// Starts or resumes a torrent streaming session, returning the local HTTP streaming URL.
     func startStream(
@@ -27,6 +74,24 @@ final class TorrentEngineManager: ObservableObject {
         filename: String? = nil,
         timeout: TimeInterval = 40
     ) async throws -> URL {
+        let requestedIdentity = TorrentStreamIdentity(
+            infoHash: infoHash,
+            fileIdx: fileIdx,
+            filename: filename
+        )
+        if let existingURL = Self.shouldReuseActiveSession(
+            isStreaming: isStreaming,
+            hasActiveSession: activeSession != nil,
+            activeIdentity: activeIdentity,
+            activeStreamURL: activeStreamURL,
+            requestedIdentity: requestedIdentity
+        ) {
+            startGeneration &+= 1
+            Self.remember(identity: requestedIdentity, playbackURL: existingURL.absoluteString)
+            torrentLog.notice("[Watchdog:Reuse] Keeping active torrent session for hash=\(requestedIdentity.infoHash)")
+            return existingURL
+        }
+
         startGeneration &+= 1
         let generation = startGeneration
 
@@ -37,7 +102,7 @@ final class TorrentEngineManager: ObservableObject {
         // Check and prune cache if exceeding configured limit
         pruneCacheIfNeeded()
 
-        currentInfoHash = infoHash
+        currentInfoHash = requestedIdentity.infoHash
         isStreaming = true
         activeStats = SwarmStats()
         activeDiagnostics = nil
@@ -63,6 +128,8 @@ final class TorrentEngineManager: ObservableObject {
             }
             self.activeSession = session
             self.activeStreamURL = streamURL
+            self.activeIdentity = requestedIdentity
+            Self.remember(identity: requestedIdentity, playbackURL: streamURL.absoluteString)
             self.startupStage = "Buffering stream..."
 
             // Start polling stats
@@ -92,6 +159,7 @@ final class TorrentEngineManager: ObservableObject {
         let session = activeSession
         activeSession = nil
         activeStreamURL = nil
+        activeIdentity = nil
         isStreaming = false
         currentInfoHash = nil
         activeStats = SwarmStats()

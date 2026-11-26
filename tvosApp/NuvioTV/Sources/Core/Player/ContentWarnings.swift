@@ -38,19 +38,61 @@ enum PlayerContentWarningCategory: String, CaseIterable, Sendable {
     }
 }
 
+enum PlayerContentWarningSeverity: String, Equatable, Sendable {
+    case severe
+    case moderate
+    case mild
+
+    init?(rawSeverity: String) {
+        self.init(rawValue: rawSeverity.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+    }
+
+    var localizationKey: String {
+        switch self {
+        case .severe: return "parental_severity_severe"
+        case .moderate: return "parental_severity_moderate"
+        case .mild: return "parental_severity_mild"
+        }
+    }
+
+    var fallbackLabel: String {
+        switch self {
+        case .severe: return "Severe"
+        case .moderate: return "Moderate"
+        case .mild: return "Mild"
+        }
+    }
+}
+
 struct PlayerContentWarning: Identifiable, Equatable, Sendable {
     let category: PlayerContentWarningCategory
     let severity: String
 
     var id: String { category.rawValue }
 
+    var severityLevel: PlayerContentWarningSeverity? {
+        PlayerContentWarningSeverity(rawSeverity: severity)
+    }
+
     var severityLocalizationKey: String? {
-        switch severity.lowercased() {
-        case "severe": return "parental_severity_severe"
-        case "moderate": return "parental_severity_moderate"
-        case "mild": return "parental_severity_mild"
-        default: return nil
+        severityLevel?.localizationKey
+    }
+
+    var localizedCategoryLabel: String {
+        L10n.string(category.localizationKey, fallback: category.fallbackLabel)
+    }
+
+    var localizedSeverityLabel: String {
+        if let level = severityLevel {
+            return L10n.string(level.localizationKey, fallback: level.fallbackLabel)
         }
+        return severity.capitalized
+    }
+}
+
+enum DetailsParentalGuideSettings {
+    static func isEnabled(in settings: UserDefaults = ProfileSettings.current) -> Bool {
+        settings.bool(forKey: SettingsKey.detailsShowParentalGuide)
     }
 }
 
@@ -58,6 +100,53 @@ actor ContentWarningsRepository {
     static let shared = ContentWarningsRepository()
 
     private var cache: [String: [PlayerContentWarning]] = [:]
+
+    func warnings(for meta: NuvioMeta) async -> [PlayerContentWarning] {
+        var triedIMDbIDs = Set<String>()
+
+        for imdbID in Self.directIMDbIDs(for: meta) {
+            guard !Task.isCancelled else { return [] }
+            guard triedIMDbIDs.insert(imdbID).inserted else { continue }
+            let found = await warnings(for: imdbID)
+            guard !Task.isCancelled else { return [] }
+            if !found.isEmpty { return found }
+        }
+
+        if let animeIMDbID = await Self.animeMappedIMDbID(for: meta),
+           triedIMDbIDs.insert(animeIMDbID).inserted {
+            guard !Task.isCancelled else { return [] }
+            let found = await warnings(for: animeIMDbID)
+            guard !Task.isCancelled else { return [] }
+            if !found.isEmpty { return found }
+        }
+
+        if let apiKey = TmdbDetailsService.currentApiKey {
+            let client = CalendarTmdb.Client(apiKey: apiKey)
+            let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
+            for tmdbID in Self.tmdbIDs(for: meta) {
+                guard !Task.isCancelled else { return [] }
+                do {
+                    let resolved = try await client.imdbId(
+                        tmdbId: tmdbID,
+                        kind: isSeries ? .series : .movie
+                    )
+                    guard !Task.isCancelled else { return [] }
+                    guard let resolved,
+                          let imdbID = Self.normalizedIMDbID(resolved),
+                          triedIMDbIDs.insert(imdbID).inserted else {
+                        continue
+                    }
+                    let found = await warnings(for: imdbID)
+                    guard !Task.isCancelled else { return [] }
+                    if !found.isEmpty { return found }
+                } catch {
+                    guard !Task.isCancelled else { return [] }
+                }
+            }
+        }
+
+        return []
+    }
 
     func warnings(for imdbID: String) async -> [PlayerContentWarning] {
         guard let normalizedID = Self.normalizedIMDbID(imdbID) else { return [] }
@@ -78,8 +167,7 @@ actor ContentWarningsRepository {
                 return []
             }
             guard (200..<300).contains(response.statusCode) else { return [] }
-            let decoded = try JSONDecoder().decode(ParentsGuideResponse.self, from: data)
-            let result = Self.map(decoded.parentsGuide)
+            let result = try Self.decodeWarnings(from: data)
             guard !Task.isCancelled else { return [] }
             cache[normalizedID] = result
             return result
@@ -88,11 +176,66 @@ actor ContentWarningsRepository {
         }
     }
 
-    private static func normalizedIMDbID(_ value: String) -> String? {
+    static func decodeWarnings(from data: Data) throws -> [PlayerContentWarning] {
+        let decoded = try JSONDecoder().decode(ParentsGuideResponse.self, from: data)
+        return map(decoded.parentsGuide)
+    }
+
+    static func directIMDbIDs(for meta: NuvioMeta) -> [String] {
+        var seen = Set<String>()
+        return [meta.imdbId.flatMap(normalizedIMDbID), normalizedIMDbID(meta.id)]
+            .compactMap { $0 }
+            .filter { seen.insert($0).inserted }
+    }
+
+    static func tmdbIDs(for meta: NuvioMeta) -> [Int] {
+        var ids: [Int] = []
+        if let tmdbId = meta.tmdbId, tmdbId > 0 {
+            ids.append(tmdbId)
+        }
+        if let parsed = extractTMDBID(from: meta.id), !ids.contains(parsed) {
+            ids.append(parsed)
+        }
+        return ids
+    }
+
+    private static func animeMappedIMDbID(for meta: NuvioMeta) async -> String? {
+        if let aniListID = AniListMetaBuilder.aniListID(from: meta.id), aniListID > 0 {
+            if let mapped = await AniListOfflineMaps.shared.imdb(aniListID: aniListID) {
+                return normalizedIMDbID(mapped)
+            }
+        }
+        if let malID = AnimeSource.malID(from: meta.id),
+           let aniListID = await AniListOfflineMaps.shared.aniListID(mal: malID),
+           let mapped = await AniListOfflineMaps.shared.imdb(aniListID: aniListID) {
+            return normalizedIMDbID(mapped)
+        }
+        if let kitsuID = AnimeSource.kitsuID(from: meta.id),
+           let aniListID = await AniListOfflineMaps.shared.aniListID(kitsu: kitsuID),
+           let mapped = await AniListOfflineMaps.shared.imdb(aniListID: aniListID) {
+            return normalizedIMDbID(mapped)
+        }
+        return nil
+    }
+
+    static func normalizedIMDbID(_ value: String) -> String? {
         guard let range = value.range(of: #"tt\d+"#, options: [.regularExpression, .caseInsensitive]) else {
             return nil
         }
         return value[range].lowercased()
+    }
+
+    private static func extractTMDBID(from value: String) -> Int? {
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else { return nil }
+        let tokens = normalized.split(whereSeparator: { $0 == ":" || $0 == "/" || $0 == "|" })
+        guard let tmdbIndex = tokens.firstIndex(where: { $0.caseInsensitiveCompare("tmdb") == .orderedSame }),
+              tokens.indices.contains(tmdbIndex + 1),
+              let parsed = Int(tokens[tmdbIndex + 1]),
+              parsed > 0 else {
+            return nil
+        }
+        return parsed
     }
 
     private static func map(_ guide: [ParentsGuideCategory]) -> [PlayerContentWarning] {

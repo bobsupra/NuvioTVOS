@@ -1,0 +1,12 @@
+{
+  "images" : [
+    {
+      "filename" : "player_nuvio_graphite.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

@@ -449,7 +449,11 @@ struct HiddenSearchTextField: UIViewRepresentable {
                 uiView.becomeFirstResponder()
             }
         } else if !isEditing && uiView.isFirstResponder {
-            uiView.resignFirstResponder()
+            DispatchQueue.main.async {
+                if uiView.isFirstResponder {
+                    uiView.resignFirstResponder()
+                }
+            }
         }
     }
 

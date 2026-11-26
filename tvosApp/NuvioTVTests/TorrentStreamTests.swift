@@ -212,4 +212,242 @@ final class TorrentStreamTests: XCTestCase {
         XCTAssertEqual(included.count, 1)
         XCTAssertEqual(included.first?.infoHash, "abcdefabcdefabcdefabcdefabcdefabcdefabcd")
     }
+
+    func testTorrentStartupWatchdogExtendsWhilePiecesArriveAndCapsAtCeiling() {
+        var tracker = TorrentStartupWatchdogTracker(
+            initialDownloadedBytes: 0,
+            maxTotalTimeoutSeconds: 120
+        )
+
+        var activeStats = SwarmStats()
+        activeStats.connectedSeeds = 17
+        activeStats.connectedPeers = 19
+        activeStats.downloadRate = 629.5 * 1024
+        activeStats.downloadedBytes = 12 * 1024 * 1024
+
+        // Window 1 (30s): pieces actively downloading -> keep waiting.
+        if case .waitAnotherWindow = tracker.evaluateWindow(windowSeconds: 30, stats: activeStats) {
+            // expected
+        } else {
+            XCTFail("Expected active swarm to receive another watchdog window at 30s")
+        }
+
+        // Window 2 (60s): momentary 0 B/s rate, but total downloaded bytes grew -> keep waiting.
+        activeStats.downloadRate = 0
+        activeStats.downloadedBytes = 28 * 1024 * 1024
+        if case .waitAnotherWindow = tracker.evaluateWindow(windowSeconds: 30, stats: activeStats) {
+            // expected
+        } else {
+            XCTFail("Expected byte progress to keep watchdog waiting at 60s")
+        }
+
+        // Window 3 (90s): still downloading blocks inside a large piece (rate > 0, bytes unchanged) -> keep waiting.
+        activeStats.downloadRate = 300 * 1024
+        if case .waitAnotherWindow = tracker.evaluateWindow(windowSeconds: 30, stats: activeStats) {
+            // expected
+        } else {
+            XCTFail("Expected positive download rate to keep watchdog waiting at 90s")
+        }
+
+        // Window 4 (120s): hits maxTotalTimeoutSeconds ceiling -> time out.
+        XCTAssertEqual(tracker.evaluateWindow(windowSeconds: 30, stats: activeStats), .timeOut)
+    }
+
+    func testTorrentStartupWatchdogTimesOutDeadSwarmImmediatelyAndStalledConnectedSwarmAfterOneGraceWindow() {
+        var deadTracker = TorrentStartupWatchdogTracker(initialDownloadedBytes: 0)
+        XCTAssertEqual(
+            deadTracker.evaluateWindow(windowSeconds: 30, stats: SwarmStats()),
+            .timeOut,
+            "A swarm with 0 peers, 0 seeds, 0 bytes, and 0 B/s must time out at 30s"
+        )
+
+        var connectedTracker = TorrentStartupWatchdogTracker(initialDownloadedBytes: 0)
+        var connectedNoBytes = SwarmStats()
+        connectedNoBytes.connectedSeeds = 5
+        connectedNoBytes.connectedPeers = 8
+
+        // First window with connected peers still unchoking gets one grace window.
+        if case .waitAnotherWindow = connectedTracker.evaluateWindow(windowSeconds: 30, stats: connectedNoBytes) {
+            // expected
+        } else {
+            XCTFail("Expected connected swarm to receive one grace window for peer unchoking")
+        }
+
+        // Second consecutive window with 0 bytes and 0 rate times out.
+        XCTAssertEqual(
+            connectedTracker.evaluateWindow(windowSeconds: 30, stats: connectedNoBytes),
+            .timeOut,
+            "Connected peers delivering zero bytes for two consecutive windows must time out"
+        )
+
+        var completeTracker = TorrentStartupWatchdogTracker(initialDownloadedBytes: 500_000_000)
+        var completeStats = SwarmStats()
+        completeStats.downloadedBytes = 500_000_000
+        completeStats.isComplete = true
+
+        // Completed file gets one probe grace window, then times out if player still never starts.
+        if case .waitAnotherWindow = completeTracker.evaluateWindow(windowSeconds: 30, stats: completeStats) {
+            // expected
+        } else {
+            XCTFail("Expected completed torrent on disk to receive one probe grace window")
+        }
+        XCTAssertEqual(completeTracker.evaluateWindow(windowSeconds: 30, stats: completeStats), .timeOut)
+    }
+
+    func testTorrentIdentityExclusionAndActiveSessionReuse() {
+        let hashUpper = "0123456789ABCDEF0123456789ABCDEF01234567"
+        let hashLower = hashUpper.lowercased()
+        let otherHash = "fedcba9876543210fedcba9876543210fedcba98"
+
+        let movieIdentity = TorrentStreamIdentity(infoHash: hashUpper, fileIdx: nil, filename: "Movie.1080p.mkv")
+        let sameMovieNormalized = TorrentStreamIdentity(infoHash: hashLower, fileIdx: nil, filename: " movie.1080p.mkv ")
+        let episode1 = TorrentStreamIdentity(infoHash: hashLower, fileIdx: 0, filename: "Show.S01E01.mkv")
+        let episode2 = TorrentStreamIdentity(infoHash: hashLower, fileIdx: 1, filename: "Show.S01E02.mkv")
+        let otherMovie = TorrentStreamIdentity(infoHash: otherHash, fileIdx: nil, filename: "Movie.1080p.mkv")
+
+        XCTAssertEqual(movieIdentity, sameMovieNormalized)
+        XCTAssertNotEqual(episode1, episode2)
+        XCTAssertNotEqual(movieIdentity, otherMovie)
+
+        let playbackURL = URL(string: "http://127.0.0.1:8888/stream/\(UUID().uuidString)")!
+        TorrentEngineManager.remember(identity: episode1, playbackURL: playbackURL.absoluteString)
+
+        XCTAssertTrue(
+            TorrentEngineManager.isExcluded(
+                infoHash: hashUpper,
+                fileIdx: 0,
+                filename: "Show.S01E01.mkv",
+                excludedPlaybackURLs: [playbackURL.absoluteString]
+            ),
+            "Failed local playback URL must exclude the matching torrent identity on failover"
+        )
+        XCTAssertFalse(
+            TorrentEngineManager.isExcluded(
+                infoHash: hashUpper,
+                fileIdx: 1,
+                filename: "Show.S01E02.mkv",
+                excludedPlaybackURLs: [playbackURL.absoluteString]
+            ),
+            "Excluding one file in a season pack must not exclude another episode in the same torrent"
+        )
+        XCTAssertFalse(
+            TorrentEngineManager.isExcluded(
+                infoHash: otherHash,
+                fileIdx: 0,
+                filename: "Show.S01E01.mkv",
+                excludedPlaybackURLs: [playbackURL.absoluteString]
+            )
+        )
+
+        XCTAssertEqual(
+            TorrentEngineManager.shouldReuseActiveSession(
+                isStreaming: true,
+                hasActiveSession: true,
+                activeIdentity: movieIdentity,
+                activeStreamURL: playbackURL,
+                requestedIdentity: sameMovieNormalized
+            ),
+            playbackURL,
+            "Restarting the exact same active torrent must preserve the existing swarm session"
+        )
+        XCTAssertNil(
+            TorrentEngineManager.shouldReuseActiveSession(
+                isStreaming: true,
+                hasActiveSession: true,
+                activeIdentity: movieIdentity,
+                activeStreamURL: playbackURL,
+                requestedIdentity: otherMovie
+            ),
+            "A different torrent must start a fresh session"
+        )
+        XCTAssertNil(
+            TorrentEngineManager.shouldReuseActiveSession(
+                isStreaming: false,
+                hasActiveSession: true,
+                activeIdentity: movieIdentity,
+                activeStreamURL: playbackURL,
+                requestedIdentity: sameMovieNormalized
+            ),
+            "An inactive manager must not report a reusable URL"
+        )
+    }
+
+    @MainActor
+    func testPlayerWatchdogKeepsWaitingWhileActiveP2PTorrentDownloadsAndFailsOverWhenDead() async throws {
+        let localTorrentURL = URL(string: "http://127.0.0.1:8888/stream/test-active-torrent")!
+
+        // 1. Active torrent making progress across multiple windows must NOT fail over.
+        do {
+            let coordinator = PlaybackSessionCoordinator(
+                engineSettingProvider: { "MPVKit" },
+                loadDispatcher: { _, _, _ in }
+            )
+            let model = PlayerViewModel(sessionCoordinator: coordinator)
+            defer { model.shutdown() }
+
+            var pollCount = 0
+            var reloadCalls = 0
+            model.loadWatchdogSleepNanosecondsOverride = 25_000_000 // 25ms per 30s window
+            model.loadWatchdogMaxTorrentTimeoutSeconds = 120
+            model.activeTorrentWatchdogStatsProvider = { urlString in
+                guard urlString == localTorrentURL.absoluteString else { return nil }
+                pollCount += 1
+                var stats = SwarmStats()
+                stats.connectedSeeds = 17
+                stats.connectedPeers = 19
+                stats.downloadRate = 629.5 * 1024
+                stats.downloadedBytes = Int64(pollCount) * 8 * 1024 * 1024
+                return stats
+            }
+            model.reloadCurrentStream = { _, _ in
+                reloadCalls += 1
+                return nil
+            }
+
+            model.load(
+                url: localTorrentURL,
+                meta: NuvioMeta(id: "tt6910001", name: "Active Torrent Test", type: "movie"),
+                subtitle: "",
+                resumeFrom: nil
+            )
+
+            // Wait past two 30s windows (60s simulated) — still well below 120s cap.
+            try await Task.sleep(nanoseconds: 70_000_000)
+            XCTAssertEqual(reloadCalls, 0, "Active P2P torrent must not trigger failover at 30s or 60s")
+            XCTAssertGreaterThanOrEqual(pollCount, 3, "Watchdog should have polled active swarm progress across windows")
+        }
+
+        // 2. Dead torrent (0 seeds, 0 peers, 0 bytes) must time out after one window and exclude its URL.
+        do {
+            let coordinator = PlaybackSessionCoordinator(
+                engineSettingProvider: { "MPVKit" },
+                loadDispatcher: { _, _, _ in }
+            )
+            let model = PlayerViewModel(sessionCoordinator: coordinator)
+            defer { model.shutdown() }
+
+            var excludedOnReload: [String] = []
+            let reloadTriggered = expectation(description: "Dead torrent triggers failover")
+            model.loadWatchdogSleepNanosecondsOverride = 20_000_000
+            model.activeTorrentWatchdogStatsProvider = { urlString in
+                guard urlString == localTorrentURL.absoluteString else { return nil }
+                return SwarmStats()
+            }
+            model.reloadCurrentStream = { _, excluded in
+                excludedOnReload = excluded
+                reloadTriggered.fulfill()
+                return nil
+            }
+
+            model.load(
+                url: localTorrentURL,
+                meta: NuvioMeta(id: "tt6910002", name: "Dead Torrent Test", type: "movie"),
+                subtitle: "",
+                resumeFrom: nil
+            )
+
+            await fulfillment(of: [reloadTriggered], timeout: 2.0)
+            XCTAssertTrue(excludedOnReload.contains(localTorrentURL.absoluteString))
+        }
+    }
 }

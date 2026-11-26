@@ -174,6 +174,9 @@ struct CalendarEntry: Codable, Hashable, Identifiable, Sendable {
     let overview: String?
     let posterURL: URL?
     let stillURL: URL?
+    /// Show or movie backdrop (never an episode still), used for Home's Today hero
+    /// so focusing a Today card does not briefly flash a zoomed portrait poster.
+    let backdropURL: URL?
     /// Japanese anime, eligible for broadcast times from AniList.
     var isAnime: Bool = false
     /// Exact broadcast time when known (anime from AniList, other series
@@ -205,7 +208,8 @@ struct CalendarEntry: Codable, Hashable, Identifiable, Sendable {
         episodeName: String? = nil,
         overview: String? = nil,
         posterURL: URL? = nil,
-        stillURL: URL? = nil
+        stillURL: URL? = nil,
+        backdropURL: URL? = nil
     ) {
         switch kind {
         case .series:
@@ -226,6 +230,7 @@ struct CalendarEntry: Codable, Hashable, Identifiable, Sendable {
         self.overview = overview
         self.posterURL = posterURL
         self.stillURL = stillURL
+        self.backdropURL = backdropURL
     }
 }
 
