@@ -6,6 +6,7 @@ enum WeTrakrConfig {
     static let activationURL = "https://wetrakr.com/activate"
     static let websiteURL = "https://wetrakr.com"
     static let documentationURL = "https://www.vinnota.store"
+    static let defaultClientID = "b3bb08203e1e4c412de3a63d833437c0"
 
     static var clientID: String {
         clientID(in: ProfileSettings.current)
@@ -20,8 +21,9 @@ enum WeTrakrConfig {
     }
 
     static func clientID(in store: UserDefaults) -> String {
-        store.string(forKey: SettingsKey.wetrakrClientID)?
+        let custom = store.string(forKey: SettingsKey.wetrakrClientID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return custom.isEmpty ? defaultClientID : custom
     }
 
     static func clientSecret(in store: UserDefaults) -> String {

@@ -314,8 +314,9 @@ final class WeTrakrAuthServiceTests: XCTestCase {
     }
 
     func testConfigAndCredentials() {
-        XCTAssertFalse(WeTrakrConfig.isConfigured(in: store))
-        XCTAssertEqual(WeTrakrConfig.clientID(in: store), "")
+        XCTAssertTrue(WeTrakrConfig.isConfigured(in: store))
+        XCTAssertEqual(WeTrakrConfig.defaultClientID, "b3bb08203e1e4c412de3a63d833437c0")
+        XCTAssertEqual(WeTrakrConfig.clientID(in: store), WeTrakrConfig.defaultClientID)
 
         store.set("wetrakr_client_123", forKey: SettingsKey.wetrakrClientID)
         store.set("wetrakr_secret_456", forKey: SettingsKey.wetrakrClientSecret)
@@ -323,6 +324,45 @@ final class WeTrakrAuthServiceTests: XCTestCase {
         XCTAssertTrue(WeTrakrConfig.isConfigured(in: store))
         XCTAssertEqual(WeTrakrConfig.clientID(in: store), "wetrakr_client_123")
         XCTAssertEqual(WeTrakrConfig.clientSecret(in: store), "wetrakr_secret_456")
+
+        store.set("   ", forKey: SettingsKey.wetrakrClientID)
+        XCTAssertTrue(WeTrakrConfig.isConfigured(in: store))
+        XCTAssertEqual(WeTrakrConfig.clientID(in: store), WeTrakrConfig.defaultClientID)
+    }
+
+    func testRequestDeviceCodeUsesDefaultProductionClientIDWhenUnset() async throws {
+        WeTrakrFixtureURLProtocol.install { _ in
+            self.fixtureResponse([
+                "device_code": "dev_default_123",
+                "user_code": "ABCD12",
+                "verification_url": "https://wetrakr.com/activate",
+                "expires_in": 600,
+                "interval": 5
+            ])
+        }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [WeTrakrFixtureURLProtocol.self]
+        let session = URLSession(configuration: configuration)
+        fixtureSession = session
+
+        let service = WeTrakrAuthService(
+            client: WeTrakrAPIClient(session: session),
+            store: store,
+            tokenStorage: memoryStorage,
+            profileScope: "default"
+        )
+        let response = try await service.requestDeviceCode()
+        XCTAssertEqual(response.userCode, "ABCD12")
+
+        let request = try XCTUnwrap(WeTrakrFixtureURLProtocol.capturedRequests().first)
+        XCTAssertEqual(request.url?.path, "/oauth/device/code")
+        XCTAssertEqual(request.value(forHTTPHeaderField: "wetrakr-api-key"), WeTrakrConfig.defaultClientID)
+        XCTAssertEqual(requestJSON(request)?["client_id"] as? String, WeTrakrConfig.defaultClientID)
+
+        let state = service.currentState
+        XCTAssertEqual(state.credentialClientID, WeTrakrConfig.defaultClientID)
+        XCTAssertTrue(state.hasActivePINFlow(in: store))
     }
 
     func testDeviceFlowSavingAndActiveCheck() {
