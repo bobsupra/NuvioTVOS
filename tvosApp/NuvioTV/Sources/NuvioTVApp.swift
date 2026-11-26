@@ -1048,11 +1048,11 @@ struct ContentView: View {
                 // Auto-select-last-profile (Settings → Profile) skips the
                 // who's-watching stop on launch; navigation is otherwise
                 // driven only by an explicit pick via `profileChosen`.
-                let autoSelectLast = (UserDefaults.standard.object(
-                    forKey: SettingsKey.profileAutoSelectLast
-                ) as? Bool) ?? (ProfileSettings.current.object(
-                    forKey: SettingsKey.profileAutoSelectLast
-                ) as? Bool) ?? true
+                // Choose Profile on Return keeps the stop: tvOS often closes
+                // Nuvio while it is in the background, so coming back is
+                // often a fresh launch.
+                let autoSelectLast = Self.remembersLastProfile
+                    && !Self.requiresProfileSelectionOnEveryReturn
                 // Signed in with the startup pull still running, so real
                 // profiles are expected to land shortly and the local
                 // placeholder must not be mistaken for the account.
@@ -1153,6 +1153,22 @@ struct ContentView: View {
         }
     }
 
+    /// Settings → Profile → Remember Last Profile and Choose Profile on Return.
+    /// Settings saves them in the standard defaults; older builds saved them in
+    /// the profile's. Kept out of ContentView's body, which is as long as the
+    /// compiler will check.
+    private static var remembersLastProfile: Bool {
+        (UserDefaults.standard.object(forKey: SettingsKey.profileAutoSelectLast) as? Bool)
+            ?? (ProfileSettings.current.object(forKey: SettingsKey.profileAutoSelectLast) as? Bool)
+            ?? true
+    }
+
+    private static var requiresProfileSelectionOnEveryReturn: Bool {
+        (UserDefaults.standard.object(forKey: SettingsKey.profileRequireSelectionAfterBackground) as? Bool)
+            ?? (ProfileSettings.current.object(forKey: SettingsKey.profileRequireSelectionAfterBackground) as? Bool)
+            ?? false
+    }
+
     /// Mirrors the cold-start profile decision when returning to the foreground.
     /// Normally, the who's-watching screen appears after a ten-minute background
     /// grace period. When remembering the last profile is disabled, the profile
@@ -1163,16 +1179,8 @@ struct ContentView: View {
         guard resolvedInitialScreen, !isOnProfileSelection else { return }
         if case .login = activeScreen { return }
 
-        let autoSelectLast = (UserDefaults.standard.object(
-            forKey: SettingsKey.profileAutoSelectLast
-        ) as? Bool) ?? (ProfileSettings.current.object(
-            forKey: SettingsKey.profileAutoSelectLast
-        ) as? Bool) ?? true
-        let requireSelectionOnEveryReturn = (UserDefaults.standard.object(
-            forKey: SettingsKey.profileRequireSelectionAfterBackground
-        ) as? Bool) ?? (ProfileSettings.current.object(
-            forKey: SettingsKey.profileRequireSelectionAfterBackground
-        ) as? Bool) ?? false
+        let autoSelectLast = Self.remembersLastProfile
+        let requireSelectionOnEveryReturn = Self.requiresProfileSelectionOnEveryReturn
         let shouldRequireSelection: Bool
         if requireSelectionOnEveryReturn {
             shouldRequireSelection = true
