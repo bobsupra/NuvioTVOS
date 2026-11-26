@@ -139,7 +139,7 @@ enum MdbListLibraryService {
         if tokenStorage.tokens(for: profileScope) != nil {
             return "oauth:\(MdbListAuthStore.accountBindingID(in: store))"
         }
-        let key = store.string(forKey: SettingsKey.mdbListApiKey)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let key = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return "key:\(key)"
     }
 
@@ -266,7 +266,8 @@ enum MdbListLibraryService {
         let first = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init)?.lowercased()
         let value = meta.id.split(separator: ":", maxSplits: 1).dropFirst().first.map(String.init)
         var ids: [String: Any] = [:]
-        if let imdb = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? (first == "imdb" ? value ?? meta.id : meta.id)) { ids["imdb"] = imdb }
+        if let imdb = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? (first == "imdb" ? value ?? meta.id : meta.id))
+            ?? NuvioMeta.imdbIDAfterAddonPrefix(in: meta.id) { ids["imdb"] = imdb }
         if let tmdb = meta.tmdbId ?? (first == "tmdb" ? Int(value ?? "") : nil) { ids["tmdb"] = tmdb }
         if let trakt = first == "trakt" ? Int(value ?? "") : nil { ids["trakt"] = trakt }
         if let tvdb = first == "tvdb" ? Int(value ?? "") : nil { ids["tvdb"] = tvdb }

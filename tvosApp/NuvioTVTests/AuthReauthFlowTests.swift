@@ -306,7 +306,7 @@ final class TraktProfileIsolationTests: XCTestCase {
 final class SimklProfileIsolationTests: XCTestCase {
     private var primaryID = ""
     private var secondaryID = ""
-    private let tokenStorage = SimklKeychainTokenStorage()
+    private let tokenStorage = SimklMemoryTokenStorage()
 
     override func setUp() {
         super.setUp()
@@ -345,7 +345,12 @@ final class SimklProfileIsolationTests: XCTestCase {
         XCTAssertNil(secondary.string(forKey: SettingsKey.simklAccessToken))
         XCTAssertNil(tokenStorage.accessToken(for: secondaryID))
         XCTAssertNil(SimklRuntimeSession.authenticatedState(store: secondary, tokenStorage: tokenStorage, profileScope: secondaryID))
-        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(.simkl, in: secondary))
+        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(
+            .simkl,
+            in: secondary,
+            simklTokenStorage: tokenStorage,
+            profileScope: secondaryID
+        ))
     }
 
     func testCapturedSimklStoreStopsWritingAfterProfileSwitch() {
@@ -362,17 +367,27 @@ final class SimklProfileIsolationTests: XCTestCase {
         )
         secondary.set(TraktWatchProgressSource.simkl.rawValue, forKey: SettingsKey.traktWatchProgressSource)
 
-        XCTAssertTrue(RemoteTrackingState.isProgressSourceAuthenticated(.simkl, in: secondary))
+        XCTAssertTrue(RemoteTrackingState.isProgressSourceAuthenticated(
+            .simkl,
+            in: secondary,
+            simklTokenStorage: tokenStorage,
+            profileScope: secondaryID
+        ))
         ProfileSettings.setActiveProfile(primaryID, isPrimary: true)
         XCTAssertFalse(ProfileSettings.isActiveStore(secondary))
-        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(.simkl, in: secondary))
+        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(
+            .simkl,
+            in: secondary,
+            simklTokenStorage: tokenStorage,
+            profileScope: secondaryID
+        ))
     }
 }
 
 final class MdbListProfileIsolationTests: XCTestCase {
     private var primaryID = ""
     private var secondaryID = ""
-    private let tokenStorage = MdbListKeychainTokenStorage()
+    private let tokenStorage = MdbListMemoryTokenStorage()
 
     override func setUp() {
         super.setUp()
@@ -404,7 +419,12 @@ final class MdbListProfileIsolationTests: XCTestCase {
         XCTAssertNil(secondary.string(forKey: SettingsKey.mdbListApiKey))
         XCTAssertFalse(secondary.bool(forKey: SettingsKey.mdbListEnabled))
         XCTAssertFalse(MdbListRuntimeSession.isAuthenticated(in: secondary, tokenStorage: tokenStorage, profileScope: secondaryID))
-        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(.mdblist, in: secondary))
+        XCTAssertFalse(RemoteTrackingState.isProgressSourceAuthenticated(
+            .mdblist,
+            in: secondary,
+            mdbListTokenStorage: tokenStorage,
+            profileScope: secondaryID
+        ))
     }
 
     func testCapturedMdbListStoreStopsWritingAfterProfileSwitch() {

@@ -42,6 +42,40 @@ final class NativePlayerExternalTests: XCTestCase {
         XCTAssertFalse(launch.absoluteString.contains("position="))
     }
 
+    func testTheTitleNamesTheEpisode() {
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "Who Is Alive?"),
+            "Severance · S2 · E3 · Who Is Alive?"
+        )
+        // The episode line Nuvio passes can already carry the code.
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "S2 · E3 · Who Is Alive?"),
+            "Severance · S2 · E3 · Who Is Alive?"
+        )
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "Episode 3"),
+            "Severance · S2 · E3"
+        )
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: nil),
+            "Severance · S2 · E3"
+        )
+        XCTAssertEqual(
+            ExternalPlayer.displayTitle(name: "Arrival", season: nil, episode: nil, episodeTitle: nil),
+            "Arrival"
+        )
+    }
+
+    func testNativePlayerGetsTheEpisodeInItsTitle() {
+        let launch = ExternalPlayer.nativePlayer.launchURL(
+            for: URL(string: "https://cdn.example/episode.mkv")!,
+            title: ExternalPlayer.displayTitle(name: "Severance", season: 2, episode: 3, episodeTitle: "Who Is Alive?")
+        )!
+        let name = URLComponents(url: launch, resolvingAgainstBaseURL: false)?.queryItems?
+            .first { $0.name == "name" }?.value
+        XCTAssertEqual(name, "Severance · S2 · E3 · Who Is Alive?")
+    }
+
     func testNativePlayerFallsBackForUnsupportedVideoURLs() {
         let file = URL(fileURLWithPath: "/tmp/movie.mp4")
         let magnet = URL(string: "magnet:?xt=urn:btih:0123456789")!
@@ -157,5 +191,118 @@ final class NativePlayerExternalTests: XCTestCase {
         let vlcSubtitle = URLComponents(url: vlc, resolvingAgainstBaseURL: false)?.queryItems?
             .first { $0.name == "sub" }?.value
         XCTAssertEqual(vlcSubtitle, vtt.absoluteString)
+    }
+
+    // MARK: - Return links
+
+    private func link(_ query: String, listed: Double? = 4_080, start: Double? = nil) -> ExternalPlaybackReport? {
+        ExternalPlaybackCallback.parse(URL(string: "nuvio-tv://external-playback/id?\(query)")!)?
+            .report(listedDuration: listed, startPosition: start)
+    }
+
+    func testNativePlayerKeepsItsPositionAndGivesTheRealLength() {
+        // An episode listed at 68 minutes that runs 75, stopped halfway. Native
+        // Player sends position and progress but no duration.
+        let report = link("lastPlayedUrl=https%3A%2F%2Fhost%2Fepisode.mkv&position=2250&progress=0.5")
+        XCTAssertEqual(report?.position, 2_250)
+        XCTAssertEqual(report?.duration, 4_500)
+        XCTAssertEqual(report?.progress, 0.5)
+        XCTAssertEqual(report?.durationIsFromPlayer, true)
+    }
+
+    func testNativePlayersDocumentedExample() throws {
+        let report = try XCTUnwrap(link(
+            "lastPlayedUrl=https%3A%2F%2Fhost%2Fmovie.mkv&position=3612&progress=0.5237",
+            listed: nil
+        ))
+        XCTAssertEqual(report.position, 3_612)
+        XCTAssertEqual(try XCTUnwrap(report.duration), 3_612 / 0.5237, accuracy: 0.001)
+    }
+
+    func testNativePlayerPlayedToTheEnd() {
+        let report = link("position=4500&progress=1")
+        XCTAssertEqual(report?.progress, 1)
+        XCTAssertEqual(report?.position, 4_500)
+        XCTAssertEqual(report?.duration, 4_500)
+    }
+
+    func testATinyProgressKeepsTheListedRuntime() {
+        // Rounded to four places, 0.49% can't give the length to the minute.
+        let report = link("position=20&progress=0.0049")
+        XCTAssertEqual(report?.position, 20)
+        XCTAssertEqual(report?.duration, 4_080)
+        XCTAssertEqual(report?.durationIsFromPlayer, false)
+    }
+
+    func testAProgressAloneUsesTheListedRuntime() {
+        let report = link("progress=0.25", listed: 4_000)
+        XCTAssertEqual(report?.position, 1_000)
+        XCTAssertEqual(report?.duration, 4_000)
+    }
+
+    func testInfusePositionWithinTheListedRuntime() {
+        let report = link("lastPlayedUrl=https%3A%2F%2Fhost%2Fepisode.mkv&position=1020")
+        XCTAssertEqual(report?.progress, 0.25)
+        XCTAssertEqual(report?.position, 1_020)
+        XCTAssertEqual(report?.duration, 4_080)
+        XCTAssertEqual(report?.durationIsFromPlayer, false)
+    }
+
+    func testInfuseJustPastTheListedRuntimeCountsAsWatched() {
+        // Infuse sends only a position. This one is 70 seconds past the 68
+        // listed minutes, after playing on from 20:00.
+        let report = link("position=4150", start: 1_200)
+        XCTAssertEqual(report?.progress, 1)
+        XCTAssertEqual(report?.position, 4_150)
+        XCTAssertEqual(report?.duration, 4_150)
+    }
+
+    func testFarPastTheListedRuntimeSaysNothing() {
+        // A 45-minute listing for a 70-minute finale, stopped at 50:00: how
+        // much is left can't be known, so it doesn't count as watched.
+        XCTAssertNil(link("position=3000", listed: 2_700, start: 1_200))
+    }
+
+    func testAPlayerClosedWhereItStartedPastTheListedRuntimeSaysNothing() {
+        XCTAssertNil(link("position=4150", start: 4_150))
+    }
+
+    func testAPlayerClosedWhereItStartedIsMarked() {
+        // Native Player sends the start position when it closes before playing.
+        XCTAssertEqual(link("position=1200&progress=0.2941", start: 1_200)?.isAtStart, true)
+        XCTAssertEqual(link("position=1260&progress=0.3088", start: 1_200)?.isAtStart, false)
+        XCTAssertEqual(link("position=1&progress=0.0002")?.isAtStart, true)
+    }
+
+    func testASentDurationAllowsOneSecondPastTheEnd() {
+        XCTAssertEqual(link("position=101&duration=100")?.progress, 1)
+        XCTAssertEqual(link("position=101&duration=100")?.position, 100)
+        XCTAssertNil(link("position=102&duration=100"))
+    }
+
+    func testAPositionWithNoLengthAtAllSaysNothing() {
+        XCTAssertNil(link("position=100", listed: nil))
+    }
+
+    func testTheStartPositionIsSavedAndOlderSessionsStillLoad() throws {
+        let suite = "NativePlayerExternalTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let session = ExternalPlaybackSession(
+            id: "session", meta: NuvioMeta(id: "tt123", name: "Title", type: "movie"),
+            sourceURL: "https://example.com/video", season: nil, episode: nil,
+            duration: 100, profileID: "a", startPosition: 42
+        )
+        ExternalPlaybackSessionStore.save(session, defaults: defaults)
+        XCTAssertEqual(ExternalPlaybackSessionStore.load(defaults: defaults)?.startPosition, 42)
+
+        var older = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: JSONEncoder().encode(session)) as? [String: Any]
+        )
+        older.removeValue(forKey: "startPosition")
+        let decoded = try JSONDecoder().decode(
+            ExternalPlaybackSession.self, from: JSONSerialization.data(withJSONObject: older)
+        )
+        XCTAssertNil(decoded.startPosition)
     }
 }

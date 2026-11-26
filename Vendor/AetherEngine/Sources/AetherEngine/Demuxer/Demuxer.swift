@@ -70,9 +70,10 @@ struct DemuxerOpenProfile: Sendable {
     /// the one shape a held connection must not take.
     var avioHeldConnection: Bool = false
 
-    /// AE#956: open a Matroska source without reading its attachments (`skip_attachments`). The
-    /// session's probe demuxer is the only open whose attachments anything reads (fonts, cover art),
-    /// so it follows `LoadOptions.skipsContainerAttachments`; side readers and reopens always skip.
+    /// AE#956: open a Matroska source without reading its attachments (`skip_attachments`). Only two
+    /// opens read them: the session's probe demuxer when the load's `AttachmentReadPlan` says
+    /// `.atOpen`, and the attachment side reader that fetches them after the first frame (AE#1129).
+    /// Every other side reader and reopen skips them.
     var skipsAttachments: Bool = false
 
     /// `LoadOptions.declaredDurationSeconds`: caller-trusted duration override consumed by
@@ -95,6 +96,27 @@ struct DemuxerOpenProfile: Sendable {
     var requestHeaders: RequestHeaderStore? = nil
     /// Caller metadata can identify a disc image even when an HTTP URL is opaque or signed.
     var discImageHint: Bool = false
+
+    /// AE#1100: `AetherEngine.liveReopenURL` for a live URL session. The reader asks it before each
+    /// reconnect of a dropped live connection, so a one-shot live URL is not opened twice. Nil
+    /// everywhere else.
+    var liveReopenURL: (@Sendable (URL) -> URL?)? = nil
+
+    /// `LoadOptions.untaggedVideoColor` (AE#1103). In the profile so the session's probe, its own
+    /// open, every reopen and rebuild, and `probe(url:options:)` all read the same stream.
+    var untaggedVideoColor: UntaggedVideoColor = .standard
+
+    func withUntaggedVideoColor(_ assumption: UntaggedVideoColor) -> DemuxerOpenProfile {
+        var copy = self
+        copy.untaggedVideoColor = assumption
+        return copy
+    }
+
+    func withLiveReopenURL(_ provider: (@Sendable (URL) -> URL?)?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.liveReopenURL = provider
+        return copy
+    }
 
     func withSourceOpenPolicy(_ policy: SourceOpenPolicy) -> DemuxerOpenProfile {
         var copy = self
@@ -227,6 +249,19 @@ struct DemuxerOpenProfile: Sendable {
         // open-ended at the seek target immediately after, so sustained reads are untouched.
         profile.boundedInitialFetch = 8 * 1024 * 1024
         profile.skipsAttachments = true
+        return profile
+    }()
+
+    /// AE#1129: the reader that fetches a Matroska source's attachments once playback is up. It
+    /// needs `avformat_open_input` only (the header and the Attachments element, found through the
+    /// SeekHead wherever it sits), so the stream analysis is skipped. Keeps the playback AVIO tuning:
+    /// the attachments are one sequential read of up to tens of megabytes.
+    static let attachmentSideReader: DemuxerOpenProfile = {
+        var profile = playback
+        profile.skipStreamInfo = true
+        profile.skipsAttachments = false
+        profile.auditsRecordlessDolbyVision = false
+        profile.readerLabel = "attachments"
         return profile
     }()
 
@@ -426,9 +461,20 @@ public final class Demuxer: @unchecked Sendable {
         return avioProvider?.resolvedByteSize != nil
     }
 
+    /// The source's size in bytes as the reader resolved it, nil when the origin never said.
+    var resolvedSourceByteSize: Int64? {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        return avioProvider?.resolvedByteSize
+    }
+
     /// Number of attached-picture (cover-art) streams reclassified to ATTACHMENT before
     /// stream-info probing on the most recent open. See `reclassifyAttachedPictures`. (#75)
     private(set) var attachedPictureStreamsReclassified: Int = 0
+
+    /// Attachment streams the most recent open kept out of stream-info probing because the demuxer
+    /// could not name their codec. See `parkUnnamedAttachments`. (AE#1129)
+    private(set) var unnamedAttachmentsParked: Int = 0
 
     // Memory probe: compare against RSS growth; 0 for file:// sources.
     var avioBytesFetched: Int64 { avioProvider?.cumulativeBytesFetched ?? 0 }
@@ -462,6 +508,11 @@ public final class Demuxer: @unchecked Sendable {
     /// A caller that only wants to spend disk to avoid a re-READ asks this: re-reading a local
     /// file costs a page-cache hit, so a second copy of it in the temporary directory buys nothing.
     var readsSourceDirectly: Bool { avioProvider == nil }
+
+    /// Forwarded to the network reader (`AVIOReader.setRangeSizeCap`); a no-op for other providers.
+    func capSourceRangeSize(_ bytes: Int?) {
+        (avioProvider as? AVIOReader)?.setRangeSizeCap(bytes)
+    }
 
     /// Timestamp of last unplanned reconnect (drop/stall, not a seek).
     /// Live producer correlates with backward source-PTS reset to detect
@@ -805,6 +856,7 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.unlock()
         reportOpenStage(.streamsProbed)
         promoteAlternativeTransferHLG()
+        applyUntaggedVideoColor()
     }
 
     /// Open a custom `IOReader` source. `formatHint` disambiguates probing when
@@ -995,7 +1047,8 @@ public final class Demuxer: @unchecked Sendable {
             sourceOpenPolicy: openProfile.sourceOpenPolicy,
             requestHeaderStore: openProfile.requestHeaders,
             diagnosticContext: openProfile.diagnosticContext,
-            routesDiscMediaType: routesDiscMediaType
+            routesDiscMediaType: routesDiscMediaType,
+            liveReopenURL: isLive ? openProfile.liveReopenURL : nil
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         reader.playIntentProvider = playIntentProvider
@@ -1141,12 +1194,40 @@ public final class Demuxer: @unchecked Sendable {
         applyProbeBudget(ctx)
         formatContext = ctx
 
+        // A fragmented MP4 whose mfra lists the video's random access
+        // points is indexed lazily, see `FragmentedMP4RandomAccess`. The reader's fragment header
+        // fetch goes on demand first, so reading the mfra cannot start the full fetch.
+        fragmentRandomAccess = nil
+        // The engine's HTTP reader only: a DASH or host reader would turn the tail read into media.
+        if Self.lazyFragmentIndexAvailable, let reader = provider as? AVIOReader, let pb = provider.context,
+           !isLive, provider.isSeekable, !openProfile.avioSequentialOnly, !Self.lazyFragmentIndexDisabled {
+            reader.setFragmentHeadersOnDemand(true)
+            let started = DispatchTime.now()
+            let probe = FragmentedMP4RandomAccess.probe(pb)
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1_000_000
+            switch probe {
+            case .usable(let access):
+                fragmentRandomAccess = access
+                EngineLog.emit(
+                    "[Demuxer] fragmented MP4: the mfra lists \(access.times.count) video random access points "
+                    + "over \(String(format: "%.1f", access.startsSeconds.last ?? 0)) s (read in \(String(format: "%.0f", ms)) ms); "
+                    + "indexing lazily, the plan takes its boundaries from them",
+                    category: .demux)
+            case .unusable(let reason):
+                reader.setFragmentHeadersOnDemand(false)
+                EngineLog.emit("[Demuxer] fragmented MP4, indexed in full: \(reason)", category: .demux)
+            case .notFragmented:
+                reader.setFragmentHeadersOnDemand(false)
+            }
+        }
+
         // URL is nil because pb is already set.
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
         Self.applyDemuxerOptions(&opts, isLive: isLive,
                                  skipDurationEstimate: openProfile.avioSequentialOnly,
                                  skipAttachments: openProfile.skipsAttachments)
+        if fragmentRandomAccess != nil { av_dict_set(&opts, "lazy_frag_index", "1", 0) }
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
@@ -1170,6 +1251,7 @@ public final class Demuxer: @unchecked Sendable {
         // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
         avioProvider?.markOpenPhaseFinished()
         promoteAlternativeTransferHLG()
+        applyUntaggedVideoColor()
     }
 
     /// AE#585: bracket the host's bounded index pass (the cue prewarm and the cursor reset that
@@ -1261,6 +1343,9 @@ public final class Demuxer: @unchecked Sendable {
     /// CRA B-frames, NOPTS repair stack stayed load-bearing).
     private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false, skipDurationEstimate: Bool = false, skipAttachments: Bool = false) {
         av_dict_set(&opts, "fflags", "+genpts", 0)
+        // movdec's lazy_frag_index (FFmpegBuild patch) is set by `openWithProvider` only, and only
+        // when the file's mfra gives the plan its keyframes (`FragmentedMP4RandomAccess`): the lazy
+        // index holds only the fragments read so far.
         if skipAttachments {
             // AE#956: matroskadec's skip_attachments (FFmpegBuild patch); other demuxers ignore it.
             av_dict_set(&opts, "skip_attachments", "1", 0)
@@ -1305,6 +1390,7 @@ public final class Demuxer: @unchecked Sendable {
 
     private func probeStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) throws {
         unresolvableAudioStreams = []
+        unnamedAttachmentsParked = 0
         // #87: the subtitle side demuxer opts out of find_stream_info. avformat_open_input already
         // carries codec_id / codec_type for every subtitle track (container header / PMT), and
         // reclassifyAttachedPictures only exists to bound the find_stream_info cost, so both are skipped.
@@ -1317,6 +1403,8 @@ public final class Demuxer: @unchecked Sendable {
         boundProbeForDeclaredDiscTitle(ctx)
         let parked = parkUnresolvableAudio(ctx)
         let parkedPGS = parkPGSSubtitles(ctx)
+        let parkedData = parkUnnamedDataStreams(ctx)
+        let parkedAttachments = parkUnnamedAttachments(ctx)
         let bytesBefore = ctx.pointee.pb?.pointee.bytes_read ?? 0
         let callStart = DispatchTime.now().uptimeNanoseconds
         interrupt.armHeaderWait(ctx, startedAt: callStart)
@@ -1325,9 +1413,12 @@ public final class Demuxer: @unchecked Sendable {
         let callReturn = DispatchTime.now().uptimeNanoseconds
         unparkUnresolvableAudio(ctx, parked)
         unparkPGSSubtitles(ctx, parkedPGS)
+        unparkUnnamedDataStreams(ctx, parkedData)
+        unparkUnnamedAttachments(ctx, parkedAttachments)
         probeReport = makeProbeReport(ctx, parkedAudio: parked, bytesBefore: bytesBefore,
                                       callStart: callStart, callReturn: callReturn,
-                                      headerWaitReleasedAfter: headerWaitReleasedAfter)
+                                      headerWaitReleasedAfter: headerWaitReleasedAfter,
+                                      attachmentsParked: parkedAttachments.count)
         guard findRet >= 0 else {
             emitOpenTimings(outcome: "find_stream_info failed (\(findRet))")
             throw DemuxerError.streamInfoFailed(code: findRet)
@@ -1349,15 +1440,16 @@ public final class Demuxer: @unchecked Sendable {
         }
     }
 
-    /// What the stream analysis of the current open did, for the `open timings` line. Nil until the
+    /// What the stream analysis of the current open did, for the `open timings` line and for the still
+    /// decoder, which tells a source without video from a cut analysis by it (AE#1118). Nil until the
     /// pass ran (an open that failed earlier, a side reader that skips it).
-    private var probeReport: ProbeReport?
+    private(set) var probeReport: ProbeReport?
 
     /// Reads the format context once `avformat_find_stream_info` has returned. Public fields only, so
     /// the line says how the pass ended without reaching inside it.
     private func makeProbeReport(_ ctx: UnsafeMutablePointer<AVFormatContext>, parkedAudio: [Int],
                                  bytesBefore: Int64, callStart: UInt64, callReturn: UInt64,
-                                 headerWaitReleasedAfter: UInt64?) -> ProbeReport {
+                                 headerWaitReleasedAfter: UInt64?, attachmentsParked: Int) -> ProbeReport {
         let isMPEGTS = ctx.pointee.iformat.map { String(cString: $0.pointee.name) == "mpegts" } ?? false
         var programs = 0
         var pmtMissing = 0
@@ -1397,7 +1489,7 @@ public final class Demuxer: @unchecked Sendable {
         let closeToReturn = closedAt.map { callReturn - max($0, callStart) }
         return ProbeReport(stop: stop, unresolved: unresolved, programs: programs, pmtMissing: pmtMissing,
                            headerWaitReleasedAfter: headerWaitReleasedAfter, probeBytes: bytes,
-                           closeToReturn: closeToReturn)
+                           closeToReturn: closeToReturn, attachmentsParked: attachmentsParked)
     }
 
     /// An audio stream this build can never resolve, named so a report can say why a source came up
@@ -1511,6 +1603,94 @@ public final class Demuxer: @unchecked Sendable {
     private func unparkPGSSubtitles(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
         for i in parked where i < Int(ctx.pointee.nb_streams) {
             ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_type = AVMEDIA_TYPE_SUBTITLE
+        }
+    }
+
+    /// Whether this stream is one the demuxer could not name, so libavformat sniffs its content
+    /// instead, and playback never reads it. (#1087)
+    ///
+    /// `mpegts.c` gives a private stream (stream_type 0x06) that no descriptor identifies
+    /// `AV_CODEC_ID_BIN_DATA` and a pending content sniff. Until that sniff ends, `ff_read_packet`
+    /// queues every later packet of every stream behind the stream's first packet, and it ends only
+    /// after 2500 packets of that one stream or once the queue holds the probe size in bytes. A
+    /// sparse track (ATSC 3.0 STPP captions, a PES every few seconds) never reaches the first, so the
+    /// video's packets wait for the second: 50 MiB at the wire rate on a live source, 13 to 17 s on
+    /// the reported channel before the host gave up. Whether it bites depends on which comes first
+    /// after the open, the caption PES or the first picture, which is why one open in three played.
+    ///
+    /// Only the unnamed fallback is matched. A data codec the PMT did name (SCTE-35, timed ID3, KLV)
+    /// gets no sniff and holds nothing, and `AV_CODEC_ID_NONE` is a stream still being identified.
+    static func dataNeedsNoProbe(codecID: AVCodecID, codecType: AVMediaType) -> Bool {
+        codecType == AVMEDIA_TYPE_DATA && codecID == AV_CODEC_ID_BIN_DATA
+    }
+
+    /// Keep unnamed data streams out of the probe with `AVDISCARD_ALL`, which `mpegts.c` checks at
+    /// every PES start, so none of their packets enters the queue the sniff would hold. Reclassifying
+    /// them like the audio and PGS parks would not help: the hold is keyed on the pending sniff, not
+    /// on the media type. The previous discard comes back after the probe; playback silences these
+    /// streams through `discardAllStreamsExcept` as before. (#1087)
+    ///
+    /// The cost is the sniff itself: a private stream no descriptor names is never identified from
+    /// its content, so an undescribed audio track in such a mux stays `bin_data` instead of turning
+    /// into, say, DTS. FFmpeg names every descriptor-carrying form (AC-3, E-AC-3, DTS, AC-4, Opus,
+    /// teletext, DVB subtitles), so what is left is a broken mux.
+    private func parkUnnamedDataStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [(Int, AVDiscard)] {
+        var parked: [(Int, AVDiscard)] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i], let codecpar = stream.pointee.codecpar,
+                  Self.dataNeedsNoProbe(codecID: codecpar.pointee.codec_id,
+                                        codecType: codecpar.pointee.codec_type)
+            else { continue }
+            parked.append((i, stream.pointee.discard))
+            stream.pointee.discard = AVDISCARD_ALL
+        }
+        return parked
+    }
+
+    private func unparkUnnamedDataStreams(_ ctx: UnsafeMutablePointer<AVFormatContext>,
+                                          _ parked: [(Int, AVDiscard)]) {
+        for (i, discard) in parked where i < Int(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[i]?.pointee.discard = discard
+        }
+    }
+
+    /// Whether this is an attached file whose type the demuxer could not name. (AE#1129)
+    ///
+    /// `matroskadec` names an attachment only from a short MIME list (`application/x-truetype-font`,
+    /// `application/x-font`, `application/vnd.ms-opentype`, `binary`). MKVToolNix writes the RFC 8081
+    /// types (`font/ttf`, `font/otf`, `font/sfnt`) by default, on Windows since v58, and since v99 it
+    /// rewrites the old names to them on every remux. So the fonts of nearly every current anime release
+    /// arrive as `AV_CODEC_ID_NONE`, and `has_codec_parameters` fails those with "unknown codec". An
+    /// attachment never carries a packet, so nothing resolves it, and the probe reads on until
+    /// `max_analyze_duration`: 60 s of content. On a test file shaped like the report (about 5 Mbit/s
+    /// of video and audio) that was 36.7 MB, 4.5 s over a 68 Mbit/s link. An attachment that does
+    /// carry a codec id is resolved.
+    static func attachmentNeedsNoProbe(codecID: AVCodecID, codecType: AVMediaType) -> Bool {
+        codecType == AVMEDIA_TYPE_ATTACHMENT && codecID == AV_CODEC_ID_NONE
+    }
+
+    /// Give unnamed attachments `AV_CODEC_ID_BIN_DATA` for the duration of the probe, which
+    /// `has_codec_parameters` accepts for an attachment, so the pass stops once the real tracks are
+    /// known. The restore follows the probe because `find_stream_info` writes its context back over
+    /// `codecpar`; the payload in `extradata` is never touched, and `fontAttachmentInfos` goes by
+    /// MIME type and file name, not by codec. (AE#1129)
+    private func parkUnnamedAttachments(_ ctx: UnsafeMutablePointer<AVFormatContext>) -> [Int] {
+        var parked: [Int] = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let codecpar = ctx.pointee.streams[i]?.pointee.codecpar,
+                  Self.attachmentNeedsNoProbe(codecID: codecpar.pointee.codec_id,
+                                              codecType: codecpar.pointee.codec_type)
+            else { continue }
+            codecpar.pointee.codec_id = AV_CODEC_ID_BIN_DATA
+            parked.append(i)
+        }
+        unnamedAttachmentsParked = parked.count
+        return parked
+    }
+
+    private func unparkUnnamedAttachments(_ ctx: UnsafeMutablePointer<AVFormatContext>, _ parked: [Int]) {
+        for i in parked where i < Int(ctx.pointee.nb_streams) {
+            ctx.pointee.streams[i]?.pointee.codecpar?.pointee.codec_id = AV_CODEC_ID_NONE
         }
     }
 
@@ -1844,6 +2024,93 @@ public final class Demuxer: @unchecked Sendable {
         )
     }
 
+    /// AE#1103: give a stream with no colour description the one the host named. Written into
+    /// `codecpar`, like the HLG promotion above and for the same reason: the route, the display
+    /// criteria, the muxer's `colr`, the decoders' frame backfill and the probe all read it from there.
+    /// After that promotion, so an HLG the SEI proved is a declared transfer and is left alone.
+    ///
+    /// A Dolby Vision Profile 5 has exactly the shape this option looks for (10 bit, nothing declared)
+    /// and its picture is IPT, not YCbCr, so calling it PQ turns it green and violet. A record in
+    /// `codecpar` rules it out, but the recordless audit that adds one runs only for a URL open with
+    /// its audit on, so an HEVC candidate is also checked for an RPU in its first video packets, which
+    /// covers custom readers, disc images and the controlled probe. Peeks, so playback still gets
+    /// every packet.
+    private func applyUntaggedVideoColor() {
+        let assumption = openProfile.untaggedVideoColor
+        guard assumption != .standard, !openProfile.skipStreamInfo else { return }
+        let index = videoStreamIndex
+        typealias Reading = (candidate: ColorDescription?, declared: ColorDescription, depth: Int,
+                             hasRecord: Bool, hevcFraming: VideoNALFraming?)
+        guard let reading = withStream(at: index, { stream -> Reading? in
+            guard stream.pointee.discard != AVDISCARD_ALL, let par = stream.pointee.codecpar else { return nil }
+            let declared = ColorDescription(codecpar: par)
+            let depth = ColorDescription.bitDepth(
+                pixelFormat: par.pointee.format, bitsPerRawSample: par.pointee.bits_per_raw_sample)
+            let hasRecord = AetherEngine.dvConfig(stream: stream) != nil
+            let framing = par.pointee.codec_id == AV_CODEC_ID_HEVC
+                ? A53SEIParser.nalFraming(codec: .hevc, extradata: par.pointee.extradata,
+                                          size: Int(par.pointee.extradata_size))
+                : nil
+            return (ColorDescription.assumed(assumption, for: declared, bitDepth: depth, isDolbyVision: hasRecord),
+                    declared, depth, hasRecord, framing)
+        }) ?? nil else { return }
+        let name = assumption == .hdr10 ? "hdr10" : "hlg"
+
+        guard let applied = reading.candidate else {
+            // A tagged or 8-bit stream is the common case under a library-wide setting, so its line
+            // stays out of the host's log.
+            let declared = reading.declared
+            let label: (UnsafePointer<CChar>?, Int32) -> String = { $0.map { String(cString: $0) } ?? "\($1)" }
+            let reason: String
+            if reading.hasRecord {
+                reason = "the stream is Dolby Vision"
+            } else if declared.primaries != AVCOL_PRI_UNSPECIFIED || declared.transfer != AVCOL_TRC_UNSPECIFIED
+                        || declared.matrix != AVCOL_SPC_UNSPECIFIED {
+                reason = "the stream declares primaries=\(label(av_color_primaries_name(declared.primaries), Int32(declared.primaries.rawValue))) "
+                    + "trc=\(label(av_color_transfer_name(declared.transfer), Int32(declared.transfer.rawValue))) "
+                    + "matrix=\(label(av_color_space_name(declared.matrix), Int32(declared.matrix.rawValue)))"
+            } else {
+                reason = reading.depth > 0 ? "the stream is \(reading.depth)-bit" : "the stream's bit depth is unknown"
+            }
+            EngineLog.emit("[Demuxer] AE#1103 stream=\(index): untaggedVideoColor=\(name) not applied, \(reason)",
+                           category: .demux, level: reading.hasRecord ? .info : .verbose)
+            return
+        }
+
+        if let framing = reading.hevcFraming, firstVideoPacketsCarryRPU(index: index, framing: framing) {
+            EngineLog.emit(
+                "[Demuxer] AE#1103 stream=\(index): untaggedVideoColor=\(name) not applied, the stream carries "
+                + "a Dolby Vision RPU and no record", category: .demux)
+            return
+        }
+
+        _ = withStream(at: index) { stream in
+            guard let par = stream.pointee.codecpar else { return }
+            par.pointee.color_primaries = applied.primaries
+            par.pointee.color_trc = applied.transfer
+            par.pointee.color_space = applied.matrix
+            par.pointee.color_range = applied.range
+        }
+        EngineLog.emit(
+            "[Demuxer] AE#1103 stream=\(index): untagged \(reading.depth)-bit video shown as \(name) "
+            + "(untaggedVideoColor)", category: .demux)
+    }
+
+    /// Whether one of the first video packets holds an unspec62 NAL, the Dolby Vision RPU. Same budget
+    /// as the HLG SEI scan: every Dolby Vision frame carries one, so the first video packet decides.
+    private func firstVideoPacketsCarryRPU(index: Int32, framing: VideoNALFraming) -> Bool {
+        var videoPackets = 0
+        var found = false
+        try? peekPackets(maxPackets: Self.alternativeTransferPacketBudget) { packet in
+            guard packet.pointee.stream_index == index, let data = packet.pointee.data else { return false }
+            videoPackets += 1
+            found = DolbyVisionLayerUnits.rpu(
+                in: UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)), framing: framing) != nil
+            return found || videoPackets >= Self.alternativeTransferVideoPacketBudget
+        }
+        return found
+    }
+
     /// Run a bounded `avformat_find_stream_info` on an already-open context (#87). Used by the subtitle
     /// side reader as a fallback when its target stream's codec is still unresolved after a `skipStreamInfo`
     /// open (a container that does not declare the subtitle codec in its header). The probe budget applied
@@ -1853,7 +2120,9 @@ public final class Demuxer: @unchecked Sendable {
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return }
         reclassifyAttachedPictures(ctx)
+        let parkedAttachments = parkUnnamedAttachments(ctx)
         _ = avformat_find_stream_info(ctx, nil)
+        unparkUnnamedAttachments(ctx, parkedAttachments)
         refreshStreamTableLocked(rebuildTracks: true)
     }
 
@@ -2564,6 +2833,43 @@ public final class Demuxer: @unchecked Sendable {
         indexedKeyframeEntries(streamIndex: streamIndex).map(\.pts)
     }
 
+    /// Lazy fragment index: the video keyframes of a lazily indexed fragmented MP4, from
+    /// its mfra, in the form `indexedKeyframeEntries` gives them, so the keyframe-aligned plan is
+    /// the one a full index builds. nil unless the stream is the mfra's track in its time scale and
+    /// the mfra agrees with every keyframe the demuxer has indexed so far (the first fragment; the
+    /// probe has checked a few more entries against their moof): a tfra time there that is not an indexed keyframe,
+    /// or an indexed keyframe outside the tfra's span, means the two do not describe one axis.
+    /// `pos` is the fragment's `moof` offset, close enough for the peak bit rate it feeds.
+    func lazyFragmentKeyframeEntries(streamIndex: Int32) -> [(pts: Int64, pos: Int64)]? {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let access = fragmentRandomAccess, let ctx = formatContext,
+              streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
+              let stream = ctx.pointee.streams[Int(streamIndex)],
+              UInt32(truncatingIfNeeded: stream.pointee.id) == access.trackID,
+              stream.pointee.time_base.num == 1, Int64(stream.pointee.time_base.den) == Int64(access.timescale),
+              access.times.count >= 2 else { return nil }
+        var indexed: [Int64] = []
+        let count = avformat_index_get_entries_count(stream)
+        for i in 0..<count {
+            guard let entry = avformat_index_get_entry(stream, i), entry.pointee.flags & 0x0001 != 0 else { continue }
+            indexed.append(entry.pointee.timestamp)
+        }
+        guard let shift = FragmentedMP4RandomAccess.shiftOntoIndex(times: access.times, indexedKeyframes: indexed) else { return nil }
+        let tb = stream.pointee.time_base
+        let compositionOffset = compositionRepair?.decodeTimestampOffset
+        var result: [(pts: Int64, pos: Int64)] = []
+        result.reserveCapacity(access.times.count)
+        for (raw, moof) in zip(access.times, access.moofOffsets) {
+            let time = raw + shift
+            guard Self.isPlausibleIndexTimestamp(time, timeBase: tb),
+                  let folded = normalizedTimestamp(time, pos: moof, timeBase: tb),
+                  let placed = Self.offsetIndexTimestamp(folded, by: compositionOffset) else { continue }
+            result.append((pts: placed, pos: moof))
+        }
+        return result.count >= 2 ? result : nil
+    }
+
     /// `indexedKeyframes` with each entry's byte position in the source (AE#783), -1 where the index
     /// has none. Matroska stores the position of the Cluster that holds the keyframe.
     func indexedKeyframeEntries(streamIndex: Int32) -> [(pts: Int64, pos: Int64)] {
@@ -3142,6 +3448,30 @@ public final class Demuxer: @unchecked Sendable {
     var dashRandomAccessStartsSeconds: [Double] {
         (avioProvider as? CustomIOReaderBridge)?.dashRandomAccessStartsSeconds ?? []
     }
+
+    /// Fragmented MP4: set when this open indexed the file lazily, see
+    /// `FragmentedMP4RandomAccess`.
+    private(set) var fragmentRandomAccess: FragmentedMP4RandomAccess?
+
+    /// The video random access points of a lazily indexed fragmented MP4, seconds from the
+    /// first. Empty for every other source.
+    var lazyFragmentRandomAccessStartsSeconds: [Double] { fragmentRandomAccess?.startsSeconds ?? [] }
+
+    /// A/B switch: `AETHER_NO_LAZY_FRAGMENTS=1` indexes every fragmented MP4 in full.
+    static let lazyFragmentIndexDisabled = ProcessInfo.processInfo.environment["AETHER_NO_LAZY_FRAGMENTS"] == "1"
+
+    /// Whether the linked libavformat has movdec's `lazy_frag_index` (FFmpegBuild's
+    /// mov-lazy-frag-index patch). An FFmpeg without it ignores the option and walks every
+    /// fragment, which the reader would then serve one on-demand range at a time, so the lazy
+    /// path is taken only where the option exists.
+    static let lazyFragmentIndexAvailable: Bool = {
+        guard let format = av_find_input_format("mov") else { return false }
+        var priv: UnsafePointer<AVClass>? = format.pointee.priv_class
+        guard priv != nil else { return false }
+        return withUnsafeMutablePointer(to: &priv) {
+            av_opt_find(UnsafeMutableRawPointer($0), "lazy_frag_index", nil, 0, AV_OPT_SEARCH_FAKE_OBJ) != nil
+        }
+    }()
 
     /// AE#1075: how far audio can run ahead of video in a DASH source's read order, see
     /// `DASHVirtualLayout.interleaveLeadSeconds`. 0 for every other source.
@@ -4006,12 +4336,15 @@ struct ProbeReport: Equatable, Sendable {
     let probeBytes: Int64
     /// From the close request to the call's return, nil without a close.
     let closeToReturn: UInt64?
+    /// Attachments without a codec id kept out of the pass (`parkUnnamedAttachments`, AE#1129).
+    var attachmentsParked = 0
 
     var logFields: String {
         func ms(_ ns: UInt64) -> String { "\(ns / 1_000_000)ms" }
         return "probe stop=\(stop.rawValue), unresolved=\(unresolved), programs=\(programs), "
             + "pmtMissing=\(pmtMissing), headerWait=\(headerWaitReleasedAfter.map { "released@\(ms($0))" } ?? "-"), "
-            + "probeBytes=\(probeBytes), closeToReturn=\(closeToReturn.map(ms) ?? "-")"
+            + "probeBytes=\(probeBytes), closeToReturn=\(closeToReturn.map(ms) ?? "-"), "
+            + "attachmentsParked=\(attachmentsParked)"
     }
 
     /// The first cause that applies, in the order a pass can end: a close or an interrupt ends it

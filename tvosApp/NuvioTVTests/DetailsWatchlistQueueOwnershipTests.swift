@@ -9,6 +9,16 @@ private final class QueueOwnershipTokens: SimklTokenStorage, WeTrakrTokenStorage
     func setAccessToken(_ token: String?, for scope: String) { access[scope] = token }
     func refreshToken(for scope: String) -> String? { refresh[scope] }
     func setRefreshToken(_ token: String?, for scope: String) { refresh[scope] = token }
+    func saveTokens(accessToken: String, refreshToken: String?, for scope: String) -> Bool {
+        access[scope] = accessToken
+        refresh[scope] = refreshToken
+        return true
+    }
+    func clearTokens(for scope: String) -> Bool {
+        access[scope] = nil
+        refresh[scope] = nil
+        return true
+    }
     func tokens(for scope: String) -> MdbListStoredTokens? { oauth[scope] }
     func save(_ tokens: MdbListStoredTokens, for scope: String) -> Bool {
         oauth[scope] = tokens

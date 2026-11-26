@@ -32047,7 +32047,7 @@
     "tvos_settings_upscale_metal": "MetalFX (Super Resolution)",
     "tvos_settings_upscale_off": "Off",
     "tvos_settings_upscale_scaler": "Upscaling Mode",
-    "tvos_settings_upscale_scaler_subtitle": "AetherEngine only. Auto automatically applies Anime4K to animation and MetalFX to movies & TV shows. You can also force a specific engine or turn upscaling off.",
+    "tvos_settings_upscale_scaler_subtitle": "AetherEngine only. Auto applies Anime4K to animation, MetalFX below 1080p, and Lanczos-3 for 1080p SDR movies & TV shows. You can also force a specific engine or turn upscaling off.",
     "tvos_settings_use_a_heavier_caption_weight": "Use a heavier caption weight",
     "tvos_settings_use_top_result": "Use Top Result",
     "tvos_settings_use_top_result_subtitle": "Play the first available source in the list, respecting your stream sort and add-on order (bypasses smart quality scoring)",

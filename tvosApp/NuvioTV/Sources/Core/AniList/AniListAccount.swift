@@ -24,6 +24,8 @@ enum AniListAccount {
         case badToken(TokenProblem)
         /// Logged out, or a newer login started, while AniList was answering.
         case superseded
+        /// AniList accepted the token, but it could not be saved on this device.
+        case persistenceFailed
 
         var errorDescription: String? {
             switch self {
@@ -32,6 +34,8 @@ enum AniListAccount {
                     "account_login_superseded",
                     fallback: "This login was replaced: you logged out or started another login meanwhile."
                 )
+            case .persistenceFailed:
+                return "AniList accepted the token, but it couldn't be saved on this device. Try again."
             case .emptyToken: return "Paste the token AniList shows after you allow access."
             case .notAccepted(let reason): return "AniList didn't accept the token (\(reason))."
             case .badToken(let problem): return problem.message
@@ -165,10 +169,26 @@ enum AniListAccount {
         loginGenerations.begin(for: profileScope)
     }
 
+    private enum LoginSaveResult {
+        case persisted
+        case persistenceFailed
+        case superseded
+    }
+
+    private static func commitLogin(_ login: Login, generation: UInt64, profileScope: String) -> LoginSaveResult {
+        var persisted = false
+        let committed = loginGenerations.commit(generation, for: profileScope) {
+            persisted = storage.save(login, for: profileScope)
+        }
+        guard committed else { return .superseded }
+        return persisted ? .persisted : .persistenceFailed
+    }
+
     /// Saves `login` only if no logout or newer login happened since `generation` began.
     @discardableResult
     static func save(_ login: Login, ifCurrent generation: UInt64, for profileScope: String) -> Bool {
-        loginGenerations.commit(generation, for: profileScope) { storage.save(login, for: profileScope) }
+        if case .persisted = commitLogin(login, generation: generation, profileScope: profileScope) { return true }
+        return false
     }
 
     /// Removes a profile's login and stops any login still waiting for it.
@@ -242,9 +262,15 @@ enum AniListAccount {
             throw AccountError.notAccepted("no account in its answer")
         }
         let login = Login(token: token, viewerID: viewer.id, viewerName: viewer.name, avatar: viewer.avatar?.large, savedAt: Date())
-        guard save(login, ifCurrent: generation, for: profileScope) else {
+        switch commitLogin(login, generation: generation, profileScope: profileScope) {
+        case .superseded:
             AniListDiagnostics.note(.account, "Log in dropped: logged out or a newer login started meanwhile")
             throw AccountError.superseded
+        case .persistenceFailed:
+            AniListDiagnostics.note(.account, "Log in failed: token couldn't be saved on this device · \(facts.summary)")
+            throw AccountError.persistenceFailed
+        case .persisted:
+            break
         }
         clearStates()
         AniListDiagnostics.note(.account, "Logged in as \(viewer.name)")
@@ -718,66 +744,65 @@ enum AniListAccount {
 
 protocol AniListTokenStorage: AnyObject {
     func login(for profileScope: String) -> AniListAccount.Login?
-    func save(_ login: AniListAccount.Login, for profileScope: String)
+    @discardableResult func save(_ login: AniListAccount.Login, for profileScope: String) -> Bool
     func remove(for profileScope: String)
 }
 
 /// The token in the Keychain, one per profile, never synced.
 final class AniListKeychainTokenStorage: AniListTokenStorage {
     private static let service = "com.nuvio.tv.anilist.auth"
-    private static let lock = NSLock()
+    private let keychain: ProviderCredentialKeychain
+    private static let lock = NSRecursiveLock()
     private static var cache: [String: AniListAccount.Login] = [:]
     private static var missing: Set<String> = []
 
-    func login(for profileScope: String) -> AniListAccount.Login? {
-        let (cached, isMissing) = Self.lock.withLock { (Self.cache[profileScope], Self.missing.contains(profileScope)) }
-        if let cached { return cached }
-        if isMissing { return nil }
-        var query = keychainQuery(for: profileScope)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let login = try? JSONDecoder().decode(AniListAccount.Login.self, from: data) else {
-            Self.lock.withLock { _ = Self.missing.insert(profileScope) }
-            return nil
-        }
-        Self.lock.withLock {
-            Self.cache[profileScope] = login
-            Self.missing.remove(profileScope)
-        }
-        return login
+    init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
+        self.keychain = keychain
     }
 
-    func save(_ login: AniListAccount.Login, for profileScope: String) {
-        guard let data = try? JSONEncoder().encode(login) else { return }
-        var add = keychainQuery(for: profileScope)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        add[kSecValueData as String] = data
-        if SecItemAdd(add as CFDictionary, nil) == errSecDuplicateItem {
-            _ = SecItemUpdate(keychainQuery(for: profileScope) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
-        }
-        Self.lock.withLock {
+    func login(for profileScope: String) -> AniListAccount.Login? {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        let cached = Self.cache[profileScope]
+        if let cached { return cached }
+        if Self.missing.contains(profileScope) { return nil }
+        let account = "login.\(profileScope)"
+        switch keychain.read(service: Self.service, account: account) {
+        case .missing:
+            Self.missing.insert(profileScope)
+            return nil
+        case .failed:
+            // A transient Keychain read failure is not evidence that the login is absent.
+            return nil
+        case .value(let encoded):
+            guard let data = encoded.data(using: .utf8),
+                  let login = try? JSONDecoder().decode(AniListAccount.Login.self, from: data) else { return nil }
             Self.cache[profileScope] = login
             Self.missing.remove(profileScope)
+            return login
         }
+    }
+
+    @discardableResult
+    func save(_ login: AniListAccount.Login, for profileScope: String) -> Bool {
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        guard let data = try? JSONEncoder().encode(login),
+              let encoded = String(data: data, encoding: .utf8),
+              keychain.write(encoded, service: Self.service, account: "login.\(profileScope)") else {
+            return false
+        }
+        Self.cache[profileScope] = login
+        Self.missing.remove(profileScope)
+        return true
     }
 
     func remove(for profileScope: String) {
-        Self.lock.withLock {
-            Self.cache[profileScope] = nil
-            Self.missing.insert(profileScope)
-        }
-        _ = SecItemDelete(keychainQuery(for: profileScope) as CFDictionary)
-    }
-
-    private func keychainQuery(for profileScope: String) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
-            kSecAttrAccount as String: "login.\(profileScope)",
-        ]
+        Self.lock.lock()
+        defer { Self.lock.unlock() }
+        _ = keychain.delete(service: Self.service, account: "login.\(profileScope)")
+        Self.cache[profileScope] = nil
+        Self.missing.insert(profileScope)
     }
 }
 
@@ -785,6 +810,6 @@ final class AniListKeychainTokenStorage: AniListTokenStorage {
 final class AniListMemoryTokenStorage: AniListTokenStorage {
     private var values: [String: AniListAccount.Login] = [:]
     func login(for profileScope: String) -> AniListAccount.Login? { values[profileScope] }
-    func save(_ login: AniListAccount.Login, for profileScope: String) { values[profileScope] = login }
+    @discardableResult func save(_ login: AniListAccount.Login, for profileScope: String) -> Bool { values[profileScope] = login; return true }
     func remove(for profileScope: String) { values[profileScope] = nil }
 }

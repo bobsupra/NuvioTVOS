@@ -47,7 +47,12 @@ enum DebridDeviceAuthorizationResult {
 }
 
 enum DebridCredentials {
-    static func token(for kind: DebridProviderKind, store: UserDefaults) -> String {
+    static func token(
+        for kind: DebridProviderKind,
+        store: UserDefaults,
+        profileScope: String? = nil,
+        keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared
+    ) -> String {
         let providerKey: String?
         switch kind {
         case .torbox: providerKey = SettingsKey.torboxAccessToken
@@ -56,7 +61,9 @@ enum DebridCredentials {
         case .none, .allDebrid, .debridLink: providerKey = nil
         }
 
-        let providerValue = providerKey.flatMap { store.string(forKey: $0) }
+        let providerValue = providerKey.flatMap {
+            ProviderCredentialStore.string(forKey: $0, in: store, profileScope: profileScope, keychain: keychain)
+        }
         let providerToken = providerValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !providerToken.isEmpty { return providerToken }
 
@@ -64,15 +71,26 @@ enum DebridCredentials {
         guard DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider)) == kind else {
             return ""
         }
-        return (store.string(forKey: SettingsKey.debridApiKey) ?? "")
+        return (ProviderCredentialStore.string(
+            forKey: SettingsKey.debridApiKey,
+            in: store,
+            profileScope: profileScope,
+            keychain: keychain
+        ) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    static func token(for provider: DebridAccountProvider, store: UserDefaults) -> String {
-        token(for: provider.debridKind, store: store)
+    static func token(
+        for provider: DebridAccountProvider,
+        store: UserDefaults,
+        profileScope: String? = nil,
+        keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared
+    ) -> String {
+        token(for: provider.debridKind, store: store, profileScope: profileScope, keychain: keychain)
     }
 
-    static func save(_ token: String, for provider: DebridAccountProvider, store: UserDefaults) {
+    @discardableResult
+    static func save(_ token: String, for provider: DebridAccountProvider, store: UserDefaults) -> Bool {
         let value = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let key: String
         switch provider {
@@ -80,12 +98,13 @@ enum DebridCredentials {
         case .premiumize: key = SettingsKey.premiumizeAccessToken
         case .realDebrid: key = SettingsKey.realDebridAccessToken
         }
-        store.set(value, forKey: key)
+        guard ProviderCredentialStore.set(value, forKey: key, in: store) else { return false }
 
         // Keep the legacy selected-provider value in step with a new device
         // connection so stream resolution works immediately.
         store.set(provider.debridKind.rawValue, forKey: SettingsKey.debridProvider)
-        store.set(value, forKey: SettingsKey.debridApiKey)
+        _ = ProviderCredentialStore.set(value, forKey: SettingsKey.debridApiKey, in: store)
+        return true
     }
 
     static func remove(provider: DebridAccountProvider, store: UserDefaults) {
@@ -95,11 +114,11 @@ enum DebridCredentials {
         case .premiumize: key = SettingsKey.premiumizeAccessToken
         case .realDebrid: key = SettingsKey.realDebridAccessToken
         }
-        store.removeObject(forKey: key)
+        guard ProviderCredentialStore.set(nil, forKey: key, in: store) else { return }
 
         let selected = DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider))
         guard selected == provider.debridKind else { return }
-        store.removeObject(forKey: SettingsKey.debridApiKey)
+        _ = ProviderCredentialStore.set(nil, forKey: SettingsKey.debridApiKey, in: store)
         store.set(DebridProviderKind.none.rawValue, forKey: SettingsKey.debridProvider)
     }
 }
@@ -499,7 +518,11 @@ final class DebridAccountConnectionViewModel: ObservableObject {
             statusMessage = "Waiting for approval…"
             return false
         case .authorized(let token):
-            DebridCredentials.save(token, for: authorization.provider, store: ProfileSettings.current)
+            guard DebridCredentials.save(token, for: authorization.provider, store: ProfileSettings.current) else {
+                state = .failed
+                statusMessage = "Approval succeeded, but this Apple TV could not save the credential."
+                return true
+            }
             state = .connected
             statusMessage = "\(authorization.provider.displayName) connected."
             return true

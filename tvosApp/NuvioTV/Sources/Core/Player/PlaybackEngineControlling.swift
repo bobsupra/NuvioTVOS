@@ -39,6 +39,7 @@ struct PlaybackDebugInfo: Equatable {
     var dynamicRange: String = ""
     var resolution: String = ""
     var frameRate: String = ""
+    var videoUpscaling: String? = nil
     var audio: String = ""
     var audioSourceCodec: String? = nil
     var audioSourceChannels: Int? = nil
@@ -103,6 +104,7 @@ struct PlaybackDebugInfo: Equatable {
         dynamicRange: String = "",
         resolution: String = "",
         frameRate: String = "",
+        videoUpscaling: String? = nil,
         audio: String = "",
         audioSourceCodec: String? = nil,
         audioSourceChannels: Int? = nil,
@@ -154,6 +156,7 @@ struct PlaybackDebugInfo: Equatable {
         self.dynamicRange = dynamicRange
         self.resolution = resolution
         self.frameRate = frameRate
+        self.videoUpscaling = videoUpscaling
         self.audio = audio
         self.audioSourceCodec = audioSourceCodec
         self.audioSourceChannels = audioSourceChannels

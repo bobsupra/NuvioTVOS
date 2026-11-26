@@ -8,12 +8,13 @@
 #   ./build.sh static   # Build static variant (not App Store friendly for closed-source apps)
 #   ./build.sh package  # Repackage frameworks from existing build products
 #   ./build.sh clean    # Remove all build artifacts
+#   ./build.sh --without-dtsx-heights   # Leave out patches/dca-xll-x-heights.patch (see README)
 #
 set -eo pipefail  # pipefail so `... | tail -N` doesn't swallow configure/make errors
 
 FFMPEG_VERSION="n8.1.3"
 FFMPEG_REPO="https://github.com/FFmpeg/FFmpeg.git"
-DAV1D_VERSION="1.5.4"
+DAV1D_VERSION="1.5.5"
 DAV1D_REPO="https://code.videolan.org/videolan/dav1d.git"
 ZIMG_VERSION="release-3.0.6"
 ZIMG_REPO="https://github.com/sekrit-twc/zimg.git"
@@ -41,12 +42,14 @@ ZVBI_SRC="${BUILD_DIR}/zvbi-src"
 # available for people who build themselves and can meet LGPL 6(a) instead.
 MODE="build"
 LINKAGE="dynamic"
+DTSX_HEIGHTS="applied"
 for ARG in "$@"; do
     case "${ARG}" in
         clean)   MODE="clean" ;;
         package) MODE="package" ;;
         static)  LINKAGE="static" ;;
         dynamic) LINKAGE="dynamic" ;;
+        --without-dtsx-heights) DTSX_HEIGHTS="left out (--without-dtsx-heights)" ;;
         *) echo "Unknown argument: ${ARG}"; exit 1 ;;
     esac
 done
@@ -86,28 +89,28 @@ fetch_ffmpeg() {
     git clone --depth 1 --branch "${FFMPEG_VERSION}" "${FFMPEG_REPO}" "${FFMPEG_SRC}"
 }
 
-patch_ffmpeg() {
-    # Upstream bug in vf_yadif_videotoolbox.m (present through n8.1.2): call_kernel gets
-    # commandBuffer / computeCommandEncoder from property getters, which return AUTORELEASED
-    # (+0) objects under FFmpeg's non-ARC ObjC build, then releases them manually via
-    # ff_objc_release, an over-release. (The s->mtl* releases in uninit ARE correct: those are
-    # +1 objects from newCommandQueue/newLibrary etc.) ffmpeg's CLI never pops a pool on its
-    # filter threads so it goes unnoticed; a host app's GCD queues pop their last-resort pool
-    # when the work block ends, crashing at session teardown (EXC_BAD_ACCESS in
-    # AutoreleasePoolPage::releaseUntil). Fix: wrap the kernel call in @autoreleasepool and drop
-    # the manual releases, so the pool pop is the single balanced release and Metal transients
-    # drain per frame.
+patch_ffmpeg_yadif_videotoolbox() {
+    # AetherEngine #1101. vf_yadif_videotoolbox.m committed a command buffer and waited for it
+    # once per plane, so an NV12 or P010 frame went to the GPU twice and the decode thread
+    # waited twice. The patch puts both planes into one command buffer with one wait (output
+    # unchanged, framemd5-identical; 2.34 -> 1.86 ms per 1080p field on an M1). It also carries
+    # the older autorelease fix: commandBuffer / computeCommandEncoder are +0 under FFmpeg's
+    # non-ARC build and upstream released them by hand, which crashed host apps whose GCD
+    # queues pop their pool at session teardown (EXC_BAD_ACCESS in
+    # AutoreleasePoolPage::releaseUntil). n8.1.3 has both; master has the pool since FFmpeg
+    # PR 23850 but still submits per plane.
     local F="${FFMPEG_SRC}/libavfilter/vf_yadif_videotoolbox.m"
-    grep -q "@autoreleasepool" "${F}" && return
-    echo "→ Patching FFmpeg: balance autoreleased Metal objects in yadif_videotoolbox"
-    perl -0777 -pi -e '
-s#\{\n    YADIFVTContext \*s = ctx->priv;\n    id<MTLCommandBuffer> buffer#{\n    YADIFVTContext *s = ctx->priv;\n    \@autoreleasepool {\n    id<MTLCommandBuffer> buffer#;
-s#    ff_objc_release\(&encoder\);\n    ff_objc_release\(&buffer\);\n\}#    } // \@autoreleasepool: buffer + encoder are +0 autoreleased by their getters.\n      // Upstream released them manually here (over-release); the pool pop above\n      // is the single balanced release. See FFmpegBuild build.sh patch_ffmpeg.\n}#;
-' "${F}"
-    if ! grep -q "@autoreleasepool" "${F}"; then
-        echo "ERROR: yadif_videotoolbox autorelease patch did not apply (upstream source changed?)"
-        exit 1
+    local P="${SCRIPT_DIR}/patches/yadif-videotoolbox-one-submission.patch"
+    grep -q "encode_plane" "${F}" && return
+    # A tree patched by an older build carries the inline perl edit that came before this patch.
+    if grep -q "See FFmpegBuild build.sh patch_ffmpeg\." "${F}"; then
+        git -C "${FFMPEG_SRC}" checkout -- libavfilter/vf_yadif_videotoolbox.m
     fi
+    echo "→ Patching FFmpeg: yadif_videotoolbox sends each frame to the GPU once (AetherEngine #1101)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: yadif_videotoolbox patch did not apply (upstream source changed?)"
+        exit 1
+    }
 }
 
 patch_ffmpeg_pgssub() {
@@ -617,16 +620,20 @@ COMMON_FLAGS=(
     # instead of being deinterlaced to 29.97 with judder. All LGPL (mpdecimate
     # would be GPL and is not needed).
     --enable-filter=idet --enable-filter=fieldmatch --enable-filter=decimate
-    # Hardware deinterlacer: yadif_videotoolbox runs the yadif kernel as a
-    # Metal compute shader over AV_PIX_FMT_VIDEOTOOLBOX frames (no
-    # bwdif_videotoolbox exists upstream). hwupload bridges software-decoded
+    # The same two on the GPU (patch_ffmpeg_ivtc_videotoolbox, AetherEngine #1108),
+    # fieldmatch and decimate for VideoToolbox frames, output equal to the CPU filters.
+    --enable-filter=fieldmatch_videotoolbox --enable-filter=decimate_videotoolbox
+    # Hardware deinterlacers: bwdif_videotoolbox (patch_ffmpeg_bwdif_videotoolbox,
+    # output equal to CPU bwdif) and yadif_videotoolbox (upstream) run as
+    # Metal compute shaders over AV_PIX_FMT_VIDEOTOOLBOX frames; yadif stays
+    # for hosts that ask for it by name. hwupload bridges software-decoded
     # frames into a VideoToolbox hwframes context so the GPU can deinterlace
     # at field rate (mode=send_field) without the 2x CPU cost of sw bwdif.
     # The dependency chain is "metal corevideo videotoolbox"; Metal is
     # normally autodetected but --disable-autodetect turns it off, so enable
     # it explicitly. The .metal kernel compiles at build time via
     # --metalcc / --metallib, overridden per slice in build_one.
-    --enable-filter=yadif_videotoolbox --enable-filter=hwupload
+    --enable-filter=bwdif_videotoolbox --enable-filter=yadif_videotoolbox --enable-filter=hwupload
     --enable-metal
     --enable-videotoolbox --enable-audiotoolbox
     --enable-libdav1d
@@ -1325,6 +1332,7 @@ record_build_inputs() {
         echo "Built      $(date -u +%Y-%m-%dT%H:%M:%SZ), linkage ${LINKAGE}"
         echo "Repo HEAD  $(git -C "${SCRIPT_DIR}" rev-parse HEAD)${DIRTY}"
         echo "build.sh   sha256 $(shasum -a 256 "${SCRIPT_DIR}/build.sh" | cut -d' ' -f1)"
+        echo "DTS:X heights patch ${DTSX_HEIGHTS}"
         for P in "${SCRIPT_DIR}"/patches/*(N); do
             echo "patches/${P:t}  sha256 $(shasum -a 256 "${P}" | cut -d' ' -f1)"
         done
@@ -1534,6 +1542,16 @@ patch_ffmpeg_dca_x_heights() {
     # substitution would be unreadable. The patch header explains the format.
     local P="${SCRIPT_DIR}/patches/dca-xll-x-heights.patch"
     local -a files=(libavcodec/dca_xll.c libavcodec/dca_xll.h libavcodec/dcadec.c libavcodec/dcadec.h)
+    if [[ "${DTSX_HEIGHTS}" != "applied" ]]; then
+        # FFmpegBuild#12: for apps that ship without AetherEngine's DTSXObjectAudio trait and
+        # want the implementation out of the binary too. The tree may still carry the patch
+        # from an earlier build, so put the four files back to the tag.
+        if grep -q '"x_heights"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
+            git -C "${FFMPEG_SRC}" checkout -- "${files[@]}"
+        fi
+        echo "→ Leaving out the DTS:X height patch (--without-dtsx-heights)"
+        return
+    fi
     if grep -q '"x_presentation"' "${FFMPEG_SRC}/libavcodec/dcadec.c"; then
         return
     fi
@@ -1604,6 +1622,108 @@ patch_ffmpeg_matroska_byte_seek_done() {
     }
 }
 
+patch_ffmpeg_mpegts_dovi_descriptor() {
+    # AetherEngine live recordings. mpegts.c reads the DOVI video stream descriptor (0xb0)
+    # into AV_PKT_DATA_DOVI_CONF, but mpegtsenc.c never writes it, so a Dolby Vision stream
+    # copied into a transport stream keeps its RPUs and loses its record. A player that
+    # recognises Dolby Vision from the record then plays the copy as HDR10 (Profile 8.1),
+    # HLG (Profile 8.4) or HDR10 with the wrong colours (Profile 5). The patch is the muxer
+    # half of FFmpeg PR 26097: an H.264 or HEVC stream whose record carries its base layer
+    # and its RPU gets the 0xb0 descriptor, and with compatibility ID 0 (Profile 5) also the
+    # 'DOVI' registration, written before the codec's own so codec_tag stays HEVC. Drop it
+    # once the upstream commit is in the pinned tag.
+    local P="${SCRIPT_DIR}/patches/mpegts-dovi-descriptor.patch"
+    if grep -q "put_dovi_descriptors" "${FFMPEG_SRC}/libavformat/mpegtsenc.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: the mpegts muxer writes the Dolby Vision descriptors"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: mpegts Dolby Vision descriptor patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_mov_lazy_frag_index() {
+    # A fragmented MP4 without a complete sidx is indexed by reading every top-level moof
+    # before the header returns, one seek each: over a network that is a request per
+    # fragment before the first packet (a 4 minute, 96 fragment file on a WAN address:
+    # about 12 s and 90 requests to open). The patch adds a mov demuxer option
+    # "lazy_frag_index" (off by default) that stops the header behind the first moof and
+    # lets a seek find its fragment on demand: byte interpolation, resynchronisation on
+    # the next moof, tfdt bisection, with the mfra as a hint when the file has one. A seek
+    # lands where it lands with the full index. Files whose fragments carry no tfdt, or
+    # whose end cannot be found, are read as before. Without the option the demuxer is
+    # unchanged.
+    local P="${SCRIPT_DIR}/patches/mov-lazy-frag-index.patch"
+    if grep -q '"lazy_frag_index"' "${FFMPEG_SRC}/libavformat/mov.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: mov lazy_frag_index option"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: mov lazy fragment index patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_bwdif_videotoolbox() {
+    # AetherEngine #1102. Upstream has bwdif for CUDA and Vulkan but not for Metal, so the GPU
+    # path ran yadif while the CPU fallback ran bwdif, and a session's picture depended on which
+    # one it got. The patch adds bwdif_videotoolbox, which is the yadif_videotoolbox wrapper with
+    # bwdif's options and a Metal kernel doing bwdifdsp.c's integer arithmetic on integer samples
+    # held in floats (exact up to 10 bits; deeper formats are refused). Its output equals CPU bwdif
+    # frame for frame (framemd5, NV12 and P010, both modes, both parities). It submits each
+    # frame once, like the yadif_videotoolbox patch.
+    local P="${SCRIPT_DIR}/patches/bwdif-videotoolbox.patch"
+    if [[ -f "${FFMPEG_SRC}/libavfilter/vf_bwdif_videotoolbox.m" ]]; then
+        return
+    fi
+    echo "→ Patching FFmpeg: bwdif_videotoolbox, bwdif as a Metal kernel (AetherEngine #1102)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: bwdif_videotoolbox patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_vc1_frame_threads() {
+    # AetherEngine #1107. Upstream decodes VC-1 and WMV3 on one thread whatever the caller asks
+    # for, because neither decoder declares a threading capability, so the engine's software path
+    # asked for frame threads and got one thread. The patch makes vc1 and wmv3 frame-threaded on
+    # the pattern of the MPEG-4 Part 2 decoder. update_thread_context copies what one picture hands
+    # the next, a reference picture reports its finished macroblock rows, and every read of a
+    # reference picture waits for the rows it touches. Output equals single-threaded decoding
+    # (FATE vc1 / wmv3-drm / mss2 at 1 to 16 threads, frame hashes across seeks).
+    local P="${SCRIPT_DIR}/patches/vc1-frame-threads.patch"
+    if grep -q "vc1_update_thread_context" "${FFMPEG_SRC}/libavcodec/vc1dec.c"; then
+        return
+    fi
+    echo "→ Patching FFmpeg: vc1 / wmv3 frame threading (AetherEngine #1107)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: vc1 frame threading patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
+patch_ffmpeg_ivtc_videotoolbox() {
+    # AetherEngine #1108 (the inverse telecine of #853). fieldmatch and decimate are plain C on one
+    # thread, about 10 ms a frame at 1080i on an M1 Max, most of it fieldmatch's comb scoring.
+    # The patch adds fieldmatch_videotoolbox and decimate_videotoolbox for VideoToolbox frames.
+    # Their Metal kernels do the per-pixel passes of vf_fieldmatch.c and vf_decimate.c on the
+    # same 8-bit integers and return per-thread sums; the decisions are the CPU filters' code on
+    # the same totals. Output equals the CPU filters frame for frame (framemd5 with timestamps,
+    # every match and drop, 80 option and clip combinations). NV12 only. fieldmatch also refuses
+    # ppsrc, combdbg, chroma=1, the pcn/ub modes, frames smaller than 32x16 and frame heights that
+    # are not a multiple of 4.
+    local P="${SCRIPT_DIR}/patches/ivtc-videotoolbox.patch"
+    if [[ -f "${FFMPEG_SRC}/libavfilter/vf_fieldmatch_videotoolbox.m" ]]; then
+        return
+    fi
+    echo "→ Patching FFmpeg: fieldmatch_videotoolbox + decimate_videotoolbox, IVTC as Metal kernels (AetherEngine #1108)"
+    git -C "${FFMPEG_SRC}" apply "${P}" || {
+        echo "ERROR: ivtc_videotoolbox patch did not apply (upstream source changed?)"
+        exit 1
+    }
+}
+
 echo "╔══════════════════════════════════════╗"
 echo "║  FFmpegBuild: FFmpeg + dav1d (AV1)  ║"
 echo "║  VideoToolbox HW + Metal ready      ║"
@@ -1611,7 +1731,7 @@ echo "║  Linkage: ${LINKAGE}                     ║"
 echo "╚══════════════════════════════════════╝"
 
 fetch_ffmpeg
-patch_ffmpeg
+patch_ffmpeg_yadif_videotoolbox
 patch_ffmpeg_pgssub
 patch_ffmpeg_visionos
 patch_ffmpeg_matroska_tts
@@ -1624,6 +1744,11 @@ patch_ffmpeg_dca_x_heights
 patch_ffmpeg_av1_delayed_rap
 patch_ffmpeg_matroska_skip_attachments
 patch_ffmpeg_matroska_byte_seek_done
+patch_ffmpeg_mpegts_dovi_descriptor
+patch_ffmpeg_mov_lazy_frag_index
+patch_ffmpeg_bwdif_videotoolbox
+patch_ffmpeg_vc1_frame_threads
+patch_ffmpeg_ivtc_videotoolbox
 fetch_dav1d
 fetch_zimg
 fetch_zvbi

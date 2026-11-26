@@ -121,13 +121,13 @@ enum AIOSettingsSync {
     /// and a newer backup replaces this Apple TV's (kept for AIOStreams:
     /// `pendingBackupKey`); the choice turns on here too. Off: the choice
     /// turns off, and the settings and the configuration here stay.
-    /// `localBackup`: the Keychain's; `saveBackup`: into the Keychain.
+    /// `localBackup`: the Keychain's; `saveBackup`: into the Keychain, true only on success.
     @discardableResult
     static func importPayload(
         _ remote: [String: Any]?,
         store: UserDefaults = .standard,
         localBackup: [String: Any]?,
-        saveBackup: ([String: Any]) -> Void
+        saveBackup: ([String: Any]) -> Bool
     ) -> Imported? {
         guard let remote, let enabled = remote[Key.enabled] as? Bool else { return nil }
         guard enabled else {
@@ -161,7 +161,7 @@ enum AIOSettingsSync {
                localBackup[BackupKey.password] as? String == backup[BackupKey.password] as? String {
                 stored[BackupKey.uuid] = uuid
             }
-            saveBackup(stored)
+            guard saveBackup(stored) else { return result }
             store.set(true, forKey: pendingBackupKey)
             result.backup = true
         }

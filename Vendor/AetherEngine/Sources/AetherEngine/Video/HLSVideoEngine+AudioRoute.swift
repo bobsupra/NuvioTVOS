@@ -115,6 +115,12 @@ extension HLSVideoEngine {
         }
     }
 
+    /// AE#1120: a FLAC track whose layout CoreMedia would misread from the fMP4 (see `FLACChannelLabels`),
+    /// so it cannot be stream-copied and goes out as PCM instead.
+    static func flacNeedsRelabel(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
+        codecpar.pointee.codec_id == AV_CODEC_ID_FLAC && !FLACChannelLabels.carries(&codecpar.pointee.ch_layout)
+    }
+
     /// #165: ordered bridge-encoder cascade. The configured mode's encoder for this source is attempted
     /// first; if it is absent from the FFmpeg build (`AudioBridgeError.encoderNotFound`, which names the
     /// missing one), fall through to the other encoder rather than dropping to silent video-only. Both
@@ -337,7 +343,9 @@ extension HLSVideoEngine {
             let sourceChannels = audioStream.pointee.codecpar.pointee.ch_layout.nb_channels
             let firstAttempt = AudioBridge.bridgeEncoder(
                 for: audioBridgeMode,
-                sourceChannels: shapes ? audioShaping.outputChannels(forSource: sourceChannels) : sourceChannels)
+                sourceChannels: shapes ? audioShaping.outputChannels(forSource: sourceChannels) : sourceChannels,
+                flacCarriesLayout: shapes || FLACChannelLabels.carries(&audioStream.pointee.codecpar.pointee.ch_layout),
+                sourceIsFLAC: audioStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_FLAC)
             let cascade = Self.bridgeEncoderCascade(firstAttempt: firstAttempt)
             attempts: for (attemptIndex, encoderAttempt) in cascade.enumerated() {
                 let isLastAttempt = attemptIndex == cascade.count - 1
@@ -357,6 +365,13 @@ extension HLSVideoEngine {
                         Self.encoderAbsentMessage(
                             missing: missing,
                             cascadingTo: AudioBridge.alternateEncoder(to: missing)),
+                        category: .session
+                    )
+                    continue attempts
+                } catch where encoderAttempt == AudioBridge.pcmOutputCodecID && !isLastAttempt {
+                    // AE#1120: PCM is there for the labels; FLAC still plays every channel.
+                    EngineLog.emit(
+                        "[HLSVideoEngine] PCM bridge init failed (\(error)), falling back to FLAC in the default layout",
                         category: .session
                     )
                     continue attempts
@@ -396,8 +411,9 @@ extension HLSVideoEngine {
                     // not from the mode: `.surroundCompat` on a stereo source produces fLaC, and a master
                     // playlist that advertises ec-3 for a FLAC track is a load failure, not a cosmetic slip.
                     let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
-                    let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
-                    let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                    let isPCMOut = bridge.outputCodecID == AudioBridge.pcmOutputCodecID
+                    let hlsCodec = isEAC3Out ? "ec-3" : isPCMOut ? AudioBridge.pcmHLSCodecs : "fLaC"
+                    let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : isPCMOut ? "PCM" : "FLAC") bridge"
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = shapes ? pipelineLabel + " (shaped)" : pipelineLabel
                     self.audioDelivery = .bridged
@@ -414,12 +430,16 @@ extension HLSVideoEngine {
                 } catch {
                     EngineLog.emit(
                         "[HLSVideoEngine] \(Self.encoderLabel(bridge.outputCodecID)) bridge header write failed "
-                        + "(\(error)), falling back to video-only",
+                        + "(\(error)), falling back to "
+                        + (bridge.outputCodecID == AudioBridge.pcmOutputCodecID && !isLastAttempt
+                           ? "FLAC in the default layout" : "video-only"),
                         category: .session
                     )
                     self.savedAudioConfig = nil
                     self.audioBridge = nil
                     bridge.close()
+                    // AE#1120: a PCM header movenc refused still has FLAC to fall back to.
+                    if bridge.outputCodecID == AudioBridge.pcmOutputCodecID && !isLastAttempt { continue attempts }
                     break attempts
                 }
             }

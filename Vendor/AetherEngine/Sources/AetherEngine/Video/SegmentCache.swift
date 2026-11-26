@@ -87,6 +87,8 @@ final class SegmentCache: @unchecked Sendable {
 
     /// Pinned in RAM (~3.5 KB); AVPlayer fetches exactly once per session; never evicted.
     private var initSegment: Data?
+    /// AE#1095: `initSegment` came from a parked session; the producer's first own init is checked against it.
+    private var adoptedParkedInit = false
 
     /// Mid-session SSAI program-switch inits: (versionID, fromSegment, data). Version 0 = session init.
     private var initVersions: [(versionID: Int, fromSegment: Int, data: Data)] = []
@@ -145,6 +147,9 @@ final class SegmentCache: @unchecked Sendable {
     /// Plan index -> how many pumps passed it without opening a segment (#358). Survives producer
     /// restarts on purpose: the repeat across a restart is the signal.
     private var foldCounts: [Int: Int] = [:]
+    /// AE#1109: how each stored segment was written. Read only together with `entries`, so a value
+    /// left behind by an eviction is never consulted, and every path that stores an index sets it.
+    private var lineages: [Int: SegmentLineage] = [:]
     /// AE#412: what a stored segment's video is worth to a COLD arrival, per index. Absent = the
     /// producer did not record it (live, or an unresolved time base), and callers must treat that
     /// as "no claim" rather than as bad news.
@@ -277,6 +282,17 @@ final class SegmentCache: @unchecked Sendable {
 
     func setInit(_ data: Data) {
         condition.lock()
+        if adoptedParkedInit {
+            adoptedParkedInit = false
+            if initSegment != data {
+                // The same thing a producer restart inside one session does: the init AVPlayer
+                // already holds stays valid for what follows only if the two agree.
+                EngineLog.emit(
+                    "[SegmentCache] the producer's init (\(data.count) B) differs from the parked "
+                    + "session's (\(initSegment?.count ?? 0) B) (AE#1095)",
+                    category: .session)
+            }
+        }
         initSegment = data
         condition.broadcast()
         condition.unlock()
@@ -398,6 +414,7 @@ final class SegmentCache: @unchecked Sendable {
             _totalBytes += data.count
             if index > _highestStoredIndex { _highestStoredIndex = index }
             _totalStoredCount &+= 1
+            lineages[index] = nil
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
@@ -418,7 +435,8 @@ final class SegmentCache: @unchecked Sendable {
     /// `videoReach` (AE#412) is what this segment's video offers a cold arrival; nil leaves the
     /// previous claim in place only if the index is re-adopted without one, which no caller does.
     @discardableResult
-    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) -> Bool {
+    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil,
+               lineage: SegmentLineage? = nil) -> Bool {
         let fileURL = nextSegmentFileURL(index: index)
         var renameOK: Bool
         do {
@@ -477,6 +495,7 @@ final class SegmentCache: @unchecked Sendable {
             // AE#412: the claim describes THESE bytes, so a re-adoption replaces it, and an
             // adoption that cannot state one must not leave the old epoch's claim standing.
             videoReaches[index] = videoReach
+            lineages[index] = lineage
         }
         let doomed = pruneOutsideWindow()
         if !doomed.isEmpty { residentSetChanged = true }
@@ -490,6 +509,122 @@ final class SegmentCache: @unchecked Sendable {
         if residentSetChanged { onResidentSetChanged?() }
         if renameOK { observer?(index, byteCount, parked) }
         return renameOK
+    }
+
+    // MARK: - AE#1095 parking
+
+    /// The sealed segments `detachForParking(into:)` moved out, and what this cache knew about them.
+    struct ParkedSegments: Sendable {
+        let directory: URL
+        let files: [Int: URL]
+        let bytes: [Int: Int]
+        let reaches: [Int: VideoReach]
+        let foldCounts: [Int: Int]
+        let initSegment: Data
+        /// AE#1109: so a rewind before the adopted span can keep it like the session's own segments.
+        var lineages: [Int: SegmentLineage] = [:]
+
+        var totalBytes: Int { bytes.values.reduce(0, +) }
+    }
+
+    /// AE#1095: moves every sealed segment into `directory` and forgets it, so the `close()` that
+    /// follows deletes only what is left (staging files, previews, the i-frame rendition). Run after
+    /// the producer finished and the local server stopped, when nothing reads or writes any more.
+    ///
+    /// nil when a later session could not use any of it: no init, no segments, an SSAI-versioned
+    /// init, or a cache that is already closed.
+    func detachForParking(into directory: URL) -> ParkedSegments? {
+        condition.lock()
+        guard !closed, let initData = initSegment, initVersions.isEmpty, !entries.isEmpty else {
+            condition.unlock()
+            return nil
+        }
+        let files = entries
+        let bytes = entryBytes
+        let reaches = videoReaches
+        let folds = foldCounts
+        let kept = lineages
+        entries.removeAll(keepingCapacity: false)
+        entryBytes.removeAll(keepingCapacity: false)
+        videoReaches.removeAll(keepingCapacity: false)
+        lineages.removeAll(keepingCapacity: false)
+        _totalBytes = 0
+        condition.unlock()
+
+        var moved: [Int: URL] = [:]
+        var movedBytes: [Int: Int] = [:]
+        for (index, url) in files {
+            let target = directory.appendingPathComponent(url.lastPathComponent)
+            guard (try? FileManager.default.moveItem(at: url, to: target)) != nil else { continue }
+            moved[index] = target
+            movedBytes[index] = bytes[index] ?? byteSize(of: target)
+        }
+        guard !moved.isEmpty else { return nil }
+        return ParkedSegments(
+            directory: directory, files: moved, bytes: movedBytes,
+            reaches: reaches.filter { moved[$0.key] != nil }, foldCounts: folds, initSegment: initData,
+            lineages: kept.filter { moved[$0.key] != nil })
+    }
+
+    /// AE#1095: takes over a parked session's segments below `frontier` as if this session had cut
+    /// them, init included. Runs before the first producer starts and before the local server
+    /// answers. Returns what was taken; the caller discards the parked directory with the rest.
+    @discardableResult
+    func adoptParked(_ parked: ParkedSegments, below frontier: Int) -> (segments: Int, bytes: Int) {
+        var moved: [(index: Int, url: URL, bytes: Int)] = []
+        for (index, url) in parked.files where index < frontier {
+            let target = nextSegmentFileURL(index: index)
+            guard (try? FileManager.default.moveItem(at: url, to: target)) != nil else { continue }
+            moved.append((index, target, parked.bytes[index] ?? byteSize(of: target)))
+        }
+        condition.lock()
+        guard !closed else {
+            condition.unlock()
+            for entry in moved { try? FileManager.default.removeItem(at: entry.url) }
+            return (0, 0)
+        }
+        var adoptedBytes = 0
+        for entry in moved {
+            if let oldBytes = entryBytes[entry.index] { _totalBytes -= oldBytes }
+            entries[entry.index] = entry.url
+            entryBytes[entry.index] = entry.bytes
+            videoReaches[entry.index] = parked.reaches[entry.index]
+            lineages[entry.index] = parked.lineages[entry.index]
+            _totalBytes += entry.bytes
+            adoptedBytes += entry.bytes
+            if entry.index > _highestStoredIndex { _highestStoredIndex = entry.index }
+            _totalStoredCount &+= 1
+        }
+        // The folds describe the source, not the session: a hole the old pumps passed over is one
+        // the new ones will pass over too, and the #358 arms count across restarts on purpose. From
+        // the frontier on, the new producer cuts and counts for itself, like a fresh session.
+        for (index, count) in parked.foldCounts where index < frontier && entries[index] == nil {
+            foldCounts[index] = max(foldCounts[index] ?? 0, count)
+        }
+        if initSegment == nil, !moved.isEmpty {
+            initSegment = parked.initSegment
+            adoptedParkedInit = true
+        }
+        let doomed = pruneOutsideWindow()
+        condition.broadcast()
+        condition.unlock()
+        for url in doomed { try? FileManager.default.removeItem(at: url) }
+        if !moved.isEmpty { onResidentSetChanged?() }
+        return (moved.count, adoptedBytes)
+    }
+
+    /// Where the first producer of a session that adopts parked segments starts: the first index at or
+    /// after `start` that neither holds a segment nor is a hole the old pumps folded over. Never past
+    /// the last segment, so a fully parked title still has a producer that reaches the end.
+    static func parkedAdoptionFrontier(start: Int, stored: Set<Int>, folded: Set<Int>,
+                                       planCount: Int) -> Int {
+        guard planCount > 0 else { return 0 }
+        var index = min(max(0, start), planCount - 1)
+        while index < planCount - 1,
+              stored.contains(index) || (index > start && folded.contains(index)) {
+            index += 1
+        }
+        return index
     }
 
     @discardableResult
@@ -509,6 +644,7 @@ final class SegmentCache: @unchecked Sendable {
         entries.removeAll(keepingCapacity: false)
         entryBytes.removeAll(keepingCapacity: false)
         videoReaches.removeAll(keepingCapacity: false)
+        lineages.removeAll(keepingCapacity: false)
         initSegment = nil
         initVersions.removeAll(keepingCapacity: false)
         inProgress.removeAll(keepingCapacity: false)
@@ -713,6 +849,7 @@ final class SegmentCache: @unchecked Sendable {
                 removed += bytes
                 _totalBytes -= bytes
                 videoReaches.removeValue(forKey: index)
+                lineages.removeValue(forKey: index)
                 doomed.append(url)
             }
         }
@@ -810,6 +947,7 @@ final class SegmentCache: @unchecked Sendable {
         entries.removeValue(forKey: index)
         _totalBytes -= entryBytes.removeValue(forKey: index) ?? 0
         videoReaches.removeValue(forKey: index)
+        lineages.removeValue(forKey: index)
         condition.broadcast()
         condition.unlock()
         EngineLog.emit("[SegmentCache] seg-\(index) vanished from disk; entry dropped (AE#451)",
@@ -990,9 +1128,12 @@ final class SegmentCache: @unchecked Sendable {
             _totalBytes -= entryBytes[k] ?? byteSize(of: url)
             entryBytes.removeValue(forKey: k)
             entries.removeValue(forKey: k)
+            videoReaches.removeValue(forKey: k)
+            lineages.removeValue(forKey: k)
             doomed.append(url)
         }
         _evictionCount += doomed.count
+        if !doomed.isEmpty { condition.broadcast() }
         condition.unlock()
         for url in doomed {
             try? FileManager.default.removeItem(at: url)
@@ -1262,6 +1403,69 @@ final class SegmentCache: @unchecked Sendable {
         return _parkedSinceStore
     }
 
+    /// AE#1109: what a producer writing on one axis may keep from the resident run at an index.
+    struct KeepableRun: Equatable, Sendable {
+        /// Last index of the run that qualifies.
+        let frontier: Int
+        /// The resident segment right after it that does not qualify (written on another axis, the
+        /// first segment of its epoch, or of unknown lineage), nil when the run simply ends.
+        let breaker: Int?
+    }
+
+    /// AE#1109: the run of resident segments from `index` that a producer writing on `axis` could only
+    /// reproduce, or nil when `index` itself is not such a segment. The walk stops at the first hole,
+    /// at the first segment that does not qualify, or after `limit`.
+    ///
+    /// A segment written on another axis, or one that opened its epoch (a gate that opened below its
+    /// boundary and dropped the leading pictures before its keyframe), is not what this producer
+    /// would write there. Neither is a segment of unknown lineage.
+    func keepableResidentRun(from index: Int, axis: SegmentLineage.Axis,
+                             through limit: Int = .max) -> KeepableRun? {
+        condition.lock()
+        defer { condition.unlock() }
+        func qualifies(_ k: Int) -> Bool {
+            guard let lineage = lineages[k] else { return false }
+            return !lineage.opensEpoch && lineage.axis == axis
+        }
+        guard entries[index] != nil, qualifies(index) else { return nil }
+        var k = index + 1
+        while k <= limit, entries[k] != nil {
+            if !qualifies(k) { return KeepableRun(frontier: k - 1, breaker: k) }
+            k += 1
+        }
+        return KeepableRun(frontier: k - 1, breaker: nil)
+    }
+
+    /// AE#1109: evicts the segment that ends a kept run, so the consumer reaching it misses and the
+    /// provider restarts a producer there, instead of being served it as the continuation of the run.
+    /// Refused once the consumer has asked for it or anything past it.
+    @discardableResult
+    func dropForRecut(index: Int) -> Bool {
+        condition.lock()
+        guard !closed, currentTargetIndex < index, let url = entries.removeValue(forKey: index) else {
+            condition.unlock()
+            return false
+        }
+        _totalBytes -= entryBytes.removeValue(forKey: index) ?? 0
+        videoReaches.removeValue(forKey: index)
+        lineages.removeValue(forKey: index)
+        _evictionCount += 1
+        condition.broadcast()
+        condition.unlock()
+        try? FileManager.default.removeItem(at: url)
+        onResidentSetChanged?()
+        return true
+    }
+
+    /// AE#1109: sleeps until anything changes in the cache (a store, an eviction, a new consumer
+    /// target) or `timeout` passes. For a producer parked in front of a resident run.
+    func awaitChange(timeout: TimeInterval) {
+        condition.lock()
+        defer { condition.unlock() }
+        guard !closed else { return }
+        _ = condition.wait(until: Date().addingTimeInterval(timeout))
+    }
+
     /// Reset before triggering a restart; previous producer's highWater would keep producerPassedAndPruned
     /// hot on every fetch, cascading a single restart into a per-segment storm.
     func resetHighWaterForRestart() {
@@ -1418,6 +1622,7 @@ final class SegmentCache: @unchecked Sendable {
                     _totalBytes -= bytes
                     entryBytes.removeValue(forKey: index)
                     videoReaches.removeValue(forKey: index)
+                    lineages.removeValue(forKey: index)
                     doomed.append(url)
                 }
             }
@@ -1447,6 +1652,7 @@ final class SegmentCache: @unchecked Sendable {
                     entryBytes.removeValue(forKey: k)
                     entries.removeValue(forKey: k)
                     videoReaches.removeValue(forKey: k)
+                    lineages.removeValue(forKey: k)
                     doomed.append(url)
                 }
             }
@@ -1459,6 +1665,7 @@ final class SegmentCache: @unchecked Sendable {
                 entryBytes.removeValue(forKey: k)
                 entries.removeValue(forKey: k)
                 videoReaches.removeValue(forKey: k)
+                lineages.removeValue(forKey: k)
                 doomed.append(url)
             }
         }
@@ -1581,4 +1788,23 @@ final class ProgressiveSegmentReader: @unchecked Sendable {
             }
         }
     }
+}
+
+/// AE#1109: how a producer wrote one stored segment.
+///
+/// Two producers of one session cut the same plan index into interchangeable bytes when they rebased
+/// it by the same shifts with the same audio delay, and the segment is not the one their epoch opened
+/// with. That is what lets a producer restarted below a resident band stop at the band instead of
+/// fetching the source again for segments the cache already holds.
+struct SegmentLineage: Equatable, Sendable {
+    struct Axis: Equatable, Sendable {
+        let videoShiftPts: Int64
+        let audioShiftPts: Int64
+        let audioDelaySeconds: Double
+    }
+
+    let axis: Axis
+    /// The producer's first segment. Its gate may have opened below the boundary, and its leading
+    /// pictures before the keyframe were dropped, so it is not what continuous production writes.
+    let opensEpoch: Bool
 }

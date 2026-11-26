@@ -34,6 +34,26 @@ final class AccountLoginGenerationsTests: XCTestCase {
                          expiresAt: Date().addingTimeInterval(3600), userName: name, clientID: "client")
     }
 
+    private final class FakeAniListCredentialKeychain: ProviderCredentialKeychain {
+        var values: [String: String] = [:]
+        var shouldFailWrites = false
+
+        private func key(_ service: String, _ account: String) -> String { "\(service)|\(account)" }
+        func read(service: String, account: String) -> ProviderCredentialKeychainRead {
+            guard let value = values[key(service, account)] else { return .missing }
+            return .value(value)
+        }
+        func write(_ value: String, service: String, account: String) -> Bool {
+            guard !shouldFailWrites else { return false }
+            values[key(service, account)] = value
+            return true
+        }
+        func delete(service: String, account: String) -> Bool {
+            values[key(service, account)] = nil
+            return true
+        }
+    }
+
     // MARK: AniList
 
     func testAniListLoginAnsweredAfterLogoutSavesNothing() {
@@ -67,6 +87,24 @@ final class AccountLoginGenerationsTests: XCTestCase {
         XCTAssertTrue(AniListAccount.save(aniList("mine"), ifCurrent: generation, for: profile))
         XCTAssertEqual(AniListAccount.storage.login(for: profile)?.viewerName, "mine")
         XCTAssertNil(AniListAccount.storage.login(for: otherProfile))
+    }
+
+    func testAniListFailedReplacementPreservesCachedAndDurableLogin() throws {
+        let keychain = FakeAniListCredentialKeychain()
+        let storage = AniListKeychainTokenStorage(keychain: keychain)
+        AniListAccount.storage = storage
+        let existing = aniList("existing")
+        let generation = AniListAccount.beginLogin(for: profile)
+        XCTAssertTrue(AniListAccount.save(existing, ifCurrent: generation, for: profile))
+
+        let account = "login.\(profile)"
+        let durableBefore = try XCTUnwrap(keychain.values["com.nuvio.tv.anilist.auth|\(account)"])
+        keychain.shouldFailWrites = true
+        let replacementGeneration = AniListAccount.beginLogin(for: profile)
+
+        XCTAssertFalse(AniListAccount.save(aniList("replacement"), ifCurrent: replacementGeneration, for: profile))
+        XCTAssertEqual(storage.login(for: profile), existing)
+        XCTAssertEqual(keychain.values["com.nuvio.tv.anilist.auth|\(account)"], durableBefore)
     }
 
     // MARK: MAL

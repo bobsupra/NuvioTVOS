@@ -46,10 +46,12 @@ import v8 from 'node:v8';
 import { createRequire } from 'node:module';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { installFfprobeBridge } from './ffprobe-bridge.mjs';
+import { createAIOConfigurationProxy } from './aio-setup-gate.mjs';
 
 const aioRoot = process.env.AIO_ROOT;
 const aioPort = Number(process.env.PORT || 8770);
 const lanPort = Number(process.env.NUVIO_LAN_PORT || 0);
+const baseURL = process.env.BASE_URL || '';
 const stateFile = process.env.NUVIO_STATE_FILE;
 const backupFile = process.env.NUVIO_BACKUP_FILE;
 const controlPort = Number(process.env.NUVIO_CONTROL_PORT || 0);
@@ -136,6 +138,7 @@ function watchRequest(request, response) {
 let aioServer = null;
 let proxyServer = null;
 let controlServer = null;
+let setupGate = null;
 
 let listening = false;
 let resolveListening;
@@ -541,6 +544,18 @@ function saveBackup(uuid, password, config) {
 
 let sessionCredentials = null; // the last login on the page
 
+function revokeSetup(revision) {
+  const revoked = revision === undefined ? setupGate?.revoke() : setupGate?.revoke(revision);
+  if (revoked) sessionCredentials = null;
+  return Boolean(revoked);
+}
+
+function revokeSetupBefore(timestamp) {
+  const revoked = setupGate?.revokeBefore(timestamp);
+  if (revoked) sessionCredentials = null;
+  return Boolean(revoked);
+}
+
 function observe(kind, request, requestBody, answer) {
   const body = parsed(requestBody.toString('utf8'));
   const data = (parsed(decoded(answer.body, answer.headers['content-encoding']).toString('utf8')).data) || {};
@@ -573,54 +588,18 @@ function observe(kind, request, requestBody, answer) {
 
 function startProxy() {
   if (!lanPort) return;
-  const proxy = http.createServer((request, response) => {
-    const watch = userApi(request);
-    const requestChunks = [];
-    if (watch) request.on('data', (chunk) => requestChunks.push(chunk));
-    const upstream = http.request(
-      { host: '127.0.0.1', port: aioPort, method: request.method, path: request.url, headers: request.headers },
-      (answer) => {
-        response.writeHead(answer.statusCode || 502, answer.headers);
-        if (!watch || (answer.statusCode || 0) >= 300) {
-          answer.pipe(response);
-          return;
-        }
-        const chunks = [];
-        answer.on('data', (chunk) => {
-          chunks.push(chunk);
-          response.write(chunk);
-        });
-        answer.on('end', () => {
-          response.end();
-          try {
-            observe(watch, request, Buffer.concat(requestChunks), { headers: answer.headers, body: Buffer.concat(chunks) });
-          } catch (error) {
-            log(`could not read the configuration page's request: ${error.message}`);
-          }
-        });
-      }
-    );
-    upstream.on('error', (error) => {
-      if (!response.headersSent) response.writeHead(502, { 'content-type': 'text/plain; charset=utf-8' });
-      response.end(`AIOStreams is not answering yet: ${error.message}`);
-    });
-    request.pipe(upstream);
+  const proxy = createAIOConfigurationProxy({
+    aioPort,
+    baseURL,
+    isObservedRequest: userApi,
+    observe,
+    log: (message) => log(message),
+    onRevoke: () => { sessionCredentials = null; },
   });
-  proxy.on('upgrade', (request, socket, head) => {
-    const upstream = net.connect(aioPort, '127.0.0.1', () => {
-      const lines = [`${request.method} ${request.url} HTTP/${request.httpVersion}`];
-      for (let i = 0; i < request.rawHeaders.length; i += 2) lines.push(`${request.rawHeaders[i]}: ${request.rawHeaders[i + 1]}`);
-      upstream.write(`${lines.join('\r\n')}\r\n\r\n`);
-      if (head && head.length) upstream.write(head);
-      upstream.pipe(socket);
-      socket.pipe(upstream);
-    });
-    upstream.on('error', () => socket.destroy());
-    socket.on('error', () => upstream.destroy());
-  });
-  proxy.on('error', (error) => log(`configuration page port ${lanPort}: ${error.message}`));
-  proxyServer = proxy;
-  originalListen.call(proxy, lanPort, '0.0.0.0', () => log(`configuration page on port ${lanPort}`));
+  proxyServer = proxy.server;
+  setupGate = proxy.gate;
+  proxyServer.on('error', (error) => log(`configuration page port ${lanPort}: ${error.message}`));
+  originalListen.call(proxyServer, lanPort, '0.0.0.0', () => log(`configuration page on port ${lanPort}`));
 }
 
 // MARK: versions (Check for updates / Update in Nuvio)
@@ -701,6 +680,21 @@ function startControl() {
       }
       if (request.method === 'GET' && request.url === '/activity') {
         return send(200, { streamRequests: activity.streamRequests, lastStreamAt: activity.lastStreamAt, open: activity.open, startup: startup.marks, wakeUps });
+      }
+      if (request.method === 'POST' && request.url === '/setup') {
+        if (!setupGate) return send(503, { error: 'configuration page unavailable' });
+        const revision = Number(request.headers['x-nuvio-setup-generation']);
+        if (!Number.isSafeInteger(revision) || revision < 1) return send(400, { error: 'invalid setup generation' });
+        const previousSetup = setupGate.setup;
+        const setup = setupGate.begin(revision);
+        if (!setup) return send(409, { error: 'stale setup generation' });
+        if (setupGate.setup !== previousSetup) sessionCredentials = null;
+        return send(200, setup);
+      }
+      if (request.method === 'POST' && request.url === '/setup/close') {
+        const revision = Number(request.headers['x-nuvio-setup-generation']);
+        if (!Number.isSafeInteger(revision) || revision < 1) return send(400, { error: 'invalid setup generation' });
+        return send(200, { closed: revokeSetup(revision) });
       }
       send(404, { error: 'not found' });
     } catch (error) {
@@ -813,7 +807,7 @@ function watchForWakeUps() {
   let lastCheck = Date.now();
   lastTick = Date.now();
 
-  const check = (why) => {
+  const check = (why, before) => {
     const now = Date.now();
     if (!listening || busy || now < quietUntil) return;
     busy = true;
@@ -821,6 +815,7 @@ function watchForWakeUps() {
     refuses(aioPort)
       .then((refused) => {
         if (!refused) return;
+        if (Number.isFinite(before)) revokeSetupBefore(before);
         wakeUps++;
         quietUntil = Date.now() + 3000;
         log(`${why}: the ports were gone, listening again (AIOStreams, configuration page, Nuvio's port)`);
@@ -836,7 +831,11 @@ function watchForWakeUps() {
   const watchWakeFile = () => {
     const watcher = fs.watch(wakeFile, { persistent: false }, (event) => {
       holdRefreshesAfterWake();
-      check('Nuvio is back from the Home screen');
+      let wakeAt = 0;
+      try { wakeAt = Number(fs.readFileSync(wakeFile, 'utf8')) * 1000; } catch {}
+      const before = Number.isFinite(wakeAt) && wakeAt > 0 ? wakeAt : undefined;
+      if (before !== undefined) revokeSetupBefore(before);
+      check('Nuvio is back from the Home screen', before);
       if (event === 'rename') {
         // Replaced instead of written: watch the new file.
         watcher.close();
@@ -858,11 +857,12 @@ function watchForWakeUps() {
 
   setInterval(() => {
     const now = Date.now();
-    const asleep = now - lastTick;
+    const previousTick = lastTick;
+    const asleep = now - previousTick;
     lastTick = now;
     if (asleep > 2500) {
       holdRefreshesAfterWake();
-      check(`back after ${Math.round(asleep / 1000)} s asleep`);
+      check(`back after ${Math.round(asleep / 1000)} s asleep`, previousTick);
     } else if (!watching && now - lastCheck >= 1000) {
       check('regular check');
     }

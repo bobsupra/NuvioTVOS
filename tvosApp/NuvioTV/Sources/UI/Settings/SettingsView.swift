@@ -518,6 +518,8 @@ enum SettingsKey {
     static let aiCatalogAnimeSeries = "nuvio.tv.settings.integrations.aiCatalogAnimeSeries"
     static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     static let useNuvioRail = "nuvio.tv.settings.layout.useNuvioRail"
+    /// Settings → Appearance → Sidebar → Press Back Twice to Exit.
+    static let doubleBackToExit = "nuvio.tv.settings.layout.doubleBackToExit"
     static let continueWatchingPerishAnimation = "nuvio.tv.settings.appearance.continueWatchingPerishAnimation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
@@ -733,7 +735,7 @@ enum SettingsKey {
     static let sceneTabDisabled = "nuvio.tv.settings.playback.sceneTabDisabled"
     static let seekPreviewEnabled = "nuvio.tv.settings.playback.seekPreviewEnabled"
     static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
-    /// Seekr (seekr.tv) API key for seek previews; kept in the Nuvio account like the other settings.
+    /// Seekr (seekr.tv) API key for seek previews; stored in this profile's Keychain.
     static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
     /// Whether Seekr is asked at all (on by default); the key stays saved while it is off.
     static let seekrEnabled = "nuvio.tv.settings.playback.seekrEnabled"
@@ -769,11 +771,26 @@ enum SettingsKey {
     /// and never enter the account settings payload.
     static let deviceLocal = Set([
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
+        tmdbApiKey, mdbListApiKey, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken, seekrApiKey,
+        simklAccessToken, simklRefreshToken, wetrakrAccessToken, wetrakrRefreshToken,
         p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage,
         // The account payload of other devices has no value for it, and a
         // pull would switch the sidebar off again.
         useNuvioRail, continueWatchingPerishAnimation,
+        // How Back leaves the app belongs to this Apple TV. The other apps
+        // have no such setting.
+        doubleBackToExit,
         aniListClientID, malClientID
+    ])
+
+    /// Synced through the dedicated `addons` table and `sync_push_addons` RPC,
+    /// never through the generic `tvos_settings` blob or iCloud KVS. Keeping
+    /// them out of generic settings sync prevents a stale or empty settings blob
+    /// or iCloud payload from overwriting a profile's installed add-ons.
+    static let syncedViaAddonRPC = Set([
+        streamAddonManifestURL,
+        streamAddonManifestURLs,
+        streamAddonManifestStates
     ])
 
     static let all = [
@@ -3342,7 +3359,11 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.doubleBackToExit) private var doubleBackToExit = false
     @AppStorage(SettingsKey.continueWatchingPerishAnimation) private var continueWatchingPerishAnimation = false
+    // Kept on this Apple TV, outside profiles and sync (`NuvioBranding`).
+    @AppStorage(NuvioBranding.key, store: .standard) private var nuvioBranding = false
+    @AppStorage(NuvioBranding.appIconKey, store: .standard) private var appIcon = NuvioAppIcon.original.rawValue
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
@@ -3471,6 +3492,18 @@ private struct AppearanceSettingsView: View {
                     accentColor: accentColor
                 )
                 .settingsLeaf(.lay, section: "Navigation Bar")
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_double_back_to_exit", fallback: "Press Back Twice to Exit"),
+                    subtitle: L10n.string(
+                        "tvos_settings_double_back_to_exit_subtitle",
+                        fallback: "When Back would leave Nuvio, the first press shows a reminder. Press Back again within 3 seconds to leave."
+                    ),
+                    isOn: $doubleBackToExit,
+                    accentColor: accentColor
+                )
+                .opacity(useTopNavigation ? 0.46 : 1)
+                .disabled(useTopNavigation)
+                .settingsLeaf(.lay, section: "Navigation Bar")
             }
             .settingsPlaces([SettingsPlace(.lay, "Navigation Bar")])
 
@@ -3503,6 +3536,34 @@ private struct AppearanceSettingsView: View {
                     isOn: $continueWatchingPerishAnimation,
                     accentColor: accentColor
                 )
+                .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_nuvio_branding", fallback: "Nuvio Branding"),
+                    subtitle: L10n.string(
+                        "tvos_settings_nuvio_branding_subtitle",
+                        fallback: "The Nuvio app icon, launch banner, sign-in screen and profile loading screen, as on Android TV. Kept on this Apple TV."
+                    ),
+                    isOn: $nuvioBranding,
+                    accentColor: accentColor
+                )
+                .onChange(of: nuvioBranding) { _, _ in NuvioBranding.applyIcon() }
+                .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
+
+                SettingsAppIconRow(
+                    selection: $appIcon,
+                    accentColor: accentColor,
+                    title: L10n.string("tvos_settings_app_icon", fallback: "App Icon"),
+                    subtitle: nuvioBranding
+                        ? (NuvioAppIcon(rawValue: appIcon) ?? .original).label
+                        : L10n.string(
+                            "tvos_settings_app_icon_branding_off",
+                            fallback: "Turn on Nuvio Branding to use one of the Nuvio icons"
+                        )
+                )
+                .disabled(!nuvioBranding)
+                .opacity(nuvioBranding ? 1 : 0.46)
+                .onChange(of: appIcon) { _, _ in NuvioBranding.applyIcon() }
                 .settingsLeaf(.app, section: "NUVIO ANDROID TV STYLING")
             }
             .settingsPlaces([SettingsPlace(.app, "NUVIO ANDROID TV STYLING")])
@@ -4628,7 +4689,7 @@ private struct StreamListStyleEditor: View {
 
         SettingsToggleRow(
             title: L10n.string("tvos_settings_nuvio_badges", fallback: "Nuvio Badges"),
-            subtitle: L10n.string("tvos_settings_nuvio_badges_subtitle", fallback: "Draw quality badges with the official Dolby, DTS and HDR10+ marks instead of the badge pack's images"),
+            subtitle: L10n.string("tvos_settings_nuvio_badges_subtitle", fallback: "Draw quality badges with the official Dolby, DTS, HDR10+ and Blu-ray marks and streaming service logos instead of the badge pack's images"),
             isOn: Binding(
                 get: { nuvioBadges },
                 set: { newValue in
@@ -6269,17 +6330,17 @@ private struct IntegrationSettingsView: View {
     @State private var wetrakrClientIDDraft: String
     @State private var wetrakrClientSecretDraft: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
-    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
+    @State private var tmdbApiKey = ""
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
-    @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
+    @State private var mdbListApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
-    @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
+    @State private var debridApiKey = ""
     @AppStorage(SettingsKey.debridEnabled) private var debridEnabled = true
     @AppStorage(SettingsKey.cloudLibraryEnabled) private var cloudLibraryEnabled = true
     @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
-    @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
-    @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
-    @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
+    @State private var torboxAccessToken = ""
+    @State private var premiumizeAccessToken = ""
+    @State private var realDebridAccessToken = ""
     @AppStorage(SettingsKey.aiSubtitlesEnabled) private var aiSubtitlesEnabled = false
     @AppStorage private var p2pEnabled: Bool
     @AppStorage private var p2pConsentAccepted: Bool
@@ -6917,6 +6978,7 @@ private struct IntegrationSettingsView: View {
             .settingsLeaf(.servers, section: nil)
         }
         .onAppear {
+            refreshDebridCredentials()
             refreshAddonSummaryCount()
             RemoteTrackingState.normalizeWatchProgressSource()
             RemoteTrackingState.normalizeLibrarySource()
@@ -6928,6 +6990,12 @@ private struct IntegrationSettingsView: View {
             mdbListViewModel.reload()
             wetrakrViewModel.reload()
             wetrakrViewModel.loadConnectedData()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshDebridCredentials()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshDebridCredentials()
         }
         .alert(
             L10n.string("tvos_settings_p2p_consent_title", fallback: "P2P Torrent Streaming"),
@@ -6946,15 +7014,7 @@ private struct IntegrationSettingsView: View {
                 fallback: "P2P connects directly to other peers. Your public IP address may be visible to them, and your device may upload data. Enable this only for content you have the legal right to access."
             ))
         }
-        .onChange(of: tmdbApiKey) { _, _ in
-            if !tmdbHasApiKey {
-                tmdbEnabled = false
-            }
-        }
         .onChange(of: mdbListApiKey) { _, _ in
-            if !mdbListHasCredential {
-                mdbListEnabled = false
-            }
             RemoteTrackingState.normalizeWatchProgressSource()
             RemoteTrackingState.normalizeLibrarySource()
         }
@@ -7072,6 +7132,7 @@ private struct IntegrationSettingsView: View {
             ) {
                 AddonsSettingsSection(accentColor: accentColor, onSyncedAddonsChange: receiveSyncedAddonSummary)
             }
+            .defaultAppStorage(profileStore)
             .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .fullScreenCover(isPresented: $showingPluginsSettings, onDismiss: {
@@ -7211,10 +7272,13 @@ private struct IntegrationSettingsView: View {
 
     private func refreshDebridCredentials() {
         let store = ProfileSettings.current
-        torboxAccessToken = store.string(forKey: SettingsKey.torboxAccessToken) ?? ""
-        premiumizeAccessToken = store.string(forKey: SettingsKey.premiumizeAccessToken) ?? ""
-        realDebridAccessToken = store.string(forKey: SettingsKey.realDebridAccessToken) ?? ""
-        debridApiKey = store.string(forKey: SettingsKey.debridApiKey) ?? ""
+        let profileScope = ProfileSettings.activeProfileScope
+        tmdbApiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store, profileScope: profileScope) ?? ""
+        mdbListApiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store, profileScope: profileScope) ?? ""
+        torboxAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.torboxAccessToken, in: store, profileScope: profileScope) ?? ""
+        premiumizeAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.premiumizeAccessToken, in: store, profileScope: profileScope) ?? ""
+        realDebridAccessToken = ProviderCredentialStore.string(forKey: SettingsKey.realDebridAccessToken, in: store, profileScope: profileScope) ?? ""
+        debridApiKey = ProviderCredentialStore.string(forKey: SettingsKey.debridApiKey, in: store, profileScope: profileScope) ?? ""
         debridProvider = store.string(forKey: SettingsKey.debridProvider) ?? "None"
     }
 
@@ -9025,7 +9089,7 @@ private struct TmdbOptionsSheet: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
-    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
+    @State private var tmdbApiKey = ""
     @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
     @AppStorage(SettingsKey.tmdbFollowAppLanguage) private var tmdbFollowAppLanguage = true
     @AppStorage(SettingsKey.tmdbUseTrailers) private var tmdbUseTrailers = true
@@ -9238,11 +9302,9 @@ private struct TmdbOptionsSheet: View {
             }
             .focusSection()
         }
-        .onAppear(perform: normalizeTmdbApiKey)
-        .onChange(of: tmdbApiKey) { _, _ in
-            if !tmdbHasApiKey {
-                tmdbEnabled = false
-            }
+        .onAppear(perform: loadTmdbApiKey)
+        .onReceive(NotificationCenter.default.publisher(for: ProviderCredentialStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            loadTmdbApiKey()
         }
         .onExitCommand { dismiss() }
     }
@@ -9263,10 +9325,34 @@ private struct TmdbOptionsSheet: View {
     }
 
     private func normalizeTmdbApiKey() {
-        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tmdbHasApiKey {
+        let normalized = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let store = ProfileSettings.current
+        let profileScope = ProfileSettings.activeProfileScope
+        guard ProviderCredentialStore.set(
+            normalized.isEmpty ? nil : normalized,
+            forKey: SettingsKey.tmdbApiKey,
+            in: store,
+            profileScope: profileScope
+        ) else {
+            tmdbApiKey = ProviderCredentialStore.string(
+                forKey: SettingsKey.tmdbApiKey,
+                in: store,
+                profileScope: profileScope
+            ) ?? ""
+            return
+        }
+        tmdbApiKey = normalized
+        if normalized.isEmpty {
             tmdbEnabled = false
         }
+    }
+
+    private func loadTmdbApiKey() {
+        tmdbApiKey = ProviderCredentialStore.string(
+            forKey: SettingsKey.tmdbApiKey,
+            in: ProfileSettings.current,
+            profileScope: ProfileSettings.activeProfileScope
+        ) ?? ""
     }
 
     private var tmdbLanguageSelection: Binding<String> {
@@ -9359,7 +9445,7 @@ private struct MdbListOptionsSheet: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
-    @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
+    @State private var mdbListApiKey = ""
     @AppStorage(SettingsKey.mdbListUseImdb) private var mdbListUseImdb = true
     @AppStorage(SettingsKey.mdbListUseTmdb) private var mdbListUseTmdb = true
     @AppStorage(SettingsKey.mdbListUseTomatoes) private var mdbListUseTomatoes = true
@@ -9476,17 +9562,17 @@ private struct MdbListOptionsSheet: View {
             .focusSection()
         }
         .onAppear {
-            normalizeMdbListApiKey()
+            loadMdbListApiKey()
             buildRatingProviderRows()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: ProviderCredentialStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            loadMdbListApiKey()
         }
         .task {
             addonRatingSources = await AddonRatingsService.availableRatingSources()
             buildRatingProviderRows()
         }
         .onChange(of: mdbListApiKey) { _, _ in
-            if !mdbListHasCredential {
-                mdbListEnabled = false
-            }
             buildRatingProviderRows()
         }
         .onChange(of: mdbListEnabled) { _, _ in
@@ -9608,10 +9694,34 @@ private struct MdbListOptionsSheet: View {
     }
 
     private func normalizeMdbListApiKey() {
-        mdbListApiKey = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let store = ProfileSettings.current
+        let profileScope = ProfileSettings.activeProfileScope
+        guard ProviderCredentialStore.set(
+            normalized.isEmpty ? nil : normalized,
+            forKey: SettingsKey.mdbListApiKey,
+            in: store,
+            profileScope: profileScope
+        ) else {
+            mdbListApiKey = ProviderCredentialStore.string(
+                forKey: SettingsKey.mdbListApiKey,
+                in: store,
+                profileScope: profileScope
+            ) ?? ""
+            return
+        }
+        mdbListApiKey = normalized
         if !mdbListHasCredential {
             mdbListEnabled = false
         }
+    }
+
+    private func loadMdbListApiKey() {
+        mdbListApiKey = ProviderCredentialStore.string(
+            forKey: SettingsKey.mdbListApiKey,
+            in: ProfileSettings.current,
+            profileScope: ProfileSettings.activeProfileScope
+        ) ?? ""
     }
 }
 
@@ -10523,7 +10633,11 @@ private struct PremiumizeApiKeySheet: View {
                 return
             }
 
-            DebridCredentials.save(key, for: .premiumize, store: ProfileSettings.current)
+            guard DebridCredentials.save(key, for: .premiumize, store: ProfileSettings.current) else {
+                validationFailed = true
+                statusMessage = "This Apple TV could not save the key securely."
+                return
+            }
             validationFailed = false
             statusMessage = "Premiumize connected."
             dismiss()
@@ -12959,7 +13073,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
-    @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
+    @State private var seekrApiKey = ""
     @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = false
     @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
     @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
@@ -13003,6 +13117,11 @@ private struct PlaybackSettingsView: View {
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
     private let externalPlayers = ExternalPlayer.settingsOptions
+    /// Players whose app is not on this Apple TV. The External Player row
+    /// skips them.
+    private var uninstalledExternalPlayers: Set<String> {
+        Set(ExternalPlayer.allCases.filter { !$0.isInstalled }.map(\.rawValue))
+    }
     private let frameRateModes = ["Off", "On start/stop", "Always"]
     /// Buffer profiles: Auto scales to RAM; Conservative/Large match product names;
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
@@ -13037,7 +13156,22 @@ private struct PlaybackSettingsView: View {
 
     private func commitSeekrApiKey() {
         let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if key != seekrApiKey { seekrApiKey = key }
+        let store = ProfileSettings.current
+        let profileScope = ProfileSettings.activeProfileScope
+        if ProviderCredentialStore.set(
+            key.isEmpty ? nil : key,
+            forKey: SettingsKey.seekrApiKey,
+            in: store,
+            profileScope: profileScope
+        ) {
+            seekrApiKey = key
+        } else {
+            seekrApiKey = ProviderCredentialStore.string(
+                forKey: SettingsKey.seekrApiKey,
+                in: store,
+                profileScope: profileScope
+            ) ?? ""
+        }
         checkSeekrApiKey()
     }
 
@@ -13123,6 +13257,7 @@ private struct PlaybackSettingsView: View {
                     ),
                     selection: $externalPlayer,
                     options: externalPlayers,
+                    disabledOptions: uninstalledExternalPlayers,
                     accentColor: accentColor
                 )
                 .settingsLeaf(.pbPlayer, section: "PLAYER")
@@ -13215,8 +13350,8 @@ private struct PlaybackSettingsView: View {
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
                     subtitle: L10n.string(
-                        "tvos_settings_seekr_api_key_subtitle",
-                        fallback: "Get your API key at seekr.tv/join. Saved in your Nuvio account."
+                        "tvos_settings_seekr_api_key_local_subtitle",
+                        fallback: "Get your API key at seekr.tv/join. Stored on this Apple TV."
                     ),
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                     text: $seekrApiKey,
@@ -13227,7 +13362,26 @@ private struct PlaybackSettingsView: View {
                 )
                 .disabled(!seekPreviewEnabled)
                 .onAppear {
+                    seekrApiKey = ProviderCredentialStore.string(
+                        forKey: SettingsKey.seekrApiKey,
+                        in: ProfileSettings.current,
+                        profileScope: ProfileSettings.activeProfileScope
+                    ) ?? ""
                     if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
+                }
+                .onReceive(NotificationCenter.default.publisher(for: ProviderCredentialStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                    seekrApiKey = ProviderCredentialStore.string(
+                        forKey: SettingsKey.seekrApiKey,
+                        in: ProfileSettings.current,
+                        profileScope: ProfileSettings.activeProfileScope
+                    ) ?? ""
+                }
+                .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.activeProfileChangedNotification).receive(on: RunLoop.main)) { _ in
+                    seekrApiKey = ProviderCredentialStore.string(
+                        forKey: SettingsKey.seekrApiKey,
+                        in: ProfileSettings.current,
+                        profileScope: ProfileSettings.activeProfileScope
+                    ) ?? ""
                 }
                 .onChange(of: seekrApiKey) { _, _ in
                     checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
@@ -14091,7 +14245,7 @@ private struct AudioVideoProcessingSettingsSection: View {
                     title: L10n.string("tvos_settings_upscale_scaler", fallback: "Upscaling Mode"),
                     subtitle: L10n.string(
                         "tvos_settings_upscale_scaler_subtitle",
-                        fallback: "AetherEngine only. Auto automatically applies Anime4K to animation and MetalFX to movies & TV shows. You can also force a specific engine or turn upscaling off."
+                        fallback: "AetherEngine only. Auto applies Anime4K to animation, MetalFX below 1080p, and Lanczos-3 for 1080p SDR movies & TV shows. You can also force a specific engine or turn upscaling off."
                     ),
                     selection: Binding(
                         get: {
@@ -15633,6 +15787,13 @@ private struct AdvancedSettingsView: View {
                 )
                 .settingsLeaf(.adv, section: "DIAGNOSTICS")
 
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_addon_sync", fallback: "Add-on Sync"),
+                    value: NuvioSyncManager.addonSyncDiagnostic,
+                    isDiagnostic: true
+                )
+                .settingsLeaf(.adv, section: "DIAGNOSTICS")
+
                 // Reports how many synced rows arrived versus how many could be
                 // rendered. A large "awaiting metadata" count means add-ons could
                 // not resolve those titles — the history itself is still stored.
@@ -15739,7 +15900,14 @@ private struct AdvancedSettingsView: View {
         let defaults = ProfileSettings.current
         PlaybackTimelineRecorder.setEnabled(false)
         defaults.removeObject(forKey: PlaybackTimelineRecorder.enabledKey)
-        SettingsKey.all.forEach { defaults.removeObject(forKey: $0) }
+        _ = ProviderCredentialStore.removeAll(in: defaults, profileScope: ProfileSettings.activeProfileScope)
+        ProviderCredentialStore.keys.forEach { defaults.removeObject(forKey: $0) }
+        SettingsKey.all
+            .filter {
+                !SettingsKey.syncedViaAddonRPC.contains($0)
+                    && !ProviderCredentialStore.keys.contains($0)
+            }
+            .forEach { defaults.removeObject(forKey: $0) }
         ProfileSettings.resetTrailerSoundPreference(in: defaults)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
@@ -16154,7 +16322,7 @@ private struct LicensesAttributionsSheet: View {
         LicenseEntry(
             id: "stream-badge-marks",
             title: "Stream badge marks",
-            body: "The Dolby, DTS and HDR10+ marks on Nuvio Badges, from Wikimedia Commons. The DTS:X mark is by CinemaLover24680, changed to a single color. All marks are trademarks of their owners and only name the format a stream has.",
+            body: "The Dolby, DTS, HDR10+ and Blu-ray Disc marks and the streaming service logos on Nuvio Badges, from Wikimedia Commons. The DTS:X mark is by CinemaLover24680, changed to a single color. The 4K Ultra HD and HEVC marks are drawn for the app. All marks are trademarks of their owners and only name a stream's format or the service it came from.",
             license: "CC BY-SA 4.0 (DTS:X), public domain (others)"
         )
     ]
@@ -18282,6 +18450,7 @@ private struct AddonsSettingsSection: View {
     @State private var renamingText = ""
     @State private var addons: [AddonItem] = AddonsSettingsSection.initialLocalAddons()
     @State private var syncedAddons: [SyncedAddon] = []
+    @State private var syncRefreshGeneration: UInt = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
@@ -18400,8 +18569,11 @@ private struct AddonsSettingsSection: View {
                 addonsSignature: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates
             )
         }
-        .task(id: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates) {
+        .task(id: "\(syncRefreshGeneration)\n\(streamAddonManifestURL)\n\(streamAddonManifestURLs)\n\(streamAddonManifestStates)") {
             await loadSyncedAddons()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification).receive(on: RunLoop.main)) { _ in
+            syncRefreshGeneration &+= 1
         }
     }
 
@@ -20382,6 +20554,55 @@ private struct DetailsSectionOrderRow: View {
 
 // MARK: - Collections manager
 
+enum LocalCollectionsExportFile {
+    static let fileName = "nuvio-collections.json"
+
+    static func primaryURL(fileManager: FileManager = .default, cachesDirectory: URL? = nil) -> URL {
+        let directory = cachesDirectory ?? fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? fileManager.temporaryDirectory
+        return directory.appendingPathComponent(fileName)
+    }
+
+    static func legacyDocumentsURL(fileManager: FileManager = .default, documentsDirectory: URL? = nil) -> URL? {
+        (documentsDirectory ?? fileManager.urls(for: .documentDirectory, in: .userDomainMask).first)?
+            .appendingPathComponent(fileName)
+    }
+
+    static func write(_ data: Data, fileManager: FileManager = .default, cachesDirectory: URL? = nil) throws {
+        let url = primaryURL(fileManager: fileManager, cachesDirectory: cachesDirectory)
+        try fileManager.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: url, options: .atomic)
+    }
+
+    static func read(fileManager: FileManager = .default, cachesDirectory: URL? = nil, documentsDirectory: URL? = nil) throws -> Data {
+        let primary = primaryURL(fileManager: fileManager, cachesDirectory: cachesDirectory)
+        do {
+            return try Data(contentsOf: primary)
+        } catch {
+            let nsError = error as NSError
+            guard nsError.domain == NSCocoaErrorDomain,
+                  nsError.code == CocoaError.fileReadNoSuchFile.rawValue,
+                  let legacy = legacyDocumentsURL(fileManager: fileManager, documentsDirectory: documentsDirectory) else {
+                throw error
+            }
+            return try Data(contentsOf: legacy)
+        }
+    }
+
+    static func parse(_ data: Data) -> [[String: Any]]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        if let rows = object as? [[String: Any]] {
+            return rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) ? rows : nil
+        }
+        if let wrapped = object as? [String: Any],
+           let rows = wrapped["collections"] as? [[String: Any]],
+           rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) {
+            return rows
+        }
+        return nil
+    }
+}
+
 /// Settings → Layout → Collections: Android-style Export / Import / New entry
 /// points, liquid-glass panels, and a full create/edit form. Edits mutate the
 /// raw synced JSON so Android-only fields survive the round-trip.
@@ -20541,19 +20762,12 @@ private struct CollectionsSettingsSection: View {
         }
         // tvOS has no general pasteboard/share sheet for arbitrary files in this
         // context — write a stable JSON export the Import flow can re-load.
-        let url = Self.collectionsExportURL
         do {
-            try data.write(to: url, options: .atomic)
-            showToast("Exported to Documents/nuvio-collections.json")
+            try LocalCollectionsExportFile.write(data)
+            showToast("Exported on this Apple TV")
         } catch {
             showToast("Export failed: \(error.localizedDescription)")
         }
-    }
-
-    static var collectionsExportURL: URL {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        return documents.appendingPathComponent("nuvio-collections.json")
     }
 
     private func importCollections(_ imported: [[String: Any]]) {
@@ -21116,7 +21330,7 @@ private enum StreamingServicesCollectionTemplate {
 
     static func resolveLogoURLs() async -> [Int: String] {
         var resolved = fallbackLogoURLs
-        let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+        let key = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: ProfileSettings.current)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !key.isEmpty else { return resolved }
 
@@ -23000,7 +23214,7 @@ private struct ImportCollectionsSheet: View {
                     switch mode {
                     case .file:
                         VStack(alignment: .leading, spacing: 14) {
-                            Text(L10n.string("tvos_settings_looks_for_documents_nuvio_collections_js_6c13671b", fallback: "Looks for Documents/nuvio-collections.json — the file written by Export on this Apple TV."))
+                            Text(L10n.string("tvos_settings_looks_for_export_on_this_apple_tv", fallback: "Looks for the collections export saved on this Apple TV."))
                                 .font(.system(size: 18, weight: .medium))
                                 .foregroundColor(.white.opacity(0.55))
                                 .fixedSize(horizontal: false, vertical: true)
@@ -23093,16 +23307,10 @@ private struct ImportCollectionsSheet: View {
     }
 
     private func loadLocalExport() {
-        let url = CollectionsSettingsSection.collectionsExportURL
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            loadedRows = nil
-            statusNote = "No export file found yet. Use Export first, or switch to From URL."
-            errorMessage = nil
-            return
-        }
+        statusNote = nil
         do {
-            let data = try Data(contentsOf: url)
-            guard let rows = parseCollections(data: data) else {
+            let data = try LocalCollectionsExportFile.read()
+            guard let rows = LocalCollectionsExportFile.parse(data) else {
                 loadedRows = nil
                 errorMessage = "Export file is not valid collections JSON"
                 return
@@ -23112,7 +23320,13 @@ private struct ImportCollectionsSheet: View {
             errorMessage = nil
         } catch {
             loadedRows = nil
-            errorMessage = error.localizedDescription
+            let nsError = error as NSError
+            if nsError.domain == NSCocoaErrorDomain && nsError.code == CocoaError.fileReadNoSuchFile.rawValue {
+                statusNote = "No export file found yet. Use Export first, or switch to From URL."
+                errorMessage = nil
+            } else {
+                errorMessage = error.localizedDescription
+            }
         }
     }
 
@@ -23131,7 +23345,7 @@ private struct ImportCollectionsSheet: View {
                 errorMessage = "HTTP \(http.statusCode)"
                 return
             }
-            guard let rows = parseCollections(data: data) else {
+            guard let rows = LocalCollectionsExportFile.parse(data) else {
                 errorMessage = "URL did not return valid collections JSON"
                 loadedRows = nil
                 return
@@ -23144,18 +23358,6 @@ private struct ImportCollectionsSheet: View {
         }
     }
 
-    private func parseCollections(data: Data) -> [[String: Any]]? {
-        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
-        if let rows = object as? [[String: Any]] {
-            return rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) ? rows : nil
-        }
-        if let wrapped = object as? [String: Any],
-           let rows = wrapped["collections"] as? [[String: Any]],
-           rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) {
-            return rows
-        }
-        return nil
-    }
 }
 
 private struct CollectionCatalogPickerSheet: View {
@@ -24399,6 +24601,9 @@ private struct SettingsOptionRow: View {
     let subtitle: String
     @Binding var selection: String
     let options: [String]
+    /// Options that can't be picked, such as players not installed on this
+    /// Apple TV. Clicking the row skips them.
+    var disabledOptions: Set<String> = []
     let accentColor: Color
     var optionLabel: (String) -> String = { L10n.optionLabel($0) }
 
@@ -24438,7 +24643,14 @@ private struct SettingsOptionRow: View {
     private func selectNext() {
         guard !options.isEmpty else { return }
         let currentIndex = options.firstIndex(of: currentStored) ?? 0
-        selection = options[(currentIndex + 1) % options.count]
+        // The next option that can be picked, wrapping around the list.
+        for step in 1...options.count {
+            let option = options[(currentIndex + step) % options.count]
+            if !disabledOptions.contains(option) {
+                selection = option
+                return
+            }
+        }
     }
 }
 
@@ -24902,6 +25114,99 @@ private struct SettingsSwatchRow: View {
             Spacer()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// The App Icon choices as a row of icon tiles, drawn like the theme swatches.
+private struct SettingsAppIconRow: View {
+    @Binding var selection: String
+    let accentColor: Color
+    let title: String
+    let subtitle: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            SettingsRowText(title: title, subtitle: subtitle)
+            HStack(spacing: 22) {
+                ForEach(NuvioAppIcon.allCases) { icon in
+                    SettingsAppIconButton(
+                        icon: icon,
+                        isSelected: selection == icon.rawValue,
+                        accentColor: accentColor
+                    ) {
+                        selection = icon.rawValue
+                    }
+                }
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.07))
+                .frame(height: 1)
+                .padding(.horizontal, 20)
+        }
+    }
+}
+
+private struct SettingsAppIconButton: View {
+    let icon: NuvioAppIcon
+    let isSelected: Bool
+    let accentColor: Color
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            VStack(spacing: 10) {
+                Image(icon.previewImageName)
+                    .resizable()
+                    .scaledToFit()
+                    .padding(12)
+                    .frame(width: 84, height: 84)
+                    .background(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .fill(Color.black)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .strokeBorder(Color.white.opacity(0.16), lineWidth: 1)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 22, style: .continuous)
+                            .strokeBorder(ringColor, lineWidth: isFocused ? AppFocusOutline.width : (isSelected ? 4 : 0))
+                            .padding(-4)
+                    )
+                    .overlay(alignment: .topTrailing) {
+                        if isSelected {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 22, weight: .bold))
+                                .foregroundStyle(.black, .white)
+                                .offset(x: 8, y: -8)
+                        }
+                    }
+
+                Text(icon.label)
+                    .font(.system(size: 14, weight: .bold))
+                    .foregroundColor(.white.opacity(isFocused || isSelected ? 1 : 0.65))
+                    .lineLimit(1)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.12 : 1.0)
+        .zIndex(isFocused ? 1 : 0)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+    }
+
+    private var ringColor: Color {
+        if isFocused { return AppFocusOutline.color }
+        return isSelected ? accentColor : .clear
     }
 }
 
@@ -25652,6 +25957,7 @@ private struct AIOStreamsHostSheet: View {
     let accentColor: Color
 
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.scenePhase) private var scenePhase
     @ObservedObject private var aio = AIOStreamsHost.shared
     @State private var sourceDraft = ""
 
@@ -25867,9 +26173,16 @@ private struct AIOStreamsHostSheet: View {
         }
         .onAppear {
             aio.setLogVisible(true)
+            aio.setConfigurationSheetVisible(true)
             sourceDraft = aio.source
         }
-        .onDisappear { aio.setLogVisible(false) }
+        .onDisappear {
+            aio.setLogVisible(false)
+            aio.setConfigurationSheetVisible(false)
+        }
+        .onChange(of: scenePhase) { _, phase in
+            aio.configurationSheetSceneChanged(isActive: phase == .active)
+        }
     }
 
     private func logLine(_ line: String) -> some View {
@@ -25895,7 +26208,7 @@ private struct AIOStreamsHostSheet: View {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Color.white.opacity(0.08))
                 .frame(width: 244, height: 244)
-                .overlay(ProgressView().opacity(aio.phase == .starting ? 1 : 0))
+                .overlay(ProgressView().opacity(aio.phase == .starting || aio.phase == .running ? 1 : 0))
         }
     }
 

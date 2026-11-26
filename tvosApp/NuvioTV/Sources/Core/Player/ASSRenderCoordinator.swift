@@ -57,6 +57,7 @@ final class ASSRenderCoordinator {
     private var lastSnapshotRendererGeneration: Int?
     private var lastSnapshotRendererID: ObjectIdentifier?
     private var loadedDialogueTimeline: [(start: Double, end: Double, identity: String)] = []
+    private var installedFontKeys = Set<String>()
 
     private struct OfferKey: Hashable {
         let id: Int
@@ -102,20 +103,20 @@ final class ASSRenderCoordinator {
 
         generation += 1
         let currentGeneration = generation
-        let fonts = player.fontAttachments
         let fontsDirectory = Self.fontsDirectory(itemID: itemID)
         builder = ASSScriptBuilder(header: header)
+        installedFontKeys.removeAll(keepingCapacity: false)
 
-        if Self.allFontsPresent(fonts, in: fontsDirectory) {
-            installRenderer(at: fontsDirectory, fonts: fonts)
-            Self.registerFontsAsync(fonts: fonts, in: fontsDirectory)
-        } else {
-            Task.detached(priority: .userInitiated) { [weak self] in
-                Self.write(fonts, to: fontsDirectory)
-                Self.registerFontsAsync(fonts: fonts, in: fontsDirectory)
-                await self?.installRendererIfCurrent(currentGeneration, at: fontsDirectory, fonts: fonts)
+        applyFontAttachments(player.fontAttachments, in: fontsDirectory, generation: currentGeneration)
+
+        player.$fontAttachments
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] fonts in
+                guard let self, self.generation == currentGeneration, !fonts.isEmpty else { return }
+                self.applyFontAttachments(fonts, in: fontsDirectory, generation: currentGeneration)
             }
-        }
+            .store(in: &cancellables)
 
         player.$subtitleCues
             .receive(on: DispatchQueue.main)
@@ -177,10 +178,42 @@ final class ASSRenderCoordinator {
         reloadInFlightRevision = nil
         requiredReloadPasses = 0
         loadedDialogueTimeline.removeAll(keepingCapacity: false)
+        installedFontKeys.removeAll(keepingCapacity: false)
         resetSnapshotCache()
     }
 
+    private func applyFontAttachments(_ fonts: [FontAttachment], in directory: URL, generation currentGeneration: Int) {
+        let keys = Set(fonts.map(\.filename))
+        if renderer != nil && keys == installedFontKeys { return }
+        installedFontKeys = keys
+
+        if Self.allFontsPresent(fonts, in: directory) {
+            installRenderer(at: directory, fonts: fonts)
+            Self.registerFontsAsync(fonts: fonts, in: directory)
+        } else {
+            Task.detached(priority: .userInitiated) { [weak self] in
+                Self.write(fonts, to: directory)
+                Self.registerFontsAsync(fonts: fonts, in: directory)
+                await self?.installRendererIfCurrent(currentGeneration, at: directory, fonts: fonts)
+            }
+        }
+    }
+
     private func installRenderer(at directory: URL, fonts: [FontAttachment]) {
+        if renderer != nil {
+            scheduledReload?.cancel()
+            scheduledReload = nil
+            scheduledReloadDeadline = nil
+            reloadInFlightRevision = nil
+            requiredReloadPasses = 0
+            isRendering = false
+            pendingRender = nil
+            resetSnapshotCache()
+            if !offered.isEmpty {
+                hasLoadedInitialTrack = false
+                pendingReload = true
+            }
+        }
         let renderer = AssSubtitlesRenderer(
             fontConfig: FontConfig(fontsPath: directory, fontProvider: .coreText),
             librarySetup: { library in

@@ -71,14 +71,44 @@ final class SpatialAudioSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.lowResUpscaling))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.upscaleScaler))
 
-        // Off turns off lowResUpscaling
-        let upscaleChoice = "off"
-        let isEnabled = upscaleChoice != "off"
-        XCTAssertFalse(isEnabled)
+        let autoMovie = AetherPlaybackController.resolvedUpscaleConfiguration(
+            choice: "smart", lowResEnabled: true, isAnime: false
+        )
+        XCTAssertTrue(autoMovie.upscalesLowResolutionVideo)
+        XCTAssertEqual(autoMovie.scaler, .automatic)
+        XCTAssertTrue(autoMovie.upscalesFullHDVideo)
 
-        // Other choices turn it on
-        for choice in ["smart", "lineArt", "automatic"] {
-            XCTAssertTrue(choice != "off")
-        }
+        let autoAnime = AetherPlaybackController.resolvedUpscaleConfiguration(
+            choice: "smart", lowResEnabled: true, isAnime: true
+        )
+        XCTAssertTrue(autoAnime.upscalesLowResolutionVideo)
+        XCTAssertEqual(autoAnime.scaler, .lineArt)
+        XCTAssertTrue(autoAnime.upscalesFullHDVideo)
+
+        let metalOnly = AetherPlaybackController.resolvedUpscaleConfiguration(
+            choice: "automatic", lowResEnabled: true, isAnime: false
+        )
+        XCTAssertTrue(metalOnly.upscalesLowResolutionVideo)
+        XCTAssertEqual(metalOnly.scaler, .automatic)
+        XCTAssertFalse(metalOnly.upscalesFullHDVideo)
+
+        let animeOnly = AetherPlaybackController.resolvedUpscaleConfiguration(
+            choice: "lineArt", lowResEnabled: true, isAnime: true
+        )
+        XCTAssertTrue(animeOnly.upscalesLowResolutionVideo)
+        XCTAssertEqual(animeOnly.scaler, .lineArt)
+        XCTAssertFalse(animeOnly.upscalesFullHDVideo)
+
+        let offChoice = AetherPlaybackController.resolvedUpscaleConfiguration(
+            choice: "off", lowResEnabled: true, isAnime: false
+        )
+        XCTAssertFalse(offChoice.upscalesLowResolutionVideo)
+        XCTAssertFalse(offChoice.upscalesFullHDVideo)
+
+        let lowResDisabled = AetherPlaybackController.resolvedUpscaleConfiguration(
+            choice: "smart", lowResEnabled: false, isAnime: false
+        )
+        XCTAssertFalse(lowResDisabled.upscalesLowResolutionVideo)
+        XCTAssertFalse(lowResDisabled.upscalesFullHDVideo)
     }
 }

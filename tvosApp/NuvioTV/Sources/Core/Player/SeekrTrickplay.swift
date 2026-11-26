@@ -178,7 +178,7 @@ actor SeekrTrickplay {
 
     private static func apiKey() async -> String {
         await MainActor.run {
-            ProfileSettings.current.string(forKey: SettingsKey.seekrApiKey)?
+            ProviderCredentialStore.string(forKey: SettingsKey.seekrApiKey, in: ProfileSettings.current)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         }
     }

@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 enum PlayerStatus: Equatable {
     case idle
@@ -187,19 +190,75 @@ enum QualityOption: Identifiable, Equatable {
 /// engine. `.builtIn` plays in-app; the rest build a deep link that opens an
 /// installed tvOS app with the stream URL (and optional subtitle URLs).
 enum ExternalPlayer: String, CaseIterable, Identifiable {
+    // The built-in player first, then the apps from A to Z. This is the order
+    // of the Play with menu and of Settings > External Player. Settings store
+    // the raw value, so the order can change without touching saved choices.
     case builtIn = "Nuvio (Built-in)"
     case infuse = "Infuse"
-    case vlc = "VLC"
-    case outplayer = "Outplayer"
-    case nplayer = "nPlayer"
-    case vidhub = "VidHub"
-    case senplayer = "SenPlayer"
     case nativePlayer = "Native Player"
+    case nplayer = "nPlayer"
+    case outplayer = "Outplayer"
+    case senplayer = "SenPlayer"
+    case vidhub = "VidHub"
+    case vlc = "VLC"
 
     var id: String { rawValue }
 
     /// Every option's display label, in the order shown in Settings.
     static var settingsOptions: [String] { allCases.map(\.rawValue) }
+
+    /// The player's app icon in Images.xcassets. The built-in player shows
+    /// Nuvio's Home Screen icon.
+    var iconAssetName: String {
+        switch self {
+        case .builtIn: return "player_nuvio"
+        case .infuse: return "player_infuse"
+        case .nativePlayer: return "player_nativeplayer"
+        case .nplayer: return "player_nplayer"
+        case .outplayer: return "player_outplayer"
+        case .senplayer: return "player_senplayer"
+        case .vidhub: return "player_vidhub"
+        case .vlc: return "player_vlc"
+        }
+    }
+
+    /// A URL scheme the player's app registers, used to check whether the app
+    /// is installed. `canOpenURL` answers only for schemes listed under
+    /// LSApplicationQueriesSchemes in Info.plist. Nil for the built-in player.
+    var probeScheme: String? {
+        switch self {
+        case .builtIn: return nil
+        case .infuse: return "infuse"
+        case .nativePlayer: return "nativeplayer"
+        case .nplayer: return "nplayer-http"
+        case .outplayer: return "outplayer"
+        case .senplayer: return "senplayer"
+        case .vidhub: return "vidhub"
+        case .vlc: return "vlc"
+        }
+    }
+
+    #if canImport(UIKit)
+    /// Whether the player's app is on this Apple TV. The built-in player
+    /// always is.
+    @MainActor var isInstalled: Bool {
+        guard let scheme = probeScheme, let url = URL(string: "\(scheme)://") else { return true }
+        return UIApplication.shared.canOpenURL(url)
+    }
+
+    /// The icon for the Play with menu, faded when the player's app is not on
+    /// this Apple TV. The fade is drawn into the image, because tvOS menus
+    /// draw an item's image without its view modifiers.
+    @MainActor var menuIcon: UIImage? {
+        guard let icon = UIImage(named: iconAssetName) else { return nil }
+        guard !isInstalled else { return icon.withRenderingMode(.alwaysOriginal) }
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = icon.scale
+        return UIGraphicsImageRenderer(size: icon.size, format: format).image { _ in
+            icon.draw(at: .zero, blendMode: .normal, alpha: 0.35)
+        }.withRenderingMode(.alwaysOriginal)
+    }
+    #endif
 
     /// System SF Symbol icon name for the player option.
     var systemImage: String {
@@ -377,6 +436,28 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
         return (path as NSString).pathExtension.lowercased()
     }
 
+    /// The title an external player shows. An episode gets its season,
+    /// number and title after the show's name, as in "Severance · S2 · E3 ·
+    /// Who Is Alive?", so the player doesn't show the same name for every
+    /// episode. A movie keeps its name.
+    static func displayTitle(name: String, season: Int?, episode: Int?, episodeTitle: String?) -> String {
+        guard let season, let episode, season >= 0, episode > 0 else { return name }
+        let code = "S\(season) · E\(episode)"
+        // The episode line can already start with its code, as in "S2 · E3 · ...".
+        let title = (episodeTitle ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"^(?:S\d{1,3}\s*[·•xX:-]?\s*E\d{1,4}\s*[·•:-]?\s*)+"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isPlaceholder = title.isEmpty
+            || title.caseInsensitiveCompare(name) == .orderedSame
+            || title.range(of: #"^(?:Season|Episode)\s+\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        return isPlaceholder ? "\(name) · \(code)" : "\(name) · \(code) · \(title)"
+    }
+
     /// Builds a sanitized, scraper-friendly media filename for external players
     /// (e.g. Infuse, Outplayer, VidHub, SenPlayer) to enable accurate metadata matching (TMDb / TheTVDB)
     /// and prevent displaying raw stream hashes/tokens.
@@ -466,7 +547,8 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     }
 }
 
-/// The callback returned by Infuse after an external playback handoff.
+/// The return link an external player (Infuse, SenPlayer, Native Player)
+/// opens when its player closes after a handoff.
 struct ExternalPlaybackCallback: Equatable {
     let id: String
     let isError: Bool
@@ -504,6 +586,86 @@ struct ExternalPlaybackCallback: Equatable {
     }
 }
 
+/// What a return link says about the playback. Times are in seconds.
+struct ExternalPlaybackReport: Equatable {
+    /// How much of the video was watched, from 0 to 1.
+    let progress: Double
+    /// Where the player was when it closed.
+    let position: Double?
+    /// The video's length.
+    let duration: Double?
+    /// Whether `duration` came from the player, sent or worked out from its
+    /// position and progress, rather than from the title's listed runtime.
+    let durationIsFromPlayer: Bool
+    /// Whether the player closed where it was asked to start, so nothing
+    /// played.
+    var isAtStart = false
+}
+
+extension ExternalPlaybackCallback {
+    /// Below this, a progress rounded to four places is too coarse to work out
+    /// a duration from.
+    private static let smallestProgressForDuration = 0.01
+    /// Listed runtimes are whole minutes, and a player can report a little
+    /// past the end, so a position up to this far past the listed runtime
+    /// counts as the end.
+    private static let overrunAllowance: Double = 120
+    /// A position this close to where the player was asked to start means it
+    /// closed before anything played.
+    private static let startTolerance: Double = 2
+
+    /// Reads the link. `listedDuration` is the title's listed runtime, or the
+    /// length Plex has for a Plex stream, and `startPosition` where the player
+    /// was asked to start, in seconds.
+    ///
+    /// The players send different values. Infuse sends only `position`.
+    /// Native Player sends `position` and `progress` but no `duration`, and
+    /// its progress is position / duration to four places, so the duration is
+    /// position / progress. A listed runtime can be minutes off the real
+    /// length, so it is only the fallback.
+    func report(listedDuration: Double?, startPosition: Double?) -> ExternalPlaybackReport? {
+        let played = position.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil }
+        let sent = duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let listed = listedDuration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let isAtStart = played.map { abs($0 - (startPosition ?? 0)) <= Self.startTolerance } ?? false
+        func make(_ progress: Double, _ position: Double?, _ duration: Double?, fromPlayer: Bool) -> ExternalPlaybackReport {
+            ExternalPlaybackReport(
+                progress: progress,
+                position: position,
+                duration: duration,
+                durationIsFromPlayer: fromPlayer,
+                isAtStart: isAtStart
+            )
+        }
+
+        if let progress {
+            var fromPlayer = sent
+            if fromPlayer == nil, let played, played > 0, progress >= Self.smallestProgressForDuration {
+                fromPlayer = played / progress
+            }
+            let length = fromPlayer ?? listed
+            return make(progress, played ?? length.map { $0 * progress }, length, fromPlayer: fromPlayer != nil)
+        }
+
+        guard let played else { return nil }
+        if let sent {
+            // A player can report the end a second past the duration.
+            guard played <= sent + 1 else { return nil }
+            return make(min(played / sent, 1), min(played, sent), sent, fromPlayer: true)
+        }
+        guard let listed else { return nil }
+        if played <= listed {
+            return make(played / listed, played, listed, fromPlayer: false)
+        }
+        // Just past the listed runtime counts as played to the end, unless the
+        // player closed where it started. Further past, the listed runtime is
+        // off by more than rounding and how much is left is unknown, so
+        // nothing is recorded.
+        guard played <= listed + Self.overrunAllowance, !isAtStart else { return nil }
+        return make(1, played, played, fromPlayer: false)
+    }
+}
+
 /// Minimal durable state for one in-flight Infuse handoff. A single slot is
 /// intentional: a second handoff supersedes the first and callback IDs prevent
 /// stale callbacks from consuming the new session.
@@ -516,6 +678,8 @@ struct ExternalPlaybackSession: Codable, Equatable {
     let duration: Double?
     let profileID: String?
     var collectionContext: CollectionPlaybackContext? = nil
+    /// Where the player was asked to start, in seconds.
+    var startPosition: Double? = nil
 }
 
 enum ExternalPlaybackSessionStore {
@@ -533,7 +697,8 @@ enum ExternalPlaybackSessionStore {
             episode: session.episode,
             duration: session.duration,
             profileID: session.profileID,
-            collectionContext: session.collectionContext
+            collectionContext: session.collectionContext,
+            startPosition: session.startPosition
         )
         guard let data = try? JSONEncoder().encode(compactSession) else { return }
         defaults.set(data, forKey: key)

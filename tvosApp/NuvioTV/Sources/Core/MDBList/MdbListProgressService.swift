@@ -19,7 +19,7 @@ enum MdbListProgressService {
         if MdbListAuthStore.state(in: store, profileScope: scope, tokenStorage: tokenStorage).hasOAuthTokens {
             return true
         }
-        return !(store.string(forKey: SettingsKey.mdbListApiKey)?
+        return !(ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
     }
 
@@ -498,7 +498,18 @@ enum MdbListProgressService {
                 season: mutation.season,
                 episodes: episodes,
                 watchedAt: mutation.isWatched ? iso8601(mutation.changedAt) : nil
-            ) else { return false }
+            ) else {
+                // A write MDBList has no id for, or with no valid season or episode, can
+                // never be sent. Waiting on it held back every write queued after it, for
+                // good, so it is dropped.
+                guard WatchedStore.acknowledgeLibraryMutation(
+                    id: mutation.id,
+                    provider: .mdblist,
+                    accountID: accountID,
+                    profileId: profileId
+                ) else { return false }
+                continue
+            }
             do {
                 let response = try await service.authorizedRequest(
                     path: mutation.isWatched ? "/sync/watched" : "/sync/watched/remove",
@@ -719,6 +730,7 @@ enum MdbListProgressService {
 
         var result: [String: Any] = [:]
         let imdb = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? first)
+            ?? NuvioMeta.imdbIDAfterAddonPrefix(in: meta.id)
         if let imdb { result["imdb"] = imdb }
         if let tmdb = meta.tmdbId ?? integer(prefixed("tmdb")) { result["tmdb"] = tmdb }
         if let trakt = integer(prefixed("trakt")) { result["trakt"] = trakt }

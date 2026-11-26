@@ -27,7 +27,36 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
     /// with different positions share the store.
     private var maxCueEndSeconds: Double = 0
 
-    init() {}
+    /// AE#1052: a bitmap rendition has no tap or reader behind it. Only the OCR worker or a sidecar
+    /// fill puts cues in, and only while one of them runs on this store.
+    let fillsOnDemand: Bool
+    private var runningFills = 0
+
+    init(fillsOnDemand: Bool = false) { self.fillsOnDemand = fillsOnDemand }
+
+    func fillStarted() { lock.lock(); runningFills += 1; lock.unlock() }
+    func fillEnded() { lock.lock(); runningFills = max(0, runningFills - 1); lock.unlock() }
+
+    /// Whether a request for this store is worth holding for cues. A bitmap store nothing fills would
+    /// hold every request for the whole readiness wait and hand back nothing anyway; on tvOS that held
+    /// the loopback connection AVPlayer also loads video on, and a seek never landed.
+    var waitsForFill: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return !fillsOnDemand || runningFills > 0
+    }
+
+    /// Set once the first request found nothing filling the store, so the log says it once.
+    func noteServedWithoutFill() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if notedWithoutFill { return false }
+        notedWithoutFill = true
+        return true
+    }
+    private var notedWithoutFill = false
+
+    /// An empty segment from this store is expected rather than a lost race: a menu marker, or a
+    /// bitmap store nothing fills. The server keeps its empty-segment warning for the other case.
+    var servesEmptyByDesign: Bool { servesSilently || !waitsForFill }
 
     private static func key(start: Double, end: Double, text: String) -> String {
         let start = SourceTimestampBounds.clampedSeconds(start), end = SourceTimestampBounds.clampedSeconds(end)
@@ -68,6 +97,25 @@ final class NativeSubtitleCueStore: @unchecked Sendable {
         lock.lock(); if !finished { externalFill = .failed }; lock.unlock()
     }
     var externalFillState: ExternalFill { lock.lock(); defer { lock.unlock() }; return externalFill }
+
+    /// AE#984: set by the fill queue that owns this store's decode. A rendition request that finds the
+    /// decode still running calls it, because the engine's own select never asks for a pending one:
+    /// something else (AVKit's menu) selected the track, so its sidecar should go next.
+    var onRequestWhilePending: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return requestWhilePendingHandler }
+        set { lock.lock(); requestWhilePendingHandler = newValue; lock.unlock() }
+    }
+    private var requestWhilePendingHandler: (@Sendable () -> Void)?
+
+    /// AE#984: whether the last whole-program answer for this rendition was "not yet". AVPlayer stops
+    /// asking after enough of them, so a later select has to deselect and reselect to make it fetch.
+    func noteRefusedWhilePending() {
+        lock.lock(); refusedWhilePending = true; let handler = requestWhilePendingHandler; lock.unlock()
+        handler?()
+    }
+    func noteServed() { lock.lock(); refusedWhilePending = false; lock.unlock() }
+    var wasRefusedWhilePending: Bool { lock.lock(); defer { lock.unlock() }; return refusedWhilePending }
+    private var refusedWhilePending = false
 
     /// AE#984: what a whole-program `.vtt` request gets from this store right now.
     enum WholeProgramServe: Equatable, Sendable {

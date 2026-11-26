@@ -83,6 +83,53 @@ final class ICloudSettingsSyncTests: XCTestCase {
         XCTAssertTrue(changed.isEmpty)
     }
 
+    func testSecretOnlyCloudPayloadIsClearedWithoutLocalSettings() {
+        let key = "nuvio.icloud.profile.settings.credential-only"
+        let changed = ICloudSettingsSyncManager.payloadsToPush(
+            local: [key: [:]],
+            cloud: [key: [
+                SettingsKey.tmdbApiKey: ["api_key": "nested-key"]
+            ] as NSDictionary]
+        )
+
+        XCTAssertEqual(Set(changed.keys), [key])
+        XCTAssertTrue(changed[key]?.isEmpty == true)
+    }
+
+    func testSecretFieldsAreRemovedWhileCloudSettingsArePreserved() {
+        let key = "nuvio.icloud.profile.settings.9"
+        let changed = ICloudSettingsSyncManager.payloadsToPush(
+            local: [key: [SettingsKey.theme: "Ocean"]],
+            cloud: [key: [
+                SettingsKey.theme: "Crimson",
+                SettingsKey.language: "fr",
+                SettingsKey.mdbListApiKey: ["api_key": "old-mdblist-key"]
+            ] as NSDictionary]
+        )
+
+        let payload = try! XCTUnwrap(changed[key])
+        XCTAssertEqual(payload[SettingsKey.theme] as? String, "Ocean")
+        XCTAssertEqual(payload[SettingsKey.language] as? String, "fr")
+        XCTAssertNil(payload[SettingsKey.mdbListApiKey])
+    }
+
+    func testImportSkipsLegacyProviderCredentials() {
+        let suiteName = "ICloudSettingsCredentialTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let didChange = ICloudSettingsSyncManager.shared.applySettingsPayload(
+            [SettingsKey.tmdbApiKey: "cloud-key", SettingsKey.theme: "Ocean"],
+            to: defaults
+        )
+        let extracted = ICloudSettingsSyncManager.shared.extractSettingsPayload(from: defaults)
+
+        XCTAssertTrue(didChange)
+        XCTAssertNil(defaults.object(forKey: SettingsKey.tmdbApiKey))
+        XCTAssertEqual(defaults.string(forKey: SettingsKey.theme), "Ocean")
+        XCTAssertNil(extracted[SettingsKey.tmdbApiKey])
+    }
+
     /// iCloud returns a stored Bool as an NSNumber; it must compare equal to the local value.
     func testBoolStoredInICloudMatchesLocalBool() {
         let key = "nuvio.icloud.profile.settings.4"

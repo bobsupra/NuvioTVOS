@@ -39,6 +39,7 @@ enum ProfileSettingsSnapshot {
         for key in SettingsKey.all {
             guard key != SettingsKey.accountSyncWatchState,
                   !SettingsKey.deviceLocal.contains(key),
+                  !SettingsKey.syncedViaAddonRPC.contains(key),
                   key != SettingsKey.streamBadgeRules else { continue }
             if let value = defaults.object(forKey: key) {
                 snapshot[key] = value
@@ -185,6 +186,11 @@ final class NuvioSyncManager: ObservableObject {
     private var profileSelectionRefreshTask: Task<Void, Never>?
     private var profileSelectionRefreshGeneration: UInt = 0
     var completedInitialPullKeys: Set<String> = []
+    /// Tracks `(userId:remoteProfileId)` keys whose `pullAddons` + `applyAddons`
+    /// completed in this session. Full-replace `sync_push_addons` writes are
+    /// gated on this so an edit before the initial add-on pull lands can never
+    /// overwrite the server's add-on list with an empty or incomplete local set.
+    var completedAddonPullKeys: Set<String> = []
     /// When each account+profile last finished a pull, so a screen re-entry can
     /// tell "the user came back" from "the data is old".
     private var lastCompletedPullAt: [String: Date] = [:]
@@ -239,6 +245,10 @@ final class NuvioSyncManager: ObservableObject {
     @MainActor static private(set) weak var current: NuvioSyncManager?
 
     func attach(authManager: AuthManager, profileViewModel: ProfileViewModel) {
+        // Never attach the live app's sync manager to a signed-in account during
+        // XCTest runs, where unit tests mutate UserDefaults / ProfileSettings on
+        // the active profile in the same test-host process.
+        guard NSClassFromString("XCTestCase") == nil else { return }
         // `onAppear` may run again after SwiftUI rebuilds the root. Refresh the
         // dependencies even though notification observers only attach once.
         self.authManager = authManager
@@ -438,6 +448,7 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     private func pushHomeCatalogSettings() async {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard !isApplyingRemote else { return }
         guard let target = await currentSyncTarget(),
               let key = currentSyncKey(),
@@ -511,6 +522,7 @@ final class NuvioSyncManager: ObservableObject {
             profileSelectionRefreshGeneration &+= 1
             profileSelectionRefreshTask = nil
             completedInitialPullKeys.removeAll()
+            completedAddonPullKeys.removeAll()
             lastCompletedPullAt.removeAll()
             activePullKey = nil
             pendingResyncRequested = false
@@ -692,6 +704,7 @@ final class NuvioSyncManager: ObservableObject {
     /// what the server accepted. This intentionally does not use the delayed
     /// general snapshot queue.
     func syncProfilesAfterLocalEdit() {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard AuthConfig.isConfigured, authManager?.isAuthenticated == true else { return }
         guard let profileViewModel else { return }
         let profiles = profileViewModel.profiles
@@ -908,6 +921,7 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     private func schedulePull(force: Bool = false) {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard AuthConfig.isConfigured else {
             Self.accountSyncDiagnostic = "backend not configured"
             return
@@ -916,7 +930,6 @@ final class NuvioSyncManager: ObservableObject {
             Self.accountSyncDiagnostic = "not authenticated"
             return
         }
-        if !force, NSClassFromString("XCTestCase") != nil { return }
         if !force, pullTask != nil { return }
 
         // A forced pull for the account+profile already being pulled queues
@@ -1235,6 +1248,7 @@ final class NuvioSyncManager: ObservableObject {
         }
         guard let profileId else { return }
         guard profileViewModel?.activeProfile?.id == profileId,
+              ProfileSettings.activeProfileID == profileId,
               ContinueWatchingStore.activeProfileId == profileId,
               LibraryStore.activeProfileId == profileId,
               WatchedStore.activeProfileId == profileId,
@@ -1515,13 +1529,19 @@ final class NuvioSyncManager: ObservableObject {
                 let remoteAddons = try await remoteAddonsRequest
                 try ensureStillSyncing(profileId: activeProfile.id)
                 lastPulledAddonRows = remoteAddons
-                let (appliedCount, didChange) = client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
+                let (appliedCount, didChange) = try client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
+                if let key = currentSyncKey() {
+                    completedAddonPullKeys.insert(key)
+                }
                 if didChange {
                     homeCatalogRevision &+= 1
                 }
-                if AddonCatalogRemovalStore.hasPendingRemoval(in: ProfileSettings.store(for: activeProfile.id)) {
-                    pushAddonPreferences(CinemetaCatalogRepository.configuredStreamAddonPreferences,
-                                         originatingProfileId: activeProfile.id)
+                let profileDefaults = ProfileSettings.store(for: activeProfile.id)
+                if AddonCatalogRemovalStore.hasPendingRemoval(in: profileDefaults) {
+                    pushAddonPreferences(
+                        CinemetaCatalogRepository.configuredStreamAddonPreferences(in: profileDefaults),
+                        originatingProfileId: activeProfile.id
+                    )
                 }
                 Self.addonSyncDiagnostic = "remote \(remoteAddons.count), enabled \(appliedCount)"
                 print("Nuvio sync pulled \(appliedCount) enabled add-on(s).")
@@ -1876,6 +1896,7 @@ final class NuvioSyncManager: ObservableObject {
     /// full pull, or never decoded locally). Intentional deletes of ids that
     /// were present in the last pull still go through.
     private func pushCollectionsEdit(_ raw: [[String: Any]], originatingProfileId: String) {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard AuthConfig.isConfigured else { return }
         guard let authManager, authManager.isAuthenticated else { return }
         guard let profileViewModel,
@@ -1948,7 +1969,11 @@ final class NuvioSyncManager: ObservableObject {
     private func pullProviderCredentials(session: AuthSession, remoteProfileId: Int, localProfileId: String) async {
         do {
             let rows = try await client.pullProviderCredentials(session: session, remoteProfileId: remoteProfileId)
-            let changed = ProviderCredentialSync.apply(rows: rows, to: ProfileSettings.store(for: localProfileId))
+            let changed = ProviderCredentialSync.apply(
+                rows: rows,
+                to: ProfileSettings.store(for: localProfileId),
+                profileScope: localProfileId
+            )
             if !changed.isEmpty {
                 print("Nuvio sync applied provider credentials: \(changed.map(\.rawValue).joined(separator: ", "))")
             }
@@ -1962,6 +1987,7 @@ final class NuvioSyncManager: ObservableObject {
     /// Sends a key saved on this Apple TV to the account, merged into the
     /// rows the account already has.
     func pushProviderCredential(_ provider: ProviderCredentialSync.Provider) {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard provider.isPushed else { return }
         Task { @MainActor in
             guard let authManager, let profileViewModel,
@@ -1969,7 +1995,11 @@ final class NuvioSyncManager: ObservableObject {
                   let session = await authManager.validSessionForSync(),
                   let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else { return }
             let remoteProfileId = ProfileSyncIndexStore.remoteId(for: activeProfile, in: profileViewModel.profiles)
-            let value = ProfileSettings.store(for: activeProfile.id).string(forKey: provider.localKey)?
+            let value = ProviderCredentialStore.string(
+                forKey: provider.localKey,
+                in: ProfileSettings.store(for: activeProfile.id),
+                profileScope: activeProfile.id
+            )?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             // An empty field never clears the account's key: leaving the field
             // without typing commits it too.
@@ -1994,6 +2024,7 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     private func pushLocalSnapshots(scopes: SyncPushScope = .all) async {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard let authManager, let profileViewModel else { return }
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
         guard let session = await authManager.validSessionForSync() else { return }
@@ -2144,6 +2175,7 @@ final class NuvioSyncManager: ObservableObject {
     /// Replaces the account's plugin repositories with this Apple TV's list
     /// (Android's `sync_push_plugins`: url, name, enabled, sort_order).
     private func pushPluginRepositories(originatingProfileId: String) {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         guard AuthConfig.isConfigured else { return }
         guard let authManager, authManager.isAuthenticated else { return }
         guard let profileViewModel,
@@ -2198,7 +2230,12 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
+    func canPushAddonPreferences(forSyncKey syncKey: String) -> Bool {
+        completedAddonPullKeys.contains(syncKey) || completedInitialPullKeys.contains(syncKey)
+    }
+
     private func pushAddonPreferences(_ preferences: [StreamAddonPreference], originatingProfileId: String) {
+        guard NSClassFromString("XCTestCase") == nil else { return }
         let normalizedPreferences = Self.normalizedAddonPreferences(preferences)
         guard AuthConfig.isConfigured else { return }
         guard let authManager, authManager.isAuthenticated else { return }
@@ -2207,6 +2244,10 @@ final class NuvioSyncManager: ObservableObject {
         guard activeProfile.id == originatingProfileId,
               ProfileSettings.activeProfileID == originatingProfileId,
               let editSyncKey = currentSyncKey() else { return }
+        guard canPushAddonPreferences(forSyncKey: editSyncKey) else {
+            print("Nuvio sync deferred add-on push until initial add-on pull completes for \(editSyncKey).")
+            return
+        }
 
         let remoteProfileId = ProfileSyncIndexStore.remoteId(
             for: activeProfile,
@@ -3036,7 +3077,6 @@ enum MdbListSyncMapper {
 
     static let remoteToLocalKeyMappings: [(remote: String, local: String)] = [
         ("mdblist_enabled", SettingsKey.mdbListEnabled),
-        ("mdblist_api_key", SettingsKey.mdbListApiKey),
         ("mdblist_use_imdb", SettingsKey.mdbListUseImdb),
         ("mdblist_use_tmdb", SettingsKey.mdbListUseTmdb),
         ("mdblist_use_tomatoes", SettingsKey.mdbListUseTomatoes),
@@ -3051,7 +3091,6 @@ enum MdbListSyncMapper {
 
     static let localToRemoteKeyMappings: [(local: String, remote: String)] = [
         (SettingsKey.mdbListEnabled, "mdblist_enabled"),
-        (SettingsKey.mdbListApiKey, "mdblist_api_key"),
         (SettingsKey.mdbListUseImdb, "mdblist_use_imdb"),
         (SettingsKey.mdbListUseTmdb, "mdblist_use_tmdb"),
         (SettingsKey.mdbListUseTomatoes, "mdblist_use_tomatoes"),
@@ -3303,6 +3342,9 @@ final class NuvioAPIClient {
             "addons?select=%2A&profile_id=eq.\(remoteProfileId)&order=sort_order",
             session: session
         )
+        if rows.rawCount > 0, rows.elements.isEmpty {
+            throw AuthError(message: "The add-on response was not in a supported format.")
+        }
         return rows.elements
     }
 
@@ -3337,7 +3379,7 @@ final class NuvioAPIClient {
         return try JSONSerialization.data(withJSONObject: blob)
     }
 
-    fileprivate func applyAddons(_ addons: [RemoteAddon], localProfileId: String) -> (appliedCount: Int, didChange: Bool) {
+    func applyAddons(_ addons: [RemoteAddon], localProfileId: String) throws -> (appliedCount: Int, didChange: Bool) {
         let receivedPreferences = addons
             .sorted { $0.sortOrder < $1.sortOrder }
             .compactMap { addon -> StreamAddonPreference? in
@@ -3346,6 +3388,10 @@ final class NuvioAPIClient {
                 let nameToUse = (trimmedName?.isEmpty == false) ? trimmedName : nil
                 return StreamAddonPreference(url: url.absoluteString, enabled: addon.enabled, name: nameToUse)
             }
+
+        if !addons.isEmpty && receivedPreferences.isEmpty {
+            throw AuthError(message: "None of the downloaded add-on rows contained a valid manifest URL.")
+        }
 
         let defaults = ProfileSettings.store(for: localProfileId)
         let preferences = AddonCatalogRemovalStore.filterRemote(receivedPreferences, in: defaults)
@@ -3784,7 +3830,8 @@ final class NuvioAPIClient {
             aioFeature,
             localBackup: AIOStreamsHost.loadBackup(),
             saveBackup: { backup in
-                if let data = try? JSONSerialization.data(withJSONObject: backup) { AIOStreamsHost.saveBackup(data) }
+                guard let data = try? JSONSerialization.data(withJSONObject: backup) else { return false }
+                return AIOStreamsHost.saveBackup(data)
             }
         ) {
             // AIOStreamsHost lives on the main thread; the pull runs off it.
@@ -3886,17 +3933,19 @@ final class NuvioAPIClient {
                 existing: existingTraktSettings,
                 dismissedKeys: ContinueWatchingDismissStore.keysForExport(profileId: localProfileId)
             )
-        // Keep Android stream-filter keys; overlay API keys + preferred resolver.
+        // Keep Android stream-filter preferences while removing old credential fields.
         let existingDebrid = features[Self.debridSettingsFeature] as? [String: Any]
-        features[Self.debridSettingsFeature] = exportDebridSettings(
+        let debridPayload = exportDebridSettings(
             localProfileId: localProfileId,
             existing: existingDebrid
         )
+        features[Self.debridSettingsFeature] = debridPayload
         let existingTmdb = features[Self.tmdbSettingsFeature] as? [String: Any]
-        features[Self.tmdbSettingsFeature] = exportTmdbSettings(
+        let tmdbPayload = exportTmdbSettings(
             localProfileId: localProfileId,
             existing: existingTmdb
         )
+        features[Self.tmdbSettingsFeature] = tmdbPayload
         let existingPosterStyle = (features[Self.posterCardStyleSettingsFeature] as? String)
             ?? (latestMobileSettingsJSON["features"] as? [String: Any])?[Self.posterCardStyleSettingsFeature] as? String
         let posterStylePayload = exportPosterCardStyleSettings(
@@ -4012,6 +4061,8 @@ final class NuvioAPIClient {
                 mobileFeatures[Self.posterCardStyleSettingsFeature] = posterStylePayload
                 mobileFeatures[Self.playerSettingsFeature] = playerPayload
                 mobileFeatures[Self.continueWatchingSettingsFeature] = cwPayload
+                mobileFeatures[Self.debridSettingsFeature] = debridPayload
+                mobileFeatures[Self.tmdbSettingsFeature] = tmdbPayload
                 mobileFeatures[Self.mdbListSettingsFeature] = mdbListPayload
                 mobileFeatures[Self.themeSettingsFeature] = themePayload
                 mobileSettingsJSON["features"] = mobileFeatures
@@ -4558,7 +4609,7 @@ final class NuvioAPIClient {
         StreamBadgeSettingsStore.saveRawRulesJSON(rawRules, for: localProfileId)
     }
 
-    private func exportSettings(localProfileId: String) -> [String: Any] {
+    func exportSettings(localProfileId: String) -> [String: Any] {
         let defaults = ProfileSettings.store(for: localProfileId)
         var exported: [String: Any] = [:]
         SettingsKey.all.forEach { key in
@@ -4566,6 +4617,7 @@ final class NuvioAPIClient {
             // or another TV disable account progress pulls everywhere.
             guard key != SettingsKey.accountSyncWatchState else { return }
             guard !SettingsKey.deviceLocal.contains(key) else { return }
+            guard !SettingsKey.syncedViaAddonRPC.contains(key) else { return }
             guard key != SettingsKey.streamBadgeRules else { return }
             guard let value = defaults.object(forKey: key),
                   let encoded = Self.encodeSettingValue(value) else {
@@ -4593,11 +4645,12 @@ final class NuvioAPIClient {
         }
     }
 
-    private func importSettings(_ remote: [String: Any], localProfileId: String) {
+    func importSettings(_ remote: [String: Any], localProfileId: String) {
         let defaults = ProfileSettings.store(for: localProfileId)
         SettingsKey.all.forEach { key in
             guard key != SettingsKey.accountSyncWatchState else { return }
             guard !SettingsKey.deviceLocal.contains(key) else { return }
+            guard !SettingsKey.syncedViaAddonRPC.contains(key) else { return }
             guard key != SettingsKey.streamBadgeRules else { return }
             guard let encoded = remote[key] as? [String: Any],
                   let value = Self.decodeSettingValue(encoded) else {
@@ -4660,10 +4713,10 @@ final class NuvioAPIClient {
     ) -> [String: Any] {
         let defaults = ProfileSettings.store(for: localProfileId)
         var feature = existing ?? [:]
+        feature.removeValue(forKey: AndroidTmdbKey.apiKey)
 
         let mappings: [(String, String)] = [
             (SettingsKey.tmdbEnabled, AndroidTmdbKey.enabled),
-            (SettingsKey.tmdbApiKey, AndroidTmdbKey.apiKey),
             (SettingsKey.tmdbLanguage, AndroidTmdbKey.language),
             (SettingsKey.tmdbUseTrailers, AndroidTmdbKey.useTrailers),
             (SettingsKey.tmdbUseArtwork, AndroidTmdbKey.useArtwork),
@@ -4692,10 +4745,25 @@ final class NuvioAPIClient {
     private func importTmdbSettings(_ remote: [String: Any]?, localProfileId: String) {
         guard let remote, !remote.isEmpty else { return }
         let defaults = ProfileSettings.store(for: localProfileId)
+        if let encoded = remote[AndroidTmdbKey.apiKey] as? [String: Any],
+           let value = Self.decodeSettingValue(encoded) as? String {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                value,
+                forKey: SettingsKey.tmdbApiKey,
+                in: defaults,
+                profileScope: localProfileId
+            )
+        } else if let value = remote[AndroidTmdbKey.apiKey] as? String {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                value,
+                forKey: SettingsKey.tmdbApiKey,
+                in: defaults,
+                profileScope: localProfileId
+            )
+        }
 
         let mappings: [(String, String)] = [
             (AndroidTmdbKey.enabled, SettingsKey.tmdbEnabled),
-            (AndroidTmdbKey.apiKey, SettingsKey.tmdbApiKey),
             (AndroidTmdbKey.language, SettingsKey.tmdbLanguage),
             (AndroidTmdbKey.useTrailers, SettingsKey.tmdbUseTrailers),
             (AndroidTmdbKey.useArtwork, SettingsKey.tmdbUseArtwork),
@@ -4731,6 +4799,19 @@ final class NuvioAPIClient {
         let defaults = ProfileSettings.store(for: localProfileId)
         var feature = existing ?? [:]
 
+        [
+            AndroidDebridKey.torbox,
+            AndroidDebridKey.premiumize,
+            AndroidDebridKey.realDebrid,
+            AndroidDebridKey.torboxPrefixed,
+            AndroidDebridKey.premiumizePrefixed,
+            AndroidDebridKey.realDebridPrefixed,
+            "torbox_access_token",
+            "premiumize_access_token",
+            "real_debrid_access_token",
+            "debrid_api_key"
+        ].forEach { feature.removeValue(forKey: $0) }
+
         func putString(_ key: String, _ value: String) {
             feature[key] = Self.encodeSettingValue(value)
         }
@@ -4738,11 +4819,11 @@ final class NuvioAPIClient {
             feature[key] = Self.encodeSettingValue(value)
         }
 
-        let torbox = (defaults.string(forKey: SettingsKey.torboxAccessToken) ?? "")
+        let torbox = (ProviderCredentialStore.string(forKey: SettingsKey.torboxAccessToken, in: defaults, profileScope: localProfileId) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let premiumize = (defaults.string(forKey: SettingsKey.premiumizeAccessToken) ?? "")
+        let premiumize = (ProviderCredentialStore.string(forKey: SettingsKey.premiumizeAccessToken, in: defaults, profileScope: localProfileId) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let realDebrid = (defaults.string(forKey: SettingsKey.realDebridAccessToken) ?? "")
+        let realDebrid = (ProviderCredentialStore.string(forKey: SettingsKey.realDebridAccessToken, in: defaults, profileScope: localProfileId) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
         putString(AndroidDebridKey.torbox, torbox)
@@ -4808,14 +4889,29 @@ final class NuvioAPIClient {
             defaults.set(cloudEnabled, forKey: SettingsKey.cloudLibraryEnabled)
         }
 
-        if let torbox = stringValue([AndroidDebridKey.torbox, AndroidDebridKey.torboxPrefixed]) {
-            defaults.set(torbox, forKey: SettingsKey.torboxAccessToken)
+        if let torbox = stringValue([AndroidDebridKey.torbox, AndroidDebridKey.torboxPrefixed, "torbox_access_token"]) {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                torbox,
+                forKey: SettingsKey.torboxAccessToken,
+                in: defaults,
+                profileScope: localProfileId
+            )
         }
-        if let premiumize = stringValue([AndroidDebridKey.premiumize, AndroidDebridKey.premiumizePrefixed]) {
-            defaults.set(premiumize, forKey: SettingsKey.premiumizeAccessToken)
+        if let premiumize = stringValue([AndroidDebridKey.premiumize, AndroidDebridKey.premiumizePrefixed, "premiumize_access_token"]) {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                premiumize,
+                forKey: SettingsKey.premiumizeAccessToken,
+                in: defaults,
+                profileScope: localProfileId
+            )
         }
-        if let realDebrid = stringValue([AndroidDebridKey.realDebrid, AndroidDebridKey.realDebridPrefixed]) {
-            defaults.set(realDebrid, forKey: SettingsKey.realDebridAccessToken)
+        if let realDebrid = stringValue([AndroidDebridKey.realDebrid, AndroidDebridKey.realDebridPrefixed, "real_debrid_access_token"]) {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                realDebrid,
+                forKey: SettingsKey.realDebridAccessToken,
+                in: defaults,
+                profileScope: localProfileId
+            )
         }
 
         let preferredRaw = stringValue([AndroidDebridKey.preferred, AndroidDebridKey.preferredPrefixed])
@@ -4823,11 +4919,11 @@ final class NuvioAPIClient {
 
         // If preferred is missing/empty, pick the first configured provider.
         if selected == .none {
-            let torbox = (defaults.string(forKey: SettingsKey.torboxAccessToken) ?? "")
+            let torbox = (ProviderCredentialStore.string(forKey: SettingsKey.torboxAccessToken, in: defaults, profileScope: localProfileId) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let premiumize = (defaults.string(forKey: SettingsKey.premiumizeAccessToken) ?? "")
+            let premiumize = (ProviderCredentialStore.string(forKey: SettingsKey.premiumizeAccessToken, in: defaults, profileScope: localProfileId) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            let realDebrid = (defaults.string(forKey: SettingsKey.realDebridAccessToken) ?? "")
+            let realDebrid = (ProviderCredentialStore.string(forKey: SettingsKey.realDebridAccessToken, in: defaults, profileScope: localProfileId) ?? "")
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             if !torbox.isEmpty {
                 selected = .torbox
@@ -4841,7 +4937,7 @@ final class NuvioAPIClient {
         if selected != .none {
             defaults.set(selected.rawValue, forKey: SettingsKey.debridProvider)
             let token = DebridCredentials.token(for: selected, store: defaults)
-            defaults.set(token, forKey: SettingsKey.debridApiKey)
+            _ = ProviderCredentialStore.set(token, forKey: SettingsKey.debridApiKey, in: defaults, profileScope: localProfileId)
         }
     }
 
@@ -4962,6 +5058,7 @@ final class NuvioAPIClient {
     ) -> [String: Any] {
         let defaults = ProfileSettings.store(for: localProfileId)
         var feature = existing ?? [:]
+        feature.removeValue(forKey: "mdblist_api_key")
 
         for (localKey, remoteKey) in MdbListSyncMapper.localToRemoteKeyMappings {
             guard let value = defaults.object(forKey: localKey),
@@ -4976,6 +5073,23 @@ final class NuvioAPIClient {
     private func importMdbListSettings(_ remote: [String: Any]?, localProfileId: String) {
         guard let remote, !remote.isEmpty else { return }
         let defaults = ProfileSettings.store(for: localProfileId)
+
+        if let encoded = remote["mdblist_api_key"] as? [String: Any],
+           let value = Self.decodeSettingValue(encoded) as? String {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                value,
+                forKey: SettingsKey.mdbListApiKey,
+                in: defaults,
+                profileScope: localProfileId
+            )
+        } else if let value = remote["mdblist_api_key"] as? String {
+            _ = ProviderCredentialStore.adoptLegacyValueIfMissing(
+                value,
+                forKey: SettingsKey.mdbListApiKey,
+                in: defaults,
+                profileScope: localProfileId
+            )
+        }
 
         for (remoteKey, localKey) in MdbListSyncMapper.remoteToLocalKeyMappings {
             guard let rawRemote = remote[remoteKey] else { continue }
@@ -5101,7 +5215,7 @@ enum EpisodeMetadataEnrichment {
             return nil
         }
 
-        let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: ProfileSettings.current)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !apiKey.isEmpty else { return nil }
 
@@ -5339,11 +5453,18 @@ struct HomeCatalogSyncItem {
     }
 }
 
-private struct RemoteAddon: Decodable {
+struct RemoteAddon: Decodable {
     let url: String
     let name: String?
     let enabled: Bool
     let sortOrder: Int
+
+    init(url: String, name: String? = nil, enabled: Bool = true, sortOrder: Int = 0) {
+        self.url = url
+        self.name = name
+        self.enabled = enabled
+        self.sortOrder = sortOrder
+    }
 
     enum CodingKeys: String, CodingKey {
         case url

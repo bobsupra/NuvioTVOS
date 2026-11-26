@@ -19,7 +19,7 @@ struct TraktStoredSession: Codable, Equatable {
 /// Survived sideload and in-place updates when container UserDefaults suites are lost.
 final class TraktKeychainStorage {
     static let shared = TraktKeychainStorage()
-    private let service = "com.nuvio.tv.trakt.auth"
+    private static let service = "com.nuvio.tv.trakt.auth"
     private static let lock = NSLock()
     private static var stringCache: [String: String] = [:]
     /// Strings the Keychain doesn't have, so they aren't looked for again until one is written.
@@ -30,19 +30,18 @@ final class TraktKeychainStorage {
     private static var sessionCache: [String: TraktStoredSession] = [:]
     private static var negativeCache: Set<String> = []
 
-    /// How a string is looked up in the Keychain. Tests count the lookups with their own (test
-    /// runs are unsigned and have no Keychain).
-    private let copyMatching: (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus
+    private let keychain: ProviderCredentialKeychain
 
-    init(copyMatching: @escaping (CFDictionary, UnsafeMutablePointer<CFTypeRef?>?) -> OSStatus = SecItemCopyMatching) {
-        self.copyMatching = copyMatching
+    init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
+        self.keychain = keychain
     }
 
     func clientID(for profileScope: String) -> String? {
         readString(accountType: "clientID", profileScope: profileScope)
     }
 
-    func setClientID(_ value: String?, for profileScope: String) {
+    @discardableResult
+    func setClientID(_ value: String?, for profileScope: String) -> Bool {
         writeString(value, accountType: "clientID", profileScope: profileScope)
     }
 
@@ -50,7 +49,8 @@ final class TraktKeychainStorage {
         readString(accountType: "clientSecret", profileScope: profileScope)
     }
 
-    func setClientSecret(_ value: String?, for profileScope: String) {
+    @discardableResult
+    func setClientSecret(_ value: String?, for profileScope: String) -> Bool {
         writeString(value, accountType: "clientSecret", profileScope: profileScope)
     }
 
@@ -58,136 +58,105 @@ final class TraktKeychainStorage {
         readString(accountType: "redirectURI", profileScope: profileScope)
     }
 
-    func setRedirectURI(_ value: String?, for profileScope: String) {
+    @discardableResult
+    func setRedirectURI(_ value: String?, for profileScope: String) -> Bool {
         writeString(value, accountType: "redirectURI", profileScope: profileScope)
     }
 
     func session(for profileScope: String) -> TraktStoredSession? {
-        let (cached, isNegative) = Self.lock.withLock {
-            (Self.sessionCache[profileScope], Self.negativeCache.contains(profileScope))
-        }
-        if let cached { return cached }
-        if isNegative { return nil }
-
-        var query = keychainQuery(for: profileScope, accountType: "tokens")
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let decoded = try? JSONDecoder().decode(TraktStoredSession.self, from: data) else {
-            Self.lock.withLock { _ = Self.negativeCache.insert(profileScope) }
-            return nil
-        }
         Self.lock.withLock {
-            Self.sessionCache[profileScope] = decoded
-            Self.negativeCache.remove(profileScope)
+            if let cached = Self.sessionCache[profileScope] { return cached }
+            if Self.negativeCache.contains(profileScope) { return nil }
+
+            switch keychain.read(service: Self.service, account: "tokens.\(profileScope)") {
+            case .missing:
+                Self.negativeCache.insert(profileScope)
+                return nil
+            case .failed:
+                return nil
+            case .value(let rawValue):
+                guard let data = rawValue.data(using: .utf8),
+                      let decoded = try? JSONDecoder().decode(TraktStoredSession.self, from: data) else {
+                    return nil
+                }
+                Self.sessionCache[profileScope] = decoded
+                Self.negativeCache.remove(profileScope)
+                return decoded
+            }
         }
-        return decoded
     }
 
     @discardableResult
     func saveSession(_ session: TraktStoredSession, for profileScope: String) -> Bool {
-        guard let data = try? JSONEncoder().encode(session) else { return false }
-        var addQuery = keychainQuery(for: profileScope, accountType: "tokens")
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        addQuery[kSecValueData as String] = data
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            _ = SecItemUpdate(
-                keychainQuery(for: profileScope, accountType: "tokens") as CFDictionary,
-                [kSecValueData as String: data] as CFDictionary
-            )
-        }
-        Self.lock.withLock {
+        guard let data = try? JSONEncoder().encode(session),
+              let value = String(data: data, encoding: .utf8) else { return false }
+        return Self.lock.withLock {
+            guard keychain.write(value, service: Self.service, account: "tokens.\(profileScope)") else {
+                return false
+            }
             Self.sessionCache[profileScope] = session
             Self.negativeCache.remove(profileScope)
+            return true
         }
-        return true
     }
 
     func removeSession(for profileScope: String) {
         Self.lock.withLock {
+            _ = keychain.delete(service: Self.service, account: "tokens.\(profileScope)")
             Self.sessionCache.removeValue(forKey: profileScope)
             Self.negativeCache.insert(profileScope)
         }
-        _ = SecItemDelete(keychainQuery(for: profileScope, accountType: "tokens") as CFDictionary)
     }
 
     func clearAll() {
         Self.lock.withLock {
+            _ = SecItemDelete([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: Self.service
+            ] as CFDictionary)
             Self.stringCache.removeAll()
             Self.missingStrings.removeAll()
             Self.sessionCache.removeAll()
             Self.negativeCache.removeAll()
         }
-        _ = SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service
-        ] as CFDictionary)
     }
 
     private func readString(accountType: String, profileScope: String) -> String? {
         let cacheKey = "\(accountType):\(profileScope)"
-        let (cached, isMissing) = Self.lock.withLock {
-            (Self.stringCache[cacheKey], Self.missingStrings.contains(cacheKey))
-        }
-        if let cached, !cached.isEmpty {
-            return cached
-        }
-        if isMissing { return nil }
+        return Self.lock.withLock {
+            if let cached = Self.stringCache[cacheKey], !cached.isEmpty { return cached }
+            if Self.missingStrings.contains(cacheKey) { return nil }
 
-        var query = keychainQuery(for: profileScope, accountType: accountType)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-
-        var item: CFTypeRef?
-        let status = copyMatching(query as CFDictionary, &item)
-        if status == errSecSuccess,
-           let data = item as? Data,
-           let str = String(data: data, encoding: .utf8), !str.isEmpty {
-            Self.lock.withLock { Self.stringCache[cacheKey] = str }
-            return str
+            switch keychain.read(service: Self.service, account: "\(accountType).\(profileScope)") {
+            case .value(let value) where !value.isEmpty:
+                Self.stringCache[cacheKey] = value
+                return value
+            case .missing:
+                // Only a confirmed absence is cached. Failures and invalid data are retried.
+                Self.missingStrings.insert(cacheKey)
+                return nil
+            case .value, .failed:
+                return nil
+            }
         }
-        // Only "not there" is remembered: a Keychain that can't be read now is asked again.
-        if status == errSecItemNotFound {
-            Self.lock.withLock { _ = Self.missingStrings.insert(cacheKey) }
-        }
-        return nil
     }
 
-    private func writeString(_ value: String?, accountType: String, profileScope: String) {
+    @discardableResult
+    private func writeString(_ value: String?, accountType: String, profileScope: String) -> Bool {
         let cacheKey = "\(accountType):\(profileScope)"
-        Self.lock.withLock {
+        return Self.lock.withLock {
+            let account = "\(accountType).\(profileScope)"
             if let value, !value.isEmpty {
+                guard keychain.write(value, service: Self.service, account: account) else { return false }
                 Self.stringCache[cacheKey] = value
                 Self.missingStrings.remove(cacheKey)
             } else {
+                guard keychain.delete(service: Self.service, account: account) else { return false }
                 Self.stringCache.removeValue(forKey: cacheKey)
                 Self.missingStrings.insert(cacheKey)
             }
+            return true
         }
-        _ = SecItemDelete(keychainQuery(for: profileScope, accountType: accountType) as CFDictionary)
-        guard let value, !value.isEmpty, let data = value.data(using: .utf8) else { return }
-        var addQuery = keychainQuery(for: profileScope, accountType: accountType)
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        addQuery[kSecValueData as String] = data
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            _ = SecItemUpdate(
-                keychainQuery(for: profileScope, accountType: accountType) as CFDictionary,
-                [kSecValueData as String: data] as CFDictionary
-            )
-        }
-    }
-
-    private func keychainQuery(for profileScope: String, accountType: String) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
-            kSecAttrAccount as String: "\(accountType).\(profileScope)"
-        ]
     }
 }
 
@@ -1179,7 +1148,7 @@ enum RemoteTrackingState {
             return ProfileSettings.isActiveStore(store)
                 && SimklRuntimeSession.authenticatedState(store: store) != nil
         case .tmdb:
-            let apiKey = store.string(forKey: SettingsKey.tmdbApiKey)?
+            let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let enabled = (store.object(forKey: SettingsKey.tmdbEnabled) as? Bool) ?? false
             let useMoreLikeThis = (store.object(forKey: SettingsKey.tmdbUseMoreLikeThis) as? Bool) ?? true
@@ -2972,8 +2941,7 @@ struct TraktProgressService {
     }
 
     fileprivate static func scrobbleMedia(for meta: NuvioMeta) -> TraktScrobbleMedia? {
-        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-        let imdb = meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil)
+        let imdb = TraktMetaIDs.imdb(for: meta)
         let tmdb = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
             ? Int(meta.id.dropFirst("tmdb:".count))
             : nil)
@@ -3743,6 +3711,18 @@ struct TraktHistoryService {
                 $0.accountID != expectedAccountID || $0.profileID != profileId
             }
         let service = TraktAuthService(session: session, store: store)
+        // Home shows Trakt's Continue Watching. Once this pass has changed Trakt, Home reloads
+        // it, as after a direct history write. Before, it caught up only on the next launch.
+        var sentToTrakt = false
+        defer {
+            if sentToTrakt {
+                NotificationCenter.default.post(
+                    name: TraktSettingsStore.continueWatchingChangedNotification,
+                    object: nil
+                )
+                TraktSettingsStore.notifyContinueWatchingSourceInvalidated(for: .trakt, in: store)
+            }
+        }
         for write in orderedWrites {
             guard isCurrentTraktAccount(
                 store: store,
@@ -3751,7 +3731,18 @@ struct TraktHistoryService {
             ) else { return false }
             switch write {
             case .mutation(let mutation):
+                // A mark Trakt has no id for can never be sent. Waiting on it held
+                // back every write queued after it, for good, so it is dropped.
+                guard historyIDs(for: mutation.meta) != nil else {
+                    guard WatchedStore.acknowledgeProviderMutation(
+                        id: mutation.id,
+                        provider: .trakt,
+                        profileId: profileId
+                    ) else { return false }
+                    continue
+                }
                 guard await uploadManualMutation(mutation, using: service) else { return false }
+                sentToTrakt = true
                 guard isCurrentTraktAccount(
                     store: store,
                     profileId: profileId,
@@ -3764,6 +3755,16 @@ struct TraktHistoryService {
                 ) else { return false }
 
             case .completion(let completion):
+                // The same for a finished playback Trakt has no id for.
+                guard historyIDs(for: completion.meta) != nil else {
+                    guard WatchedStore.acknowledgePlaybackCompletion(
+                        completionID: completion.completionID,
+                        provider: .trakt,
+                        accountID: expectedAccountID,
+                        profileId: profileId
+                    ) else { return false }
+                    continue
+                }
                 guard await uploadPlaybackCompletion(
                     completion,
                     using: service,
@@ -3771,6 +3772,7 @@ struct TraktHistoryService {
                     profileId: profileId,
                     expectedAccountID: expectedAccountID
                 ) else { return false }
+                sentToTrakt = true
 
             case .libraryMutation(let mutation):
                 guard await uploadLibraryMutation(mutation, using: service) else {
@@ -3782,6 +3784,7 @@ struct TraktHistoryService {
                     )
                     return false
                 }
+                sentToTrakt = true
                 guard isCurrentTraktAccount(
                     store: store,
                     profileId: profileId,
@@ -3979,6 +3982,15 @@ struct TraktHistoryService {
     }
 
     private static func completionMatches(show: TraktProgressMediaDTO, expected: NuvioMeta) -> Bool {
+        // The ids a completion is sent with find it again, also for an add-on id
+        // ("cotonet:tt16418808") that as a whole matches no Trakt id. Missed, the
+        // next attempt would send the same play again.
+        if let ids = historyIDs(for: expected), let remote = show.ids {
+            if let imdb = ids.imdb, let remoteIMDb = remote.imdb,
+               imdb.caseInsensitiveCompare(remoteIMDb) == .orderedSame { return true }
+            if let tmdb = ids.tmdb, tmdb == remote.tmdb { return true }
+            if let trakt = ids.trakt, trakt == remote.trakt { return true }
+        }
         guard let contentID = historyContentID(from: show.ids) else { return false }
         let remote = historyMeta(from: show, contentID: contentID, type: expected.isSeries ? "series" : "movie")
         return WatchedStore.sameContent(remote, expected)
@@ -4271,6 +4283,20 @@ struct TraktHistoryService {
         }
     }
 
+    /// The ids Trakt can find `meta` by, or nil when it has none of them, so no
+    /// history request for it can ever work.
+    private static func historyIDs(for meta: NuvioMeta) -> TraktHistoryIDs? {
+        let ids = TraktHistoryIDs(
+            trakt: meta.id.hasPrefix("trakt:") ? Int(meta.id.dropFirst("trakt:".count)) : nil,
+            imdb: TraktMetaIDs.imdb(for: meta),
+            tmdb: meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
+                ? Int(meta.id.dropFirst("tmdb:".count))
+                : nil)
+        )
+        guard ids.trakt != nil || ids.imdb != nil || ids.tmdb != nil else { return nil }
+        return ids
+    }
+
     /// `episodes` carries every episode being marked in one season, so a whole
     /// season is one request rather than one per episode.
     private static func mutation(
@@ -4279,15 +4305,7 @@ struct TraktHistoryService {
         episodes: [Int],
         watchedAt: String?
     ) -> TraktHistoryMutation? {
-        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-        let ids = TraktHistoryIDs(
-            trakt: meta.id.hasPrefix("trakt:") ? Int(meta.id.dropFirst("trakt:".count)) : nil,
-            imdb: meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil),
-            tmdb: meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
-                ? Int(meta.id.dropFirst("tmdb:".count))
-                : nil)
-        )
-        guard ids.trakt != nil || ids.imdb != nil || ids.tmdb != nil else { return nil }
+        guard let ids = historyIDs(for: meta) else { return nil }
 
         if meta.isSeries {
             let seasons: [TraktHistorySeason]?
@@ -4585,6 +4603,25 @@ private struct TraktHistoryEpisode: Encodable {
     enum CodingKeys: String, CodingKey {
         case number
         case watchedAt = "watched_at"
+    }
+}
+
+/// The ids a Trakt request finds a title by.
+enum TraktMetaIDs {
+    /// The title's IMDb id. Some add-ons put their own prefix in front of it
+    /// ("cotonet:tt16418808") instead of starting the id with it, so a later part
+    /// of the id counts too when it is an IMDb id.
+    static func imdb(for meta: NuvioMeta) -> String? {
+        if let imdb = meta.imdbId { return imdb }
+        let parts = meta.id.split(separator: ":").map(String.init)
+        if let first = parts.first, first.hasPrefix("tt") { return first }
+        return parts.dropFirst().first(where: isIMDbID)
+    }
+
+    private static func isIMDbID(_ part: String) -> Bool {
+        part.count > 2
+            && part.hasPrefix("tt")
+            && part.dropFirst(2).allSatisfy { $0.isASCII && $0.isNumber }
     }
 }
 
@@ -4962,8 +4999,7 @@ struct TraktLibraryService {
     }
 
     private static func watchlistMutation(for meta: NuvioMeta) -> TraktWatchlistMutation? {
-        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-        let imdb = meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil)
+        let imdb = TraktMetaIDs.imdb(for: meta)
         let tmdb = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
             ? Int(meta.id.dropFirst("tmdb:".count))
             : nil)

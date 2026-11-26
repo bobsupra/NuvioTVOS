@@ -682,7 +682,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var replayReadyIndex = 0
     var replayPendingBytes = 0
     var replayDeferredError: Error?
-    private var damagedPacketLogCounts: [String: Int] = [:]
+    /// Every damaged live packet this producer held, forwarded or discarded, counted before the log
+    /// throttle. Pump state.
+    private var damagedPacketCounts: [DamagedPacketKey: Int] = [:]
     private static let maximumReplayPendingBytes = LivePacketReplayGuard.maximumPendingBytes
     private static let maximumReplayPendingPackets = LivePacketReplayGuard.maximumPendingPackets
 
@@ -719,6 +721,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// One-packet look-behind; next packet's dts fills pending.duration when per-block duration is missing.
     private var pendingVideoPkt: UnsafeMutablePointer<AVPacket>?
+    private var pendingVideoPlacement: VideoOutputPlacement?
     private var pendingAudioPkt: UnsafeMutablePointer<AVPacket>?
 
     /// Live segment index captured when pending packet was examined; the live cutter advances at keyframes.
@@ -1093,6 +1096,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Dynamic PTS shift = firstActualDts - desiredFirstTfdt; Int64.min = not yet computed.
     private var videoShiftPts: Int64 = Int64.min
     private var audioShiftPts: Int64 = Int64.min
+    /// AE#1109: set once this producer adopted a segment; the first one opened its epoch.
+    private var adoptedFirstSegment = false
 
     /// Max segments ahead of AVPlayer's highest fetched segment. Historically a constant (cut from 20 to
     /// 10; 4K HEVC ~10 MB/seg = 200 MB old buffer); now per session from `LoadOptions.forwardBufferSegments`
@@ -2761,7 +2766,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 firstSyncItemPtsBySegment[currentMuxerSegmentIndex] =
                     planBoundaryAxis.timestamp(dts: pending.pointee.dts, pts: pending.pointee.pts)
             }
-            finalizeAndWriteVideo(pending, nextDts: nil, muxer: muxer)
+            finalizeAndWriteVideo(pending, nextPacket: nil, muxer: muxer)
             bumpPacketsWritten()
         }
         switch muxer.cutFragmentForNextSegment(newIdx) {
@@ -2773,7 +2778,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             cache.adopt(index: currentMuxerSegmentIndex,
                         stagingPath: path,
                         byteCount: bytesWritten,
-                        videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex))
+                        videoReach: takeVideoReach(forSegmentIndex: currentMuxerSegmentIndex),
+                        lineage: takeLineage())
             // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
             // credit this pump with the previous epoch's production.
             pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
@@ -2868,6 +2874,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
             // backlog exceeded bufferAheadSegments.
             if !awaitLiveWindowHeadroom(head: newIdx) { return nil }
         } else {
+            // AE#1109: a restart below a band the cache already holds stops at the band. Without
+            // this the forward park never holds a whole-source prefetch (its target sits thousands
+            // of segments below the head), so the pump cut the rest of the title again.
+            if onSequentialSegmentFinalized == nil, !awaitResidentRunHandover(head: newIdx) { return nil }
             let backpressureTarget = newIdx - bufferAheadSegments
             let parkSkipped = onSequentialSegmentFinalized != nil
                 && Self.sequentialParkWouldSelfDeadlock(target: backpressureTarget,
@@ -2899,6 +2909,102 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if checkShouldStop() { return nil }
 
         return muxer
+    }
+
+    /// AE#1109: the axis this producer writes on, once its gate has opened.
+    private var writtenAxis: SegmentLineage.Axis? {
+        guard videoShiftPts != Int64.min else { return nil }
+        return SegmentLineage.Axis(videoShiftPts: videoShiftPts, audioShiftPts: audioShiftPts,
+                                   audioDelaySeconds: audioDelaySeconds)
+    }
+
+    /// AE#1109: the lineage of the segment being adopted. The first one this producer adopts opened
+    /// its epoch.
+    private func takeLineage() -> SegmentLineage? {
+        let opensEpoch = !adoptedFirstSegment
+        adoptedFirstSegment = true
+        return writtenAxis.map { SegmentLineage(axis: $0, opensEpoch: opensEpoch) }
+    }
+
+    /// AE#1109: how far a kept run has to reach past the pump's head before the pump stops in front
+    /// of it. The consumer reaching its end asks for an index the provider restarts at, and AVPlayer
+    /// asks a few segments ahead of what it plays, so a run this deep hands that restart a full
+    /// cushion. Same depth and same measure as the provider's rule for keeping a producer on a
+    /// resident backward target (`residentBackwardTargetKeepsProducer`).
+    static let residentRunMinimumDepth = VideoSegmentProvider.forwardWaitWindow
+
+    /// AE#1109: whether a run of kept segments from `head` through `frontier` lets the pump stop in
+    /// front of it. A run that reaches the last plan index leaves nothing to produce at any depth.
+    static func residentRunHoldsPump(head: Int, frontier: Int, lastIndex: Int,
+                                     minimumDepth: Int = residentRunMinimumDepth) -> Bool {
+        guard frontier >= head else { return false }
+        return frontier >= lastIndex || frontier - head >= minimumDepth
+    }
+
+    /// AE#1109: whether a parked pump goes back to cutting, given the first gap in the minimum depth
+    /// behind its head (nil while that stretch still holds). Only for a gap the consumer has not
+    /// reached: the provider waits on the active producer for an index that close to its base instead
+    /// of restarting, so nobody else would fill it. A gap behind the consumer is an eviction behind
+    /// the playhead, and cutting there would pull the band through the pump a second time, one
+    /// segment per eviction. A gap further on is the provider's restart.
+    static func residentRunParkReleases(consumerTarget: Int, firstGap: Int?) -> Bool {
+        guard let firstGap else { return false }
+        return firstGap > consumerTarget
+    }
+
+    /// AE#1109: parks the pump while the segments from `head` on are already resident, written on
+    /// this producer's axis by an earlier producer. Returns true to go on cutting, false when the
+    /// pump was asked to stop.
+    ///
+    /// While this producer is installed nothing else writes segments, so the run only changes by
+    /// eviction: the full walk runs once, and the recheck after each wake only looks a minimum depth
+    /// ahead. A segment that ends the run without qualifying is evicted, so the consumer misses there
+    /// and the provider restarts a producer at it.
+    private func awaitResidentRunHandover(head: Int) -> Bool {
+        guard let axis = writtenAxis,
+              let run = cache.keepableResidentRun(from: head, axis: axis)
+        else { return true }
+        let lastIndex = baseIndex + max(0, segmentBoundaries.count - 2)
+        guard Self.residentRunHoldsPump(head: head, frontier: run.frontier, lastIndex: lastIndex)
+        else { return true }
+        // Refused when the consumer already asked for the breaker (it has those bytes either way) or
+        // when it is gone already.
+        let dropped = run.breaker.map { cache.dropForRecut(index: $0) } ?? false
+        let parkedSince = DispatchTime.now().uptimeNanoseconds
+        // #240: a parked pump is not using the link.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
+        if pumpQoSCurrent == QOS_CLASS_UTILITY { pumpRelaxationRate.reset() }
+        EngineLog.emit(
+            "[HLSSegmentProducer] AE#1109 seg-\(head)...seg-\(run.frontier) are resident, written on "
+            + "this producer's axis by an earlier one; parking instead of cutting them again "
+            + "(last plan index \(lastIndex), cacheTarget=\(cache.targetIndex)"
+            + (run.breaker.map { ", seg-\($0) after it was written another way and "
+                + (dropped ? "is evicted" : "was not evicted (already asked for, or gone)") } ?? "")
+            + ")",
+            category: .session
+        )
+        let recheckLimit = head + Self.residentRunMinimumDepth
+        while !checkShouldStop() {
+            cache.awaitChange(timeout: 1.0)
+            let window = cache.keepableResidentRun(from: head, axis: axis, through: recheckLimit)
+            let holds = window.map {
+                Self.residentRunHoldsPump(head: head, frontier: $0.frontier, lastIndex: lastIndex)
+            } ?? false
+            let firstGap = holds ? nil : (window.map { $0.frontier + 1 } ?? head)
+            let consumerTarget = cache.targetIndex
+            if Self.residentRunParkReleases(consumerTarget: consumerTarget, firstGap: firstGap) {
+                let seconds = Double(DispatchTime.now().uptimeNanoseconds - parkedSince) / 1e9
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#1109 resident run at seg-\(head) has a gap at "
+                    + "seg-\(firstGap ?? head) after \(String(format: "%.1f", seconds))s, ahead of the "
+                    + "consumer (cacheTarget=\(consumerTarget)); cutting from the head",
+                    category: .session
+                )
+                return true
+            }
+        }
+        return false
     }
 
     /// Sequential-VOD duration became known (next segment's start recorded at the ledger).
@@ -3026,7 +3132,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
             cache.adopt(index: idx, stagingPath: result.path,
                         byteCount: result.bytesWritten,
-                        videoReach: takeVideoReach(forSegmentIndex: idx))
+                        videoReach: takeVideoReach(forSegmentIndex: idx),
+                        lineage: takeLineage())
             if isLive {
                 reportLiveSegmentFinalized(index: idx, nextIndex: nil)
             } else if onSequentialSegmentFinalized != nil {
@@ -3074,6 +3181,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     }
 
     // MARK: - Public API
+
+    /// AE#1095: runs on the pump thread before its first read. Set before `start()`. A session that
+    /// adopted parked segments positions the demuxer here, because on a file without an index that
+    /// seek is a linear scan (6.5 s on a 2 MB/s origin), and the load does not need to wait for it
+    /// while its first segments are already on disk.
+    var positionBeforeFirstRead: (@Sendable () -> Void)?
 
     func start() {
         assert(!isLive || onLiveSegmentFinalized != nil,
@@ -3273,7 +3386,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     replayReady.removeAll(keepingCapacity: true)
                     replayReadyIndex = 0
                 }
-                logDamagedLivePacket(ready.packet, origin: ready.origin, action: "forwarded")
+                logDamagedLivePacket(ready.packet, origin: ready.origin, action: .forwarded)
                 logVideoPacketProgress(ready.sample)
                 tapForRecording(ready.packet)
                 recordPlayedMedia(ready.packet, origin: ready.origin)
@@ -3330,7 +3443,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     if !wasCheckingReplay, liveReplayGuard.isDroppingReplay {
                         noCutWatchdog?.setReplayChecking(true, at: Date())
                     }
-                    logDamagedLivePacket(read.packet, origin: read.origin, action: "held")
+                    logDamagedLivePacket(read.packet, origin: read.origin, action: .held)
                     noCutWatchdog?.noteReplayPacketRead(at: Date())
                     replayPending.append(ReplayBufferedPacket(packet: read.packet, origin: read.origin,
                                                                sample: sample, isDuplicate: decision.drop))
@@ -3372,7 +3485,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 if damagedLivePacketStream(read.packet, origin: read.origin) != nil {
                     liveReplayGuard.noteDamagedPacket()
                 }
-                logDamagedLivePacket(read.packet, origin: read.origin, action: "held")
+                logDamagedLivePacket(read.packet, origin: read.origin, action: .held)
                 // Untimed fragments of this damaged boundary are provisional too;
                 // only verified replay permits discarding them without a signature.
                 replayPending.append(ReplayBufferedPacket(packet: read.packet, origin: read.origin,
@@ -3385,7 +3498,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 continue
             }
             // The recording sees the same unique source packets as playback.
-            logDamagedLivePacket(read.packet, origin: read.origin, action: "forwarded")
+            logDamagedLivePacket(read.packet, origin: read.origin, action: .forwarded)
             logVideoPacketProgress(sample)
             tapForRecording(read.packet)
             recordPlayedMedia(read.packet, origin: read.origin)
@@ -3393,25 +3506,42 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
-    func damagedLivePacketStream(_ packet: UnsafePointer<AVPacket>, origin: PacketOrigin) -> String? {
+    enum DamagedPacketStream: String { case video, audio }
+    enum DamagedPacketAction: String { case held, forwarded, discarded }
+    struct DamagedPacketKey: Hashable {
+        let stream: DamagedPacketStream
+        let action: DamagedPacketAction
+    }
+
+    func damagedLivePacketStream(_ packet: UnsafePointer<AVPacket>, origin: PacketOrigin) -> DamagedPacketStream? {
         guard isLive, (packet.pointee.flags & AV_PKT_FLAG_CORRUPT) != 0 else { return nil }
-        if origin == .main, packet.pointee.stream_index == videoStreamIndex { return "video" }
+        if origin == .main, packet.pointee.stream_index == videoStreamIndex { return .video }
         if packet.pointee.stream_index == audioConfig?.sourceStreamIndex,
-           (origin == .side) == (sideAudioDemuxer != nil) { return "audio" }
+           (origin == .side) == (sideAudioDemuxer != nil) { return .audio }
         return nil
     }
 
-    func logDamagedLivePacket(_ packet: UnsafePointer<AVPacket>, origin: PacketOrigin, action: String) {
+    func logDamagedLivePacket(_ packet: UnsafePointer<AVPacket>, origin: PacketOrigin, action: DamagedPacketAction) {
         guard let stream = damagedLivePacketStream(packet, origin: origin) else { return }
-        let key = stream + action
-        damagedPacketLogCounts[key, default: 0] += 1
-        let count = damagedPacketLogCounts[key]!
+        let key = DamagedPacketKey(stream: stream, action: action)
+        damagedPacketCounts[key, default: 0] += 1
+        let count = damagedPacketCounts[key]!
         guard count <= 3 || count.isMultiple(of: 64) else { return }
         let dts = packet.pointee.dts == Int64.min ? "missing" : String(packet.pointee.dts)
         let pts = packet.pointee.pts == Int64.min ? "missing" : String(packet.pointee.pts)
         let keyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
-        EngineLog.emit("[HLSSegmentProducer] live damaged packet: stream=\(stream) action=\(action) "
+        EngineLog.emit("[HLSSegmentProducer] live damaged packet: stream=\(stream.rawValue) action=\(action.rawValue) "
             + "count=\(count) dts=\(dts) pts=\(pts) keyframe=\(keyframe)", category: .session)
+    }
+
+    /// How many damaged packets of `stream` this producer handled with `action`. The counts are pump
+    /// state, so this may only be read once the pump has finished. Tests read it instead of the log
+    /// lines, which every producer in the process writes.
+    func damagedPacketCount(_ stream: DamagedPacketStream, _ action: DamagedPacketAction) -> Int {
+        finishCondition.lock()
+        defer { finishCondition.unlock() }
+        precondition(didFinishFlag, "damagedPacketCount read while the pump is running")
+        return damagedPacketCounts[DamagedPacketKey(stream: stream, action: action)] ?? 0
     }
 
     private var admittedVideoProgress = VideoPacketProgress()
@@ -3787,6 +3917,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         )
         if restartTargetVideoPts > Int64.min {
             bumpRestartCount()
+        }
+        if let position = positionBeforeFirstRead {
+            positionBeforeFirstRead = nil
+            if !checkShouldStop() { position() }
         }
         // #240: a running pump is pulling from the source. Claimed for the whole loop and released
         // on every exit path; the two park helpers hand it back for the duration of their wait.
@@ -4999,12 +5133,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
                                                                    pts: prev.pointee.pts)
                                 }
                             }
-                            finalizeAndWriteVideo(prev, nextDts: packet.pointee.dts, muxer: muxer)
+                            finalizeAndWriteVideo(prev, nextPacket: packet, muxer: muxer)
                             bumpPacketsWritten()
                         } else {
                             var pkt: UnsafeMutablePointer<AVPacket>? = prev
                             trackedPacketFree(&pkt)
                             pendingVideoPkt = nil
+                            pendingVideoPlacement = nil
                             exitReason = .muxerFailed
                             break readLoop
                         }
@@ -5148,11 +5283,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if let prev = pendingVideoPkt {
             let prevSeg = pendingVideoSegIndex   // unified: live + VOD both carry the routed index
             if let muxer = ensureMuxer(forSegmentIndex: prevSeg) {
-                finalizeAndWriteVideo(prev, nextDts: nil, muxer: muxer)
+                finalizeAndWriteVideo(prev, nextPacket: nil, muxer: muxer)
                 bumpPacketsWritten()
             } else {
                 var pkt: UnsafeMutablePointer<AVPacket>? = prev
                 trackedPacketFree(&pkt)
+                pendingVideoPlacement = nil
             }
             pendingVideoPkt = nil
         }
@@ -5341,19 +5477,93 @@ final class HLSSegmentProducer: @unchecked Sendable {
             : Int64.max
     }
 
+    /// Output-time-base timestamps and placement outcome for a video packet before telescoping
+    /// duration to its successor's output DTS.
+    struct VideoOutputPlacement: Equatable {
+        enum Outcome: Equatable {
+            case passedThrough
+            case gridded
+            case retimed
+        }
+
+        let muxerTimeBase: AVRational
+        let pts: Int64
+        let dts: Int64
+        let duration: Int64
+        let outcome: Outcome
+
+        static func == (lhs: Self, rhs: Self) -> Bool {
+            lhs.muxerTimeBase.num == rhs.muxerTimeBase.num
+                && lhs.muxerTimeBase.den == rhs.muxerTimeBase.den
+                && lhs.pts == rhs.pts
+                && lhs.dts == rhs.dts
+                && lhs.duration == rhs.duration
+                && lhs.outcome == rhs.outcome
+        }
+    }
+
+    static func rescaledVideoTicks(
+        _ ticks: Int64,
+        from sourceTimeBase: AVRational,
+        to targetTimeBase: AVRational
+    ) -> Int64 {
+        guard ticks != Int64.min,
+              sourceTimeBase.num > 0, sourceTimeBase.den > 0,
+              targetTimeBase.num > 0, targetTimeBase.den > 0 else {
+            return ticks
+        }
+        return av_rescale_q(ticks, sourceTimeBase, targetTimeBase)
+    }
+
+    /// Computes a packet's output `(pts, dts, duration)` in `muxerTimeBase`, applying
+    /// `pulldownRetimer` / `frameGrid` when active on a matching grid muxer and otherwise rescaling
+    /// from `sourceTimeBase`.
+    static func placeVideoPacket(
+        pts: Int64,
+        dts: Int64,
+        sourceDuration: Int64,
+        sourceTimeBase: AVRational,
+        muxerTimeBase: AVRational,
+        shift: Int64,
+        frameGrid: CFRFrameGrid?,
+        pulldownRetimer: PulldownCadenceRetimer?
+    ) -> VideoOutputPlacement {
+        let onGridMuxer = frameGrid.map { muxerTimeBase.den == $0.outputTimeBase.den } ?? false
+        let gridded: (pts: Int64, dts: Int64, duration: Int64)?
+        if !onGridMuxer {
+            gridded = nil
+        } else if let pulldownRetimer {
+            gridded = pulldownRetimer.place(pts: pts, dts: dts, duration: sourceDuration, shift: shift)
+        } else {
+            gridded = frameGrid?.place(pts: pts, dts: dts, duration: sourceDuration, shift: shift)
+        }
+        if let gridded {
+            let outcome: VideoOutputPlacement.Outcome =
+                pulldownRetimer?.lastOutcome == .retimed ? .retimed : .gridded
+            return VideoOutputPlacement(
+                muxerTimeBase: muxerTimeBase,
+                pts: gridded.pts,
+                dts: gridded.dts,
+                duration: gridded.duration,
+                outcome: outcome
+            )
+        }
+        return VideoOutputPlacement(
+            muxerTimeBase: muxerTimeBase,
+            pts: rescaledVideoTicks(pts, from: sourceTimeBase, to: muxerTimeBase),
+            dts: rescaledVideoTicks(dts, from: sourceTimeBase, to: muxerTimeBase),
+            duration: sourceDuration > 0
+                ? rescaledVideoTicks(sourceDuration, from: sourceTimeBase, to: muxerTimeBase)
+                : sourceDuration,
+            outcome: .passedThrough
+        )
+    }
+
     private func finalizeAndWriteVideo(
         _ packet: UnsafeMutablePointer<AVPacket>,
-        nextDts: Int64?,
+        nextPacket: UnsafeMutablePointer<AVPacket>?,
         muxer: MP4SegmentMuxer
     ) {
-        packet.pointee.duration = Self.resolveVideoSampleDuration(
-            existingDuration: packet.pointee.duration,
-            dts: packet.pointee.dts,
-            nextDts: nextDts,
-            fallback: videoFallbackDurationPts,
-            capTicks: videoSampleDurationCapTicks
-        )
-
         packet.pointee.stream_index = muxer.videoOutputStreamIndex
 
         if !hdr10PlusDetected, HDR10PlusMetadataScan.packetCarriesHDR10Plus(
@@ -5396,31 +5606,77 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let tapSourceKey = packet.pointee.pts
         let tapForWrite = convertP7Active ? videoPacketTapProvider?() : nil
 
-        // AE#886: decided on the source time base, before the rescale rounds it away.
-        // Sodalite#236: the retimer owns every packet of a 24p grid, so its window sees them all.
-        let onGridMuxer = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den
-        let gridded: (pts: Int64, dts: Int64, duration: Int64)?
-        if !onGridMuxer {
-            gridded = nil
-        } else if let pulldownRetimer {
-            gridded = pulldownRetimer.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
-                                            duration: packet.pointee.duration, shift: videoShiftPts)
+        // AE#886 / Sodalite#236: place both the look-behind packet and its successor on the muxer's
+        // output time base BEFORE resolving duration, then telescope duration to `next.dts - prev.dts`
+        // in that output time base. Resolving duration in the source time base before placement left
+        // snapped/unsnapped transitions and off-grid DTS fallbacks with `prev.dts + prev.duration >
+        // next.dts`, tripping movenc's `check_pkt` (`Packet duration: -N ... out of range` + `pts has
+        // no value`).
+        let muxerTb = muxer.muxerVideoTimeBase
+        let prevPlacement: VideoOutputPlacement
+        if let cached = pendingVideoPlacement,
+           cached.muxerTimeBase.num == muxerTb.num,
+           cached.muxerTimeBase.den == muxerTb.den {
+            prevPlacement = cached
         } else {
-            gridded = frameGrid?.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
-                                       duration: packet.pointee.duration, shift: videoShiftPts)
+            prevPlacement = Self.placeVideoPacket(
+                pts: packet.pointee.pts,
+                dts: packet.pointee.dts,
+                sourceDuration: packet.pointee.duration,
+                sourceTimeBase: sourceVideoTimeBase,
+                muxerTimeBase: muxerTb,
+                shift: videoShiftPts,
+                frameGrid: frameGrid,
+                pulldownRetimer: pulldownRetimer
+            )
         }
-        av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
-        if let gridded {
-            packet.pointee.pts = gridded.pts
-            packet.pointee.dts = gridded.dts
-            packet.pointee.duration = gridded.duration
-            if onGridMuxer, pulldownRetimer?.lastOutcome == .retimed {
-                retimedVideoPackets += 1
-            } else {
-                griddedVideoPackets += 1
+
+        let nextPlacement: VideoOutputPlacement?
+        if let nextPacket {
+            let placedNext = Self.placeVideoPacket(
+                pts: nextPacket.pointee.pts,
+                dts: nextPacket.pointee.dts,
+                sourceDuration: nextPacket.pointee.duration,
+                sourceTimeBase: sourceVideoTimeBase,
+                muxerTimeBase: muxerTb,
+                shift: videoShiftPts,
+                frameGrid: frameGrid,
+                pulldownRetimer: pulldownRetimer
+            )
+            pendingVideoPlacement = placedNext
+            nextPlacement = placedNext
+        } else {
+            pendingVideoPlacement = nil
+            nextPlacement = nil
+        }
+
+        let muxerCapTicks = videoSampleDurationCapTicks == Int64.max
+            ? Int64.max
+            : Self.rescaledVideoTicks(videoSampleDurationCapTicks, from: sourceVideoTimeBase, to: muxerTb)
+        let muxerFallback = videoFallbackDurationPts > 0
+            ? max(1, Self.rescaledVideoTicks(videoFallbackDurationPts, from: sourceVideoTimeBase, to: muxerTb))
+            : videoFallbackDurationPts
+
+        let resolvedDuration = Self.resolveVideoSampleDuration(
+            existingDuration: prevPlacement.duration,
+            dts: prevPlacement.dts,
+            nextDts: nextPlacement?.dts,
+            fallback: muxerFallback,
+            capTicks: muxerCapTicks
+        )
+
+        packet.pointee.pts = prevPlacement.pts
+        packet.pointee.dts = prevPlacement.dts
+        packet.pointee.duration = resolvedDuration
+        switch prevPlacement.outcome {
+        case .retimed:
+            retimedVideoPackets += 1
+        case .gridded:
+            griddedVideoPackets += 1
+        case .passedThrough:
+            if frameGrid != nil {
+                offGridVideoPackets += 1
             }
-        } else if frameGrid != nil {
-            offGridVideoPackets += 1
         }
         let write = writeMuxPacket { muxer.writePacket(packet) }
         if write.rc < 0, !loggedVideoWriteFailure {

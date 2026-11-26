@@ -44,6 +44,7 @@ struct ScenePlaybackInfo: Equatable, Sendable {
     var videoCodec: String
     var resolution: String
     var frameRate: String
+    var upscaling: String?
     var dynamicRange: String
     var dolbyVisionProfile: String?
     var videoBitrate: String
@@ -65,6 +66,7 @@ struct ScenePlaybackInfo: Equatable, Sendable {
         videoCodec: String = "—",
         resolution: String = "—",
         frameRate: String = "—",
+        upscaling: String? = nil,
         dynamicRange: String = "—",
         dolbyVisionProfile: String? = nil,
         videoBitrate: String = "—",
@@ -83,6 +85,7 @@ struct ScenePlaybackInfo: Equatable, Sendable {
         self.videoCodec = videoCodec
         self.resolution = resolution
         self.frameRate = frameRate
+        self.upscaling = upscaling
         self.dynamicRange = dynamicRange
         self.dolbyVisionProfile = dolbyVisionProfile
         self.videoBitrate = videoBitrate

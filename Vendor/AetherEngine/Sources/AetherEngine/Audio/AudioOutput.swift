@@ -63,7 +63,7 @@ final class AudioOutput: @unchecked Sendable {
         // whether they keep pitch (#434). Pinned here, while the timebase is still stopped.
         AudioRatePolicy.apply(to: renderer)
         observeAutomaticFlush()
-        rendererStatusObservation = renderer.observe(\.status, options: [.new]) { [weak self] _, _ in
+        rendererStatusObservation = renderer.observe(\.status, options: []) { [weak self] _, _ in
             guard let self else { return }
             rendererFailureQueue.async { [weak self] in self?.reportRendererFailure() }
         }

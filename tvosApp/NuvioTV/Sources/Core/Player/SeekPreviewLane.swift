@@ -888,12 +888,14 @@ final class SeekPreviewLane {
     var isDecodeDisabled: Bool { decodeDisabledReason != nil || transport.trippedReason != nil }
 
     init(originURL: URL, headers: [String: String], diskKey: String,
-         admission: @escaping Admission, localFrame: @escaping LocalFrame) {
+         admission: @escaping Admission, localFrame: @escaping LocalFrame,
+         configuration: URLSessionConfiguration? = nil) {
         self.originURL = originURL
         self.diskKey = diskKey
         self.admission = admission
         self.localFrame = localFrame
-        let transport = SeekPreviewRangeTransport(originURL: originURL, headers: headers)
+        let transport = SeekPreviewRangeTransport(originURL: originURL, headers: headers,
+                                                  configuration: configuration)
         self.transport = transport
         self.reader = SeekPreviewRangeReader(
             transport: transport,
@@ -1027,9 +1029,10 @@ final class SeekPreviewLane {
 
     private func ensureExtractor() -> FrameExtractor {
         if let extractor { return extractor }
-        // Software decode: a still never takes a VideoToolbox session from playback, and a Dolby
-        // Vision profile 5 keyframe gets the same reshaping as every other still.
-        let created = FrameExtractor(reader: reader, formatHint: nil, allowsHardwareDecode: false)
+        // Allow VideoToolbox so 4K HEVC stills (refused in software by FrameDecodeContext) can
+        // decode; FrameDecodeContext.stillUsesHardware still keeps no-base-layer Dolby Vision on
+        // software and falls back to software when VideoToolbox declines a codec.
+        let created = FrameExtractor(reader: reader, formatHint: nil, allowsHardwareDecode: true)
         extractor = created
         return created
     }

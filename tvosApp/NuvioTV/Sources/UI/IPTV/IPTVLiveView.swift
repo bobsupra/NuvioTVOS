@@ -63,6 +63,7 @@ struct IPTVLiveView: View {
     let onPlay: (URL, NuvioMeta, [String: String]) -> Void
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.amoledSurfaces) private var amoledSurfaces = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @State private var inlinePreviewPlayer: AVPlayer?
     @State private var inlinePreviewIsReady = false
@@ -355,7 +356,7 @@ struct IPTVLiveView: View {
 
         return ZStack {
             // Background
-            Color(red: 0.05, green: 0.05, blue: 0.07)
+            Self.backgroundColor(amoled: amoled, bodyColor: bodyColor)
                 .ignoresSafeArea()
 
             HStack(alignment: .top, spacing: 28) {
@@ -854,7 +855,7 @@ struct IPTVLiveView: View {
                     .padding(12)
                     .background(
                         RoundedRectangle(cornerRadius: 18)
-                            .fill(Color(red: 0.08, green: 0.08, blue: 0.11))
+                            .fill(cardSurfaceFill)
                             .overlay(RoundedRectangle(cornerRadius: 18).stroke(Color.white.opacity(0.08), lineWidth: 1))
                     )
                 }
@@ -1329,7 +1330,7 @@ struct IPTVLiveView: View {
         }
         .background(
             RoundedRectangle(cornerRadius: 20)
-                .fill(Color(red: 0.08, green: 0.08, blue: 0.11))
+                .fill(cardSurfaceFill)
                 .overlay(
                     RoundedRectangle(cornerRadius: 20)
                         .stroke(Color.white.opacity(0.08), lineWidth: 1)
@@ -1455,7 +1456,7 @@ struct IPTVLiveView: View {
                 // Background / preview
                 GeometryReader { geo in
                     ZStack {
-                        Color(red: 0.12, green: 0.12, blue: 0.16)
+                        previewBackdropFill
                         active.brandColor.opacity(0.25)
                         VStack {
                             channelBadgeView(channel: active, size: CGSize(width: 80, height: 60))
@@ -1554,7 +1555,7 @@ struct IPTVLiveView: View {
 
     private var emptyLivePlayerPreviewCard: some View {
         ZStack {
-            Color(red: 0.10, green: 0.10, blue: 0.14)
+            cardSurfaceFill
             VStack(spacing: 16) {
                 if loading {
                     ProgressView()
@@ -1654,12 +1655,28 @@ struct IPTVLiveView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             RoundedRectangle(cornerRadius: 20)
-                .fill(Color(red: 0.08, green: 0.08, blue: 0.11))
+                .fill(cardSurfaceFill)
                 .overlay(
                     RoundedRectangle(cornerRadius: 20)
                         .stroke(Color.white.opacity(0.08), lineWidth: 1)
                 )
         )
+    }
+
+    static func backgroundColor(amoled: Bool, bodyColor: String) -> Color {
+        Color.nuvioBackground(amoled: amoled, body: bodyColor)
+    }
+
+    static func surfaceFill(amoled: Bool, amoledSurfaces: Bool, opacity: Double = 0.045) -> Color {
+        (amoled && amoledSurfaces) ? .black : Color.white.opacity(opacity)
+    }
+
+    private var cardSurfaceFill: Color {
+        Self.surfaceFill(amoled: amoled, amoledSurfaces: amoledSurfaces)
+    }
+
+    private var previewBackdropFill: Color {
+        Self.surfaceFill(amoled: amoled, amoledSurfaces: amoledSurfaces, opacity: 0.06)
     }
 
     @ViewBuilder

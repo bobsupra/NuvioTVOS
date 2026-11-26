@@ -1602,8 +1602,8 @@ enum StreamBadgeSizing {
         // Decimal units, so the badge matches the size the source shows.
         let gigabytes = Double(bytes) / 1_000_000_000
         if gigabytes >= 1 {
-            return String(format: "Size %.1f GB", gigabytes)
+            return String(format: "%.1f GB", gigabytes)
         }
-        return "Size \(Int((Double(bytes) / 1_000_000).rounded())) MB"
+        return "\(Int((Double(bytes) / 1_000_000).rounded())) MB"
     }
 }

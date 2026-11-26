@@ -763,7 +763,7 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
     func testMdbListSettingsKeyMappingsCoverage() {
         let localKeys = MdbListSyncMapper.localToRemoteKeyMappings.map(\.local)
         XCTAssertTrue(localKeys.contains(SettingsKey.mdbListEnabled))
-        XCTAssertTrue(localKeys.contains(SettingsKey.mdbListApiKey))
+        XCTAssertFalse(localKeys.contains(SettingsKey.mdbListApiKey))
         XCTAssertTrue(localKeys.contains(SettingsKey.mdbListUseImdb))
         XCTAssertTrue(localKeys.contains(SettingsKey.mdbListUseTmdb))
         XCTAssertTrue(localKeys.contains(SettingsKey.mdbListUseTomatoes))
@@ -776,7 +776,7 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
 
         let remoteKeys = MdbListSyncMapper.remoteToLocalKeyMappings.map(\.remote)
         XCTAssertTrue(remoteKeys.contains("mdblist_enabled"))
-        XCTAssertTrue(remoteKeys.contains("mdblist_api_key"))
+        XCTAssertFalse(remoteKeys.contains("mdblist_api_key"))
         XCTAssertTrue(remoteKeys.contains("mdblist_use_imdb"))
         XCTAssertTrue(remoteKeys.contains("mdblist_use_tmdb"))
         XCTAssertTrue(remoteKeys.contains("mdblist_use_tomatoes"))

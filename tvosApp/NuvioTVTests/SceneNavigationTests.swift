@@ -791,5 +791,56 @@ final class SceneNavigationTests: XCTestCase {
 
         XCTAssertFalse(viewModel.isAdvancingEpisode, "playNextEpisode must not proceed when episode has not aired")
     }
+
+    func testScenePlaybackInfoFormatsAndPropagatesUpscalingStatus() {
+        XCTAssertNil(AetherPlaybackController.upscaleSummary(nil))
+
+        let lanczosSummary = AetherPlaybackController.formatUpscaleSummary(
+            scaler: .lanczos,
+            mlScale: nil,
+            sourceSize: CGSize(width: 1920, height: 1080),
+            targetSize: CGSize(width: 3840, height: 2160),
+            degraded: false,
+            disabledReason: nil
+        )
+        XCTAssertEqual(lanczosSummary, "Lanczos-3 · 1920×1080 → 3840×2160")
+
+        let metalFXWithMLSummary = AetherPlaybackController.formatUpscaleSummary(
+            scaler: .automatic,
+            mlScale: 2.0,
+            sourceSize: CGSize(width: 1280, height: 720),
+            targetSize: CGSize(width: 3840, height: 2160),
+            degraded: false,
+            disabledReason: nil
+        )
+        XCTAssertEqual(metalFXWithMLSummary, "VT Super Res + MetalFX · 1280×720 → 3840×2160")
+
+        let animeFallbackSummary = AetherPlaybackController.formatUpscaleSummary(
+            scaler: .lineArt,
+            mlScale: nil,
+            sourceSize: CGSize(width: 1280, height: 720),
+            targetSize: CGSize(width: 3840, height: 2160),
+            degraded: true,
+            disabledReason: nil
+        )
+        XCTAssertEqual(animeFallbackSummary, "Anime4K (Fallback) · 1280×720 → 3840×2160")
+
+        let disabledSummary = AetherPlaybackController.formatUpscaleSummary(
+            scaler: .lanczos,
+            mlScale: nil,
+            sourceSize: CGSize(width: 1920, height: 1080),
+            targetSize: CGSize(width: 3840, height: 2160),
+            degraded: false,
+            disabledReason: "frame budget overrun"
+        )
+        XCTAssertEqual(disabledSummary, "Disabled (frame budget overrun)")
+
+        let infoWithUpscaling = ScenePlaybackInfo(upscaling: lanczosSummary)
+        XCTAssertEqual(infoWithUpscaling.upscaling, "Lanczos-3 · 1920×1080 → 3840×2160")
+        XCTAssertNil(ScenePlaybackInfo().upscaling)
+
+        let debug = PlaybackDebugInfo(videoUpscaling: lanczosSummary)
+        XCTAssertEqual(debug.videoUpscaling, lanczosSummary)
+    }
 }
 

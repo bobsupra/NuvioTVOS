@@ -106,12 +106,12 @@ final class AIOSettingsSyncTests: XCTestCase {
         store.set(true, forKey: AIOStreamsHost.autoStartKey)
         var saved: [[String: Any]] = []
         let imported = try XCTUnwrap(AIOSettingsSync.importPayload(
-            ["enabled": false], store: store, localBackup: backup("2026-11-01T10:00:00.000Z")) { saved.append($0) })
+            ["enabled": false], store: store, localBackup: backup("2026-11-01T10:00:00.000Z")) { saved.append($0); return true })
         XCTAssertEqual(imported, AIOSettingsSync.Imported(settings: false, backup: false))
         XCTAssertEqual(AIOSettingsSync.syncChoice(store: store), false)
         XCTAssertTrue(store.bool(forKey: AIOStreamsHost.autoStartKey))
         XCTAssertTrue(saved.isEmpty)
-        XCTAssertNil(AIOSettingsSync.importPayload(["enabled": false], store: store, localBackup: nil) { _ in },
+        XCTAssertNil(AIOSettingsSync.importPayload(["enabled": false], store: store, localBackup: nil) { _ in true },
                      "already off: nothing to do")
     }
 
@@ -124,7 +124,7 @@ final class AIOSettingsSyncTests: XCTestCase {
             "backup": backup("2026-11-02T10:00:00.000Z", password: "new-pw", name: "theirs"),
         ]
         let imported = try XCTUnwrap(AIOSettingsSync.importPayload(
-            remote, store: store, localBackup: backup("2026-11-01T10:00:00.000Z", uuid: "local")) { saved.append($0) })
+            remote, store: store, localBackup: backup("2026-11-01T10:00:00.000Z", uuid: "local")) { saved.append($0); return true })
         XCTAssertEqual(imported, AIOSettingsSync.Imported(settings: true, backup: true))
         XCTAssertEqual(AIOSettingsSync.syncChoice(store: store), true)
         XCTAssertTrue(store.bool(forKey: AIOStreamsHost.autoStartKey))
@@ -141,7 +141,7 @@ final class AIOSettingsSyncTests: XCTestCase {
         AIOSettingsSync.importPayload(
             ["enabled": true, "backup": backup("2026-11-02T10:00:00.000Z", password: "same", name: "theirs")],
             store: store, localBackup: backup("2026-11-01T10:00:00.000Z", password: "same", uuid: "local-uuid")
-        ) { saved.append($0) }
+        ) { saved.append($0); return true }
         XCTAssertEqual(saved.first?["uuid"] as? String, "local-uuid", "the changes go into the configuration here; the addon keeps its address")
     }
 
@@ -150,11 +150,21 @@ final class AIOSettingsSyncTests: XCTestCase {
         let local = backup("2026-11-02T10:00:00.000Z", uuid: "local")
         for remoteTime in ["2026-11-01T10:00:00.000Z", "2026-11-02T10:00:00.000Z"] {
             let imported = AIOSettingsSync.importPayload(
-                ["enabled": true, "backup": backup(remoteTime, name: "theirs")], store: store, localBackup: local) { saved.append($0) }
+                ["enabled": true, "backup": backup(remoteTime, name: "theirs")], store: store, localBackup: local) { saved.append($0); return true }
             XCTAssertEqual(imported?.backup, false)
         }
         XCTAssertTrue(saved.isEmpty)
         XCTAssertFalse(store.bool(forKey: AIOSettingsSync.pendingBackupKey))
+    }
+
+    func testImportDoesNotQueueOrReportABackupWhenSecureStorageFails() throws {
+        let imported = try XCTUnwrap(AIOSettingsSync.importPayload(
+            ["enabled": true, "backup": backup("2026-11-02T10:00:00.000Z", name: "theirs")],
+            store: store, localBackup: nil
+        ) { _ in false })
+        XCTAssertEqual(imported.backup, false)
+        XCTAssertFalse(store.bool(forKey: AIOSettingsSync.pendingBackupKey))
+        XCTAssertEqual(AIOSettingsSync.syncChoice(store: store), true)
     }
 
     func testImportOfTheSameSettingsChangesNothing() throws {
@@ -162,7 +172,7 @@ final class AIOSettingsSyncTests: XCTestCase {
         store.set(true, forKey: AIOStreamsHost.autoStartKey)
         store.set("both", forKey: AIOStreamsHost.animeRequestKey)
         let imported = AIOSettingsSync.importPayload(
-            ["enabled": true, "settings": ["startWithNuvio": true, "animeRequest": "both"]], store: store, localBackup: nil) { _ in }
+            ["enabled": true, "settings": ["startWithNuvio": true, "animeRequest": "both"]], store: store, localBackup: nil) { _ in true }
         XCTAssertEqual(imported, AIOSettingsSync.Imported(settings: false, backup: false))
     }
 
@@ -170,7 +180,7 @@ final class AIOSettingsSyncTests: XCTestCase {
         var saved: [[String: Any]] = []
         AIOSettingsSync.importPayload(
             ["enabled": true, "backup": ["config": ["addonName": "x"], "savedAt": "2026-11-02T10:00:00.000Z"]],
-            store: store, localBackup: nil) { saved.append($0) }
+            store: store, localBackup: nil) { saved.append($0); return true }
         XCTAssertTrue(saved.isEmpty)
     }
 

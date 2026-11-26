@@ -1,0 +1,123 @@
+avformat/mpegtsenc: write the Dolby Vision descriptors
+
+The demuxer reads the DOVI video stream descriptor (0xb0) into the
+stream's AV_PKT_DATA_DOVI_CONF record, but the muxer never wrote it. A
+Dolby Vision stream copied from one transport stream into another
+therefore kept every RPU NAL unit and lost its configuration record,
+and a player that recognises Dolby Vision from the record treats the
+copy as HDR10 (Profile 8.1), HLG (Profile 8.4) or, for Profile 5, as
+HDR10 with the wrong colours, because IPT-PQ-c2 is then decoded as
+YCbCr. AetherEngine's live recordings stream-copy into MPEG-TS and hit
+exactly that.
+
+This is the muxer half of the upstream submission (FFmpeg PR 26097,
+second round), ported to n8.1.3. For an H.264 or HEVC stream whose
+record carries both its base layer and its RPU, the muxer writes the
+DOVI video stream descriptor from "Dolby Vision Streams Within the
+MPEG-2 Transport Stream Format" v1.2, and for compatibility ID 0
+(Profile 5) also the 'DOVI' registration descriptor, as section 7.1.2
+asks. Both go before the codec registration, because the demuxer keeps
+the last registration as codec_tag. Profile 5 keeps stream_type 0x24
+instead of the 0x06 of 7.1.2, since players that do not know Dolby
+Vision lose the video with 0x06. The last byte carries
+dv_md_compression where the demuxer reads it.
+
+Not covered: an enhancement layer on its own PID, which needs its base
+layer's PID. The upstream PMT size check is not part of this port: it
+guards the LCEVC linkage descriptor, which n8.1.3 does not write, and
+the at most 13 new bytes fit the existing 32-byte margin.
+
+diff --git a/libavformat/mpegtsenc.c b/libavformat/mpegtsenc.c
+index 96cdea955e..8f2279ef6e 100644
+--- a/libavformat/mpegtsenc.c
++++ b/libavformat/mpegtsenc.c
+@@ -23,6 +23,7 @@
+ #include "libavutil/bswap.h"
+ #include "libavutil/crc.h"
+ #include "libavutil/dict.h"
++#include "libavutil/dovi_meta.h"
+ #include "libavutil/intreadwrite.h"
+ #include "libavutil/mathematics.h"
+ #include "libavutil/mem.h"
+@@ -352,6 +353,56 @@ static void put_registration_descriptor(uint8_t **q_ptr, uint32_t tag)
+     *q_ptr = q;
+ }
+ 
++/* The Dolby Vision record of a stream that gets the descriptors of "Dolby
++ * Vision Streams Within the MPEG-2 Transport Stream Format" v1.2, or NULL.
++ * Only a single-PID stream qualifies, one that carries its base layer and its
++ * RPU: an enhancement layer on a PID of its own also needs the PID of its
++ * base layer, which the record does not hold. */
++static const AVDOVIDecoderConfigurationRecord *get_dovi_record(const AVCodecParameters *par)
++{
++    const AVPacketSideData *sd;
++    const AVDOVIDecoderConfigurationRecord *dovi;
++
++    if (par->codec_id != AV_CODEC_ID_HEVC && par->codec_id != AV_CODEC_ID_H264)
++        return NULL;
++    sd = av_packet_side_data_get(par->coded_side_data, par->nb_coded_side_data,
++                                 AV_PKT_DATA_DOVI_CONF);
++    if (!sd)
++        return NULL;
++    dovi = (const AVDOVIDecoderConfigurationRecord *)sd->data;
++    return dovi->bl_present_flag && dovi->rpu_present_flag ? dovi : NULL;
++}
++
++static void put_dovi_descriptors(uint8_t **q_ptr, const AVDOVIDecoderConfigurationRecord *dovi)
++{
++    uint8_t *q;
++
++    /* Section 7.1.2: a base layer that is neither SDR nor HDR compliant
++     * (compatibility ID 0, Profile 5) also gets the registration. The spec
++     * asks for stream_type 0x06 there too, which this muxer does not use:
++     * readers that do not know Dolby Vision, this demuxer among them, would
++     * no longer find the video. */
++    if (!dovi->dv_bl_signal_compatibility_id)
++        put_registration_descriptor(q_ptr, MKTAG('D', 'O', 'V', 'I'));
++
++    q = *q_ptr;
++    *q++ = DOVI_VIDEO_STREAM_DESCRIPTOR;
++    *q++ = 5;
++    *q++ = dovi->dv_version_major;
++    *q++ = dovi->dv_version_minor;
++    put16(&q, (dovi->dv_profile & 0x7f) << 9 |
++              (dovi->dv_level   & 0x3f) << 3 |
++              1 << 2 /* rpu_present_flag */ |
++              !!dovi->el_present_flag << 1 |
++              1 /* bl_present_flag */);
++    /* v1.2 reserves the low nibble. The demuxer reads dv_md_compression from
++     * its top two bits, as in the ISOBMFF dvcC box, so it goes there. */
++    *q++ = (dovi->dv_bl_signal_compatibility_id & 0x0f) << 4 |
++           (dovi->dv_md_compression & 0x03) << 2 |
++           0x03;
++    *q_ptr = q;
++}
++
+ static int get_dvb_stream_type(AVFormatContext *s, AVStream *st)
+ {
+     MpegTSWrite *ts = s->priv_data;
+@@ -801,7 +852,15 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+                     break;
+             }
+         break;
+-        case AVMEDIA_TYPE_VIDEO:
++        case AVMEDIA_TYPE_VIDEO: {
++            /* At most 13 bytes, which the 32-byte margin above still covers
++             * next to the codec registration. */
++            const AVDOVIDecoderConfigurationRecord *dovi = get_dovi_record(st->codecpar);
++
++            /* Before the codec registration: the demuxer takes codec_tag from
++             * the last registration it reads. */
++            if (dovi)
++                put_dovi_descriptors(&q, dovi);
+             if (stream_type == STREAM_TYPE_VIDEO_DIRAC) {
+                 put_registration_descriptor(&q, MKTAG('d', 'r', 'a', 'c'));
+             } else if (stream_type == STREAM_TYPE_VIDEO_VC1) {
+@@ -813,6 +872,7 @@ static int mpegts_write_pmt(AVFormatContext *s, MpegTSService *service)
+                 put_registration_descriptor(&q, MKTAG('A', 'V', 'S', 'V'));
+             }
+             break;
++        }
+         case AVMEDIA_TYPE_DATA:
+             if (codec_id == AV_CODEC_ID_SMPTE_KLV) {
+                 put_registration_descriptor(&q, MKTAG('K', 'L', 'V', 'A'));

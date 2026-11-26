@@ -1,0 +1,1601 @@
+mov: option to index the fragments of a seekable file lazily
+
+A fragmented file without a complete sidx is indexed while it opens: on a
+seekable input the header reads every top-level moof to the end of the
+file, one seek per fragment, before it returns. Over a network that is a
+request per fragment ahead of the first packet. Measured on a 4 minute,
+61 MB file of 96 fragments on a WAN address (35 ms round trip): 12 s and
+about 90 requests to open, and the same again for the first seek.
+
+lazy_frag_index (off by default) stops the header behind the first moof
+and leaves the rest to the seeks. A seek estimates a byte offset from the
+fragments it knows, resynchronises on the next moof, reads its tfdt and
+bisects on that until it has the fragment that holds the target. A
+resynchronised moof counts only when it parses in full (box sizes that add
+up, mfhd first, track ids the moov declares, a tfdt for every track with
+samples, sample data inside the mdat behind it) and the box chain behind
+it leads to another fragment or to the end of the media, so the estimate
+decides how many reads a seek takes and never where it lands. When the
+file has an mfra its moof offsets are used as hints, each checked against
+the moof it points at; its times are never used for timestamps. A complete
+sidx keeps the existing path.
+
+The sample is then looked up in the stream index as before. So that it is
+the sample a complete index gives, the seek also reads the headers of the
+neighbouring fragments where that sample can be in one of them: backwards
+to a sync sample when the fragment does not start with one, forwards for a
+forward seek, and backwards for the other audio and video streams, whose
+sample at the seek time a muxer may have put in an earlier fragment.
+
+A stream that follows the seeked one, and a seeked stream that is not the
+reference track, also reads the fragments after the one the seek resolved
+to, as far as its sample can be there: forward to the fragment that holds
+it, so that a video stream starts on a sync sample when fragments do not
+start with one, and backward while the next fragment starts the stream at
+or before the seek time.
+
+The streams get their durations when the file opens, from the last
+fragment of each track: through the mfra when there is one, else by
+resynchronising near the end of the file. A file is read as before, every
+moof, when its fragments carry no tfdt (their time is then only known by
+adding up everything before them), when its end cannot be found that way
+(a truncated file), or when the input is not seekable.
+
+Differences from a full index that remain with the option on:
+- the per-stream bit rate is not set at open (it was the total sample size
+  over the duration; one fragment says nothing about it), the container
+  bit rate is unchanged;
+- a file with a separate moof per track delivers the same packets with the
+  same timestamps in file order, a video fragment and then the audio
+  fragment behind it, rather than interleaved by timestamp across them;
+- boxes behind the last fragment other than the mfra are not read;
+- a forward seek past the last sync sample of a stream leaves the streams
+  that follow the seeked one at their end; a full index leaves them where
+  they were.
+
+Measured on the file above over the same WAN address: 0.9 s and 4 requests
+to open instead of 12 s and about 90, identical stream durations, and 30
+seeks that deliver packet for packet what the full index delivers. Checked
+packet for packet against the unpatched demuxer on 18 fragmented layouts
+(absolute and moof-relative offsets, with and without mfra, sidx per
+fragment and global, fragments that do not start with a sync sample,
+separate moofs per track, negative composition offsets, edit lists with
+empty and shifted edits, samples in the moov, audio only, truncated, no
+tfdt), backward, forward and any-sample seeks on the video and the audio
+stream, cold and in long sessions with reads in between. Without the
+option, and with it on files that are not fragmented, packets and reads
+are those of the unpatched demuxer.
+
+--- a/libavformat/isom.h
++++ b/libavformat/isom.h
+@@ -151,6 +151,8 @@
+ 
+ typedef struct MOVFragmentIndexItem {
+     int64_t moof_offset;
++    int64_t lazy_next;      ///< lazy_frag_index: where the root atoms continue behind this fragment
++    int lazy_loaded;        ///< lazy_frag_index: the samples of this fragment are in the stream indexes
+     int headers_read;
+     int current;
+     int nb_stream_info;
+@@ -164,7 +166,22 @@
+     int nb_items;
+     MOVFragmentIndexItem * item;
+ } MOVFragmentIndex;
++
++/* lazy_frag_index: a fragment found by resynchronising or by following the box chain */
++typedef struct MOVLazyFrag {
++    int64_t offset;         ///< of the moof
++    int64_t end;            ///< of the mdat behind it
++    int64_t next;           ///< offset of the next fragment; 0 not looked up, negative: none
++    int64_t time;           ///< reference track: tfdt
++    int64_t time_end;       ///< reference track: tfdt plus the sample durations
++    int has_ref;            ///< the fragment has samples of the reference track
++} MOVLazyFrag;
+ 
++typedef struct MOVLazyHint {
++    int64_t time;           ///< tfra time of the reference track
++    int64_t offset;         ///< tfra moof offset
++} MOVLazyHint;
++
+ typedef struct MOVIndexRange {
+     int64_t start;
+     int64_t end;
+@@ -377,6 +394,26 @@
+     int have_read_mfra_size;
+     uint32_t mfra_size;
+     uint32_t max_stts_delta;
++    int lazy_frag_index;        ///< option: index fragments as seeks need them
++    int lazy_state;             ///< 0 undecided, 1 in use, -1 not usable for this file
++    int lazy_ref_stream;        ///< stream whose tfdt orders the fragments
++    int lazy_seek_phase;        ///< 1 while seeking the streams that follow the seeked one, 2 while redoing the seeked one
++    int64_t lazy_size;          ///< file size
++    int64_t lazy_media_end;     ///< where the fragments end: the mfra, else the file size
++    int64_t lazy_first;         ///< offset of the first fragment of the reference track
++    int64_t lazy_floor;         ///< offset of the earliest fragment the last seek read
++    int64_t lazy_seek_frag;     ///< offset of the fragment the last seek resolved to
++    int64_t lazy_dur_sum;       ///< reference track duration of the known fragments
++    int lazy_dur_count;
++    MOVLazyFrag *lazy_frags;    ///< known fragments, by offset
++    int nb_lazy_frags;
++    unsigned lazy_frags_allocated;
++    MOVLazyHint *lazy_hints;    ///< fragment positions from the mfra, by offset
++    int nb_lazy_hints;
++    int64_t *lazy_track_end;    ///< per stream: latest end of a known fragment, track time scale
++    int64_t *lazy_sidx_end;     ///< per stream: latest end a sidx between fragments gave
++    int64_t *lazy_chain_end;    ///< per stream: track ends of the moof mov_lazy_chain() parses
++    int64_t *lazy_scan_end;     ///< per stream: track ends of a resynchronised candidate
+     int primary_item_id;
+     int cur_item_id;
+     HEIFItem **heif_item;
+--- a/libavformat/mov.c
++++ b/libavformat/mov.c
+@@ -1821,6 +1821,8 @@
+ 
+     item = &c->frag_index.item[index];
+     item->headers_read = 0;
++    item->lazy_next = 0;
++    item->lazy_loaded = 0;
+     item->current = 0;
+     item->nb_stream_info = c->fc->nb_streams;
+     item->moof_offset = offset;
+@@ -1868,6 +1870,18 @@
+     c->fragment.moof_offset = c->fragment.implicit_offset = avio_tell(pb) - 8;
+     av_log(c->fc, AV_LOG_TRACE, "moof offset %"PRIx64"\n", c->fragment.moof_offset);
+     c->frag_index.current = update_frag_index(c, c->fragment.moof_offset);
++    if (c->lazy_frag_index && c->frag_index.current >= 0) {
++        /* With a lazy index, reading on can run into a fragment a seek has
++         * already read (boxes like sidx in front of it are not fragments of
++         * their own): its samples are in the indexes, pass over it. */
++        int ret;
++        if (c->frag_index.item[c->frag_index.current].lazy_loaded)
++            return 0;
++        ret = mov_read_default(c, pb, atom);
++        if (ret >= 0 && c->frag_index.current >= 0 && c->frag_index.current < c->frag_index.nb_items)
++            c->frag_index.item[c->frag_index.current].lazy_loaded = 1;
++        return ret;
++    }
+     return mov_read_default(c, pb, atom);
+ }
+ 
+@@ -6237,7 +6251,11 @@
+         pts += duration;
+     }
+ 
+-    st->duration = sc->track_end = pts;
++    /* The duration of a lazily indexed file is known from its last fragment;
++     * a sidx in front of an earlier one must not shorten it. */
++    sc->track_end = pts;
++    if (c->lazy_state <= 0 || st->duration < pts)
++        st->duration = pts;
+ 
+     sc->has_sidx = 1;
+ 
+@@ -6281,7 +6299,10 @@
+             }
+         }
+ 
+-        if (offadd == 0)
++        /* A sidx in front of the last fragment reaches the end of the file like
++         * one that describes the whole file does. Read on its own, behind a lazy
++         * index, it says nothing about the fragments before it. */
++        if (offadd == 0 && c->lazy_state <= 0)
+             c->frag_index.complete = 1;
+     }
+ 
+@@ -9567,8 +9588,944 @@
+     for (int i = 0; i < nb_atoms; i++)
+         av_free(atoms[i].data);
+     av_free(atoms);
++
++    return ret;
++}
++
++/*
++ * Lazy fragment index (option lazy_frag_index).
++ *
++ * A fragmented file without a complete sidx is normally indexed by reading every
++ * top-level moof before the header returns, one seek per fragment. With the option,
++ * the header stops after the first moof and a seek finds its fragment on demand:
++ * it estimates a byte offset, resynchronises on the next moof, checks that it really
++ * is one, reads its tfdt and bisects on that. Only fragments reached that way, or by
++ * walking the box chain from one, are ever used, so the estimate decides how many
++ * reads a seek takes and never where it lands.
++ */
++#define MOV_LAZY_PROBE     8192
++#define MOV_LAZY_CHUNK     65536
++#define MOV_LAZY_MAX_MOOF  (32 << 20)
++#define MOV_LAZY_MAX_TRAFS 64
++#define MOV_LAZY_END       (-1)
++#define MOV_LAZY_INVALID   (-2)
++
++/* Index of the first known fragment at or after offset. */
++static int mov_lazy_find(const MOVContext *c, int64_t offset)
++{
++    int a = 0, b = c->nb_lazy_frags;
++
++    while (a < b) {
++        int m = (a + b) >> 1;
++        if (c->lazy_frags[m].offset < offset)
++            a = m + 1;
++        else
++            b = m;
++    }
++    return a;
++}
++
++static int mov_lazy_add(MOVContext *c, const MOVLazyFrag *frag)
++{
++    int index = mov_lazy_find(c, frag->offset);
++    MOVLazyFrag *tab;
++
++    if (index < c->nb_lazy_frags && c->lazy_frags[index].offset == frag->offset)
++        return index;
++    tab = av_fast_realloc(c->lazy_frags, &c->lazy_frags_allocated,
++                          (c->nb_lazy_frags + 1) * sizeof(*tab));
++    if (!tab)
++        return AVERROR(ENOMEM);
++    c->lazy_frags = tab;
++    memmove(tab + index + 1, tab + index, (c->nb_lazy_frags - index) * sizeof(*tab));
++    tab[index] = *frag;
++    c->nb_lazy_frags++;
++    if (frag->has_ref) {
++        c->lazy_dur_sum += frag->time_end - frag->time;
++        c->lazy_dur_count++;
++    }
++    return index;
++}
++
++static void mov_lazy_remove(MOVContext *c, int64_t offset)
++{
++    int index = mov_lazy_find(c, offset);
++
++    if (index >= c->nb_lazy_frags || c->lazy_frags[index].offset != offset)
++        return;
++    if (c->lazy_frags[index].has_ref) {
++        c->lazy_dur_sum -= c->lazy_frags[index].time_end - c->lazy_frags[index].time;
++        c->lazy_dur_count--;
++    }
++    memmove(c->lazy_frags + index, c->lazy_frags + index + 1,
++            (c->nb_lazy_frags - index - 1) * sizeof(*c->lazy_frags));
++    c->nb_lazy_frags--;
++}
++
++static int mov_lazy_read(AVIOContext *pb, int64_t pos, uint8_t *buf, int size)
++{
++    int ret;
++
++    if (avio_seek(pb, pos, SEEK_SET) < 0)
++        return 0;
++    ret = avio_read(pb, buf, size);
++    return FFMAX(ret, 0);
++}
++
++/**
++ * Check that buf holds a moof at file position offset, followed by its mdat, and
++ * describe it. Everything a false "moof" in sample data would have to get right:
++ * box sizes that add up exactly, mfhd first, track ids the moov declares, a tfdt
++ * for every track with samples, and sample data that lies inside the mdat.
++ *
++ * @return 0, AVERROR(EAGAIN) when len is short of FFMIN(size + 16, bytes left in
++ *         the file), AVERROR_INVALIDDATA when this is not a usable moof
++ */
++static int mov_lazy_parse_moof(MOVContext *c, const uint8_t *buf, int64_t len,
++                               int64_t offset, MOVLazyFrag *frag, int64_t *ends)
++{
++    int64_t file_size = c->lazy_size, left = file_size - offset;
++    int64_t size, p, mdat_size, mdat_hdr = 8, implicit = offset;
++    int64_t data_lo = INT64_MAX, data_hi = 0;
++    int     traf_stream[MOV_LAZY_MAX_TRAFS];
++    int64_t traf_end[MOV_LAZY_MAX_TRAFS];
++    int nb_trafs = 0, first = 1;
++
++    if (len < 8 || left < 8)
++        return AVERROR_INVALIDDATA;
++    size = AV_RB32(buf);
++    if (AV_RL32(buf + 4) != MKTAG('m','o','o','f') ||
++        size < 8 + 16 + 8 + 16 || size > MOV_LAZY_MAX_MOOF || size + 8 > left)
++        return AVERROR_INVALIDDATA;
++    if (len < FFMIN(size + 16, left))
++        return AVERROR(EAGAIN);
++
++    memset(frag, 0, sizeof(*frag));
++    frag->offset = offset;
++
++    for (p = 8; p < size;) {
++        int64_t cs;
++        uint32_t ct;
++
++        if (size - p < 8)
++            return AVERROR_INVALIDDATA;
++        cs = AV_RB32(buf + p);
++        ct = AV_RL32(buf + p + 4);
++        if (cs < 8 || cs > size - p)
++            return AVERROR_INVALIDDATA;
++        if (first) {
++            if (ct != MKTAG('m','f','h','d') || cs != 16)
++                return AVERROR_INVALIDDATA;
++            first = 0;
++        } else if (ct == MKTAG('t','r','a','f')) {
++            const uint8_t *t = buf + p;
++            int64_t q, base = -1, cur = -1, tfdt = AV_NOPTS_VALUE, dur_sum = 0;
++            int64_t samples = 0;
++            unsigned def_dur = 0, def_size = 0;
++            int stream = -1, tfhd = 0;
++
++            for (q = 8; q < cs;) {
++                const uint8_t *b = t + q;
++                int64_t bs;
++                uint32_t bt;
++
++                if (cs - q < 8)
++                    return AVERROR_INVALIDDATA;
++                bs = AV_RB32(b);
++                bt = AV_RL32(b + 4);
++                if (bs < 8 || bs > cs - q)
++                    return AVERROR_INVALIDDATA;
++                if (!tfhd && bt != MKTAG('t','f','h','d'))
++                    return AVERROR_INVALIDDATA;
++                if (bt == MKTAG('t','f','h','d')) {
++                    int64_t r = 16;
++                    unsigned flags, id;
++                    const MOVTrackExt *trex = NULL;
++
++                    if (tfhd || bs < 16)
++                        return AVERROR_INVALIDDATA;
++                    tfhd  = 1;
++                    flags = AV_RB24(b + 9);
++                    id    = AV_RB32(b + 12);
++                    for (int i = 0; i < c->trex_count; i++)
++                        if (c->trex_data[i].track_id == id)
++                            trex = &c->trex_data[i];
++                    for (int i = 0; i < c->fc->nb_streams; i++)
++                        if (((MOVStreamContext *)c->fc->streams[i]->priv_data)->id == id)
++                            stream = i;
++                    if (!trex || stream < 0)
++                        return AVERROR_INVALIDDATA;
++                    def_dur  = trex->duration;
++                    def_size = trex->size;
++                    if (flags & MOV_TFHD_BASE_DATA_OFFSET) {
++                        if (bs < r + 8)
++                            return AVERROR_INVALIDDATA;
++                        base = AV_RB64(b + r);
++                        r += 8;
++                    } else if (flags & MOV_TFHD_DEFAULT_BASE_IS_MOOF) {
++                        base = offset;
++                    } else {
++                        base = implicit;
++                    }
++                    if (flags & MOV_TFHD_STSD_ID)
++                        r += 4;
++                    if (flags & MOV_TFHD_DEFAULT_DURATION) {
++                        if (bs < r + 4)
++                            return AVERROR_INVALIDDATA;
++                        def_dur = AV_RB32(b + r);
++                        r += 4;
++                    }
++                    if (flags & MOV_TFHD_DEFAULT_SIZE) {
++                        if (bs < r + 4)
++                            return AVERROR_INVALIDDATA;
++                        def_size = AV_RB32(b + r);
++                        r += 4;
++                    }
++                    if (flags & MOV_TFHD_DEFAULT_FLAGS)
++                        r += 4;
++                    if (bs < r || base < 0)
++                        return AVERROR_INVALIDDATA;
++                    cur = base;
++                } else if (bt == MKTAG('t','f','d','t')) {
++                    if (bs < 16 || (b[8] && bs < 20))
++                        return AVERROR_INVALIDDATA;
++                    tfdt = b[8] ? AV_RB64(b + 12) : AV_RB32(b + 12);
++                    if (tfdt < 0)
++                        return AVERROR_INVALIDDATA;
++                } else if (bt == MKTAG('t','r','u','n')) {
++                    int64_t r = 16, n, es, bytes = 0, dur = 0;
++                    unsigned flags;
++
++                    if (bs < 16)
++                        return AVERROR_INVALIDDATA;
++                    flags = AV_RB24(b + 9);
++                    n     = AV_RB32(b + 12);
++                    if (flags & MOV_TRUN_DATA_OFFSET) {
++                        if (bs < r + 4)
++                            return AVERROR_INVALIDDATA;
++                        cur = base + (int32_t)AV_RB32(b + r);
++                        r += 4;
++                    }
++                    if (flags & MOV_TRUN_FIRST_SAMPLE_FLAGS)
++                        r += 4;
++                    es = !!(flags & MOV_TRUN_SAMPLE_DURATION) * 4 +
++                         !!(flags & MOV_TRUN_SAMPLE_SIZE)     * 4 +
++                         !!(flags & MOV_TRUN_SAMPLE_FLAGS)    * 4 +
++                         !!(flags & MOV_TRUN_SAMPLE_CTS)      * 4;
++                    if (bs < r || (es && (bs - r) / es < n) || n > INT_MAX)
++                        return AVERROR_INVALIDDATA;
++                    if (flags & (MOV_TRUN_SAMPLE_DURATION | MOV_TRUN_SAMPLE_SIZE)) {
++                        const uint8_t *e = b + r;
++                        int size_at = !!(flags & MOV_TRUN_SAMPLE_DURATION) * 4;
++                        for (int64_t i = 0; i < n; i++, e += es) {
++                            dur   += flags & MOV_TRUN_SAMPLE_DURATION ? AV_RB32(e) : def_dur;
++                            bytes += flags & MOV_TRUN_SAMPLE_SIZE ? AV_RB32(e + size_at) : def_size;
++                        }
++                    } else {
++                        dur   = n * def_dur;
++                        bytes = n * def_size;
++                    }
++                    if (n) {
++                        if (cur < 0 || !bytes)
++                            return AVERROR_INVALIDDATA;
++                        data_lo  = FFMIN(data_lo, cur);
++                        cur     += bytes;
++                        data_hi  = FFMAX(data_hi, cur);
++                        dur_sum += dur;
++                        samples += n;
++                    }
++                }
++                q += bs;
++            }
++            if (!tfhd)
++                return AVERROR_INVALIDDATA;
++            if (samples) {
++                /* Without a tfdt the fragment's time is only known by reading
++                 * every fragment before it. */
++                if (tfdt == AV_NOPTS_VALUE || nb_trafs == MOV_LAZY_MAX_TRAFS ||
++                    dur_sum > INT64_MAX - tfdt)
++                    return AVERROR_INVALIDDATA;
++                traf_stream[nb_trafs] = stream;
++                traf_end[nb_trafs++]  = tfdt + dur_sum;
++                if (stream == c->lazy_ref_stream && !frag->has_ref) {
++                    frag->has_ref  = 1;
++                    frag->time     = tfdt;
++                    frag->time_end = tfdt + dur_sum;
++                }
++                implicit = cur;
++            }
++        }
++        p += cs;
++    }
++    if (!nb_trafs)
++        return AVERROR_INVALIDDATA;
++
++    /* the mdat the samples are in */
++    if (AV_RL32(buf + size + 4) != MKTAG('m','d','a','t'))
++        return AVERROR_INVALIDDATA;
++    mdat_size = AV_RB32(buf + size);
++    if (mdat_size == 1) {
++        if (left < size + 16)
++            return AVERROR_INVALIDDATA;
++        mdat_size = AV_RB64(buf + size + 8);
++        mdat_hdr  = 16;
++    } else if (!mdat_size) {
++        mdat_size = left - size;
++    }
++    if (mdat_size < mdat_hdr || mdat_size > left - size)
++        return AVERROR_INVALIDDATA;
++    frag->end = offset + size + mdat_size;
++    if (data_lo < offset + size + mdat_hdr || data_hi > frag->end)
++        return AVERROR_INVALIDDATA;
++
++    for (int i = 0; i < c->fc->nb_streams; i++)
++        ends[i] = AV_NOPTS_VALUE;
++    for (int i = 0; i < nb_trafs; i++)
++        ends[traf_stream[i]] = FFMAX(ends[traf_stream[i]], traf_end[i]);
++    return 0;
++}
++
++/* The track ends of a parsed moof count once the fragment is accepted: a candidate
++ * found by resynchronising may still be dropped, and its times are then sample data. */
++static void mov_lazy_take_ends(MOVContext *c, const int64_t *ends)
++{
++    for (int i = 0; i < c->fc->nb_streams; i++)
++        if (ends[i] != AV_NOPTS_VALUE)
++            c->lazy_track_end[i] = FFMAX(c->lazy_track_end[i], ends[i]);
++}
++
++/* A sidx passed over on the way: mov_read_sidx() makes the end of what it describes
++ * the duration of its track, so a file with a sidx per fragment gets its duration
++ * from the last one. Note that end, as stored there (in the sidx's own time scale). */
++static void mov_lazy_sidx_end(MOVContext *c, const uint8_t *buf, int len)
++{
++    int version, count, p;
++    int64_t end;
++    unsigned id;
++
++    if (len < 32 || (version = buf[8]) > 1)
++        return;
++    id  = AV_RB32(buf + 12);
++    end = version ? AV_RB64(buf + 20) : AV_RB32(buf + 20);
++    p   = version ? 36 : 28;
++    if (len < p + 4)
++        return;
++    count = AV_RB16(buf + p + 2);
++    p += 4;
++    if (len < p + 12 * count)
++        return;
++    for (int i = 0; i < count; i++)
++        end += AV_RB32(buf + p + 12 * i + 4);
++    for (int i = 0; i < c->fc->nb_streams; i++)
++        if (((MOVStreamContext *)c->fc->streams[i]->priv_data)->id == id)
++            c->lazy_sidx_end[i] = FFMAX(c->lazy_sidx_end[i], end);
++}
++
++/**
++ * The box chain puts a top-level box at pos. Find the fragment that starts there,
++ * stepping over the boxes that may sit between fragments.
++ *
++ * @return its index, MOV_LAZY_END when the media ends there, MOV_LAZY_INVALID when
++ *         what is there cannot be followed, or a negative AVERROR
++ */
++static int mov_lazy_chain(MOVContext *c, AVIOContext *pb, int64_t pos)
++{
++    uint8_t buf[MOV_LAZY_PROBE];
++
++    for (int n = 0; n < 256; n++) {
++        int64_t left = c->lazy_size - pos, size;
++        uint32_t type;
++        int index = mov_lazy_find(c, pos), len;
++
++        if (index < c->nb_lazy_frags && c->lazy_frags[index].offset == pos)
++            return index;
++        if (!left || pos == c->lazy_media_end)
++            return MOV_LAZY_END;
++        if (left < 8)
++            return MOV_LAZY_INVALID;
++        len = mov_lazy_read(pb, pos, buf, FFMIN(sizeof(buf), left));
++        if (len < 8)
++            return MOV_LAZY_INVALID;
++        size = AV_RB32(buf);
++        type = AV_RL32(buf + 4);
++        if (type == MKTAG('m','o','o','f')) {
++            MOVLazyFrag frag;
++            int ret = mov_lazy_parse_moof(c, buf, len, pos, &frag, c->lazy_chain_end);
++            if (ret == AVERROR(EAGAIN)) {
++                int need = FFMIN(size + 16, left);
++                uint8_t *big = av_malloc(need);
++                if (!big)
++                    return AVERROR(ENOMEM);
++                ret = mov_lazy_read(pb, pos, big, need) == need ?
++                      mov_lazy_parse_moof(c, big, need, pos, &frag, c->lazy_chain_end) :
++                      AVERROR_INVALIDDATA;
++                av_free(big);
++            }
++            if (ret < 0)
++                return MOV_LAZY_INVALID;
++            mov_lazy_take_ends(c, c->lazy_chain_end);
++            return mov_lazy_add(c, &frag);
++        }
++        if (size == 1) {
++            if (len < 16)
++                return MOV_LAZY_INVALID;
++            size = AV_RB64(buf + 8);
++        } else if (!size) {
++            size = left;
++        }
++        if (size < 8 || size > left)
++            return MOV_LAZY_INVALID;
++        switch (type) {
++        case MKTAG('s','i','d','x'):
++            mov_lazy_sidx_end(c, buf, FFMIN(len, size));
++        case MKTAG('s','s','i','x'):
++        case MKTAG('s','t','y','p'): case MKTAG('p','r','f','t'):
++        case MKTAG('e','m','s','g'): case MKTAG('f','r','e','e'):
++        case MKTAG('s','k','i','p'): case MKTAG('u','u','i','d'):
++        case MKTAG('m','d','a','t'):
++            pos += size;
++            break;
++        case MKTAG('m','f','r','a'): case MKTAG('m','e','t','a'):
++        case MKTAG('u','d','t','a'):
++            return MOV_LAZY_END;
++        default:
++            return MOV_LAZY_INVALID;
++        }
++    }
++    return MOV_LAZY_INVALID;
++}
++
++/** The fragment after the one at offset, as mov_lazy_chain() returns it. */
++static int mov_lazy_next(MOVContext *c, AVIOContext *pb, int64_t offset)
++{
++    int index = mov_lazy_find(c, offset), ret;
++    int64_t end;
++
++    if (index >= c->nb_lazy_frags || c->lazy_frags[index].offset != offset)
++        return MOV_LAZY_INVALID;
++    if (c->lazy_frags[index].next > 0)
++        return mov_lazy_find(c, c->lazy_frags[index].next);
++    if (c->lazy_frags[index].next < 0)
++        return c->lazy_frags[index].next;
++    end = c->lazy_frags[index].end;
++    ret = mov_lazy_chain(c, pb, end);
++    if (ret < MOV_LAZY_INVALID)
++        return ret;
++    index = mov_lazy_find(c, offset);
++    c->lazy_frags[index].next = ret >= 0 ? c->lazy_frags[ret].offset : ret;
++    return ret;
++}
++
++/**
++ * Resynchronise: the first fragment that starts at or after from and before limit.
++ * A candidate counts once it parses and the box chain behind it holds.
++ *
++ * @return its index, MOV_LAZY_END when no fragment starts in that range, or a
++ *         negative AVERROR
++ */
++static int mov_lazy_scan(MOVContext *c, AVIOContext *pb, int64_t from, int64_t limit)
++{
++    uint8_t *buf = NULL;
++    unsigned allocated = 0;
++    int64_t base = from, rp = from;
++    int len = 0, pos = 4, eof = 0, ret = MOV_LAZY_END;
++
++#define MOV_LAZY_FILL(want) do {                                              \
++        int n_;                                                               \
++        uint8_t *nb_ = av_fast_realloc(buf, &allocated, len + (want));        \
++        if (!nb_) { ret = AVERROR(ENOMEM); goto end; }                        \
++        buf = nb_;                                                            \
++        if (avio_tell(pb) != rp && avio_seek(pb, rp, SEEK_SET) < 0) n_ = 0;   \
++        else n_ = avio_read(pb, buf + len, (want));                           \
++        if (n_ <= 0) eof = 1;                                                 \
++        else { len += n_; rp += n_; }                                         \
++    } while (0)
++
++    while (1) {
++        int found = -1, cand;
++        int64_t coff, size;
++
++        for (int i = pos; i + 4 <= len; i++)
++            if (buf[i] == 'm' && AV_RL32(buf + i) == MKTAG('m','o','o','f')) {
++                found = i;
++                break;
++            }
++        if (found < 0) {
++            int keep = FFMIN(len, 7);
++            if (eof || base + len >= limit + 8)
++                break;
++            memmove(buf, buf + len - keep, keep);
++            base += len - keep;
++            len   = keep;
++            pos   = 4;
++            MOV_LAZY_FILL(MOV_LAZY_CHUNK);
++            continue;
++        }
++        cand = found - 4;
++        coff = base + cand;
++        if (coff >= limit)
++            break;
++        size = AV_RB32(buf + cand);
++        if (size >= 8 + 16 + 8 + 16 && size <= MOV_LAZY_MAX_MOOF &&
++            size + 8 <= c->lazy_size - coff) {
++            int64_t need = FFMIN(size + 16, c->lazy_size - coff);
++            MOVLazyFrag frag;
++
++            while (len - cand < need && !eof)
++                MOV_LAZY_FILL(FFMAX(need - (len - cand), MOV_LAZY_CHUNK));
++            if (len - cand >= need &&
++                !mov_lazy_parse_moof(c, buf + cand, len - cand, coff, &frag, c->lazy_scan_end)) {
++                int index = mov_lazy_add(c, &frag);
++                if (index < 0) {
++                    ret = index;
++                    goto end;
++                }
++                ret = mov_lazy_next(c, pb, coff);
++                if (ret < MOV_LAZY_INVALID)
++                    goto end;
++                if (ret != MOV_LAZY_INVALID) {
++                    mov_lazy_take_ends(c, c->lazy_scan_end);
++                    ret = mov_lazy_find(c, coff);
++                    goto end;
++                }
++                mov_lazy_remove(c, coff);
++                ret = MOV_LAZY_END;
++            }
++        }
++        pos = found + 1;
++    }
++end:
++    av_free(buf);
++    return ret;
++}
++
++/* Probe the fragment an mfra entry points at; the mfra is dropped if it lies. */
++static int mov_lazy_hint(MOVContext *c, AVIOContext *pb, int i)
++{
++    int ret = mov_lazy_chain(c, pb, c->lazy_hints[i].offset);
++
++    if (ret == MOV_LAZY_INVALID || ret == MOV_LAZY_END ||
++        (ret >= 0 && c->lazy_frags[ret].offset != c->lazy_hints[i].offset)) {
++        c->nb_lazy_hints = 0;
++        return MOV_LAZY_INVALID;
++    }
++    return ret;
++}
++
++/**
++ * Find the fragment of the reference track that holds decode time t (reference
++ * track time scale, as in tfdt): the last one starting at or before t.
++ *
++ * @return its index, or a negative AVERROR
++ */
++static int mov_lazy_resolve(MOVContext *c, AVIOContext *pb, int64_t t)
++{
++    int64_t lo = -1, hi_limit = c->lazy_size, hi_time = AV_NOPTS_VALUE;
++    int halved = 1, index, ret;
++
++    /* An mfra says where the fragments are and roughly when; go straight there. */
++    if (c->nb_lazy_hints) {
++        int a = 0, b = c->nb_lazy_hints;
++        while (a < b) {
++            int m = (a + b) >> 1;
++            if (c->lazy_hints[m].time <= t)
++                a = m + 1;
++            else
++                b = m;
++        }
++        for (a = FFMAX(a - 1, 0); a >= 0 && c->nb_lazy_hints; a--) {
++            ret = mov_lazy_hint(c, pb, a);
++            if (ret < MOV_LAZY_INVALID)
++                return ret;
++            if (ret < 0 || !c->lazy_frags[ret].has_ref || c->lazy_frags[ret].time <= t)
++                break;
++        }
++    }
++
++    for (int i = 0; i < c->nb_lazy_frags; i++) {
++        const MOVLazyFrag *f = &c->lazy_frags[i];
++        if (!f->has_ref)
++            continue;
++        if (f->time <= t) {
++            lo = f->offset;
++        } else {
++            if (lo < 0)             /* before the first fragment: that one it is */
++                return i;
++            hi_limit = f->offset;
++            hi_time  = f->time;
++            break;
++        }
++    }
++    if (lo < 0)
++        return AVERROR_INVALIDDATA;
++
++    for (int step = 0; step < 1000; step++) {
++        const MOVLazyFrag *l = &c->lazy_frags[mov_lazy_find(c, lo)];
++        int64_t low = l->end, guess, before = hi_limit - low, fdur, ht, first;
++        int scanned, near;
++
++        if (t < l->time_end || low >= hi_limit)
++            break;
++        fdur = FFMAX(c->lazy_dur_sum / FFMAX(c->lazy_dur_count, 1), 1);
++        ht   = hi_time != AV_NOPTS_VALUE ? hi_time :
++               FFMAX(c->lazy_track_end[c->lazy_ref_stream], t + fdur);
++        near = t - l->time_end <= 2 * fdur || before <= 2 * MOV_LAZY_PROBE;
++        if (near)
++            guess = low;
++        else if (halved)            /* interpolate, aiming a fragment and a half early */
++            guess = low + (int64_t)((double)(t - l->time_end - fdur - fdur / 2) * before /
++                                    FFMAX(ht - l->time_end, 1));
++        else                        /* interpolation is not converging: bisect */
++            guess = low + before / 2;
++        guess   = FFMIN(guess, hi_limit - 1);
++        scanned = guess > low + MOV_LAZY_PROBE;
++
++        if (!scanned) {
++            ret = mov_lazy_next(c, pb, lo);
++        } else if (c->nb_lazy_hints) {
++            int a = 0, b = c->nb_lazy_hints;
++            while (a < b) {
++                int m = (a + b) >> 1;
++                if (c->lazy_hints[m].offset < guess)
++                    a = m + 1;
++                else
++                    b = m;
++            }
++            if (a < c->nb_lazy_hints && c->lazy_hints[a].offset < hi_limit) {
++                ret = mov_lazy_hint(c, pb, a);
++                if (ret == MOV_LAZY_INVALID)
++                    continue;       /* the mfra is gone, resynchronise instead */
++            } else {
++                ret = MOV_LAZY_END;
++            }
++        } else {
++            ret = mov_lazy_scan(c, pb, guess, hi_limit);
++        }
++        if (ret < MOV_LAZY_INVALID)
++            return ret;
++        if (ret < 0 && !scanned)
++            break;                  /* the media ends after lo */
++        first = ret >= 0 ? c->lazy_frags[ret].offset : -1;
++        /* A fragment without the reference track decides nothing; the next one does. */
++        while (ret >= 0 && !c->lazy_frags[ret].has_ref)
++            ret = mov_lazy_next(c, pb, c->lazy_frags[ret].offset);
++        if (ret < MOV_LAZY_INVALID)
++            return ret;
++        if (ret >= 0 && c->lazy_frags[ret].time <= t) {
++            lo = c->lazy_frags[ret].offset;
++        } else {
++            /* A scan from guess shows that no fragment starts between guess and
++             * the one it found. */
++            hi_limit = scanned ? guess : low;
++            hi_time  = ret >= 0 ? c->lazy_frags[ret].time : AV_NOPTS_VALUE;
++            if (ret < 0 && first < 0)
++                halved = 0;
++        }
++        l = &c->lazy_frags[mov_lazy_find(c, lo)];
++        if (hi_limit - l->end > before / 2)
++            halved = 0;
++        else
++            halved = 1;
++    }
++    /* What follows lo must start after t. An mfra that leaves fragments out, or a
++     * hole in the timeline, shows here. */
++    for (int n = 0;; n++) {
++        if (t < c->lazy_frags[mov_lazy_find(c, lo)].time_end)
++            break;
++        ret = mov_lazy_next(c, pb, lo);
++        while (ret >= 0 && !c->lazy_frags[ret].has_ref)
++            ret = mov_lazy_next(c, pb, c->lazy_frags[ret].offset);
++        if (ret < MOV_LAZY_INVALID)
++            return ret;
++        if (ret < 0 || c->lazy_frags[ret].time > t)
++            break;
++        lo = c->lazy_frags[ret].offset;
++        if (n == 4 && c->nb_lazy_hints) {
++            c->nb_lazy_hints = 0;
++            return mov_lazy_resolve(c, pb, t);
++        }
++    }
++    index = mov_lazy_find(c, lo);
++    return index;
++}
+ 
++/**
++ * The reference-track fragment before the one at offset.
++ *
++ * @param resync when 0, only what is known without reading sample data
++ * @return its offset, -1 when there is none or it is not known, or a negative AVERROR
++ */
++static int64_t mov_lazy_prev(MOVContext *c, AVIOContext *pb, int64_t offset, int resync)
++{
++    int64_t back = 4 * MOV_LAZY_CHUNK;
++
++    if (offset <= c->lazy_first)
++        return -1;
++    for (int pass = 0; pass < 16; pass++) {
++        int64_t found = -1, from;
++        int index = mov_lazy_find(c, offset), ret;
++
++        /* walk the known chain back from offset */
++        while (index > 0 && c->lazy_frags[index - 1].next == c->lazy_frags[index].offset) {
++            index--;
++            if (c->lazy_frags[index].has_ref) {
++                found = c->lazy_frags[index].offset;
++                break;
++            }
++        }
++        if (found >= 0)
++            return found;
++        from = c->lazy_frags[index].offset;     /* earliest fragment chained to offset */
++        if (from <= c->lazy_first)
++            return -1;
++
++        if (c->nb_lazy_hints) {
++            int a = 0, b = c->nb_lazy_hints;
++            while (a < b) {
++                int m = (a + b) >> 1;
++                if (c->lazy_hints[m].offset < from)
++                    a = m + 1;
++                else
++                    b = m;
++            }
++            ret = a > 0 ? mov_lazy_hint(c, pb, a - 1) : MOV_LAZY_END;
++        } else if (!resync) {
++            return -1;
++        } else {
++            int64_t start = FFMAX(from - back, c->lazy_first);
++            ret = start <= c->lazy_first ? mov_lazy_find(c, c->lazy_first) :
++                                           mov_lazy_scan(c, pb, start, from);
++            back *= 4;
++        }
++        if (ret < MOV_LAZY_INVALID)
++            return ret;
++        /* chain forward from what was found until it meets the fragment at from */
++        for (int n = 0; ret >= 0 && n < 4096 && c->lazy_frags[ret].offset < from; n++)
++            ret = mov_lazy_next(c, pb, c->lazy_frags[ret].offset);
++        if (ret < MOV_LAZY_INVALID)
++            return ret;
++        if (!c->nb_lazy_hints && !resync)
++            return -1;
++    }
++    return -1;
++}
++
++/* Fragment positions from the mfra, when the file has one. Only used as hints:
++ * each is checked against the moof it points at before it counts. */
++static int mov_lazy_read_mfra(MOVContext *c, AVIOContext *pb, int64_t *tail, int before_last)
++{
++    uint8_t last[16384], *alloc = NULL;
++    const uint8_t *buf;
++    int64_t size, p;
++    int n = FFMIN(c->lazy_size, sizeof(last));
++    unsigned ref_id = ((MOVStreamContext *)c->fc->streams[c->lazy_ref_stream]->priv_data)->id;
++
++    *tail = INT64_MAX;
++    /* one read for the mfro and, unless it is large, the mfra in front of it */
++    if (n < 16 || mov_lazy_read(pb, c->lazy_size - n, last, n) != n)
++        return 0;
++    size = AV_RB32(last + n - 4);
++    if (AV_RL32(last + n - 12) != MKTAG('m','f','r','o') ||
++        size < 8 + 24 + 16 || size > FFMIN(c->lazy_size, 64 << 20))
++        return 0;
++    if (size <= n) {
++        buf = last + n - size;
++    } else {
++        buf = alloc = av_malloc(size);
++        if (!alloc)
++            return AVERROR(ENOMEM);
++        if (mov_lazy_read(pb, c->lazy_size - size, alloc, size) != size) {
++            av_free(alloc);
++            return 0;
++        }
++    }
++    if (AV_RB32(buf) != size || AV_RL32(buf + 4) != MKTAG('m','f','r','a')) {
++        av_free(alloc);
++        return 0;
++    }
++    c->lazy_media_end = c->lazy_size - size;
++    for (p = 8; size - p >= 8;) {
++        int64_t bs = AV_RB32(buf + p);
++
++        if (bs < 8 || bs > size - p)
++            break;
++        if (AV_RL32(buf + p + 4) == MKTAG('t','f','r','a') && bs >= 24) {
++            const uint8_t *e = buf + p + 24;
++            int version    = buf[p + 8];
++            unsigned track = AV_RB32(buf + p + 12), fl = AV_RB32(buf + p + 16);
++            int64_t n      = AV_RB32(buf + p + 20), last = -1, last2 = -1;
++            int es = (version ? 16 : 8) + ((fl >> 4) & 3) + ((fl >> 2) & 3) + (fl & 3) + 3;
++            MOVLazyHint *hints = NULL;
++
++            if ((bs - 24) / es < n)
++                break;
++            if (track == ref_id && !c->lazy_hints && n) {
++                hints = av_malloc_array(n, sizeof(*hints));
++                if (!hints) {
++                    av_free(alloc);
++                    return AVERROR(ENOMEM);
++                }
++            }
++            for (int64_t i = 0; i < n; i++, e += es) {
++                int64_t time   = version ? AV_RB64(e)     : AV_RB32(e);
++                int64_t offset = version ? AV_RB64(e + 8) : AV_RB32(e + 4);
++                /* entries are in time order; keep the ones that also advance in the file */
++                if (offset <= last || offset >= c->lazy_size)
++                    continue;
++                last2 = last;
++                last  = offset;
++                if (hints) {
++                    hints[c->nb_lazy_hints].time     = time;
++                    hints[c->nb_lazy_hints++].offset = offset;
++                }
++            }
++            if (hints)
++                c->lazy_hints = hints;
++            /* A sidx in front of the last fragment is only passed when the walk
++             * to the end starts one fragment earlier. */
++            if (before_last && last2 >= 0)
++                last = last2;
++            if (last >= 0)
++                *tail = FFMIN(*tail, last);
++        }
++        p += bs;
++    }
++    av_free(alloc);
++    return 0;
++}
++
++/* Whether every audio and video stream has a fragment among those parsed since
++ * the ends in before were noted. */
++static int mov_lazy_tail_covers(const MOVContext *c, const int64_t *before)
++{
++    for (int i = 0; i < c->fc->nb_streams; i++) {
++        const AVStream *st = c->fc->streams[i];
++        if ((st->codecpar->codec_type == AVMEDIA_TYPE_AUDIO ||
++             st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) &&
++            !(st->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
++            c->lazy_track_end[i] == before[i])
++            return 0;
++    }
++    return 1;
++}
++
++/* Follow the chain from offset to the end of the media. */
++static int mov_lazy_walk_to_end(MOVContext *c, AVIOContext *pb, int64_t offset)
++{
++    int ret = mov_lazy_chain(c, pb, offset);
++
++    for (int n = 0; ret >= 0 && n < 65536; n++)
++        ret = mov_lazy_next(c, pb, c->lazy_frags[ret].offset);
+     return ret;
++}
++
++/**
++ * Decide, once the first moof has been read, whether this file can be indexed
++ * lazily: its fragments must carry tfdt, and the end of the media must be found
++ * (through the mfra, or by resynchronising near the end of the file) so that the
++ * streams get the duration a full scan would have given them.
++ */
++static void mov_lazy_init(MOVContext *c, AVIOContext *pb)
++{
++    int64_t pos = avio_tell(pb), tail = INT64_MAX, *before = NULL;
++    int ret, has_sidx = 0;
++
++    c->lazy_state = -1;
++    c->lazy_size  = c->lazy_media_end = avio_size(pb);
++    if (c->lazy_size <= 0 || !c->fc->nb_streams)
++        return;
++    c->lazy_ref_stream = 0;
++    for (int i = 0; i < c->fc->nb_streams; i++) {
++        const AVStream *st = c->fc->streams[i];
++        if (st->codecpar->codec_type == AVMEDIA_TYPE_VIDEO &&
++            !(st->disposition & AV_DISPOSITION_ATTACHED_PIC)) {
++            c->lazy_ref_stream = i;
++            break;
++        }
++    }
++    c->lazy_track_end = av_malloc_array(c->fc->nb_streams, 4 * sizeof(*c->lazy_track_end));
++    if (!c->lazy_track_end)
++        return;
++    c->lazy_sidx_end  = c->lazy_track_end + c->fc->nb_streams;
++    c->lazy_chain_end = c->lazy_track_end + 2 * c->fc->nb_streams;
++    c->lazy_scan_end  = c->lazy_track_end + 3 * c->fc->nb_streams;
++    for (int i = 0; i < 2 * c->fc->nb_streams; i++)
++        c->lazy_track_end[i] = AV_NOPTS_VALUE;
++
++    /* the fragment(s) the header has just read */
++    c->lazy_first = c->frag_index.item[0].moof_offset;
++    ret = mov_lazy_chain(c, pb, c->lazy_first);
++    for (int n = 0; ret >= 0 && !c->lazy_frags[ret].has_ref && n < 64; n++)
++        ret = mov_lazy_next(c, pb, c->lazy_frags[ret].offset);
++    if (ret < 0 || !c->lazy_frags[ret].has_ref)
++        goto end;
++    c->lazy_first = c->lazy_frags[ret].offset;
++
++    /* The end of the media, and with it the duration of every stream: the last
++     * fragment of each audio and video track has to be among those found. */
++    before = av_memdup(c->lazy_track_end, c->fc->nb_streams * sizeof(*before));
++    for (int i = 0; i < c->fc->nb_streams; i++)
++        has_sidx |= ((MOVStreamContext *)c->fc->streams[i]->priv_data)->has_sidx;
++    if (!before || mov_lazy_read_mfra(c, pb, &tail, has_sidx) < 0)
++        goto end;
++    ret = MOV_LAZY_INVALID;
++    if (tail != INT64_MAX)
++        ret = mov_lazy_walk_to_end(c, pb, tail);
++    if (ret != MOV_LAZY_END || !mov_lazy_tail_covers(c, before)) {
++        int64_t limit = c->lazy_media_end, first_end = c->lazy_frags[mov_lazy_find(c, c->lazy_first)].end;
++
++        if (ret != MOV_LAZY_END) {          /* the mfra does not lead to fragments */
++            av_freep(&c->lazy_hints);
++            c->nb_lazy_hints  = 0;
++            c->lazy_media_end = limit = c->lazy_size;
++        }
++        ret = MOV_LAZY_INVALID;
++        for (int64_t window = 4 * MOV_LAZY_CHUNK; window <= (64 << 20); window *= 4) {
++            int64_t from = FFMAX(c->lazy_size - window, first_end);
++            int found = from < limit ? mov_lazy_scan(c, pb, from, limit) : MOV_LAZY_END;
++
++            if (found < MOV_LAZY_INVALID)
++                goto end;
++            if (found >= 0) {
++                ret = mov_lazy_walk_to_end(c, pb, c->lazy_frags[found].offset);
++                if (ret != MOV_LAZY_END)
++                    break;
++            }
++            if (from == first_end) {     /* everything behind the first fragment was searched */
++                ret = mov_lazy_walk_to_end(c, pb, c->lazy_first);
++                break;
++            }
++            if (ret == MOV_LAZY_END && mov_lazy_tail_covers(c, before))
++                break;
++            limit = from;
++        }
++    }
++    if (ret != MOV_LAZY_END || !mov_lazy_tail_covers(c, before))
++        goto end;
++
++    for (int i = 0; i < c->fc->nb_streams; i++) {
++        AVStream *st = c->fc->streams[i];
++        int64_t end = FFMAX(c->lazy_track_end[i], c->lazy_sidx_end[i]);
++        if (end != AV_NOPTS_VALUE && st->duration < end)
++            st->duration = end;
++    }
++    c->lazy_state = 1;
++    av_log(c->fc, AV_LOG_VERBOSE, "fragment index is built lazily%s\n",
++           c->nb_lazy_hints ? ", with the mfra as a hint" : "");
++end:
++    if (c->lazy_state < 0)
++        av_log(c->fc, AV_LOG_VERBOSE, "fragments cannot be indexed lazily, reading them all\n");
++    av_free(before);
++    avio_seek(pb, pos, SEEK_SET);
++}
++
++static int mov_lazy_active(MOVContext *c, AVIOContext *pb)
++{
++    if (!c->lazy_state && c->lazy_frag_index && c->trex_data &&
++        (pb->seekable & AVIO_SEEKABLE_NORMAL) && pb == c->fc->pb &&
++        c->frag_index.nb_items && !c->frag_index.complete)
++        mov_lazy_init(c, pb);
++    return c->lazy_state > 0 && !c->frag_index.complete;
+ }
+ 
+ static const MOVParseTableEntry mov_default_parse_table[] = {
+@@ -9802,6 +10759,27 @@
+                 c->atom_depth --;
+                 return 0;
+             }
++            if (c->lazy_frag_index && atom.type == MKTAG('r','o','o','t') &&
++                c->found_moov && c->found_mdat && a.size <= INT64_MAX - start_pos &&
++                mov_lazy_active(c, pb)) {
++                int cur = c->frag_index.current;
++                c->next_root_atom = start_pos + a.size;
++                /* Only when this box belongs to the current fragment: after a seek,
++                 * current is the last fragment the seek read, and reading on can be
++                 * behind an earlier one (an mdat in front of the first moof, then
++                 * that moof's own mdat). Noting it there made the fragment its own
++                 * successor, and reading switched to it forever. */
++                if (cur >= 0 && cur < c->frag_index.nb_items &&
++                    c->frag_index.item[cur].moof_offset <= start_pos &&
++                    (cur + 1 == c->frag_index.nb_items ||
++                     c->frag_index.item[cur + 1].moof_offset > start_pos)) {
++                    /* also when reading on got here: a later seek must not read it again */
++                    c->frag_index.item[cur].headers_read = 1;
++                    c->frag_index.item[cur].lazy_next    = c->next_root_atom;
++                }
++                c->atom_depth --;
++                return 0;
++            }
+             left = a.size - avio_tell(pb) + start_pos;
+             if (left > 0) /* skip garbage at atom end */
+                 avio_skip(pb, left);
+@@ -10210,6 +11188,9 @@
+         av_freep(&mov->frag_index.item[i].stream_info);
+     }
+     av_freep(&mov->frag_index.item);
++    av_freep(&mov->lazy_frags);
++    av_freep(&mov->lazy_hints);
++    av_freep(&mov->lazy_track_end);
+ 
+     av_freep(&mov->aes_decrypt);
+     av_freep(&mov->chapter_tracks);
+@@ -11101,7 +12082,7 @@
+         }
+     }
+ 
+-    if (mov->trex_data || mov->use_mfra_for > 0) {
++    if ((mov->trex_data || mov->use_mfra_for > 0) && mov->lazy_state <= 0) {
+         for (i = 0; i < s->nb_streams; i++) {
+             AVStream *st = s->streams[i];
+             MOVStreamContext *sc = st->priv_data;
+@@ -11257,6 +12238,11 @@
+         mov->frag_index.item[index].moof_offset == target) {
+         if (index + 1 < mov->frag_index.nb_items)
+             mov->next_root_atom = mov->frag_index.item[index + 1].moof_offset;
++        /* The next known fragment need not be the next one in the file. */
++        if (mov->lazy_state > 0 && !mov->frag_index.complete) {
++            mov->next_root_atom     = mov->frag_index.item[index].lazy_next;
++            mov->frag_index.current = index;
++        }
+         if (mov->frag_index.item[index].headers_read)
+             return 0;
+         mov->frag_index.item[index].headers_read = 1;
+@@ -11455,6 +12441,12 @@
+             mov->frag_index.allocated_size = 0;
+             mov->frag_index.current = -1;
+             mov->frag_index.complete = 0;
++            /* the lazy index goes with it and is set up again with the first moof */
++            mov->lazy_state    = 0;
++            mov->nb_lazy_frags = mov->nb_lazy_hints = 0;
++            mov->lazy_dur_sum  = mov->lazy_dur_count = 0;
++            av_freep(&mov->lazy_hints);
++            av_freep(&mov->lazy_track_end);
+         }
+ 
+         for (i = 0; i < s->nb_streams; i++) {
+@@ -11609,11 +12601,297 @@
+     return 0;
+ }
+ 
+-static int mov_seek_fragment(AVFormatContext *s, AVStream *st, int64_t timestamp)
++/* Read the headers of the fragment at offset, unless they have been read. */
++static int mov_lazy_load(AVFormatContext *s, int64_t offset)
+ {
+     MOVContext *mov = s->priv_data;
++    int index = update_frag_index(mov, offset);
++
++    if (index < 0)
++        return AVERROR(ENOMEM);
++    if (!mov->frag_index.item[index].headers_read) {
++        int ret = mov_switch_root(s, -1, index);
++        if (ret < 0)
++            return ret;
++    }
++    return 0;
++}
++
++/* Read the headers of every fragment from the one at from up to, not including,
++ * the one at to. */
++static int mov_lazy_load_range(AVFormatContext *s, int64_t from, int64_t to)
++{
++    MOVContext *mov = s->priv_data;
++    int ret;
++
++    for (int n = 0; from < to && n < 4096; n++) {
++        if ((ret = mov_lazy_load(s, from)) < 0)
++            return ret;
++        ret = mov_lazy_next(mov, s->pb, from);
++        if (ret < 0)
++            return ret < MOV_LAZY_INVALID ? ret : 0;
++        from = mov->lazy_frags[ret].offset;
++    }
++    return 0;
++}
++
++/* Whether the stream's samples in the (loaded) fragment at offset include the one
++ * a seek to timestamp with these flags stops at. */
++static int mov_lazy_has_sample(MOVContext *mov, AVStream *st, int64_t offset,
++                               int64_t timestamp, int flags)
++{
++    const MOVStreamContext *sc = st->priv_data;
++    const FFStream *sti = ffstream(st);
++    int index = search_frag_moof_offset(&mov->frag_index, offset);
++    const MOVFragmentStreamInfo *info = get_frag_stream_info(&mov->frag_index, index, sc->id);
++    int start, end = sti->nb_index_entries;
++
++    if (!info || info->index_entry < 0)
++        return 0;
++    start = info->index_entry;
++    for (int i = index + 1; i < mov->frag_index.nb_items; i++) {
++        const MOVFragmentStreamInfo *next = get_frag_stream_info(&mov->frag_index, i, sc->id);
++        if (next && next->index_entry >= 0) {
++            end = next->index_entry;
++            break;
++        }
++    }
++    for (int i = start; i < end && i < sti->nb_index_entries; i++) {
++        const AVIndexEntry *e = &sti->index_entries[i];
++        if (!(flags & AVSEEK_FLAG_ANY) && !(e->flags & AVINDEX_KEYFRAME))
++            continue;
++        if (flags & AVSEEK_FLAG_BACKWARD ? e->timestamp <= timestamp : e->timestamp >= timestamp)
++            return 1;
++    }
++    return 0;
++}
++
++/**
++ * Seek with a lazy fragment index: find the fragment that holds timestamp, read
++ * its headers, and read those of its neighbours as far as the sample the seek
++ * stops at needs them. The sample itself is then found in the stream's index as
++ * with a complete fragment index.
++ */
++static int mov_lazy_seek_fragment(AVFormatContext *s, AVStream *st, int64_t timestamp, int flags)
++{
++    MOVContext *mov = s->priv_data;
++    const MOVStreamContext *sc = st->priv_data;
++    AVStream *ref = s->streams[mov->lazy_ref_stream];
++    int64_t t, offset, floor, cur, prev;
++    int index, ret;
++
++    if (mov->lazy_seek_phase || !mov->frag_index.nb_items)
++        return 0;
++
++    t = av_sat_add64(timestamp, sc->time_offset);
++    if (st != ref)
++        t = av_rescale_q(t, st->time_base, ref->time_base);
++    index = mov_lazy_resolve(mov, s->pb, t);
++    if (index < 0)
++        return index;
++    offset = floor = cur = mov->lazy_seek_frag = mov->lazy_frags[index].offset;
++    av_log(s, AV_LOG_DEBUG, "lazy seek: stream %d time %"PRId64" is in the fragment at 0x%"PRIx64
++           " (%"PRId64" to %"PRId64"), %d fragments known\n", st->index, t, offset,
++           mov->lazy_frags[index].time, mov->lazy_frags[index].time_end, mov->nb_lazy_frags);
++    if ((ret = mov_lazy_load(s, offset)) < 0)
++        return ret;
++
++    /* A stream other than the reference track may not have a fragment of its own
++     * here; read on to the first one that has it. */
++    if (st != ref) {
++        for (int n = 0; n < 8; n++) {
++            const MOVFragmentStreamInfo *info =
++                get_frag_stream_info(&mov->frag_index,
++                                     search_frag_moof_offset(&mov->frag_index, cur), sc->id);
++            if (info && info->index_entry >= 0)
++                break;
++            index = mov_lazy_next(mov, s->pb, cur);
++            if (index < MOV_LAZY_INVALID)
++                return index;
++            if (index < 0)
++                break;
++            cur = mov->lazy_frags[index].offset;
++            if ((ret = mov_lazy_load(s, cur)) < 0)
++                return ret;
++        }
++    }
++
++    /* The fragment before, when finding it costs no sample data: the other
++     * streams' samples that straddle the seek point are in it. */
++    prev = mov_lazy_prev(mov, s->pb, offset, 0);
++    if (prev < -1)
++        return prev;
++    if (prev >= 0) {
++        if ((ret = mov_lazy_load_range(s, prev, offset)) < 0)
++            return ret;
++        floor = prev;
++    }
++
++    /* The sample this seek stops at: a fragment need not start with a sync
++     * sample, and need not hold one at all. */
++    if (flags & AVSEEK_FLAG_BACKWARD) {
++        for (int n = 0; n < 256 && !mov_lazy_has_sample(mov, st, cur, timestamp, flags); n++) {
++            prev = mov_lazy_prev(mov, s->pb, cur, 1);
++            if (prev < -1)
++                return prev;
++            if (prev < 0)
++                break;
++            if ((ret = mov_lazy_load_range(s, prev, cur)) < 0)
++                return ret;
++            cur   = prev;
++            floor = FFMIN(floor, prev);
++        }
++    } else {
++        for (int n = 0; n < 256 && !mov_lazy_has_sample(mov, st, cur, timestamp, flags); n++) {
++            index = mov_lazy_next(mov, s->pb, cur);
++            if (index < MOV_LAZY_INVALID)
++                return index;
++            if (index < 0)
++                break;
++            cur = mov->lazy_frags[index].offset;
++            if ((ret = mov_lazy_load(s, cur)) < 0)
++                return ret;
++        }
++    }
++
++    /* Reading resumes behind the earliest fragment this seek may land in. What
++     * lies before the first fragment is in the moov and always indexed. */
++    mov->lazy_floor = floor > mov->frag_index.item[0].moof_offset ? floor : 0;
++    index = search_frag_moof_offset(&mov->frag_index, floor);
++    if (index < mov->frag_index.nb_items && mov->frag_index.item[index].moof_offset == floor)
++        mov->next_root_atom = mov->frag_index.item[index].lazy_next;
++    return 0;
++}
++
++/**
++ * After the seeked stream has its sample: the audio and video streams that follow
++ * it are positioned by that sample's time, on a sample a muxer may have put in an
++ * earlier fragment. Read fragments backwards until the fragments read reach back
++ * to that time in each of them, so that they stop where a complete index would
++ * have them stop.
++ *
++ * @return 1 when fragments were read and the seeked stream's sample must be looked
++ *         up again, 0 when nothing changed, or a negative AVERROR
++ */
++static int mov_lazy_seek_others(AVFormatContext *s, int stream_index, int64_t seek_timestamp, int flags)
++{
++    MOVContext *mov = s->priv_data;
++    int changed = 0;
++
++    if (mov->lazy_floor <= mov->lazy_first)
++        return 0;
++    /* a sample at or before the time: the sync sample a backward seek stops at,
++     * any sample to know that nothing is missing in front of a forward one */
++    if (!(flags & AVSEEK_FLAG_BACKWARD))
++        flags = AVSEEK_FLAG_BACKWARD | AVSEEK_FLAG_ANY;
++    for (int round = 0; round < 256; round++) {
++        int64_t prev;
++        int need = 0, index, ret;
++
++        for (int i = 0; i < s->nb_streams && !need; i++) {
++            AVStream *st = s->streams[i];
++            const FFStream *sti = ffstream(st);
++            const MOVStreamContext *sc = st->priv_data;
++            int64_t timestamp;
++            int sample;
++
++            if (i == stream_index || sti->nb_index_entries < 2 || st->discard == AVDISCARD_ALL ||
++                (st->disposition & AV_DISPOSITION_ATTACHED_PIC) ||
++                (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
++                 st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO))
++                continue;
++            timestamp = av_rescale_q(seek_timestamp, s->streams[stream_index]->time_base, st->time_base) -
++                        (sc->min_corrected_pts + sc->dts_shift);
++            sample = av_index_search_timestamp(st, timestamp, flags);
++            need   = sample >= 0 && sti->index_entries[sample].pos < mov->lazy_floor;
++        }
++        if (!need)
++            break;
++        prev = mov_lazy_prev(mov, s->pb, mov->lazy_floor, 1);
++        if (prev < -1)
++            return prev;
++        if (prev < 0)
++            break;
++        if ((ret = mov_lazy_load_range(s, prev, mov->lazy_floor)) < 0)
++            return ret;
++        mov->lazy_floor = prev;
++        index = search_frag_moof_offset(&mov->frag_index, prev);
++        if (index < mov->frag_index.nb_items && mov->frag_index.item[index].moof_offset == prev)
++            mov->next_root_atom = mov->frag_index.item[index].lazy_next;
++        changed = 1;
++    }
++    return changed;
++}
++
++/* The stream's first sample in the (loaded) fragment at offset, or NULL. */
++static const AVIndexEntry *mov_lazy_first_sample(MOVContext *mov, AVStream *st, int64_t offset)
++{
++    const MOVStreamContext *sc = st->priv_data;
++    const FFStream *sti = ffstream(st);
++    int index = search_frag_moof_offset(&mov->frag_index, offset);
++    const MOVFragmentStreamInfo *info = get_frag_stream_info(&mov->frag_index, index, sc->id);
++
++    if (!info || info->index_entry < 0 || info->index_entry >= sti->nb_index_entries)
++        return NULL;
++    return &sti->index_entries[info->index_entry];
++}
++
++/**
++ * Read the fragments from the one the seek resolved to onwards for an audio or
++ * video stream that is positioned without having resolved a fragment of its own
++ * (one that follows the seeked stream, or a seeked stream that is not the
++ * reference track), as far as a complete index could have its sample there:
++ * - forward, until a fragment holds the sample the seek stops at; else the
++ *   nearest sample known could lie behind fragments not read yet, or the stream
++ *   could start on the first sample read, which need not be a sync sample when
++ *   fragments do not start with one;
++ * - backward, while the next fragment starts the stream at or before timestamp:
++ *   a muxer may begin a track's fragment slightly earlier than the reference
++ *   track's, so the sample at timestamp can be in the fragment after.
++ */
++static int mov_lazy_seek_forward(AVFormatContext *s, AVStream *st, int64_t timestamp, int flags)
++{
++    MOVContext *mov = s->priv_data;
++    int64_t cur = mov->lazy_seek_frag, resume = mov->next_root_atom;
++    int index, ret = 0, missing = 0;
++
++    if ((st->disposition & AV_DISPOSITION_ATTACHED_PIC) ||
++        (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO &&
++         st->codecpar->codec_type != AVMEDIA_TYPE_VIDEO))
++        return 0;
++    for (int n = 0; n < 256; n++) {
++        if ((ret = mov_lazy_load(s, cur)) < 0)
++            break;
++        if (flags & AVSEEK_FLAG_BACKWARD) {
++            const AVIndexEntry *first = mov_lazy_first_sample(mov, st, cur);
++            if (n && first && first->timestamp > timestamp)
++                break;
++            /* a stream that has ended does not come back */
++            if (!first && ++missing == 8)
++                break;
++        } else if (mov_lazy_has_sample(mov, st, cur, timestamp, flags)) {
++            break;
++        }
++        index = mov_lazy_next(mov, s->pb, cur);
++        if (index < 0) {
++            ret = index < MOV_LAZY_INVALID ? index : 0;
++            break;
++        }
++        cur = mov->lazy_frags[index].offset;
++    }
++    /* loading moved the root atom; reading still resumes behind the floor */
++    mov->next_root_atom = resume;
++    return ret;
++}
++
++static int mov_seek_fragment(AVFormatContext *s, AVStream *st, int64_t timestamp, int flags)
++{
++    MOVContext *mov = s->priv_data;
+     int index;
+ 
++    if (mov->lazy_state > 0 && !mov->frag_index.complete)
++        return mov_lazy_seek_fragment(s, st, timestamp, flags);
++
+     if (!mov->frag_index.complete)
+         return 0;
+ 
+@@ -11684,15 +12962,24 @@
+     // can search over the DTS timeline.
+     timestamp -= (sc->min_corrected_pts + sc->dts_shift);
+ 
+-    ret = mov_seek_fragment(s, st, timestamp);
++    ret = mov_seek_fragment(s, st, timestamp, flags);
+     if (ret < 0)
+         return ret;
++    {
++        MOVContext *mov = s->priv_data;
++        if (mov->lazy_state > 0 && !mov->frag_index.complete && mov->lazy_seek_phase != 2 &&
++            (mov->lazy_seek_phase == 1 || st->index != mov->lazy_ref_stream) &&
++            (ret = mov_lazy_seek_forward(s, st, timestamp, flags)) < 0)
++            return ret;
++    }
+ 
+     for (;;) {
+         sample = av_index_search_timestamp(st, timestamp, flags);
+         av_log(s, AV_LOG_TRACE, "stream %d, timestamp %"PRId64", sample %d\n", st->index, timestamp, sample);
+         if (sample < 0 && sti->nb_index_entries && timestamp < sti->index_entries[0].timestamp)
+             sample = 0;
++        if (sample < 0 && ((MOVContext *)s->priv_data)->lazy_seek_phase == 1)
++            break;
+         if (sample < 0) /* not sure what to do */
+             return AVERROR_INVALIDDATA;
+ 
+@@ -11713,6 +13000,25 @@
+         timestamp = next_ts;
+     }
+ 
++    /* Lazy fragment index: the stream index has holes. A stream that follows the
++     * seeked one starts in the fragments that seek read, never in older ones that
++     * happen to be the nearest known. */
++    if (((MOVContext *)s->priv_data)->lazy_seek_phase == 1) {
++        const MOVContext *mov = s->priv_data;
++        if (sample < 0)
++            sample = flags & AVSEEK_FLAG_BACKWARD ? 0 : sti->nb_index_entries;
++        while ((flags & AVSEEK_FLAG_BACKWARD) && sample < sti->nb_index_entries &&
++               sti->index_entries[sample].pos < mov->lazy_floor)
++            sample++;
++        if (sample == sti->nb_index_entries) {
++            /* nothing read yet: its samples become current as they are read */
++            mov_current_sample_set(sc, sample);
++            sc->tts_index  = sample;
++            sc->tts_sample = 0;
++            return AVERROR(EAGAIN);
++        }
++    }
++
+     mov_current_sample_set(sc, sample);
+     av_log(s, AV_LOG_TRACE, "stream %d, found sample %d\n", st->index, sc->current_sample);
+     /* adjust time to sample index */
+@@ -11777,6 +13083,7 @@
+ 
+     st = s->streams[stream_index];
+     sti = ffstream(st);
++    mc->lazy_floor = 0;
+     sample = mov_seek_stream(s, st, sample_time, flags);
+     if (sample < 0)
+         return sample;
+@@ -11784,6 +13091,21 @@
+     if (mc->seek_individually) {
+         /* adjust seek timestamp to found sample timestamp */
+         int64_t seek_timestamp = sti->index_entries[sample].timestamp;
++
++        if (mc->lazy_state > 0 && !mc->frag_index.complete && mc->lazy_floor > 0) {
++            int ret = mov_lazy_seek_others(s, stream_index, seek_timestamp, flags);
++            if (ret < 0)
++                return ret;
++            if (ret) {
++                /* fragments were read in front of the sample: find it again */
++                mc->lazy_seek_phase = 2;
++                sample = mov_seek_stream(s, st, sample_time, flags);
++                mc->lazy_seek_phase = 0;
++                if (sample < 0)
++                    return sample;
++                seek_timestamp = sti->index_entries[sample].timestamp;
++            }
++        }
+         sti->skip_samples = mov_get_skip_samples(st, sample);
+ 
+         for (i = 0; i < s->nb_streams; i++) {
+@@ -11795,7 +13117,9 @@
+                 continue;
+ 
+             timestamp = av_rescale_q(seek_timestamp, s->streams[stream_index]->time_base, st->time_base);
++            mc->lazy_seek_phase = mc->lazy_state > 0 && !mc->frag_index.complete;
+             sample = mov_seek_stream(s, st, timestamp, flags);
++            mc->lazy_seek_phase = 0;
+             if (sample >= 0)
+                 sti->skip_samples = mov_get_skip_samples(st, sample);
+         }
+@@ -11872,6 +13196,8 @@
+         {.i64 = 0}, 0, 1, FLAGS },
+     { "max_stts_delta", "treat offsets above this value as invalid", OFFSET(max_stts_delta), AV_OPT_TYPE_INT, {.i64 = UINT_MAX-48000*10 }, 0, UINT_MAX, .flags = AV_OPT_FLAG_DECODING_PARAM },
+     { "interleaved_read", "Interleave packets from multiple tracks at demuxer level", OFFSET(interleaved_read), AV_OPT_TYPE_BOOL, {.i64 = 1 }, 0, 1, .flags = AV_OPT_FLAG_DECODING_PARAM },
++    { "lazy_frag_index", "Index the fragments of a seekable fragmented file as seeks need them instead of reading every moof before the header returns",
++        OFFSET(lazy_frag_index), AV_OPT_TYPE_BOOL, {.i64 = 0 }, 0, 1, .flags = AV_OPT_FLAG_DECODING_PARAM },
+ 
+     { NULL },
+ };

@@ -78,12 +78,12 @@ struct SelectedLibraryMutationContext {
                         && MdbListAuthStore.accountBindingID(in: store) == binding
                 }
             } else {
-                let key = store.string(forKey: SettingsKey.mdbListApiKey)?
+                let key = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store, profileScope: scope)?
                     .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 guard !key.isEmpty else { return nil }
                 accountIsCurrent = {
                     mdbListTokens.tokens(for: scope) == nil
-                        && store.string(forKey: SettingsKey.mdbListApiKey)?
+                        && ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store, profileScope: scope)?
                             .trimmingCharacters(in: .whitespacesAndNewlines) == key
                 }
             }

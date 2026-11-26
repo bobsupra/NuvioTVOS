@@ -1051,7 +1051,7 @@ enum AddonRatingsService {
 
         // Keep credentials out of task/cache identifiers while still invalidating them when a key
         // changes. The final signature is a SHA-256 digest of the profile and relevant settings.
-        let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey) ?? ""
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: defaults) ?? ""
         let apiKeyDigest = SHA256.hash(data: Data(apiKey.utf8)).map { String(format: "%02x", $0) }.joined()
         let profileID = ProfileSettings.activeProfileID ?? "default"
         let payload = (["profile=\(profileID)", "mdbListApiKey=\(apiKeyDigest)"] + relevantSettings)

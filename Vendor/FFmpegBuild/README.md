@@ -10,7 +10,7 @@
   <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dswift-versions"></a>
   <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dplatforms"></a>
   <img src="https://img.shields.io/badge/FFmpeg-8.1-brightgreen">
-  <img src="https://img.shields.io/badge/dav1d-1.5.4-blue">
+  <img src="https://img.shields.io/badge/dav1d-1.5.5-blue">
   <img src="https://img.shields.io/badge/license-LGPL--2.1-lightgrey">
   <a href="https://ko-fi.com/superuser404"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
@@ -32,7 +32,7 @@ Full FFmpeg builds for iOS land at 40-70 MB because they bundle a TLS stack, enc
 | libavutil      | Shared primitives                                     |
 | libswresample  | Audio resampling / channel remap / format convert     |
 | libswscale     | Pixel-format convert (YUV → NV12 / P010) for the SW-decode path |
-| libavfilter    | Trimmed filter set: zscale + tonemap + colorspace for HDR → SDR still extraction, bwdif + yadif for CPU deinterlacing on the SW-decode path, idet + fieldmatch + decimate for inverse telecine, yadif_videotoolbox + hwupload for GPU (Metal) deinterlacing of VideoToolbox frames, dialoguenhance + pan + acompressor + alimiter (with abuffer / abuffersink / aformat / aresample) for AetherEngine's audio shaping |
+| libavfilter    | Trimmed filter set: zscale + tonemap + colorspace for HDR → SDR still extraction, bwdif + yadif for CPU deinterlacing on the SW-decode path, idet + fieldmatch + decimate for inverse telecine, bwdif_videotoolbox + yadif_videotoolbox + hwupload for GPU (Metal) deinterlacing of VideoToolbox frames, fieldmatch_videotoolbox + decimate_videotoolbox for GPU (Metal) inverse telecine, dialoguenhance + pan + acompressor + alimiter (with abuffer / abuffersink / aformat / aresample) for AetherEngine's audio shaping |
 | **dav1d**      | Fast AV1 software decoder (separate xcframework)      |
 | **zimg**       | zscale's resampling / colorspace backend (separate xcframework, link-only) |
 | **libzvbi**    | DVB teletext decoder backend for `libzvbi_teletext` (separate xcframework, link-only) |
@@ -45,7 +45,7 @@ Anything the app layer should already handle or doesn't need:
 - Encoders, except FLAC and EAC3 (kept for the audio bridge that re-encodes non-streamable sources like TrueHD / DTS / DTS-HD MA. FLAC for the lossless 7.1 path, EAC3 5.1 for the default soundbar-compat path that surfaces surround via HDMI bitstream tunnel; AAC-LC, ALAC and the AC-3 encoder E-AC-3 pulls in, for the silence AetherEngine appends to a stream-copied track whose audio ends before its video, AetherEngine#847)
 - Muxers, except MP4 / MOV / HLS (kept for the HLS-fMP4 producer that wraps streams for AVPlayer)
 - libavdevice (libavfilter is included but trimmed to a handful of filters, see In)
-- Most filters: libavfilter ships only buffer / buffersink / format / scale / zscale / tonemap / colorspace / bwdif / yadif / idet / fieldmatch / decimate / yadif_videotoolbox / hwupload, and on the audio side abuffer / abuffersink / aformat / aresample / pan / dialoguenhance / acompressor / alimiter
+- Most filters: libavfilter ships only buffer / buffersink / format / scale / zscale / tonemap / colorspace / bwdif / yadif / idet / fieldmatch / decimate / bwdif_videotoolbox / yadif_videotoolbox / fieldmatch_videotoolbox / decimate_videotoolbox / hwupload, and on the audio side abuffer / abuffersink / aformat / aresample / pan / dialoguenhance / acompressor / alimiter
 - Programs (`ffmpeg`, `ffplay`, `ffprobe`)
 - Hardware accel layers other than VideoToolbox
 - Text subtitle rendering (do that in SwiftUI)
@@ -57,6 +57,7 @@ Anything the app layer should already handle or doesn't need:
 ./build.sh static   # static variant, for apps that can meet LGPL 6(a) themselves
 ./build.sh package  # repackage frameworks without recompiling
 ./build.sh clean    # wipe everything
+./build.sh --without-dtsx-heights   # leave out the DTS:X height patch, see below
 ```
 
 Needs Xcode 16+ and roughly 10-30 minutes depending on your machine. All sources (FFmpeg, dav1d, zimg, libzvbi) clone on first run.
@@ -68,14 +69,14 @@ Output lands in `Sources/` as xcframeworks, ready to consume via Swift Package M
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "3.15.0")
+    .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "3.19.1")
 ]
 
 // Target:
 .product(name: "AetherFFmpegBuild", package: "FFmpegBuild")
 ```
 
-Pin `branch: "main"` instead of a version if you want to track the latest rebuilds (that is how [AetherEngine](https://github.com/superuser404notfound/AetherEngine) consumes it).
+Pin `branch: "main"` instead of a version if you want to track the latest rebuilds. [AetherEngine](https://github.com/superuser404notfound/AetherEngine) pins a release with `.upToNextMinor(from:)`.
 
 Then import the modules you need: `AetherLibavformat`, `AetherLibavcodec`, `AetherLibavutil`, `AetherLibswresample`, `AetherLibswscale`, `AetherLibavfilter`, `AetherLibdav1d`. (`AetherLibzimg` is a link-only backend for `zscale`, and `AetherLibzvbi` a link-only backend for the teletext decoder; you don't import either directly.) The umbrella `AetherFFmpegBuild` product links all of them plus the system frameworks (AudioToolbox, CoreMedia, CoreVideo, VideoToolbox) in one shot.
 
@@ -137,9 +138,11 @@ The frameworks that call one of Apple's required-reason APIs carry their own `Pr
 
 ## Local FFmpeg patches
 
-`build.sh` applies twelve patches to the FFmpeg source after checkout (each documented in place; the two largest live in `patches/`):
+`build.sh` applies eighteen patches to the FFmpeg source after checkout (each documented in place; the larger ones live in `patches/`):
 
-- **`patch_ffmpeg`**: balances autoreleased Metal objects in `vf_yadif_videotoolbox.m` (upstream over-release crashes host apps whose GCD queues pop their last-resort autorelease pool at session teardown).
+- **`patch_ffmpeg_yadif_videotoolbox`** (`patches/yadif-videotoolbox-one-submission.patch`): `vf_yadif_videotoolbox.m` sends each frame to the GPU once. Upstream commits a command buffer and waits for it once per plane, so an NV12 or P010 frame goes to the GPU twice and the decode thread waits twice. The planes are now dispatches in one command buffer with one wait. The output is unchanged (framemd5-identical for NV12 and P010, field and frame mode, both parities), and on an M1 a 1080p59.94 field took 1.86 ms instead of 2.34 ms (AetherEngine issue 1101).
+
+  The same patch carries two fixes. The command buffer and encoder are autoreleased objects under FFmpeg's non-ARC build, and upstream also releases them by hand; that over-release crashed host apps whose GCD queues pop their last-resort autorelease pool at session teardown, so a per-frame `@autoreleasepool` is now their only release. And a texture the texture cache fails to create no longer goes into `CFRelease` as NULL.
 - **`patch_ffmpeg_pgssub`**: `pgssubdec.c` emits an empty (clearing) subtitle instead of dropping a display set whose palette is missing, outside `AV_EF_EXPLODE`. PGS carries no end time, a cue is closed by the start of its successor, so dropping a damaged set also dropped the successor that closes the previous cue, and the predecessor overstayed its authored end until the next intact set arrived (AetherEngine issue 142). The pts is already set and no rect is allocated at that point, so this is the same clearing form the `object_count == 0` path returns. The first version of this patch instead kept the palette/object cache across an Epoch-Continue PCS; that was withdrawn because retained objects occupy the fixed `MAX_EPOCH_OBJECTS` slots and made a conformant connection set fail with "Too many objects in epoch". Proposed upstream as FFmpeg PR 23851.
 - **`patch_ffmpeg_visionos`**: `videotoolbox.c` skips `kCVPixelBufferOpenGLESCompatibilityKey` on visionOS, where the key is unavailable because the platform has neither OpenGL ES nor OpenGL. Upstream selects it on `TARGET_OS_IPHONE`, which is 1 on visionOS (`TARGET_OS_IOS` is the one that is 0), so the hardware-decode path does not compile for `xros` without this. Nothing is lost: the attribute only asks CoreVideo to make the buffer bindable as a GL texture, and on visionOS every consumer is Metal, which the IOSurface properties set alongside it already cover.
 - **`patch_ffmpeg_vc1_parser`**: `vc1_parser.c` seeds its parse context from `avctx->extradata` the way `vc1_decode_init` does. libavformat closes and reopens the parser on every reposition, so without this a seek lands on a zeroed `VC1Context` and the entry point BDU that follows is read at the wrong bit offset: `hrd_full[]` precedes `coded_size_flag` only when the sequence header set `hrd_param_flag`, which a zeroed context cannot know. The bit taken for `coded_size_flag` is then the leaky bucket fullness at that entry point, so a bucket below half falls back to a zero picture size ("Picture size 0x0 is invalid") and one above half takes a coded size out of the following payload, silently. Affects any VC-1 track whose encoder leaves the sequence header to the container (AetherEngine issue 490). Proposed upstream as FFmpeg PR 24458.
@@ -151,7 +154,69 @@ The frameworks that call one of Apple's required-reason APIs carry their own `Pr
 - **`patch_ffmpeg_av1_delayed_rap`** (`patches/av1-delayed-rap.patch`): an AV1 Temporal Unit that carries a Sequence Header and opens with a hidden Key Frame (`show_frame = 0`) refreshing all eight reference slots is a keyframe. Encodes built on forward key frames open every GOP that way, and decoding from such a unit is correct right away, but upstream treats it as an inter frame in two places: `av1_parser` reports only a shown Key Frame, and for Matroska video that verdict replaces the block's flag; and muxers (mkvmerge, lavf) leave the SimpleBlock flag off, so `matroskadec` never builds an index and every seek fails, including the one back to the start after probing. The reporting file reached AetherEngine without a single keyframe and never started (AetherEngine issue 931). The patch adds `ff_av1_is_random_access_point()` to `libavformat/av1.c`, which reads the first frame header up to `refresh_frame_flags`; `matroskadec` flags an unflagged AV1 SimpleBlock that passes it and `av1_parser` reports the same case. A hidden Key Frame with a partial refresh, which libaom writes for `--enable-fwd-kf`, is left alone, since frames after it still reference the previous shown Key Frame. Proposed upstream as FFmpeg PR 25607.
 - **`patch_ffmpeg_matroska_skip_attachments`** (`patches/matroska-skip-attachments.patch`): the matroska demuxer gains an AVClass with the option `skip_attachments` (off by default). Matroska attachments, in practice the fonts of ASS subtitles, are read in full while the file opens, before the first packet: tens of megabytes on anime releases, about 11 s of a WAN open in the report (AetherEngine issue 956). With the option the open passes over the Attachments element, both where mkvmerge and lavf write it (before the first Cluster) and behind the Clusters, where mkvpropedit appends it and only the SeekHead points at it. No attachment streams are created, Tags that target one are dropped without a warning, and tracks, their indices and packets are unchanged. Without the option the demuxer is unchanged.
 - **`patch_ffmpeg_matroska_byte_seek_done`** (`patches/matroska-byte-seek-done.patch`): the matroska demuxer forgets an end of stream after a byte seek. It latches end of stream in its private `done` flag, and only its own `read_seek` cleared it, but `AVSEEK_FLAG_BYTE` and the generic fallback a failed index seek takes never reach `read_seek`. So once a file had been read to its end, or a read had failed, every later read returned EOF wherever the seek landed (AetherEngine issue 944: a subtitle side reader read EOF at second 0 of an 888 s file). `read_packet` now honours `io_repositioned` like oggdec and av1dec: it resets the parsing state at the new position, drops queued packets and a pending keyframe skip, and clears the flag.
+- **`patch_ffmpeg_mpegts_dovi_descriptor`** (`patches/mpegts-dovi-descriptor.patch`): the `mpegts` muxer writes the Dolby Vision descriptors. The demuxer reads the DOVI video stream descriptor (`0xb0`) into the stream's `AV_PKT_DATA_DOVI_CONF` record, but the muxer never wrote it, so a Dolby Vision stream copied into a transport stream kept every RPU and lost its record. AetherEngine's live recordings are such a copy: played back, Profile 8.1 came out as HDR10, Profile 8.4 as HLG and Profile 5 as HDR10 with the wrong colours.
+
+  An H.264 or HEVC stream whose record carries both its base layer and its RPU now gets the `0xb0` descriptor from that record (version, profile, level, the present flags, base-layer compatibility id, metadata compression). With compatibility id 0 (Profile 5) it also gets the `DOVI` registration descriptor, as Dolby's TS spec asks, placed before the `HEVC` registration so the stream keeps `HEVC` as its codec tag. Profile 5 stays on stream_type `0x24` instead of the spec's `0x06`, because players that do not know Dolby Vision cannot find the video under `0x06`.
+
+  Left as they were: a stream without a base layer (its descriptor needs the base layer's PID, which the record does not carry), a base layer whose RPU was stripped, and streams without a record. The patch is the muxer half of upstream [FFmpeg PR 26097](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/26097) and goes once that lands in the pinned tag.
+- **`patch_ffmpeg_mov_lazy_frag_index`** (`patches/mov-lazy-frag-index.patch`): the mov demuxer takes `lazy_frag_index` (off by default). A fragmented MP4 without a complete `sidx` is indexed while it opens: on a seekable input the header reads every top-level `moof` to the end of the file, one seek per fragment, before the first packet (a 4 minute file of 96 fragments on a WAN address: 12 s and about 90 requests to open). With the option the header stops behind the first `moof`, and a seek finds its fragment on demand: it estimates a byte offset, resynchronises on the next `moof`, checks that it is one (box sizes, track ids, a `tfdt` per track, sample data inside the `mdat`, the box chain behind it), and bisects on `tfdt`. An `mfra` is used for its `moof` offsets only, each checked against the `moof` it points at. The streams get their durations at open from the last fragment of each track. Files whose fragments carry no `tfdt`, or whose end cannot be found (a truncated file), are read as before. Checked packet for packet against the unpatched demuxer on 18 fragmented layouts; the same file opens in 0.9 s and 4 requests. Differences that remain with the option on: the per-stream bit rate is not set at open, a file with a separate `moof` per track delivers its packets in file order rather than interleaved across fragments, and a forward seek past a stream's last sync sample leaves the streams that follow at their end (the full index leaves them where they were). Without the option, and on files that are not fragmented, the demuxer is unchanged. `LazyFragIndexTests` checks that the option is there and that seeks land where the full index lands.
+- **`patch_ffmpeg_bwdif_videotoolbox`** (`patches/bwdif-videotoolbox.patch`): adds `bwdif_videotoolbox`, bwdif as a Metal compute kernel over VideoToolbox frames. Upstream has bwdif for CUDA and Vulkan but not for Metal, so a GPU deinterlace ran yadif while the CPU fallback ran bwdif, and the picture depended on the path (AetherEngine issue 1102).
+
+  The kernel does the integer arithmetic of `bwdifdsp.c` on integer samples held in floats. That is exact for samples of up to 10 bits, so deeper formats are refused. Its output equals CPU `bwdif` frame for frame (framemd5 on 1080i and 480i MPEG-2, testsrc2, NV12 and P010, both modes, both parities). The wrapper is `vf_yadif_videotoolbox.m` with bwdif's options (`mode` send_frame or send_field, default send_field; `parity`; `deint`), and it submits each frame to the GPU once, like `patch_ffmpeg_yadif_videotoolbox`. On an M1 a 1080p59.94 field costs 2.19 ms against 1.90 ms for `yadif_videotoolbox` in the same run (the 1.86 ms above is a separate run). Formats the kernel cannot run are refused when the graph is configured. Not proposed upstream yet.
+- **`patch_ffmpeg_vc1_frame_threads`** (`patches/vc1-frame-threads.patch`): the `vc1` and `wmv3` decoders decode with frame threads. Upstream decodes them on one thread whatever the caller asks for, because neither declares a threading capability, so AetherEngine's software path asked for frame threads and got one. With the patch VC-1 spreads over the cores, and a seek catches up sooner (AetherEngine issue 1107). `vc1image` and `wmv3image` stay single-threaded.
+
+  The patch follows the MPEG-4 Part 2 decoder. A reference picture reports the macroblock rows it has finished, and every read of a reference picture waits for the rows it needs. The field flags that B field pictures read in direct mode move from the decoder context into one buffer per reference field picture. A reference picture that fails partway reports itself finished, so no thread waits for it forever.
+
+  The output equals single-threaded decoding. FATE's `vc1`, `wmv3-drm` and `mss2` tests pass at 1 to 16 frame threads, and frame hashes across repeated seeks match at 1, 3 and 8 threads. 600 damaged streams decode without a hang or a crash, and AddressSanitizer is clean. ThreadSanitizer is clean on intact streams. On damaged ones it reports races, all of them in error concealment, which rewrites rows the picture had already reported; the H.264 decoder does the same. A damaged stream can also send slices out of order and rewrite reported rows that way. Either way the picture of a broken stream can differ from run to run. The reporter measured 1080 Blu-ray VC-1 on an M1 Max with 6 threads against 1. Progressive decodes 4.0 to 4.5 times as fast, interlaced with frame and field pictures mixed 3.6 to 4.6 times, field pictures only 2.2 to 2.4 times. Proposed upstream as [FFmpeg PR 26273](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/26273); the patch goes once that lands in the pinned tag.
+- **`patch_ffmpeg_ivtc_videotoolbox`** (`patches/ivtc-videotoolbox.patch`): adds `fieldmatch_videotoolbox` and `decimate_videotoolbox`, inverse telecine as Metal compute kernels over VideoToolbox frames (AetherEngine issue 1108). CPU `fieldmatch` is plain C on one thread, and its comb test branches on every pixel, so grainy film costs several times what clean film does. AetherEngine runs both stages after the upload with these filters.
+
+  The kernels do the per-pixel passes of `vf_fieldmatch.c` (the field difference map, the match sums, the comb mask and its block counts, the scene change sum, the woven output frame) and of `vf_decimate.c` (the block differences) on the same 8-bit integers, and return sums per thread. The CPU adds them in 64 bits and runs the CPU filters' decision code unchanged. Output equals CPU `fieldmatch,decimate` frame for frame, timestamps, matches, combed flags and drops included (80 combinations of 8 clips and 10 option sets, 480 to 1080, on the reporter's M1 Max; 63 of them repeated on an M1). `fieldmatch_videotoolbox` scores every candidate in one GPU pass, so a frame costs one wait, plus one for a woven output frame. `decimate_videotoolbox` waits once per cycle, because its metrics are read only when the cycle is complete. Matched and kept frames go out by reference.
+
+  Cost of AetherEngine's chain (`fieldmatch=order=auto:combmatch=full,decimate`, upload, `bwdif_videotoolbox`) against the same chain with these filters, per input frame on an M1, raw input, one filter thread, user plus system time:
+
+  | Source | CPU stages | GPU stages |
+  |---|---|---|
+  | 480i 3:2 film, clean | 1.8 ms CPU, 1.7 ms wall | 1.5 ms CPU, 2.6 ms wall |
+  | 480i 3:2 film, noisy | 6.1 ms CPU, 6.3 ms wall | 1.8 ms CPU, 3.7 ms wall |
+  | 576i 3:2 film | 2.3 ms CPU, 2.5 ms wall | 1.8 ms CPU, 3.2 ms wall |
+  | 1080i 3:2 film | 11.5 ms CPU, 12.6 ms wall | 3.5 ms CPU, 7.3 ms wall |
+
+  The CPU time drops everywhere. On clean SD the wall time grows by about 0.8 ms, because the filter thread waits for the GPU, which is far inside a 33 ms frame.
+
+  Supported: NV12, `fieldmatch` modes `pc`, `pc_n` (default) and `pc_u`, `combmatch` none, sc and full, `chroma=0`. Refused when the graph is configured: other pixel formats, `ppsrc`, `combdbg`, `chroma=1`, the `pcn` and `ub` modes, frames smaller than 32x16, and frame heights that are not a multiple of 4 (on a plane with an odd number of rows, `vf_fieldmatch.c` reads a row it never wrote, so its result cannot be reproduced). Not proposed upstream yet.
+
+  The GPU filters carry copies of the CPU filters' decision code, so an FFmpeg tag bump can change one side and not the other while the patch still applies. `Tests/ivtc-videotoolbox/` holds the equality checks to run after every such bump (macOS only, they need the GPU).
 - **`patch_ffmpeg_matroska_tts`**: `matroskadec.c` logs a warning when a Matroska track carries a `TrackTimestampScale` other than 1.0. Timestamp behavior stays exactly as upstream implements it, which is what RFC 9559 specifies (block timestamps and BlockDuration are Track Ticks). The element is deprecated (maxver 3) and many readers ignore it, so a file carrying it may have been authored against such readers and mistime silently; the warning surfaces that condition (AetherEngine issue 145). Until 2.1.x this patch clamped TTS to 1.0; the clamp rested on a wrong reading of the RFC and was dropped after upstream review (FFmpeg PR 23852).
+
+## Building without the DTS:X height patch
+
+`./build.sh --without-dtsx-heights` builds everything as usual but leaves out `patch_ffmpeg_dca_x_heights`. The `dca` decoder is then upstream's. DTS core, DTS-HD Master Audio and the 7.1 bed of DTS:X decode exactly as in stock FFmpeg n8.1.3, and the decoder has no `x_heights` or `x_presentation` option. The flag combines with `static`.
+
+This is for apps that build AetherEngine without its `DTSXObjectAudio` trait (off by default) and want the height decoder out of the shipped binary too, not just unused (FFmpegBuild#12). The released xcframeworks always carry the patch, so this variant is one you build yourself.
+
+- A source tree patched by an earlier build gets the four files the patch touches put back to the tag, so you can switch in either direction without `clean`.
+- `BUILD-INFO.txt` then says `DTS:X heights patch left out (--without-dtsx-heights)`, and `DTSXHeightsOptionTests` checks that the option is absent instead of present.
+- AetherEngine with the trait off never asks for the option. With the trait on against such a build, it logs `no x_heights option` and plays DTS:X as its 7.1 bed.
+
+To ship it, the app has to resolve your build instead of this repo, for AetherEngine too:
+
+1. Fork this repo, run `./build.sh --without-dtsx-heights` and commit `Sources/` and `BUILD-INFO.txt`.
+2. Tag that commit with the version you built from. AetherEngine requires FFmpegBuild within a version range, so the tag has to fall inside it. Your fork already carries that tag pointing at the patched binaries; delete it there first.
+3. Point SwiftPM at the fork with a mirror. For a package, run `swift package config set-mirror --original https://github.com/superuser404notfound/FFmpegBuild --mirror https://github.com/<you>/FFmpegBuild`. For an Xcode project, put the same mirror into `YourApp.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/configuration/mirrors.json` (and into the `.xcworkspace` if you open one), then run File > Packages > Resolve Package Versions:
+
+```json
+{
+  "object" : [
+    {
+      "mirror" : "https://github.com/<you>/FFmpegBuild",
+      "original" : "https://github.com/superuser404notfound/FFmpegBuild"
+    }
+  ],
+  "version" : 1
+}
+```
+
+Your fork is then the source of the build you ship, which is what step 3 under [Shipping in an App Store app](#shipping-in-an-app-store-app) links to.
 
 ## Build record
 
@@ -159,6 +224,7 @@ The binaries are built on a local Mac, not in CI, so there is no attestation. In
 
 - the upstream tag and resolved commit of FFmpeg, dav1d, zimg and libzvbi, and a SHA-256 over the changes the patch functions made to each tree (tracked edits plus added files such as the libzvbi stub),
 - the SHA-256 of `build.sh` and of every file in `patches/`,
+- whether the DTS:X height patch was applied or left out (`--without-dtsx-heights`; a record without that line applied it),
 - macOS, Xcode, clang and SDK versions, and the versions of meson, ninja, autotools and pkg-config,
 - FFmpeg's configure line for every slice, as recorded in its `config.h`,
 - the SHA-256 of every shipped binary.

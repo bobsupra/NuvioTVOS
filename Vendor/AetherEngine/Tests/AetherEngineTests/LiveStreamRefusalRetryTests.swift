@@ -113,13 +113,15 @@ struct LiveStreamRefusalRetryTests {
     }
 
     /// Reads until `expectedBytes` have come through or the reader fails; the bytes, and the code
-    /// the read ended with when it did not deliver them.
+    /// the read ended with when it did not deliver them. The last read asks only for what is left: a
+    /// reader that already prefetched the next connection hands over a whole 64 KB, and on a loaded
+    /// runner that overshot `chunk.count * 16` with no failure (CI, 2026-11-21).
     private static func drain(_ reader: AVIOReader, expectedBytes: Int) -> (bytes: Int, failure: Int32?) {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64 * 1024)
         defer { buf.deallocate() }
         var total = 0
         while total < expectedBytes {
-            let n = reader.read(into: buf, size: 64 * 1024)
+            let n = reader.read(into: buf, size: Int32(min(64 * 1024, expectedBytes - total)))
             if n <= 0 { return (total, n) }
             total += Int(n)
         }
@@ -375,5 +377,50 @@ struct LiveStreamRefusalRetryTests {
 
         let failure = #expect(throws: AVIOReaderError.self) { try reader.open() }
         #expect(failure == .hlsPlaylistOnRawLivePath)
+    }
+
+    // MARK: - Short answers that are not refusals
+
+    /// StreamX, 2026-11-19: a channel that is still spinning up answers every request 200 with
+    /// "Channel starting.\n". Labelled as TS, or sent without a length, it is no AE#925 suspect, so
+    /// its 18 bytes counted as a delivering connection and the reader asked again at once: 46,000
+    /// requests in 40 s on loopback, 4,330 in 19 s in their field run.
+    private static let startingNotice = Data("Channel starting.\n".utf8)
+
+    @Test("a live source answering every request with a few bytes is paced and given up on")
+    func tinyAnswersAreBoundedAndGivenUp() throws {
+        let origin = try #require(ScriptedOrigin { _ in .init(status: 200, body: Self.startingNotice) })
+        defer { origin.stop() }
+        let reader = Self.makeLiveReader(origin.url)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let drained = Self.drain(reader, expectedBytes: 256 * 1024)
+
+        #expect(drained.failure == FFmpegErr.eio, "read \(drained.bytes) B without failing")
+        // The never-productive ladder: four paced retries, then out. Slack for the open's own request.
+        #expect(origin.requestCount <= 8, "\(origin.requestCount) requests for \(drained.bytes) B")
+    }
+
+    @Test("a live source that ends every connection after real data keeps playing at full pace")
+    func healthyShortConnectionsStayOffTheLadder() throws {
+        // 128 KB: past what any notice is, short of minReconnectProgress, the low-bitrate shape.
+        let chunk = Self.streamBytes(count: 700)
+        let origin = try #require(ScriptedOrigin { _ in .init(status: 200, body: chunk) })
+        defer { origin.stop() }
+        // The real backoff: a charged reconnect would cost seconds, not milliseconds.
+        let reader = Self.makeLiveReader(origin.url, backoffScale: 1)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let started = DispatchTime.now()
+        let drained = Self.drain(reader, expectedBytes: chunk.count * 16)
+        let spent = Double(DispatchTime.now().uptimeNanoseconds - started.uptimeNanoseconds) / 1e9
+
+        // Sixteen connections: past the never-productive cap and past the full twelve, so a charged
+        // ladder would have given up, not just slowed down.
+        #expect(drained.failure == nil)
+        #expect(drained.bytes == chunk.count * 16)
+        #expect(spent < 2, "sixteen connections took \(spent) s")
     }
 }

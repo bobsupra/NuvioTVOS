@@ -238,7 +238,7 @@ enum TmdbDetailsService {
     ) async -> T {
         if requestContext != nil { return await operation() }
         let store = defaults ?? ProfileSettings.current
-        let rawKey = store.string(forKey: SettingsKey.tmdbApiKey)?
+        let rawKey = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let keys = [
             SettingsKey.tmdbUseTrailers, SettingsKey.tmdbUseArtwork,
@@ -294,7 +294,7 @@ enum TmdbDetailsService {
     static var currentApiKey: String? { apiKey }
     private static var apiKey: String? {
         if let requestContext { return requestContext.apiKey }
-        let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+        let key = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: ProfileSettings.current)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return key.isEmpty ? nil : key
     }
@@ -815,7 +815,7 @@ enum TmdbDetailsService {
             return cached
         }
 
-        let key = defaults.string(forKey: SettingsKey.tmdbApiKey)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = ProviderCredentialStore.string(forKey: SettingsKey.tmdbApiKey, in: defaults)?.trimmingCharacters(in: .whitespacesAndNewlines)
             ?? apiKey ?? ""
         guard !key.isEmpty else { return nil }
 
@@ -2571,7 +2571,7 @@ enum MdbListDetailsService {
     /// without calling per-title Stremio rating add-ons.
     static func prefetchBatchRatings(for metas: [NuvioMeta], defaults: UserDefaults = ProfileSettings.current) async {
         guard defaults.bool(forKey: SettingsKey.mdbListEnabled),
-              let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey)?
+              let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: defaults)?
                 .trimmingCharacters(in: .whitespacesAndNewlines),
               !apiKey.isEmpty else {
             return
@@ -2620,7 +2620,7 @@ enum MdbListDetailsService {
 
     private static func mdbListRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
         let defaults = ProfileSettings.current
-        let apiKey = defaults.string(forKey: SettingsKey.mdbListApiKey)?
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: defaults)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard defaults.bool(forKey: SettingsKey.mdbListEnabled),
               !apiKey.isEmpty || MdbListRuntimeSession.isAuthenticated(in: defaults) else {

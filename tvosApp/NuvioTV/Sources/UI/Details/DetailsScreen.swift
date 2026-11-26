@@ -100,9 +100,7 @@ struct DetailsScreen: View {
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
-    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
-    @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
     @AppStorage(SettingsKey.backgroundStreamPreFetch) private var backgroundStreamPreFetch = true
     @State private var preResolvedStream: NuvioStream? = nil
     @State private var preResolvedURL: URL? = nil
@@ -4270,7 +4268,8 @@ enum StreamPickerListBuilder {
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
         return displayedStreams(
-            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: selectionMode),
+            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: selectionMode,
+                                ownedLibraries: ownedLibraryNames(in: groups)),
             sortOption: sortOption,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
@@ -4327,7 +4326,8 @@ enum StreamPickerListBuilder {
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: nil)
         let displayed = displayedStreams(
-            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: .automatic),
+            tiers: episodeTiers(from: source, target: episodeTarget, selectionMode: .automatic,
+                                ownedLibraries: ownedLibraryNames(in: groups)),
             sortOption: sortOption,
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly,
@@ -4352,16 +4352,31 @@ enum StreamPickerListBuilder {
         return result
     }
 
+    /// The viewer's own libraries: network shares, Jellyfin and Plex.
+    static let ownedLibraryAddonIds: Set<String> = ["local.smb", "local.jellyfin", "local.plex"]
+
+    /// Add-on names of the library groups in `groups`.
+    static func ownedLibraryNames(in groups: [AddonStreamGroup]) -> Set<String> {
+        Set(groups.filter { ownedLibraryAddonIds.contains($0.addonId) }.map(\.displayName))
+    }
+
     private static func episodeTiers(
         from source: [NuvioStream],
         target: StreamEpisodeTarget?,
-        selectionMode: SelectionMode
+        selectionMode: SelectionMode,
+        ownedLibraries: Set<String> = []
     ) -> [[NuvioStream]] {
         guard let target else { return [source] }
         var confirmed: [NuvioStream] = []
         var unknown: [NuvioStream] = []
         var mismatch: [NuvioStream] = []
         for stream in source {
+            // A library stream comes from the library's own entry for this
+            // episode, though its label ("720p WEB-DL") rarely names it.
+            if ownedLibraries.contains(stream.addonName ?? "") {
+                confirmed.append(stream)
+                continue
+            }
             switch target.match(for: stream) {
             case .confirmed:
                 confirmed.append(stream)
@@ -11964,14 +11979,14 @@ struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
         if filled {
-            if #available(tvOS 26.0, *) {
+            if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
                 content
                     .background(Color.white.opacity(0.96), in: shape)
                     .glassEffect(.regular, in: shape)
             } else {
                 content.background(Color.white, in: shape)
             }
-        } else if #available(tvOS 26.0, *) {
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content
                 .background(Color.black.opacity(0.20), in: shape)
                 .background(Color.white.opacity(0.08), in: shape)
@@ -11985,18 +12000,26 @@ struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
 }
 
 /// Translucent "liquid glass" fill used by the stream picker panel and cards.
-/// Uses real Liquid Glass on tvOS 26+, falling back to a frosted material with
-/// a matching tint on older systems so the look stays consistent.
+/// Uses real Liquid Glass on supported tvOS 26 hardware, falling back to a
+/// frosted material with a matching tint on older or unsupported hardware.
+///
+/// The glass effect lives in a sibling background layer rather than wrapping
+/// `content`: on tvOS 26+, applying `.glassEffect` directly around a
+/// `ScrollView` prevents `UIContextMenuInteraction` from hiding the source card
+/// while lifted, rendering a duplicate overlapping copy behind the menu.
 private struct TvStreamGlass<S: InsettableShape>: ViewModifier {
     let shape: S
     let tint: Color
 
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(tvOS 26.0, *) {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
             content
-                .background(tint, in: shape)
-                .glassEffect(.regular, in: shape)
+                .background {
+                    shape
+                        .fill(tint)
+                        .glassEffect(.regular, in: shape)
+                }
         } else {
             content
                 .background(.ultraThinMaterial, in: shape)
@@ -13950,16 +13973,28 @@ private struct TvStreamCard: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(looksFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+        .contentShape(.contextMenuPreview, RoundedRectangle(cornerRadius: 22, style: .continuous))
         .contextMenu {
             Section(L10n.string("details_play_with", fallback: "Play with")) {
+                // Every player with its app icon. The ones not installed on
+                // this Apple TV are greyed out and can't be picked.
                 ForEach(ExternalPlayer.allCases) { player in
                     Button {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                             onSelectPlayer?(player)
                         }
                     } label: {
-                        Label(player.rawValue, systemImage: player.systemImage)
+                        if let icon = player.menuIcon {
+                            Label {
+                                Text(player.rawValue)
+                            } icon: {
+                                Image(uiImage: icon)
+                            }
+                        } else {
+                            Label(player.rawValue, systemImage: player.systemImage)
+                        }
                     }
+                    .disabled(!player.isInstalled)
                 }
             }
         }

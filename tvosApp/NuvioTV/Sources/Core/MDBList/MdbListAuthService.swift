@@ -141,76 +141,66 @@ final class MdbListKeychainTokenStorage: MdbListTokenStorage {
     private static let lock = NSLock()
     private static var tokenCache: [String: MdbListStoredTokens] = [:]
     private static var negativeCache: Set<String> = []
+    private let keychain: ProviderCredentialKeychain
+
+    init(keychain: ProviderCredentialKeychain = SystemProviderCredentialKeychain.shared) {
+        self.keychain = keychain
+    }
 
     func tokens(for profileScope: String) -> MdbListStoredTokens? {
-        let (cached, isNegative) = Self.lock.withLock {
-            (Self.tokenCache[profileScope], Self.negativeCache.contains(profileScope))
-        }
-        if let cached { return cached }
-        if isNegative { return nil }
-
-        var query = keychainQuery(for: profileScope)
-        query[kSecReturnData as String] = kCFBooleanTrue
-        query[kSecMatchLimit as String] = kSecMatchLimitOne
-        var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data,
-              let decoded = try? JSONDecoder().decode(MdbListStoredTokens.self, from: data) else {
-            Self.lock.withLock { _ = Self.negativeCache.insert(profileScope) }
-            return nil
-        }
         Self.lock.withLock {
-            Self.tokenCache[profileScope] = decoded
-            Self.negativeCache.remove(profileScope)
+            if let cached = Self.tokenCache[profileScope] { return cached }
+            if Self.negativeCache.contains(profileScope) { return nil }
+
+            switch keychain.read(service: Self.service, account: "tokens.\(profileScope)") {
+            case .missing:
+                Self.negativeCache.insert(profileScope)
+                return nil
+            case .failed:
+                return nil
+            case .value(let rawValue):
+                guard let data = rawValue.data(using: .utf8),
+                      let decoded = try? JSONDecoder().decode(MdbListStoredTokens.self, from: data) else {
+                    return nil
+                }
+                Self.tokenCache[profileScope] = decoded
+                Self.negativeCache.remove(profileScope)
+                return decoded
+            }
         }
-        return decoded
     }
 
     @discardableResult
     func save(_ tokens: MdbListStoredTokens, for profileScope: String) -> Bool {
-        guard let data = try? JSONEncoder().encode(tokens) else { return false }
-        var addQuery = keychainQuery(for: profileScope)
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        addQuery[kSecValueData as String] = data
-        let status = SecItemAdd(addQuery as CFDictionary, nil)
-        if status == errSecDuplicateItem {
-            _ = SecItemUpdate(
-                keychainQuery(for: profileScope) as CFDictionary,
-                [kSecValueData as String: data] as CFDictionary
-            )
-        }
-        Self.lock.withLock {
+        guard let data = try? JSONEncoder().encode(tokens),
+              let value = String(data: data, encoding: .utf8) else { return false }
+        return Self.lock.withLock {
+            guard keychain.write(value, service: Self.service, account: "tokens.\(profileScope)") else {
+                return false
+            }
             Self.tokenCache[profileScope] = tokens
             Self.negativeCache.remove(profileScope)
+            return true
         }
-        return true
     }
 
     func remove(for profileScope: String) {
         Self.lock.withLock {
+            _ = keychain.delete(service: Self.service, account: "tokens.\(profileScope)")
             Self.tokenCache.removeValue(forKey: profileScope)
             Self.negativeCache.insert(profileScope)
         }
-        _ = SecItemDelete(keychainQuery(for: profileScope) as CFDictionary)
     }
 
     func removeAll() {
         Self.lock.withLock {
+            _ = SecItemDelete([
+                kSecClass as String: kSecClassGenericPassword,
+                kSecAttrService as String: Self.service
+            ] as CFDictionary)
             Self.tokenCache.removeAll()
             Self.negativeCache.removeAll()
         }
-        _ = SecItemDelete([
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service
-        ] as CFDictionary)
-    }
-
-    private func keychainQuery(for profileScope: String) -> [String: Any] {
-        [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.service,
-            kSecAttrAccount as String: "tokens.\(profileScope)"
-        ]
     }
 }
 
@@ -848,7 +838,7 @@ final class MdbListAuthService {
             return response
         }
 
-        let apiKey = store.string(forKey: SettingsKey.mdbListApiKey)?
+        let apiKey = ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !apiKey.isEmpty else {
             throw MdbListServiceError.message("MDBList is not connected.")
@@ -1107,7 +1097,7 @@ enum MdbListRuntimeSession {
     }
 
     static func hasAPIKey(in store: UserDefaults = ProfileSettings.current) -> Bool {
-        !(store.string(forKey: SettingsKey.mdbListApiKey)?
+        !(ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
     }
 }
@@ -1162,7 +1152,7 @@ final class MdbListSettingsViewModel: ObservableObject {
     }
 
     var hasAPIKey: Bool {
-        !(store.string(forKey: SettingsKey.mdbListApiKey)?
+        !(ProviderCredentialStore.string(forKey: SettingsKey.mdbListApiKey, in: store)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
     }
 

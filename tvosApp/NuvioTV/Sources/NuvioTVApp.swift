@@ -72,6 +72,7 @@ struct NuvioTVApp: App {
                 ContentView()
                     .environmentObject(atvloadlyService)
                     .overlay { CardDisintegrationOverlay() }
+                    .overlay { LaunchSplashOverlay() }
             }
         }
     }
@@ -649,6 +650,9 @@ struct ContentView: View {
     @State private var partyLaunchID = UUID()
     @State private var partyDetailsOrigin: PartyDetailsOrigin?
     @State private var resolvedInitialScreen = false
+    /// Settings > Look > Appearance > Nuvio Branding: the Nuvio sign-in and
+    /// profile loading screens in place of the app's own.
+    @AppStorage(NuvioBranding.key, store: .standard) private var nuvioBranding = false
     /// `nil` until tvOS has actually backgrounded the app, so the initial
     /// `.active` callback is never treated as a resume.
     @State private var backgroundedAt: Date?
@@ -779,7 +783,7 @@ struct ContentView: View {
                 // bootstrap and raised the "Syncing your account" gate on every
                 // single relaunch, not just on a real sign-in.
                 if resolvedInitialScreen {
-                    LoginView(auth: authManager) {
+                    let onLoginContinue: () -> Void = {
                         // Successful authentication owns the initial account pull.
                         // Profile selection remains a later, deliberate switch and
                         // is no longer needed to kick-start a missed bootstrap.
@@ -789,6 +793,14 @@ struct ContentView: View {
                         withAnimation(.easeInOut(duration: 0.28)) {
                             awaitingPostLoginSync = syncManager.isPullingAccountProfiles
                             activeScreen = .profileSelection
+                        }
+                    }
+
+                    Group {
+                        if nuvioBranding {
+                            NuvioLoginView(auth: authManager, onContinue: onLoginContinue)
+                        } else {
+                            LoginView(auth: authManager, onContinue: onLoginContinue)
                         }
                     }
                     .transition(.opacity)
@@ -854,12 +866,24 @@ struct ContentView: View {
             // can settle before the user sees it. This applies equally to an
             // automatic cold launch and a newly selected profile.
             if isPreparingProfile {
-                ZStack {
-                    ProfileScopedRootBackground()
-                    ProgressView()
-                        .progressViewStyle(.circular)
-                        .tint(.white)
-                        .scaleEffect(1.8)
+                Group {
+                    if nuvioBranding {
+                        let profile = profileViewModel.activeProfile
+                        ProfileLoadingSplash(
+                            profile: profile,
+                            profileColor: profile.map {
+                                UserProfileView.profileColor(for: $0, in: profileViewModel.profiles)
+                            } ?? Color(hex: "#1E88E5")
+                        )
+                    } else {
+                        ZStack {
+                            ProfileScopedRootBackground()
+                            ProgressView()
+                                .progressViewStyle(.circular)
+                                .tint(.white)
+                                .scaleEffect(1.8)
+                        }
+                    }
                 }
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
@@ -893,7 +917,7 @@ struct ContentView: View {
             AtvloadlyNoticeCountdownDriver(release: atvloadlyNoticeRelease)
 
             // A quick Back during a transition (nothing focused) stays in the app.
-            RemoteBackGuard()
+            RemoteBackGuard(allowsAppExit: !isOverlayPresented)
                 .allowsHitTesting(false)
                 .frame(width: 0, height: 0)
         }
@@ -1014,7 +1038,7 @@ struct ContentView: View {
                 watchPartyOwner.attach(authManager: authManager, profiles: profileViewModel)
             }
             syncManager.attach(authManager: authManager, profileViewModel: profileViewModel)
-            ICloudSettingsSyncManager.shared.start()
+            ICloudSettingsSyncManager.shared.startForAppLaunch()
             setupPictureInPicture()
             guard !resolvedInitialScreen else { return }
             resolvedInitialScreen = true
@@ -1603,20 +1627,29 @@ struct ContentView: View {
         // session still makes retries/idempotent duplicate callbacks harmless.
         guard !callback.isError else { return }
 
-        let callbackDuration = callback.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        let duration = callbackDuration
-            ?? session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
-        let progress = callback.progress ?? callback.position.flatMap { position in
-            guard let duration, position.isFinite, position >= 0 else { return nil }
-            let normalizedProgress = position / duration
-            guard callbackDuration != nil,
-                  position > duration,
-                  position - duration <= 1 else {
-                return normalizedProgress
+        guard let report = callback.report(
+            listedDuration: session.duration,
+            startPosition: session.startPosition
+        ) else { return }
+        let progress = report.progress
+        let duration = report.duration
+        // Plex hears about built-in playback while it plays, and nothing while
+        // another app plays. Tell it where that app stopped, so its resume
+        // point and watched state match. A player closed before anything
+        // played says nothing new, and Plex may have a later position from
+        // another Plex app.
+        if progress > 0, !report.isAtStart, let position = report.position {
+            let sourceURL = session.sourceURL
+            let reportedDuration = report.duration
+            Task { @MainActor in
+                await PlexPlaybackSync.shared.externalPlaybackEnded(
+                    url: sourceURL,
+                    position: position,
+                    duration: reportedDuration
+                )
             }
-            return 1
         }
-        guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
+
         // External callbacks can underreport EOF position; allow up to two minutes of grace,
         // with an 80% floor, while built-in playback keeps its stream-timed threshold.
         let callbackCompletionCutoff: (Double) -> Double = { completionFraction in
@@ -1646,7 +1679,7 @@ struct ContentView: View {
                 let reportDuration = duration ?? 100
                 let reportPosition = isComplete
                     ? reportDuration
-                    : (duration.map { $0 * progress } ?? (100 * progress))
+                    : (duration.map { report.position ?? $0 * progress } ?? (100 * progress))
                 let action: TraktScrobbleAction = isComplete ? .stop : .pause
                 let store = ProfileSettings.current
                 if let localCheckpointDuration = duration ?? (isComplete ? reportDuration : nil) {
@@ -1709,7 +1742,7 @@ struct ContentView: View {
                 episode: session.episode
             )
         } else if let duration, progress > 0 {
-            let position = duration * progress
+            let position = report.position ?? duration * progress
             if position >= WatchProgressLedger.minimumTrackableSeconds {
                 ContinueWatchingDismissStore.clear(contentId: session.meta.id)
             }
@@ -2301,9 +2334,12 @@ struct ContentView: View {
                 sourceURL: url.absoluteString,
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
-                duration: Self.runtimeSeconds(meta.runtime),
+                // Plex has a Plex stream's exact length. A listed runtime
+                // can be minutes off.
+                duration: PlexPlaybackSync.shared.duration(for: url) ?? Self.runtimeSeconds(meta.runtime),
                 profileID: profileID,
-                collectionContext: provenance
+                collectionContext: provenance,
+                startPosition: resumeFrom
             )
             successCallback = URL(string: "nuvio-tv://external-playback/\(id)")
             errorCallback = URL(string: "nuvio-tv://external-playback/error/\(id)")
@@ -2316,11 +2352,12 @@ struct ContentView: View {
         // Hand off to the external app only when it is actually installed
         // (`canOpenURL` needs its scheme in LSApplicationQueriesSchemes); if it
         // isn't, fall through to the built-in player instead of a dead launch.
+        let episodeTitle = isActionPlaybackSession ? nil : (playbackCurrentEpisode?.title ?? (meta.isSeries ? subtitle : nil))
         let mediaFilename = filename ?? ExternalPlayer.mediaFilename(
             meta: meta,
             season: meta.isSeries ? numbers?.season : nil,
             episode: meta.isSeries ? numbers?.episode : nil,
-            episodeTitle: isActionPlaybackSession ? nil : (playbackCurrentEpisode?.title ?? (meta.isSeries ? subtitle : nil))
+            episodeTitle: episodeTitle
         )
 
         if !isStandalonePlaybackSession,
@@ -2330,7 +2367,12 @@ struct ContentView: View {
                filename: mediaFilename,
                subtitleURLs: subtitleURLs,
                position: resumeFrom,
-               title: meta.name,
+               title: ExternalPlayer.displayTitle(
+                   name: meta.name,
+                   season: meta.isSeries ? numbers?.season : nil,
+                   episode: meta.isSeries ? numbers?.episode : nil,
+                   episodeTitle: episodeTitle
+               ),
                successURL: successCallback,
                errorURL: errorCallback
            ),
@@ -5163,6 +5205,81 @@ private struct TVSidebarWatchdogView: View {
 }
 #endif
 
+/// Settings → Appearance → Sidebar → Press Back Twice to Exit. A Back press
+/// that nothing on screen handles reaches this handler, and without one tvOS
+/// leaves the app. The first press shows a reminder. While it shows, the
+/// handler is off, so a second press leaves the usual way and tvOS keeps the
+/// app's state. The state lives here, so a press redraws the reminder and not
+/// the tab view this wraps: until that redraw, the handler stays on and would
+/// take the second press too.
+private struct TVExitGuard: ViewModifier {
+    /// How long the reminder shows and waits for the second press.
+    private static let seconds: Double = 3
+
+    let isEnabled: Bool
+    @State private var isHintVisible = false
+    @State private var hideTask: Task<Void, Never>?
+    @Environment(\.scenePhase) private var scenePhase
+
+    func body(content: Content) -> some View {
+        content
+            .onExitCommand(perform: isEnabled && !isHintVisible ? showHint : nil)
+            .overlay(alignment: .bottom) {
+                if isHintVisible {
+                    TVExitHint()
+                        .transition(.opacity.combined(with: .move(edge: .bottom)))
+                }
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active { hideHint() }
+            }
+            .onChange(of: isEnabled) { _, enabled in
+                if !enabled { hideHint() }
+            }
+    }
+
+    private func showHint() {
+        hideTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) { isHintVisible = true }
+        // RemoteBackGuard swallows a Back that comes right after another, and
+        // the second press of a double press does. It lets Back through while
+        // the reminder shows.
+        BackGuardHostView.passBackUntil = CACurrentMediaTime() + Self.seconds
+        UIAccessibility.post(notification: .announcement, argument: TVExitHint.message)
+        hideTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(Self.seconds))
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeOut(duration: 0.2)) { isHintVisible = false }
+        }
+    }
+
+    private func hideHint() {
+        hideTask?.cancel()
+        hideTask = nil
+        isHintVisible = false
+        BackGuardHostView.passBackUntil = -.infinity
+    }
+}
+
+/// The reminder for Settings → Appearance → Sidebar → Press Back Twice to Exit.
+private struct TVExitHint: View {
+    static var message: String {
+        L10n.string("tvos_exit_press_back_again", fallback: "Press Back again to exit")
+    }
+
+    var body: some View {
+        Text(Self.message)
+            .font(.appFont(size: 26, weight: .semibold))
+            .foregroundColor(.white)
+            .padding(.horizontal, 34)
+            .padding(.vertical, 18)
+            .background(Capsule().fill(Color.black.opacity(0.72)))
+            .overlay(Capsule().stroke(Color.white.opacity(0.14), lineWidth: 1))
+            .padding(.bottom, 64)
+            .allowsHitTesting(false)
+    }
+}
+
 private struct TVMainTabSettings: Equatable {
     let profileID: String?
     let amoled: Bool
@@ -5172,6 +5289,7 @@ private struct TVMainTabSettings: Equatable {
     let showSurpriseMeTab: Bool
     let useTopNavigation: Bool
     let useNuvioRail: Bool
+    let doubleBackToExit: Bool
     let showWatchPartyTab: Bool
     let nativeIPTVEnabled: Bool
     let searchStyle: String
@@ -5189,6 +5307,7 @@ private struct TVMainTabSettings: Equatable {
             showSurpriseMeTab: defaults.object(forKey: SettingsKey.showSurpriseMeTab) as? Bool ?? false,
             useTopNavigation: defaults.object(forKey: SettingsKey.useTopNavigation) as? Bool ?? false,
             useNuvioRail: defaults.object(forKey: SettingsKey.useNuvioRail) as? Bool ?? false,
+            doubleBackToExit: defaults.object(forKey: SettingsKey.doubleBackToExit) as? Bool ?? false,
             showWatchPartyTab: defaults.object(forKey: SettingsKey.showWatchPartyTab) as? Bool ?? true,
             nativeIPTVEnabled: defaults.object(forKey: SettingsKey.nativeIPTVEnabled) as? Bool ?? false,
             searchStyle: defaults.string(forKey: SettingsKey.searchStyle) ?? "Netflix",
@@ -5223,6 +5342,7 @@ private struct TVMainTabSettingsObserver: View {
     @AppStorage(SettingsKey.showSurpriseMeTab) private var showSurpriseMeTab = false
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.doubleBackToExit) private var doubleBackToExit = false
     @AppStorage(SettingsKey.showWatchPartyTab) private var showWatchPartyTab = true
     @AppStorage(SettingsKey.nativeIPTVEnabled) private var nativeIPTVEnabled = false
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
@@ -5239,6 +5359,7 @@ private struct TVMainTabSettingsObserver: View {
             showSurpriseMeTab: showSurpriseMeTab,
             useTopNavigation: useTopNavigation,
             useNuvioRail: useNuvioRail,
+            doubleBackToExit: doubleBackToExit,
             showWatchPartyTab: showWatchPartyTab,
             nativeIPTVEnabled: nativeIPTVEnabled,
             searchStyle: searchStyle,
@@ -5355,6 +5476,7 @@ private struct TVMainTabView: View {
     private var showSurpriseMeTab: Bool { tabSettings.showSurpriseMeTab }
     private var useTopNavigation: Bool { tabSettings.useTopNavigation }
     private var useNuvioRail: Bool { tabSettings.useNuvioRail }
+    private var doubleBackToExit: Bool { tabSettings.doubleBackToExit }
     private var showWatchPartyTab: Bool { tabSettings.showWatchPartyTab }
     private var nativeIPTVEnabled: Bool { tabSettings.nativeIPTVEnabled }
     private var searchStyle: String { tabSettings.searchStyle }
@@ -5413,6 +5535,10 @@ private struct TVMainTabView: View {
         .onChange(of: nativeIPTVEnabled) { _, enabled in
             if !enabled, selectedTab == .liveTV { selectedTab = .home }
         }
+        // Settings → Appearance → Sidebar → Press Back Twice to Exit. Not
+        // with the top tab bar: there tvOS moves focus to the bar on Back,
+        // and the guard would take that press too.
+        .modifier(TVExitGuard(isEnabled: doubleBackToExit && !useTopNavigation && !isFullScreenOverlayPresented))
     }
 
     /// Search screen chosen in Settings → Layout & Discovery → Search Style.
