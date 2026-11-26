@@ -322,12 +322,15 @@ final class UsenetAvailabilityChecker: ObservableObject {
     private func remember(_ spec: UsenetStreamSpec, _ report: UsenetAvailabilityReport) {
         let key = Self.memoryKey(spec)
         if report.verdict == .incomplete {
+            let reason = report.playbackProblem?.rawValue ?? "\(report.missing)/\(report.checked) sampled articles missing"
+            usenetLog.notice("usenet: remembered as incomplete (\(reason, privacy: .public))")
             remembered[key] = Remembered(report: report, at: Date())
             if remembered.count > Self.rememberedLimit,
                let oldest = remembered.min(by: { $0.value.at < $1.value.at })?.key {
                 remembered[oldest] = nil
             }
         } else if remembered[key] != nil {
+            usenetLog.notice("usenet: found \(report.verdict.rawValue, privacy: .public), no longer remembered as incomplete")
             remembered[key] = nil
         } else {
             return
@@ -385,6 +388,9 @@ final class UsenetAvailabilityChecker: ObservableObject {
                     state = .failed(UsenetConnectionPool.describe(error))
                 } catch {
                     state = .failed(error.localizedDescription)
+                }
+                if case .failed(let message) = state {
+                    usenetLog.error("usenet: check failed: \(message, privacy: .public)")
                 }
                 self.finish(spec, state)
             }
