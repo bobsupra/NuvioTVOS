@@ -168,6 +168,9 @@ final class PlexServerStore: ObservableObject {
 enum PlexCredentialStore {
     private static let service = "com.nuvio.tv.plex"
     private static let accountKey = "account"
+    private static let lock = NSLock()
+    private static var cachedValues: [String: String] = [:]
+    private static var missingAccounts: Set<String> = []
 
     static func accountToken(profileScope: String = ProfileSettings.activeProfileScope) -> String {
         read(account: "\(accountKey).\(profileScope)") ?? ""
@@ -223,13 +226,33 @@ enum PlexCredentialStore {
     }
 
     private static func read(account: String) -> String? {
+        if let cached = lock.withLock({ () -> String?? in
+            if let value = cachedValues[account] { return .some(value) }
+            if missingAccounts.contains(account) { return .some(nil) }
+            return nil
+        }) {
+            return cached
+        }
         var request = query(account)
         request[kSecReturnData as String] = kCFBooleanTrue
         request[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
-        guard SecItemCopyMatching(request as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
+        let status = SecItemCopyMatching(request as CFDictionary, &item)
+        if status == errSecItemNotFound {
+            lock.withLock {
+                cachedValues.removeValue(forKey: account)
+                missingAccounts.insert(account)
+            }
+            return nil
+        }
+        guard status == errSecSuccess,
+              let data = item as? Data,
+              let value = String(data: data, encoding: .utf8) else { return nil }
+        lock.withLock {
+            cachedValues[account] = value
+            missingAccounts.remove(account)
+        }
+        return value
     }
 
     private static func write(_ value: String, account: String) {
@@ -241,12 +264,28 @@ enum PlexCredentialStore {
         var add = query(account)
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         add[kSecValueData as String] = data
-        if SecItemAdd(add as CFDictionary, nil) == errSecDuplicateItem {
-            SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary)
+        let status = SecItemAdd(add as CFDictionary, nil)
+        let succeeded: Bool
+        if status == errSecDuplicateItem {
+            succeeded = SecItemUpdate(query(account) as CFDictionary, [kSecValueData as String: data] as CFDictionary) == errSecSuccess
+        } else {
+            succeeded = status == errSecSuccess
+        }
+        if succeeded {
+            lock.withLock {
+                cachedValues[account] = value
+                missingAccounts.remove(account)
+            }
         }
     }
 
     private static func delete(account: String) {
-        SecItemDelete(query(account) as CFDictionary)
+        let status = SecItemDelete(query(account) as CFDictionary)
+        if status == errSecSuccess || status == errSecItemNotFound {
+            lock.withLock {
+                cachedValues.removeValue(forKey: account)
+                missingAccounts.insert(account)
+            }
+        }
     }
 }

@@ -459,7 +459,16 @@ final class PlexSessionManager: ObservableObject {
                     throw failure
                 }
                 let titles = outcome.titles
-                if titles != previousTitles {
+                let (titlesChanged, episodeCount) = await Task.detached(priority: .utility) {
+                    let changed = titles != previousTitles
+                    let episodes = titles.reduce(0) { count, title in
+                        title.type == "series" ? count + title.items.count : count
+                    }
+                    return (changed, episodes)
+                }.value
+                try Task.checkCancellation()
+                guard self.activeProfileID == profileID else { return }
+                if titlesChanged {
                     try await PlexLibraryIndex.shared.replace(titles: titles, forServerID: server.id)
                     // Saving can take seconds: a disconnect, a Plex Home
                     // switch or a profile switch may have come in meanwhile.
@@ -481,7 +490,7 @@ final class PlexSessionManager: ObservableObject {
                 }
                 self.syncStates[server.id] = .done(PlexSyncReport(
                     titles: titles.count,
-                    episodes: titles.filter { $0.type == "series" }.reduce(0) { $0 + $1.items.count },
+                    episodes: episodeCount,
                     oversizedLibraries: outcome.oversizedLibraries,
                     failedLibraries: outcome.failures
                 ))
