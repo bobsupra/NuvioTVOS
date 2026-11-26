@@ -157,4 +157,24 @@ final class SMBLibraryResolverTests: XCTestCase {
         XCTAssertEqual(parsed?.title, "Dune - Part Two")
         XCTAssertEqual(parsed?.year, 2024)
     }
+
+    // MARK: - First scan on this Apple TV
+
+    /// Picked shares with nothing indexed here scan once; a share whose last scan
+    /// found nothing, or a server with no share picked, doesn't.
+    func testPickedSharesWithNothingIndexedHereScanOnce() {
+        let neverScanned = SMBServerConfig(displayName: "NAS", host: "nas.local", selectedShares: ["Media"])
+        XCTAssertTrue(SMBSessionManager.needsFirstScanHere(neverScanned, indexedTitles: 0))
+        XCTAssertFalse(SMBSessionManager.needsFirstScanHere(neverScanned, indexedTitles: 12))
+        let restored = SMBServerConfig(
+            displayName: "NAS", host: "nas.local", selectedShares: ["Media"], lastScanDate: Date(), lastScanTitleCount: 12
+        )
+        XCTAssertTrue(SMBSessionManager.needsFirstScanHere(restored, indexedTitles: 0))
+        let foundNone = SMBServerConfig(
+            displayName: "NAS", host: "nas.local", selectedShares: ["Media"], lastScanDate: Date(), lastScanTitleCount: 0
+        )
+        XCTAssertFalse(SMBSessionManager.needsFirstScanHere(foundNone, indexedTitles: 0))
+        let noShares = SMBServerConfig(displayName: "NAS", host: "nas.local")
+        XCTAssertFalse(SMBSessionManager.needsFirstScanHere(noShares, indexedTitles: 0))
+    }
 }

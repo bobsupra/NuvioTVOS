@@ -453,4 +453,25 @@ final class JellyfinAutoSyncTests: XCTestCase {
             sizeBytes: nil
         )
     }
+
+    /// A server just added picks its movie and TV libraries; a restored one with
+    /// nothing indexed here syncs whatever the interval says.
+    func testANewServerPicksItsVideoLibrariesAndARestoredOneSyncs() {
+        let fresh = JellyfinServerConfig(id: "j1", displayName: "Jellyfin", baseURLString: baseURL.absoluteString)
+        XCTAssertTrue(JellyfinSessionManager.picksVideoLibrariesOnFirstSync(fresh))
+        let libraries = [
+            JellyfinLibrary(id: "m", name: "Movies", collectionType: "movies"),
+            JellyfinLibrary(id: "t", name: "Shows", collectionType: "tvshows"),
+            JellyfinLibrary(id: "x", name: "Music", collectionType: "music"),
+        ]
+        XCTAssertEqual(JellyfinSessionManager.videoLibraryIDs(libraries), ["m", "t"])
+
+        let restored = JellyfinServerConfig(
+            id: "j2", displayName: "Jellyfin", baseURLString: baseURL.absoluteString,
+            selectedLibraryIDs: ["m"], lastSyncDate: Date(), lastSyncTitleCount: 40
+        )
+        XCTAssertFalse(JellyfinSessionManager.picksVideoLibrariesOnFirstSync(restored))
+        XCTAssertTrue(JellyfinSessionManager.needsFirstSyncHere(restored, indexedTitles: 0))
+        XCTAssertFalse(JellyfinSessionManager.needsFirstSyncHere(restored, indexedTitles: 40))
+    }
 }

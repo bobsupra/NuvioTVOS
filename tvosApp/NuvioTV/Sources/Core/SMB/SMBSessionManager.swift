@@ -92,6 +92,22 @@ final class SMBSessionManager: ObservableObject {
                 }
             }
         }
+        // Shares picked before a fresh install, restored by settings sync, or
+        // never scanned: scan once connected, so their titles show in Library.
+        for server in SMBServerStore.shared.servers {
+            guard case .connected = connectionState(for: server.id) else { continue }
+            if case .scanning = scanState(for: server.id) { continue }
+            let indexedTitles = SMBLibraryIndex.shared.titlesByServerID[server.id]?.count ?? 0
+            guard Self.needsFirstScanHere(server, indexedTitles: indexedTitles) else { continue }
+            scan(server)
+        }
+    }
+
+    /// Picked shares with nothing indexed on this Apple TV, on a server that was
+    /// never scanned or had titles when it last was.
+    nonisolated static func needsFirstScanHere(_ server: SMBServerConfig, indexedTitles: Int) -> Bool {
+        !server.selectedShares.isEmpty && indexedTitles == 0
+            && (server.lastScanDate == nil || (server.lastScanTitleCount ?? 0) > 0)
     }
 
     func connect(_ server: SMBServerConfig) async {

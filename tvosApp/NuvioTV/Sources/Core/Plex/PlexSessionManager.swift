@@ -263,11 +263,26 @@ final class PlexSessionManager: ObservableObject {
     }
 
     func autoSyncConnectedServers(minimumInterval: TimeInterval) {
-        for server in PlexServerStore.shared.servers {
+        for var server in PlexServerStore.shared.servers {
             guard server.syncAutomatically,
-                  !server.selectedLibraryIDs.isEmpty,
-                  connectionState(for: server.id).isConnected else { continue }
+                  case .connected(let libraries) = connectionState(for: server.id) else { continue }
             if case .syncing = syncState(for: server.id) { continue }
+            // A server just added: its movie and TV libraries, so the Library's
+            // Servers tab fills without a trip to Settings.
+            if Self.picksVideoLibrariesOnFirstSync(server) {
+                let video = Self.videoLibraryIDs(libraries)
+                guard !video.isEmpty else { continue }
+                server.selectedLibraryIDs = video
+                PlexServerStore.shared.upsert(server)
+            }
+            guard !server.selectedLibraryIDs.isEmpty else { continue }
+            if Self.needsFirstSyncHere(
+                server,
+                indexedTitles: PlexLibraryIndex.shared.titlesByServerID[server.id]?.count ?? 0
+            ) {
+                sync(server, force: true)
+                continue
+            }
             guard Self.isSyncDue(
                 lastSyncDate: server.lastSyncDate,
                 lastAttemptDate: server.lastSyncAttemptDate,
@@ -275,6 +290,25 @@ final class PlexSessionManager: ObservableObject {
             ) else { continue }
             sync(server)
         }
+    }
+
+    /// A server added since its last sync anywhere, with no library picked yet.
+    /// One whose libraries were all unpicked later keeps its sync dates.
+    nonisolated static func picksVideoLibrariesOnFirstSync(_ server: PlexServerConfig) -> Bool {
+        server.selectedLibraryIDs.isEmpty && server.lastSyncDate == nil && server.lastSyncAttemptDate == nil
+    }
+
+    /// The movie and TV libraries; music and photos are never synced.
+    nonisolated static func videoLibraryIDs(_ libraries: [PlexLibrary]) -> [String] {
+        libraries.filter { $0.type == "movie" || $0.type == "show" }.map(\.id)
+    }
+
+    /// Nothing indexed on this Apple TV for a server that never synced, or that
+    /// had titles when it last did, as after a fresh install with the servers
+    /// restored by settings sync. The restored change markers describe another
+    /// index, so this sync lists every library again.
+    nonisolated static func needsFirstSyncHere(_ server: PlexServerConfig, indexedTitles: Int) -> Bool {
+        indexedTitles == 0 && (server.lastSyncDate == nil || (server.lastSyncTitleCount ?? 0) > 0)
     }
 
     /// Due once `minimumInterval` has passed since the later of the last
