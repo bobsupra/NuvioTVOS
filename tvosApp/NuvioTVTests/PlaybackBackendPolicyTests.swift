@@ -3287,6 +3287,60 @@ private final class TraktHistoryURLProtocolStub: URLProtocol {
     override func stopLoading() {}
 }
 
+/// Trakt for a drain of the history queue: the movie history is empty until a play is
+/// posted, then holds each posted play at `watchedAt`. Records the IMDb id of every post.
+private final class TraktQueueDrainMock: @unchecked Sendable {
+    private let lock = NSLock()
+    private let watchedAt: String
+    private var _postedIMDbIDs: [String] = []
+
+    init(watchedAt: String) {
+        self.watchedAt = watchedAt
+    }
+
+    var postedIMDbIDs: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return _postedIMDbIDs
+    }
+
+    func handle(_ request: URLRequest) throws -> TraktStubReply {
+        lock.lock(); defer { lock.unlock() }
+        let path = request.url?.path ?? ""
+        let method = request.httpMethod ?? "GET"
+
+        if method == "GET", path == "/users/me/history/movies" {
+            let rows: [[String: Any]] = _postedIMDbIDs.enumerated().map { index, imdb in
+                [
+                    "id": 700 + index,
+                    "watched_at": watchedAt,
+                    "movie": ["title": "Posted", "year": 2026, "ids": ["imdb": imdb]]
+                ]
+            }
+            return TraktStubReply(
+                statusCode: 200,
+                headers: ["Content-Type": "application/json", "x-pagination-page-count": "1"],
+                data: try JSONSerialization.data(withJSONObject: rows)
+            )
+        }
+
+        if method == "POST", path == "/sync/history" {
+            let data = try XCTUnwrap(GeminiURLProtocolStub.body(from: request))
+            let object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+            let items = (object["movies"] as? [[String: Any]]) ?? (object["shows"] as? [[String: Any]]) ?? []
+            let ids = try XCTUnwrap(items.first?["ids"] as? [String: Any])
+            _postedIMDbIDs.append(try XCTUnwrap(ids["imdb"] as? String))
+            let added: [String: Any] = ["added": ["movies": 1, "episodes": 1], "not_found": ["movies": [], "shows": []]]
+            return TraktStubReply(
+                statusCode: 201,
+                headers: ["Content-Type": "application/json"],
+                data: try JSONSerialization.data(withJSONObject: added)
+            )
+        }
+
+        throw URLError(.unsupportedURL)
+    }
+}
+
 private final class TraktCompletionHistoryMock: @unchecked Sendable {
     private let lock = NSLock()
     private let expectedWatchedAt: String
@@ -4238,6 +4292,81 @@ final class TraktCompletionHistoryTests: XCTestCase {
         XCTAssertEqual(aggregate.count, 1)
         XCTAssertEqual(aggregate.first?.watchCountsBySource[TraktWatchProgressSource.trakt.rawValue], 2)
         XCTAssertEqual(aggregate.first?.watchedAt, later)
+    }
+
+    /// A finished playback Trakt has no id for stopped the queue for good, ahead of every
+    /// later one, and an add-on's prefix ("cotonet:tt…") hid the IMDb id of the next.
+    @MainActor
+    func testCompletionBehindOneTraktCannotIdentifyIsSentByItsPrefixedIMDbID() async throws {
+        let profile = activateTraktProfile(slug: "account-a")
+        defer { restore(profile) }
+        let accounts = [TraktWatchProgressSource.trakt.rawValue: "account-a"]
+        let unknown = NuvioMeta(id: "kitsu:4242", name: "Unknown To Trakt", type: "movie", year: 2026)
+        let prefixed = NuvioMeta(id: "cotonet:tt7654321", name: "Prefixed Movie", type: "movie", year: 2026)
+        XCTAssertTrue(WatchedStore.recordPlaybackCompletion(
+            unknown, completionID: "unknown-completion", source: .trakt, completionAccounts: accounts
+        ))
+        XCTAssertTrue(WatchedStore.recordPlaybackCompletion(
+            prefixed, completionID: "prefixed-completion", source: .trakt, completionAccounts: accounts
+        ))
+        let prefixedEvent = try XCTUnwrap(
+            WatchedStore.pendingPlaybackCompletions(provider: .trakt, profileId: profile.id)
+                .first { $0.meta.id == prefixed.id }
+        )
+
+        let mock = TraktQueueDrainMock(
+            watchedAt: TraktHistoryService.completionMinuteTimestamp(prefixedEvent.watchedAt)
+        )
+        let session = makeQueueDrainSession(mock: mock)
+        defer {
+            TraktHistoryURLProtocolStub.handler = nil
+            session.invalidateAndCancel()
+        }
+
+        let flushed = await TraktHistoryService.flushPendingPlaybackCompletions(
+            store: profile.store,
+            profileId: profile.id,
+            session: session
+        )
+
+        XCTAssertTrue(flushed)
+        XCTAssertTrue(WatchedStore.pendingPlaybackCompletions(provider: .trakt, profileId: profile.id).isEmpty)
+        XCTAssertEqual(mock.postedIMDbIDs, ["tt7654321"])
+    }
+
+    /// The same for marks made by hand, such as Mark as watched.
+    @MainActor
+    func testMarkBehindOneTraktCannotIdentifyIsSentByItsPrefixedIMDbID() async throws {
+        let profile = activateTraktProfile(slug: "account-a")
+        defer { restore(profile) }
+        let unknown = NuvioMeta(id: "kitsu:4243", name: "Unknown Show", type: "series")
+        let prefixed = NuvioMeta(id: "ptgdrive:tt7654322", name: "Prefixed Show", type: "series")
+        XCTAssertTrue(WatchedStore.markWatched(unknown, season: 1, episode: 1))
+        XCTAssertTrue(WatchedStore.markWatched(prefixed, season: 1, episode: 2))
+
+        let mock = TraktQueueDrainMock(watchedAt: "")
+        let session = makeQueueDrainSession(mock: mock)
+        defer {
+            TraktHistoryURLProtocolStub.handler = nil
+            session.invalidateAndCancel()
+        }
+
+        let flushed = await TraktHistoryService.flushPendingPlaybackCompletions(
+            store: profile.store,
+            profileId: profile.id,
+            session: session
+        )
+
+        XCTAssertTrue(flushed)
+        XCTAssertTrue(WatchedStore.pendingProviderMutations(provider: .trakt, profileId: profile.id).isEmpty)
+        XCTAssertEqual(mock.postedIMDbIDs, ["tt7654322"])
+    }
+
+    private func makeQueueDrainSession(mock: TraktQueueDrainMock) -> URLSession {
+        TraktHistoryURLProtocolStub.handler = { try mock.handle($0) }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [TraktHistoryURLProtocolStub.self]
+        return URLSession(configuration: configuration)
     }
 
     @MainActor
