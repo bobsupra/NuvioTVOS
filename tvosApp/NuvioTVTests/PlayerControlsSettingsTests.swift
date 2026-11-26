@@ -3467,6 +3467,14 @@ final class ExternalPlayerTests: XCTestCase {
         XCTAssertTrue(ExternalPlayer.builtIn.isInstalled)
     }
 
+    /// With Nuvio Branding on, the built-in player shows the chosen Nuvio icon.
+    func testEveryNuvioAppIconHasABuiltInPlayerTile() {
+        for icon in NuvioAppIcon.allCases {
+            let name = ExternalPlayer.builtInIconAssetName(for: icon)
+            XCTAssertNotNil(UIImage(named: name), name)
+        }
+    }
+
     func testSubtitleMenuFormatterExternalLabels() {
         // Standard external subtitle with distinct release label:
         // release label becomes primary title, add-on name becomes secondary subtitle.
