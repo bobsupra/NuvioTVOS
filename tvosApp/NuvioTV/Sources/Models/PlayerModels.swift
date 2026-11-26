@@ -208,10 +208,13 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     static var settingsOptions: [String] { allCases.map(\.rawValue) }
 
     /// The player's app icon in Images.xcassets. The built-in player shows
-    /// Nuvio's Home Screen icon.
+    /// Nuvio's Home Screen icon: the chosen Nuvio icon with Nuvio Branding on,
+    /// the app's own icon with it off.
     var iconAssetName: String {
         switch self {
-        case .builtIn: return "player_nuvio"
+        case .builtIn:
+            guard NuvioBranding.isOn else { return "player_nuvio" }
+            return Self.builtInIconAssetName(for: NuvioBranding.appIcon)
         case .infuse: return "player_infuse"
         case .nativePlayer: return "player_nativeplayer"
         case .nplayer: return "player_nplayer"
@@ -220,6 +223,12 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
         case .vidhub: return "player_vidhub"
         case .vlc: return "player_vlc"
         }
+    }
+
+    /// The built-in player's icon tile for a Nuvio app icon, such as
+    /// `player_nuvio_arcticblue` for Arctic Blue.
+    static func builtInIconAssetName(for icon: NuvioAppIcon) -> String {
+        "player_nuvio_" + icon.rawValue.replacingOccurrences(of: "_", with: "")
     }
 
     /// A URL scheme the player's app registers, used to check whether the app
