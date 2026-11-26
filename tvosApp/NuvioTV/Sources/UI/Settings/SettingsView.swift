@@ -246,6 +246,8 @@ enum SettingsKey {
     static let aiCatalogAnimeSeries = "nuvio.tv.settings.integrations.aiCatalogAnimeSeries"
     static let useTopNavigation = "nuvio.tv.settings.layout.useTopNavigation"
     static let useNuvioRail = "nuvio.tv.settings.layout.useNuvioRail"
+    /// Settings → Appearance → Sidebar → Press Back Twice to Exit.
+    static let doubleBackToExit = "nuvio.tv.settings.layout.doubleBackToExit"
     static let continueWatchingPerishAnimation = "nuvio.tv.settings.appearance.continueWatchingPerishAnimation"
     /// Settings → Appearance → Sidebar → Watch Party.
     static let showWatchPartyTab = "nuvio.tv.settings.layout.showWatchPartyTab"
@@ -503,6 +505,9 @@ enum SettingsKey {
         // The account payload of other devices has no value for it, and a
         // pull would switch the sidebar off again.
         useNuvioRail, continueWatchingPerishAnimation,
+        // How Back leaves the app belongs to this Apple TV. The other apps
+        // have no such setting.
+        doubleBackToExit,
         aniListClientID, malClientID
     ])
 
@@ -3093,6 +3098,7 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.showCalendarTab) private var showCalendarTab = true
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
     @AppStorage(SettingsKey.useNuvioRail) private var useNuvioRail = false
+    @AppStorage(SettingsKey.doubleBackToExit) private var doubleBackToExit = false
     @AppStorage(SettingsKey.continueWatchingPerishAnimation) private var continueWatchingPerishAnimation = false
     // Kept on this Apple TV, outside profiles and sync (`NuvioBranding`).
     @AppStorage(NuvioBranding.key, store: .standard) private var nuvioBranding = false
@@ -3217,6 +3223,17 @@ private struct AppearanceSettingsView: View {
                     isOn: $showWatchPartyTab,
                     accentColor: accentColor
                 )
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_double_back_to_exit", fallback: "Press Back Twice to Exit"),
+                    subtitle: L10n.string(
+                        "tvos_settings_double_back_to_exit_subtitle",
+                        fallback: "When Back would leave Nuvio, the first press shows a reminder. Press Back again within 3 seconds to leave."
+                    ),
+                    isOn: $doubleBackToExit,
+                    accentColor: accentColor
+                )
+                .opacity(useTopNavigation ? 0.46 : 1)
+                .disabled(useTopNavigation)
             }
 
             SettingsGroup(
