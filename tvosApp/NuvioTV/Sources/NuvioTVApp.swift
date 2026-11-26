@@ -2352,11 +2352,12 @@ struct ContentView: View {
         // Hand off to the external app only when it is actually installed
         // (`canOpenURL` needs its scheme in LSApplicationQueriesSchemes); if it
         // isn't, fall through to the built-in player instead of a dead launch.
+        let episodeTitle = isActionPlaybackSession ? nil : (playbackCurrentEpisode?.title ?? (meta.isSeries ? subtitle : nil))
         let mediaFilename = filename ?? ExternalPlayer.mediaFilename(
             meta: meta,
             season: meta.isSeries ? numbers?.season : nil,
             episode: meta.isSeries ? numbers?.episode : nil,
-            episodeTitle: isActionPlaybackSession ? nil : (playbackCurrentEpisode?.title ?? (meta.isSeries ? subtitle : nil))
+            episodeTitle: episodeTitle
         )
 
         if !isStandalonePlaybackSession,
@@ -2366,7 +2367,12 @@ struct ContentView: View {
                filename: mediaFilename,
                subtitleURLs: subtitleURLs,
                position: resumeFrom,
-               title: meta.name,
+               title: ExternalPlayer.displayTitle(
+                   name: meta.name,
+                   season: meta.isSeries ? numbers?.season : nil,
+                   episode: meta.isSeries ? numbers?.episode : nil,
+                   episodeTitle: episodeTitle
+               ),
                successURL: successCallback,
                errorURL: errorCallback
            ),

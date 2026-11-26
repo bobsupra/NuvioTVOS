@@ -436,6 +436,28 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
         return (path as NSString).pathExtension.lowercased()
     }
 
+    /// The title an external player shows. An episode gets its season,
+    /// number and title after the show's name, as in "Severance · S2 · E3 ·
+    /// Who Is Alive?", so the player doesn't show the same name for every
+    /// episode. A movie keeps its name.
+    static func displayTitle(name: String, season: Int?, episode: Int?, episodeTitle: String?) -> String {
+        guard let season, let episode, season >= 0, episode > 0 else { return name }
+        let code = "S\(season) · E\(episode)"
+        // The episode line can already start with its code, as in "S2 · E3 · ...".
+        let title = (episodeTitle ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .replacingOccurrences(
+                of: #"^(?:S\d{1,3}\s*[·•xX:-]?\s*E\d{1,4}\s*[·•:-]?\s*)+"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let isPlaceholder = title.isEmpty
+            || title.caseInsensitiveCompare(name) == .orderedSame
+            || title.range(of: #"^(?:Season|Episode)\s+\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        return isPlaceholder ? "\(name) · \(code)" : "\(name) · \(code) · \(title)"
+    }
+
     /// Builds a sanitized, scraper-friendly media filename for external players
     /// (e.g. Infuse, Outplayer, VidHub, SenPlayer) to enable accurate metadata matching (TMDb / TheTVDB)
     /// and prevent displaying raw stream hashes/tokens.
