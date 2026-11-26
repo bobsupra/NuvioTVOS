@@ -224,6 +224,10 @@ struct PosterCard: View {
     var layoutMode: String = "Modern"
     var showPosterLabels: Bool = false
     var smoothFocusAnimations: Bool = true
+    /// Whether growing into the backdrop animates, when it differs from
+    /// `smoothFocusAnimations`: Home's rows animate it even with Fast Horizontal
+    /// Navigation, which stops the focus-move animations.
+    var expandsWithAnimation: Bool? = nil
     var focusHighlighterEnabled: Bool = false
     /// Keeps the last-selected card visually outlined while an overlay owns
     /// tvOS focus. The parent supplies this for exactly one saved card.
@@ -396,9 +400,9 @@ struct PosterCard: View {
         .zIndex(showsFocusedAppearance ? 1 : 0)
         // Critically damped, no overshoot, and the row's own curve for the same change.
         .animation(
-            effectiveSmoothFocus
-                ? TVHomeLayout.backdropAnimation(expanding: effectiveLandscape)
-                : nil,
+            effectiveLandscape
+                ? (animatesBackdropExpansion ? TVHomeLayout.backdropExpandAnimation : nil)
+                : (effectiveSmoothFocus ? TVHomeLayout.backdropCollapseAnimation : nil),
             value: effectiveLandscape
         )
     }
@@ -809,6 +813,10 @@ struct PosterCard: View {
 
     private var effectiveSmoothFocus: Bool {
         smoothFocusAnimations
+    }
+
+    private var animatesBackdropExpansion: Bool {
+        expandsWithAnimation ?? smoothFocusAnimations
     }
 
     private var effectiveFocusHighlighter: Bool {
@@ -1265,6 +1273,7 @@ extension PosterCard: Equatable {
             && lhs.layoutMode == rhs.layoutMode
             && lhs.showPosterLabels == rhs.showPosterLabels
             && lhs.smoothFocusAnimations == rhs.smoothFocusAnimations
+            && lhs.expandsWithAnimation == rhs.expandsWithAnimation
             && lhs.focusHighlighterEnabled == rhs.focusHighlighterEnabled
             && lhs.retainFocusAppearance == rhs.retainFocusAppearance
             && lhs.allowsFocus == rhs.allowsFocus

@@ -35,6 +35,16 @@ enum TVHomeLayout {
     static func backdropAnimation(expanding: Bool) -> Animation {
         expanding ? backdropExpandAnimation : backdropCollapseAnimation
     }
+
+    /// A row's curve for a backdrop change. With Smooth Focus on, the expansion animates
+    /// even with Fast Horizontal Navigation: it starts only once focus has rested, so it
+    /// doesn't slow a move. The collapse comes with a focus move, so Fast Horizontal
+    /// Navigation keeps it instant.
+    static func backdropRowAnimation(expanding: Bool, smooth: Bool, fast: Bool) -> Animation? {
+        guard smooth else { return nil }
+        if expanding { return backdropExpandAnimation }
+        return fast ? nil : backdropCollapseAnimation
+    }
     /// Gliding horizontal strip motion that mimics native momentum with smooth fluid deceleration.
     static let horizontalGlideAnimation = Animation.interactiveSpring(response: 0.34, dampingFraction: 0.90, blendDuration: 0.24)
     /// Gliding vertical row transition preserving momentum with smooth, bounce-free settle.
@@ -883,6 +893,7 @@ struct TVCatalogRow: View {
             layoutMode: rowHomeLayout,
             showPosterLabels: rowPosterLabels,
             smoothFocusAnimations: rowCardFocusAnimations,
+            expandsWithAnimation: rowSmoothFocus && !suppressFocusAnimations,
             focusHighlighterEnabled: rowFocusHighlighter,
             retainFocusAppearance: retainFocusAppearanceForCardKey == cardKey,
             allowsFocus: restrictFocusToCardKey == nil || restrictFocusToCardKey == cardKey,
@@ -930,8 +941,12 @@ struct TVCatalogRow: View {
             .padding(.trailing, trailingRoom)
             .padding(.vertical, TVHomeLayout.stripVerticalPadding)
             .animation(
-                rowCardFocusAnimations && restrictFocusToCardKey == nil
-                    ? TVHomeLayout.backdropAnimation(expanding: landscapeFocusedId != nil) : nil,
+                restrictFocusToCardKey == nil
+                    ? TVHomeLayout.backdropRowAnimation(
+                        expanding: landscapeFocusedId != nil,
+                        smooth: smoothFocus && !suppressFocusAnimations,
+                        fast: fastNavigation
+                    ) : nil,
                 value: landscapeFocusedId
             )
             .background {
