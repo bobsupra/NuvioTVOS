@@ -7,6 +7,7 @@
 // simply skips it, so a fresh clone generates and builds unsigned with no
 // setup at all.
 #include? "Signing.local.xcconfig"
+#include? "Secrets.local.xcconfig"
 
 // Lets Xcode manage a development profile for on-device debugging. Signed
 // distribution would set this to Manual and add a specifier; see README.md.

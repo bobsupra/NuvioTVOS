@@ -314,9 +314,9 @@ final class WeTrakrAuthServiceTests: XCTestCase {
     }
 
     func testConfigAndCredentials() {
-        XCTAssertTrue(WeTrakrConfig.isConfigured(in: store))
-        XCTAssertEqual(WeTrakrConfig.defaultClientID, "b3bb08203e1e4c412de3a63d833437c0")
-        XCTAssertEqual(WeTrakrConfig.clientID(in: store), WeTrakrConfig.defaultClientID)
+        let bundledDefault = WeTrakrConfig.defaultClientID
+        XCTAssertEqual(WeTrakrConfig.isConfigured(in: store), !bundledDefault.isEmpty)
+        XCTAssertEqual(WeTrakrConfig.clientID(in: store), bundledDefault)
 
         store.set("wetrakr_client_123", forKey: SettingsKey.wetrakrClientID)
         store.set("wetrakr_secret_456", forKey: SettingsKey.wetrakrClientSecret)
@@ -326,11 +326,14 @@ final class WeTrakrAuthServiceTests: XCTestCase {
         XCTAssertEqual(WeTrakrConfig.clientSecret(in: store), "wetrakr_secret_456")
 
         store.set("   ", forKey: SettingsKey.wetrakrClientID)
-        XCTAssertTrue(WeTrakrConfig.isConfigured(in: store))
-        XCTAssertEqual(WeTrakrConfig.clientID(in: store), WeTrakrConfig.defaultClientID)
+        XCTAssertEqual(WeTrakrConfig.isConfigured(in: store), !bundledDefault.isEmpty)
+        XCTAssertEqual(WeTrakrConfig.clientID(in: store), bundledDefault)
     }
 
     func testRequestDeviceCodeUsesDefaultProductionClientIDWhenUnset() async throws {
+        let bundledDefault = WeTrakrConfig.defaultClientID
+        try XCTSkipIf(bundledDefault.isEmpty, "Local WETRAKR_CLIENT_ID is not configured in this build.")
+
         WeTrakrFixtureURLProtocol.install { _ in
             self.fixtureResponse([
                 "device_code": "dev_default_123",
@@ -357,11 +360,11 @@ final class WeTrakrAuthServiceTests: XCTestCase {
 
         let request = try XCTUnwrap(WeTrakrFixtureURLProtocol.capturedRequests().first)
         XCTAssertEqual(request.url?.path, "/oauth/device/code")
-        XCTAssertEqual(request.value(forHTTPHeaderField: "wetrakr-api-key"), WeTrakrConfig.defaultClientID)
-        XCTAssertEqual(requestJSON(request)?["client_id"] as? String, WeTrakrConfig.defaultClientID)
+        XCTAssertEqual(request.value(forHTTPHeaderField: "wetrakr-api-key"), bundledDefault)
+        XCTAssertEqual(requestJSON(request)?["client_id"] as? String, bundledDefault)
 
         let state = service.currentState
-        XCTAssertEqual(state.credentialClientID, WeTrakrConfig.defaultClientID)
+        XCTAssertEqual(state.credentialClientID, bundledDefault)
         XCTAssertTrue(state.hasActivePINFlow(in: store))
     }
 

@@ -6389,9 +6389,15 @@ private struct IntegrationSettingsView: View {
                 subtitle: "Track movies, TV shows and anime with watch history and scrobbling"
             ) {
                 SettingsTextFieldRow(
-                    title: "WeTrakr Client ID (Optional)",
-                    subtitle: "Leave blank to use Nuvio's built-in key, or enter a custom key — stored only on this Apple TV",
-                    placeholder: "Using built-in key",
+                    title: WeTrakrConfig.defaultClientID.isEmpty
+                        ? "WeTrakr Client ID"
+                        : "WeTrakr Client ID (Optional)",
+                    subtitle: WeTrakrConfig.defaultClientID.isEmpty
+                        ? "Your app key from WeTrakr Settings API — stored only on this Apple TV"
+                        : "Leave blank to use Nuvio's built-in key, or enter a custom key — stored only on this Apple TV",
+                    placeholder: WeTrakrConfig.defaultClientID.isEmpty
+                        ? L10n.string("debrid_not_set", fallback: "Not set")
+                        : "Using built-in key",
                     text: $wetrakrClientIDDraft,
                     onCommit: {
                         wetrakrClientID = wetrakrClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -6,7 +6,13 @@ enum WeTrakrConfig {
     static let activationURL = "https://wetrakr.com/activate"
     static let websiteURL = "https://wetrakr.com"
     static let documentationURL = "https://www.vinnota.store"
-    static let defaultClientID = "b3bb08203e1e4c412de3a63d833437c0"
+
+    static var defaultClientID: String {
+        let raw = (Bundle.main.object(forInfoDictionaryKey: "WETRAKR_CLIENT_ID") as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, !raw.hasPrefix("$(") else { return "" }
+        return raw
+    }
 
     static var clientID: String {
         clientID(in: ProfileSettings.current)
