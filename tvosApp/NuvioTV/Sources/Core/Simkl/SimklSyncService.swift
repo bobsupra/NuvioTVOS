@@ -1417,7 +1417,17 @@ struct SimklHistoryService {
                     season: mutation.season,
                     episodes: episodes,
                     store: store
+                ) else {
+                // A write Simkl has no id for can never be sent. Waiting on it held back
+                // every write queued after it, for good, so it is dropped.
+                guard WatchedStore.acknowledgeLibraryMutation(
+                    id: mutation.id,
+                    provider: .simkl,
+                    accountID: accountID,
+                    profileId: profileId
                 ) else { return false }
+                continue
+            }
             do {
                 let response = try await service.postReturningBody(
                     path: mutation.isWatched ? "sync/history" : "sync/history/remove",
@@ -3818,7 +3828,9 @@ private func simklIDs(_ meta: NuvioMeta) -> SimklSyncIDs? {
 
     let ids = SimklSyncIDs(
         simkl: prefixedInt("simkl"),
-        imdb: meta.imdbId ?? (first.hasPrefix("tt") ? first : nil),
+        imdb: meta.imdbId
+            ?? (first.hasPrefix("tt") ? first : nil)
+            ?? NuvioMeta.imdbIDAfterAddonPrefix(in: meta.id),
         tmdb: meta.tmdbId ?? prefixedInt("tmdb"),
         tvdb: prefixedInt("tvdb"),
         mal: prefixedInt("mal"),

@@ -163,4 +163,56 @@ final class PlexPlaybackSyncTests: XCTestCase {
         XCTAssertEqual(state?.viewOffsetMs, 0)
         XCTAssertEqual(state?.isWatched, true)
     }
+
+    func testAnExternalPlayersStopReachesPlexEvenAfterAnEarlierStop() async {
+        sync.serverReady = { _ in true }
+        // The built-in player played this item and stopped earlier in the run.
+        sync.report(.playing, url: storedLink, currentTime: 100, duration: 600)
+        sync.report(.stopped, url: storedLink, currentTime: 110, duration: 600)
+        sent = []
+        await sync.externalPlaybackEnded(url: storedLink, position: 300, duration: nil)
+        XCTAssertEqual(sent.map(\.state), [.stopped])
+        XCTAssertEqual(sent.map(\.timeMs), [300_000])
+        XCTAssertEqual(PlexLibraryIndex.shared.watchState(serverID: serverID, ratingKey: "101")?.viewOffsetMs, 300_000)
+    }
+
+    func testAnExternalPlayersStopUsesPlexsOwnLengthFirst() async {
+        sync.serverReady = { _ in true }
+        var lengths: [Int64] = []
+        sync.sendTimeline = { _, _, _, durationMs in lengths.append(durationMs) }
+        await sync.externalPlaybackEnded(url: storedLink, position: 300, duration: 650)
+        XCTAssertEqual(lengths, [600_000])
+        XCTAssertEqual(sync.duration(for: URL(string: storedLink)!), 600)
+        XCTAssertNil(sync.duration(for: URL(string: "https://example.com/video.mkv")!))
+    }
+
+    func testAnExternalPlayersStopWithoutAConnectedServerChangesNothing() async {
+        sync.serverReady = { _ in false }
+        await sync.externalPlaybackEnded(url: storedLink, position: 300, duration: nil)
+        XCTAssertTrue(sent.isEmpty)
+        // The local copy of Plex's state stays where the server has it.
+        XCTAssertEqual(PlexLibraryIndex.shared.watchState(serverID: serverID, ratingKey: "101")?.viewOffsetMs, 120_000)
+    }
+
+    func testAnExternalPlayerOnAnotherStreamLeavesPlexAlone() async {
+        sync.serverReady = { _ in true }
+        await sync.externalPlaybackEnded(url: "https://example.com/video.mkv", position: 300, duration: nil)
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testANewerPlayOfTheSameItemWinsOverAnExternalStop() async {
+        sync.serverReady = { _ in true }
+        // The built-in player started the same item while the stop waited.
+        sync.report(.playing, url: storedLink, currentTime: 200, duration: 600)
+        sent = []
+        await sync.externalPlaybackEnded(url: storedLink, position: 300, duration: nil)
+        XCTAssertTrue(sent.isEmpty)
+    }
+
+    func testWaitingForAServerThatNeverConnectsGivesUp() async {
+        let start = Date()
+        let ready = await PlexSessionManager.shared.waitForClient(serverID: "no-such-server", timeout: 0.6)
+        XCTAssertFalse(ready)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 5)
+    }
 }
