@@ -9088,6 +9088,8 @@ struct AVPlayerFullscreenOverlay: View {
     let year: Int?
     let isLive: Bool
     let isReady: Bool
+    let liveProgrammes: [IPTVProgramme]
+    let liveStartedAt: Date?
     let onTrailerReady: () -> Void
     let onDismiss: () -> Void
 
@@ -9097,6 +9099,8 @@ struct AVPlayerFullscreenOverlay: View {
         year: Int?,
         isLive: Bool,
         isReady: Bool,
+        liveProgrammes: [IPTVProgramme] = [],
+        liveStartedAt: Date? = nil,
         onTrailerReady: @escaping () -> Void,
         onDismiss: @escaping () -> Void
     ) {
@@ -9105,11 +9109,15 @@ struct AVPlayerFullscreenOverlay: View {
         self.year = year
         self.isLive = isLive
         self.isReady = isReady
+        self.liveProgrammes = liveProgrammes
+        self.liveStartedAt = liveStartedAt
         self.onTrailerReady = onTrailerReady
         self.onDismiss = onDismiss
     }
 
     @FocusState private var focusedControl: TvDetailsTrailerControlFocus?
+    @StateObject private var liveClock = PlaybackClock()
+    @State private var fallbackLiveStartedAt = Date()
     @State private var isPlaying = true
     @State private var isSurfaceReady = false
     @State private var currentTime: Double = 0
@@ -9130,7 +9138,8 @@ struct AVPlayerFullscreenOverlay: View {
 
     private var transportFocusOrder: [TvDetailsTrailerControlFocus] {
         guard isLive else { return [.subtitles, .audio] }
-        return [.playPause]
+        return (pipController != nil ? [.pip] : [])
+            + [.playPause]
             + (subtitleOptions.isEmpty ? [] : [.subtitles])
             + (audioOptions.isEmpty ? [] : [.audio])
     }
@@ -9181,7 +9190,15 @@ struct AVPlayerFullscreenOverlay: View {
             // 2. Keep trailer PiP behavior; live uses its detachable inline AVPlayerLayer surface.
             Group {
                 if isLive {
-                    IPTVVideoSurface(player: player, videoGravity: .resizeAspect) {
+                    IPTVVideoSurface(
+                        player: player,
+                        videoGravity: .resizeAspect,
+                        onLayerAvailable: { layer in
+                            if AVPictureInPictureController.isPictureInPictureSupported() {
+                                pipController = AVPictureInPictureController(playerLayer: layer)
+                            }
+                        }
+                    ) {
                         withAnimation(.easeOut(duration: 0.2)) {
                             isSurfaceReady = true
                         }
@@ -9339,20 +9356,38 @@ struct AVPlayerFullscreenOverlay: View {
 
     // MARK: - Playback title
 
+    private var liveProgrammeSubtitle: String? {
+        guard isLive,
+              let current = IPTVChannelGuideLookup.currentProgramme(in: liveProgrammes, at: Date()),
+              current.title.localizedCaseInsensitiveCompare(title) != .orderedSame else {
+            return nil
+        }
+        return current.title
+    }
+
     private var playbackTitle: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 8) {
-                Text(isLive ? L10n.string("player_live", fallback: "LIVE") : L10n.string("details_trailer", fallback: "Trailer"))
-                    .font(.system(size: 21, weight: .medium))
-                    .foregroundColor(.white.opacity(0.76))
-
-                if !isLive, let year {
-                    Text("•")
-                        .font(.system(size: 21, weight: .medium))
-                        .foregroundColor(.white.opacity(0.48))
-                    Text(String(year))
+            if isLive {
+                if let subtitle = liveProgrammeSubtitle {
+                    Text(subtitle)
                         .font(.system(size: 21, weight: .medium))
                         .foregroundColor(.white.opacity(0.76))
+                        .lineLimit(1)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Text(L10n.string("details_trailer", fallback: "Trailer"))
+                        .font(.system(size: 21, weight: .medium))
+                        .foregroundColor(.white.opacity(0.76))
+
+                    if let year {
+                        Text("•")
+                            .font(.system(size: 21, weight: .medium))
+                            .foregroundColor(.white.opacity(0.48))
+                        Text(String(year))
+                            .font(.system(size: 21, weight: .medium))
+                            .foregroundColor(.white.opacity(0.76))
+                    }
                 }
             }
 
@@ -9372,7 +9407,14 @@ struct AVPlayerFullscreenOverlay: View {
                 Spacer(minLength: 24)
                 transportRow
             }
-            if !isLive {
+            if isLive {
+                PlayerLiveTimelineBar(
+                    clock: liveClock,
+                    programmes: liveProgrammes,
+                    startedAt: liveStartedAt ?? fallbackLiveStartedAt,
+                    isActive: showControls
+                )
+            } else {
                 timelineBar
             }
         }
@@ -9383,6 +9425,19 @@ struct AVPlayerFullscreenOverlay: View {
 
     private var transportRow: some View {
         HStack(spacing: 18) {
+            if isLive, pipController != nil {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .pip,
+                    isFocused: focusedControl == .pip,
+                    action: togglePictureInPicture
+                ) {
+                    Image(systemName: "pip.enter")
+                }
+                .accessibilityLabel(L10n.string("player_pip", fallback: "Picture in Picture"))
+            }
+
             if isLive {
                 glassIconButton(
                     size: 70,
@@ -9817,7 +9872,22 @@ struct AVPlayerFullscreenOverlay: View {
         let interval = CMTime(value: 1, timescale: 4)
         timeObserverToken = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak player] time in
             guard let player else { return }
-            if !isLive {
+            if isLive {
+                if let item = player.currentItem,
+                   let seekable = item.seekableTimeRanges.last?.timeRangeValue {
+                    let start = seekable.start.seconds
+                    let dur = seekable.duration.seconds
+                    let cur = time.seconds
+                    if start.isFinite, dur.isFinite, dur > 0, cur.isFinite {
+                        let pos = min(max(cur - start, 0), dur)
+                        let loadedEnd = item.loadedTimeRanges.last?.timeRangeValue.end.seconds ?? cur
+                        let buf = loadedEnd.isFinite ? min(max(loadedEnd - start, pos), dur) : pos
+                        if liveClock.livePosition != pos { liveClock.livePosition = pos }
+                        if liveClock.liveDuration != dur { liveClock.liveDuration = dur }
+                        if liveClock.liveBuffered != buf { liveClock.liveBuffered = buf }
+                    }
+                }
+            } else {
                 let sec = time.seconds
                 if !sec.isNaN && !sec.isInfinite {
                     currentTime = sec

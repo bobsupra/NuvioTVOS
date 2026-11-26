@@ -3741,10 +3741,14 @@ extension View {
     }
 
     @ViewBuilder
-    func defaultFocusIfAvailable(_ binding: FocusState<Bool>.Binding, enabled: Bool) -> some View {
+    func defaultFocusIfAvailable(
+        _ binding: FocusState<Bool>.Binding,
+        enabled: Bool,
+        priority: DefaultFocusEvaluationPriority = .automatic
+    ) -> some View {
         if enabled {
             if #available(tvOS 17.0, *) {
-                self.defaultFocus(binding, true)
+                self.defaultFocus(binding, true, priority: priority)
             } else {
                 self
             }
