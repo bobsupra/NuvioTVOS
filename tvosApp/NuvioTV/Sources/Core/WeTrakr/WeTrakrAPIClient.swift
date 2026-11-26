@@ -7,6 +7,13 @@ enum WeTrakrConfig {
     static let websiteURL = "https://wetrakr.com"
     static let documentationURL = "https://www.vinnota.store"
 
+    static var defaultClientID: String {
+        let raw = (Bundle.main.object(forInfoDictionaryKey: "WETRAKR_CLIENT_ID") as? String ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, !raw.hasPrefix("$(") else { return "" }
+        return raw
+    }
+
     static var clientID: String {
         clientID(in: ProfileSettings.current)
     }
@@ -20,8 +27,9 @@ enum WeTrakrConfig {
     }
 
     static func clientID(in store: UserDefaults) -> String {
-        store.string(forKey: SettingsKey.wetrakrClientID)?
+        let custom = store.string(forKey: SettingsKey.wetrakrClientID)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return custom.isEmpty ? defaultClientID : custom
     }
 
     static func clientSecret(in store: UserDefaults) -> String {

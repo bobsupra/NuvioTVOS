@@ -89,6 +89,8 @@
 	<string>This app does not require microphone access.</string>
 	<key>PREMIUMIZE_CLIENT_ID</key>
 	<string></string>
+	<key>WETRAKR_CLIENT_ID</key>
+	<string>$(WETRAKR_CLIENT_ID)</string>
 	<key>UIAppFonts</key>
 	<array>
 		<string>inter_variable.ttf</string>

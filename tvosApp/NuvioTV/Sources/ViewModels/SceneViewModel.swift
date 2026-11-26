@@ -58,7 +58,8 @@ final class SceneViewModel: ObservableObject {
         nextEpisode: NuvioVideo?,
         playbackInfo: ScenePlaybackInfo? = nil,
         hasChapters: Bool = false,
-        hasAutoSync: Bool = false
+        hasAutoSync: Bool = false,
+        includeSceneTab: Bool = true
     ) {
         self.infoTitle = title
         self.infoYear = year.map(String.init)
@@ -74,7 +75,14 @@ final class SceneViewModel: ObservableObject {
         }
         
         // The file's chapters are a tab of their own (ordered with the others in InSight Sections).
-        var tabs: [SceneTab] = hasChapters ? [.chapters, .scene, .info] : [.scene, .info]
+        var tabs: [SceneTab] = []
+        if hasChapters {
+            tabs.append(.chapters)
+        }
+        if includeSceneTab {
+            tabs.append(.scene)
+        }
+        tabs.append(.info)
         // AutoSubSync, for add-on subtitles on a file it can read.
         if hasAutoSync {
             tabs.append(.autoSync)
@@ -92,8 +100,12 @@ final class SceneViewModel: ObservableObject {
     func open() {
         guard !isVisible else { return }
         isVisible = true
-        selectedTab = .scene
-        coordinator.openPanel()
+        if availableTabs.contains(.scene) {
+            selectedTab = .scene
+            coordinator.openPanel()
+        } else {
+            selectedTab = availableTabs.first ?? .info
+        }
     }
     
     func close() {

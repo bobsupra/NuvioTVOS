@@ -148,6 +148,7 @@ enum CalendarTmdb {
         let id: Int
         let name: String?
         let posterPath: String?
+        let backdropPath: String?
         let nextEpisodeToAir: Episode?
         let lastEpisodeToAir: Episode?
         let seasons: [SeasonSummary]?
@@ -173,6 +174,7 @@ enum CalendarTmdb {
         enum CodingKeys: String, CodingKey {
             case id, name, seasons, genres, translations
             case posterPath = "poster_path"
+            case backdropPath = "backdrop_path"
             case nextEpisodeToAir = "next_episode_to_air"
             case lastEpisodeToAir = "last_episode_to_air"
             case originCountry = "origin_country"
@@ -189,12 +191,14 @@ enum CalendarTmdb {
             return nil
         }
 
-        init(id: Int, name: String?, posterPath: String? = nil, nextEpisodeToAir: Episode? = nil,
+        init(id: Int, name: String?, posterPath: String? = nil, backdropPath: String? = nil,
+             nextEpisodeToAir: Episode? = nil,
              lastEpisodeToAir: Episode? = nil, seasons: [SeasonSummary]? = nil,
              genres: [Genre]? = nil, originCountry: [String]? = nil, translations: Translations? = nil) {
             self.id = id
             self.name = name
             self.posterPath = posterPath
+            self.backdropPath = backdropPath
             self.nextEpisodeToAir = nextEpisodeToAir
             self.lastEpisodeToAir = lastEpisodeToAir
             self.seasons = seasons

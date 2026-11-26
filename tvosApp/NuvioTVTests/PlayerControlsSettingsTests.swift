@@ -771,6 +771,135 @@ final class PlayerControlsSettingsTests: XCTestCase {
         ), "The skip-segment prompt must keep the window catcher from consuming input")
     }
 
+    @MainActor
+    func testVerticalNavigationFromTimelineAndSkipSegment() {
+        XCTAssertEqual(
+            PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: [.episodes, .subtitles, .settings]),
+            .episodes,
+            "Pressing Up from the timeline must land on the first transport circle button, not skip straight to Skip Intro"
+        )
+        XCTAssertEqual(
+            PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: []),
+            .settings
+        )
+
+        XCTAssertTrue(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: true,
+                isTimelineFocused: true,
+                isSkipSegmentFocused: false
+            ),
+            "Skip segment card must stay out of the spatial focus graph while the progress bar owns focus"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: true,
+                isTimelineFocused: false,
+                isSkipSegmentFocused: false
+            ),
+            "Skip segment card must be focusable once focus moves up to the transport circle buttons"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: true,
+                isTimelineFocused: true,
+                isSkipSegmentFocused: true
+            ),
+            "Skip segment card must remain enabled while it already holds focus"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.shouldDisableSkipSegmentForTimelineFocus(
+                isQuickMenuPresented: false,
+                showControls: false,
+                isTimelineFocused: false,
+                isSkipSegmentFocused: false
+            ),
+            "Skip segment card must remain focusable while playback controls are hidden"
+        )
+
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: true,
+                isTimelineDownSuppressed: true,
+                isAuxiliaryCardFocused: false,
+                isMoveSuppressed: false
+            ),
+            "Landing on the timeline from Skip Intro/Recap must not open InSight on the same Down press"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: false,
+                isTimelineDownSuppressed: false,
+                isAuxiliaryCardFocused: false,
+                isMoveSuppressed: false
+            ),
+            "Down before timeline focus settles must not open InSight"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: true,
+                isTimelineDownSuppressed: false,
+                isAuxiliaryCardFocused: true,
+                isMoveSuppressed: false
+            ),
+            "Auxiliary card focus must block timeline Down from opening InSight"
+        )
+        XCTAssertTrue(
+            PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                isSceneEnabled: true,
+                isTimelineFocused: true,
+                isTimelineDownSuppressed: false,
+                isAuxiliaryCardFocused: false,
+                isMoveSuppressed: false
+            ),
+            "Down while resting on the timeline must still open InSight"
+        )
+
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: true,
+                isTransportUpSuppressed: false
+            ),
+            "An Up press originating from the timeline must stop on the circle buttons"
+        )
+        XCTAssertFalse(
+            PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: false,
+                isTransportUpSuppressed: true
+            ),
+            "The transport-up cooldown must prevent a single Up press from hopping through to Skip Intro"
+        )
+        XCTAssertTrue(
+            PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: false,
+                isTransportUpSuppressed: false
+            ),
+            "Pressing Up while resting on the circle buttons must still reach Skip Intro / Next Episode"
+        )
+
+        let viewModel = PlayerViewModel()
+        defer { viewModel.shutdown() }
+        viewModel.status = .paused
+        viewModel.showControls = true
+        viewModel.isTimelineFocused = true
+        viewModel.suppressTimelineDownBriefly(0.35)
+        XCTAssertTrue(viewModel.isTimelineDownSuppressed)
+
+        viewModel.remoteTouchBegan()
+        viewModel.remoteTouchMoved(dx: 0, dy: 35)
+        XCTAssertFalse(viewModel.showScenePanel, "Suppressed timeline Down must not open InSight via trackpad")
+        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+
+        viewModel.suppressTransportUpBriefly(0.35)
+        XCTAssertTrue(viewModel.isTransportUpSuppressed)
+    }
+
     func testPlayerControlsSettingsSyncMappings() {
         let localMappings = Dictionary(uniqueKeysWithValues: PlayerSettingsSyncMapper.localToRemoteKeyMappings)
         XCTAssertEqual(localMappings[SettingsKey.playerShowPiP], "player_show_pip")
@@ -3467,6 +3596,14 @@ final class ExternalPlayerTests: XCTestCase {
         XCTAssertTrue(ExternalPlayer.builtIn.isInstalled)
     }
 
+    /// With Nuvio Branding on, the built-in player shows the chosen Nuvio icon.
+    func testEveryNuvioAppIconHasABuiltInPlayerTile() {
+        for icon in NuvioAppIcon.allCases {
+            let name = ExternalPlayer.builtInIconAssetName(for: icon)
+            XCTAssertNotNil(UIImage(named: name), name)
+        }
+    }
+
     func testSubtitleMenuFormatterExternalLabels() {
         // Standard external subtitle with distinct release label:
         // release label becomes primary title, add-on name becomes secondary subtitle.
@@ -4144,4 +4281,180 @@ vVjjlhScq3lOTC9efOPB5oNyc8Ftcir9RlInAuTZYz4AAAAGQZogEaCMASgxC+MpVMz/4+f/v9au
 c5zbnOZfPla58rXPla50K3Oc25zm3Oc1DMrXPla58rXPlVAifc5zbnObcyZbJlsytc+VUCFQIn3O
 c1HA
 """
+}
+
+@MainActor
+final class PlayerQuickMenuPanelTests: XCTestCase {
+    private func makeSnapshot(
+        pageID: String = "speed.root",
+        header: String = "Playback Speed",
+        rows: [PlayerQuickMenuRow],
+        canPopBack: Bool = false,
+        initialFocusID: String? = nil,
+        actions: [String: () -> Void] = [:]
+    ) -> PlayerQuickMenuSnapshot {
+        PlayerQuickMenuSnapshot(
+            content: PlayerQuickMenuContent(
+                pageID: pageID,
+                header: header,
+                items: rows.map(PlayerQuickMenuItem.row),
+                canPopBack: canPopBack,
+                initialFocusID: initialFocusID
+            ),
+            actions: actions
+        )
+    }
+
+    func testQuickMenuPopupHugsShortRowsAndCapsLongListsWithScroll() {
+        let container = UIView(frame: CGRect(x: 0, y: 0, width: 1920, height: 1080))
+        let triggerFrame = CGRect(x: 1620, y: 920, width: 70, height: 70)
+
+        let shortRows = [
+            PlayerQuickMenuRow(id: "r1", title: "0.75x", subtitle: nil, isSelected: false, isDisabled: false, showsChevron: false, closesMenu: true),
+            PlayerQuickMenuRow(id: "r2", title: "1x (Normal)", subtitle: nil, isSelected: true, isDisabled: false, showsChevron: false, closesMenu: true),
+            PlayerQuickMenuRow(id: "r3", title: "1.25x", subtitle: nil, isSelected: false, isDisabled: false, showsChevron: false, closesMenu: true),
+        ]
+        let shortList = PlayerQuickMenuListView(snapshot: makeSnapshot(rows: shortRows, initialFocusID: "r2"))
+        let shortPanel = PlayerQuickMenuPanelView.present(
+            listView: shortList,
+            in: container,
+            triggerFrame: triggerFrame,
+            animated: false
+        )
+
+        XCTAssertEqual(shortPanel.bounds.width, PlayerQuickMenuListView.menuWidth, accuracy: 0.5)
+        XCTAssertEqual(shortPanel.bounds.width, 450, accuracy: 0.5)
+        XCTAssertEqual(shortPanel.backgroundEffectView.layer.cornerRadius, PlayerQuickMenuPanelView.Metrics.cornerRadius, accuracy: 0.5)
+        XCTAssertEqual(
+            shortPanel.bounds.height,
+            PlayerQuickMenuListView.Metrics.headerHeight + 3 * PlayerQuickMenuListView.Metrics.rowHeight + PlayerQuickMenuListView.Metrics.bottomInset,
+            accuracy: 1.0
+        )
+        XCTAssertEqual(shortPanel.frame.maxY, triggerFrame.minY - PlayerQuickMenuPanelView.Metrics.buttonGap, accuracy: 0.5)
+
+        shortPanel.dismissPanel(notify: false, animated: false)
+
+        let longRows = (0..<12).map { index in
+            PlayerQuickMenuRow(
+                id: "track-\(index)",
+                title: "Language \(index)",
+                subtitle: "SubRip External Track \(index)",
+                isSelected: index == 0,
+                isDisabled: false,
+                showsChevron: false,
+                closesMenu: true
+            )
+        }
+        let longList = PlayerQuickMenuListView(snapshot: makeSnapshot(pageID: "sub.root", header: "Subtitles", rows: longRows))
+        let longPanel = PlayerQuickMenuPanelView.present(
+            listView: longList,
+            in: container,
+            triggerFrame: triggerFrame,
+            animated: false
+        )
+
+        XCTAssertEqual(longPanel.bounds.height, PlayerQuickMenuPanelView.Metrics.maxHeight, accuracy: 1.0)
+        XCTAssertGreaterThan(longList.scrollView.contentSize.height, longList.scrollView.bounds.height)
+    }
+
+    func testFocusedRowUsesBlackTextOnWhitePillAndUnfocusedRestoresWhiteText() {
+        let row = PlayerQuickMenuRow(
+            id: "eng",
+            title: "English",
+            subtitle: "Dolby Atmos",
+            isSelected: true,
+            isDisabled: false,
+            showsChevron: true,
+            closesMenu: false
+        )
+        let button = PlayerQuickMenuRowButton(row: row)
+        button.frame = CGRect(x: 0, y: 0, width: 408, height: 86)
+        button.layoutIfNeeded()
+
+        XCTAssertEqual(button.titleLabel.textColor, .white)
+        XCTAssertEqual(button.checkmarkView.tintColor, .white)
+        XCTAssertEqual(button.pill.backgroundColor, .clear)
+        XCTAssertEqual(button.pill.layer.shadowOpacity, 0)
+
+        button.applyFocus(true)
+        XCTAssertEqual(button.titleLabel.textColor, .black)
+        XCTAssertEqual(button.checkmarkView.tintColor, .black)
+        XCTAssertEqual(button.chevronView.tintColor, .black)
+        XCTAssertEqual(button.pill.backgroundColor, .white)
+        XCTAssertEqual(
+            button.pill.layer.cornerRadius,
+            PlayerQuickMenuListView.Metrics.rowRadius + PlayerQuickMenuListView.Metrics.focusGrowth,
+            accuracy: 0.5
+        )
+        XCTAssertEqual(button.pill.frame, button.bounds.insetBy(dx: -4, dy: -4))
+        XCTAssertEqual(button.pill.layer.shadowOpacity, 0.3, accuracy: 0.01)
+
+        button.applyFocus(false)
+        XCTAssertEqual(button.titleLabel.textColor, .white)
+        XCTAssertEqual(button.pill.backgroundColor, .clear)
+        XCTAssertEqual(button.pill.layer.shadowOpacity, 0)
+    }
+
+    func testMenuPressPopsSubmenuBeforeDismissingAndSkipsDisabledRows() {
+        let rows = [
+            PlayerQuickMenuRow(id: "status", title: "Checking…", subtitle: nil, isSelected: false, isDisabled: true, showsChevron: false, closesMenu: false),
+            PlayerQuickMenuRow(id: "style", title: "Subtitle Style", subtitle: "Classic", isSelected: false, isDisabled: false, showsChevron: true, closesMenu: false),
+        ]
+        var backPopCount = 0
+        let list = PlayerQuickMenuListView(snapshot: makeSnapshot(
+            pageID: "subtitles.style",
+            header: "Subtitle Style",
+            rows: rows,
+            canPopBack: true,
+            initialFocusID: "status"
+        ))
+        list.onMenuBack = { backPopCount += 1 }
+
+        XCTAssertFalse(list.rowButtons[0].canBecomeFocused)
+        XCTAssertTrue(list.rowButtons[1].canBecomeFocused)
+        XCTAssertTrue(list.preferredFocusEnvironments.first === list.rowButtons[1])
+
+        XCTAssertTrue(list.handleMenuPress())
+        XCTAssertEqual(backPopCount, 1)
+
+        list.update(with: makeSnapshot(
+            pageID: "subtitles.root",
+            header: "Subtitles",
+            rows: rows,
+            canPopBack: false,
+            initialFocusID: "style"
+        ))
+        XCTAssertFalse(list.handleMenuPress())
+        XCTAssertEqual(backPopCount, 1)
+    }
+
+    func testQuickMenuSnapshotsBuildForSubtitlesAudioAndSpeedWithoutExclusivityViolation() {
+        let model = PlayerViewModel(sessionCoordinator: PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        ))
+        defer { model.shutdown() }
+        model.subtitles = [
+            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true),
+            SubtitleTrack(id: "1", name: "English", language: "en", isSelected: false),
+        ]
+        model.audioTracks = [
+            AudioTrack(id: "1", name: "English 5.1", language: "en", isSelected: true, languageName: "English"),
+        ]
+
+        let controls = PlayerControls(
+            viewModel: model,
+            didReportPlaybackStarted: true,
+            isQuickMenuPresented: .constant(true),
+            requestedFocus: .constant(nil)
+        )
+
+        let subtitles = controls.buildQuickMenuSnapshot(for: .subtitles)
+        let audio = controls.buildQuickMenuSnapshot(for: .audio)
+        let speed = controls.buildQuickMenuSnapshot(for: .speed)
+
+        XCTAssertFalse(subtitles.content.items.isEmpty)
+        XCTAssertFalse(audio.content.items.isEmpty)
+        XCTAssertEqual(speed.content.items.count, PlaybackSpeed.allCases.count)
+    }
 }

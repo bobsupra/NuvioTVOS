@@ -1184,6 +1184,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     // State (polled from the view model every 250ms)
     var onFirstFrameReady: (() -> Void)?
+    var onExternalSubtitleLoadFailed: ((String) -> Void)?
     var isPlayerLoading: Bool = true
     var loadingStepMessage: String? {
         isPlayerLoading ? L10n.string("player_loading_buffering", fallback: "Buffering…") : nil
@@ -3024,7 +3025,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                                          channelCount: 0, fallback: "Subtitle \(subIdx + 1)")
                 subs.append(PlaybackTrackInfo(index: subIdx, id: id, type: type, title: display, lang: lang,
                                       selected: selected, externalFilename: externalFilename,
-                                      isForced: isForced))
+                                      isForced: isForced, detail: codec))
                 subIdx += 1
             }
         }
@@ -4279,6 +4280,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                   self.loadGeneration == pending.loadGeneration else { return }
             if let message {
                 self.appendPlaybackLog(prefix: pending.command, level: "error", text: message)
+                if pending.command == "sub-add" {
+                    self.onExternalSubtitleLoadFailed?(pending.url)
+                }
             } else {
                 self.completeTrackCommand(pending)
             }

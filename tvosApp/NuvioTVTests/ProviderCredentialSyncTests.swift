@@ -330,15 +330,45 @@ final class ProviderCredentialSyncTests: XCTestCase {
             XCTAssertNil(destination.object(forKey: key), "\(key) must not cross profile boundaries")
         }
     }
+
+    func testMissingCredentialIsNegativeCachedWithoutCachingTransientFailures() {
+        XCTAssertNil(credential(SettingsKey.mdbListApiKey))
+        XCTAssertEqual(keychain.readCount, 1)
+
+        // Repeated reads on an unconfigured key avoid extra Keychain IPC.
+        XCTAssertNil(credential(SettingsKey.mdbListApiKey))
+        XCTAssertEqual(keychain.readCount, 1)
+
+        // Writing a credential clears the negative cache.
+        XCTAssertTrue(ProviderCredentialStore.set(
+            "mdb-live-key",
+            forKey: SettingsKey.mdbListApiKey,
+            in: store,
+            profileScope: profileScope,
+            keychain: keychain
+        ))
+        XCTAssertEqual(credential(SettingsKey.mdbListApiKey), "mdb-live-key")
+
+        // A transient Keychain read failure must never be negative-cached.
+        keychain.failReads = true
+        XCTAssertNil(credential(SettingsKey.tmdbApiKey))
+        let readsAfterFailure = keychain.readCount
+        keychain.failReads = false
+        keychain.put("recovered-tmdb", for: SettingsKey.tmdbApiKey, profileScope: profileScope)
+        XCTAssertEqual(credential(SettingsKey.tmdbApiKey), "recovered-tmdb")
+        XCTAssertEqual(keychain.readCount, readsAfterFailure + 1)
+    }
 }
 
 private final class MemoryProviderCredentialKeychain: ProviderCredentialKeychain {
     private var entries: [String: String] = [:]
+    var readCount = 0
     var failReads = false
     var failWrites = false
     var failDeletes = false
 
     func read(service: String, account: String) -> ProviderCredentialKeychainRead {
+        readCount += 1
         guard !failReads else { return .failed }
         guard let value = entries[entry(service: service, account: account)] else { return .missing }
         return .value(value)

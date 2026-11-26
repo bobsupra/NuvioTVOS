@@ -1313,7 +1313,12 @@ struct TrailerPlayerSurface: UIViewRepresentable {
         view.playerLayer.videoGravity = videoGravity
         view.playerLayer.player = player
         context.coordinator.observe(layer: view.playerLayer, player: player)
-        onLayerAvailable?(view.playerLayer)
+        if let onLayerAvailable {
+            let layer = view.playerLayer
+            DispatchQueue.main.async {
+                onLayerAvailable(layer)
+            }
+        }
         return view
     }
 
@@ -1324,7 +1329,12 @@ struct TrailerPlayerSurface: UIViewRepresentable {
         if uiView.playerLayer.player !== player {
             uiView.playerLayer.player = player
             context.coordinator.observe(layer: uiView.playerLayer, player: player)
-            onLayerAvailable?(uiView.playerLayer)
+            if let onLayerAvailable {
+                let layer = uiView.playerLayer
+                DispatchQueue.main.async {
+                    onLayerAvailable(layer)
+                }
+            }
         } else {
             context.coordinator.checkReadiness(layer: uiView.playerLayer, player: player)
         }
@@ -1706,14 +1716,11 @@ struct PosterGridCard: View {
     private var customPosterEnabledScreens: String { cardAppearance.customPosterEnabledScreens }
 
     private var customPosterArtworkURL: String? {
-        let screens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? customPosterEnabledScreens
-            : "all"
-        return CustomPosterURLResolver.resolve(
+        CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: meta,
             screen: customPosterScreen,
-            enabledScreens: screens,
+            enabledScreens: customPosterEnabledScreens,
             shape: meta.tileShape == .square ? "square" : "poster"
         )
     }
@@ -3741,10 +3748,14 @@ extension View {
     }
 
     @ViewBuilder
-    func defaultFocusIfAvailable(_ binding: FocusState<Bool>.Binding, enabled: Bool) -> some View {
+    func defaultFocusIfAvailable(
+        _ binding: FocusState<Bool>.Binding,
+        enabled: Bool,
+        priority: DefaultFocusEvaluationPriority = .automatic
+    ) -> some View {
         if enabled {
             if #available(tvOS 17.0, *) {
-                self.defaultFocus(binding, true)
+                self.defaultFocus(binding, true, priority: priority)
             } else {
                 self
             }

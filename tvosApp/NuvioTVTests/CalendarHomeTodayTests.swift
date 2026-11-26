@@ -91,6 +91,32 @@ final class CalendarHomeTodayTests: XCTestCase {
         XCTAssertEqual(row.metas[1].type, "movie")
     }
 
+    func testCardsCarryShowBackdropWithoutLeakingEpisodeStill() {
+        let entry = CalendarEntry(
+            itemId: "tt1",
+            itemType: "series",
+            kind: .series,
+            tmdbId: 1,
+            title: "Show",
+            date: homeToday,
+            releaseKind: .episode,
+            seasonNumber: 2,
+            episodeNumber: 5,
+            episodeName: "Spoiler Title",
+            posterURL: URL(string: "https://img/poster.jpg"),
+            stillURL: URL(string: "https://img/episode-still.jpg"),
+            backdropURL: URL(string: "https://img/show-backdrop.jpg")
+        )
+        let row = CalendarHomeToday.build(
+            from: makeResult([entry]),
+            today: homeToday,
+            hideSpoilers: true,
+            time: time
+        )
+        XCTAssertEqual(row.metas.first?.backgroundUrl, "https://img/show-backdrop.jpg")
+        XCTAssertNil(row.labels["tt1"]?.artworkURL)
+    }
+
     func testCinemaReleasesAreLeftOut() {
         let row = CalendarHomeToday.build(
             from: makeResult([makeEntry("tt9", kind: .movie, tmdbId: 9, release: .theatrical)]),

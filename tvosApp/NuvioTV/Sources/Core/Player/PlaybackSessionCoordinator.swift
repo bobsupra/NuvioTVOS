@@ -394,6 +394,11 @@ final class PlaybackSessionCoordinator: ObservableObject {
         return aetherController.hasPresentedCurrentLoad(generation: generation)
     }
 
+    nonisolated static func isWatchdogGraceEligibleURL(_ url: URL, localStreamSourceURL: URL?) -> Bool {
+        PlaybackBackendPolicy.isRemoteHTTP(url.absoluteString)
+            || (localStreamSourceURL != nil && localStreamSourceURL == url)
+    }
+
     func shouldGrantDiscStartupWatchdogGrace(generation: UInt64, graceAlreadyGranted: Bool) -> Bool {
         guard loadGeneration == generation else { return false }
         return AetherDiscStartupWatchdogGracePolicy.shouldGrantGrace(
@@ -402,7 +407,8 @@ final class PlaybackSessionCoordinator: ObservableObject {
             loadGeneration: generation,
             dispatchedLoadGeneration: dispatchedLoadGeneration,
             progress: aetherController?.startupLoadCheckpointWitness,
-            graceAlreadyGranted: graceAlreadyGranted
+            graceAlreadyGranted: graceAlreadyGranted,
+            localStreamSourceURL: torrentStreamSourceURL
         )
     }
 
@@ -416,7 +422,10 @@ final class PlaybackSessionCoordinator: ObservableObject {
               let request = lastRequest,
               !request.isLiveStream,
               !request.isSports,
-              PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString) else {
+              Self.isWatchdogGraceEligibleURL(
+                request.videoURL,
+                localStreamSourceURL: torrentStreamSourceURL
+              ) else {
             return false
         }
         if activeBackend == .aether {

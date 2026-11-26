@@ -68,4 +68,5 @@ tvosApp/NuvioTV.xcworkspace/
 # Local signing values (Team ID); see tvosApp/Configurations/README.md.
 # Signing.xcconfig itself IS tracked and optional-includes this file.
 tvosApp/Configurations/Signing.local.xcconfig
+tvosApp/Configurations/Secrets.local.xcconfig
 /build_derived/

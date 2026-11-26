@@ -74,6 +74,40 @@ struct IPTVPlaylistParser {
 
     private static let m3uHeader = "#EXTM3U"
     private static let streamInfoHeader = "#EXTINF:"
+    /// RFC 8216 HLS directives that identify a media or multivariant HLS manifest
+    /// rather than an IPTV channel list. Non-HLS custom `#EXT-X-*` metadata lines
+    /// (such as EPGenius's `#EXT-X-CREDENTIALS`) are ignored like other comments.
+    private static let hlsPlaylistTags: Set<String> = [
+        "#EXT-X-VERSION",
+        "#EXT-X-TARGETDURATION",
+        "#EXT-X-MEDIA-SEQUENCE",
+        "#EXT-X-DISCONTINUITY-SEQUENCE",
+        "#EXT-X-ENDLIST",
+        "#EXT-X-PLAYLIST-TYPE",
+        "#EXT-X-I-FRAMES-ONLY",
+        "#EXT-X-PART-INF",
+        "#EXT-X-SERVER-CONTROL",
+        "#EXT-X-BYTERANGE",
+        "#EXT-X-DISCONTINUITY",
+        "#EXT-X-KEY",
+        "#EXT-X-MAP",
+        "#EXT-X-PROGRAM-DATE-TIME",
+        "#EXT-X-GAP",
+        "#EXT-X-BITRATE",
+        "#EXT-X-PART",
+        "#EXT-X-DATERANGE",
+        "#EXT-X-SKIP",
+        "#EXT-X-PRELOAD-HINT",
+        "#EXT-X-RENDITION-REPORT",
+        "#EXT-X-MEDIA",
+        "#EXT-X-STREAM-INF",
+        "#EXT-X-I-FRAME-STREAM-INF",
+        "#EXT-X-SESSION-KEY",
+        "#EXT-X-CONTENT-STEERING",
+        "#EXT-X-INDEPENDENT-SEGMENTS",
+        "#EXT-X-START",
+        "#EXT-X-DEFINE"
+    ]
     private static let attributeRegex = try! NSRegularExpression(
         pattern: #"([A-Za-z0-9_-]+)\s*=\s*("([^"]*)"|([^\s,]+))"#
     )
@@ -119,13 +153,13 @@ struct IPTVPlaylistParser {
                 return
             }
 
-            if line.uppercased().hasPrefix("#EXT-X-") {
+            if Self.isHLSPlaylistTag(line) {
                 parserError = .hlsPlaylist
                 stop = true
                 return
             }
 
-            if line.hasPrefix(Self.m3uHeader) {
+            if Self.hasCaseInsensitivePrefix(line, Self.m3uHeader) {
                 guard playlistCount < maximumItems else {
                     parserError = .tooLarge
                     stop = true
@@ -146,7 +180,7 @@ struct IPTVPlaylistParser {
                 return
             }
 
-            if line.hasPrefix(Self.streamInfoHeader) {
+            if Self.hasCaseInsensitivePrefix(line, Self.streamInfoHeader) {
                 pendingStream = Self.buildStream(from: line)
                 return
             }
@@ -182,6 +216,17 @@ struct IPTVPlaylistParser {
 
 
         return playlists
+    }
+
+    private static func isHLSPlaylistTag(_ line: String) -> Bool {
+        guard line.hasPrefix("#") else { return false }
+        let tag = line.prefix { $0 != ":" && !$0.isWhitespace }.uppercased()
+        guard tag.hasPrefix("#EXT-X-") else { return false }
+        return hlsPlaylistTags.contains(tag)
+    }
+
+    private static func hasCaseInsensitivePrefix(_ line: String, _ prefix: String) -> Bool {
+        line.range(of: prefix, options: [.anchored, .caseInsensitive]) != nil
     }
 
     private static func normalize(_ string: String) -> String {

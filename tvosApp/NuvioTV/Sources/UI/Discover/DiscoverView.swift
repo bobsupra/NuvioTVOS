@@ -514,14 +514,11 @@ private struct DiscoverCard: View {
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
 
     private var customPosterArtworkURL: String? {
-        let screens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? customPosterEnabledScreens
-            : "all"
-        return CustomPosterURLResolver.resolve(
+        CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: meta,
             screen: .search,
-            enabledScreens: screens,
+            enabledScreens: customPosterEnabledScreens,
             shape: meta.tileShape == .square ? "square" : "poster"
         )
     }

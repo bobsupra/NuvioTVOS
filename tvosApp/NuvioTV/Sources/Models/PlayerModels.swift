@@ -25,6 +25,154 @@ struct SubtitleTrack: Identifiable, Equatable {
     /// because subtitle providers do not expose container disposition metadata.
     var isForced: Bool = false
     var isNativelyRenderedSubtitle: Bool = false
+    /// Container/backend codec name (e.g. "subrip", "hdmv_pgs_subtitle", "ass").
+    var codec: String = ""
+}
+
+enum SubtitleFormatPreference: String, CaseIterable, Identifiable, Equatable {
+    case auto = "Auto"
+    case text = "Text"
+    case srt = "SRT"
+    case ass = "ASS"
+    case vtt = "VTT"
+    case pgs = "PGS"
+
+    var id: String { rawValue }
+
+    static func fromStored(_ raw: String?) -> SubtitleFormatPreference {
+        let normalized = (raw ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalized {
+        case "text": return .text
+        case "srt", "subrip": return .srt
+        case "ass", "ssa": return .ass
+        case "vtt", "webvtt": return .vtt
+        case "pgs", "sup", "pgssub": return .pgs
+        default: return .auto
+        }
+    }
+
+    var displayTitle: String {
+        switch self {
+        case .auto:
+            return L10n.string("tvos_settings_option_auto", fallback: "Auto")
+        case .text:
+            return L10n.string("tvos_playback_subtitle_format_text", fallback: "Text (SRT / ASS / VTT)")
+        case .srt:
+            return "SRT"
+        case .ass:
+            return "ASS / SSA"
+        case .vtt:
+            return "WebVTT"
+        case .pgs:
+            return "PGS"
+        }
+    }
+
+    private enum DetectedFormat {
+        case srt
+        case ass
+        case vtt
+        case otherText
+        case pgs
+        case otherBitmap
+        case unknown
+    }
+
+    func matches(_ track: SubtitleTrack) -> Bool {
+        guard self != .auto else { return false }
+        let detected = Self.detectFormat(
+            codec: track.codec,
+            urlString: track.externalFilename,
+            label: track.name
+        )
+        return matches(detected)
+    }
+
+    func matches(_ subtitle: NuvioSubtitle) -> Bool {
+        guard self != .auto else { return false }
+        let detected = Self.detectFormat(
+            codec: "",
+            urlString: subtitle.url,
+            label: subtitle.label
+        )
+        return matches(detected)
+    }
+
+    private func matches(_ detected: DetectedFormat) -> Bool {
+        switch self {
+        case .auto:
+            return false
+        case .text:
+            switch detected {
+            case .srt, .ass, .vtt, .otherText:
+                return true
+            case .pgs, .otherBitmap, .unknown:
+                return false
+            }
+        case .srt:
+            return detected == .srt
+        case .ass:
+            return detected == .ass
+        case .vtt:
+            return detected == .vtt
+        case .pgs:
+            return detected == .pgs
+        }
+    }
+
+    private static func detectFormat(codec: String, urlString: String, label: String?) -> DetectedFormat {
+        let lowerCodec = codec.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !lowerCodec.isEmpty {
+            if let classified = classifyToken(lowerCodec) {
+                return classified
+            }
+        }
+
+        let cleanURL = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !cleanURL.isEmpty {
+            let ext = (URL(string: cleanURL)?.pathExtension ?? (cleanURL as NSString).pathExtension).lowercased()
+            if !ext.isEmpty, let classified = classifyToken(ext) {
+                return classified
+            }
+        }
+
+        if let label {
+            let tokens = label.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+            for token in tokens {
+                if let classified = classifyToken(token) {
+                    return classified
+                }
+            }
+        }
+        return .unknown
+    }
+
+    private static func classifyToken(_ raw: String) -> DetectedFormat? {
+        if raw == "subrip" || raw == "srt" {
+            return .srt
+        }
+        if raw == "ass" || raw == "ssa" {
+            return .ass
+        }
+        if raw == "webvtt" || raw == "vtt" {
+            return .vtt
+        }
+        if raw == "sup" || raw.contains("pgs") || raw.contains("hdmv") {
+            return .pgs
+        }
+        if raw.contains("dvd_sub") || raw.contains("dvdsub") || raw.contains("dvb_sub")
+            || raw.contains("dvbsub") || raw.contains("vobsub") || raw.contains("xsub") {
+            return .otherBitmap
+        }
+        if raw == "mov_text" || raw == "tx3g" || raw == "ttml" || raw == "sami" || raw == "smi"
+            || raw == "text" || raw == "eia_608" || raw == "eia_708" || raw == "cea708"
+            || raw == "cea_708" || raw.contains("teletext") {
+            return .otherText
+        }
+        return nil
+    }
 }
 
 struct AudioTrack: Identifiable, Equatable {
@@ -208,10 +356,13 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     static var settingsOptions: [String] { allCases.map(\.rawValue) }
 
     /// The player's app icon in Images.xcassets. The built-in player shows
-    /// Nuvio's Home Screen icon.
+    /// Nuvio's Home Screen icon: the chosen Nuvio icon with Nuvio Branding on,
+    /// the app's own icon with it off.
     var iconAssetName: String {
         switch self {
-        case .builtIn: return "player_nuvio"
+        case .builtIn:
+            guard NuvioBranding.isOn else { return "player_nuvio" }
+            return Self.builtInIconAssetName(for: NuvioBranding.appIcon)
         case .infuse: return "player_infuse"
         case .nativePlayer: return "player_nativeplayer"
         case .nplayer: return "player_nplayer"
@@ -220,6 +371,12 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
         case .vidhub: return "player_vidhub"
         case .vlc: return "player_vlc"
         }
+    }
+
+    /// The built-in player's icon tile for a Nuvio app icon, such as
+    /// `player_nuvio_arcticblue` for Arctic Blue.
+    static func builtInIconAssetName(for icon: NuvioAppIcon) -> String {
+        "player_nuvio_" + icon.rawValue.replacingOccurrences(of: "_", with: "")
     }
 
     /// A URL scheme the player's app registers, used to check whether the app

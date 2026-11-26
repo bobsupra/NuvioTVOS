@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 import AVKit
 import CoreGraphics
 
@@ -27,11 +28,43 @@ private extension TVPlayerButton {
     }
 }
 
+enum PlayerQuickMenu: Hashable {
+    case subtitles
+    case audio
+    case speed
+
+    var focusKey: PlayerControlFocus {
+        switch self {
+        case .subtitles: return .subtitles
+        case .audio: return .audio
+        case .speed: return .speed
+        }
+    }
+}
+
+private enum PlayerQuickMenuPage: Equatable {
+    case root
+    case subtitleLanguage(String)
+    case subtitleStyle
+    case audioDialogue
+    case audioLoudness
+}
+
+private struct PlayerQuickMenuAnchorPreferenceKey: PreferenceKey {
+    static var defaultValue: [PlayerQuickMenu: Anchor<CGRect>] = [:]
+
+    static func reduce(value: inout [PlayerQuickMenu: Anchor<CGRect>], nextValue: () -> [PlayerQuickMenu: Anchor<CGRect>]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
 struct PlayerControls: View {
     @ObservedObject var viewModel: PlayerViewModel
     var didReportPlaybackStarted: Bool = false
     var isSkipSegmentFocused: Bool = false
     var isNextEpisodeFocused: Bool = false
+    @Binding var isQuickMenuPresented: Bool
+    var isControlsLayerVisible: Bool = true
     @Binding var requestedFocus: PlayerControlFocus?
     var onFocusSkipSegment: () -> Void = {}
     var onFocusNextEpisode: () -> Void = {}
@@ -43,6 +76,10 @@ struct PlayerControls: View {
     @State private var isNamingSubtitlePreset = false
     @State private var presetNameToSave = ""
     @State private var renamingPresetID: String?
+    @State private var activeQuickMenu: PlayerQuickMenu?
+    @State private var quickMenuPage: PlayerQuickMenuPage = .root
+    @State private var quickMenuReturnFocusID: String?
+    @State private var quickMenuPresentationID = UUID()
 
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
@@ -51,6 +88,8 @@ struct PlayerControls: View {
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
     @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
+    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
+    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
 
     var body: some View {
         ZStack {
@@ -94,6 +133,22 @@ struct PlayerControls: View {
                 .transition(.opacity)
             }
         }
+        .overlayPreferenceValue(PlayerQuickMenuAnchorPreferenceKey.self) { anchors in
+            GeometryReader { geometry in
+                let resolvedMenu: PlayerQuickMenu? = isNamingSubtitlePreset ? nil : activeQuickMenu
+                let triggerFrame = resolvedMenu.flatMap { anchors[$0] }.map { geometry[$0] }
+                let snapshot = resolvedMenu.map { buildQuickMenuSnapshot(for: $0) }
+                PlayerQuickMenuOverlayHost(
+                    presentationID: quickMenuPresentationID,
+                    snapshot: snapshot,
+                    triggerFrame: triggerFrame,
+                    onMenuBack: { handleQuickMenuBack() },
+                    onDismiss: { closeQuickMenu(restoreFocus: true) }
+                )
+                .frame(width: geometry.size.width, height: geometry.size.height)
+            }
+            .allowsHitTesting(activeQuickMenu != nil && !isNamingSubtitlePreset)
+        }
         .overlay(alignment: .topTrailing) {
             if playerShowFinishTime && !viewModel.isLiveStream && !isNamingSubtitlePreset {
                 PlayerEstimatedFinishTime(
@@ -112,19 +167,24 @@ struct PlayerControls: View {
         .onChange(of: requestedFocus) { _, target in
             guard let target,
                   viewModel.showControls,
+                  activeQuickMenu == nil,
                   !viewModel.controlsAutoHideSuspended || isAuxiliaryCardFocusActive else { return }
             DispatchQueue.main.async {
                 let resolvedTarget: PlayerControlFocus
                 if target == .firstTransportButton {
                     resolvedTarget = transportFocusOrder.first ?? .settings
-                } else if target == .timeline && !didReportPlaybackStarted {
-                    resolvedTarget = .settings
+                } else if target == .timeline && (!didReportPlaybackStarted || viewModel.isLiveStream) {
+                    resolvedTarget = viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .settings
                 } else {
                     resolvedTarget = target
                 }
                 if resolvedTarget == .timeline {
+                    viewModel.suppressTimelineDownBriefly()
                     focusedControl = .timeline
                 } else {
+                    if focusedControl == .timeline || viewModel.isTimelineFocused {
+                        viewModel.suppressTransportUpBriefly()
+                    }
                     focusedControl = isTransportButtonFocusable(resolvedTarget) ? resolvedTarget : (transportFocusOrder.first ?? .settings)
                 }
                 requestedFocus = nil
@@ -139,7 +199,7 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
-            if !isPresented, viewModel.showControls {
+            if !isPresented, viewModel.showControls, activeQuickMenu == nil {
                 DispatchQueue.main.async { focusedControl = .settings }
             }
         }
@@ -188,6 +248,9 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.showControls) { _, isVisible in
+            if !isVisible {
+                closeQuickMenu(restoreFocus: false)
+            }
             guard !viewModel.controlsAutoHideSuspended else { return }
             // Don't steal focus while the pause metadata sheet, loading, or post play owns the remote.
             if isVisible,
@@ -259,7 +322,7 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.isLiveStream) { _, isLive in
-            if isLive, focusedControl == .timeline {
+            if isLive, focusedControl == .timeline, activeQuickMenu == nil {
                 DispatchQueue.main.async { focusedControl = initialFocusControl }
             }
         }
@@ -291,6 +354,11 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: focusedControl) { oldControl, newControl in
+            if oldControl != .timeline && newControl == .timeline {
+                viewModel.suppressTimelineDownBriefly()
+            } else if oldControl == .timeline, let newControl, newControl != .timeline {
+                viewModel.suppressTransportUpBriefly()
+            }
             if newControl != nil {
                 isAuxiliaryCardFocusActive = false
             }
@@ -313,32 +381,40 @@ struct PlayerControls: View {
                     PlaybackTimelineRecorder.record(.subtitleMenuFocusReturned, engine: viewModel.activeEngineKind)
                 }
             }
+            if activeQuickMenu != nil { return }
             if onTimeline {
                 viewModel.setControlsAutoHideSuspended(false)
                 viewModel.scheduleControlsHide(after: 5.0)
             } else if newControl != nil {
-                // A focused Menu button is not an open menu. Returning to it
-                // after selecting or cancelling must resume the hide timer.
-                viewModel.setControlsAutoHideSuspended(false)
-                viewModel.scheduleControlsHide(after: 10.0)
-            } else if viewModel.showControls,
-                      !isAuxiliaryCardFocusActive,
-                      let old = oldControl, old == .subtitles || old == .audio {
-                // Focus transitioned from a native Menu button into the presented menu items.
-                // Losing focus because controls were hidden must not suspend
-                // auto-hide and block a later revealControls() call.
-                DispatchQueue.main.async {
-                    // Card focus bindings update asynchronously with the focus handoff.
-                    guard focusedControl == nil,
-                          viewModel.showControls,
-                          !isAuxiliaryCardFocusActive,
-                          !isSkipSegmentFocused,
-                          !isNextEpisodeFocused else { return }
-                    viewModel.setControlsAutoHideSuspended(true)
+                // Closing a quick menu clears suspension before focus returns.
+                if viewModel.controlsAutoHideSuspended {
+                    viewModel.setControlsAutoHideSuspended(false)
                 }
+                viewModel.scheduleControlsHide(after: 10.0)
+            }
+        }
+        .onChange(of: controlsInteractable) { _, isInteractable in
+            if !isInteractable {
+                closeQuickMenu(restoreFocus: false)
+            }
+        }
+        .onChange(of: isControlsLayerVisible) { _, isVisible in
+            if !isVisible {
+                closeQuickMenu(restoreFocus: false)
+            }
+        }
+        .onChange(of: viewModel.isScrubbing) { _, isScrubbing in
+            if isScrubbing {
+                closeQuickMenu(restoreFocus: false)
+            }
+        }
+        .onChange(of: transportFocusOrder) { _, order in
+            if let activeQuickMenu, !order.contains(activeQuickMenu.focusKey) {
+                closeQuickMenu(restoreFocus: false)
             }
         }
         .onDisappear {
+            closeQuickMenu(restoreFocus: false)
             viewModel.setTimelineFocused(false)
             viewModel.setControlsAutoHideSuspended(false)
             isAuxiliaryCardFocusActive = false
@@ -351,8 +427,634 @@ struct PlayerControls: View {
             renamingPresetID = nil
             return
         }
+        if activeQuickMenu != nil {
+            handleQuickMenuBack()
+            return
+        }
         PlaybackTimelineRecorder.record(.controlsExitReceived, engine: viewModel.activeEngineKind)
         onRemoteBackAction()
+    }
+
+    private func presentQuickMenu(_ menu: PlayerQuickMenu) {
+        guard activeQuickMenu == nil else { return }
+        quickMenuPage = .root
+        quickMenuReturnFocusID = nil
+        quickMenuPresentationID = UUID()
+        activeQuickMenu = menu
+        focusedControl = nil
+        isQuickMenuPresented = true
+        viewModel.setControlsAutoHideSuspended(true)
+    }
+
+    private func closeQuickMenu(restoreFocus: Bool = true) {
+        guard activeQuickMenu != nil else { return }
+        let origin = activeQuickMenu?.focusKey
+        activeQuickMenu = nil
+        quickMenuPage = .root
+        quickMenuReturnFocusID = nil
+        isQuickMenuPresented = false
+        viewModel.setControlsAutoHideSuspended(false)
+
+        guard restoreFocus,
+              let origin,
+              controlsInteractable,
+              viewModel.showControls else { return }
+
+        focusedControl = origin
+        viewModel.scheduleControlsHide(after: 10.0)
+        DispatchQueue.main.async {
+            guard activeQuickMenu == nil,
+                  !isQuickMenuPresented,
+                  controlsInteractable,
+                  viewModel.showControls else { return }
+            focusedControl = origin
+        }
+    }
+
+    private func handleQuickMenuBack() {
+        guard activeQuickMenu != nil else { return }
+        switch quickMenuPage {
+        case .root:
+            closeQuickMenu()
+        case .subtitleLanguage(_), .subtitleStyle, .audioDialogue, .audioLoudness:
+            quickMenuPage = .root
+        }
+    }
+
+    private func showQuickMenuPage(
+        _ page: PlayerQuickMenuPage,
+        returningTo focusID: String
+    ) {
+        quickMenuReturnFocusID = focusID
+        quickMenuPage = page
+    }
+
+    private func initialQuickMenuFocusID(for menu: PlayerQuickMenu) -> String? {
+        switch quickMenuPage {
+        case .root:
+            if let returnID = quickMenuReturnFocusID {
+                return returnID
+            }
+            switch menu {
+            case .subtitles:
+                if subtitleNoneOption?.isSelected == true { return "subtitle.none" }
+                if let selectedGroup = subtitleLanguageGroups.first(where: \.hasSelected) {
+                    return subtitleLanguageRowID(selectedGroup.language)
+                }
+                if subtitleNoneOption != nil { return "subtitle.none" }
+                if let group = subtitleLanguageGroups.first {
+                    return subtitleLanguageRowID(group.language)
+                }
+                return "subtitle.style"
+            case .audio:
+                if let track = orderedAudioTracks.first(where: \.isSelected) ?? orderedAudioTracks.first {
+                    return audioTrackRowID(track)
+                }
+                if viewModel.supportsAudioProcessing { return "audio.enhance" }
+                return "quick-menu.close"
+            case .speed:
+                return speedRowID(viewModel.playbackSpeed)
+            }
+        case .subtitleLanguage(let language):
+            guard let group = subtitleLanguageGroups.first(where: { $0.language == language }) else { return nil }
+            return group.selectedOption.map(subtitleOptionRowID) ?? group.options.first.map(subtitleOptionRowID)
+        case .subtitleStyle:
+            if let active = SubtitleStylePresetStore.shared.activePreset(for: viewModel.subtitleStyle) {
+                return "subtitle.style.\(active.id)"
+            }
+            return SubtitleStylePresetStore.shared.allPresets().first.map { "subtitle.style.\($0.id)" }
+        case .audioDialogue:
+            return "audio.dialogue.\(viewModel.enhanceDialogueMode.rawValue)"
+        case .audioLoudness:
+            return "audio.loudness.\(loudnessTargetPreset)"
+        }
+    }
+
+    private func quickMenuPageID(for menu: PlayerQuickMenu) -> String {
+        switch quickMenuPage {
+        case .root:
+            switch menu {
+            case .subtitles: return "subtitles.root"
+            case .audio: return "audio.root"
+            case .speed: return "speed.root"
+            }
+        case .subtitleLanguage(let language):
+            return "subtitles.language.\(language)"
+        case .subtitleStyle:
+            return "subtitles.style"
+        case .audioDialogue:
+            return "audio.dialogue"
+        case .audioLoudness:
+            return "audio.loudness"
+        }
+    }
+
+    private func quickMenuTitle(for menu: PlayerQuickMenu) -> String {
+        switch quickMenuPage {
+        case .root:
+            switch menu {
+            case .subtitles:
+                return L10n.string("playback_section_subtitles", fallback: "Subtitles")
+            case .audio:
+                return viewModel.supportsAudioProcessing
+                    ? "Audio"
+                    : L10n.string("player_audio_tracks", fallback: "Audio Tracks")
+            case .speed:
+                return L10n.string("player_speed_title", fallback: "Playback Speed")
+            }
+        case .subtitleLanguage(let language):
+            return language
+        case .subtitleStyle:
+            return L10n.string("subtitle_style_title", fallback: "Subtitle Style")
+        case .audioDialogue:
+            return L10n.string("player_enhance_dialogue", fallback: "Enhance Dialogue")
+        case .audioLoudness:
+            return L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target")
+        }
+    }
+
+    private struct QuickMenuBuilder {
+        var items: [PlayerQuickMenuItem] = []
+        var actions: [String: () -> Void] = [:]
+
+        mutating func addRow(
+            id: String,
+            title: String,
+            subtitle: String? = nil,
+            systemImage: String? = nil,
+            isSelected: Bool = false,
+            isDisabled: Bool = false,
+            showsChevron: Bool = false,
+            closesMenu: Bool = false,
+            action: @escaping () -> Void = {}
+        ) {
+            items.append(.row(PlayerQuickMenuRow(
+                id: id,
+                title: title,
+                subtitle: subtitle,
+                systemImage: systemImage,
+                isSelected: isSelected,
+                isDisabled: isDisabled,
+                showsChevron: showsChevron,
+                closesMenu: closesMenu
+            )))
+            actions[id] = action
+        }
+
+        mutating func addSeparator(id: String) {
+            items.append(.separator(id: id))
+        }
+
+        mutating func addSectionHeader(id: String, title: String, isCompactTop: Bool = false) {
+            items.append(.sectionHeader(id: id, title: title, isCompactTop: isCompactTop))
+        }
+    }
+
+    func buildQuickMenuSnapshot(for menu: PlayerQuickMenu) -> PlayerQuickMenuSnapshot {
+        var builder = QuickMenuBuilder()
+
+        switch quickMenuPage {
+        case .root:
+            switch menu {
+            case .subtitles:
+                appendSubtitleRootItems(into: &builder)
+            case .audio:
+                appendAudioRootItems(into: &builder)
+            case .speed:
+                for speed in PlaybackSpeed.allCases {
+                    builder.addRow(
+                        id: speedRowID(speed),
+                        title: speedTitle(for: speed),
+                        isSelected: viewModel.playbackSpeed == speed,
+                        closesMenu: true
+                    ) {
+                        viewModel.setSpeed(speed)
+                        viewModel.showPlayerToast("Speed \(speed.label)")
+                    }
+                }
+            }
+
+        case .subtitleLanguage(let language):
+            if let group = subtitleLanguageGroups.first(where: { $0.language == language }) {
+                let hasBothSections = !group.builtInOptions.isEmpty && !group.externalOptions.isEmpty
+                if !group.builtInOptions.isEmpty {
+                    if hasBothSections {
+                        builder.addSectionHeader(
+                            id: "subtitle.section.built-in",
+                            title: L10n.string("tvos_settings_option_built_in", fallback: "Built-In"),
+                            isCompactTop: true
+                        )
+                    }
+                    for option in group.builtInOptions {
+                        let labels = SubtitleMenuFormatter.builtInMenuLabels(option: option)
+                        builder.addRow(
+                            id: subtitleOptionRowID(option),
+                            title: labels.title,
+                            subtitle: labels.subtitle,
+                            isSelected: option.isSelected,
+                            closesMenu: true
+                        ) {
+                            selectSubtitlePickerOption(option)
+                        }
+                    }
+                }
+                if !group.externalOptions.isEmpty {
+                    if hasBothSections {
+                        builder.addSeparator(id: "subtitle.section.sep")
+                        builder.addSectionHeader(
+                            id: "subtitle.section.external",
+                            title: L10n.string("player_external_subtitles", fallback: "External Subtitles"),
+                            isCompactTop: false
+                        )
+                    }
+                    for option in group.externalOptions {
+                        let labels = SubtitleMenuFormatter.groupedExternalMenuLabels(option: option)
+                        builder.addRow(
+                            id: subtitleOptionRowID(option),
+                            title: labels.title,
+                            subtitle: labels.subtitle,
+                            isSelected: option.isSelected,
+                            closesMenu: true
+                        ) {
+                            selectSubtitlePickerOption(option)
+                        }
+                    }
+                }
+            }
+
+        case .subtitleStyle:
+            let activeID = SubtitleStylePresetStore.shared.activePreset(for: viewModel.subtitleStyle)?.id
+            for preset in SubtitleStylePresetStore.shared.allPresets() {
+                builder.addRow(
+                    id: "subtitle.style.\(preset.id)",
+                    title: preset.name,
+                    isSelected: activeID == preset.id,
+                    closesMenu: true
+                ) {
+                    SubtitleStylePresetStore.shared.applyPreset(preset)
+                    viewModel.applySubtitleStyle()
+                    viewModel.showPlayerToast(L10n.format("subtitle_style_applied_toast", fallback: "Style: %@", preset.name))
+                }
+            }
+
+        case .audioDialogue:
+            for mode in EnhanceDialogueMode.allCases {
+                builder.addRow(
+                    id: "audio.dialogue.\(mode.rawValue)",
+                    title: mode.title,
+                    isSelected: viewModel.enhanceDialogueMode == mode,
+                    closesMenu: true
+                ) {
+                    viewModel.setEnhanceDialogueMode(mode)
+                }
+            }
+
+        case .audioLoudness:
+            for preset in ["standard", "night", "boost"] {
+                builder.addRow(
+                    id: "audio.loudness.\(preset)",
+                    title: loudnessTargetPresetTitle(preset),
+                    isSelected: loudnessTargetPreset == preset,
+                    closesMenu: true
+                ) {
+                    loudnessTargetPreset = preset
+                    viewModel.updateLoudnessTarget()
+                }
+            }
+        }
+
+        return PlayerQuickMenuSnapshot(
+            content: PlayerQuickMenuContent(
+                pageID: quickMenuPageID(for: menu),
+                header: quickMenuTitle(for: menu),
+                items: builder.items,
+                canPopBack: quickMenuPage != .root,
+                initialFocusID: initialQuickMenuFocusID(for: menu)
+            ),
+            actions: builder.actions
+        )
+    }
+
+    private func appendSubtitleRootItems(into builder: inout QuickMenuBuilder) {
+        let activeAddonSubtitle = viewModel.activeAddonSubtitle
+        let autoSyncState = activeAddonSubtitle.flatMap { viewModel.subtitleAutoSyncStates[$0.url] }
+        let isSubtitleAutoSyncUsingOriginal = activeAddonSubtitle.map {
+            viewModel.isSubtitleAutoSyncUsingOriginal($0.url)
+        } ?? false
+        let syncActionTitle: String = {
+            switch autoSyncState {
+            case .checking?:
+                return L10n.string("player_autosync_running", fallback: "Checking…")
+            case .synced?:
+                return L10n.string(
+                    isSubtitleAutoSyncUsingOriginal
+                        ? "player_subtitle_autosync_original"
+                        : "player_autosync_subtitle_synced",
+                    fallback: isSubtitleAutoSyncUsingOriginal ? "Original Timing" : "Subtitle Synced"
+                )
+            case .kept(.inSync)?:
+                return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In Sync")
+            default:
+                return L10n.string("player_autosync_sync_subtitle", fallback: "Sync Subtitle")
+            }
+        }()
+        let audioSyncStatus = viewModel.audioSyncStatus.flatMap {
+            $0.subtitleURL == activeAddonSubtitle?.url ? $0 : nil
+        }
+        let audioSyncTimingStatus = viewModel.audioSyncTimingStatusForCurrentSubtitle
+        let isAudioSyncRunningForSelectedSubtitle = viewModel.isAudioSyncRunning
+            && audioSyncStatus?.isRunning == true
+        let isAudioSyncAppliedForSelectedSubtitle = audioSyncTimingStatus != nil
+        let isAudioSyncUsingOriginalTiming = audioSyncTimingStatus?.isOriginalTimingSelected ?? false
+        let canToggleAudioSyncTiming = audioSyncTimingStatus.map {
+            $0.originalDelayMs != $0.syncedDelayMs
+        } ?? false
+        let canToggleAudioSync = activeAddonSubtitle != nil
+            && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether)
+
+        switch autoSyncState {
+        case .synced?:
+            builder.addRow(
+                id: "subtitle.sync.status",
+                title: syncActionTitle,
+                systemImage: isSubtitleAutoSyncUsingOriginal ? "clock" : "checkmark.circle",
+                isDisabled: true
+            )
+            builder.addRow(
+                id: "subtitle.sync.timing",
+                title: L10n.string(
+                    isSubtitleAutoSyncUsingOriginal
+                        ? "player_autosync_use_synced"
+                        : "player_subtitle_autosync_original",
+                    fallback: isSubtitleAutoSyncUsingOriginal ? "Synced Timing" : "Original Timing"
+                ),
+                systemImage: isSubtitleAutoSyncUsingOriginal ? "checkmark.circle" : "arrow.uturn.backward"
+            ) {
+                viewModel.toggleSubtitleAutoSyncTiming()
+            }
+        case .kept(.inSync)?:
+            builder.addRow(
+                id: "subtitle.sync.status",
+                title: syncActionTitle,
+                systemImage: "checkmark.circle",
+                isDisabled: true
+            )
+        case .checking?:
+            builder.addRow(
+                id: "subtitle.sync.status",
+                title: syncActionTitle,
+                systemImage: "arrow.triangle.2.circlepath",
+                isDisabled: true
+            )
+        default:
+            builder.addRow(
+                id: "subtitle.sync.run",
+                title: syncActionTitle,
+                systemImage: "arrow.triangle.2.circlepath",
+                isDisabled: activeAddonSubtitle == nil
+            ) {
+                runSubtitleAutoSync()
+            }
+        }
+
+        if isAudioSyncAppliedForSelectedSubtitle {
+            builder.addRow(
+                id: "subtitle.audio-sync.status",
+                title: L10n.string(
+                    isAudioSyncUsingOriginalTiming
+                        ? "player_subtitle_autosync_original"
+                        : "player_autosync_audio_synced",
+                    fallback: isAudioSyncUsingOriginalTiming ? "Original Timing" : "Synced by Audio"
+                ),
+                systemImage: isAudioSyncUsingOriginalTiming ? "clock" : "checkmark.circle",
+                isDisabled: true
+            )
+            if canToggleAudioSyncTiming {
+                builder.addRow(
+                    id: "subtitle.audio-sync.timing",
+                    title: L10n.string(
+                        isAudioSyncUsingOriginalTiming
+                            ? "player_autosync_use_synced"
+                            : "player_subtitle_autosync_original",
+                        fallback: isAudioSyncUsingOriginalTiming ? "Synced Timing" : "Original Timing"
+                    ),
+                    systemImage: isAudioSyncUsingOriginalTiming ? "checkmark.circle" : "arrow.uturn.backward"
+                ) {
+                    viewModel.toggleAudioSyncTiming()
+                }
+            }
+        } else {
+            builder.addRow(
+                id: "subtitle.audio-sync.toggle",
+                title: L10n.string(
+                    isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
+                    fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
+                ),
+                systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform",
+                isDisabled: !canToggleAudioSync,
+                closesMenu: true
+            ) {
+                if viewModel.isAudioSyncRunning,
+                   let activeAddonSubtitle,
+                   viewModel.audioSyncStatus?.subtitleURL != activeAddonSubtitle.url {
+                    viewModel.startAudioSync()
+                } else {
+                    viewModel.toggleAudioSync()
+                }
+            }
+        }
+
+        builder.addRow(
+            id: "subtitle.style",
+            title: L10n.string("subtitle_style_title", fallback: "Subtitle Style"),
+            subtitle: SubtitleStylePresetStore.shared.activePresetTitle(for: viewModel.subtitleStyle),
+            systemImage: "textformat",
+            showsChevron: true
+        ) {
+            showQuickMenuPage(.subtitleStyle, returningTo: "subtitle.style")
+        }
+
+        builder.addSeparator(id: "subtitle.tracks.sep")
+
+        if let none = subtitleNoneOption {
+            builder.addRow(
+                id: "subtitle.none",
+                title: L10n.string("action_none", fallback: "None"),
+                isSelected: none.isSelected,
+                closesMenu: true
+            ) {
+                selectSubtitlePickerOption(none)
+            }
+        }
+
+        for group in subtitleLanguageGroups {
+            let selectedTitle = group.selectedOption.map { SubtitleMenuFormatter.optionDisplayTitle(for: $0) } ?? ""
+            let subtitle = !selectedTitle.isEmpty
+                && selectedTitle.caseInsensitiveCompare(group.language) != .orderedSame
+                ? selectedTitle
+                : nil
+            let rowID = subtitleLanguageRowID(group.language)
+            builder.addRow(
+                id: rowID,
+                title: group.language,
+                subtitle: subtitle,
+                isSelected: group.hasSelected,
+                showsChevron: true
+            ) {
+                showQuickMenuPage(.subtitleLanguage(group.language), returningTo: rowID)
+            }
+        }
+    }
+
+    private func appendAudioRootItems(into builder: inout QuickMenuBuilder) {
+        if viewModel.supportsAudioProcessing {
+            builder.addRow(
+                id: "audio.enhance",
+                title: L10n.string("player_enhance_dialogue", fallback: "Enhance Dialogue"),
+                subtitle: viewModel.enhanceDialogueMode.title,
+                systemImage: "waveform",
+                showsChevron: true
+            ) {
+                showQuickMenuPage(.audioDialogue, returningTo: "audio.enhance")
+            }
+            builder.addRow(
+                id: "audio.reduce-loud-sounds",
+                title: L10n.string("player_reduce_loud_sounds", fallback: "Reduce Loud Sounds"),
+                isSelected: viewModel.isReduceLoudSoundsActive,
+                closesMenu: true
+            ) {
+                viewModel.toggleReduceLoudSounds()
+            }
+            if loudnessNormalizer {
+                builder.addRow(
+                    id: "audio.loudness",
+                    title: L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"),
+                    subtitle: loudnessTargetPresetTitle(loudnessTargetPreset),
+                    showsChevron: true
+                ) {
+                    showQuickMenuPage(.audioLoudness, returningTo: "audio.loudness")
+                }
+            }
+        }
+
+        if !orderedAudioTracks.isEmpty {
+            if viewModel.supportsAudioProcessing {
+                builder.addSeparator(id: "audio.tracks.sep")
+                builder.addSectionHeader(
+                    id: "audio.tracks.header",
+                    title: L10n.string("player_audio_tracks", fallback: "Audio Tracks"),
+                    isCompactTop: false
+                )
+            }
+            for track in orderedAudioTracks {
+                builder.addRow(
+                    id: audioTrackRowID(track),
+                    title: audioMenuTrackTitle(for: track),
+                    isSelected: track.isSelected,
+                    closesMenu: true
+                ) {
+                    viewModel.selectAudio(track)
+                }
+            }
+        }
+
+        if !viewModel.supportsAudioProcessing && orderedAudioTracks.isEmpty {
+            builder.addRow(
+                id: "quick-menu.close",
+                title: L10n.string("action_close", fallback: "Close"),
+                closesMenu: true
+            )
+        }
+    }
+
+    private func subtitleLanguageRowID(_ language: String) -> String {
+        "subtitle.language.\(language)"
+    }
+
+    private func subtitleOptionRowID(_ option: SubtitlePanelOption) -> String {
+        "subtitle.option.\(option.id)"
+    }
+
+    private func audioTrackRowID(_ track: AudioTrack) -> String {
+        "audio.track.\(track.id)"
+    }
+
+    private func speedRowID(_ speed: PlaybackSpeed) -> String {
+        "speed.\(speed.rawValue)"
+    }
+
+    private func loudnessTargetPresetTitle(_ preset: String) -> String {
+        switch preset {
+        case "night":
+            return L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)")
+        case "boost":
+            return L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)")
+        default:
+            return L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)")
+        }
+    }
+
+    private func speedTitle(for speed: PlaybackSpeed) -> String {
+        if speed == .normal {
+            return "\(speed.label) (\(L10n.string("player_speed_normal", fallback: "Normal")))"
+        }
+        return speed.label
+    }
+
+    private func audioMenuTrackTitle(for track: AudioTrack) -> String {
+        let rawName = track.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawLang = track.language.trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawLangName = track.languageName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let langIdentifier = !rawLang.isEmpty ? rawLang : rawLangName
+        let humanLanguage = SubtitleLanguagePreferences.humanLanguageName(from: langIdentifier)
+
+        let isGenericTrack = rawName.isEmpty || rawName.range(of: #"^Track\s*\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        if isGenericTrack {
+            if !humanLanguage.isEmpty { return humanLanguage }
+            return rawName.isEmpty ? L10n.format("player_track_format", fallback: "Track %d", track.id) : rawName
+        }
+        if (!rawLang.isEmpty && rawName.caseInsensitiveCompare(rawLang) == .orderedSame)
+            || (!rawLangName.isEmpty && rawName.caseInsensitiveCompare(rawLangName) == .orderedSame) {
+            return !humanLanguage.isEmpty ? humanLanguage : rawName.capitalized
+        }
+        if !humanLanguage.isEmpty {
+            let codeToCheck = !rawLang.isEmpty ? rawLang : rawLangName
+            if !codeToCheck.isEmpty {
+                let pattern = #"^"# + NSRegularExpression.escapedPattern(for: codeToCheck) + #"\b[\s:_\-]*"#
+                if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                    let range = NSRange(rawName.startIndex..<rawName.endIndex, in: rawName)
+                    if let match = regex.firstMatch(in: rawName, options: [], range: range) {
+                        let startIndex = rawName.index(rawName.startIndex, offsetBy: match.range.length)
+                        let suffix = String(rawName[startIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                        if suffix.isEmpty { return humanLanguage }
+                        if suffix.hasPrefix("(") || suffix.hasPrefix("[") { return "\(humanLanguage) \(suffix)" }
+                        return "\(humanLanguage) (\(suffix))"
+                    }
+                }
+            }
+            if rawName.localizedCaseInsensitiveContains(humanLanguage) { return rawName }
+            return "\(humanLanguage) (\(rawName))"
+        }
+        return rawName
+    }
+
+    private func selectSubtitlePickerOption(_ option: SubtitlePanelOption) {
+        switch option.kind {
+        case .track(let track):
+            viewModel.selectSubtitle(track)
+        case .external(let subtitle):
+            viewModel.selectExternalSubtitle(subtitle)
+        }
+    }
+
+    private func runSubtitleAutoSync() {
+        guard let activeAddonSubtitle = viewModel.activeAddonSubtitle else { return }
+        switch viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] {
+        case .checking?, .synced?, .kept(.inSync)?:
+            return
+        default:
+            viewModel.runSubtitleAutoSyncNow()
+        }
     }
 
     private var isPlaybackStarted: Bool {
@@ -446,18 +1148,21 @@ struct PlayerControls: View {
     }
 
     private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
+        guard activeQuickMenu == nil else { return false }
         guard controlsInteractable else { return false }
         guard key != .pip || didReportPlaybackStarted else { return false }
         return true
     }
 
     private func moveFocus(to control: PlayerControlFocus) {
+        guard activeQuickMenu == nil else { return }
         focusedControl = control
     }
 
     /// Navigate from the control that *received* the move — not `focusedControl`,
     /// which may already have been updated by the spatial focus engine.
     private func handleMove(_ direction: MoveCommandDirection, from origin: PlayerControlFocus) {
+        guard activeQuickMenu == nil else { return }
         guard !isSkipSegmentFocused, !isNextEpisodeFocused else { return }
         guard controlsInteractable else { return }
         guard origin != .timeline || didReportPlaybackStarted else { return }
@@ -478,11 +1183,14 @@ struct PlayerControls: View {
         case .up:
             viewModel.cancelMoveSeekTracking()
             if origin == .timeline {
-                if viewModel.showSkipSegmentCard {
-                    onFocusSkipSegment()
-                } else {
-                    moveFocus(to: transportFocusOrder.first ?? .settings)
-                }
+                viewModel.suppressTransportUpBriefly()
+                moveFocus(to: PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: transportFocusOrder))
+            } else if !PlayerControlsVerticalNavigationPolicy.canPromoteFromTransportUp(
+                isTimelineFocused: viewModel.isTimelineFocused,
+                isTransportUpSuppressed: viewModel.isTransportUpSuppressed
+            ) {
+                viewModel.suppressTransportUpBriefly()
+                moveFocus(to: origin)
             } else if viewModel.showNextEpisodeCard {
                 onFocusNextEpisode()
             } else if viewModel.showSkipSegmentCard {
@@ -494,10 +1202,26 @@ struct PlayerControls: View {
             viewModel.cancelMoveSeekTracking()
             if origin != .timeline, !viewModel.isLiveStream {
                 if didReportPlaybackStarted {
+                    viewModel.suppressTimelineDownBriefly()
                     moveFocus(to: .timeline)
                 }
-            } else if origin == .timeline, viewModel.isSceneEnabled {
-                viewModel.openScene()
+            } else if origin != .timeline, viewModel.isLiveStream {
+                if viewModel.isSceneEnabled {
+                    viewModel.openScene()
+                }
+            } else if origin == .timeline {
+                if PlayerControlsVerticalNavigationPolicy.canOpenSceneOnTimelineDown(
+                    isSceneEnabled: viewModel.isSceneEnabled,
+                    isTimelineFocused: viewModel.isTimelineFocused,
+                    isTimelineDownSuppressed: viewModel.isTimelineDownSuppressed,
+                    isAuxiliaryCardFocused: isAuxiliaryCardFocusActive || isSkipSegmentFocused || isNextEpisodeFocused,
+                    isMoveSuppressed: viewModel.moveSuppressed
+                ) {
+                    viewModel.openScene()
+                } else {
+                    viewModel.suppressTimelineDownBriefly()
+                    moveFocus(to: .timeline)
+                }
             }
         case .left:
             if origin == .timeline, !viewModel.isLiveStream {
@@ -546,11 +1270,18 @@ struct PlayerControls: View {
 
     private var playbackSubtitle: String? {
         let subtitle = viewModel.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !subtitle.isEmpty, subtitle != PlaybackMarkers.trailerSubtitle else { return nil }
-        let line = subtitle
-            .replacingOccurrences(of: " · E", with: ", E")
-            .replacingOccurrences(of: " · ", with: " • ")
-        return AniListMetaBuilder.playerEpisodeLine(line, titleID: viewModel.activeMeta?.id)
+        if !subtitle.isEmpty && subtitle != PlaybackMarkers.trailerSubtitle {
+            let line = subtitle
+                .replacingOccurrences(of: " · E", with: ", E")
+                .replacingOccurrences(of: " · ", with: " • ")
+            return AniListMetaBuilder.playerEpisodeLine(line, titleID: viewModel.activeMeta?.id)
+        }
+        if viewModel.isLiveStream,
+           let current = IPTVChannelGuideLookup.currentProgramme(in: viewModel.liveProgrammes, at: Date()),
+           current.title.localizedCaseInsensitiveCompare(viewModel.title) != .orderedSame {
+            return current.title
+        }
+        return nil
     }
 
     // MARK: - Bottom controls
@@ -637,157 +1368,55 @@ struct PlayerControls: View {
             .id("sources_button")
 
         case .subtitles:
-            let activeAddonSubtitle = viewModel.activeAddonSubtitle
-            let autoSyncState = activeAddonSubtitle.flatMap { viewModel.subtitleAutoSyncStates[$0.url] }
-            let isSubtitleAutoSyncUsingOriginal = activeAddonSubtitle.map {
-                viewModel.isSubtitleAutoSyncUsingOriginal($0.url)
-            } ?? false
-            let syncActionTitle: String = {
-                switch autoSyncState {
-                case .checking?:
-                    return L10n.string("player_autosync_running", fallback: "Checking…")
-                case .synced?:
-                    return L10n.string(
-                        isSubtitleAutoSyncUsingOriginal
-                            ? "player_subtitle_autosync_original"
-                            : "player_autosync_subtitle_synced",
-                        fallback: isSubtitleAutoSyncUsingOriginal ? "Original Timing" : "Subtitle Synced"
-                    )
-                case .kept(.inSync)?:
-                    return L10n.string("player_subtitle_autosync_in_sync_short", fallback: "In Sync")
-                default:
-                    return L10n.string("player_autosync_sync_subtitle", fallback: "Sync Subtitle")
-                }
-            }()
-            let audioSyncStatus = viewModel.audioSyncStatus.flatMap {
-                $0.subtitleURL == activeAddonSubtitle?.url ? $0 : nil
-            }
-            let audioSyncTimingStatus = viewModel.audioSyncTimingStatusForCurrentSubtitle
-            let isAudioSyncRunningForSelectedSubtitle = viewModel.isAudioSyncRunning
-                && audioSyncStatus?.isRunning == true
-            let isAudioSyncAppliedForSelectedSubtitle = audioSyncTimingStatus != nil
-            let isAudioSyncUsingOriginalTiming = audioSyncTimingStatus?.isOriginalTimingSelected ?? false
-            let canToggleAudioSyncTiming = audioSyncTimingStatus.map {
-                $0.originalDelayMs != $0.syncedDelayMs
-            } ?? false
-            PlayerSubtitleMenuButton(
-                noneOption: subtitleNoneOption,
-                languageGroups: subtitleLanguageGroups,
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .subtitles,
                 isFocused: focusedControl == .subtitles,
-                autoSyncState: autoSyncState,
-                syncActionTitle: syncActionTitle,
-                isSubtitleAutoSyncUsingOriginal: isSubtitleAutoSyncUsingOriginal,
-                hasActiveAddonSubtitle: activeAddonSubtitle != nil,
-                isAudioSyncRunningForSelectedSubtitle: isAudioSyncRunningForSelectedSubtitle,
-                isAudioSyncAppliedForSelectedSubtitle: isAudioSyncAppliedForSelectedSubtitle,
-                isAudioSyncUsingOriginalTiming: isAudioSyncUsingOriginalTiming,
-                canToggleAudioSyncTiming: canToggleAudioSyncTiming,
-                canToggleAudioSync: activeAddonSubtitle != nil
-                    && (isAudioSyncRunningForSelectedSubtitle || viewModel.activeEngineKind == .aether),
-                activeStylePresetTitle: SubtitleStylePresetStore.shared.activePresetTitle(for: viewModel.subtitleStyle),
-                activeStylePresetID: SubtitleStylePresetStore.shared.activePreset(for: viewModel.subtitleStyle)?.id,
-                stylePresets: SubtitleStylePresetStore.shared.allPresets(),
-                onSelect: { selectSubtitlePickerOption($0) },
-                onRunAutoSync: {
-                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle else { return }
-                    switch viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] {
-                    case .checking?, .synced?, .kept(.inSync)?:
-                        return
-                    default:
-                        viewModel.runSubtitleAutoSyncNow()
-                    }
-                },
-                onToggleSubtitleTiming: {
-                    guard let activeAddonSubtitle = viewModel.activeAddonSubtitle,
-                          case .synced? = viewModel.subtitleAutoSyncStates[activeAddonSubtitle.url] else {
-                        return
-                    }
-                    viewModel.toggleSubtitleAutoSyncTiming()
-                },
-                onToggleAudioSync: {
-                    if viewModel.isAudioSyncRunning,
-                       let activeAddonSubtitle,
-                       viewModel.audioSyncStatus?.subtitleURL != activeAddonSubtitle.url {
-                        viewModel.startAudioSync()
-                    } else {
-                        viewModel.toggleAudioSync()
-                    }
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onToggleAudioSyncTiming: {
-                    viewModel.toggleAudioSyncTiming()
-                },
-                onSelectPreset: { preset in
-                    SubtitleStylePresetStore.shared.applyPreset(preset)
-                    viewModel.applySubtitleStyle()
-                    viewModel.showPlayerToast(L10n.format("subtitle_style_applied_toast", fallback: "Style: %@", preset.name))
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                }
-            )
-            .equatable()
-            .focused($focusedControl, equals: .subtitles)
-            .disabled(!isTransportButtonFocusable(.subtitles))
-            .onExitCommand(perform: handleExit)
-            .onMoveCommand { direction in
-                handleMove(direction, from: .subtitles)
+                isMenuPresented: activeQuickMenu == .subtitles,
+                action: { presentQuickMenu(.subtitles) }
+            ) {
+                Image(systemName: "captions.bubble")
             }
+            .anchorPreference(key: PlayerQuickMenuAnchorPreferenceKey.self, value: .bounds) {
+                [.subtitles: $0]
+            }
+            .accessibilityLabel(L10n.string("playback_section_subtitles", fallback: "Subtitles"))
+            .id("subtitles_button")
 
         case .audio:
-            PlayerAudioMenuButton(
-                orderedTracks: orderedAudioTracks,
-                supportsAudioProcessing: viewModel.supportsAudioProcessing,
-                enhanceDialogueMode: viewModel.supportsAudioProcessing ? viewModel.enhanceDialogueMode : .off,
-                isReduceLoudSoundsActive: viewModel.supportsAudioProcessing && viewModel.isReduceLoudSoundsActive,
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .audio,
                 isFocused: focusedControl == .audio,
-                onSelectTrack: { track in
-                    viewModel.selectAudio(track)
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onSetEnhanceDialogueMode: { mode in
-                    viewModel.setEnhanceDialogueMode(mode)
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onToggleReduceLoudSounds: {
-                    viewModel.toggleReduceLoudSounds()
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                },
-                onUpdateLoudnessTarget: {
-                    viewModel.updateLoudnessTarget()
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                }
-            )
-            .equatable()
-            .focused($focusedControl, equals: .audio)
-            .disabled(!isTransportButtonFocusable(.audio))
-            .onExitCommand(perform: handleExit)
-            .onMoveCommand { direction in
-                handleMove(direction, from: .audio)
+                isMenuPresented: activeQuickMenu == .audio,
+                action: { presentQuickMenu(.audio) }
+            ) {
+                Image(systemName: "waveform")
             }
+            .anchorPreference(key: PlayerQuickMenuAnchorPreferenceKey.self, value: .bounds) {
+                [.audio: $0]
+            }
+            .accessibilityLabel(L10n.string("player_audio_tracks", fallback: "Audio"))
+            .id("audio_button")
 
         case .speed:
-            PlayerSpeedMenuButton(
-                currentSpeed: viewModel.playbackSpeed,
+            glassIconButton(
+                size: 70,
+                iconSize: 28,
+                focusKey: .speed,
                 isFocused: focusedControl == .speed,
-                onSelectSpeed: { speed in
-                    viewModel.setSpeed(speed)
-                    viewModel.showPlayerToast("Speed \(speed.label)")
-                    viewModel.setControlsAutoHideSuspended(false)
-                    viewModel.scheduleControlsHide(after: 10.0)
-                }
-            )
-            .equatable()
-            .focused($focusedControl, equals: .speed)
-            .disabled(!isTransportButtonFocusable(.speed))
-            .onExitCommand(perform: handleExit)
-            .onMoveCommand { direction in
-                handleMove(direction, from: .speed)
+                isMenuPresented: activeQuickMenu == .speed,
+                action: { presentQuickMenu(.speed) }
+            ) {
+                Image(systemName: "gauge.with.dots.needle.bottom.50percent")
             }
+            .anchorPreference(key: PlayerQuickMenuAnchorPreferenceKey.self, value: .bounds) {
+                [.speed: $0]
+            }
+            .accessibilityLabel(L10n.string("player_speed_title", fallback: "Playback Speed"))
+            .id("speed_button")
         }
     }
 
@@ -796,6 +1425,7 @@ struct PlayerControls: View {
         iconSize: CGFloat,
         focusKey: PlayerControlFocus,
         isFocused: Bool,
+        isMenuPresented: Bool = false,
         action: @escaping () -> Void,
         @ViewBuilder icon: () -> Icon
     ) -> some View {
@@ -816,6 +1446,7 @@ struct PlayerControls: View {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: size, height: size)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
+                .background(Color.white.opacity(isMenuPresented && !isFocused ? 0.32 : 0), in: Circle())
                 .frame(width: size, height: size)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -870,17 +1501,6 @@ struct PlayerControls: View {
         }
     }
 
-    private func selectSubtitlePickerOption(_ option: SubtitlePanelOption) {
-        switch option.kind {
-        case .track(let track):
-            viewModel.selectSubtitle(track)
-        case .external(let subtitle):
-            viewModel.selectExternalSubtitle(subtitle)
-        }
-        viewModel.setControlsAutoHideSuspended(false)
-        viewModel.scheduleControlsHide(after: 10.0)
-    }
-
     private var orderedAudioTracks: [AudioTrack] {
         let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
         return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
@@ -906,7 +1526,9 @@ struct PlayerControls: View {
     // MARK: - Timeline
 
     private var isTimelineFocused: Bool {
-        didReportPlaybackStarted && (focusedControl == .timeline || viewModel.isHoldingSeek)
+        activeQuickMenu == nil
+            && didReportPlaybackStarted
+            && (focusedControl == .timeline || viewModel.isHoldingSeek)
     }
 
     @ViewBuilder
@@ -919,16 +1541,12 @@ struct PlayerControls: View {
     }
 
     private var liveStatusBar: some View {
-        HStack(spacing: 11) {
-            Circle()
-                .fill(Color.red)
-                .frame(width: 12, height: 12)
-            Text(L10n.string("player_live", fallback: "LIVE"))
-                .font(.system(size: 22, weight: .bold))
-                .foregroundColor(.white.opacity(0.9))
-            Spacer()
-        }
-        .frame(height: 44)
+        PlayerLiveTimelineBar(
+            clock: viewModel.clock,
+            programmes: viewModel.liveProgrammes,
+            startedAt: viewModel.liveStreamStartedAt,
+            isActive: viewModel.showControls
+        )
     }
 
     private var finiteTimelineBar: some View {
@@ -964,6 +1582,7 @@ struct PlayerControls: View {
         }
         .focusable(
             didReportPlaybackStarted
+                && activeQuickMenu == nil
                 && (viewModel.showControls || viewModel.isScrubbing)
                 && !viewModel.showSettingsPanel
                 && !viewModel.showPauseOverlay
@@ -971,7 +1590,7 @@ struct PlayerControls: View {
                 && !viewModel.isSceneDetailVisible
         )
         .focused($focusedControl, equals: .timeline)
-        .allowsHitTesting(didReportPlaybackStarted)
+        .allowsHitTesting(didReportPlaybackStarted && activeQuickMenu == nil)
         .focusEffectDisabledIfAvailable()
         .onExitCommand(perform: handleExit)
         .onTapGesture {
@@ -991,532 +1610,904 @@ struct PlayerControls: View {
     }
 }
 
-// MARK: - Native Subtitle & Audio Menu Buttons (Isolated EquatableViews)
+// MARK: - Rivulet-style Liquid Glass Quick Menu (UIKit)
+//
+// Modeled directly on Rivulet's `PlayerRailPanelView` + `CardTrackListView` +
+// `TransportControlButton.glassEffect()` + `FocusAppearanceCoordinator`, matching
+// AVKit's tvOS 26 tool menus: 450pt fixed width, 54pt continuous corners,
+// tinted `.regular` Liquid Glass platter that hugs its rows up to 560pt,
+// 66pt/86pt rows with a left checkmark column and a 4pt-growing white pill
+// with black text on focus, and Menu-button submenu navigation.
 
-private struct PlayerSubtitleMenuButton: View, Equatable {
-    let noneOption: SubtitlePanelOption?
-    let languageGroups: [SubtitleLanguageGroup]
-    let isFocused: Bool
-    let autoSyncState: SubtitleAutoSyncState?
-    let syncActionTitle: String
-    let isSubtitleAutoSyncUsingOriginal: Bool
-    let hasActiveAddonSubtitle: Bool
-    let isAudioSyncRunningForSelectedSubtitle: Bool
-    let isAudioSyncAppliedForSelectedSubtitle: Bool
-    let isAudioSyncUsingOriginalTiming: Bool
-    let canToggleAudioSyncTiming: Bool
-    let canToggleAudioSync: Bool
-    let activeStylePresetTitle: String
-    let activeStylePresetID: String?
-    let stylePresets: [SubtitleStylePreset]
-    let onSelect: (SubtitlePanelOption) -> Void
-    let onRunAutoSync: () -> Void
-    let onToggleSubtitleTiming: () -> Void
-    let onToggleAudioSync: () -> Void
-    let onToggleAudioSyncTiming: () -> Void
-    let onSelectPreset: (SubtitleStylePreset) -> Void
+struct PlayerQuickMenuRow: Equatable {
+    let id: String
+    let title: String
+    let subtitle: String?
+    let systemImage: String?
+    let isSelected: Bool
+    let isDisabled: Bool
+    let showsChevron: Bool
+    let closesMenu: Bool
 
-    static func == (lhs: PlayerSubtitleMenuButton, rhs: PlayerSubtitleMenuButton) -> Bool {
-        lhs.isFocused == rhs.isFocused
-            && lhs.noneOption == rhs.noneOption
-            && lhs.languageGroups == rhs.languageGroups
-            && lhs.autoSyncState == rhs.autoSyncState
-            && lhs.syncActionTitle == rhs.syncActionTitle
-            && lhs.isSubtitleAutoSyncUsingOriginal == rhs.isSubtitleAutoSyncUsingOriginal
-            && lhs.hasActiveAddonSubtitle == rhs.hasActiveAddonSubtitle
-            && lhs.isAudioSyncRunningForSelectedSubtitle == rhs.isAudioSyncRunningForSelectedSubtitle
-            && lhs.isAudioSyncAppliedForSelectedSubtitle == rhs.isAudioSyncAppliedForSelectedSubtitle
-            && lhs.isAudioSyncUsingOriginalTiming == rhs.isAudioSyncUsingOriginalTiming
-            && lhs.canToggleAudioSyncTiming == rhs.canToggleAudioSyncTiming
-            && lhs.canToggleAudioSync == rhs.canToggleAudioSync
-            && lhs.activeStylePresetTitle == rhs.activeStylePresetTitle
-            && lhs.activeStylePresetID == rhs.activeStylePresetID
-            && lhs.stylePresets == rhs.stylePresets
-    }
-
-    var body: some View {
-        Menu {
-            Section(L10n.string("playback_section_subtitles", fallback: "Subtitles")) {
-                switch autoSyncState {
-                case .synced?:
-                    Button {} label: {
-                        Label(
-                            syncActionTitle,
-                            systemImage: isSubtitleAutoSyncUsingOriginal ? "clock" : "checkmark.circle"
-                        )
-                    }
-                    .disabled(true)
-
-                    Button {
-                        onToggleSubtitleTiming()
-                    } label: {
-                        Label(
-                            L10n.string(
-                                isSubtitleAutoSyncUsingOriginal
-                                    ? "player_autosync_use_synced"
-                                    : "player_subtitle_autosync_original",
-                                fallback: isSubtitleAutoSyncUsingOriginal ? "Synced Timing" : "Original Timing"
-                            ),
-                            systemImage: isSubtitleAutoSyncUsingOriginal ? "checkmark.circle" : "arrow.uturn.backward"
-                        )
-                    }
-                    .menuActionDismissBehavior(.disabled)
-
-                case .kept(.inSync)?:
-                    Button {} label: {
-                        Label(syncActionTitle, systemImage: "checkmark.circle")
-                    }
-                    .disabled(true)
-
-                case .checking?, nil:
-                    Button {
-                        onRunAutoSync()
-                    } label: {
-                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .menuActionDismissBehavior(.disabled)
-                    .disabled(!hasActiveAddonSubtitle)
-
-                default:
-                    Button {
-                        onRunAutoSync()
-                    } label: {
-                        Label(syncActionTitle, systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .menuActionDismissBehavior(.disabled)
-                    .disabled(!hasActiveAddonSubtitle)
-                }
-
-                if isAudioSyncAppliedForSelectedSubtitle {
-                    Button {} label: {
-                        Label(
-                            L10n.string(
-                                isAudioSyncUsingOriginalTiming
-                                    ? "player_subtitle_autosync_original"
-                                    : "player_autosync_audio_synced",
-                                fallback: isAudioSyncUsingOriginalTiming ? "Original Timing" : "Synced by Audio"
-                            ),
-                            systemImage: isAudioSyncUsingOriginalTiming ? "clock" : "checkmark.circle"
-                        )
-                    }
-                    .disabled(true)
-
-                    if canToggleAudioSyncTiming {
-                        Button {
-                            onToggleAudioSyncTiming()
-                        } label: {
-                            Label(
-                                L10n.string(
-                                    isAudioSyncUsingOriginalTiming
-                                        ? "player_autosync_use_synced"
-                                        : "player_subtitle_autosync_original",
-                                    fallback: isAudioSyncUsingOriginalTiming ? "Synced Timing" : "Original Timing"
-                                ),
-                                systemImage: isAudioSyncUsingOriginalTiming ? "checkmark.circle" : "arrow.uturn.backward"
-                            )
-                        }
-                        .menuActionDismissBehavior(.disabled)
-                    }
-                } else {
-                    Button {
-                        onToggleAudioSync()
-                    } label: {
-                        Label(
-                            L10n.string(
-                                isAudioSyncRunningForSelectedSubtitle ? "player_autosync_audio_stop" : "player_autosync_audio",
-                                fallback: isAudioSyncRunningForSelectedSubtitle ? "Stop Listening" : "Sync by Audio"
-                            ),
-                            systemImage: isAudioSyncRunningForSelectedSubtitle ? "stop.circle" : "waveform"
-                        )
-                    }
-                    .disabled(!canToggleAudioSync)
-                }
-
-                Menu {
-                    ForEach(stylePresets) { preset in
-                        Button {
-                            onSelectPreset(preset)
-                        } label: {
-                            subtitleMenuItem(
-                                title: preset.name,
-                                isSelected: activeStylePresetID == preset.id
-                            )
-                        }
-                    }
-                } label: {
-                    HStack {
-                        Label(
-                            L10n.string("subtitle_style_title", fallback: "Subtitle Style"),
-                            systemImage: "textformat"
-                        )
-                        Spacer()
-                        Text(activeStylePresetTitle)
-                    }
-                }
-
-                Divider()
-
-                if let none = noneOption {
-                    Button {
-                        onSelect(none)
-                    } label: {
-                        subtitleMenuItem(
-                            title: L10n.string("action_none", fallback: "None"),
-                            isSelected: none.isSelected
-                        )
-                    }
-                }
-
-                ForEach(languageGroups) { group in
-                    Menu {
-                        if !group.builtInOptions.isEmpty {
-                            Section(L10n.string("tvos_settings_option_built_in", fallback: "Built-In")) {
-                                ForEach(group.builtInOptions) { option in
-                                    let labels = SubtitleMenuFormatter.builtInMenuLabels(option: option)
-                                    Button {
-                                        onSelect(option)
-                                    } label: {
-                                        subtitleMenuItem(
-                                            title: labels.title,
-                                            subtitle: labels.subtitle,
-                                            isSelected: option.isSelected
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        if !group.externalOptions.isEmpty {
-                            Section(L10n.string("player_external_subtitles", fallback: "External Subtitles")) {
-                                ForEach(group.externalOptions) { option in
-                                    let labels = SubtitleMenuFormatter.groupedExternalMenuLabels(option: option)
-                                    Button {
-                                        onSelect(option)
-                                    } label: {
-                                        subtitleMenuItem(
-                                            title: labels.title,
-                                            subtitle: labels.subtitle,
-                                            isSelected: option.isSelected
-                                        )
-                                    }
-                                }
-                            }
-                        }
-                    } label: {
-                        HStack {
-                            if let selected = group.selectedOption {
-                                let selectedTitle = SubtitleMenuFormatter.optionDisplayTitle(for: selected)
-                                if !selectedTitle.isEmpty && selectedTitle.caseInsensitiveCompare(group.language) != .orderedSame {
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(group.language)
-                                        Text(selectedTitle)
-                                    }
-                                } else {
-                                    Text(group.language)
-                                }
-                            } else {
-                                Text(group.language)
-                            }
-                            Spacer()
-                            if group.hasSelected {
-                                Image(systemName: "checkmark")
-                            }
-                        }
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "captions.bubble")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: 70, height: 70)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .id("subtitles_button")
-    }
-
-    @ViewBuilder
-    private func subtitleMenuItem(
+    init(
+        id: String,
         title: String,
         subtitle: String? = nil,
-        isSelected: Bool
-    ) -> some View {
-        Text(title)
-        if let subtitle, !subtitle.isEmpty {
-            Text(subtitle)
+        systemImage: String? = nil,
+        isSelected: Bool = false,
+        isDisabled: Bool = false,
+        showsChevron: Bool = false,
+        closesMenu: Bool = false
+    ) {
+        self.id = id
+        self.title = title
+        self.subtitle = subtitle
+        self.systemImage = systemImage
+        self.isSelected = isSelected
+        self.isDisabled = isDisabled
+        self.showsChevron = showsChevron
+        self.closesMenu = closesMenu
+    }
+}
+
+enum PlayerQuickMenuItem: Equatable {
+    case row(PlayerQuickMenuRow)
+    case separator(id: String)
+    case sectionHeader(id: String, title: String, isCompactTop: Bool)
+}
+
+struct PlayerQuickMenuContent: Equatable {
+    let pageID: String
+    let header: String
+    let items: [PlayerQuickMenuItem]
+    let canPopBack: Bool
+    let initialFocusID: String?
+}
+
+struct PlayerQuickMenuSnapshot {
+    let content: PlayerQuickMenuContent
+    let actions: [String: () -> Void]
+}
+
+private enum PlayerQuickMenuGlassEffect {
+    /// Liquid Glass surface on tvOS 26+ capable Apple TVs with a subtle dark neutral tint
+    /// for crisp text contrast across bright and dark scenes; falls back to dark blur on older systems.
+    static func make() -> UIVisualEffect {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
+            let effect = UIGlassEffect(style: .regular)
+            effect.tintColor = UIColor(white: 0.08, alpha: 0.24)
+            return effect
         }
-        if isSelected {
-            Image(systemName: "checkmark")
+        return UIBlurEffect(style: .dark)
+    }
+}
+
+private extension UIFocusAnimationCoordinator {
+    /// Rivulet's `FocusAppearanceCoordinator`: gaining focus rides the coordinator
+    /// so the white pill grows smoothly; losing focus applies immediately to avoid ghosting.
+    func animateQuickMenuFocusChange(gained: Bool, _ apply: @escaping () -> Void) {
+        if gained {
+            addCoordinatedAnimations(apply, completion: nil)
+        } else {
+            apply()
         }
     }
 }
 
-private struct PlayerAudioMenuButton: View, Equatable {
-    let orderedTracks: [AudioTrack]
-    let supportsAudioProcessing: Bool
-    let enhanceDialogueMode: EnhanceDialogueMode
-    let isReduceLoudSoundsActive: Bool
-    let isFocused: Bool
-    let onSelectTrack: (AudioTrack) -> Void
-    let onSetEnhanceDialogueMode: (EnhanceDialogueMode) -> Void
-    let onToggleReduceLoudSounds: () -> Void
-    var onUpdateLoudnessTarget: (() -> Void)? = nil
+private struct PlayerQuickMenuOverlayHost: UIViewControllerRepresentable {
+    let presentationID: UUID
+    let snapshot: PlayerQuickMenuSnapshot?
+    let triggerFrame: CGRect?
+    let onMenuBack: () -> Void
+    let onDismiss: () -> Void
 
-    @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
-    @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
-
-    static func == (lhs: PlayerAudioMenuButton, rhs: PlayerAudioMenuButton) -> Bool {
-        lhs.isFocused == rhs.isFocused
-            && lhs.supportsAudioProcessing == rhs.supportsAudioProcessing
-            && lhs.enhanceDialogueMode == rhs.enhanceDialogueMode
-            && lhs.isReduceLoudSoundsActive == rhs.isReduceLoudSoundsActive
-            && lhs.orderedTracks == rhs.orderedTracks
-            && lhs.loudnessNormalizer == rhs.loudnessNormalizer
-            && lhs.loudnessTargetPreset == rhs.loudnessTargetPreset
+    func makeUIViewController(context: Context) -> PlayerQuickMenuHostController {
+        let controller = PlayerQuickMenuHostController()
+        controller.onMenuBack = onMenuBack
+        controller.onDismiss = onDismiss
+        return controller
     }
 
-    var body: some View {
-        Menu {
-            if supportsAudioProcessing {
-                Section(L10n.string("player_audio_adjustments", fallback: "Audio Adjustments")) {
-                    Menu {
-                        ForEach(EnhanceDialogueMode.allCases) { mode in
-                            Button {
-                                onSetEnhanceDialogueMode(mode)
-                            } label: {
-                                audioMenuItem(
-                                    title: mode.title,
-                                    isSelected: enhanceDialogueMode == mode
-                                )
-                            }
-                        }
-                    } label: {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(L10n.string("player_enhance_dialogue", fallback: "Enhance Dialogue"))
-                            Text(enhanceDialogueMode.title)
-                        }
-                    }
-
-                    Button {
-                        onToggleReduceLoudSounds()
-                    } label: {
-                        audioMenuItem(
-                            title: L10n.string("player_reduce_loud_sounds", fallback: "Reduce Loud Sounds"),
-                            isSelected: isReduceLoudSoundsActive
-                        )
-                    }
-
-                    if loudnessNormalizer {
-                        Menu {
-                            Button {
-                                loudnessTargetPreset = "standard"
-                                onUpdateLoudnessTarget?()
-                            } label: {
-                                audioMenuItem(
-                                    title: L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)"),
-                                    isSelected: loudnessTargetPreset == "standard"
-                                )
-                            }
-                            Button {
-                                loudnessTargetPreset = "night"
-                                onUpdateLoudnessTarget?()
-                            } label: {
-                                audioMenuItem(
-                                    title: L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)"),
-                                    isSelected: loudnessTargetPreset == "night"
-                                )
-                            }
-                            Button {
-                                loudnessTargetPreset = "boost"
-                                onUpdateLoudnessTarget?()
-                            } label: {
-                                audioMenuItem(
-                                    title: L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)"),
-                                    isSelected: loudnessTargetPreset == "boost"
-                                )
-                            }
-                        } label: {
-                            VStack(alignment: .leading, spacing: 2) {
-                                Text(L10n.string("tvos_settings_loudness_target", fallback: "Loudness Target"))
-                                Text(loudnessTargetPresetTitle(loudnessTargetPreset))
-                            }
-                        }
-                    }
-                }
-            }
-
-            if !orderedTracks.isEmpty {
-                Section(L10n.string("player_audio_tracks", fallback: "Audio Tracks")) {
-                    ForEach(orderedTracks) { track in
-                        Button {
-                            onSelectTrack(track)
-                        } label: {
-                            audioMenuItem(
-                                title: audioMenuTrackTitle(for: track),
-                                isSelected: track.isSelected
-                            )
-                        }
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "waveform")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: 70, height: 70)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .id("audio_button")
-    }
-
-    private func audioMenuItem(title: String, isSelected: Bool) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            if isSelected {
-                Image(systemName: "checkmark")
-            }
-        }
-    }
-
-    private func loudnessTargetPresetTitle(_ preset: String) -> String {
-        switch preset {
-        case "night":
-            return L10n.string("tvos_settings_loudness_night", fallback: "Night Listening (-20 LUFS)")
-        case "boost":
-            return L10n.string("tvos_settings_loudness_boost", fallback: "Quiet Source Boost (-16 LUFS)")
-        default:
-            return L10n.string("tvos_settings_loudness_standard", fallback: "Cinema / Standard (-24 LUFS)")
-        }
-    }
-
-    private func audioMenuTrackTitle(for track: AudioTrack) -> String {
-        let rawName = track.name.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rawLang = track.language.trimmingCharacters(in: .whitespacesAndNewlines)
-        let rawLangName = track.languageName.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        let langIdentifier = !rawLang.isEmpty ? rawLang : rawLangName
-        let humanLanguage = SubtitleLanguagePreferences.humanLanguageName(from: langIdentifier)
-
-        // 1. If name is completely empty or just generic "Track 1" / "Track 2"
-        let isGenericTrack = rawName.isEmpty || rawName.range(of: #"^Track\s*\d+$"#, options: [.regularExpression, .caseInsensitive]) != nil
-        if isGenericTrack {
-            if !humanLanguage.isEmpty {
-                return humanLanguage
-            }
-            return rawName.isEmpty ? L10n.format("player_track_format", fallback: "Track %d", track.id) : rawName
-        }
-
-        // 2. If name is just the language code (e.g. "eng", "en", "fra", "nob")
-        if (!rawLang.isEmpty && rawName.caseInsensitiveCompare(rawLang) == .orderedSame) ||
-           (!rawLangName.isEmpty && rawName.caseInsensitiveCompare(rawLangName) == .orderedSame) {
-            return !humanLanguage.isEmpty ? humanLanguage : rawName.capitalized
-        }
-
-        // 3. If name starts with the language code (e.g. "eng (DTS-HD MA 5.1)", "eng [Original]", "eng - 5.1")
-        if !humanLanguage.isEmpty {
-            let codeToCheck = !rawLang.isEmpty ? rawLang : rawLangName
-            if !codeToCheck.isEmpty {
-                let pattern = #"^"# + NSRegularExpression.escapedPattern(for: codeToCheck) + #"\b[\s:_\-]*"#
-                if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
-                    let range = NSRange(rawName.startIndex..<rawName.endIndex, in: rawName)
-                    if let match = regex.firstMatch(in: rawName, options: [], range: range) {
-                        let startIndex = rawName.index(rawName.startIndex, offsetBy: match.range.length)
-                        let suffix = String(rawName[startIndex...]).trimmingCharacters(in: .whitespacesAndNewlines)
-                        if suffix.isEmpty {
-                            return humanLanguage
-                        } else if suffix.hasPrefix("(") || suffix.hasPrefix("[") {
-                            return "\(humanLanguage) \(suffix)"
-                        } else {
-                            return "\(humanLanguage) (\(suffix))"
-                        }
-                    }
-                }
-            }
-
-            // 4. If name already contains the full language name (e.g. "English (Original)")
-            if rawName.localizedCaseInsensitiveContains(humanLanguage) {
-                return rawName
-            }
-
-            // 5. If name is another descriptor without language (e.g. "Director's Commentary" or "DTS 5.1")
-            return "\(humanLanguage) (\(rawName))"
-        }
-
-        return rawName
+    func updateUIViewController(_ uiViewController: PlayerQuickMenuHostController, context: Context) {
+        uiViewController.onMenuBack = onMenuBack
+        uiViewController.onDismiss = onDismiss
+        uiViewController.sync(
+            presentationID: presentationID,
+            snapshot: snapshot,
+            triggerFrame: triggerFrame
+        )
     }
 }
 
-private struct PlayerSpeedMenuButton: View, Equatable {
-    let currentSpeed: PlaybackSpeed
-    let isFocused: Bool
-    let onSelectSpeed: (PlaybackSpeed) -> Void
+final class PlayerQuickMenuHostController: UIViewController {
+    var onMenuBack: () -> Void = {}
+    var onDismiss: () -> Void = {}
 
-    static func == (lhs: PlayerSpeedMenuButton, rhs: PlayerSpeedMenuButton) -> Bool {
-        lhs.isFocused == rhs.isFocused
-            && lhs.currentSpeed == rhs.currentSpeed
+    private var presentedID: UUID?
+    private var activePanel: PlayerQuickMenuPanelView?
+    private var activeList: PlayerQuickMenuListView?
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .clear
+        view.isUserInteractionEnabled = false
     }
 
-    var body: some View {
-        Menu {
-            Section(L10n.string("player_speed_title", fallback: "Playback Speed")) {
-                ForEach(PlaybackSpeed.allCases) { speed in
-                    Button {
-                        onSelectSpeed(speed)
-                    } label: {
-                        speedMenuItem(
-                            title: speedTitle(for: speed),
-                            isSelected: currentSpeed == speed
-                        )
+    override var preferredFocusEnvironments: [UIFocusEnvironment] {
+        activePanel.map { [$0] } ?? []
+    }
+
+    func sync(
+        presentationID: UUID,
+        snapshot: PlayerQuickMenuSnapshot?,
+        triggerFrame: CGRect?
+    ) {
+        guard let snapshot, let triggerFrame, triggerFrame.width > 0, triggerFrame.height > 0 else {
+            if let panel = activePanel {
+                activePanel = nil
+                activeList = nil
+                presentedID = nil
+                view.isUserInteractionEnabled = false
+                panel.dismissPanel(notify: false)
+            }
+            return
+        }
+
+        if presentedID != presentationID || activePanel == nil || activeList == nil {
+            activePanel?.dismissPanel(notify: false)
+            presentedID = presentationID
+            let list = PlayerQuickMenuListView(snapshot: snapshot)
+            list.onMenuBack = { [weak self] in self?.onMenuBack() }
+            list.onRequestDismiss = { [weak self] in self?.activePanel?.dismissPanel(notify: true) }
+
+            view.isUserInteractionEnabled = true
+            let panel = PlayerQuickMenuPanelView.present(
+                listView: list,
+                in: view,
+                triggerFrame: triggerFrame
+            )
+            panel.onDismiss = { [weak self, weak panel] in
+                guard let self else { return }
+                if self.activePanel === panel {
+                    self.activePanel = nil
+                    self.activeList = nil
+                    self.presentedID = nil
+                    self.view.isUserInteractionEnabled = false
+                }
+                self.onDismiss()
+            }
+            activePanel = panel
+            activeList = list
+            focusActivePanel(panel)
+            DispatchQueue.main.async { [weak self, weak panel] in
+                guard let self, let panel, self.activePanel === panel, !panel.isDismissed else { return }
+                self.focusActivePanel(panel)
+            }
+        } else if let panel = activePanel, let list = activeList {
+            view.isUserInteractionEnabled = true
+            panel.updateAnchor(triggerFrame: triggerFrame)
+            list.update(with: snapshot)
+        }
+    }
+
+    private func focusActivePanel(_ panel: PlayerQuickMenuPanelView) {
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+        if let focusSystem = UIFocusSystem.focusSystem(for: panel) {
+            let target: UIFocusEnvironment = panel.listView.preferredInitialFocusTarget ?? panel
+            focusSystem.requestFocusUpdate(to: target)
+            focusSystem.updateFocusIfNeeded()
+        }
+    }
+}
+
+/// Floating Liquid Glass popup cloned from Rivulet's `PlayerRailPanelView`.
+final class PlayerQuickMenuPanelView: UIView {
+    enum Metrics {
+        static let cornerRadius: CGFloat = 44
+        static let buttonGap: CGFloat = 20.5
+        static let maxHeight: CGFloat = 560
+        static let screenMargin: CGFloat = 80
+        static let topSafetyInset: CGFloat = 40
+        static let collapsedScale: CGFloat = 0.1
+        static let spring = UISpringTimingParameters(mass: 1, stiffness: 200, damping: 23, initialVelocity: .zero)
+        static let springDuration: TimeInterval = 0.677
+        static let contentFade: TimeInterval = 0.17
+        static let contentFadeCurve = UICubicTimingParameters(
+            controlPoint1: CGPoint(x: 0.33, y: 0),
+            controlPoint2: CGPoint(x: 0.67, y: 1)
+        )
+    }
+
+    var onDismiss: (() -> Void)?
+    private(set) var isDismissed = false
+
+    let backgroundEffectView: UIVisualEffectView
+    let listView: PlayerQuickMenuListView
+    private var springAnimator: UIViewPropertyAnimator?
+    private var bottomConstraint: NSLayoutConstraint?
+    private var trailingConstraint: NSLayoutConstraint?
+    private var maxHeightConstraint: NSLayoutConstraint?
+
+    var containsCurrentFocus: Bool {
+        guard let focused = UIFocusSystem.focusSystem(for: self)?.focusedItem as? UIView else { return false }
+        return focused.isDescendant(of: self)
+    }
+
+    init(listView: PlayerQuickMenuListView) {
+        self.listView = listView
+        self.backgroundEffectView = UIVisualEffectView(effect: PlayerQuickMenuGlassEffect.make())
+        super.init(frame: .zero)
+
+        backgroundEffectView.clipsToBounds = true
+        backgroundEffectView.layer.cornerRadius = Metrics.cornerRadius
+        backgroundEffectView.layer.cornerCurve = .continuous
+
+        [backgroundEffectView, listView].forEach {
+            addSubview($0)
+            $0.translatesAutoresizingMaskIntoConstraints = false
+        }
+
+        let maxHeight = heightAnchor.constraint(lessThanOrEqualToConstant: Metrics.maxHeight)
+        maxHeightConstraint = maxHeight
+
+        NSLayoutConstraint.activate([
+            maxHeight,
+            backgroundEffectView.topAnchor.constraint(equalTo: topAnchor),
+            backgroundEffectView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            backgroundEffectView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            backgroundEffectView.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            listView.topAnchor.constraint(equalTo: topAnchor),
+            listView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            listView.trailingAnchor.constraint(equalTo: trailingAnchor),
+            listView.bottomAnchor.constraint(equalTo: bottomAnchor),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @discardableResult
+    static func present(
+        listView: PlayerQuickMenuListView,
+        in container: UIView,
+        triggerFrame: CGRect,
+        animated: Bool = true
+    ) -> PlayerQuickMenuPanelView {
+        let panel = PlayerQuickMenuPanelView(listView: listView)
+        container.addSubview(panel)
+        panel.translatesAutoresizingMaskIntoConstraints = false
+
+        let width = panel.widthAnchor.constraint(equalToConstant: PlayerQuickMenuListView.menuWidth)
+        width.priority = .defaultHigh + 1
+
+        let trailing = panel.trailingAnchor.constraint(equalTo: container.leadingAnchor, constant: triggerFrame.maxX)
+        trailing.priority = .defaultLow + 250
+
+        let bottom = panel.bottomAnchor.constraint(equalTo: container.topAnchor, constant: triggerFrame.minY - Metrics.buttonGap)
+
+        panel.trailingConstraint = trailing
+        panel.bottomConstraint = bottom
+        panel.maxHeightConstraint?.constant = Self.resolvedMaxHeight(for: triggerFrame)
+
+        NSLayoutConstraint.activate([
+            width,
+            bottom,
+            trailing,
+            panel.leadingAnchor.constraint(greaterThanOrEqualTo: container.leadingAnchor, constant: Metrics.screenMargin),
+            panel.trailingAnchor.constraint(lessThanOrEqualTo: container.trailingAnchor, constant: -Metrics.screenMargin),
+        ])
+        container.layoutIfNeeded()
+        listView.scrollInitialFocusIntoViewIfNeeded()
+
+        if animated {
+            panel.transform = panel.collapsedTransform
+            listView.alpha = 0
+            panel.animate(toTransform: .identity, contentAlpha: 1, completion: nil)
+        }
+
+        container.setNeedsFocusUpdate()
+        container.updateFocusIfNeeded()
+        return panel
+    }
+
+    func updateAnchor(triggerFrame: CGRect) {
+        let newBottom = triggerFrame.minY - Metrics.buttonGap
+        let newTrailing = triggerFrame.maxX
+        let newMaxHeight = Self.resolvedMaxHeight(for: triggerFrame)
+        if bottomConstraint?.constant != newBottom {
+            bottomConstraint?.constant = newBottom
+        }
+        if trailingConstraint?.constant != newTrailing {
+            trailingConstraint?.constant = newTrailing
+        }
+        if maxHeightConstraint?.constant != newMaxHeight {
+            maxHeightConstraint?.constant = newMaxHeight
+        }
+    }
+
+    private static func resolvedMaxHeight(for triggerFrame: CGRect) -> CGFloat {
+        let availableAboveTrigger = triggerFrame.minY - Metrics.buttonGap - Metrics.topSafetyInset
+        return min(Metrics.maxHeight, max(140, availableAboveTrigger))
+    }
+
+    private var collapsedTransform: CGAffineTransform {
+        let corner = CGPoint(x: bounds.width / 2, y: bounds.height / 2)
+        return CGAffineTransform(translationX: corner.x, y: corner.y)
+            .scaledBy(x: Metrics.collapsedScale, y: Metrics.collapsedScale)
+            .translatedBy(x: -corner.x, y: -corner.y)
+    }
+
+    private func animate(
+        toTransform transform: CGAffineTransform,
+        contentAlpha: CGFloat,
+        clearsGlass: Bool = false,
+        completion: (() -> Void)?
+    ) {
+        springAnimator?.stopAnimation(true)
+        let spring = UIViewPropertyAnimator(duration: Metrics.springDuration, timingParameters: Metrics.spring)
+        spring.addAnimations { self.transform = transform }
+        springAnimator = spring
+        spring.startAnimation()
+
+        let fade = UIViewPropertyAnimator(duration: Metrics.contentFade, timingParameters: Metrics.contentFadeCurve)
+        fade.addAnimations {
+            self.listView.alpha = contentAlpha
+            if clearsGlass { self.backgroundEffectView.effect = nil }
+        }
+        fade.addCompletion { _ in completion?() }
+        fade.startAnimation()
+    }
+
+    func dismissPanel(notify: Bool = true, animated: Bool = true) {
+        guard !isDismissed else { return }
+        isDismissed = true
+        isUserInteractionEnabled = false
+        if animated {
+            animate(toTransform: collapsedTransform, contentAlpha: 0, clearsGlass: true) { [weak self] in
+                self?.removeFromSuperview()
+            }
+        } else {
+            removeFromSuperview()
+        }
+        if notify {
+            onDismiss?()
+        }
+    }
+
+    // MARK: - Focus & Menu
+
+    override var canBecomeFocused: Bool { !isDismissed }
+
+    override var preferredFocusEnvironments: [UIFocusEnvironment] {
+        isDismissed ? [] : [listView]
+    }
+
+    override func shouldUpdateFocus(in context: UIFocusUpdateContext) -> Bool {
+        if isDismissed {
+            return !(context.nextFocusedView?.isDescendant(of: self) ?? false)
+        }
+        guard window != nil else { return true }
+        if let next = context.nextFocusedView, next.isDescendant(of: self) {
+            return true
+        }
+        return false
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses where press.type == .menu {
+            if !listView.handleMenuPress() {
+                dismissPanel(notify: true)
+            }
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses where press.type == .menu {
+            return
+        }
+        super.pressesEnded(presses, with: event)
+    }
+}
+
+/// Choice menu list cloned from Rivulet's `CardTrackListView`.
+final class PlayerQuickMenuListView: UIView, UIScrollViewDelegate {
+    /// AVKit / Rivulet menus are a fixed 450pt wide.
+    static let menuWidth: CGFloat = 450
+
+    enum Metrics {
+        static let headerHeight: CGFloat = 68
+        static let headerLabelCenterY: CGFloat = 38.5
+        static let headerLabelLeading: CGFloat = 35
+        static let rowInset: CGFloat = 21
+        static let bottomInset: CGFloat = 18
+        static let separatorInset: CGFloat = 14
+        static let separatorGap: CGFloat = 18
+        static let rowHeight: CGFloat = 64
+        static let twoLineRowHeight: CGFloat = 84
+        static let leadingContentX: CGFloat = 14
+        static let leadingGlyphWidth: CGFloat = 28
+        static let leadingGlyphSpacing: CGFloat = 14
+        static let trailingChevronInset: CGFloat = 18
+        static let rowRadius: CGFloat = 32
+        static let focusGrowth: CGFloat = 4
+        static let focusScale: CGFloat = 416 / 408
+        static let topFadeHeight: CGFloat = 22
+        static let bottomFadeHeight: CGFloat = 36
+        static let titleFont = UIFont.systemFont(ofSize: 25, weight: .medium)
+        static let secondaryFont = UIFont.systemFont(ofSize: 23, weight: .medium)
+        static let secondaryColor = UIColor.white.withAlphaComponent(0.8)
+        static let separatorColor = UIColor.white.withAlphaComponent(0.26)
+    }
+
+    var onMenuBack: (() -> Void)?
+    var onRequestDismiss: (() -> Void)?
+
+    private(set) var content: PlayerQuickMenuContent
+    private var actions: [String: () -> Void]
+    let headerLabel = UILabel()
+    private let scrollContainer = UIView()
+    private let scrollFadeMask = CAGradientLayer()
+    let scrollView = UIScrollView()
+    private let stack = UIStackView()
+    private(set) var rowButtons: [PlayerQuickMenuRowButton] = []
+
+    private weak var pendingFocus: UIView?
+    private var hasPinnedInitialFocus = false
+    private weak var lastFocusedControl: UIView?
+    private var lastFocusedRowID: String?
+
+    var preferredInitialFocusTarget: UIView? {
+        if let pendingFocus { return pendingFocus }
+        if hasPinnedInitialFocus { return lastFocusedControl }
+        return resolveFocusRow(preferredID: content.initialFocusID)
+    }
+
+    init(snapshot: PlayerQuickMenuSnapshot) {
+        self.content = snapshot.content
+        self.actions = snapshot.actions
+        super.init(frame: .zero)
+        setupViews()
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    private func setupViews() {
+        headerLabel.font = Metrics.secondaryFont
+        headerLabel.textColor = Metrics.secondaryColor
+        addSubview(headerLabel)
+
+        scrollContainer.clipsToBounds = true
+        scrollFadeMask.startPoint = CGPoint(x: 0.5, y: 0)
+        scrollFadeMask.endPoint = CGPoint(x: 0.5, y: 1)
+        scrollContainer.layer.mask = scrollFadeMask
+        addSubview(scrollContainer)
+
+        stack.axis = .vertical
+        scrollView.delegate = self
+        scrollView.clipsToBounds = true
+        scrollView.addSubview(stack)
+        scrollContainer.addSubview(scrollView)
+
+        [headerLabel, scrollContainer, scrollView, stack].forEach {
+            $0.translatesAutoresizingMaskIntoConstraints = false
+        }
+
+        // Grows with content up to the popup's cap so short menus hug their rows and long ones scroll.
+        let scrollHeight = scrollView.heightAnchor.constraint(
+            equalTo: stack.heightAnchor,
+            constant: Metrics.focusGrowth + Metrics.bottomInset
+        )
+        scrollHeight.priority = .defaultHigh - 1
+
+        NSLayoutConstraint.activate([
+            headerLabel.centerYAnchor.constraint(equalTo: topAnchor, constant: Metrics.headerLabelCenterY),
+            headerLabel.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Metrics.headerLabelLeading),
+            headerLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -Metrics.headerLabelLeading),
+
+            // Starts focusGrowth early so the top row's focused pill is never clipped.
+            scrollContainer.topAnchor.constraint(equalTo: topAnchor, constant: Metrics.headerHeight - Metrics.focusGrowth),
+            scrollContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            scrollContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+            scrollContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            scrollView.topAnchor.constraint(equalTo: scrollContainer.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: scrollContainer.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: scrollContainer.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: scrollContainer.bottomAnchor),
+            scrollHeight,
+
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: Metrics.focusGrowth),
+            stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor, constant: Metrics.rowInset),
+            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -Metrics.rowInset),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -Metrics.bottomInset),
+            stack.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor, constant: -2 * Metrics.rowInset),
+        ])
+
+        buildRows(resetScroll: true, preferredID: content.initialFocusID)
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        updateScrollFadeMask()
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        updateScrollFadeMask()
+    }
+
+    private func updateScrollFadeMask() {
+        let bounds = scrollContainer.bounds
+        guard bounds.height > 0 else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        scrollFadeMask.frame = bounds
+
+        let contentHeight = scrollView.contentSize.height
+        let visibleHeight = scrollView.bounds.height
+        let hasTopOverflow = scrollView.contentOffset.y > 2
+        let hasBottomOverflow = contentHeight > visibleHeight + 2
+            && (scrollView.contentOffset.y + visibleHeight) < (contentHeight - 2)
+
+        if !hasTopOverflow && !hasBottomOverflow {
+            scrollFadeMask.colors = [UIColor.white.cgColor, UIColor.white.cgColor]
+            scrollFadeMask.locations = [0, 1]
+        } else {
+            let topStop = hasTopOverflow ? min(0.18, Metrics.topFadeHeight / bounds.height) : 0
+            let bottomStop = hasBottomOverflow ? max(0.75, 1 - Metrics.bottomFadeHeight / bounds.height) : 1
+            scrollFadeMask.colors = [
+                (hasTopOverflow ? UIColor.clear : UIColor.white).cgColor,
+                UIColor.white.cgColor,
+                UIColor.white.cgColor,
+                (hasBottomOverflow ? UIColor.clear : UIColor.white).cgColor,
+            ]
+            scrollFadeMask.locations = [
+                NSNumber(value: 0.0),
+                NSNumber(value: Double(topStop)),
+                NSNumber(value: Double(bottomStop)),
+                NSNumber(value: 1.0),
+            ]
+        }
+        CATransaction.commit()
+    }
+
+    func update(with snapshot: PlayerQuickMenuSnapshot) {
+        actions = snapshot.actions
+        guard snapshot.content != content else { return }
+
+        let isPageChange = snapshot.content.pageID != content.pageID
+        let previousOffset = scrollView.contentOffset
+        let preservedFocusID = lastFocusedRowID
+        content = snapshot.content
+
+        let targetFocusID = isPageChange ? content.initialFocusID : (preservedFocusID ?? content.initialFocusID)
+        buildRows(resetScroll: isPageChange, preferredID: targetFocusID)
+
+        superview?.layoutIfNeeded()
+        layoutIfNeeded()
+
+        if !isPageChange {
+            let maxOffsetY = max(0, scrollView.contentSize.height - scrollView.bounds.height)
+            scrollView.contentOffset = CGPoint(x: 0, y: min(max(0, previousOffset.y), maxOffsetY))
+        } else {
+            scrollInitialFocusIntoViewIfNeeded()
+        }
+        updateScrollFadeMask()
+
+        setNeedsFocusUpdate()
+        updateFocusIfNeeded()
+        if let target = pendingFocus, let focusSystem = UIFocusSystem.focusSystem(for: self) {
+            focusSystem.requestFocusUpdate(to: target)
+            focusSystem.updateFocusIfNeeded()
+        }
+    }
+
+    private func buildRows(resetScroll: Bool, preferredID: String?) {
+        stack.arrangedSubviews.forEach { $0.removeFromSuperview() }
+        rowButtons = []
+        hasPinnedInitialFocus = false
+        lastFocusedControl = nil
+        if resetScroll {
+            scrollView.contentOffset = .zero
+        }
+        headerLabel.text = content.header
+
+        for item in content.items {
+            switch item {
+            case .row(let row):
+                let button = PlayerQuickMenuRowButton(row: row)
+                button.onTap = { [weak self] in
+                    guard let self, !row.isDisabled else { return }
+                    self.actions[row.id]?()
+                    if row.closesMenu {
+                        self.onRequestDismiss?()
                     }
                 }
-            }
-        } label: {
-            Image(systemName: "gauge.with.dots.needle.bottom.50percent")
-                .font(.system(size: 28, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .frame(width: 70, height: 70)
-                .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .frame(width: 70, height: 70)
-                .clipShape(Circle())
-                .contentShape(Circle())
-        }
-        .menuStyle(.borderlessButton)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.06 : 1.0)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .id("speed_button")
-    }
-
-    private func speedMenuItem(title: String, isSelected: Bool) -> some View {
-        HStack {
-            Text(title)
-            Spacer()
-            if isSelected {
-                Image(systemName: "checkmark")
+                stack.addArrangedSubview(button)
+                rowButtons.append(button)
+            case .separator:
+                stack.addArrangedSubview(PlayerQuickMenuSeparatorView())
+            case .sectionHeader(_, let title, let isCompactTop):
+                stack.addArrangedSubview(PlayerQuickMenuSectionHeaderView(title: title, isCompactTop: isCompactTop))
             }
         }
+
+        pendingFocus = resolveFocusRow(preferredID: preferredID)
     }
 
-    private func speedTitle(for speed: PlaybackSpeed) -> String {
-        if speed == .normal {
-            return "\(speed.label) (\(L10n.string("player_speed_normal", fallback: "Normal")))"
+    private func resolveFocusRow(preferredID: String?) -> PlayerQuickMenuRowButton? {
+        if let preferredID,
+           let match = rowButtons.first(where: { $0.row.id == preferredID && $0.canBecomeFocused }) {
+            return match
         }
-        return speed.label
+        if let selected = rowButtons.first(where: { $0.row.isSelected && $0.canBecomeFocused }) {
+            return selected
+        }
+        return rowButtons.first(where: \.canBecomeFocused)
+    }
+
+    func scrollInitialFocusIntoViewIfNeeded() {
+        layoutIfNeeded()
+        guard scrollView.contentSize.height > scrollView.bounds.height,
+              let target = (pendingFocus as? PlayerQuickMenuRowButton) ?? resolveFocusRow(preferredID: content.initialFocusID) else {
+            updateScrollFadeMask()
+            return
+        }
+        let targetFrame = target.convert(target.bounds, to: scrollView)
+        let padded = targetFrame.insetBy(dx: 0, dy: -Metrics.focusGrowth)
+        scrollView.scrollRectToVisible(padded, animated: false)
+        updateScrollFadeMask()
+    }
+
+    func handleMenuPress() -> Bool {
+        guard content.canPopBack else { return false }
+        onMenuBack?()
+        return true
+    }
+
+    override var preferredFocusEnvironments: [UIFocusEnvironment] {
+        if let pendingFocus {
+            return [pendingFocus]
+        }
+        if hasPinnedInitialFocus {
+            return lastFocusedControl.map { [$0] } ?? []
+        }
+        if let target = resolveFocusRow(preferredID: content.initialFocusID) {
+            return [target]
+        }
+        return [self]
+    }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        guard let next = context.nextFocusedView, next.isDescendant(of: self) else { return }
+        if let row = rowButtons.first(where: { next.isDescendant(of: $0) || next === $0 }) {
+            pendingFocus = nil
+            hasPinnedInitialFocus = true
+            lastFocusedControl = row
+            lastFocusedRowID = row.row.id
+        }
+    }
+}
+
+private final class PlayerQuickMenuSeparatorView: UIView {
+    init() {
+        super.init(frame: .zero)
+        let line = UIView()
+        line.backgroundColor = PlayerQuickMenuListView.Metrics.separatorColor
+        addSubview(line)
+        line.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: PlayerQuickMenuListView.Metrics.separatorGap + 1),
+            line.heightAnchor.constraint(equalToConstant: 1),
+            line.centerYAnchor.constraint(equalTo: centerYAnchor),
+            line.leadingAnchor.constraint(equalTo: leadingAnchor, constant: PlayerQuickMenuListView.Metrics.separatorInset),
+            line.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -PlayerQuickMenuListView.Metrics.separatorInset),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+private final class PlayerQuickMenuSectionHeaderView: UIView {
+    init(title: String, isCompactTop: Bool) {
+        super.init(frame: .zero)
+        let label = UILabel()
+        label.text = title
+        label.font = PlayerQuickMenuListView.Metrics.secondaryFont
+        label.textColor = PlayerQuickMenuListView.Metrics.secondaryColor
+        addSubview(label)
+        label.translatesAutoresizingMaskIntoConstraints = false
+        let height: CGFloat = isCompactTop ? 44 : PlayerQuickMenuListView.Metrics.headerHeight
+        let centerY: CGFloat = isCompactTop ? 20 : PlayerQuickMenuListView.Metrics.headerLabelCenterY
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: height),
+            label.centerYAnchor.constraint(equalTo: topAnchor, constant: centerY),
+            label.leadingAnchor.constraint(
+                equalTo: leadingAnchor,
+                constant: PlayerQuickMenuListView.Metrics.headerLabelLeading - PlayerQuickMenuListView.Metrics.rowInset
+            ),
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+/// The white pill a focused menu row rises on: Rivulet/AVKit's 4pt growth and shadow.
+final class PlayerQuickMenuPill: UIView {
+    init() {
+        super.init(frame: .zero)
+        layer.cornerRadius = PlayerQuickMenuListView.Metrics.rowRadius
+        layer.cornerCurve = .continuous
+        layer.shadowColor = UIColor.black.cgColor
+        layer.shadowOffset = CGSize(width: 0, height: 20)
+        layer.shadowRadius = 15
+        isUserInteractionEnabled = false
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func layout(in rowBounds: CGRect, focused: Bool) {
+        let growth = focused ? PlayerQuickMenuListView.Metrics.focusGrowth : 0
+        frame = rowBounds.insetBy(dx: -growth, dy: -growth)
+        layer.shadowPath = UIBezierPath(roundedRect: bounds, cornerRadius: layer.cornerRadius).cgPath
+    }
+
+    func apply(focused: Bool, in rowBounds: CGRect) {
+        let growth = focused ? PlayerQuickMenuListView.Metrics.focusGrowth : 0
+        layer.cornerRadius = PlayerQuickMenuListView.Metrics.rowRadius + growth
+        layout(in: rowBounds, focused: focused)
+        backgroundColor = focused ? .white : .clear
+        layer.shadowOpacity = focused ? 0.3 : 0
+    }
+}
+
+/// One menu row cloned from Rivulet's `CardTrackRowButton`, with flush left-margin
+/// alignment for icons, checkmarks, and titles.
+final class PlayerQuickMenuRowButton: UIControl {
+    let row: PlayerQuickMenuRow
+    var onTap: (() -> Void)?
+
+    let pill = PlayerQuickMenuPill()
+    private let contentContainer = UIView()
+    let titleLabel = UILabel()
+    let subtitleLabel = UILabel()
+    let leadingIconView = UIImageView()
+    let chevronView = UIImageView(image: UIImage(
+        systemName: "chevron.forward",
+        withConfiguration: UIImage.SymbolConfiguration(pointSize: 20, weight: .semibold)
+    ))
+
+    var checkmarkView: UIImageView { leadingIconView }
+
+    init(row: PlayerQuickMenuRow) {
+        self.row = row
+        super.init(frame: .zero)
+        typealias M = PlayerQuickMenuListView.Metrics
+
+        let hasSubtitle = !(row.subtitle?.isEmpty ?? true)
+        let leadingSymbolName: String? = row.isSelected ? "checkmark" : row.systemImage
+        let hasLeadingGlyph = leadingSymbolName != nil
+
+        contentContainer.isUserInteractionEnabled = false
+
+        titleLabel.text = row.title
+        titleLabel.font = M.titleFont
+        titleLabel.textColor = .white
+
+        subtitleLabel.text = row.subtitle
+        subtitleLabel.font = M.secondaryFont
+        subtitleLabel.textColor = M.secondaryColor
+        subtitleLabel.isHidden = !hasSubtitle
+
+        if let leadingSymbolName {
+            let symbolConfig = UIImage.SymbolConfiguration(
+                pointSize: row.isSelected ? 22 : 24,
+                weight: row.isSelected ? .bold : .medium
+            )
+            leadingIconView.image = UIImage(systemName: leadingSymbolName, withConfiguration: symbolConfig)
+        }
+        leadingIconView.tintColor = .white
+        leadingIconView.isHidden = !hasLeadingGlyph
+        leadingIconView.contentMode = .center
+
+        chevronView.isHidden = !row.showsChevron
+        chevronView.tintColor = M.secondaryColor
+        chevronView.contentMode = .center
+        chevronView.setContentHuggingPriority(.required, for: .horizontal)
+        chevronView.setContentCompressionResistancePriority(.required, for: .horizontal)
+
+        alpha = row.isDisabled ? 0.48 : 1.0
+        accessibilityLabel = hasSubtitle ? "\(row.title), \(row.subtitle ?? "")" : row.title
+        isAccessibilityElement = true
+        accessibilityTraits = row.isDisabled ? [.notEnabled] : (row.isSelected ? [.button, .selected] : [.button])
+
+        addSubview(pill)
+        addSubview(contentContainer)
+        [leadingIconView, titleLabel, subtitleLabel, chevronView].forEach {
+            contentContainer.addSubview($0)
+            $0.translatesAutoresizingMaskIntoConstraints = false
+        }
+        contentContainer.translatesAutoresizingMaskIntoConstraints = false
+
+        let titleLeadingX: CGFloat = hasLeadingGlyph
+            ? M.leadingContentX + M.leadingGlyphWidth + M.leadingGlyphSpacing
+            : M.leadingContentX
+        let trailingAnchorTarget = row.showsChevron ? chevronView.leadingAnchor : contentContainer.trailingAnchor
+        let trailingOffset: CGFloat = row.showsChevron ? -10 : -M.trailingChevronInset
+
+        var constraints = [
+            heightAnchor.constraint(equalToConstant: hasSubtitle ? M.twoLineRowHeight : M.rowHeight),
+            contentContainer.topAnchor.constraint(equalTo: topAnchor),
+            contentContainer.bottomAnchor.constraint(equalTo: bottomAnchor),
+            contentContainer.leadingAnchor.constraint(equalTo: leadingAnchor),
+            contentContainer.trailingAnchor.constraint(equalTo: trailingAnchor),
+
+            leadingIconView.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor, constant: M.leadingContentX),
+            leadingIconView.widthAnchor.constraint(equalToConstant: M.leadingGlyphWidth),
+            leadingIconView.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+
+            titleLabel.leadingAnchor.constraint(equalTo: contentContainer.leadingAnchor, constant: titleLeadingX),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchorTarget, constant: trailingOffset),
+            subtitleLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            subtitleLabel.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchorTarget, constant: trailingOffset),
+
+            chevronView.trailingAnchor.constraint(equalTo: contentContainer.trailingAnchor, constant: -M.trailingChevronInset),
+            chevronView.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor),
+        ]
+
+        if hasSubtitle {
+            constraints += [
+                titleLabel.topAnchor.constraint(equalTo: contentContainer.topAnchor, constant: 12),
+                subtitleLabel.topAnchor.constraint(equalTo: contentContainer.topAnchor, constant: 44),
+            ]
+        } else {
+            constraints.append(titleLabel.centerYAnchor.constraint(equalTo: contentContainer.centerYAnchor))
+        }
+
+        NSLayoutConstraint.activate(constraints)
+        applyFocus(false)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        pill.layout(in: bounds, focused: isFocused)
+    }
+
+    override var canBecomeFocused: Bool { !row.isDisabled }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        for press in presses where press.type == .select {
+            onTap?()
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func didUpdateFocus(in context: UIFocusUpdateContext, with coordinator: UIFocusAnimationCoordinator) {
+        super.didUpdateFocus(in: context, with: coordinator)
+        let focused = context.nextFocusedView === self
+        coordinator.animateQuickMenuFocusChange(gained: focused) {
+            self.applyFocus(focused)
+        }
+    }
+
+    func applyFocus(_ focused: Bool) {
+        typealias M = PlayerQuickMenuListView.Metrics
+        pill.apply(focused: focused, in: bounds)
+        contentContainer.transform = focused ? CGAffineTransform(scaleX: M.focusScale, y: M.focusScale) : .identity
+        titleLabel.textColor = focused ? .black : .white
+        subtitleLabel.textColor = focused ? UIColor.black.withAlphaComponent(0.6) : M.secondaryColor
+        titleLabel.enablesMarqueeWhenAncestorFocused = focused
+        if !focused { titleLabel.lineBreakMode = .byTruncatingTail }
+        subtitleLabel.enablesMarqueeWhenAncestorFocused = focused
+        if !focused { subtitleLabel.lineBreakMode = .byTruncatingTail }
+        leadingIconView.tintColor = focused ? .black : .white
+        chevronView.tintColor = focused ? .black : M.secondaryColor
     }
 }
 
@@ -1597,6 +2588,217 @@ private struct PlayerEstimatedFinishTime: View {
                         .accessibilityLabel(label)
                 }
             }
+        }
+    }
+}
+
+enum LiveTimelineState: Equatable {
+    case programme(
+        title: String,
+        start: Date,
+        end: Date,
+        progress: Double,
+        nextTitle: String?,
+        nextStart: Date?
+    )
+    case liveWindow(
+        played: Double,
+        buffered: Double,
+        behindLiveSeconds: Double,
+        windowDuration: Double,
+        positionSeconds: Double
+    )
+    case liveEdge(
+        elapsedSeconds: Double,
+        bufferedAheadSeconds: Double
+    )
+}
+
+enum LiveTimelineProgressResolver {
+    static func resolve(
+        programmes: [IPTVProgramme],
+        livePosition: Double,
+        liveDuration: Double,
+        liveBuffered: Double,
+        startedAt: Date?,
+        now: Date
+    ) -> LiveTimelineState {
+        if let current = IPTVChannelGuideLookup.currentProgramme(in: programmes, at: now) {
+            let total = current.end.timeIntervalSince(current.start)
+            let progress = total > 0
+                ? min(max(now.timeIntervalSince(current.start) / total, 0), 1)
+                : 0
+            let next = IPTVChannelGuideLookup.upcomingProgrammes(in: programmes, at: current.end, limit: 1).first
+            return .programme(
+                title: current.title,
+                start: current.start,
+                end: current.end,
+                progress: progress,
+                nextTitle: next?.title,
+                nextStart: next?.start
+            )
+        }
+
+        let safeDuration = liveDuration.isFinite ? max(0, liveDuration) : 0
+        let safePosition = livePosition.isFinite ? max(0, livePosition) : 0
+        let safeBuffered = liveBuffered.isFinite ? max(0, liveBuffered) : 0
+
+        if safeDuration > 0 {
+            let clampedPos = min(safePosition, safeDuration)
+            let clampedBuf = min(max(safeBuffered, clampedPos), safeDuration)
+            let played = min(max(clampedPos / safeDuration, 0), 1)
+            let buffered = min(max(clampedBuf / safeDuration, played), 1)
+            let behindLive = max(0, safeDuration - clampedPos)
+            return .liveWindow(
+                played: played,
+                buffered: buffered,
+                behindLiveSeconds: behindLive,
+                windowDuration: safeDuration,
+                positionSeconds: clampedPos
+            )
+        }
+
+        let elapsed = startedAt.map { max(0, now.timeIntervalSince($0)) } ?? safePosition
+        let bufferedAhead = max(0, safeBuffered - safePosition)
+        return .liveEdge(elapsedSeconds: elapsed, bufferedAheadSeconds: bufferedAhead)
+    }
+}
+
+struct PlayerLiveTimelineBar: View {
+    @ObservedObject var clock: PlaybackClock
+    let programmes: [IPTVProgramme]
+    let startedAt: Date?
+    let isActive: Bool
+
+    private static let clockFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm"
+        formatter.locale = AppLocaleManager.shared.locale
+        return formatter
+    }()
+
+    var body: some View {
+        if isActive {
+            TimelineView(.periodic(from: .now, by: 1.0)) { context in
+                content(at: context.date)
+            }
+        } else {
+            content(at: Date())
+        }
+    }
+
+    @ViewBuilder
+    private func content(at now: Date) -> some View {
+        let state = LiveTimelineProgressResolver.resolve(
+            programmes: programmes,
+            livePosition: clock.livePosition,
+            liveDuration: clock.liveDuration,
+            liveBuffered: clock.liveBuffered,
+            startedAt: startedAt,
+            now: now
+        )
+
+        VStack(spacing: 10) {
+            PlayerProgressTrack(
+                played: playedFraction(for: state),
+                buffered: bufferedFraction(for: state),
+                height: 10,
+                showThumb: false,
+                emphasized: false,
+                glassTrack: true
+            )
+            .frame(height: 16)
+
+            statusRow(for: state)
+                .frame(height: 28)
+        }
+    }
+
+    private func playedFraction(for state: LiveTimelineState) -> Double {
+        switch state {
+        case .programme(_, _, _, let progress, _, _):
+            return progress
+        case .liveWindow(let played, _, _, _, _):
+            return played
+        case .liveEdge:
+            return 1.0
+        }
+    }
+
+    private func bufferedFraction(for state: LiveTimelineState) -> Double {
+        switch state {
+        case .programme(_, _, _, let progress, _, _):
+            return progress
+        case .liveWindow(_, let buffered, _, _, _):
+            return buffered
+        case .liveEdge:
+            return 1.0
+        }
+    }
+
+    @ViewBuilder
+    private func statusRow(for state: LiveTimelineState) -> some View {
+        switch state {
+        case let .programme(_, start, end, _, nextTitle, _):
+            HStack(spacing: 12) {
+                liveBadge
+                Text(Self.clockFormatter.string(from: start))
+                    .font(.system(size: 22, weight: .bold).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.76))
+
+                if let nextTitle, !nextTitle.isEmpty {
+                    Spacer(minLength: 16)
+                    Text("\(L10n.string("iptv_next_program", fallback: "Next")): \(nextTitle)")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.55))
+                        .lineLimit(1)
+                    Spacer(minLength: 16)
+                } else {
+                    Spacer(minLength: 16)
+                }
+
+                Text(Self.clockFormatter.string(from: end))
+                    .font(.system(size: 22, weight: .bold).monospacedDigit())
+                    .foregroundColor(.white.opacity(0.76))
+            }
+
+        case let .liveWindow(_, _, behindLiveSeconds, _, positionSeconds):
+            HStack(spacing: 12) {
+                liveBadge
+                if behindLiveSeconds >= 5 {
+                    Text("-\(PlayerTime.formatted(time: behindLiveSeconds))")
+                        .font(.system(size: 22, weight: .bold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.72))
+                }
+                Spacer(minLength: 16)
+                if positionSeconds >= 1 {
+                    Text(PlayerTime.formatted(time: positionSeconds))
+                        .font(.system(size: 22, weight: .bold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.62))
+                }
+            }
+
+        case let .liveEdge(elapsedSeconds, _):
+            HStack(spacing: 12) {
+                liveBadge
+                Spacer(minLength: 16)
+                if elapsedSeconds >= 1 {
+                    Text(PlayerTime.formatted(time: elapsedSeconds))
+                        .font(.system(size: 22, weight: .bold).monospacedDigit())
+                        .foregroundColor(.white.opacity(0.62))
+                }
+            }
+        }
+    }
+
+    private var liveBadge: some View {
+        HStack(spacing: 9) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 11, height: 11)
+            Text(L10n.string("player_live", fallback: "LIVE"))
+                .font(.system(size: 22, weight: .bold))
+                .foregroundColor(.white.opacity(0.92))
         }
     }
 }
@@ -1844,9 +3046,13 @@ extension View {
     }
 
     @ViewBuilder
-    func glassRoundedRect(cornerRadius: CGFloat) -> some View {
+    func glassRoundedRect(cornerRadius: CGFloat, tint: Color? = nil) -> some View {
         if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
-            glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+            if let tint {
+                glassEffect(.regular.tint(tint), in: .rect(cornerRadius: cornerRadius))
+            } else {
+                glassEffect(.regular, in: .rect(cornerRadius: cornerRadius))
+            }
         } else {
             background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: cornerRadius))
         }

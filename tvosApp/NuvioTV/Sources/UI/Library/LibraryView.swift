@@ -1126,14 +1126,11 @@ struct LibraryItemButton: View {
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
 
     private var customPosterArtworkURL: String? {
-        let screens = customPosterURLPattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            ? customPosterEnabledScreens
-            : "all"
-        return CustomPosterURLResolver.resolve(
+        CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: item.asNuvioMeta,
             screen: .library,
-            enabledScreens: screens,
+            enabledScreens: customPosterEnabledScreens,
             shape: "poster"
         )
     }

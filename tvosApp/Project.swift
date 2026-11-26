@@ -49,8 +49,8 @@ let signingXCConfig: Path = .relativeToManifest("Configurations/Signing.xcconfig
 // MARK: - Shared values
 
 let bundleID = "com.pyksel.nuviotvos"
-let marketingVersion = "3.5.3"
-let projectVersion = "84"
+let marketingVersion = "3.5.4"
+let projectVersion = "85"
 // LibTrueHD 3.0.0 requires tvOS 18; APAC rendering itself is gated to tvOS 26+.
 let tvOSDeployment = "18.0"
 
@@ -68,11 +68,14 @@ let projectBaseSettings: SettingsDictionary = [
     "CLANG_ENABLE_MODULES": "YES",
     "CLANG_ENABLE_OBJC_ARC": "YES",
     "GCC_C_LANGUAGE_STANDARD": "gnu99",
-    // Inert on a tvOS-only project, but the original set it project-wide and
-    // without it the extension floats up to the current SDK version.
-    "IPHONEOS_DEPLOYMENT_TARGET": "15.1",
+    // Inert on a tvOS-only project, but kept aligned with the tvOS target so
+    // Xcode's recommended deployment-target check stays satisfied.
+    "IPHONEOS_DEPLOYMENT_TARGET": .string(tvOSDeployment),
     "GCC_NO_COMMON_BLOCKS": "YES",
     "ENABLE_STRICT_OBJC_MSGSEND": "YES",
+    // Thin Aether Simulator Frameworks reads Vendor/FFmpegBuild/Sources without
+    // declared script input/output file lists.
+    "ENABLE_USER_SCRIPT_SANDBOXING": "NO",
     "LD_RUNPATH_SEARCH_PATHS": ["/usr/lib/swift", "$(inherited)"],
     "LIBRARY_SEARCH_PATHS": "$(inherited)",
     "SDKROOT": "appletvos",
@@ -183,7 +186,6 @@ let appTarget: Target = .target(
             // Settings > Look > Appearance > App Icon: the six Nuvio icons, used
             // while Nuvio Branding is on (`NuvioAppIcon`).
             "ASSETCATALOG_COMPILER_ALTERNATE_APPICON_NAMES": "NuvioIconOriginal NuvioIconArcticBlue NuvioIconEmerald NuvioIconRoseGold NuvioIconCopper NuvioIconGraphite",
-            "ENABLE_BITCODE": "NO",
             "FRAMEWORK_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "LD_RUNPATH_SEARCH_PATHS": ["$(inherited)", "@executable_path/Frameworks"],

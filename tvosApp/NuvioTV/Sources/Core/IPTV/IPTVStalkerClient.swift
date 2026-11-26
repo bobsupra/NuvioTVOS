@@ -156,18 +156,19 @@ actor IPTVStalkerClient {
         request.setValue(Self.deviceAgent, forHTTPHeaderField: "X-User-Agent")
         request.setValue(cookie, forHTTPHeaderField: "Cookie")
         if authorized, let token { request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization") }
-        let (bytes, response) = try await session.bytes(for: request)
-        guard let http = response as? HTTPURLResponse else { throw IPTVStalkerError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else { throw IPTVStalkerError.httpStatus(http.statusCode) }
-        guard http.expectedContentLength <= Int64(Self.maxBytes) else { throw IPTVStalkerError.tooLarge }
-        var data = Data()
-        for try await byte in bytes {
-            if data.count.isMultiple(of: 4096) { try Task.checkCancellation() }
-            guard data.count < Self.maxBytes else { throw IPTVStalkerError.tooLarge }
-            data.append(byte)
+        do {
+            return try await IPTVBoundedDataDownloader.download(
+                request,
+                in: session,
+                maximumBytes: Self.maxBytes
+            ).data
+        } catch IPTVBoundedDownloadError.invalidResponse {
+            throw IPTVStalkerError.invalidResponse
+        } catch IPTVBoundedDownloadError.httpStatus(let status) {
+            throw IPTVStalkerError.httpStatus(status)
+        } catch IPTVBoundedDownloadError.tooLarge {
+            throw IPTVStalkerError.tooLarge
         }
-        try Task.checkCancellation()
-        return data
     }
 
     private static let userAgent = "Mozilla/5.0 (QtEmbedded; Linux; C) AppleWebKit/533.3 MAG200"

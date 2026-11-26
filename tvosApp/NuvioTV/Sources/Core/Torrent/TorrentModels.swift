@@ -153,6 +153,78 @@ enum TorrentSourceParser {
     }
 }
 
+struct TorrentStreamIdentity: Hashable, Sendable {
+    let infoHash: String
+    let fileIdx: Int?
+    let filename: String?
+
+    init(infoHash: String, fileIdx: Int?, filename: String?) {
+        self.infoHash = TorrentSourceParser.normalizedInfoHash(infoHash)
+            ?? infoHash.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        self.fileIdx = fileIdx
+        let cleanedFilename = filename?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        self.filename = (cleanedFilename?.isEmpty == false) ? cleanedFilename : nil
+    }
+}
+
+/// Decides whether the player load watchdog should keep waiting on an active
+/// P2P torrent stream instead of aborting and restarting at 30 seconds.
+struct TorrentStartupWatchdogTracker: Equatable, Sendable {
+    static let defaultMaxTotalTimeoutSeconds: UInt64 = 300
+
+    enum Decision: Equatable, Sendable {
+        case waitAnotherWindow(reason: String)
+        case timeOut
+    }
+
+    private(set) var lastObservedDownloadedBytes: Int64
+    private(set) var consecutiveNoByteWindows: Int = 0
+    private(set) var elapsedSeconds: UInt64 = 0
+    let maxTotalTimeoutSeconds: UInt64
+
+    init(
+        initialDownloadedBytes: Int64,
+        maxTotalTimeoutSeconds: UInt64 = defaultMaxTotalTimeoutSeconds
+    ) {
+        self.lastObservedDownloadedBytes = max(0, initialDownloadedBytes)
+        self.maxTotalTimeoutSeconds = maxTotalTimeoutSeconds
+    }
+
+    /// Evaluates one elapsed watchdog window (`windowSeconds`) against the
+    /// live torrent swarm snapshot.
+    mutating func evaluateWindow(windowSeconds: UInt64, stats: SwarmStats) -> Decision {
+        elapsedSeconds += windowSeconds
+        guard elapsedSeconds < maxTotalTimeoutSeconds else {
+            return .timeOut
+        }
+
+        let currentBytes = max(0, stats.downloadedBytes)
+        let bytesAdvanced = currentBytes > lastObservedDownloadedBytes
+        if bytesAdvanced {
+            lastObservedDownloadedBytes = currentBytes
+        }
+
+        if bytesAdvanced || stats.downloadRate > 0 {
+            consecutiveNoByteWindows = 0
+            return .waitAnotherWindow(
+                reason: "swarm active (\(stats.connectedSeeds) seeds, \(stats.connectedPeers) peers, \(stats.downloadRateFormatted))"
+            )
+        }
+
+        let hasSwarmOrCompleteData = stats.connectedSeeds > 0 || stats.connectedPeers > 0 || stats.isComplete
+        if hasSwarmOrCompleteData && consecutiveNoByteWindows == 0 {
+            consecutiveNoByteWindows += 1
+            return .waitAnotherWindow(
+                reason: stats.isComplete
+                    ? "torrent data ready on disk, awaiting player probe"
+                    : "swarm connected (\(stats.connectedSeeds) seeds, \(stats.connectedPeers) peers), awaiting first pieces"
+            )
+        }
+
+        return .timeOut
+    }
+}
+
 struct SwarmStats: Sendable {
     var downloadedBytes: Int64 = 0
     var downloadRate: Double = 0

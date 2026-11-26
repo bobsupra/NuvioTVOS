@@ -73,7 +73,8 @@ extension PlayerView {
                     trickplayURL: trickplayURL,
                     sourceID: sourceID,
                     currentEpisode: currentEpisode,
-                    isActionPlaybackSession: isActionPlaybackSession
+                    isActionPlaybackSession: isActionPlaybackSession,
+                    liveProgrammes: liveProgrammes
                 )
                 // load() may adopt the retained PiP coordinator. Acquire for
                 // that session so restoring fullscreen cannot add another hold.

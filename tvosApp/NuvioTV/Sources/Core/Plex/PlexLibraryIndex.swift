@@ -333,8 +333,11 @@ final class PlexLibraryIndex: ObservableObject {
         guard updated != watchStatesByServerID else { return }
         watchStatesByServerID = updated
         PlexWatched.rebuild(titles: titlesByServerID, states: updated)
-        if let data = try? JSONEncoder().encode(updated) {
-            _ = LargePayloadStore.write(data, key: Self.watchStateKey, directory: Self.storageDirectoryName)
+        let watchStateKey = Self.watchStateKey
+        Self.writeQueue.async {
+            if let data = try? JSONEncoder().encode(updated) {
+                _ = LargePayloadStore.write(data, key: watchStateKey, directory: Self.storageDirectoryName)
+            }
         }
         NotificationCenter.default.post(name: Self.watchStateChangedNotification, object: nil)
     }
@@ -525,15 +528,17 @@ final class PlexLibraryIndex: ObservableObject {
     /// the memory a save needs to that of the largest library, and the main
     /// actor stays free while a large library is written.
     func replace(titles: [PlexIndexedTitle], forServerID serverID: String) async throws {
-        let previous = Dictionary(grouping: titlesByServerID[serverID] ?? [], by: \.libraryID)
+        let existingTitles = titlesByServerID[serverID] ?? []
         let onDisk = savedLibraryIDs[serverID] ?? []
-        let libraries = Self.groupedByLibrary(titles)
-        let changed = libraries.filter { !onDisk.contains($0.libraryID) || previous[$0.libraryID] != $0.titles }
-        let order = libraries.map(\.libraryID)
         let prefix = Self.storagePrefix
         let removal = removals[serverID, default: 0]
-        let saved = await Self.onWriteQueue {
-            Self.writeServer(serverID, changed: changed, order: order, prefix: prefix)
+        let (saved, order) = await Self.onWriteQueue {
+            let previous = Dictionary(grouping: existingTitles, by: \.libraryID)
+            let libraries = Self.groupedByLibrary(titles)
+            let changed = libraries.filter { !onDisk.contains($0.libraryID) || previous[$0.libraryID] != $0.titles }
+            let order = libraries.map(\.libraryID)
+            let saved = Self.writeServer(serverID, changed: changed, order: order, prefix: prefix)
+            return (saved, order)
         }
         // The server was removed or the profile changed while this was
         // written: `removeAll`'s delete is queued after the write, and the
