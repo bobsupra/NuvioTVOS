@@ -4362,6 +4362,53 @@ final class TraktCompletionHistoryTests: XCTestCase {
         XCTAssertEqual(mock.postedIMDbIDs, ["tt7654322"])
     }
 
+    /// Home reloads Trakt's Continue Watching once a drain has sent writes, as after a direct
+    /// history write. Before, it caught up only on the next launch. A drain that sends nothing
+    /// asks for no reload, so the sync a reload starts doesn't set off another one.
+    @MainActor
+    func testDrainThatSendsAWriteReloadsContinueWatchingAndAnEmptyOneDoesNot() async throws {
+        let profile = activateTraktProfile(slug: "account-a")
+        defer { restore(profile) }
+        XCTAssertTrue(WatchedStore.markWatched(
+            NuvioMeta(id: "tt7654323", name: "Plain Show", type: "series"),
+            season: 1,
+            episode: 3
+        ))
+        let mock = TraktQueueDrainMock(watchedAt: "")
+        let session = makeQueueDrainSession(mock: mock)
+        defer {
+            TraktHistoryURLProtocolStub.handler = nil
+            session.invalidateAndCancel()
+        }
+        // The mark posts its own notifications; let those go out before counting.
+        try await Task.sleep(nanoseconds: 300_000_000)
+        let reloads = RequestCounter()
+        let observer = NotificationCenter.default.addObserver(
+            forName: TraktSettingsStore.continueWatchingChangedNotification,
+            object: nil,
+            queue: nil
+        ) { _ in reloads.increment() }
+        defer { NotificationCenter.default.removeObserver(observer) }
+
+        let sent = await TraktHistoryService.flushPendingPlaybackCompletions(
+            store: profile.store,
+            profileId: profile.id,
+            session: session
+        )
+        XCTAssertTrue(sent)
+        XCTAssertEqual(mock.postedIMDbIDs, ["tt7654323"])
+        XCTAssertGreaterThanOrEqual(reloads.value, 1)
+
+        let afterSending = reloads.value
+        let nothingLeft = await TraktHistoryService.flushPendingPlaybackCompletions(
+            store: profile.store,
+            profileId: profile.id,
+            session: session
+        )
+        XCTAssertTrue(nothingLeft)
+        XCTAssertEqual(reloads.value, afterSending, "a drain that sends nothing asks for no reload")
+    }
+
     private func makeQueueDrainSession(mock: TraktQueueDrainMock) -> URLSession {
         TraktHistoryURLProtocolStub.handler = { try mock.handle($0) }
         let configuration = URLSessionConfiguration.ephemeral

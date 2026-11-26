@@ -3711,6 +3711,18 @@ struct TraktHistoryService {
                 $0.accountID != expectedAccountID || $0.profileID != profileId
             }
         let service = TraktAuthService(session: session, store: store)
+        // Home shows Trakt's Continue Watching. Once this pass has changed Trakt, Home reloads
+        // it, as after a direct history write. Before, it caught up only on the next launch.
+        var sentToTrakt = false
+        defer {
+            if sentToTrakt {
+                NotificationCenter.default.post(
+                    name: TraktSettingsStore.continueWatchingChangedNotification,
+                    object: nil
+                )
+                TraktSettingsStore.notifyContinueWatchingSourceInvalidated(for: .trakt, in: store)
+            }
+        }
         for write in orderedWrites {
             guard isCurrentTraktAccount(
                 store: store,
@@ -3730,6 +3742,7 @@ struct TraktHistoryService {
                     continue
                 }
                 guard await uploadManualMutation(mutation, using: service) else { return false }
+                sentToTrakt = true
                 guard isCurrentTraktAccount(
                     store: store,
                     profileId: profileId,
@@ -3759,6 +3772,7 @@ struct TraktHistoryService {
                     profileId: profileId,
                     expectedAccountID: expectedAccountID
                 ) else { return false }
+                sentToTrakt = true
 
             case .libraryMutation(let mutation):
                 guard await uploadLibraryMutation(mutation, using: service) else {
@@ -3770,6 +3784,7 @@ struct TraktHistoryService {
                     )
                     return false
                 }
+                sentToTrakt = true
                 guard isCurrentTraktAccount(
                     store: store,
                     profileId: profileId,
