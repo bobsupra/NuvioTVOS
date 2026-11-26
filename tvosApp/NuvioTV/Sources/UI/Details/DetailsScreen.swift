@@ -7502,6 +7502,11 @@ private struct TvDetailsActionRow: View {
     let entryLocked: Bool
     let onFocus: () -> Void
 
+    /// Moving focus shrinks one button to its icon and widens the next to show its title.
+    static let focusAnimation: Animation = .easeOut(duration: 0.2)
+
+    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var focusedButtonTitle = false
+
     var body: some View {
         HStack(spacing: 26) {
             TvDetailsActionButton(
@@ -7520,7 +7525,9 @@ private struct TvDetailsActionRow: View {
 
             if let onShuffleClick {
                 TvDetailsActionButton(
-                    title: nil,
+                    title: isShuffleOn
+                        ? L10n.string("details_shuffle_on", fallback: "Shuffle On")
+                        : L10n.string("details_shuffle", fallback: "Shuffle"),
                     systemName: isShuffleOn ? "shuffle.circle.fill" : "shuffle",
                     accessibilityLabel: isShuffleOn
                         ? L10n.string("details_shuffle_on", fallback: "Shuffle On")
@@ -7540,7 +7547,7 @@ private struct TvDetailsActionRow: View {
 
             if let onHostWatchParty {
                 TvDetailsActionButton(
-                    title: nil,
+                    title: L10n.string("nav_watch_party", fallback: "Watch Party"),
                     systemName: "person.2.fill",
                     accessibilityLabel: "Create Watch Party",
                     accessibilityHint: "Host a private room for this title",
@@ -7555,7 +7562,9 @@ private struct TvDetailsActionRow: View {
             }
 
             TvDetailsActionButton(
-                title: nil,
+                title: isInWatchlist
+                    ? L10n.string("details_in_library", fallback: "In library")
+                    : L10n.string("details_add_to_library", fallback: "Add to library"),
                 systemName: isInWatchlist ? "checkmark" : "plus",
                 accessibilityLabel: isInWatchlist
                     ? L10n.string("details_in_library", fallback: "In library")
@@ -7643,7 +7652,9 @@ private struct TvDetailsActionRow: View {
             }
 
             TvDetailsActionButton(
-                title: nil,
+                title: isWatched
+                    ? L10n.string("details_mark_as_unwatched", fallback: "Mark as unwatched")
+                    : L10n.string("details_mark_as_watched", fallback: "Mark as watched"),
                 systemName: isWatched ? "eye.fill" : "eye.slash.fill",
                 accessibilityLabel: isWatched
                     ? L10n.string("details_watched", fallback: "Watched")
@@ -7661,7 +7672,7 @@ private struct TvDetailsActionRow: View {
             .disabled(entryLocked)
 
             TvDetailsActionButton(
-                title: nil,
+                title: L10n.string("details_trailer", fallback: "Trailer"),
                 systemName: "play.rectangle.fill",
                 accessibilityLabel: L10n.string("details_trailer", fallback: "Trailer"),
                 accessibilityHint: L10n.string("details_trailer_hint", fallback: "Plays the trailer when available"),
@@ -7677,6 +7688,7 @@ private struct TvDetailsActionRow: View {
         // As wide as its buttons: in a film's narrower column, AniList's and MAL's wide buttons
         // were squeezed to an icon and "A…". The row may reach past the column's edge instead.
         .fixedSize(horizontal: true, vertical: false)
+        .animation(focusedButtonTitle ? Self.focusAnimation : nil, value: focus.wrappedValue)
         .focusSection()
         .onExitCommand {
             onBack?()
@@ -8054,7 +8066,7 @@ private struct TvDetailsActionButton: View {
     let accessibilityLabel: String
     var accessibilityHint: String? = nil
     let isPrimary: Bool
-    /// As wide as its title, like Play, without being filled.
+    /// Shows its title even when not focused: a list status such as "Watching 5/12".
     var isWide: Bool = false
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
@@ -8063,8 +8075,24 @@ private struct TvDetailsActionButton: View {
     var longPressAction: (() -> Void)? = nil
     var onBack: (() -> Void)? = nil
 
+    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var focusedButtonTitle = false
     @State private var didTriggerHold = false
     private var isFocused: Bool { focus.wrappedValue == tag }
+
+    private var showsTitle: Bool {
+        DetailsActionButtonLook.showsTitle(
+            hasTitle: title != nil,
+            isPrimary: isPrimary,
+            isWide: isWide,
+            isFocused: isFocused,
+            rowHasFocus: focus.wrappedValue != nil,
+            focusedButtonTitle: focusedButtonTitle
+        )
+    }
+
+    private var isFilled: Bool {
+        DetailsActionButtonLook.isFilled(isPrimary: isPrimary, isFocused: isFocused, focusedButtonTitle: focusedButtonTitle)
+    }
 
     var body: some View {
         Button(action: {
@@ -8074,7 +8102,7 @@ private struct TvDetailsActionButton: View {
             }
             action()
         }) {
-            HStack(spacing: 16) {
+            HStack(spacing: showsTitle ? 16 : 0) {
                 if iconURL != nil || iconAsset != nil {
                     TvDetailsServiceIcon(url: iconURL, assetName: iconAsset, systemName: systemName, size: 44)
                         .accessibilityHidden(true)
@@ -8085,26 +8113,34 @@ private struct TvDetailsActionButton: View {
                 }
 
                 if let title {
+                    // Always present, so it widens and fades with the capsule. Added and removed
+                    // instead, it showed at the circle's edge for a few frames before the capsule grew.
                     Text(title)
                         .font(.appFont(size: 32, weight: .medium))
                         .lineLimit(1)
-                        // Play, AniList and MAL keep their whole title ("Watching 5/12"), never "A…".
-                        .fixedSize(horizontal: isPrimary || isWide, vertical: false)
+                        // A shown title is never cut short ("Watching 5/12", never "A…").
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(width: showsTitle ? nil : 0, alignment: .leading)
+                        .opacity(showsTitle ? 1 : 0)
                         .accessibilityHidden(true)
                 }
             }
             .foregroundColor(foregroundColor)
-            .padding(.horizontal, isPrimary ? 44 : (isWide && title != nil ? 32 : 0))
-            .frame(minWidth: isPrimary ? 228 : 98, maxWidth: (isPrimary || isWide) ? nil : 98, minHeight: 98)
+            .padding(.horizontal, showsTitle ? (isPrimary ? 44 : 32) : 0)
+            .frame(minWidth: showsTitle && isPrimary ? 228 : 98, maxWidth: showsTitle ? nil : 98, minHeight: 98)
             .frame(height: 98)
-            .modifier(TvDetailsGlassBackground(filled: isPrimary || isFocused, shape: Capsule()))
+            // While the button grows or shrinks, its title stays inside it.
+            .clipShape(Capsule())
+            // Only the focused button is white, so the white button is always where focus is.
+            .modifier(TvDetailsActionBackground(filled: isFilled))
             .shadow(color: .black.opacity(isFocused ? 0.35 : 0.18), radius: isFocused ? 18 : 7, y: 8)
         }
         .buttonStyle(TvPlayActionButtonStyle(onHold: longPressAction, didTriggerHold: $didTriggerHold))
         .focused(focus, equals: tag)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
+        // The same timing as the row, which moves the other buttons as this one resizes.
+        .animation(focusedButtonTitle ? TvDetailsActionRow.focusAnimation : .easeOut(duration: 0.14), value: isFocused)
         .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
             didTriggerHold = false
@@ -8119,10 +8155,56 @@ private struct TvDetailsActionButton: View {
     }
 
     private var foregroundColor: Color {
-        if isPrimary || isFocused {
-            return .black
+        isFilled ? .black : .white
+    }
+}
+
+/// When a Details action button shows its title and is white.
+enum DetailsActionButtonLook {
+    /// With Settings → Details Page → Focused Button Title on, the focused button shows its
+    /// title and the others only their icon, and while focus is elsewhere on the page Play
+    /// shows its title ("Next S3 E8"). Off, Play shows its title and the others their icon.
+    /// AniList, MyAnimeList and Kitsu (`isWide`) always show their list status.
+    static func showsTitle(
+        hasTitle: Bool,
+        isPrimary: Bool,
+        isWide: Bool,
+        isFocused: Bool,
+        rowHasFocus: Bool,
+        focusedButtonTitle: Bool
+    ) -> Bool {
+        guard hasTitle else { return false }
+        guard focusedButtonTitle else { return isPrimary || isWide }
+        return isFocused || isWide || (isPrimary && !rowHasFocus)
+    }
+
+    /// On, only the focused button is white, so the white button is always where focus is.
+    /// Off, Play is white too.
+    static func isFilled(isPrimary: Bool, isFocused: Bool, focusedButtonTitle: Bool) -> Bool {
+        focusedButtonTitle ? isFocused : (isPrimary || isFocused)
+    }
+}
+
+/// The action button's capsule. It stays the same view whether filled or not, so moving focus
+/// resizes and recolours it. `TvDetailsGlassBackground` builds the two looks as different views,
+/// and those fade into each other at their old and new sizes while the row moves.
+private struct TvDetailsActionBackground: ViewModifier {
+    let filled: Bool
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
+            content
+                .background(Color.white.opacity(filled ? 0.96 : 0), in: Capsule())
+                .background(Color.black.opacity(filled ? 0 : 0.20), in: Capsule())
+                .background(Color.white.opacity(filled ? 0 : 0.08), in: Capsule())
+                .glassEffect(.regular, in: Capsule())
+        } else {
+            content
+                .background(Color.white.opacity(filled ? 1 : 0), in: Capsule())
+                .background(.ultraThinMaterial, in: Capsule())
+                .background(Color.black.opacity(filled ? 0 : 0.30), in: Capsule())
         }
-        return .white
     }
 }
 
