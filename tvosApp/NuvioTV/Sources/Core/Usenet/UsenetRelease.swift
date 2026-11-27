@@ -49,6 +49,26 @@ struct UsenetStreamSource: Sendable {
         return starts
     }
 
+    /// Ranges of a file this source maps (`ranges`, in its order) as extents of its volumes.
+    static func compose(_ ranges: [Range<Int64>], through extents: [UsenetExtent]) -> [UsenetExtent] {
+        let starts = UsenetStreamSource(name: "", kind: .plain, volumes: [], extents: extents, firstArticles: []).extentStarts
+        var out: [UsenetExtent] = []
+        for range in ranges {
+            var position = range.lowerBound
+            while position < range.upperBound, let place = locate(position, extents: extents, starts: starts) {
+                let extent = extents[place.extent]
+                let take = min(range.upperBound - position, starts[place.extent] + extent.length - position)
+                if let last = out.last, last.volume == extent.volume, last.offset + last.length == place.volumeOffset {
+                    out[out.count - 1].length += take
+                } else {
+                    out.append(UsenetExtent(volume: extent.volume, offset: place.volumeOffset, length: take))
+                }
+                position += take
+            }
+        }
+        return out
+    }
+
     /// The extent holding `offset` and the matching offset inside its volume.
     static func locate(_ offset: Int64, extents: [UsenetExtent], starts: [Int64]) -> (extent: Int, volumeOffset: Int64)? {
         guard offset >= 0, !extents.isEmpty else { return nil }
@@ -95,6 +115,9 @@ struct UsenetPlayableEntry: Equatable, Sendable {
         case plain(Int)
         case split([Int])
         case rar([Int])
+        /// A file of a RAR set stored inside the RAR set of these NZB files: its volumes are
+        /// files of the outer set, by name, in order.
+        case nestedRar([Int], volumes: [String])
     }
 
     var name: String
@@ -221,26 +244,133 @@ struct UsenetReleaseResolver {
                 }
             }
             let mapping = try Self.rarMapping(parsed.map { $0.volume }, innerName: chosen.name, password: nzb.password)
-            let extents = mapping.extents
-            let used = Set(extents.map(\.volume))
-            let kept = parsed.indices.filter(used.contains)
-            let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
-            if let cipher = mapping.cipher {
-                if !cipher.passwordChecked, let first = extents.first,
-                   let head = Self.plainHead(of: parsed[first.volume].head, from: first, cipher: cipher),
-                   Self.passwordLooksWrong(name: chosen.name, plainHead: head) {
-                    throw UsenetError.wrongPassword
-                }
-                usenetLog.notice("usenet: encrypted RAR, opened with the NZB's password")
-            }
-            return UsenetStreamSource(
-                name: chosen.name, kind: .rar,
-                volumes: kept.map { files[parsed[$0].index] },
-                extents: extents.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
-                firstArticles: kept.map { parsed[$0].head },
-                cipher: mapping.cipher
-            )
+            return try rarSource(chosen.name, mapping: mapping, parsed: parsed)
+        case .nestedRar(let indices, let innerNames):
+            guard let parsed = rarDetails[indices]?.parsed, !parsed.isEmpty else { throw UsenetError.noPlayableFile }
+            let outer = parsed.map(\.volume)
+            let inner = try await innerVolumes(innerNames, outer: outer, parsed: parsed)
+            let mapping = try Self.nestedMapping(outer: outer, innerNames: innerNames, inner: inner,
+                                                 innerName: chosen.name, password: nzb.password)
+            usenetLog.notice("usenet: RAR set inside a RAR set, \(innerNames.count) inner volumes")
+            return try rarSource(chosen.name, mapping: mapping, parsed: parsed)
         }
+    }
+
+    /// The stream of a file mapped onto the volumes of a RAR set (`parsed`, in volume order).
+    private func rarSource(_ name: String, mapping: UsenetRarMapping,
+                           parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)]) throws -> UsenetStreamSource {
+        let files = nzb.files
+        let extents = mapping.extents
+        let used = Set(extents.map(\.volume))
+        let kept = parsed.indices.filter(used.contains)
+        let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
+        if let cipher = mapping.cipher {
+            if !cipher.passwordChecked, let first = extents.first,
+               let head = Self.plainHead(of: parsed[first.volume].head, from: first, cipher: cipher),
+               Self.passwordLooksWrong(name: name, plainHead: head) {
+                throw UsenetError.wrongPassword
+            }
+            usenetLog.notice("usenet: encrypted RAR, opened with the NZB's password")
+        }
+        return UsenetStreamSource(
+            name: name, kind: .rar,
+            volumes: kept.map { files[parsed[$0].index] },
+            extents: extents.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
+            firstArticles: kept.map { parsed[$0].head },
+            cipher: mapping.cipher
+        )
+    }
+
+    // MARK: - RAR inside RAR
+
+    /// The inner volumes' headers, from the first bytes of each one in the outer set, read in
+    /// parallel.
+    private func innerVolumes(_ names: [String], outer: [UsenetRarVolume],
+                              parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)]) async throws -> [UsenetRarVolume] {
+        let password = nzb.password
+        let placed = try names.map { try Self.rarMapping(outer, innerName: $0, password: password).extents }
+        return try await withThrowingTaskGroup(of: (Int, UsenetRarVolume?).self, returning: [UsenetRarVolume].self) { group in
+            var result = [UsenetRarVolume?](repeating: nil, count: names.count)
+            var pending = names.indices.makeIterator()
+            for _ in 0..<8 {
+                guard let index = pending.next() else { break }
+                group.addTask {
+                    let bytes = try await self.storedBytes(placed[index], parsed: parsed, length: Self.innerHeaderBytes)
+                    return (index, UsenetRar.parseVolume(bytes, password: password))
+                }
+            }
+            while let finished = try await group.next() {
+                result[finished.0] = finished.1
+                if let index = pending.next() {
+                    group.addTask {
+                        let bytes = try await self.storedBytes(placed[index], parsed: parsed, length: Self.innerHeaderBytes)
+                        return (index, UsenetRar.parseVolume(bytes, password: password))
+                    }
+                }
+            }
+            return try result.map { volume in
+                guard let volume else { throw UsenetError.releaseIncomplete }
+                return volume
+            }
+        }
+    }
+
+    /// An inner volume's headers fit in its first bytes (a scene volume's take a few hundred).
+    static let innerHeaderBytes = 32 * 1024
+
+    /// The first `length` bytes of a file stored in a RAR set (at `extents` of its volumes).
+    private func storedBytes(_ extents: [UsenetExtent], parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)],
+                             length: Int) async throws -> Data {
+        var out = Data()
+        for extent in extents where out.count < length {
+            let wanted = Int(min(Int64(length - out.count), extent.length))
+            let volume = parsed[extent.volume]
+            guard let bytes = try await volumeBytes(nzb.files[volume.index], head: volume.head, at: extent.offset, length: wanted),
+                  !bytes.isEmpty else { break }
+            out.append(bytes)
+            if bytes.count < wanted { break }
+        }
+        return out
+    }
+
+    /// The RAR sets among the files of an outer set, each in volume order.
+    static func innerRarSets(_ names: [String]) -> [[String]] {
+        var sets: [String: [(name: String, number: Int)]] = [:]
+        var order: [String] = []
+        for name in names where role(ofName: name) == .rar {
+            guard let key = rarVolumeKey(name) else { continue }
+            if sets[key.set] == nil { order.append(key.set) }
+            sets[key.set, default: []].append((name, key.number))
+        }
+        return order.compactMap { sets[$0]?.sorted { $0.number < $1.number }.map(\.name) }
+    }
+
+    /// A file of a RAR set stored inside another RAR set (`outer`, whose files `innerNames` are
+    /// the inner set's volumes `inner`): where its bytes sit in the outer volumes.
+    static func nestedMapping(outer: [UsenetRarVolume], innerNames: [String], inner: [UsenetRarVolume],
+                              innerName: String, password: String?) throws -> UsenetRarMapping {
+        let mapping = try rarMapping(inner, innerName: innerName, password: password)
+        var placed: [Int: [UsenetExtent]] = [:]
+        var extents: [UsenetExtent] = []
+        for extent in mapping.extents {
+            guard innerNames.indices.contains(extent.volume) else { throw UsenetError.releaseIncomplete }
+            if placed[extent.volume] == nil {
+                let volume = try rarMapping(outer, innerName: innerNames[extent.volume], password: password)
+                // An encrypted outer set would need decrypting before the inner one is read.
+                guard volume.cipher == nil else { throw UsenetError.archiveEncrypted }
+                placed[extent.volume] = volume.extents
+            }
+            let pieces = UsenetStreamSource.compose([extent.offset..<(extent.offset + extent.length)], through: placed[extent.volume] ?? [])
+            guard pieces.reduce(0, { $0 + $1.length }) == extent.length else { throw UsenetError.releaseIncomplete }
+            for piece in pieces {
+                if let last = extents.last, last.volume == piece.volume, last.offset + last.length == piece.offset {
+                    extents[extents.count - 1].length += piece.length
+                } else {
+                    extents.append(piece)
+                }
+            }
+        }
+        return UsenetRarMapping(extents: extents, cipher: mapping.cipher)
     }
 
     // MARK: - Names and roles
@@ -497,7 +627,9 @@ struct UsenetReleaseResolver {
 
         let listed = volume.entries.filter { !$0.isDirectory && !$0.continuesFromPrevious }
             .reduce(Int64(0)) { $0 + max(0, $1.unpackedSize) }
-        let isMultiFile = Self.isMultiFileSet(listedBytes: listed, encodedSetBytes: setBytes)
+        // A set holding another RAR set's volumes is always listed: they are found by name.
+        let wrapsRar = volume.entries.contains { !$0.isDirectory && Self.role(ofName: $0.name) == .rar }
+        let isMultiFile = (Self.isMultiFileSet(listedBytes: listed, encodedSetBytes: setBytes) || wrapsRar)
             && !volume.headersEncrypted
 
         if !isMultiFile {
@@ -513,21 +645,60 @@ struct UsenetReleaseResolver {
             parsed.append((index, volumeHead, parsedVolume))
         }
         if obfuscated { parsed = Self.orderObfuscated(parsed) }
-        for k in parsed.indices {
-            parsed[k].volume = try await completeHeaders(parsed[k].volume, file: files[parsed[k].index], head: parsed[k].head)
-        }
+        parsed = try await completeAllHeaders(parsed, files: files)
         details[set] = UsenetRarSetDetail(parsed: parsed)
 
-        let starts = parsed.flatMap { $0.volume.entries }
-            .filter { !$0.isDirectory && !$0.continuesFromPrevious && Self.isVideoName($0.name) }
+        let stored = parsed.flatMap { $0.volume.entries }.filter { !$0.isDirectory && !$0.continuesFromPrevious }
+        let starts = stored.filter { Self.isVideoName($0.name) }
         usenetLog.notice("usenet: RAR set holds \(starts.count) videos")
-        return starts.enumerated().map { number, entry in
+        var entries = starts.enumerated().map { number, entry in
             UsenetPlayableEntry(
                 name: entry.name, source: .rar(set),
                 size: Int(clamping: max(0, entry.unpackedSize)),
                 order: baseOrder + number
             )
         }
+        // RAR sets stored inside this one: the videos their first volume lists.
+        let outer = parsed.map(\.volume)
+        for innerNames in Self.innerRarSets(stored.map(\.name)) {
+            guard let firstName = innerNames.first,
+                  let extents = try? Self.rarMapping(outer, innerName: firstName, password: nzb.password).extents,
+                  let bytes = try? await storedBytes(extents, parsed: parsed, length: Self.innerHeaderBytes),
+                  let inner = UsenetRar.parseVolume(bytes, password: nzb.password) else { continue }
+            let videos = inner.entries.filter { !$0.isDirectory && !$0.continuesFromPrevious && Self.isVideoName($0.name) }
+            usenetLog.notice("usenet: RAR set inside the set, \(innerNames.count) volumes, \(videos.count) videos")
+            for video in videos {
+                entries.append(UsenetPlayableEntry(
+                    name: video.name, source: .nestedRar(set, volumes: innerNames),
+                    size: Int(clamping: max(0, video.unpackedSize)),
+                    order: baseOrder + entries.count
+                ))
+            }
+        }
+        return entries
+    }
+
+    /// Reads every volume's remaining headers, several volumes at a time.
+    private func completeAllHeaders(_ parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)],
+                                    files: [UsenetFile]) async throws -> [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)] {
+        var result = parsed
+        let completed = try await withThrowingTaskGroup(of: (Int, UsenetRarVolume).self, returning: [Int: UsenetRarVolume].self) { group in
+            var done: [Int: UsenetRarVolume] = [:]
+            var pending = parsed.indices.makeIterator()
+            for _ in 0..<8 {
+                guard let k = pending.next() else { break }
+                group.addTask { (k, try await self.completeHeaders(parsed[k].volume, file: files[parsed[k].index], head: parsed[k].head)) }
+            }
+            while let finished = try await group.next() {
+                done[finished.0] = finished.1
+                if let k = pending.next() {
+                    group.addTask { (k, try await self.completeHeaders(parsed[k].volume, file: files[parsed[k].index], head: parsed[k].head)) }
+                }
+            }
+            return done
+        }
+        for (k, volume) in completed { result[k].volume = volume }
+        return result
     }
 
     /// A first file under 85 % of the set means more files follow it
