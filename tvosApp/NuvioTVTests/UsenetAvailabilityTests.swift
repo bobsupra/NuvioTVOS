@@ -216,8 +216,9 @@ final class UsenetAvailabilityTests: XCTestCase {
     func testWhatWasRememberedExpires() throws {
         let (store, suite) = defaults()
         defer { store.removePersistentDomain(forName: suite) }
-        let old = Date().addingTimeInterval(-UsenetAvailabilityChecker.rememberedLifetime - 60)
-        let saved = [UsenetAvailabilityChecker.memoryKey(spec): UsenetAvailabilityChecker.Remembered(report: report(missing: 5), at: old)]
+        let old = Date().addingTimeInterval(-UsenetAvailabilityChecker.incompleteLifetime - 60)
+        let servers = UsenetAvailabilityChecker(defaults: store).serversDigest(spec)
+        let saved = [UsenetAvailabilityChecker.memoryKey(spec): UsenetAvailabilityChecker.Remembered(report: report(missing: 5), at: old, servers: servers)]
         store.set(try JSONEncoder().encode(saved), forKey: UsenetAvailabilityChecker.rememberedKey)
         XCTAssertNil(UsenetAvailabilityChecker(defaults: store).state(for: spec))
     }
@@ -237,5 +238,65 @@ final class UsenetAvailabilityTests: XCTestCase {
         XCTAssertEqual(UsenetSettings.autoCheckCount(store: store), -1)
         UsenetSettings.setAutoCheckCount(7, store: store)
         XCTAssertEqual(UsenetSettings.autoCheckCount(store: store), 0)
+    }
+
+    // MARK: Remembered like Nuvio on Android TV
+
+    @MainActor
+    func testAReleaseThatPlayedIsRememberedAsPlayed() {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        UsenetAvailabilityChecker(defaults: store).recordPlayed(spec)
+        guard case .checked(let report)? = UsenetAvailabilityChecker(defaults: store).state(for: spec) else {
+            return XCTFail("played: remembered")
+        }
+        XCTAssertTrue(report.played)
+        XCTAssertEqual(report.verdict, .available)
+    }
+
+    @MainActor
+    func testWhatOtherServersShowedDoesNotApply() throws {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        let saved = [UsenetAvailabilityChecker.memoryKey(spec): UsenetAvailabilityChecker.Remembered(
+            report: report(missing: 5), at: Date(), servers: "another provider"
+        )]
+        store.set(try JSONEncoder().encode(saved), forKey: UsenetAvailabilityChecker.rememberedKey)
+        XCTAssertNil(UsenetAvailabilityChecker(defaults: store).state(for: spec))
+    }
+
+    private func usenetStream(_ nzb: String, filename: String?, size: Int64?) -> NuvioStream {
+        let url = UsenetStreamSpec(nzbURL: URL(string: nzb)!).url.absoluteString
+        return NuvioStream(url: url, name: "Usenet", description: nil, addonName: "U", filename: filename, videoSize: size)
+    }
+
+    func testAnotherIndexersCopyHasTheSameNameAndSizeKey() throws {
+        let geek = usenetStream("https://geek.example/api?t=get&id=1&apikey=K", filename: "Show.S01E02.1080p.WEB-DL-GRP", size: 1_500_000_000)
+        let dog = usenetStream("https://dog.example/getnzb/abc", filename: "Show.S01E02.1080p.WEB-DL-GRP", size: 1_500_200_000)
+        let other = usenetStream("https://dog.example/getnzb/def", filename: "Show.S01E02.1080p.WEB-DL-GRP", size: 1_700_000_000)
+        func key(_ stream: NuvioStream) -> String? {
+            UsenetAvailabilityChecker.titleKey(stream, spec: UsenetAvailabilityChecker.spec(for: stream)!)
+        }
+        XCTAssertNotNil(key(geek))
+        XCTAssertEqual(key(geek), key(dog), "sizes within a MB")
+        XCTAssertNotEqual(key(geek), key(other))
+        XCTAssertNil(key(usenetStream("https://geek.example/x", filename: nil, size: 1)))
+        XCTAssertFalse(try XCTUnwrap(key(geek)).contains("Show"), "only a hash")
+    }
+
+    @MainActor
+    func testAnIncompleteReleaseIsKnownFromAnotherIndexer() {
+        let (store, suite) = defaults()
+        defer { store.removePersistentDomain(forName: suite) }
+        let geek = usenetStream("https://geek.example/api?t=get&id=1&apikey=K", filename: "Movie.2024.1080p-GRP", size: 9_000_000_000)
+        let dog = usenetStream("https://dog.example/getnzb/abc", filename: "Movie.2024.1080p-GRP", size: 9_000_000_000)
+        let checker = UsenetAvailabilityChecker(defaults: store)
+        _ = checker.state(for: geek)        // the list showed it
+        var failed = report()
+        failed.playbackProblem = .wouldNotStart
+        checker.recordPlayback(UsenetAvailabilityChecker.spec(for: geek)!, report: failed)
+
+        let later = UsenetAvailabilityChecker(defaults: store)
+        XCTAssertTrue(later.isIncomplete(dog))
     }
 }

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Combine
 
@@ -38,6 +39,9 @@ struct UsenetAvailabilityReport: Sendable, Equatable, Codable {
         case damaged
     }
     var playbackProblem: PlaybackProblem?
+    /// It played on these servers lately (its first seconds came): an available release
+    /// whether or not anything was sampled.
+    var played = false
 
     /// Damage this long a run stops playback (`UsenetStreamSession.damageConsecutiveMissing`).
     static let nzbGapsLimit = 3
@@ -234,11 +238,15 @@ enum UsenetAvailability {
 /// at once, over connections of their own (two per server), closed once the checks are
 /// done, so playback keeps its own.
 ///
-/// A stream found incomplete, by a check or by playing it (it wouldn't start, or turned
-/// out too damaged), is remembered on this Apple TV for `rememberedLifetime`: its card
-/// says so the next time and failover passes it by. A check that finds it available
-/// clears what a check found; what playing it showed stays until it expires. Kept by a
-/// hash of the NZB URL, which can carry an indexer key, never by the URL itself.
+/// What a release showed is remembered on this Apple TV, for the servers it showed it on
+/// (another provider may have what one lacks):
+/// - incomplete, by a check or by playing it (it wouldn't start, or turned out too damaged),
+///   for `incompleteLifetime`: its card says so and failover passes it by. A check that
+///   finds it available clears what a check found; what playing it showed stays;
+/// - played (its first seconds came), for `playedLifetime`: its card says so.
+/// Kept by a hash of the NZB URL, which can carry an indexer key, never the URL itself, and
+/// by a hash of the release name and its size in MB, which another indexer's copy of the
+/// same upload shares (like Nuvio on Android TV).
 @MainActor
 final class UsenetAvailabilityChecker: ObservableObject {
     static let shared = UsenetAvailabilityChecker()
@@ -261,13 +269,24 @@ final class UsenetAvailabilityChecker: ObservableObject {
     /// articles can still go missing later (takedowns), so not for longer.
     static let resultLifetime: TimeInterval = 6 * 60 * 60
 
-    static let rememberedKey = "nuvio.tv.usenet.rememberedIncomplete"
-    static let rememberedLifetime: TimeInterval = 14 * 24 * 60 * 60
-    static let rememberedLimit = 300
+    static let rememberedKey = "nuvio.tv.usenet.rememberedReleases"
+    nonisolated static let incompleteLifetime: TimeInterval = 30 * 24 * 60 * 60
+    nonisolated static let playedLifetime: TimeInterval = 14 * 24 * 60 * 60
+    static let rememberedLimit = 500
 
     struct Remembered: Codable, Equatable {
         var report: UsenetAvailabilityReport
         var at: Date
+        /// `serversDigest` of the servers it was found on.
+        var servers: String
+
+        var lifetime: TimeInterval {
+            report.verdict == .incomplete ? UsenetAvailabilityChecker.incompleteLifetime : UsenetAvailabilityChecker.playedLifetime
+        }
+
+        func isCurrent(servers: String, now: Date) -> Bool {
+            self.servers == servers && now.timeIntervalSince(at) < lifetime
+        }
     }
 
     private var checkedAt: [URL: Date] = [:]
@@ -275,8 +294,15 @@ final class UsenetAvailabilityChecker: ObservableObject {
     private var running = 0
     private var pools: [[UsenetServerConfig]: UsenetConnectionPool] = [:]
     private var poolShutdown: Task<Void, Never>?
-    /// Incomplete streams by `memoryKey(_:)`.
+    /// By `memoryKey(_:)` and by `titleKey(_:spec:)`.
     @Published private var remembered: [String: Remembered] = [:]
+    /// The name-and-size key of streams the list showed, by `memoryKey`: what the engine,
+    /// which knows only the URL, remembers a release under too. Not published: filled while
+    /// the list draws.
+    private var titleKeys: [String: String] = [:]
+    /// The servers' part of `serversDigest`, until they change.
+    private var ownServers: (prefersOwn: Bool, own: [String])?
+    private var serversObserver: NSObjectProtocol?
     private let defaults: UserDefaults
 
     init(defaults: UserDefaults = .standard) {
@@ -284,7 +310,12 @@ final class UsenetAvailabilityChecker: ObservableObject {
         if let data = defaults.data(forKey: Self.rememberedKey),
            let saved = try? JSONDecoder().decode([String: Remembered].self, from: data) {
             let now = Date()
-            remembered = saved.filter { now.timeIntervalSince($0.value.at) < Self.rememberedLifetime }
+            remembered = saved.filter { now.timeIntervalSince($0.value.at) < $0.value.lifetime }
+        }
+        serversObserver = NotificationCenter.default.addObserver(
+            forName: .usenetServersChanged, object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.ownServers = nil }
         }
     }
 
@@ -293,13 +324,66 @@ final class UsenetAvailabilityChecker: ObservableObject {
     }
 
     func state(for stream: NuvioStream) -> State? {
-        Self.spec(for: stream).flatMap { self.state(for: $0) }
+        guard let spec = Self.spec(for: stream) else { return nil }
+        if let titleKey = Self.titleKey(stream, spec: spec) { titleKeys[Self.memoryKey(spec)] = titleKey }
+        return state(for: spec)
     }
 
-    /// This session's check, else what was remembered.
+    /// This session's check, else what was remembered for these servers.
     func state(for spec: UsenetStreamSpec) -> State? {
         if let state = states[spec.nzbURL] { return state }
-        return remembered[Self.memoryKey(spec)].map { .checked($0.report) }
+        return rememberedEntry(spec).map { .checked($0.report) }
+    }
+
+    private func rememberedEntry(_ spec: UsenetStreamSpec) -> Remembered? {
+        let servers = serversDigest(spec)
+        let now = Date()
+        let key = Self.memoryKey(spec)
+        if let entry = remembered[key], entry.isCurrent(servers: servers, now: now) { return entry }
+        if let titleKey = titleKeys[key], let entry = remembered[titleKey], entry.isCurrent(servers: servers, now: now) {
+            return entry
+        }
+        return nil
+    }
+
+    /// The same upload from another indexer: a hash of its release name (letters and digits
+    /// only) and its size in MB, and the episode of a pack. nil without a name or a size.
+    nonisolated static func titleKey(_ stream: NuvioStream, spec: UsenetStreamSpec) -> String? {
+        guard let name = stream.filename, let size = stream.videoSize, size > 0 else { return nil }
+        let letters = name.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) }
+        guard !letters.isEmpty else { return nil }
+        let megabytes = Int((Double(size) / 1_000_000).rounded())
+        let digest = SHA256.hash(data: Data((String(String.UnicodeScalarView(letters)) + "|\(megabytes)").utf8))
+        var key = "title:" + digest.map { String(format: "%02x", $0) }.joined()
+        if let file = spec.fileMustInclude, !file.isEmpty { key += "|" + file.lowercased() }
+        if let index = spec.fileIdx { key += "|#\(index)" }
+        return key
+    }
+
+    /// The servers a stream is played from, by host, port and login: what one provider
+    /// lacks another may have. Never a password.
+    func serversDigest(_ spec: UsenetStreamSpec) -> String {
+        let settings = ownServers ?? {
+            let own = UsenetSettings.servers().filter(\.isEnabled).map { "\($0.host):\($0.port):\($0.username)" }
+            let value = (prefersOwn: UsenetSettings.prefersOwnServers(), own: own)
+            self.ownServers = value
+            return value
+        }()
+        let addon = spec.servers.map { "\($0.host):\($0.port):\($0.username ?? "")" }
+        let used = settings.prefersOwn && !settings.own.isEmpty ? settings.own : addon + settings.own
+        let digest = SHA256.hash(data: Data(Array(Set(used)).sorted().joined(separator: ",").utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    /// Its first seconds played (the player read its duration): remembered as available on
+    /// these servers.
+    func recordPlayed(_ spec: UsenetStreamSpec) {
+        var report = UsenetAvailabilityReport(checked: 0, missing: 0, tailMissing: false, nzbGaps: 0, missingVolumes: 0)
+        report.played = true
+        if case .checked(let current)? = states[spec.nzbURL], current.verdict == .incomplete { return }
+        states[spec.nzbURL] = .checked(report)
+        checkedAt[spec.nzbURL] = Date()
+        remember(spec, report)
     }
 
     /// A hash of the NZB URL, and the episode of a pack.
@@ -320,17 +404,23 @@ final class UsenetAvailabilityChecker: ObservableObject {
 
     private func remember(_ spec: UsenetStreamSpec, _ report: UsenetAvailabilityReport) {
         let key = Self.memoryKey(spec)
-        if report.verdict == .incomplete {
-            let reason = report.playbackProblem?.rawValue ?? "\(report.missing)/\(report.checked) sampled articles missing"
-            usenetLog.notice("usenet: remembered as incomplete (\(reason, privacy: .public))")
-            remembered[key] = Remembered(report: report, at: Date())
-            if remembered.count > Self.rememberedLimit,
-               let oldest = remembered.min(by: { $0.value.at < $1.value.at })?.key {
+        let keys = [key] + (titleKeys[key].map { [$0] } ?? [])
+        if report.verdict == .incomplete || report.played {
+            if report.played {
+                usenetLog.notice("usenet: remembered as played on these servers")
+            } else {
+                let reason = report.playbackProblem?.rawValue ?? "\(report.missing)/\(report.checked) sampled articles missing"
+                usenetLog.notice("usenet: remembered as incomplete (\(reason, privacy: .public))")
+            }
+            let entry = Remembered(report: report, at: Date(), servers: serversDigest(spec))
+            for key in keys { remembered[key] = entry }
+            while remembered.count > Self.rememberedLimit,
+                  let oldest = remembered.min(by: { $0.value.at < $1.value.at })?.key {
                 remembered[oldest] = nil
             }
-        } else if remembered[key] != nil {
+        } else if keys.contains(where: { remembered[$0]?.report.verdict == .incomplete }) {
             usenetLog.notice("usenet: found \(report.verdict.rawValue, privacy: .public), no longer remembered as incomplete")
-            remembered[key] = nil
+            for key in keys where remembered[key]?.report.verdict == .incomplete { remembered[key] = nil }
         } else {
             return
         }
@@ -350,10 +440,12 @@ final class UsenetAvailabilityChecker: ObservableObject {
         for stream in streams {
             guard let spec = Self.spec(for: stream), seen.insert(spec.nzbURL).inserted else { continue }
             let url = spec.nzbURL
+            if let titleKey = Self.titleKey(stream, spec: spec) { titleKeys[Self.memoryKey(spec)] = titleKey }
             if states[url]?.isPending == true { continue }
             if case .checked? = states[url], let at = checkedAt[url],
                Date().timeIntervalSince(at) < Self.resultLifetime { continue }
-            if states[url] == nil, remembered[Self.memoryKey(spec)] != nil { continue }
+            // Remembered incomplete or played on these servers: nothing to ask.
+            if states[url] == nil, rememberedEntry(spec) != nil { continue }
             states[url] = .queued
             queue.append(spec)
         }
@@ -397,7 +489,7 @@ final class UsenetAvailabilityChecker: ObservableObject {
         if case .checked(var report) = state {
             // What playing it showed outweighs a sample: a check doesn't clear it.
             if report.playbackProblem == nil,
-               let problem = remembered[Self.memoryKey(spec)]?.report.playbackProblem {
+               let problem = rememberedEntry(spec)?.report.playbackProblem {
                 report.playbackProblem = problem
                 states[url] = .checked(report)
             }

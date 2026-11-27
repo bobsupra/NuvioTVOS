@@ -243,6 +243,9 @@ final class UsenetEngineManager: ObservableObject {
     func reportDuration(_ duration: Double, playbackURL: String?) {
         guard let session, let activeStreamURL, playbackURL == activeStreamURL.absoluteString,
               duration.isFinite, duration > 60, abs(duration - reportedDuration) > 1 else { return }
+        // The first time: the player opened the file and read its length, so the release
+        // plays on these servers.
+        if reportedDuration == 0, let activeSpec { UsenetAvailabilityChecker.shared.recordPlayed(activeSpec) }
         reportedDuration = duration
         Task { await session.setDuration(duration) }
     }

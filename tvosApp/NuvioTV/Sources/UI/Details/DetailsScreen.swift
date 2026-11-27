@@ -14840,6 +14840,8 @@ private struct TvStreamAvailabilityLine: View {
 
     static func text(_ report: UsenetAvailabilityReport) -> String {
         switch report.verdict {
+        case .available where report.played:
+            return L10n.string("usenet_check_played", fallback: "Played on your Usenet servers lately")
         case .available:
             return L10n.string("usenet_check_available", fallback: "Available on your Usenet servers")
         case .partial:
