@@ -3596,6 +3596,40 @@ final class ExternalPlayerTests: XCTestCase {
         XCTAssertTrue(ExternalPlayer.builtIn.isInstalled)
     }
 
+    /// The first return within six hours of opening an external player skips
+    /// Choose Profile on Return; later returns and stale marks don't.
+    func testOnlyTheFirstRecentReturnFromAnExternalPlayerCounts() throws {
+        let suiteName = "PlayerControlsSettingsTests.externalReturn"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let opened = Date(timeIntervalSince1970: 1_800_000_000)
+        let window = ExternalPlayerReturn.window
+
+        XCTAssertFalse(ExternalPlayerReturn.consumeRecentReturn(now: opened, defaults: defaults))
+
+        ExternalPlayerReturn.markOpened(at: opened, defaults: defaults)
+        XCTAssertTrue(ExternalPlayerReturn.consumeRecentReturn(now: opened.addingTimeInterval(2 * 60 * 60), defaults: defaults))
+        XCTAssertFalse(ExternalPlayerReturn.consumeRecentReturn(now: opened.addingTimeInterval(2 * 60 * 60 + 5), defaults: defaults))
+
+        // The window ends at six hours exactly.
+        ExternalPlayerReturn.markOpened(at: opened, defaults: defaults)
+        XCTAssertTrue(ExternalPlayerReturn.consumeRecentReturn(now: opened.addingTimeInterval(window - 1), defaults: defaults))
+        ExternalPlayerReturn.markOpened(at: opened, defaults: defaults)
+        XCTAssertFalse(ExternalPlayerReturn.consumeRecentReturn(now: opened.addingTimeInterval(window), defaults: defaults))
+        XCTAssertNil(defaults.object(forKey: ExternalPlayerReturn.key))
+
+        // A clock set back since the player opened doesn't count either.
+        ExternalPlayerReturn.markOpened(at: opened, defaults: defaults)
+        XCTAssertFalse(ExternalPlayerReturn.consumeRecentReturn(now: opened.addingTimeInterval(-60), defaults: defaults))
+        XCTAssertNil(defaults.object(forKey: ExternalPlayerReturn.key))
+
+        // A player that didn't open leaves nothing behind.
+        ExternalPlayerReturn.markOpened(at: opened, defaults: defaults)
+        ExternalPlayerReturn.clear(defaults: defaults)
+        XCTAssertFalse(ExternalPlayerReturn.consumeRecentReturn(now: opened, defaults: defaults))
+    }
+
     /// With Nuvio Branding on, the built-in player shows the chosen Nuvio icon.
     func testEveryNuvioAppIconHasABuiltInPlayerTile() {
         for icon in NuvioAppIcon.allCases {
