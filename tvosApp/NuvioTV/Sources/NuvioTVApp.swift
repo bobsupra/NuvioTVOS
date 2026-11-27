@@ -3938,7 +3938,7 @@ struct ContentView: View {
 
             guard let urlString = candidate.directURL, let rawURL = URL(string: urlString),
                   resolvedEpisodeTarget?.match(url: rawURL) != .mismatch,
-                  let url = await Self.playableURL(for: rawURL) else { continue }
+                  let url = await Self.playableURL(for: rawURL, automatic: true) else { continue }
             PlaybackStartupTiming.markSourcePicked(stream: candidate, token: startupToken)
             LastStreamQualityStore.save(
                 metaId: metaIdForTags,
@@ -4037,11 +4037,12 @@ struct ContentView: View {
     }
 
     /// A Usenet stream URL becomes the on-device engine's local URL (nil when
-    /// it can't start); every other URL is returned unchanged.
-    private static func playableURL(for url: URL) async -> URL? {
+    /// it can't start); every other URL is returned unchanged. `automatic`: picked for the
+    /// viewer (failover, the next episode), so an upload that failed already is passed by.
+    private static func playableURL(for url: URL, automatic: Bool = false) async -> URL? {
         guard let spec = UsenetStreamSpec(url: url) else { return url }
         do {
-            return try await UsenetEngineManager.shared.startStream(spec)
+            return try await UsenetEngineManager.shared.startStream(spec, skippingFailedUploads: automatic)
         } catch {
             usenetLog.error("usenet: source not started: \(error.localizedDescription, privacy: .public)")
             return nil

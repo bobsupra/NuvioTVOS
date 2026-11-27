@@ -95,6 +95,10 @@ final class UsenetEngineManager: ObservableObject {
     private var pool: UsenetConnectionPool?
     private var statsTask: Task<Void, Never>?
     private(set) var activeStreamURL: URL?
+    /// The uploads (`uploadIDs(of:)`) that failed to start or played damaged in this run of the
+    /// app, and the playing one's: automatic failover passes another indexer's copy of them by.
+    private var failedUploads = Set<String>()
+    private var activeUploadIDs = Set<String>()
     private var generation = 0
     /// The duration last passed to the session.
     private var reportedDuration: Double = 0
@@ -104,7 +108,10 @@ final class UsenetEngineManager: ObservableObject {
     /// Downloads and parses the NZB, connects to the servers, works out the
     /// file (also inside stored RAR sets and obfuscated releases), checks the
     /// release is complete and returns the local playback URL.
-    func startStream(_ spec: UsenetStreamSpec) async throws -> URL {
+    ///
+    /// `skippingFailedUploads` (automatic failover): an upload that failed already, from any
+    /// indexer, fails at once once its NZB is read, without connecting to a server.
+    func startStream(_ spec: UsenetStreamSpec, skippingFailedUploads: Bool = false) async throws -> URL {
         generation &+= 1
         let current = generation
         await stopCurrent()
@@ -117,8 +124,14 @@ final class UsenetEngineManager: ObservableObject {
         }
 
         let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: UsenetSettings.speedLimitMbps())
+        var uploadIDs = Set<String>()
         do {
             let nzb = try await Self.loadNZB(spec.nzbURL)
+            uploadIDs = Self.uploadIDs(of: nzb)
+            if skippingFailedUploads, !uploadIDs.isDisjoint(with: failedUploads) {
+                usenetLog.notice("usenet: the same upload as a release that failed (another indexer's copy), skipped")
+                throw UsenetError.releaseIncomplete
+            }
             let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
             let source = try await resolver.resolve()
             try Task.checkCancellation()
@@ -148,6 +161,7 @@ final class UsenetEngineManager: ObservableObject {
             self.server = server
             self.pool = pool
             self.activeStreamURL = url
+            self.activeUploadIDs = uploadIDs
             activeStats = UsenetStreamStats(
                 totalConnections: pool.totalConnections,
                 configuredConnections: pool.totalConnections,
@@ -169,6 +183,7 @@ final class UsenetEngineManager: ObservableObject {
         } catch {
             await pool.shutdown()
             if (error as? UsenetError) == .nzbUnreadable { UsenetNZBCache.remove(spec.nzbURL) }
+            if Self.isReleaseProblem(error) { failedUploads.formUnion(uploadIDs) }
             lastError = error.localizedDescription
             usenetLog.error("usenet: start failed: \(error.localizedDescription, privacy: .public)")
             throw error
@@ -207,6 +222,7 @@ final class UsenetEngineManager: ObservableObject {
         self.server = nil
         self.pool = nil
         activeStreamURL = nil
+        activeUploadIDs = []
         reportedDuration = 0
         isStreaming = false
         activeStats = UsenetStreamStats()
@@ -229,6 +245,15 @@ final class UsenetEngineManager: ObservableObject {
         guard generation == self.generation else { return }
         damagedGeneration = generation
         if let activeStreamURL { damagedStreamURL = activeStreamURL }
+        failedUploads.formUnion(activeUploadIDs)
+    }
+
+    /// What identifies an upload whichever indexer's NZB lists it: the message-ID of the first
+    /// article of each file played from (not its PAR2, NFO and such). Indexers write NZBs from
+    /// the same articles, so another indexer's copy shares them; a repost has new ones.
+    nonisolated static func uploadIDs(of nzb: UsenetNZB) -> Set<String> {
+        let content = nzb.files.filter { !$0.isSidecar }
+        return Set((content.isEmpty ? nzb.files : content).compactMap { $0.segments.first?.messageID })
     }
 
     // MARK: - Which add-on stream a playback URL came from

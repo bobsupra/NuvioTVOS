@@ -661,6 +661,24 @@ final class UsenetSourceTests: XCTestCase {
         XCTAssertFalse(UsenetHealthCheck.isPlayable(.init(checked: 12, missing: 1, tailMissing: true)))
     }
 
+    func testAnUploadIsKnownByItsFilesFirstArticlesWhicheverIndexerListsIt() {
+        func file(_ name: String, _ ids: [String]) -> UsenetFile {
+            UsenetFile(subject: "\"\(name)\" yEnc (1/\(ids.count))", name: name,
+                       segments: ids.enumerated().map { UsenetSegment(messageID: $1, bytes: 700_000, number: $0 + 1) })
+        }
+        let geek = UsenetNZB(title: "Geek", password: nil, files: [
+            file("x.part01.rar", ["a1@x", "a2@x"]), file("x.part02.rar", ["b1@x", "b2@x"]), file("x.par2", ["p1@x"]),
+        ])
+        // Another indexer: no PAR2, an NFO, its own title.
+        let dog = UsenetNZB(title: "Dog", password: nil, files: [
+            file("x.nfo", ["n1@x"]), file("x.part01.rar", ["a1@x", "a2@x"]), file("x.part02.rar", ["b1@x", "b2@x"]),
+        ])
+        let repost = UsenetNZB(title: nil, password: nil, files: [file("x.part01.rar", ["r1@y"]), file("x.part02.rar", ["r2@y"])])
+        XCTAssertEqual(UsenetEngineManager.uploadIDs(of: geek), ["a1@x", "b1@x"])
+        XCTAssertEqual(UsenetEngineManager.uploadIDs(of: dog), UsenetEngineManager.uploadIDs(of: geek))
+        XCTAssertTrue(UsenetEngineManager.uploadIDs(of: repost).isDisjoint(with: UsenetEngineManager.uploadIDs(of: geek)))
+    }
+
     func testReleaseProblemsAllowFallback() {
         XCTAssertTrue(UsenetEngineManager.isReleaseProblem(UsenetError.releaseIncomplete))
         XCTAssertTrue(UsenetEngineManager.isReleaseProblem(UsenetError.archiveCompressed("a.mkv")))
