@@ -5162,7 +5162,6 @@ private struct LayoutDiscoverySettingsView: View {
                         accentColor: accentColor
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                    .settingsLeaf(.home, section: "HERO CATALOGS")
 
                     SettingsStepperRow(
                         title: L10n.string(
@@ -5623,18 +5622,19 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $detailsShowParentalGuide,
                     accentColor: accentColor
                 )
-
-                SettingsFeatureSummaryCard(
-                    featureName: L10n.string("tvos_settings_details_sections", fallback: "Details Sections"),
-                    status: "\(detailsSectionsActiveCount) of \(TVDetailsSection.allCases.count) active",
-                    actionSubtitle: L10n.string("tvos_settings_details_sections_subtitle", fallback: "Reorder and toggle Cast, More Like This, Episodes, etc."),
-                    accentColor: accentColor
-                ) {
-                    showingDetailsSectionsSettings = true
-                }
-                .settingsLeaf(.detail, section: "SECTIONS")
+                .settingsLeaf(.detail, section: "APPEARANCE")
             }
-            .settingsPlaces([SettingsPlace(.detail, "APPEARANCE"), SettingsPlace(.detail, "SECTIONS")])
+            .settingsPlaces([SettingsPlace(.detail, "APPEARANCE")])
+
+            SettingsFeatureSummaryCard(
+                featureName: L10n.string("tvos_settings_details_sections", fallback: "Details Sections"),
+                status: "\(detailsSectionsActiveCount) of \(TVDetailsSection.allCases.count) active",
+                actionSubtitle: L10n.string("tvos_settings_details_sections_subtitle", fallback: "Reorder and toggle Cast, More Like This, Episodes, etc."),
+                accentColor: accentColor
+            ) {
+                showingDetailsSectionsSettings = true
+            }
+            .settingsLeaf(.detail, section: "SECTIONS")
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_settings_stream_list", fallback: "Stream List"),
@@ -5860,6 +5860,8 @@ private struct HeroCatalogSelectionRow: View {
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.snapshotChangedNotification).receive(on: RunLoop.main)) { _ in
             loadCatalogs()
         }
+        // Set on the row itself: where the row is shown depends on the Home layout.
+        .settingsLeaf(.home, section: "HERO CATALOGS")
     }
 
     private func isSelected(_ id: String) -> Bool {
