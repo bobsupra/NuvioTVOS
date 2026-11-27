@@ -123,6 +123,8 @@ enum UsenetError: LocalizedError, Equatable {
     case serverRejected(String)
     case archiveCompressed(String)
     case archiveEncrypted
+    /// The NZB's password doesn't open the archive.
+    case wrongPassword
     case releaseIncomplete
     case fileNotInPack
 
@@ -146,6 +148,8 @@ enum UsenetError: LocalizedError, Equatable {
             return L10n.format("usenet_error_archive_compressed", fallback: "%@ is compressed inside its archive and can't be streamed.", name)
         case .archiveEncrypted:
             return L10n.string("usenet_error_archive_encrypted", fallback: "The release is password protected.")
+        case .wrongPassword:
+            return L10n.string("usenet_error_wrong_password", fallback: "The password in the NZB doesn't open this release.")
         case .releaseIncomplete:
             return L10n.string("usenet_error_incomplete", fallback: "Parts of this release are missing on your Usenet servers.")
         case .fileNotInPack:

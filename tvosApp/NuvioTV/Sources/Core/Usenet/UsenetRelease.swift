@@ -24,8 +24,19 @@ struct UsenetStreamSource: Sendable {
     var extents: [UsenetExtent]
     /// Decoded first article of each volume (it gives the volume's layout).
     var firstArticles: [UsenetYEncSegment]
+    /// A file stored encrypted in a password-protected RAR set: its stored bytes are
+    /// decrypted as they are read.
+    var cipher: UsenetRarCipher? = nil
 
-    var totalSize: Int64 { extents.reduce(0) { $0 + $1.length } }
+    /// The bytes the extents hold: the file's own, or for an encrypted file the encrypted
+    /// ones, padded to whole blocks.
+    var storedSize: Int64 { extents.reduce(0) { $0 + $1.length } }
+
+    /// The size of the played file.
+    var totalSize: Int64 {
+        guard let cipher else { return storedSize }
+        return min(storedSize, max(0, cipher.plainSize))
+    }
 
     /// Where each extent starts in the played file.
     var extentStarts: [Int64] {
@@ -50,6 +61,13 @@ struct UsenetStreamSource: Sendable {
         guard offset < starts[low] + extents[low].length else { return nil }
         return (low, extents[low].offset + (offset - starts[low]))
     }
+}
+
+/// Where a file stored in a RAR set sits, and how it is decrypted when the set is password
+/// protected.
+struct UsenetRarMapping: Sendable {
+    var extents: [UsenetExtent]
+    var cipher: UsenetRarCipher?
 }
 
 /// A multi-file RAR set with every volume's headers read, in volume order.
@@ -195,22 +213,32 @@ struct UsenetReleaseResolver {
             } else {
                 let volumeHeads = try await requireHeads(indices, heads: &heads)
                 for (index, head) in zip(indices, volumeHeads) {
-                    guard let volume = UsenetRar.parseVolume(head.data) else { throw UsenetError.releaseIncomplete }
+                    guard let volume = UsenetRar.parseVolume(head.data, password: nzb.password) else { throw UsenetError.releaseIncomplete }
                     parsed.append((index, head, volume))
                 }
                 if indices.allSatisfy(obfuscatedRar.contains) {
                     parsed = Self.orderObfuscated(parsed)
                 }
             }
-            let extents = try Self.rarExtents(parsed.map { $0.volume }, innerName: chosen.name)
+            let mapping = try Self.rarMapping(parsed.map { $0.volume }, innerName: chosen.name, password: nzb.password)
+            let extents = mapping.extents
             let used = Set(extents.map(\.volume))
             let kept = parsed.indices.filter(used.contains)
             let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
+            if let cipher = mapping.cipher {
+                if !cipher.passwordChecked, let first = extents.first,
+                   let head = Self.plainHead(of: parsed[first.volume].head, from: first, cipher: cipher),
+                   Self.passwordLooksWrong(name: chosen.name, plainHead: head) {
+                    throw UsenetError.wrongPassword
+                }
+                usenetLog.notice("usenet: encrypted RAR, opened with the NZB's password")
+            }
             return UsenetStreamSource(
                 name: chosen.name, kind: .rar,
                 volumes: kept.map { files[parsed[$0].index] },
                 extents: extents.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
-                firstArticles: kept.map { parsed[$0].head }
+                firstArticles: kept.map { parsed[$0].head },
+                cipher: mapping.cipher
             )
         }
     }
@@ -324,15 +352,25 @@ struct UsenetReleaseResolver {
 
     /// Where a stored file's bytes sit across the volumes of its set.
     static func rarExtents(_ volumes: [UsenetRarVolume], innerName: String) throws -> [UsenetExtent] {
+        try rarMapping(volumes, innerName: innerName, password: nil).extents
+    }
+
+    /// Where a stored file's bytes sit across the volumes of its set, and the key they are
+    /// decrypted with when the set is password protected (`password`: the NZB's).
+    static func rarMapping(_ volumes: [UsenetRarVolume], innerName: String, password: String?) throws -> UsenetRarMapping {
         guard !volumes.isEmpty else { throw UsenetError.noPlayableFile }
-        if volumes.contains(where: \.headersEncrypted) { throw UsenetError.archiveEncrypted }
+        if volumes.contains(where: \.headersEncrypted) {
+            throw volumes.contains(where: \.passwordRejected) ? UsenetError.wrongPassword : UsenetError.archiveEncrypted
+        }
         // In a multi-file set the wanted file can start in any volume.
         let startsHere: (UsenetRarEntry) -> Bool = { $0.name == innerName && !$0.continuesFromPrevious }
         guard let startVolume = volumes.firstIndex(where: { $0.entries.contains(where: startsHere) }),
               let firstEntry = volumes[startVolume].entries.first(where: startsHere) else {
             throw UsenetError.noPlayableFile
         }
-        if firstEntry.isEncrypted { throw UsenetError.archiveEncrypted }
+        if firstEntry.isEncrypted, (password?.isEmpty ?? true) || firstEntry.encryption == nil {
+            throw UsenetError.archiveEncrypted
+        }
         guard firstEntry.isStored else { throw UsenetError.archiveCompressed(innerName) }
 
         var extents = [UsenetExtent(volume: startVolume, offset: firstEntry.dataOffset, length: firstEntry.packedSize)]
@@ -342,7 +380,7 @@ struct UsenetReleaseResolver {
             guard let part = volumes[volume].entries.first(where: { $0.name == innerName && $0.continuesFromPrevious }) else {
                 throw UsenetError.releaseIncomplete
             }
-            if part.isEncrypted { throw UsenetError.archiveEncrypted }
+            if part.isEncrypted != firstEntry.isEncrypted { throw UsenetError.archiveEncrypted }
             extents.append(UsenetExtent(volume: volume, offset: part.dataOffset, length: part.packedSize))
             continues = part.continuesInNext
             volume += 1
@@ -352,7 +390,32 @@ struct UsenetReleaseResolver {
             // Volumes are missing from the NZB.
             throw UsenetError.releaseIncomplete
         }
-        return extents.filter { $0.length > 0 }
+        var cipher: UsenetRarCipher?
+        if firstEntry.isEncrypted, let password, let encryption = firstEntry.encryption {
+            let plainSize = firstEntry.unpackedSize >= 0 ? firstEntry.unpackedSize : total
+            cipher = try UsenetRarCrypto.cipher(for: encryption, password: password, plainSize: plainSize)
+        }
+        return UsenetRarMapping(extents: extents.filter { $0.length > 0 }, cipher: cipher)
+    }
+
+    /// The first plain bytes of an encrypted file, when the first article of its first volume
+    /// holds them.
+    static func plainHead(of article: UsenetYEncSegment, from extent: UsenetExtent, cipher: UsenetRarCipher) -> Data? {
+        let begin = Int64(article.fileOffset)
+        let from = extent.offset - begin
+        let length = Int(min(extent.length, 1024, Int64(article.data.count) - from)) / 16 * 16
+        guard from >= 0, length >= 16 else { return nil }
+        let start = article.data.startIndex + Int(from)
+        let stored = article.data.subdata(in: start..<(start + length))
+        return UsenetRarCrypto.plain(stored, storedStart: 0, previous: nil, cipher: cipher, offset: 0, length: length)
+    }
+
+    /// A video that doesn't start the way its kind does: the archive's password (which RAR 4
+    /// can't check) decrypted it into noise.
+    static func passwordLooksWrong(name: String, plainHead: Data) -> Bool {
+        let sniffable = ["mkv", "webm", "mp4", "m4v", "avi", "ts", "m2ts"]
+        guard sniffable.contains((name as NSString).pathExtension.lowercased()), plainHead.count >= 400 else { return false }
+        return UsenetSniff.kind(of: plainHead) == .unknown
     }
 
     /// Stremio examples write `fileMustInclude` like a JavaScript literal,
@@ -423,14 +486,14 @@ struct UsenetReleaseResolver {
         var leader = first
         if heads[first] != nil, set.count > 1 {
             let volumes = set.compactMap { index in
-                heads[index].map(\.data).flatMap(UsenetRar.parseVolume).map { (index, $0) }
+                heads[index].flatMap { UsenetRar.parseVolume($0.data, password: nzb.password) }.map { (index, $0) }
             }
             if let firstVolume = volumes.first(where: { $0.1.isFirstVolume == true || $0.1.volumeNumber == 0 }) {
                 leader = firstVolume.0
             }
         }
         guard let head = try await requireHeads([leader], heads: &heads).first,
-              let volume = UsenetRar.parseVolume(head.data) else { return [] }
+              let volume = UsenetRar.parseVolume(head.data, password: nzb.password) else { return [] }
 
         let listed = volume.entries.filter { !$0.isDirectory && !$0.continuesFromPrevious }
             .reduce(Int64(0)) { $0 + max(0, $1.unpackedSize) }
@@ -446,7 +509,7 @@ struct UsenetReleaseResolver {
         let volumeHeads = try await requireHeads(set, heads: &heads)
         var parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)] = []
         for (index, volumeHead) in zip(set, volumeHeads) {
-            guard let parsedVolume = UsenetRar.parseVolume(volumeHead.data) else { throw UsenetError.releaseIncomplete }
+            guard let parsedVolume = UsenetRar.parseVolume(volumeHead.data, password: nzb.password) else { throw UsenetError.releaseIncomplete }
             parsed.append((index, volumeHead, parsedVolume))
         }
         if obfuscated { parsed = Self.orderObfuscated(parsed) }
