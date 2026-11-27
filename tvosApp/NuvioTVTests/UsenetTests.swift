@@ -1250,6 +1250,7 @@ final class UsenetPoolTests: XCTestCase {
 
             XCTAssertEqual(results, Array(repeating: .body, count: 12), "\(refusal): no article may be lost to a refused connection")
             XCTAssertEqual(stats.totalConnections, 2, "\(refusal)")
+            XCTAssertEqual(pool.primaryConnections, 2, "\(refusal): the read-ahead keeps to what the server let in")
             XCTAssertEqual(stats.configuredConnections, 6, "\(refusal)")
             XCTAssertEqual(server.counts.accepted, 2, "\(refusal)")
             XCTAssertEqual(server.counts.turnedAway, 4, "\(refusal): no new connection after the limit was found")
@@ -1273,7 +1274,17 @@ final class UsenetPoolTests: XCTestCase {
         XCTAssertFalse(body.isEmpty)
         XCTAssertEqual(results, Array(repeating: .body, count: 6))
         XCTAssertEqual(stats.totalConnections, 2, "the pool keeps to one fewer while previews hold one")
+        XCTAssertEqual(pool.primaryConnections, 2)
         XCTAssertEqual(server.counts.turnedAway, 0, "previews never push the stream past the configured count")
+    }
+
+    func testTheReadAheadCountsOnlyTheFirstServersConnections() {
+        let pool = UsenetConnectionPool(servers: [
+            UsenetServerConfig(host: "a.example", port: 563, useSSL: true, username: nil, password: nil, maxConnections: 20),
+            UsenetServerConfig(host: "b.example", port: 563, useSSL: true, username: nil, password: nil, maxConnections: 10),
+        ])
+        XCTAssertEqual(pool.totalConnections, 30)
+        XCTAssertEqual(pool.primaryConnections, 20, "the backup server only fills in missing articles")
     }
 
     func testSingleConnectionPlanKeepsItsConnectionForPlayback() async throws {
