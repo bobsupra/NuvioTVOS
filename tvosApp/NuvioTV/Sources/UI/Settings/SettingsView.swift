@@ -6797,7 +6797,6 @@ private struct LayoutDiscoverySettingsView: View {
                     accentColor: accentColor
                 )
                 .settingsLeaf(.home, section: "HOME LAYOUT")
-
                 SettingsToggleRow(
                     title: L10n.string("layout_catalog_type", fallback: "Show Catalog Type"),
                     subtitle: L10n.string(
