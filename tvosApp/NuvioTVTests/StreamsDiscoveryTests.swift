@@ -2125,6 +2125,57 @@ final class StreamsDiscoveryTests: XCTestCase {
             testToken
         )
     }
+
+    func testAddonPrefixedIMDbIDIsTheIMDbIDWithTheEpisodeKept() {
+        XCTAssertEqual(StreamsRepository.imdbRequestID(forAddonPrefixed: "addon:tt0944947"), "tt0944947")
+        XCTAssertEqual(StreamsRepository.imdbRequestID(forAddonPrefixed: "addon:tt0944947:1:2"), "tt0944947:1:2")
+        XCTAssertEqual(StreamsRepository.imdbRequestID(forAddonPrefixed: "addon:TT0944947:0:3"), "tt0944947:0:3")
+        // An IMDb id without a prefix, other id schemes and anything that isn't an episode stay as they are.
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: "tt0944947"))
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: "tt0944947:1:2"))
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: "kitsu:47759:1"))
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: "tmdb:1399:1:1"))
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: "addon:tt0944947:special"))
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: "addon:tt0944947:1:0"))
+        XCTAssertNil(StreamsRepository.imdbRequestID(forAddonPrefixed: ":tt0944947"))
+    }
+
+    func testAddOnsThatTakeIMDbIDsAreAskedByTheIMDbIDOfAnAddonPrefixedTitle() async throws {
+        func manifest(_ json: String) throws -> StreamAddonManifest {
+            try JSONDecoder().decode(StreamAddonManifest.self, from: Data(json.utf8))
+        }
+        let imdbOnly = try manifest(#"{"id":"imdb","resources":["stream","subtitles"],"types":["movie","series"],"idPrefixes":["tt"]}"#)
+        let ownPrefix = try manifest(#"{"id":"own","resources":["stream"],"types":["movie","series"],"idPrefixes":["addon:"]}"#)
+
+        for (type, videoId, imdbID) in [("series", "addon:tt0944947:1:2", "tt0944947:1:2"), ("movie", "addon:tt0133093", "tt0133093")] {
+            for resource in ["stream", "subtitles"] {
+                let alternatives = await StreamsRepository.aniListAlternatives(
+                    for: videoId, type: type, resource: resource, manifests: [imdbOnly, ownPrefix]
+                )
+                XCTAssertEqual(alternatives.first, imdbID, "\(videoId) \(resource)")
+                XCTAssertEqual(
+                    AniListStreamIds.requestID(for: imdbOnly, resource: resource, type: type, videoId: videoId, alternatives: alternatives),
+                    imdbID
+                )
+            }
+            // An add-on that takes the prefixed id is still asked by it.
+            let alternatives = await StreamsRepository.aniListAlternatives(
+                for: videoId, type: type, resource: "stream", manifests: [imdbOnly, ownPrefix]
+            )
+            XCTAssertEqual(
+                AniListStreamIds.requestID(for: ownPrefix, resource: "stream", type: type, videoId: videoId, alternatives: alternatives),
+                videoId
+            )
+            let pluginID = await StreamsRepository.pluginVideoId(for: videoId)
+            XCTAssertEqual(pluginID, imdbID)
+        }
+
+        // An IMDb id is asked as it is, and needs no other id.
+        let plain = await StreamsRepository.aniListAlternatives(
+            for: "tt0944947:1:2", type: "series", resource: "stream", manifests: [imdbOnly]
+        )
+        XCTAssertEqual(plain, [])
+    }
 }
 
 private final class MemoryJellyfinCredentialStorage: JellyfinCredentialStorage {
