@@ -95,6 +95,10 @@ final class UsenetEngineManager: ObservableObject {
     private var pool: UsenetConnectionPool?
     private var statsTask: Task<Void, Never>?
     private(set) var activeStreamURL: URL?
+    /// The playing stream's servers, so a preparation for the same ones shares its pool.
+    private var activeServers: [UsenetServerConfig] = []
+    /// A stream got ready ahead (`prepare`): starting it skips the NZB, the file and the check.
+    private var preparedStart: PreparedStart?
     private var generation = 0
     /// The duration last passed to the session.
     private var reportedDuration: Double = 0
@@ -117,15 +121,16 @@ final class UsenetEngineManager: ObservableObject {
         }
 
         let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: UsenetSettings.speedLimitMbps())
+        let prepared = takePrepared(spec)
         do {
-            let nzb = try await Self.loadNZB(spec.nzbURL)
-            let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
-            let source = try await resolver.resolve()
+            let source: UsenetStreamSource
+            if let prepared {
+                source = prepared
+                usenetLog.notice("usenet: \(source.name, privacy: .public) — got ready ahead, starting at once")
+            } else {
+                source = try await Self.readyRelease(spec, pool: pool)
+            }
             try Task.checkCancellation()
-
-            let health = try await UsenetHealthCheck.check(source, pool: pool)
-            usenetLog.notice("usenet: \(source.name, privacy: .public) [\(source.kind.rawValue, privacy: .public)] — \(source.volumes.count) file(s), \(health.missing)/\(health.checked) sampled articles missing")
-            guard UsenetHealthCheck.isPlayable(health) else { throw UsenetError.releaseIncomplete }
 
             // Off the main thread: it clears what an earlier stream left on disk.
             let diskBytes = UsenetSettings.diskReadAheadBytes()
@@ -148,6 +153,7 @@ final class UsenetEngineManager: ObservableObject {
             self.server = server
             self.pool = pool
             self.activeStreamURL = url
+            self.activeServers = servers
             activeStats = UsenetStreamStats(
                 totalConnections: pool.totalConnections,
                 configuredConnections: pool.totalConnections,
@@ -173,6 +179,66 @@ final class UsenetEngineManager: ObservableObject {
             usenetLog.error("usenet: start failed: \(error.localizedDescription, privacy: .public)")
             throw error
         }
+    }
+
+    /// The NZB read, the file worked out and the release checked: what a start waits for
+    /// before the session opens.
+    private static func readyRelease(_ spec: UsenetStreamSpec, pool: UsenetConnectionPool) async throws -> UsenetStreamSource {
+        let nzb = try await loadNZB(spec.nzbURL)
+        let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
+        let source = try await resolver.resolve()
+        try Task.checkCancellation()
+        let health = try await UsenetHealthCheck.check(source, pool: pool)
+        usenetLog.notice("usenet: \(source.name, privacy: .public) [\(source.kind.rawValue, privacy: .public)] — \(source.volumes.count) file(s), \(health.missing)/\(health.checked) sampled articles missing")
+        guard UsenetHealthCheck.isPlayable(health) else { throw UsenetError.releaseIncomplete }
+        return source
+    }
+
+    // MARK: - Getting a stream ready ahead
+
+    private struct PreparedStart {
+        let url: URL
+        let source: UsenetStreamSource
+        let at: Date
+    }
+
+    /// How long a stream got ready ahead may wait to be started; the check is redone after.
+    static let preparedLifetime: TimeInterval = 30 * 60
+    /// Connections a preparation opens when it can't share the playing stream's.
+    static let preparationConnections = 2
+
+    /// Gets `spec` ready while another stream plays (the next episode): reads its NZB, works
+    /// out its file and checks the release, without stopping or slowing the playing stream.
+    /// It shares the playing stream's connections when the servers are the same (no more
+    /// connections than the plan allows), else opens two of its own. `startStream(spec)` then
+    /// skips all that. Throws what a start would (an incomplete release, say).
+    func prepare(_ spec: UsenetStreamSpec) async throws {
+        if let preparedStart, preparedStart.url == spec.url,
+           Date().timeIntervalSince(preparedStart.at) < Self.preparedLifetime { return }
+        let servers = UsenetSettings.servers(for: spec)
+        guard !servers.isEmpty else { throw UsenetError.noServers }
+        let shared = servers == activeServers ? self.pool : nil
+        let preparationPool = shared ?? UsenetConnectionPool(servers: servers.map {
+            UsenetServerConfig(host: $0.host, port: $0.port, useSSL: $0.useSSL, username: $0.username,
+                               password: $0.password, maxConnections: min($0.maxConnections, Self.preparationConnections))
+        })
+        do {
+            let source = try await Self.readyRelease(spec, pool: preparationPool)
+            if shared == nil { await preparationPool.shutdown() }
+            preparedStart = PreparedStart(url: spec.url, source: source, at: Date())
+        } catch {
+            if shared == nil { await preparationPool.shutdown() }
+            usenetLog.notice("usenet: couldn't get the next stream ready: \(error.localizedDescription, privacy: .public)")
+            throw error
+        }
+    }
+
+    /// The release `prepare` got ready for `spec`, once: nil when there is none or it waited too long.
+    private func takePrepared(_ spec: UsenetStreamSpec) -> UsenetStreamSource? {
+        guard let preparedStart, preparedStart.url == spec.url else { return nil }
+        self.preparedStart = nil
+        guard Date().timeIntervalSince(preparedStart.at) < Self.preparedLifetime else { return nil }
+        return preparedStart.source
     }
 
     /// A delayed player exit only stops its own stream, never a newer one.
@@ -207,6 +273,7 @@ final class UsenetEngineManager: ObservableObject {
         self.server = nil
         self.pool = nil
         activeStreamURL = nil
+        activeServers = []
         reportedDuration = 0
         isStreaming = false
         activeStats = UsenetStreamStats()
@@ -315,4 +382,12 @@ final class UsenetEngineManager: ObservableObject {
         UsenetNZBCache.store(data, for: url)
         return nzb
     }
+}
+
+/// While on (`UsenetPreparation.$isAhead.withValue(true) { … }`), a Usenet stream picked for
+/// playback is only got ready (`UsenetEngineManager.prepare`), not started, and its
+/// `nuvio-usenet://` URL comes back: the stream playing now keeps going. The player starts it
+/// when the next episode begins.
+enum UsenetPreparation {
+    @TaskLocal static var isAhead = false
 }

@@ -661,6 +661,27 @@ final class UsenetSourceTests: XCTestCase {
         XCTAssertFalse(UsenetHealthCheck.isPlayable(.init(checked: 12, missing: 1, tailMissing: true)))
     }
 
+    @MainActor
+    func testGettingAStreamReadyAheadNeedsServers() async {
+        let spec = UsenetStreamSpec(nzbURL: URL(string: "https://i.example/ready-ahead.nzb")!)
+        do {
+            try await UsenetEngineManager.shared.prepare(spec)
+            XCTFail("no servers: nothing to get ready")
+        } catch {
+            XCTAssertEqual(error as? UsenetError, .noServers)
+        }
+    }
+
+    func testGettingReadyAheadIsOnOnlyWhereAskedFor() async {
+        XCTAssertFalse(UsenetPreparation.isAhead)
+        let inside = await UsenetPreparation.$isAhead.withValue(true) { () async -> Bool in
+            await Task.yield()
+            return UsenetPreparation.isAhead
+        }
+        XCTAssertTrue(inside)
+        XCTAssertFalse(UsenetPreparation.isAhead)
+    }
+
     func testReleaseProblemsAllowFallback() {
         XCTAssertTrue(UsenetEngineManager.isReleaseProblem(UsenetError.releaseIncomplete))
         XCTAssertTrue(UsenetEngineManager.isReleaseProblem(UsenetError.archiveCompressed("a.mkv")))
