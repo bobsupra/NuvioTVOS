@@ -25237,6 +25237,227 @@ private final class UsenetSettingsModel: ObservableObject {
     }
 }
 
+/// Runs `UsenetConnectionTuner` for one server and applies what it recommends.
+@MainActor
+private final class UsenetTuneModel: ObservableObject {
+    enum State: Equatable {
+        case idle
+        case running
+        case finished
+        case failed
+        case stopped
+    }
+
+    @Published var state = State.idle
+    @Published var progress: UsenetTuneProgress?
+    @Published var result: UsenetTuneResult?
+    @Published var failure: String?
+    @Published var applied = false
+    let server: UsenetSavedServer
+    private var tuner: UsenetConnectionTuner?
+    private var task: Task<Void, Never>?
+
+    init(server: UsenetSavedServer) {
+        self.server = server
+    }
+
+    var changes: Bool {
+        guard let result else { return false }
+        return result.port != server.port || min(result.connections, UsenetServerConfig.maxConnectionsLimit) != server.connections
+    }
+
+    func start() {
+        let config = server.config(password: UsenetCredentialStore.password(forServerID: server.id))
+        let tuner = UsenetConnectionTuner(server: config)
+        self.tuner = tuner
+        state = .running
+        result = nil
+        failure = nil
+        progress = nil
+        applied = false
+        task = Task { [weak self] in
+            do {
+                let result = try await tuner.run { progress in
+                    Task { @MainActor [weak self] in self?.progress = progress }
+                }
+                self?.result = result
+                self?.state = .finished
+            } catch is CancellationError {
+                self?.state = .stopped
+            } catch let failure as UsenetTuneFailure {
+                self?.failure = Self.describe(failure)
+                self?.state = .failed
+            } catch {
+                self?.failure = error.localizedDescription
+                self?.state = .failed
+            }
+        }
+    }
+
+    func stop() {
+        let tuner = tuner
+        Task { await tuner?.stop() }
+        task?.cancel()
+    }
+
+    func apply() {
+        guard let result else { return }
+        var updated = server
+        updated.port = result.port
+        updated.connections = max(1, min(result.connections, UsenetServerConfig.maxConnectionsLimit))
+        UsenetSettings.upsert(updated, password: nil)
+        applied = true
+    }
+
+    static func describe(_ failure: UsenetTuneFailure) -> String {
+        switch failure {
+        case .connect(let message): return message
+        case .testData: return L10n.string("usenet_tune_test_data", fallback: "The test file's NZB couldn't be downloaded.")
+        case .missingArticles: return L10n.string("usenet_tune_missing", fallback: "Your server doesn't have the test file.")
+        case .tooSlow: return L10n.string("usenet_tune_too_slow", fallback: "Too little arrived to measure a speed.")
+        }
+    }
+}
+
+/// Settings → Usenet → a server → Tune: what the tuner measures and recommends.
+private struct UsenetTuneSheet: View {
+    let server: UsenetSavedServer
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @StateObject private var model: UsenetTuneModel
+
+    init(server: UsenetSavedServer, accentColor: Color) {
+        self.server = server
+        self.accentColor = accentColor
+        _model = StateObject(wrappedValue: UsenetTuneModel(server: server))
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+            ScrollView {
+                VStack(alignment: .leading, spacing: 18) {
+                    Text(L10n.format("usenet_tune_title", fallback: "Tune %@", server.displayName))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+                    if model.state == .idle {
+                        line(L10n.string(
+                            "usenet_tune_intro",
+                            fallback: "Finds how many connections your plan accepts, then measures which port and how many connections download fastest, with a public test file posted for speed tests. It takes a minute or two and uses data; stop it any time."
+                        ), secondary: true)
+                    }
+                    if model.state == .running {
+                        HStack(spacing: 14) {
+                            ProgressView()
+                            line(progressText)
+                        }
+                    }
+                    if let result = model.result {
+                        summary(result)
+                    }
+                    if let failure = model.failure {
+                        line(failure)
+                    }
+                    if model.state == .stopped {
+                        line(L10n.string("usenet_tune_stopped", fallback: "Stopped."), secondary: true)
+                    }
+                    ForEach(Array(readings.enumerated()), id: \.offset) { _, reading in
+                        Text(L10n.format("usenet_tune_reading", fallback: "Port %d · %d connections · %@ Mbit/s",
+                                         reading.port, reading.connections, Self.mbps(reading.megabitsPerSecond)))
+                            .font(.system(size: 20, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.6))
+                    }
+                    HStack(spacing: 16) {
+                        buttons
+                    }
+                    .padding(.top, 12)
+                }
+                .padding(.horizontal, 90)
+                .padding(.vertical, 60)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .onDisappear { model.stop() }
+    }
+
+    @ViewBuilder
+    private var buttons: some View {
+        switch model.state {
+        case .running:
+            SMBRowButton(title: L10n.string("usenet_tune_stop", fallback: "Stop"), accentColor: accentColor) { model.stop() }
+        case .idle:
+            SMBRowButton(title: L10n.string("usenet_tune_start", fallback: "Start"), accentColor: accentColor) { model.start() }
+            SMBRowButton(title: L10n.string("usenet_tune_close", fallback: "Close"), accentColor: accentColor) { dismiss() }
+        default:
+            if model.changes, !model.applied {
+                SMBRowButton(title: L10n.string("usenet_tune_apply", fallback: "Apply"), accentColor: accentColor) {
+                    model.apply()
+                }
+            }
+            SMBRowButton(title: L10n.string("usenet_tune_again", fallback: "Again"), accentColor: accentColor) { model.start() }
+            SMBRowButton(title: L10n.string("usenet_tune_close", fallback: "Close"), accentColor: accentColor) { dismiss() }
+        }
+    }
+
+    private var readings: [UsenetTuneReading] {
+        model.result?.readings ?? model.progress?.readings ?? []
+    }
+
+    private var progressText: String {
+        guard let progress = model.progress else {
+            return L10n.string("usenet_tune_preparing", fallback: "Preparing…")
+        }
+        switch progress.phase {
+        case .testData:
+            return L10n.string("usenet_tune_test_data_running", fallback: "Downloading the test file's NZB…")
+        case .limit:
+            return L10n.format("usenet_tune_limit_running", fallback: "Checking the connection limit: %d open…", progress.connections)
+        case .port:
+            return L10n.format("usenet_tune_port_running", fallback: "Measuring port %d with %d connections…", progress.port, progress.connections)
+        case .connections:
+            return L10n.format("usenet_tune_connections_running", fallback: "Measuring %d connections…", progress.connections)
+        }
+    }
+
+    @ViewBuilder
+    private func summary(_ result: UsenetTuneResult) -> some View {
+        if let limit = result.limit {
+            line(L10n.format("usenet_tune_limit", fallback: "Your plan accepts %d connections.", limit))
+            if server.connections > UsenetTunePlan.usable(limit: limit, tried: result.tried) {
+                line(L10n.format("usenet_tune_over_limit", fallback: "%d are set: more than it accepts, so some are turned away.", server.connections))
+            }
+        } else {
+            line(L10n.format("usenet_tune_no_limit", fallback: "No limit up to %d connections.", result.tried))
+        }
+        line(L10n.format("usenet_tune_fastest", fallback: "Fastest: %d connections, %@ Mbit/s.",
+                         result.fastestConnections, Self.mbps(result.megabitsPerSecond)))
+        if model.applied {
+            line(L10n.string("usenet_tune_applied", fallback: "Saved."))
+        } else if model.changes {
+            line(L10n.format("usenet_tune_recommended", fallback: "Recommended: port %d, %d connections.",
+                             result.port, min(result.connections, UsenetServerConfig.maxConnectionsLimit)))
+        } else {
+            line(L10n.string("usenet_tune_unchanged", fallback: "Your settings are already right."))
+        }
+        line(L10n.format("usenet_tune_data", fallback: "Data used: %@",
+                         ByteCountFormatter.string(fromByteCount: result.downloadedBytes, countStyle: .file)), secondary: true)
+    }
+
+    private func line(_ text: String, secondary: Bool = false) -> some View {
+        Text(text)
+            .font(.system(size: secondary ? 22 : 26, weight: secondary ? .regular : .semibold))
+            .foregroundColor(.white.opacity(secondary ? 0.65 : 0.95))
+            .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private static func mbps(_ value: Double) -> String {
+        String(format: "%.0f", value)
+    }
+}
+
 /// Settings → Usenet → Read Ahead on Disk: on or off, its size (a choice, or typed in GB) and
 /// what tvOS reports free.
 private struct UsenetDiskReadAheadRows: View {
@@ -25342,6 +25563,7 @@ private struct UsenetSettingsSection: View {
 
     @StateObject private var model = UsenetSettingsModel()
     @State private var editingServer: UsenetSavedServer?
+    @State private var tuningServer: UsenetSavedServer?
     @State private var isAddingServer = false
     @State private var profile = UsenetSettings.profile().rawValue
     @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
@@ -25369,6 +25591,7 @@ private struct UsenetSettingsSection: View {
                     testState: model.tests[server.id] ?? .idle,
                     onEdit: { editingServer = server },
                     onTest: { model.test(server) },
+                    onTune: { tuningServer = server },
                     onDelete: { model.remove(server) }
                 )
             }
@@ -25441,6 +25664,9 @@ private struct UsenetSettingsSection: View {
             UsenetServerEditSheet(server: nil, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .fullScreenCover(item: $tuningServer) { server in
+            UsenetTuneSheet(server: server, accentColor: accentColor)
+        }
         .sheet(item: $editingServer) { server in
             UsenetServerEditSheet(server: server, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
@@ -25454,6 +25680,7 @@ private struct UsenetServerRow: View {
     let testState: UsenetSettingsModel.TestState
     let onEdit: () -> Void
     let onTest: () -> Void
+    let onTune: () -> Void
     let onDelete: () -> Void
 
     @FocusState private var isFocused: Bool
@@ -25484,6 +25711,11 @@ private struct UsenetServerRow: View {
                     accentColor: accentColor,
                     isLoading: testState == .testing,
                     action: onTest
+                )
+                SMBRowButton(
+                    title: L10n.string("usenet_tune", fallback: "Tune"),
+                    accentColor: accentColor,
+                    action: onTune
                 )
                 Spacer()
                 SMBDeleteButton(action: onDelete)
