@@ -234,6 +234,26 @@ final class UsenetNZBTests: XCTestCase {
         XCTAssertEqual(chosen?.name, "Show.S01E01.1080p.mkv")
     }
 
+    func testDiscImagesPlayLikeVideos() throws {
+        let nzb = try UsenetNZB.parse(UsenetFixture.nzb([
+            (#"[1/3] - "Movie.2019.COMPLETE.BLURAY.iso" yEnc (1/2)"#, [("i1@x", 900, 1), ("i2@x", 900, 2)]),
+            (#"[2/3] - "Movie.2019.sample.m2ts" yEnc (1/1)"#, [("s@x", 50, 1)]),
+            (#"[3/3] - "Movie.2019.nfo" yEnc (1/1)"#, [("n@x", 5, 1)]),
+        ]))
+        XCTAssertEqual(UsenetReleaseResolver.choose(entries(nzb), mustInclude: nil, fileIdx: nil)?.name, "Movie.2019.COMPLETE.BLURAY.iso")
+        XCTAssertTrue(UsenetReleaseResolver.isPlayableName("Movie.ISO"))
+        XCTAssertFalse(UsenetReleaseResolver.isVideoName("Movie.iso"))
+    }
+
+    func testADiscIsNeverPlayedForAnotherEpisode() {
+        let disc = [UsenetPlayableEntry(name: "Show.S01.DISC1.BLURAY.iso", source: .plain(0), size: 900, order: 0)]
+        XCTAssertNil(UsenetReleaseResolver.choose(disc, mustInclude: "S01E02", fileIdx: nil))
+        let named = [UsenetPlayableEntry(name: "Show.S01E02.BLURAY.iso", source: .plain(0), size: 900, order: 0)]
+        XCTAssertEqual(UsenetReleaseResolver.choose(named, mustInclude: "S01E02", fileIdx: nil)?.name, "Show.S01E02.BLURAY.iso")
+        // Without an episode to find, a lone disc plays.
+        XCTAssertEqual(UsenetReleaseResolver.choose(disc, mustInclude: nil, fileIdx: nil)?.name, "Show.S01.DISC1.BLURAY.iso")
+    }
+
     func testTrailerInSeriesTitleDoesNotExcludeEpisode() {
         let candidates = [
             UsenetPlayableEntry(name: "Trailer.Park.Boys.S01E01.1080p.mkv", source: .plain(0), size: 200, order: 0),
@@ -295,6 +315,9 @@ final class UsenetNZBTests: XCTestCase {
         XCTAssertEqual(role("Movie.nfo"), .sidecar)
         XCTAssertEqual(role("Movie.7z"), .unsupportedArchive)
         XCTAssertEqual(role("Movie.mkv.001"), .split)
+        XCTAssertEqual(role("Movie.2019.COMPLETE.BLURAY.iso"), .image)
+        XCTAssertEqual(role("Movie.DVD.img"), .image)
+        XCTAssertEqual(role("Movie.iso.001"), .split)
         XCTAssertEqual(role("a8f3e1c9b2d47e6f"), .unknown)
         XCTAssertEqual(role("Show.S01E01.1080p"), .unknown)
     }
@@ -607,6 +630,17 @@ final class UsenetFormatTests: XCTestCase {
         ts[0] = 0x47; ts[188] = 0x47; ts[376] = 0x47
         XCTAssertEqual(UsenetSniff.kind(of: ts), .video("ts"))
         XCTAssertEqual(UsenetSniff.kind(of: Data("hello world".utf8)), .unknown)
+        // A disc image: its volume recognition sequence starts at sector 16.
+        for identifier in ["NSR03", "BEA01", "CD001"] {
+            var image = Data(count: 40_000)
+            image.replaceSubrange((16 * 2048 + 1)..<(16 * 2048 + 6), with: Data(identifier.utf8))
+            XCTAssertEqual(UsenetSniff.kind(of: image), .discImage, identifier)
+        }
+        var bluRay = Data(count: 40_000)
+        bluRay.replaceSubrange((17 * 2048 + 1)..<(17 * 2048 + 6), with: Data("NSR03".utf8))
+        XCTAssertEqual(UsenetSniff.kind(of: bluRay), .discImage)
+        XCTAssertEqual(UsenetSniff.kind(of: Data(count: 40_000)), .unknown)
+        XCTAssertEqual(UsenetSniff.kind(of: Data(count: 2048)), .unknown)
     }
 }
 

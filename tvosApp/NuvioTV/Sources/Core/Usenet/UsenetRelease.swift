@@ -64,7 +64,9 @@ enum UsenetFileRole: Equatable, Sendable {
     /// A raw split of a video (`movie.mkv.001`, `.002`, …).
     case split
     case par2
-    /// An archive format that can't be streamed (7z, zip, iso).
+    /// A disc image (`.iso`, `.img`): the player reads its Blu-ray or DVD title out of it.
+    case image
+    /// An archive format that can't be streamed (7z, zip).
     case unsupportedArchive
     case sidecar
     /// No telling from the name: obfuscated, or an extension nobody uses.
@@ -108,7 +110,7 @@ struct UsenetReleaseResolver {
         // 1. Obfuscated files: their first article tells what they are. Only
         //    worth it when the named files aren't already the bulk of the release.
         let unknown = files.indices.filter { roles[$0] == .unknown && !files[$0].segments.isEmpty }
-        let namedBytes = files.indices.filter { [UsenetFileRole.video, .rar, .split].contains(roles[$0]) }
+        let namedBytes = files.indices.filter { [UsenetFileRole.video, .rar, .split, .image].contains(roles[$0]) }
             .reduce(0) { $0 + files[$1].encodedBytes }
         let unknownBytes = unknown.reduce(0) { $0 + files[$1].encodedBytes }
         if !unknown.isEmpty, namedBytes == 0 || unknownBytes > namedBytes {
@@ -138,6 +140,9 @@ struct UsenetReleaseResolver {
                     obfuscatedRar.insert(index)
                 case .par2:
                     roles[index] = .par2
+                case .discImage:
+                    names[index] = "\(names[index]).iso"
+                    roles[index] = .image
                 case .sevenZip, .zip:
                     roles[index] = .unsupportedArchive
                 case .unknown:
@@ -158,7 +163,8 @@ struct UsenetReleaseResolver {
         entries.sort { $0.order < $1.order }
 
         guard let chosen = Self.choose(entries, mustInclude: mustInclude, fileIdx: fileIdx) else {
-            if let mustInclude, !mustInclude.isEmpty, entries.count > 1 {
+            if let mustInclude, !mustInclude.isEmpty,
+               entries.count > 1 || entries.contains(where: { Self.isDiscImageName($0.name) }) {
                 // A pack without the wanted episode: never play another one instead.
                 throw UsenetError.fileNotInPack
             }
@@ -229,14 +235,15 @@ struct UsenetReleaseResolver {
         if ext == "par2" { return .par2 }
         if ext == "rar" { return .rar }
         if ext.count == 3, ext.hasPrefix("r"), Int(ext.dropFirst()) != nil { return .rar }
+        if ["iso", "img"].contains(ext) { return .image }
         if ext.count == 3, Int(ext) != nil {
             let inner = ((lower as NSString).deletingPathExtension as NSString).pathExtension
-            if UsenetFile.videoExtensions.contains(inner) { return .split }
+            if UsenetFile.videoExtensions.contains(inner) || ["iso", "img"].contains(inner) { return .split }
             if ["7z", "zip"].contains(inner) { return .unsupportedArchive }
             if inner == "rar" { return .rar }
             return .unknown
         }
-        if ["7z", "zip", "iso", "img"].contains(ext) { return .unsupportedArchive }
+        if ["7z", "zip"].contains(ext) { return .unsupportedArchive }
         if sidecarExtensions.contains(ext) { return .sidecar }
         return .unknown
     }
@@ -268,7 +275,7 @@ struct UsenetReleaseResolver {
         var splits: [String: [(index: Int, number: Int)]] = [:]
         for index in files.indices {
             switch roles[index] {
-            case .video:
+            case .video, .image:
                 entries.append(UsenetPlayableEntry(name: names[index], source: .plain(index), size: files[index].encodedBytes, order: index * 1000))
             case .split:
                 let base = (names[index] as NSString).deletingPathExtension
@@ -383,6 +390,8 @@ struct UsenetReleaseResolver {
             if let match = entries.first(where: { matches($0.name) }) { return match }
             // Several files and none is the wanted one: let the caller fail.
             if candidates.count > 1 { return nil }
+            // A disc holds several episodes, and which of its titles is the wanted one isn't known.
+            if candidates.contains(where: { isDiscImageName($0.name) }) { return nil }
         }
         if let fileIdx, entries.indices.contains(fileIdx) { return entries[fileIdx] }
         return (candidates.isEmpty ? entries : candidates).max { $0.size < $1.size }
@@ -438,7 +447,7 @@ struct UsenetReleaseResolver {
             && !volume.headersEncrypted
 
         if !isMultiFile {
-            let videos = volume.entries.filter { !$0.isDirectory && Self.isVideoName($0.name) }
+            let videos = volume.entries.filter { !$0.isDirectory && Self.isPlayableName($0.name) }
             guard let inner = videos.max(by: { $0.unpackedSize < $1.unpackedSize }) else { return [] }
             return [UsenetPlayableEntry(name: inner.name, source: .rar(set), size: setBytes, order: baseOrder)]
         }
@@ -456,7 +465,7 @@ struct UsenetReleaseResolver {
         details[set] = UsenetRarSetDetail(parsed: parsed)
 
         let starts = parsed.flatMap { $0.volume.entries }
-            .filter { !$0.isDirectory && !$0.continuesFromPrevious && Self.isVideoName($0.name) }
+            .filter { !$0.isDirectory && !$0.continuesFromPrevious && Self.isPlayableName($0.name) }
         usenetLog.notice("usenet: RAR set holds \(starts.count) videos")
         return starts.enumerated().map { number, entry in
             UsenetPlayableEntry(
@@ -477,6 +486,17 @@ struct UsenetReleaseResolver {
 
     static func isVideoName(_ name: String) -> Bool {
         UsenetFile.videoExtensions.contains((name as NSString).pathExtension.lowercased())
+    }
+
+    /// A Blu-ray or DVD image: the player opens its title itself, like an `.iso` from a debrid
+    /// service or a torrent.
+    static func isDiscImageName(_ name: String) -> Bool {
+        ["iso", "img"].contains((name as NSString).pathExtension.lowercased())
+    }
+
+    /// A video, or a disc image.
+    static func isPlayableName(_ name: String) -> Bool {
+        isVideoName(name) || isDiscImageName(name)
     }
 
     /// Reads the headers that sit after the previous file's data, until the
