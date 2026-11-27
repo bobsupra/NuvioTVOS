@@ -226,9 +226,8 @@ enum UsenetAvailability {
 
 // MARK: - Checking streams from the stream list
 
-/// Checks Usenet streams before they're played: one from its card's menu, all the list
-/// shows from the button beside the sort button, or the first ones by themselves
-/// (Settings → Usenet → Check Streams Automatically).
+/// Checks Usenet streams before they're played: the first ones the stream list shows, by
+/// themselves (Settings → Usenet → Check Availability on Usenet).
 ///
 /// Each check downloads the stream's NZB into the NZB cache, so playing it afterwards
 /// doesn't download it again; the indexer still counts it as a download. Two checks run
@@ -344,23 +343,17 @@ final class UsenetAvailabilityChecker: ObservableObject {
         return report.verdict == .incomplete
     }
 
-    func isChecking(_ streams: [NuvioStream]) -> Bool {
-        streams.contains { state(for: $0)?.isPending == true }
-    }
-
-    /// Checks the Usenet ones among `streams`, in order. Asked for (`force`), it asks the
-    /// servers again (the NZB comes from the cache); by itself, it skips streams checked
-    /// within `resultLifetime`.
-    func check(_ streams: [NuvioStream], force: Bool) {
+    /// Checks the Usenet ones among `streams`, in order, but not streams checked within
+    /// `resultLifetime` or remembered incomplete.
+    func check(_ streams: [NuvioStream]) {
         var seen = Set<URL>()
         for stream in streams {
             guard let spec = Self.spec(for: stream), seen.insert(spec.nzbURL).inserted else { continue }
             let url = spec.nzbURL
             if states[url]?.isPending == true { continue }
-            if !force, case .checked? = states[url], let at = checkedAt[url],
+            if case .checked? = states[url], let at = checkedAt[url],
                Date().timeIntervalSince(at) < Self.resultLifetime { continue }
-            // Remembered incomplete: only a check asked for looks again.
-            if !force, states[url] == nil, remembered[Self.memoryKey(spec)] != nil { continue }
+            if states[url] == nil, remembered[Self.memoryKey(spec)] != nil { continue }
             states[url] = .queued
             queue.append(spec)
         }

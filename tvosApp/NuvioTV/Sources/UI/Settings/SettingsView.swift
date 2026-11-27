@@ -25397,10 +25397,10 @@ private struct UsenetSettingsSection: View {
             UsenetDiskReadAheadRows(accentColor: accentColor)
 
             SettingsChoiceRow(
-                title: L10n.string("usenet_auto_check_title", fallback: "Check Streams Automatically"),
+                title: L10n.string("usenet_auto_check_title", fallback: "Check Availability on Usenet"),
                 subtitle: L10n.string(
                     "usenet_auto_check_subtitle",
-                    fallback: "When the stream list opens, check the first Usenet streams on your servers, as the button beside the sort button does. Each check downloads the stream's NZB, which the indexer counts as a download."
+                    fallback: "When the stream list opens, check the first Usenet streams on your servers; each card shows what was found. Each check downloads the stream's NZB from its indexer, which counts against your API and download limits, so a premium account on the indexers you use is recommended."
                 ),
                 selection: $autoCheck,
                 options: UsenetSettings.autoCheckOptions.map(String.init),

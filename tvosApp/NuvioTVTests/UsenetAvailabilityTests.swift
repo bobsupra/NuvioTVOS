@@ -231,6 +231,8 @@ final class UsenetAvailabilityTests: XCTestCase {
         XCTAssertEqual(UsenetSettings.autoCheckCount(store: store), 0)
         UsenetSettings.setAutoCheckCount(5, store: store)
         XCTAssertEqual(UsenetSettings.autoCheckCount(store: store), 5)
+        UsenetSettings.setAutoCheckCount(10, store: store)
+        XCTAssertEqual(UsenetSettings.autoCheckCount(store: store), 10)
         UsenetSettings.setAutoCheckCount(-1, store: store)
         XCTAssertEqual(UsenetSettings.autoCheckCount(store: store), -1)
         UsenetSettings.setAutoCheckCount(7, store: store)
