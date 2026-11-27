@@ -701,7 +701,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Other ids of a title for add-ons that don't take its own but offer `resource`: an AniList
     /// title's Kitsu, MAL, AniDB, IMDb and TMDB ids; a Cinemeta anime's AniList, Kitsu, MAL and
-    /// AniDB ones.
+    /// AniDB ones; the IMDb id of a title whose id has an add-on's prefix.
     nonisolated static func aniListAlternatives(
         for videoId: String,
         type: String,
@@ -716,13 +716,35 @@ final class StreamsRepository: ObservableObject {
         if AniListMetaBuilder.isAniListID(videoId) || AnimeSource.isOtherSourceTitle(videoId) {
             return await AniListStreamIds.alternatives(for: videoId)
         }
+        // An add-on's prefix before the IMDb id: add-ons that take IMDb ids are asked by the
+        // IMDb id, and add-ons that take only anime ids as for the Cinemeta title.
+        if let imdbID = imdbRequestID(forAddonPrefixed: videoId) {
+            return [imdbID] + (await AniListStreamIds.cinemetaAlternatives(for: imdbID))
+        }
         // A Cinemeta anime, for add-ons that take only anime ids (kitsu:, anilist:, mal:, anidb:).
         return await AniListStreamIds.cinemetaAlternatives(for: videoId)
     }
 
-    /// The id plugins are asked by: the title's own, or an AniList title's IMDb id (plugins
-    /// take IMDb and TMDB ids), as add-ons that don't take anilist: ids are asked by it.
+    /// The IMDb id in a title id that has an add-on's prefix before it, with the episode kept:
+    /// "addon:tt0944947" gives "tt0944947", and "addon:tt0944947:1:2" gives "tt0944947:1:2".
+    /// nil for any other id, an IMDb id without a prefix included.
+    nonisolated static func imdbRequestID(forAddonPrefixed videoId: String) -> String? {
+        let parts = videoId.split(separator: ":", omittingEmptySubsequences: false).map(String.init)
+        guard parts.count == 2 || parts.count == 4,
+              !parts[0].isEmpty,
+              NuvioMeta.canonicalImdbID(from: parts[0]) == nil,
+              let imdbID = NuvioMeta.canonicalImdbID(from: parts[1]) else { return nil }
+        guard parts.count == 4 else { return imdbID }
+        guard let season = Int(parts[2]), season >= 0,
+              let episode = Int(parts[3]), episode > 0 else { return nil }
+        return "\(imdbID):\(season):\(episode)"
+    }
+
+    /// The id plugins are asked by: the title's own; an AniList title's IMDb id (plugins take
+    /// IMDb and TMDB ids), as add-ons that don't take anilist: ids are asked by it; or the IMDb
+    /// id of a title whose id has an add-on's prefix.
     nonisolated static func pluginVideoId(for videoId: String) async -> String {
+        if let imdbID = imdbRequestID(forAddonPrefixed: videoId) { return imdbID }
         guard AniListMetaBuilder.isAniListID(videoId) || AnimeSource.isOtherSourceTitle(videoId) else { return videoId }
         return await AniListStreamIds.alternatives(for: videoId).first { $0.hasPrefix("tt") } ?? videoId
     }
