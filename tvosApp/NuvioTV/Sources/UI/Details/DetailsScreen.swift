@@ -13298,10 +13298,11 @@ private struct TvStreamPickerOverlay: View {
 
             VStack(alignment: .leading, spacing: 8) {
                 if let episode {
+                    let title = revealedEpisodeTitle(for: episode) ?? ""
                     (Text(L10n.format("details_season_episode", fallback: "Season %1$d · Episode %2$d", episode.season, episode.episode))
                         .font(.system(size: 34, weight: .semibold))
                         .foregroundColor(.white)
-                    + Text(episode.title.isEmpty ? "" : "  ·  " + episode.title)
+                    + Text(title.isEmpty ? "" : "  ·  " + title)
                         .font(.system(size: 34, weight: .regular))
                         .foregroundColor(.white.opacity(0.75)))
                         .lineLimit(1)
@@ -13411,10 +13412,18 @@ private struct TvStreamPickerOverlay: View {
     }
 
     private func displayEpisodeTitle(for episode: NuvioVideo) -> String {
-        if hideUnwatchedEpisodeTitles && shouldApplySpoilerProtection(for: episode) {
-            return L10n.format("calendar_episode_number", fallback: "Episode %d", episode.episode)
-        }
-        return episode.title
+        revealedEpisodeTitle(for: episode)
+            ?? L10n.format("calendar_episode_number", fallback: "Episode %d", episode.episode)
+    }
+
+    /// The episode's title, or nil while Hide Unwatched Titles hides it. The summary beside
+    /// the list and the episode line above it both show this.
+    private func revealedEpisodeTitle(for episode: NuvioVideo) -> String? {
+        EpisodeSpoilerPolicy.revealedTitle(
+            of: episode,
+            hidesUnwatchedTitles: hideUnwatchedEpisodeTitles,
+            isProtected: shouldApplySpoilerProtection(for: episode)
+        )
     }
 
     private func shouldApplySpoilerProtection(for episode: NuvioVideo) -> Bool {

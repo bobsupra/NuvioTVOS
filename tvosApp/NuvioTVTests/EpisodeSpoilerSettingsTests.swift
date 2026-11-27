@@ -535,4 +535,29 @@ final class EpisodeSpoilerSettingsTests: XCTestCase {
         XCTAssertFalse(shouldApplySpoilerProtection(isWatched: true, continueProgress: 0.0))
         XCTAssertFalse(shouldApplySpoilerProtection(isWatched: true, continueProgress: 1.0))
     }
+
+    /// The source list's episode line and its summary both read `revealedTitle`.
+    func testRevealedTitleIsHiddenOnlyForAProtectedEpisodeWithTheSettingOn() {
+        let episode = NuvioVideo(
+            id: "tt0411008:1:1",
+            title: "Pilot (1)",
+            season: 1,
+            episode: 1,
+            thumbnail: nil,
+            overview: nil,
+            released: "2004-09-22"
+        )
+        XCTAssertNil(EpisodeSpoilerPolicy.revealedTitle(of: episode, hidesUnwatchedTitles: true, isProtected: true))
+        XCTAssertEqual(EpisodeSpoilerPolicy.revealedTitle(of: episode, hidesUnwatchedTitles: true, isProtected: false), "Pilot (1)")
+        XCTAssertEqual(EpisodeSpoilerPolicy.revealedTitle(of: episode, hidesUnwatchedTitles: false, isProtected: true), "Pilot (1)")
+
+        // With the setting off, protection isn't worked out at all.
+        var checked = false
+        func protected() -> Bool {
+            checked = true
+            return true
+        }
+        _ = EpisodeSpoilerPolicy.revealedTitle(of: episode, hidesUnwatchedTitles: false, isProtected: protected())
+        XCTAssertFalse(checked)
+    }
 }
