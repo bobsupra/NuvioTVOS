@@ -6820,7 +6820,6 @@ private struct LayoutDiscoverySettingsView: View {
                         accentColor: accentColor
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
-                    .settingsLeaf(.home, section: "HERO CATALOGS")
 
                     SettingsStepperRow(
                         title: L10n.string(
@@ -7323,7 +7322,7 @@ private struct LayoutDiscoverySettingsView: View {
 
                 DetailPageExtraRows(accentColor: accentColor)
             }
-            .settingsPlaces([SettingsPlace(.detail, "APPEARANCE"), SettingsPlace(.detail, "SECTIONS")])
+            .settingsPlaces([SettingsPlace(.detail, "APPEARANCE")])
 
             SettingsFeatureSummaryCard(
                 featureName: L10n.string("tvos_settings_stream_list", fallback: "Stream List"),
@@ -7551,6 +7550,8 @@ private struct HeroCatalogSelectionRow: View {
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.snapshotChangedNotification).receive(on: RunLoop.main)) { _ in
             loadCatalogs()
         }
+        // Set on the row itself: where the row is shown depends on the Home layout.
+        .settingsLeaf(.home, section: "HERO CATALOGS")
     }
 
     private func isSelected(_ id: String) -> Bool {
