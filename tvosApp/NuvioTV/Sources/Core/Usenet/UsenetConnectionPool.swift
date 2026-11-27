@@ -180,8 +180,13 @@ actor UsenetConnectionPool {
     }
 
     /// Fetches an article body, trying every server before giving up.
+    ///
+    /// `isIntact` checks each copy (the yEnc CRC): a damaged copy sends it on to the next
+    /// server, like a missing article. With no intact copy anywhere, the last damaged one
+    /// comes back, for the caller to tell (it checks the copy itself).
     func fetch(messageID: String, expectedBytes: Int = 0, priority: FetchPriority = .startup,
-               onProgress: (@Sendable (FetchProgress) -> Void)? = nil) async throws -> FetchOutcome {
+               onProgress: (@Sendable (FetchProgress) -> Void)? = nil,
+               isIntact: (@Sendable (Data) async -> Bool)? = nil) async throws -> FetchOutcome {
         var charged = 0
         if let limiter, expectedBytes > 0 {
             switch priority {
@@ -200,7 +205,7 @@ actor UsenetConnectionPool {
         if let onProgress { onConnected = { @Sendable in onProgress(.connected) } }
         do {
             switch try await run(messageID: messageID, statOnly: false, urgent: priority == .playback,
-                                 onConnected: onConnected) {
+                                 onConnected: onConnected, isIntact: isIntact) {
             case .body(let body): return .body(body)
             case .exists, .missing: return .missing
             }
@@ -230,6 +235,8 @@ actor UsenetConnectionPool {
         var configuredConnections = 0
         /// Articles a later server had after the first one didn't.
         var fallbackArticles = 0
+        /// Copies that failed their CRC, each sent on to the next server.
+        var damagedCopies = 0
         /// Connections replaced by fresh ones: dropped by the server, idle too
         /// long, or gone with another one that was dropped.
         var reconnects = 0
@@ -244,6 +251,7 @@ actor UsenetConnectionPool {
             totalConnections: servers.reduce(0) { $0 + $1.limit },
             configuredConnections: totalConnections,
             fallbackArticles: fallbackArticles,
+            damagedCopies: damagedCopies,
             reconnects: reconnects,
             primaryHost: servers.first?.config.host ?? "",
             serverCount: servers.count
@@ -251,6 +259,7 @@ actor UsenetConnectionPool {
     }
 
     private var fallbackArticles = 0
+    private var damagedCopies = 0
     private var reconnects = 0
 
     private enum Answer {
@@ -260,7 +269,10 @@ actor UsenetConnectionPool {
     }
 
     private func run(messageID: String, statOnly: Bool, urgent: Bool,
-                     onConnected: (@Sendable () -> Void)? = nil) async throws -> Answer {
+                     onConnected: (@Sendable () -> Void)? = nil,
+                     isIntact: (@Sendable (Data) async -> Bool)? = nil) async throws -> Answer {
+        // The last copy that failed `isIntact`, returned when no server has a better one.
+        var damaged: Data?
         var authError: UsenetNNTPError?
         // Every server turning the connection away (all connections in use,
         // maybe by another device) is not a missing article.
@@ -293,6 +305,14 @@ actor UsenetConnectionPool {
                     } else {
                         let body = try await connection.fetchBody(messageID: messageID)
                         release(connection, to: index)
+                        if let isIntact, !(await isIntact(body)) {
+                            damagedCopies += 1
+                            usenetLog.notice("usenet: \(self.servers[index].config.host, privacy: .public) sent a damaged copy of an article (CRC), asking the next server")
+                            damaged = body
+                            answered = true
+                            attempt = 3          // next server
+                            continue
+                        }
                         if index > 0 { fallbackArticles += 1 }
                         return .body(body)
                     }
@@ -323,6 +343,7 @@ actor UsenetConnectionPool {
                 }
             }
         }
+        if let damaged { return .body(damaged) }
         if let authError {
             throw UsenetError.serverRejected(Self.describe(authError))
         }

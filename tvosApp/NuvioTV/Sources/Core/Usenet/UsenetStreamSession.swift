@@ -106,6 +106,9 @@ struct UsenetFileLayout: Sendable, Equatable {
 struct UsenetSessionStats: Equatable, Sendable {
     var downloadedBytes: Int64 = 0
     var missingArticles = 0
+    /// Articles no server had an intact copy of (bad CRC): played as they came, and counted
+    /// towards damage like missing ones.
+    var damagedArticles = 0
     var cacheHits = 0
     var cacheMisses = 0
     var bufferedAheadBytes: Int64 = 0
@@ -644,15 +647,27 @@ actor UsenetStreamSession {
         let segment = source.volumes[place.volume].segments[place.index]
         let pool = self.pool
         return Task {
+            // Each copy is decoded once, here: a bad CRC sends the pool on to the next server.
+            let checked = UsenetCheckedCopy()
             let outcome = try await pool.fetch(
                 messageID: segment.messageID,
                 expectedBytes: segment.bytes,
                 priority: priority,
-                onProgress: { progress in Task { await self.fetchProgressed(index, token: token, progress) } }
+                onProgress: { progress in Task { await self.fetchProgressed(index, token: token, progress) } },
+                isIntact: { body in
+                    guard let decoded = try? await Self.decode(body) else { return false }
+                    checked.keep(decoded, of: body)
+                    return decoded.crcMatches != false
+                }
             )
             switch outcome {
             case .body(let body):
-                let decoded = try await Self.decode(body)
+                let decoded: UsenetYEncSegment
+                if let copy = checked.decoded(of: body) {
+                    decoded = copy
+                } else {
+                    decoded = try await Self.decode(body)
+                }
                 self.accept(index, place, decoded)
                 return decoded.data
             case .missing:
@@ -667,6 +682,8 @@ actor UsenetStreamSession {
     }
 
     private func accept(_ index: Int, _ place: (volume: Int, index: Int), _ decoded: UsenetYEncSegment) {
+        let intact = decoded.crcMatches != false
+        if !intact { counters.damagedArticles += 1 }
         let begin = Int64(decoded.fileOffset)
         layouts[place.volume].learn(place.index, range: begin..<(begin + Int64(decoded.data.count)))
         // Read-ahead past the memory one goes to the disk only, so it doesn't push out what
@@ -676,7 +693,9 @@ actor UsenetStreamSession {
         }
         keepOnDisk(index, decoded.data)
         counters.downloadedBytes += Int64(decoded.data.count)
-        recordOutcome(missing: false)
+        // No server had it intact: played as it is (a damaged frame beats a blank one), but
+        // a run of them is a broken release too.
+        recordOutcome(missing: !intact)
     }
 
     // MARK: - Damage
@@ -698,7 +717,7 @@ actor UsenetStreamSession {
         consecutiveMissing = missing ? consecutiveMissing + 1 : 0
         guard !reportedDamage, Self.isDamaged(consecutiveMissing: consecutiveMissing, recent: recentOutcomes) else { return }
         reportedDamage = true
-        usenetLog.error("usenet: release damaged (\(self.counters.missingArticles) missing articles), asking for another source")
+        usenetLog.error("usenet: release damaged (\(self.counters.missingArticles) missing articles, \(self.counters.damagedArticles) damaged), asking for another source")
         onDamaged()
     }
 
@@ -963,5 +982,27 @@ actor UsenetStreamSession {
             evicted.append(index)
         }
         return evicted
+    }
+}
+
+/// The decoded copy an article fetch checked, so it isn't decoded a second time. A copy that
+/// failed its check is kept too: with no intact one anywhere, the pool returns it.
+final class UsenetCheckedCopy: @unchecked Sendable {
+    private let lock = NSLock()
+    private var body: Data?
+    private var segment: UsenetYEncSegment?
+
+    func keep(_ segment: UsenetYEncSegment, of body: Data) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.body = body
+        self.segment = segment
+    }
+
+    /// What `body` decoded to, if it was checked.
+    func decoded(of body: Data) -> UsenetYEncSegment? {
+        lock.lock()
+        defer { lock.unlock() }
+        return self.body == body ? segment : nil
     }
 }

@@ -1055,6 +1055,7 @@ private final class FakeNNTPServer: @unchecked Sendable {
     private let allowed: Int
     private let refusal: Refusal
     private let bodies: Bodies
+    private let bodyLine: String
     private var served: [ObjectIdentifier: Int] = [:]
     private let queue = DispatchQueue(label: "nuvio.tests.fake-nntp")
     private let lock = NSLock()
@@ -1063,10 +1064,11 @@ private final class FakeNNTPServer: @unchecked Sendable {
     private var accepted = 0
     private var turnedAway = 0
 
-    init(allowed: Int, refusal: Refusal, bodies: Bodies = .always) {
+    init(allowed: Int, refusal: Refusal, bodies: Bodies = .always, bodyLine: String = "fake article line") {
         self.allowed = allowed
         self.refusal = refusal
         self.bodies = bodies
+        self.bodyLine = bodyLine
     }
 
     /// Bodies this connection asked for before, counting this one.
@@ -1163,7 +1165,7 @@ private final class FakeNNTPServer: @unchecked Sendable {
             }
             // Slow enough that the pool wants more connections than it gets.
             queue.asyncAfter(deadline: .now() + 0.05) {
-                self.send("222 0 body follows\r\nfake article line\r\n.\r\n", on: connection)
+                self.send("222 0 body follows\r\n\(self.bodyLine)\r\n.\r\n", on: connection)
             }
         } else {
             send("500 What?\r\n", on: connection)
@@ -1316,6 +1318,53 @@ final class UsenetPoolTests: XCTestCase {
         XCTAssertEqual(first, Array(repeating: .body, count: 4))
         XCTAssertEqual(second, Array(repeating: .body, count: 4), "a dropped connection is no missing article")
         XCTAssertGreaterThan(stats.reconnects, 0, "the idle connections that went with it were replaced")
+    }
+
+    func testADamagedCopyIsAskedForOnTheNextServer() async throws {
+        let first = FakeNNTPServer(allowed: 4, refusal: .greeting, bodyLine: "damaged copy")
+        let second = FakeNNTPServer(allowed: 4, refusal: .greeting, bodyLine: "intact copy")
+        let firstPort = try await first.start()
+        let secondPort = try await second.start()
+        let pool = UsenetConnectionPool(servers: [firstPort, secondPort].map {
+            UsenetServerConfig(host: "127.0.0.1", port: $0, useSSL: false, username: nil, password: nil, maxConnections: 2)
+        })
+        let isIntact: @Sendable (Data) async -> Bool = { String(decoding: $0, as: UTF8.self).contains("intact") }
+
+        let outcome = try await pool.fetch(messageID: "a@test", priority: .playback, isIntact: isIntact)
+        let stats = await pool.stats()
+        await pool.shutdown()
+        first.stop()
+        second.stop()
+
+        guard case .body(let body) = outcome else { return XCTFail("expected a body") }
+        XCTAssertTrue(String(decoding: body, as: UTF8.self).contains("intact copy"))
+        XCTAssertEqual(stats.damagedCopies, 1)
+        XCTAssertEqual(stats.fallbackArticles, 1)
+    }
+
+    func testWithNoIntactCopyTheDamagedOneComesBack() async throws {
+        let server = FakeNNTPServer(allowed: 4, refusal: .greeting, bodyLine: "damaged copy")
+        let port = try await server.start()
+        let pool = pool(port: port, login: false, connections: 2)
+
+        let outcome = try await pool.fetch(messageID: "a@test", priority: .playback, isIntact: { _ in false })
+        let stats = await pool.stats()
+        await pool.shutdown()
+        server.stop()
+
+        // Not a missing article: the caller plays it and counts it as damage itself.
+        guard case .body(let body) = outcome else { return XCTFail("expected the damaged copy") }
+        XCTAssertTrue(String(decoding: body, as: UTF8.self).contains("damaged copy"))
+        XCTAssertEqual(stats.damagedCopies, 1)
+    }
+
+    func testAKeptCopyIsOnlyReusedForTheSameBody() throws {
+        let checked = UsenetCheckedCopy()
+        let body = Data("=ybegin line=128 size=3 name=a\r\nabc\r\n=yend size=3\r\n".utf8)
+        let segment = try UsenetYEnc.decode(body: body)
+        checked.keep(segment, of: body)
+        XCTAssertNotNil(checked.decoded(of: body))
+        XCTAssertNil(checked.decoded(of: Data("other".utf8)))
     }
 
     func testConnectionsThatKeepFailingAreAnErrorNotAMissingArticle() async throws {
