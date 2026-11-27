@@ -3042,6 +3042,17 @@ enum ContinueWatchingFeatureFlags {
 /// setting. Selection follows the full guide order and the furthest watched
 /// episode, so out-of-order watch history never reveals several later cards.
 enum EpisodeSpoilerPolicy {
+    /// An episode's title, or nil when Hide Unwatched Titles is on and the episode is still
+    /// protected. `isProtected` is only checked with the setting on.
+    static func revealedTitle(
+        of episode: NuvioVideo,
+        hidesUnwatchedTitles: Bool,
+        isProtected: @autoclosure () -> Bool
+    ) -> String? {
+        if hidesUnwatchedTitles && isProtected() { return nil }
+        return episode.title
+    }
+
     static func completedLedgerEpisodeKeysByContentID() -> [String: Set<String>] {
         completedLedgerEpisodeKeysByContentID(from: WatchProgressLedger.records())
     }
