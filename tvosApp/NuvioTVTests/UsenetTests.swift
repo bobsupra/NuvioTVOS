@@ -293,7 +293,7 @@ final class UsenetNZBTests: XCTestCase {
         XCTAssertEqual(role("Movie.r07"), .rar)
         XCTAssertEqual(role("Movie.vol03+04.par2"), .par2)
         XCTAssertEqual(role("Movie.nfo"), .sidecar)
-        XCTAssertEqual(role("Movie.7z"), .unsupportedArchive)
+        XCTAssertEqual(role("Movie.7z"), .sevenZip)
         XCTAssertEqual(role("Movie.mkv.001"), .split)
         XCTAssertEqual(role("a8f3e1c9b2d47e6f"), .unknown)
         XCTAssertEqual(role("Show.S01E01.1080p"), .unknown)

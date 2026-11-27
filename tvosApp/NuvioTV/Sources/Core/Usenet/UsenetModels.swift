@@ -139,7 +139,7 @@ enum UsenetError: LocalizedError, Equatable {
         case .noPlayableFile:
             return L10n.string("usenet_error_no_file", fallback: "The NZB has no video file to play.")
         case .archiveNotSupported(let name):
-            return L10n.format("usenet_error_archive", fallback: "%@ is packed in a 7z/zip archive, which can't be streamed.", name)
+            return L10n.format("usenet_error_archive", fallback: "%@ is packed in an archive that can't be streamed.", name)
         case .firstSegmentUnavailable:
             return L10n.string("usenet_error_first_segment", fallback: "The release is incomplete on your Usenet servers.")
         case .serverRejected(let message):

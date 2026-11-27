@@ -16,6 +16,7 @@ struct UsenetStreamSource: Sendable {
         case plain
         case split
         case rar
+        case sevenZip = "7z"
     }
 
     var name: String
@@ -90,6 +91,15 @@ struct UsenetRarMapping: Sendable {
     var cipher: UsenetRarCipher?
 }
 
+/// A 7z archive's volumes and file list.
+struct UsenetSevenZipDetail: Sendable {
+    /// First article of each volume.
+    var heads: [UsenetYEncSegment]
+    /// Each volume's place in the archive.
+    var volumes: [UsenetExtent]
+    var entries: [UsenetSevenZip.Entry]
+}
+
 /// A multi-file RAR set with every volume's headers read, in volume order.
 struct UsenetRarSetDetail: Sendable {
     var parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)]
@@ -102,7 +112,9 @@ enum UsenetFileRole: Equatable, Sendable {
     /// A raw split of a video (`movie.mkv.001`, `.002`, …).
     case split
     case par2
-    /// An archive format that can't be streamed (7z, zip, iso).
+    /// A 7z archive, or a volume of one (`movie.7z`, `movie.7z.001`, …).
+    case sevenZip
+    /// An archive format that can't be streamed (zip, iso).
     case unsupportedArchive
     case sidecar
     /// No telling from the name: obfuscated, or an extension nobody uses.
@@ -118,6 +130,8 @@ struct UsenetPlayableEntry: Equatable, Sendable {
         /// A file of a RAR set stored inside the RAR set of these NZB files: its volumes are
         /// files of the outer set, by name, in order.
         case nestedRar([Int], volumes: [String])
+        /// A file stored in the 7z archive these NZB files are the volumes of.
+        case sevenZip([Int], file: String)
     }
 
     var name: String
@@ -149,7 +163,7 @@ struct UsenetReleaseResolver {
         // 1. Obfuscated files: their first article tells what they are. Only
         //    worth it when the named files aren't already the bulk of the release.
         let unknown = files.indices.filter { roles[$0] == .unknown && !files[$0].segments.isEmpty }
-        let namedBytes = files.indices.filter { [UsenetFileRole.video, .rar, .split].contains(roles[$0]) }
+        let namedBytes = files.indices.filter { [UsenetFileRole.video, .rar, .split, .sevenZip].contains(roles[$0]) }
             .reduce(0) { $0 + files[$1].encodedBytes }
         let unknownBytes = unknown.reduce(0) { $0 + files[$1].encodedBytes }
         if !unknown.isEmpty, namedBytes == 0 || unknownBytes > namedBytes {
@@ -179,7 +193,9 @@ struct UsenetReleaseResolver {
                     obfuscatedRar.insert(index)
                 case .par2:
                     roles[index] = .par2
-                case .sevenZip, .zip:
+                case .sevenZip:
+                    roles[index] = .sevenZip
+                case .zip:
                     roles[index] = .unsupportedArchive
                 case .unknown:
                     break
@@ -196,6 +212,12 @@ struct UsenetReleaseResolver {
                 heads: &heads, details: &rarDetails
             )
         }
+        var sevenZipDetails: [[Int]: UsenetSevenZipDetail] = [:]
+        var archiveProblem: UsenetError?
+        for set in Self.sevenZipSets(names: names, roles: roles) {
+            entries += try await sevenZipEntries(set, name: names[set[0]], heads: &heads,
+                                                 details: &sevenZipDetails, problem: &archiveProblem)
+        }
         entries.sort { $0.order < $1.order }
 
         guard let chosen = Self.choose(entries, mustInclude: mustInclude, fileIdx: fileIdx) else {
@@ -203,6 +225,7 @@ struct UsenetReleaseResolver {
                 // A pack without the wanted episode: never play another one instead.
                 throw UsenetError.fileNotInPack
             }
+            if let archiveProblem { throw archiveProblem }
             if let archive = files.indices.first(where: { roles[$0] == .unsupportedArchive }) {
                 throw UsenetError.archiveNotSupported(names[archive])
             }
@@ -253,7 +276,134 @@ struct UsenetReleaseResolver {
                                                  innerName: chosen.name, password: nzb.password)
             usenetLog.notice("usenet: RAR set inside a RAR set, \(innerNames.count) inner volumes")
             return try rarSource(chosen.name, mapping: mapping, parsed: parsed)
+        case .sevenZip(let indices, let fileName):
+            guard let detail = sevenZipDetails[indices] else { throw UsenetError.noPlayableFile }
+            return try sevenZipSource(fileName, indices: indices, detail: detail)
         }
+    }
+
+    // MARK: - 7z
+
+    /// 7z archives, by name: `x.7z` alone, or its volumes `x.7z.001`, `x.7z.002`, … in order. An
+    /// obfuscated archive recognised by its bytes stands alone.
+    static func sevenZipSets(names: [String], roles: [UsenetFileRole]) -> [[Int]] {
+        var sets: [String: [(index: Int, number: Int)]] = [:]
+        for index in names.indices where roles[index] == .sevenZip {
+            let lower = names[index].lowercased()
+            let ext = (lower as NSString).pathExtension
+            if ext == "7z" {
+                sets[lower, default: []].append((index, 0))
+            } else if ext.count == 3, let number = Int(ext), (lower as NSString).deletingPathExtension.hasSuffix(".7z") {
+                sets[(lower as NSString).deletingPathExtension, default: []].append((index, number))
+            } else {
+                sets["\u{0}\(index)", default: []].append((index, 0))
+            }
+        }
+        return sets.values.map { $0.sorted { $0.number < $1.number }.map(\.index) }
+            .sorted { ($0.first ?? 0) < ($1.first ?? 0) }
+    }
+
+    /// The videos stored in one 7z archive (its volumes `set`): its file list, read from the
+    /// archive's end. What keeps a video from playing (compressed, a password) is kept in
+    /// `problem` for when nothing else plays.
+    private func sevenZipEntries(_ set: [Int], name: String, heads: inout [Int: UsenetYEncSegment],
+                                 details: inout [[Int]: UsenetSevenZipDetail], problem: inout UsenetError?) async throws -> [UsenetPlayableEntry] {
+        let volumeHeads = try await requireHeads(set, heads: &heads)
+        let volumes = volumeHeads.enumerated().map { UsenetExtent(volume: $0.offset, offset: 0, length: Self.fileSize($0.element)) }
+        let archiveSize = volumes.reduce(0) { $0 + $1.length }
+        let entries: [UsenetSevenZip.Entry]
+        do {
+            let next = try UsenetSevenZip.nextHeader(volumeHeads[0].data)
+            guard next.offset + Int64(next.size) <= archiveSize else { throw UsenetError.releaseIncomplete }
+            let read: UsenetSevenZip.Reader = { offset, length in
+                try await self.archiveBytes(set, heads: volumeHeads, volumes: volumes, offset: offset, length: length)
+            }
+            let header = try await read(next.offset, next.size)
+            entries = try await UsenetSevenZip.entries(header: header, password: nzb.password, read: read)
+        } catch let failure as UsenetSevenZip.Failure {
+            switch failure {
+            case .needsPassword: problem = problem ?? .archiveEncrypted
+            case .wrongPassword: problem = problem ?? .wrongPassword
+            case .notSevenZip, .damaged: problem = problem ?? .releaseIncomplete
+            case .unsupported: problem = problem ?? .archiveNotSupported(name)
+            }
+            usenetLog.notice("usenet: 7z file list unreadable: \(String(describing: failure), privacy: .public)")
+            return []
+        }
+        details[set] = UsenetSevenZipDetail(heads: volumeHeads, volumes: volumes, entries: entries)
+
+        let baseOrder = (set.min() ?? 0) * 1000
+        var playable: [UsenetPlayableEntry] = []
+        for entry in entries where !entry.isDirectory && entry.size > 0 && Self.isVideoName(entry.name) {
+            switch entry.method {
+            case .stored:
+                break
+            case .encrypted:
+                // Encrypted files are decrypted from their folder's start: a file further into a
+                // solid folder would need everything before it.
+                guard entry.offsetInFolder == 0, !(nzb.password ?? "").isEmpty else {
+                    problem = problem ?? .archiveEncrypted
+                    continue
+                }
+            case .compressed:
+                problem = problem ?? .archiveCompressed(entry.name)
+                continue
+            }
+            playable.append(UsenetPlayableEntry(name: entry.name, source: .sevenZip(set, file: entry.name),
+                                                size: Int(clamping: entry.size), order: baseOrder + playable.count))
+        }
+        usenetLog.notice("usenet: 7z archive of \(set.count) volume(s) holds \(playable.count) playable videos")
+        return playable
+    }
+
+    /// The stream of a file stored in a 7z archive.
+    private func sevenZipSource(_ fileName: String, indices: [Int], detail: UsenetSevenZipDetail) throws -> UsenetStreamSource {
+        guard let entry = detail.entries.first(where: { $0.name == fileName && !$0.isDirectory }) else {
+            throw UsenetError.noPlayableFile
+        }
+        let start = entry.packStart + entry.offsetInFolder
+        var storedLength = entry.size
+        var cipher: UsenetRarCipher?
+        if case .encrypted(let properties) = entry.method {
+            guard let password = nzb.password, !password.isEmpty else { throw UsenetError.archiveEncrypted }
+            do {
+                cipher = try UsenetSevenZip.cipher(properties: properties, password: password, plainSize: entry.size)
+            } catch {
+                throw UsenetError.archiveEncrypted
+            }
+            // The whole folder: the file padded to AES blocks.
+            storedLength = entry.packSize
+        }
+        let mapped = UsenetStreamSource.compose([start..<(start + storedLength)], through: detail.volumes)
+        guard mapped.reduce(0, { $0 + $1.length }) == storedLength else { throw UsenetError.releaseIncomplete }
+        if let cipher, let first = mapped.first,
+           let head = Self.plainHead(of: detail.heads[first.volume], from: first, cipher: cipher),
+           Self.passwordLooksWrong(name: fileName, plainHead: head) {
+            throw UsenetError.wrongPassword
+        }
+        let used = Set(mapped.map(\.volume))
+        let kept = detail.heads.indices.filter(used.contains)
+        let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
+        return UsenetStreamSource(
+            name: fileName, kind: .sevenZip,
+            volumes: kept.map { nzb.files[indices[$0]] },
+            extents: mapped.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
+            firstArticles: kept.map { detail.heads[$0] },
+            cipher: cipher
+        )
+    }
+
+    /// `length` bytes of a 7z archive (its volumes joined) from `offset`.
+    private func archiveBytes(_ set: [Int], heads: [UsenetYEncSegment], volumes: [UsenetExtent],
+                              offset: Int64, length: Int) async throws -> Data {
+        var out = Data()
+        for piece in UsenetStreamSource.compose([offset..<(offset + Int64(length))], through: volumes) {
+            guard let bytes = try await volumeBytes(nzb.files[set[piece.volume]], head: heads[piece.volume],
+                                                    at: piece.offset, length: Int(piece.length)),
+                  bytes.count == Int(piece.length) else { throw UsenetError.releaseIncomplete }
+            out.append(bytes)
+        }
+        return out
     }
 
     /// The stream of a file mapped onto the volumes of a RAR set (`parsed`, in volume order).
@@ -390,11 +540,13 @@ struct UsenetReleaseResolver {
         if ext.count == 3, Int(ext) != nil {
             let inner = ((lower as NSString).deletingPathExtension as NSString).pathExtension
             if UsenetFile.videoExtensions.contains(inner) { return .split }
-            if ["7z", "zip"].contains(inner) { return .unsupportedArchive }
+            if inner == "7z" { return .sevenZip }
+            if inner == "zip" { return .unsupportedArchive }
             if inner == "rar" { return .rar }
             return .unknown
         }
-        if ["7z", "zip", "iso", "img"].contains(ext) { return .unsupportedArchive }
+        if ext == "7z" { return .sevenZip }
+        if ["zip", "iso", "img"].contains(ext) { return .unsupportedArchive }
         if sidecarExtensions.contains(ext) { return .sidecar }
         return .unknown
     }
