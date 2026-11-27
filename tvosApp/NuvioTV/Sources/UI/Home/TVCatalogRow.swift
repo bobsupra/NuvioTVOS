@@ -39,8 +39,47 @@ enum TVLayout {
 
 /// The UIKit scroll view under a SwiftUI ScrollView, found from a view in its content.
 final class TVScrollViewBox {
+    /// The offset `hold(_:for:)` keeps.
+    ///
+    /// SwiftUI sets an offset of its own on the UIKit scroll view when it updates it
+    /// (`HostingScrollView.updateContext`). While a backdrop resized a row, it did that a frame
+    /// or two after the row moved, with the offset from before the move: the row went back a
+    /// card, and the focused card was no longer under the row's title.
+    private var heldOffset: CGFloat?
+    private var heldUntil: TimeInterval = 0
+    private var holdObservation: NSKeyValueObservation?
+    private var isRestoringHeldOffset = false
+
+    /// Keeps the scroll view at `x` for `duration`. Anything else that moves it meanwhile is
+    /// undone in the same update, so no frame shows the other offset.
+    func hold(_ x: CGFloat, for duration: TimeInterval) {
+        heldOffset = x
+        heldUntil = ProcessInfo.processInfo.systemUptime + duration
+        if holdObservation == nil, let scrollView { observeForHold(scrollView) }
+    }
+
+    private func observeForHold(_ scrollView: UIScrollView) {
+        holdObservation = scrollView.observe(\.contentOffset, options: [.new]) { [weak self] scrollView, change in
+            guard let self, !self.isRestoringHeldOffset, let held = self.heldOffset else { return }
+            guard ProcessInfo.processInfo.systemUptime < self.heldUntil else {
+                self.heldOffset = nil
+                return
+            }
+            // Clamped to the content as it is now, which a backdrop change resizes.
+            let target = TVScrollMove.clamped(CGPoint(x: held, y: scrollView.contentOffset.y), in: scrollView).x
+            guard let x = change.newValue?.x, abs(x - target) > 0.5 else { return }
+            self.isRestoringHeldOffset = true
+            scrollView.contentOffset.x = target
+            self.isRestoringHeldOffset = false
+        }
+    }
+
     weak var scrollView: UIScrollView? {
         didSet {
+            if scrollView !== oldValue {
+                holdObservation = nil
+                heldOffset = nil
+            }
             guard scrollView !== oldValue, let scrollView, oldValue != nil else { return }
             onReplaced?(scrollView)
         }
@@ -111,13 +150,7 @@ enum TVScrollMove {
         animated: Bool,
         duration: TimeInterval = TVScrollMove.duration
     ) {
-        let inset = scrollView.adjustedContentInset
-        let maxX = max(scrollView.contentSize.width + inset.right - scrollView.bounds.width, -inset.left)
-        let maxY = max(scrollView.contentSize.height + inset.bottom - scrollView.bounds.height, -inset.top)
-        let offset = CGPoint(
-            x: min(max(target.x, -inset.left), maxX),
-            y: min(max(target.y, -inset.top), maxY)
-        )
+        let offset = clamped(target, in: scrollView)
         guard animated else {
             scrollView.contentOffset = offset
             return
@@ -131,6 +164,17 @@ enum TVScrollMove {
         ) {
             scrollView.contentOffset = offset
         }
+    }
+
+    /// `target` kept inside the scroll view's content.
+    static func clamped(_ target: CGPoint, in scrollView: UIScrollView) -> CGPoint {
+        let inset = scrollView.adjustedContentInset
+        let maxX = max(scrollView.contentSize.width + inset.right - scrollView.bounds.width, -inset.left)
+        let maxY = max(scrollView.contentSize.height + inset.bottom - scrollView.bounds.height, -inset.top)
+        return CGPoint(
+            x: min(max(target.x, -inset.left), maxX),
+            y: min(max(target.y, -inset.top), maxY)
+        )
     }
 }
 
@@ -993,14 +1037,15 @@ struct TVCatalogRow: View {
         duration: TimeInterval = TVScrollMove.duration
     ) -> Bool {
         guard let scrollView = scrollBox.scrollView else { return false }
-        TVScrollMove.move(
-            scrollView,
-            to: CGPoint(x: x, y: scrollView.contentOffset.y),
-            animated: animated,
-            duration: duration
-        )
+        let target = TVScrollMove.clamped(CGPoint(x: x, y: scrollView.contentOffset.y), in: scrollView)
+        // Held before the move, which would otherwise be put back to the last offset held.
+        scrollBox.hold(target.x, for: Self.heldOffsetDuration)
+        TVScrollMove.move(scrollView, to: target, animated: animated, duration: duration)
         return true
     }
+
+    /// Longer than a backdrop change, which can be under way when the row moves.
+    private static let heldOffsetDuration: TimeInterval = 1.0
 
     /// As `moveRow`, once the row's UIKit scroll view is there (it is found once the strip is in
     /// the window, which can be just after the row appears).
