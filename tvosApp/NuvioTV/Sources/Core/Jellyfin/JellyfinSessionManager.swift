@@ -429,22 +429,50 @@ final class JellyfinSessionManager: ObservableObject {
     /// Skips servers where `syncAutomatically` is false, libraries are not selected,
     /// a sync is already in flight, or `lastSyncDate` is fresher than `minimumInterval`.
     func autoSyncConnectedServers(minimumInterval: TimeInterval? = nil) {
-        for server in JellyfinServerStore.shared.servers {
+        for var server in JellyfinServerStore.shared.servers {
             guard server.syncAutomatically,
-                  !server.selectedLibraryIDs.isEmpty,
-                  connectionState(for: server.id).isConnected else {
+                  case .connected(let libraries) = connectionState(for: server.id) else {
                 continue
             }
             if case .syncing = syncState(for: server.id) {
                 continue
             }
-            if let lastSync = server.lastSyncDate, let minimumInterval {
+            // A server just added: its movie and TV libraries, so the Library's
+            // Servers tab fills without a trip to Settings.
+            if Self.picksVideoLibrariesOnFirstSync(server) {
+                let video = Self.videoLibraryIDs(libraries)
+                guard !video.isEmpty else { continue }
+                server.selectedLibraryIDs = video
+                JellyfinServerStore.shared.upsert(server)
+            }
+            guard !server.selectedLibraryIDs.isEmpty else { continue }
+            let indexedTitles = JellyfinLibraryIndex.shared.titlesByServerID[server.id]?.count ?? 0
+            if let lastSync = server.lastSyncDate, let minimumInterval,
+               !Self.needsFirstSyncHere(server, indexedTitles: indexedTitles) {
                 guard Date().timeIntervalSince(lastSync) >= minimumInterval else {
                     continue
                 }
             }
             sync(server)
         }
+    }
+
+    /// A server added since its last sync, with no library picked yet. One whose
+    /// libraries were all unpicked later keeps its sync date.
+    nonisolated static func picksVideoLibrariesOnFirstSync(_ server: JellyfinServerConfig) -> Bool {
+        server.selectedLibraryIDs.isEmpty && server.lastSyncDate == nil
+    }
+
+    /// The movie and TV libraries.
+    nonisolated static func videoLibraryIDs(_ libraries: [JellyfinLibrary]) -> [String] {
+        libraries.filter { $0.collectionType == "movies" || $0.collectionType == "tvshows" }.map(\.id)
+    }
+
+    /// Nothing indexed on this Apple TV for a server that never synced, or that
+    /// had titles when it last did, as after a fresh install with the servers
+    /// restored by settings sync: it syncs whatever the interval says.
+    nonisolated static func needsFirstSyncHere(_ server: JellyfinServerConfig, indexedTitles: Int) -> Bool {
+        indexedTitles == 0 && (server.lastSyncDate == nil || (server.lastSyncTitleCount ?? 0) > 0)
     }
 
     func connect(_ server: JellyfinServerConfig) async {
