@@ -66,6 +66,19 @@ enum UsenetSettings {
         store.set(speedLimitOptions.contains(value) ? value : 0, forKey: speedLimitKey)
     }
 
+    static let pipelineKey = "nuvio.tv.settings.integrations.usenetPipeline"
+    /// Read-ahead requests on one connection at once; 1 is off (the next one goes after the answer).
+    static let pipelineOptions = [1, 2, 4]
+
+    static func pipelineDepth(store: UserDefaults = ProfileSettings.current) -> Int {
+        let value = store.integer(forKey: pipelineKey)
+        return pipelineOptions.contains(value) ? value : 1
+    }
+
+    static func setPipelineDepth(_ value: Int, store: UserDefaults = ProfileSettings.current) {
+        store.set(pipelineOptions.contains(value) ? value : 1, forKey: pipelineKey)
+    }
+
     static func servers(store: UserDefaults = ProfileSettings.current) -> [UsenetSavedServer] {
         guard let data = store.data(forKey: serversKey),
               let servers = try? JSONDecoder().decode([UsenetSavedServer].self, from: data) else { return [] }

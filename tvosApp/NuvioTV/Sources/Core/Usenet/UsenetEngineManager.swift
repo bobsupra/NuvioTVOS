@@ -28,6 +28,8 @@ struct UsenetStreamStats: Equatable, Sendable {
     var kind = ""
     var fileSize: Int64 = 0
     var speedLimitMbps = 0
+    /// Read-ahead requests per connection at once; 1 when pipelining is off.
+    var pipelineDepth = 1
 
     var downloadRateFormatted: String {
         ByteCountFormatter.string(fromByteCount: Int64(downloadRate), countStyle: .file) + "/s"
@@ -48,6 +50,7 @@ struct UsenetStreamStats: Equatable, Sendable {
         if configuredConnections > totalConnections { connections += " (\(configuredConnections) set)" }
         var parts = [host, connections, downloadRateFormatted]
         if speedLimitMbps > 0 { parts.append("max \(speedLimitMbps) Mbit/s") }
+        if pipelineDepth > 1 { parts.append("pipeline ×\(pipelineDepth)") }
         return parts.joined(separator: " · ")
     }
 
@@ -116,7 +119,8 @@ final class UsenetEngineManager: ObservableObject {
             throw UsenetError.noServers
         }
 
-        let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: UsenetSettings.speedLimitMbps())
+        let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: UsenetSettings.speedLimitMbps(),
+                                        pipelineDepth: UsenetSettings.pipelineDepth())
         do {
             let nzb = try await Self.loadNZB(spec.nzbURL)
             let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
@@ -156,7 +160,8 @@ final class UsenetEngineManager: ObservableObject {
                 fileName: source.name,
                 kind: source.kind.rawValue,
                 fileSize: source.totalSize,
-                speedLimitMbps: pool.speedLimitMbps
+                speedLimitMbps: pool.speedLimitMbps,
+                pipelineDepth: pool.pipelineDepth
             )
             isStreaming = true
             Self.remember(source: spec.url.absoluteString, playback: url.absoluteString)

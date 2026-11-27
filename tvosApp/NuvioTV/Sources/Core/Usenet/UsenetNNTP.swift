@@ -178,6 +178,15 @@ actor UsenetNNTPConnection {
     private var lineQueue: [Data] = []
     private var lineCursor = 0
     private(set) var isClosed = false
+
+    // Pipelining: commands go out as soon as they are made and the server answers them in
+    // order, so each takes a ticket when it sends and reads its answer when its turn comes.
+    private var sentTickets = 0
+    private var readTicket = 0
+    private var turnWaiters: [Int: CheckedContinuation<Bool, Never>] = [:]
+
+    /// Commands sent whose answer hasn't been read yet.
+    var pendingAnswers: Int { sentTickets - readTicket }
     init(config: UsenetServerConfig) {
         self.config = config
     }
@@ -272,7 +281,10 @@ actor UsenetNNTPConnection {
         guard Self.isValidMessageID(messageID) else {
             throw UsenetNNTPError.articleUnavailable(code: 430)
         }
-        try await send("BODY <\(messageID)>")
+        return try await inTurn("BODY <\(messageID)>") { try await self.readBodyAnswer() }
+    }
+
+    private func readBodyAnswer() async throws -> Data {
         let status = try await readStatus()
         switch status.code {
         case 222:
@@ -296,7 +308,10 @@ actor UsenetNNTPConnection {
     /// Whether the server still has an article, without downloading it (`STAT`).
     func stat(messageID: String) async throws -> Bool {
         guard Self.isValidMessageID(messageID) else { return false }
-        try await send("STAT <\(messageID)>")
+        return try await inTurn("STAT <\(messageID)>") { try await self.readStatAnswer() }
+    }
+
+    private func readStatAnswer() async throws -> Bool {
         let status = try await readStatus()
         switch status.code {
         case 223:
@@ -310,6 +325,73 @@ actor UsenetNNTPConnection {
         default:
             throw UsenetNNTPError.protocolError("unexpected STAT response \(status.code)")
         }
+    }
+
+    // MARK: - Turns
+
+    /// Sends `command` right away and reads its answer once the answers to the commands sent
+    /// before it are read. An answer that says the article is gone leaves the connection in step;
+    /// any other failure (or a cancelled wait) closes it, failing the commands queued behind.
+    private func inTurn<T>(_ command: String, read: () async throws -> T) async throws -> T {
+        let ticket = sentTickets
+        sentTickets += 1
+        do {
+            try await send(command)
+            try await waitForTurn(ticket)
+        } catch {
+            failPipeline()
+            throw error
+        }
+        do {
+            let answer = try await read()
+            passTurn()
+            return answer
+        } catch UsenetNNTPError.articleUnavailable(let code) {
+            passTurn()
+            throw UsenetNNTPError.articleUnavailable(code: code)
+        } catch {
+            failPipeline()
+            throw error
+        }
+    }
+
+    private func waitForTurn(_ ticket: Int) async throws {
+        guard readTicket != ticket else { return }
+        guard !isClosed else { throw UsenetNNTPError.connectionClosed }
+        let proceed = await withTaskCancellationHandler {
+            await withCheckedContinuation { (continuation: CheckedContinuation<Bool, Never>) in
+                if readTicket == ticket {
+                    continuation.resume(returning: true)
+                } else if isClosed || Task.isCancelled {
+                    continuation.resume(returning: false)
+                } else {
+                    turnWaiters[ticket] = continuation
+                }
+            }
+        } onCancel: {
+            Task { await self.cancelTurn(ticket) }
+        }
+        if Task.isCancelled { throw CancellationError() }
+        guard proceed else { throw UsenetNNTPError.connectionClosed }
+    }
+
+    /// A read-ahead the player no longer needs, waiting behind other answers: rather than
+    /// downloading what nobody reads, the connection closes (the caller does that on throw).
+    private func cancelTurn(_ ticket: Int) {
+        turnWaiters.removeValue(forKey: ticket)?.resume(returning: false)
+    }
+
+    private func passTurn() {
+        readTicket += 1
+        turnWaiters.removeValue(forKey: readTicket)?.resume(returning: true)
+    }
+
+    private func failPipeline() {
+        close()
+        readTicket = sentTickets
+        let waiters = turnWaiters
+        turnWaiters = [:]
+        for waiter in waiters.values { waiter.resume(returning: false) }
     }
 
     /// A syntactically safe message-ID: no whitespace/control bytes and no angle brackets (we add
