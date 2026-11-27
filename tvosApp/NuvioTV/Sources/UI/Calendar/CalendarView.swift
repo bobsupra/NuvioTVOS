@@ -256,10 +256,6 @@ final class CalendarViewModel: ObservableObject {
         didRestore = true
         guard CalendarLibrarySource.isTmdbConfigured else { return false }
         let capturedInputs = currentInputs()
-        let snapshotSettings = Self.snapshotSignature(
-            settings: capturedInputs.settings,
-            sourceItems: capturedInputs.sourceItems
-        )
         let snapshots = self.snapshots
         state = .loading
         restoreTask = Task { [weak self] in
@@ -269,12 +265,14 @@ final class CalendarViewModel: ObservableObject {
             let currentInputs = self.currentInputs()
             if let snapshot,
                currentInputs.settings == capturedInputs.settings,
-               currentInputs.sourceItems == capturedInputs.sourceItems,
-               snapshot.isUsable(settings: snapshotSettings, now: Date()) {
+               snapshot.isUsable(settings: capturedInputs.settings, now: Date()) {
+                // Made from other shows (or before they were known): shown all the
+                // same, and `loadIfNeeded` loads the current one behind it.
                 self.loaded = Inputs(
                     day: snapshot.day,
                     settings: capturedInputs.settings,
-                    sourceItems: capturedInputs.sourceItems
+                    sourceItems: snapshot.hasSources(currentInputs.sourceItems)
+                        ? currentInputs.sourceItems : Self.staleSourceItems
                 )
                 self.state = .loaded(snapshot.result, loadedAt: snapshot.loadedAt)
             } else {
@@ -380,7 +378,8 @@ final class CalendarViewModel: ObservableObject {
         snapshotSequence += 1
         let sequence = snapshotSequence
         let snapshot = CalendarSnapshot(
-            settings: Self.snapshotSignature(settings: loaded.settings, sourceItems: loaded.sourceItems),
+            settings: loaded.settings,
+            sources: loaded.sourceItems,
             day: loaded.day,
             loadedAt: loadedAt,
             result: result
@@ -397,9 +396,9 @@ final class CalendarViewModel: ObservableObject {
         Inputs(day: CalendarDay(date: Date()), settings: Self.settingsSignature(), sourceItems: sourceItemsSignature)
     }
 
-    private static func snapshotSignature(settings: String, sourceItems: String) -> String {
-        "\(settings)|\(sourceItems)"
-    }
+    /// The sources of a saved calendar made from other shows than the current
+    /// ones: never equal to current inputs, so it is loaded again.
+    private static let staleSourceItems = "saved-calendar-from-other-sources"
 
     /// Everything besides the day that changes what the calendar holds.
     private static func settingsSignature() -> String {
