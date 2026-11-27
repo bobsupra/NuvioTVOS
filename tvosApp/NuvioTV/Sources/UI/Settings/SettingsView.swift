@@ -13924,7 +13924,7 @@ private struct AudioVideoProcessingSettingsSection: View {
                     title: L10n.string("tvos_settings_truehd_spatial_audio", fallback: "Atmos & DTS:X Spatial Audio (Beta)"),
                     subtitle: L10n.string(
                         "tvos_settings_truehd_spatial_audio_subtitle",
-                        fallback: "Render TrueHD Atmos and DTS:X to 9.1.6 using lossy APAC. Requires tvOS 26+ and AetherEngine; applies to the next playback."
+                        fallback: "Render TrueHD Atmos and DTS:X to 9.1.6. Requires tvOS 26+ and AetherEngine; applies to the next playback."
                     ),
                     isOn: $trueHDSpatialAudio,
                     accentColor: accentColor
