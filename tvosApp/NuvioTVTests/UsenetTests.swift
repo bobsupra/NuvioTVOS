@@ -654,6 +654,16 @@ final class UsenetSourceTests: XCTestCase {
         XCTAssertEqual(try source(segmentCounts: [5, 5]).totalSize, 20)
     }
 
+    func testTwoSamplesFromInsideTheReleaseAreDownloaded() throws {
+        let samples = UsenetHealthCheck.samples(for: try source(segmentCounts: [30]))
+        let downloads = UsenetHealthCheck.downloads(in: samples)
+        XCTAssertEqual(downloads.count, UsenetHealthCheck.bodyProbes)
+        XCTAssertEqual(downloads, [samples[3], samples[7]])
+        XCTAssertFalse(downloads.contains(samples.first!))
+        XCTAssertFalse(downloads.contains(samples.last!), "the end is only asked about")
+        XCTAssertTrue(UsenetHealthCheck.downloads(in: ["a", "b"]).isEmpty)
+    }
+
     func testHealthVerdict() {
         XCTAssertTrue(UsenetHealthCheck.isPlayable(.init(checked: 12, missing: 0, tailMissing: false)))
         XCTAssertTrue(UsenetHealthCheck.isPlayable(.init(checked: 12, missing: 1, tailMissing: false)))

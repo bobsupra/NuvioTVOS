@@ -610,11 +610,14 @@ struct UsenetReleaseResolver {
 
 // MARK: - Availability check
 
-/// Asks the servers (STAT, no download) whether a sample of the release's
-/// articles still exists, so an incomplete upload fails in a second instead
-/// of half an hour into the film.
+/// Asks the servers whether a sample of the release's articles still exists, so
+/// an incomplete upload fails in a second instead of half an hour into the film.
+/// Most are only asked about (STAT); `bodyProbes` of them from inside the release
+/// are downloaded (BODY), because a provider can still answer STAT for an article
+/// taken down that BODY then refuses (451).
 enum UsenetHealthCheck {
     static let sampleCount = 12
+    static let bodyProbes = 2
 
     struct Result: Equatable {
         var checked: Int
@@ -635,12 +638,29 @@ enum UsenetHealthCheck {
         return picked
     }
 
+    /// The samples downloaded instead of only asked about: spread inside the release, never
+    /// its first or last; none when there are fewer than three samples.
+    static func downloads(in samples: [String]) -> Set<String> {
+        guard samples.count >= 3 else { return [] }
+        return Set((1...bodyProbes).map { samples[$0 * (samples.count - 1) / (bodyProbes + 1)] })
+    }
+
     static func check(_ source: UsenetStreamSource, pool: UsenetConnectionPool) async throws -> Result {
         let ids = samples(for: source)
         guard let tail = ids.last else { return Result(checked: 0, missing: 0, tailMissing: false) }
+        let downloads = downloads(in: ids)
         let found = try await withThrowingTaskGroup(of: (String, Bool).self, returning: [String: Bool].self) { group in
             for id in ids {
-                group.addTask { (id, try await pool.exists(messageID: id)) }
+                if downloads.contains(id) {
+                    group.addTask {
+                        switch try await pool.fetch(messageID: id) {
+                        case .body(let body): return (id, !body.isEmpty)
+                        case .missing: return (id, false)
+                        }
+                    }
+                } else {
+                    group.addTask { (id, try await pool.exists(messageID: id)) }
+                }
             }
             var results: [String: Bool] = [:]
             for try await answer in group { results[answer.0] = answer.1 }
