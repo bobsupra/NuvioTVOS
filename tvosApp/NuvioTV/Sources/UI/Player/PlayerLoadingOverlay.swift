@@ -284,6 +284,9 @@ struct PlayerLoadingOverlay: View {
     var focusEnabled: Bool = true
     var onSelect: (() -> Void)? = nil
     var onMove: ((MoveCommandDirection) -> Void)? = nil
+    /// Loading Overlay is off in Settings: the artwork screen is not drawn,
+    /// only a spinner. Focus, Select and Back are handled the same way.
+    var spinnerOnly: Bool = false
 
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @FocusState private var isFocusActive: Bool
@@ -309,7 +312,8 @@ struct PlayerLoadingOverlay: View {
         onDismiss: (() -> Void)? = nil,
         focusEnabled: Bool = true,
         onSelect: (() -> Void)? = nil,
-        onMove: ((MoveCommandDirection) -> Void)? = nil
+        onMove: ((MoveCommandDirection) -> Void)? = nil,
+        spinnerOnly: Bool = false
     ) {
         self.backdropUrl = backdropUrl
         self.logoUrl = logoUrl
@@ -321,6 +325,7 @@ struct PlayerLoadingOverlay: View {
         self.focusEnabled = focusEnabled
         self.onSelect = onSelect
         self.onMove = onMove
+        self.spinnerOnly = spinnerOnly
 
         let initialImage: UIImage?
         if let backdropUrl,
@@ -356,8 +361,17 @@ struct PlayerLoadingOverlay: View {
                 }
             #endif
 
+            if spinnerOnly {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .scaleEffect(2)
+                    .padding(48)
+                    .glassCircle()
+            }
+
             // 1. Solid Black Base
             Color.black.ignoresSafeArea()
+                .opacity(spinnerOnly ? 0 : 1)
 
             // 2. Fullscreen Backdrop Image. Filled inside a screen-sized frame and cut
             // to it: a portrait poster (a title without a backdrop) filled on its own
@@ -372,6 +386,7 @@ struct PlayerLoadingOverlay: View {
                     }
                     .clipped()
                     .ignoresSafeArea()
+                    .opacity(spinnerOnly ? 0 : 1)
             }
 
             // 3. Cinematic Vignette Gradient Overlays (matching Android TV)
@@ -386,6 +401,7 @@ struct PlayerLoadingOverlay: View {
                 endPoint: .bottom
             )
             .ignoresSafeArea()
+            .opacity(spinnerOnly ? 0 : 1)
 
             RadialGradient(
                 gradient: Gradient(colors: [
@@ -397,6 +413,7 @@ struct PlayerLoadingOverlay: View {
                 endRadius: 900
             )
             .ignoresSafeArea()
+            .opacity(spinnerOnly ? 0 : 1)
 
             // 4. Center Logo / Title + Status Text
             VStack(spacing: 24) {
@@ -578,6 +595,7 @@ struct PlayerLoadingOverlay: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
             .padding(.horizontal, 80)
+            .opacity(spinnerOnly ? 0 : 1)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .ignoresSafeArea()

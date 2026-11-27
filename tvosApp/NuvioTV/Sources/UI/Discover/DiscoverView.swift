@@ -512,6 +512,7 @@ private struct DiscoverCard: View {
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @Environment(\.cardAppearance) private var cardAppearance
 
     private var customPosterArtworkURL: String? {
         CustomPosterURLResolver.resolve(
@@ -563,6 +564,8 @@ private struct DiscoverCard: View {
                         coveredByArtwork: true
                     )
                 )
+                // Settings → Poster Card Style → Card depth effect.
+                .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .posters, shape: shape))
                 .overlay(alignment: .topTrailing) {
                     WatchedCheckmarkBadge(meta: meta)
                 }

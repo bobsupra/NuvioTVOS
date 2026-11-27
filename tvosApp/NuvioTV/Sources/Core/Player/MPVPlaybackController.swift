@@ -1333,7 +1333,15 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         checkError(mpv_set_option_string(mpv, "ao", Self.defaultAudioOutput))
         // AVSampleBufferAudioRenderer follows tvOS's active output route without
         // using the failing RemoteIO callback from MPV's AudioUnit backend.
-        checkError(mpv_set_option_string(mpv, "audio-channels", "auto-safe"))
+        // Settings → Audio → Downmix names the widest layout allowed. Off
+        // keeps the route's own layout.
+        let downmixChannels = AudioDownmix.mpvChannels(in: ProfileSettings.current)
+        checkError(mpv_set_option_string(mpv, "audio-channels", downmixChannels ?? "auto-safe"), context: "audio-channels")
+        // Maintain Original Audio on Downmix, switched off, lowers the mix so
+        // it cannot clip. Left at mpv's default while Downmix is off.
+        if AudioDownmix.mpvNormalizesDownmix(in: ProfileSettings.current) == true {
+            checkError(mpv_set_option_string(mpv, "audio-normalize-downmix", "yes"), context: "audio-normalize-downmix")
+        }
         // AVFoundation accepts interleaved PCM; packed float preserves decoded
         // precision while supporting route-selected stereo or multichannel audio.
         checkError(mpv_set_option_string(mpv, "audio-format", "float"))
@@ -1380,8 +1388,18 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         checkError(mpv_set_option_string(mpv, "demuxer-mkv-subtitle-preroll", "yes"), context: "demuxer-mkv-subtitle-preroll")
         checkError(mpv_set_option_string(mpv, "demuxer-mkv-subtitle-preroll-secs", "2"), context: "demuxer-mkv-subtitle-preroll-secs")
         checkError(mpv_set_option_string(mpv, "sub-fix-timing", "no"), context: "sub-fix-timing")
-        if let audioLanguage = SubtitleLanguagePreferences.preferredAudioLanguage(),
-           let alang = SubtitleLanguagePreferences.mpvLanguageList(for: [audioLanguage]) {
+        // The preferred language, then the secondary one when it is set.
+        // The secondary only backs up a preferred language. With none, mpv
+        // gets no list and plays the file's default track, as before.
+        var audioLanguages: [String] = []
+        if let preferred = SubtitleLanguagePreferences.preferredAudioLanguage() {
+            audioLanguages = [preferred]
+            if let secondary = SubtitleLanguagePreferences.secondaryAudioLanguage(), secondary != preferred {
+                audioLanguages.append(secondary)
+            }
+        }
+        if !audioLanguages.isEmpty,
+           let alang = SubtitleLanguagePreferences.mpvLanguageList(for: audioLanguages) {
             checkError(mpv_set_option_string(mpv, "alang", alang), context: "alang")
         }
         let preferredSubtitleLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
@@ -2677,11 +2695,23 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         setStringProperty("sub-margin-y", String(style.subMarginY))
         setStringProperty("sub-margin-x", String(style.subMarginX))
         setStringProperty("sub-spacing", String(style.subSpacing))
-        setStringProperty("sub-shadow-offset", style.backgroundEnabled ? "4" : "0")
+        // Subtitle Style → Drop shadow. mpv has one offset for the backdrop
+        // box and the shadow, so the shadow is drawn only while the backdrop
+        // is off. The shadow has its own color option.
+        let drawsShadow = style.hasShadow && !style.backgroundEnabled
+        setStringProperty("sub-shadow-offset", style.backgroundEnabled ? "4" : (drawsShadow ? String(style.resolvedShadowSize) : "0"))
         setStringProperty("sub-border-style", style.backgroundEnabled ? "background-box" : "outline-and-shadow")
         setStringProperty("sub-color", style.subColor)
         setStringProperty("sub-outline-color", style.subOutlineColor)
         setStringProperty("sub-back-color", style.subBackgroundColor)
+        if drawsShadow {
+            setStringProperty("sub-shadow-color", style.subShadowColor)
+        }
+        // Settings → Subtitles → Strip SDH Subtitles: mpv's own filter, for
+        // text subtitles (not image subtitles, not styled ASS).
+        let stripsSDH = ProfileSettings.current.object(forKey: SettingsKey.subtitleStripSDH) as? Bool ?? false
+        setStringProperty("sub-filter-sdh", stripsSDH ? "yes" : "no")
+        setStringProperty("sub-filter-sdh-harder", stripsSDH ? "yes" : "no")
         if !style.mpvFontName.isEmpty {
             setStringProperty("sub-font", style.mpvFontName)
         } else {

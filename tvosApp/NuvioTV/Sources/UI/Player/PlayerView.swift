@@ -23,6 +23,8 @@ struct PlayerView: View {
     @State private var completedLedgerEpisodeKeysByContentID: [String: Set<String>] = [:]
     @State private var hasCachedCompletedLedgerEvidence = false
     @AppStorage(SettingsKey.revealNextEpisodeSpoilers) var revealNextEpisodeSpoilers = false
+    /// Settings → Player Interface → Loading Overlay.
+    @AppStorage(SettingsKey.showLoadingOverlay) var showLoadingOverlay = true
     @Environment(\.scenePhase) var scenePhase
 
     let url: URL

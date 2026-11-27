@@ -582,6 +582,7 @@ struct TVCatalogRow: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.landscapePosters) private var landscapePosters = false
     @AppStorage(SettingsKey.continueWatchingLandscape) private var continueWatchingLandscape = false
+    @AppStorage(SettingsKey.continueWatchingEpisodeThumbnails) private var continueWatchingEpisodeThumbnails = true
     /// The row's UIKit scroll view, which the row moves itself.
     @State private var scrollBox = TVScrollViewBox()
 
@@ -788,7 +789,9 @@ struct TVCatalogRow: View {
         let episodeText: String? = progressItem?.episodeLabel ?? calendarLabel?.episode
         let episodeTitleText: String? = progressItem?.episodeDisplayTitle ?? calendarLabel?.episodeTitle
         let upcomingArtworkURL: String? = id == TVHomeSection.upcomingId ? progressItem?.meta.backdropUrl : nil
-        let episodeArtworkURL: String? = progressItem?.episodeArtworkURL ?? upcomingArtworkURL ?? calendarLabel?.artworkURL
+        // Off in Settings → Continue Watching leaves the card on the title's own artwork.
+        let progressArtworkURL: String? = continueWatchingEpisodeThumbnails ? progressItem?.episodeArtworkURL : nil
+        let episodeArtworkURL: String? = progressArtworkURL ?? upcomingArtworkURL ?? calendarLabel?.artworkURL
         let isUpNext: Bool = progressItem?.isUpNextEntry == true || calendarLabel != nil
         let upNextBadgeText: String? = progressLabels?.badge ?? calendarLabel?.badge
         let handleFocus: (NuvioMeta) -> Void = { focused in

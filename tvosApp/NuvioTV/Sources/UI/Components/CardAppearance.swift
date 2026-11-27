@@ -24,6 +24,10 @@ struct CardAppearance: Equatable {
     var blurUnwatchedEpisodes = false
     var hideUnwatchedEpisodeTitles = false
     var hideUnwatchedEpisodeDescriptions = false
+    var landscapeAlwaysBackdropLogo = false
+    var trailerStartSeconds = 0
+    var animatedArtworkOnFocus = false
+    var cardDepth = CardDepthStyle()
 
     /// The values saved in `defaults`, for views outside ContentView's tree.
     static func stored(in defaults: UserDefaults) -> CardAppearance {
@@ -45,7 +49,170 @@ struct CardAppearance: Equatable {
         if let value = defaults.object(forKey: SettingsKey.blurUnwatchedEpisodes) as? Bool { appearance.blurUnwatchedEpisodes = value }
         if let value = defaults.object(forKey: SettingsKey.hideUnwatchedEpisodeTitles) as? Bool { appearance.hideUnwatchedEpisodeTitles = value }
         if let value = defaults.object(forKey: SettingsKey.hideUnwatchedEpisodeDescriptions) as? Bool { appearance.hideUnwatchedEpisodeDescriptions = value }
+        if let value = defaults.object(forKey: SettingsKey.landscapeAlwaysBackdropLogo) as? Bool { appearance.landscapeAlwaysBackdropLogo = value }
+        if let value = defaults.object(forKey: SettingsKey.trailerStartSeconds) as? Int { appearance.trailerStartSeconds = value }
+        appearance.animatedArtworkOnFocus = AnimatedArtworkMode.playsOnFocus(defaults.string(forKey: SettingsKey.animatedArtwork))
+        appearance.cardDepth = CardDepthStyle.stored(in: defaults)
         return appearance
+    }
+}
+
+
+/// Settings → Poster Card Style → Animated artwork. The desktop app's
+/// "Always" is left out: on Apple TV only the focused card animates.
+enum AnimatedArtworkMode {
+    static let off = "Off"
+    static let onFocus = "On focus"
+    static let options = [off, onFocus]
+
+    static func playsOnFocus(_ stored: String?) -> Bool {
+        stored == onFocus
+    }
+
+    /// Animated posters are recognised by their address, so no card has to
+    /// download anything to find out.
+    static func isAnimatedImageURL(_ urlString: String?) -> Bool {
+        guard let urlString, let url = URL(string: urlString.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return false
+        }
+        return url.pathExtension.lowercased() == "gif"
+    }
+}
+
+#if os(tvOS)
+/// An animated poster over a grid card, for Settings → Poster Card Style →
+/// Animated artwork. Made only for a card whose poster is a GIF, with the
+/// option on. Nothing is downloaded or played until focus has rested on the
+/// card, and it stops when focus leaves.
+struct FocusedAnimatedArtwork: View {
+    let urlString: String
+    let isFocused: Bool
+    @State private var isArmed = false
+
+    var body: some View {
+        ZStack {
+            if isFocused && isArmed {
+                AnimatedRemoteGIFView(urlString: urlString, isActive: true, maxPixelSize: 640)
+            }
+        }
+        .allowsHitTesting(false)
+        .task(id: isFocused) {
+            guard isFocused else {
+                if isArmed { isArmed = false }
+                return
+            }
+            do {
+                try await Task.sleep(nanoseconds: 350_000_000)
+            } catch {
+                return
+            }
+            isArmed = true
+        }
+    }
+}
+#endif
+
+/// Settings → Poster Card Style → Card depth effect: a lit top edge and a
+/// soft sheen on image cards. Edge, sheen and coverage run from 0 to 100,
+/// as in the desktop app.
+struct CardDepthStyle: Equatable {
+    enum Surface {
+        case posters, continueWatching, episodes, cast
+    }
+
+    static let defaultEdge = 28
+    static let defaultSheen = 10
+    static let defaultCoverage = 0
+
+    static let keys = [
+        SettingsKey.cardDepthEnabled, SettingsKey.cardDepthEdge, SettingsKey.cardDepthSheen,
+        SettingsKey.cardDepthCoverage, SettingsKey.cardDepthPosters, SettingsKey.cardDepthContinueWatching,
+        SettingsKey.cardDepthEpisodes, SettingsKey.cardDepthCast
+    ]
+
+    var isEnabled = false
+    var edge = CardDepthStyle.defaultEdge
+    var sheen = CardDepthStyle.defaultSheen
+    var coverage = CardDepthStyle.defaultCoverage
+    var posters = true
+    var continueWatching = true
+    var episodes = true
+    var cast = true
+
+    func applies(to surface: Surface) -> Bool {
+        guard isEnabled, edge > 0 || sheen > 0 else { return false }
+        switch surface {
+        case .posters: return posters
+        case .continueWatching: return continueWatching
+        case .episodes: return episodes
+        case .cast: return cast
+        }
+    }
+
+    static func stored(in defaults: UserDefaults) -> CardDepthStyle {
+        var style = CardDepthStyle()
+        if let value = defaults.object(forKey: SettingsKey.cardDepthEnabled) as? Bool { style.isEnabled = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthEdge) as? Int { style.edge = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthSheen) as? Int { style.sheen = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthCoverage) as? Int { style.coverage = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthPosters) as? Bool { style.posters = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthContinueWatching) as? Bool { style.continueWatching = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthEpisodes) as? Bool { style.episodes = value }
+        if let value = defaults.object(forKey: SettingsKey.cardDepthCast) as? Bool { style.cast = value }
+        return style
+    }
+}
+
+/// Draws the card depth effect over a card. With the effect off, or off for
+/// this kind of card, the overlay is empty and nothing is drawn.
+struct CardDepthEffect<S: InsettableShape>: ViewModifier {
+    let style: CardDepthStyle
+    let surface: CardDepthStyle.Surface
+    let shape: S
+
+    func body(content: Content) -> some View {
+        content.overlay {
+            if style.applies(to: surface) {
+                CardDepthOverlay(style: style, shape: shape)
+            }
+        }
+    }
+}
+
+private struct CardDepthOverlay<S: InsettableShape>: View {
+    let style: CardDepthStyle
+    let shape: S
+
+    var body: some View {
+        let edge = Double(min(max(style.edge, 0), 100)) / 100
+        let sheen = Double(min(max(style.sheen, 0), 100)) / 100
+        let coverage = Double(min(max(style.coverage, 0), 100)) / 100
+        ZStack {
+            if sheen > 0 {
+                // The sheen covers the top 22 percent of the card.
+                LinearGradient(
+                    colors: [.white.opacity(sheen), .white.opacity(0)],
+                    startPoint: .top,
+                    endPoint: UnitPoint(x: 0.5, y: 0.22)
+                )
+                .clipShape(shape)
+            }
+            if edge > 0 {
+                shape.strokeBorder(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .white.opacity(edge), location: 0),
+                            .init(color: .white.opacity(edge * (0.33 + 0.67 * coverage)), location: 0.5),
+                            .init(color: .white.opacity(edge * coverage), location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    ),
+                    lineWidth: 2
+                )
+            }
+        }
+        .allowsHitTesting(false)
     }
 }
 
@@ -80,6 +247,17 @@ struct CardAppearanceProvider: ViewModifier {
     @AppStorage(SettingsKey.blurUnwatchedEpisodes) private var blurUnwatchedEpisodes = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeTitles) private var hideUnwatchedEpisodeTitles = false
     @AppStorage(SettingsKey.hideUnwatchedEpisodeDescriptions) private var hideUnwatchedEpisodeDescriptions = false
+    @AppStorage(SettingsKey.landscapeAlwaysBackdropLogo) private var landscapeAlwaysBackdropLogo = false
+    @AppStorage(SettingsKey.trailerStartSeconds) private var trailerStartSeconds = 0
+    @AppStorage(SettingsKey.animatedArtwork) private var animatedArtwork = AnimatedArtworkMode.off
+    @AppStorage(SettingsKey.cardDepthEnabled) private var cardDepthEnabled = false
+    @AppStorage(SettingsKey.cardDepthEdge) private var cardDepthEdge = CardDepthStyle.defaultEdge
+    @AppStorage(SettingsKey.cardDepthSheen) private var cardDepthSheen = CardDepthStyle.defaultSheen
+    @AppStorage(SettingsKey.cardDepthCoverage) private var cardDepthCoverage = CardDepthStyle.defaultCoverage
+    @AppStorage(SettingsKey.cardDepthPosters) private var cardDepthPosters = true
+    @AppStorage(SettingsKey.cardDepthContinueWatching) private var cardDepthContinueWatching = true
+    @AppStorage(SettingsKey.cardDepthEpisodes) private var cardDepthEpisodes = true
+    @AppStorage(SettingsKey.cardDepthCast) private var cardDepthCast = true
 
     func body(content: Content) -> some View {
         content.environment(
@@ -101,7 +279,20 @@ struct CardAppearanceProvider: ViewModifier {
                 continueWatchingBlurNextUp: continueWatchingBlurNextUp,
                 blurUnwatchedEpisodes: blurUnwatchedEpisodes,
                 hideUnwatchedEpisodeTitles: hideUnwatchedEpisodeTitles,
-                hideUnwatchedEpisodeDescriptions: hideUnwatchedEpisodeDescriptions
+                hideUnwatchedEpisodeDescriptions: hideUnwatchedEpisodeDescriptions,
+                landscapeAlwaysBackdropLogo: landscapeAlwaysBackdropLogo,
+                trailerStartSeconds: trailerStartSeconds,
+                animatedArtworkOnFocus: AnimatedArtworkMode.playsOnFocus(animatedArtwork),
+                cardDepth: CardDepthStyle(
+                    isEnabled: cardDepthEnabled,
+                    edge: cardDepthEdge,
+                    sheen: cardDepthSheen,
+                    coverage: cardDepthCoverage,
+                    posters: cardDepthPosters,
+                    continueWatching: cardDepthContinueWatching,
+                    episodes: cardDepthEpisodes,
+                    cast: cardDepthCast
+                )
             )
         )
     }

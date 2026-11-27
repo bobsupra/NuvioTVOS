@@ -290,6 +290,9 @@ public struct LibraryView: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
+    /// Settings → Tracking → Library lists. Read here so the list menu
+    /// follows a change made while the Library is kept alive.
+    @AppStorage(SettingsKey.mdbListHiddenLibraryLists) private var mdbListHiddenLibraryLists = ""
 
     init(
         viewModel: LibraryViewModel,
@@ -421,7 +424,7 @@ public struct LibraryView: View {
                         }
 
                         if TraktSettingsStore.librarySourceMode == .mdblist,
-                           !viewModel.mdbListLists.isEmpty {
+                           !viewModel.visibleMdbListLists.isEmpty {
                             FilterMenu(
                                 label: "MDBList: \(selectedMdbListListLabel)"
                             ) {
@@ -433,7 +436,7 @@ public struct LibraryView: View {
                                         selected: viewModel.selectedMdbListListID == nil
                                     )
                                 }
-                                ForEach(viewModel.mdbListLists) { list in
+                                ForEach(viewModel.visibleMdbListLists) { list in
                                     Button {
                                         Task { await viewModel.selectMdbListList(list.id) }
                                     } label: {
@@ -552,6 +555,12 @@ public struct LibraryView: View {
             if cloudViewModel.isAvailable {
                 await cloudViewModel.load()
             }
+        }
+        .onChange(of: mdbListHiddenLibraryLists, initial: true) { _, hidden in
+            // A list that is no longer offered goes back to the Library.
+            guard let selected = viewModel.selectedMdbListListID,
+                  MdbListLibraryLists.hiddenIDs(from: hidden).contains(selected) else { return }
+            Task { await viewModel.selectMdbListList(nil) }
         }
         .onChange(of: cloudLibraryAvailable) { _, available in
             if !available && sourceMode == .cloud {
@@ -712,7 +721,7 @@ public struct LibraryView: View {
 
     private var selectedMdbListListLabel: String {
         guard let selected = viewModel.selectedMdbListListID,
-              let list = viewModel.mdbListLists.first(where: { $0.id == selected }) else {
+              let list = viewModel.visibleMdbListLists.first(where: { $0.id == selected }) else {
             return "Library"
         }
         return list.name
@@ -1124,6 +1133,7 @@ struct LibraryItemButton: View {
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @AppStorage(SettingsKey.customPosterURLPattern) private var customPosterURLPattern = ""
     @AppStorage(SettingsKey.customPosterEnabledScreens) private var customPosterEnabledScreens = "all"
+    @Environment(\.cardAppearance) private var cardAppearance
 
     private var customPosterArtworkURL: String? {
         CustomPosterURLResolver.resolve(
@@ -1163,6 +1173,8 @@ struct LibraryItemButton: View {
                         coveredByArtwork: true
                     )
                 )
+                // Settings → Poster Card Style → Card depth effect.
+                .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .posters, shape: RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)))
                 .overlay(alignment: .topTrailing) {
                     WatchedCheckmarkBadge(
                         meta: item.asNuvioMeta,

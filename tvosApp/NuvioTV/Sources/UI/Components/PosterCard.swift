@@ -483,6 +483,20 @@ struct PosterCard: View {
             // trailer is ready to draw, avoiding a black frame on slow links.
             .opacity(isTrailerPreviewVisible ? 0 : 1)
             .overlay {
+                // Settings → Poster Card Style → Animated artwork. Only the
+                // focused card plays, once focus has rested on it, and only
+                // when the picture it shows is a GIF. Other cards add nothing.
+                // Not over a blurred Next Up picture, which it would reveal.
+                if cardAppearance.animatedArtworkOnFocus, isFocused, landscapePreloadArmed,
+                   !isTrailerPreviewVisible, !shouldBlurNextUpArtwork,
+                   let animatedURL = imageUrl, AnimatedArtworkMode.isAnimatedImageURL(animatedURL) {
+                    AnimatedRemoteGIFView(urlString: animatedURL, isActive: true, maxPixelSize: 640)
+                        .frame(width: cardWidth, height: cardHeight)
+                        .clipped()
+                        .allowsHitTesting(false)
+                }
+            }
+            .overlay {
                 // Prepare during the delay, but keep playback and visibility
                 // gated by isTrailerPreviewActive until the timer completes.
                 if isFocused && effectiveLandscape && trailersEnabled && meta.supportsTrailerLookup
@@ -550,6 +564,14 @@ struct PosterCard: View {
                     isFocused: showsFocusedAppearance,
                     glass: liquidGlassCards,
                     amoledSurfaces: cardAppearance.amoled && cardAppearance.amoledSurfaces
+                )
+            )
+            // Settings → Poster Card Style → Card depth effect. Drawn under the focus outline.
+            .modifier(
+                CardDepthEffect(
+                    style: cardAppearance.cardDepth,
+                    surface: isContinueOrUpcomingCard ? .continueWatching : .posters,
+                    shape: RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                 )
             )
             .overlay {
@@ -821,7 +843,9 @@ struct PosterCard: View {
     }
 
     private var isUsingAddonLandscapePoster: Bool {
-        Self.isUsingAddonLandscapePoster(
+        // With "Always backdrop with logo" the add-on's landscape poster is not used.
+        guard !cardAppearance.landscapeAlwaysBackdropLogo else { return false }
+        return Self.isUsingAddonLandscapePoster(
             meta: meta,
             isEffectivelyAlwaysLandscape: isEffectivelyAlwaysLandscape,
             hasCustomLandscapeArtwork: customLandscapeArtworkURL != nil
@@ -942,7 +966,8 @@ struct PosterCard: View {
             meta: meta,
             isEffectivelyAlwaysLandscape: isEffectivelyAlwaysLandscape,
             continueEpisodeText: continueEpisodeText,
-            continueEpisodeArtworkURL: continueEpisodeArtworkURL
+            continueEpisodeArtworkURL: continueEpisodeArtworkURL,
+            alwaysBackdrop: cardAppearance.landscapeAlwaysBackdropLogo
         )
     }
 
@@ -1016,13 +1041,16 @@ struct PosterCard: View {
         meta: NuvioMeta,
         isEffectivelyAlwaysLandscape: Bool,
         continueEpisodeText: String? = nil,
-        continueEpisodeArtworkURL: String? = nil
+        continueEpisodeArtworkURL: String? = nil,
+        alwaysBackdrop: Bool = false
     ) -> String? {
         if continueEpisodeText != nil,
            let continueEpisodeArtworkURL, !continueEpisodeArtworkURL.isEmpty {
             return continueEpisodeArtworkURL
         }
-        if isEffectivelyAlwaysLandscape {
+        // "Always backdrop with logo" skips the landscape posters, so the
+        // card shows the backdrop with the logo drawn over it.
+        if isEffectivelyAlwaysLandscape, !alwaysBackdrop {
             if let customLandscape = meta.landscapePosterUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customLandscape.isEmpty {
                 return customLandscape
             }
@@ -1044,7 +1072,8 @@ struct PosterCard: View {
     }
 
     private var customLandscapeArtworkURL: String? {
-        CustomPosterURLResolver.resolve(
+        guard !cardAppearance.landscapeAlwaysBackdropLogo else { return nil }
+        return CustomPosterURLResolver.resolve(
             pattern: customPosterURLPattern,
             meta: meta,
             screen: customPosterScreen,
@@ -1456,6 +1485,7 @@ struct TrailerPreviewPlayer: View {
     @State private var didReportUnavailable = false
     @State private var isPlaybackUnavailable = false
     @State private var playbackActiveOverride: Bool?
+    @Environment(\.cardAppearance) private var cardAppearance
     private let resolver = YouTubeTrailerResolver.shared
 
     var body: some View {
@@ -1566,6 +1596,14 @@ struct TrailerPreviewPlayer: View {
 
         diagnosticObserver = TrailerAVPlayerDiagnosticObserver(item: item, token: diagToken)
         player.replaceCurrentItem(with: item)
+        // Settings → Focus Preview → Trailer Start Time.
+        let startSeconds = min(max(cardAppearance.trailerStartSeconds, 0), 5)
+        if startSeconds > 0 {
+            // No completion handler: AVFoundation raises an exception for
+            // one on an item that is not ready yet. Without one the seek is
+            // held until the item loads.
+            item.seek(to: CMTime(seconds: Double(startSeconds), preferredTimescale: 600), completionHandler: nil)
+        }
         observePlaybackFailure(for: item)
         applySoundPreference(soundEnabled)
         setupTimeObserver()
@@ -1750,6 +1788,18 @@ struct PosterGridCard: View {
                 placeholder
             }
             .frame(width: width, height: height)
+            #if os(tvOS)
+            .overlay {
+                // Settings → Poster Card Style → Animated artwork.
+                if cardAppearance.animatedArtworkOnFocus,
+                   let animatedURL = customPosterArtworkURL ?? meta.posterUrl,
+                   AnimatedArtworkMode.isAnimatedImageURL(animatedURL) {
+                    FocusedAnimatedArtwork(urlString: animatedURL, isFocused: focused)
+                        .frame(width: width, height: height)
+                        .clipped()
+                }
+            }
+            #endif
             .clipShape(shape)
             .modifier(
                 LiquidGlassCardModifier(
@@ -1759,6 +1809,8 @@ struct PosterGridCard: View {
                     coveredByArtwork: true
                 )
             )
+            // Settings → Poster Card Style → Card depth effect.
+            .modifier(CardDepthEffect(style: cardAppearance.cardDepth, surface: .posters, shape: shape))
             .overlay(alignment: .topTrailing) {
                 WatchedCheckmarkBadge(meta: meta)
             }

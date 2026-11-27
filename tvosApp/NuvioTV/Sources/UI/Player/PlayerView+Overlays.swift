@@ -122,7 +122,8 @@ extension PlayerView {
                         onDismiss: onRemoteBack,
                         focusEnabled: loadingOverlayFocusEnabled,
                         onSelect: { revealControlsAndFocusSettings() },
-                        onMove: handleLoadingOverlayMove
+                        onMove: handleLoadingOverlayMove,
+                        spinnerOnly: !showLoadingOverlay
                     )
                     .id(viewModel.startupBenchmarkToken)
                     .transition(.opacity)
@@ -144,7 +145,8 @@ extension PlayerView {
                         onDismiss: onRemoteBack,
                         focusEnabled: loadingOverlayFocusEnabled,
                         onSelect: { revealControlsAndFocusSettings() },
-                        onMove: handleLoadingOverlayMove
+                        onMove: handleLoadingOverlayMove,
+                        spinnerOnly: !showLoadingOverlay
                     )
                     .id(viewModel.startupBenchmarkToken)
                     .transition(.opacity)

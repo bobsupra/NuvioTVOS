@@ -456,6 +456,61 @@ enum PlaybackSystemMonitor {
     }
 }
 
+// MARK: - AudioDelayMemory
+
+/// The audio delay the player starts with and where a change is saved.
+/// Settings → Audio → Remember Audio Delay per Device keeps one delay for
+/// each audio output. With it off there is one delay for every output, kept
+/// when the player's "Persist between sessions" is on.
+enum AudioDelayMemory {
+    static func isPerDevice(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.audioDelayPerDevice) as? Bool ?? false
+    }
+
+    /// The audio outputs in use, by port type and name (the TV or receiver
+    /// on HDMI, the AirPlay speaker, the headphones). Nil when the audio
+    /// session reports none, and then the single delay is used.
+    static func currentOutputKey() -> String? {
+        let outputs = AVAudioSession.sharedInstance().currentRoute.outputs
+        guard !outputs.isEmpty else { return nil }
+        return outputs
+            .map { "\($0.portType.rawValue)|\($0.portName.trimmingCharacters(in: .whitespacesAndNewlines))" }
+            .sorted()
+            .joined(separator: "+")
+    }
+
+    /// The delay in milliseconds for an output: its own when one was saved,
+    /// otherwise the single remembered delay, otherwise none.
+    static func remembered(in settings: UserDefaults, outputKey: String?) -> Int {
+        if isPerDevice(in: settings), let outputKey, let delay = delays(in: settings)[outputKey] {
+            return min(max(delay, -3_000), 3_000)
+        }
+        return settings.bool(forKey: SettingsKey.audioDelayPersistEnabled)
+            ? settings.integer(forKey: SettingsKey.persistentAudioDelayMs)
+            : 0
+    }
+
+    static func store(_ milliseconds: Int, in settings: UserDefaults, outputKey: String?) {
+        if isPerDevice(in: settings), let outputKey {
+            var all = delays(in: settings)
+            all[outputKey] = milliseconds
+            if let data = try? JSONEncoder().encode(all) {
+                settings.set(String(decoding: data, as: UTF8.self), forKey: SettingsKey.audioDelayByDevice)
+            }
+            return
+        }
+        if settings.bool(forKey: SettingsKey.audioDelayPersistEnabled) {
+            settings.set(milliseconds, forKey: SettingsKey.persistentAudioDelayMs)
+        }
+    }
+
+    private static func delays(in settings: UserDefaults) -> [String: Int] {
+        guard let stored = settings.string(forKey: SettingsKey.audioDelayByDevice),
+              let decoded = try? JSONDecoder().decode([String: Int].self, from: Data(stored.utf8)) else { return [:] }
+        return decoded
+    }
+}
+
 // MARK: - TVMemoryDiagnostic
 
 /// Comprehensive memory inspection and telemetry sampler for NuvioTVOS.

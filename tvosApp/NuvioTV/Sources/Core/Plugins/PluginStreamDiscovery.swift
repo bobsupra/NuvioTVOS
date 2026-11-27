@@ -21,6 +21,91 @@ enum PluginStreamDiscovery {
             .map { Target(groupID: "plugin:\($0.id)", displayName: $0.name, scraper: $0) }
     }
 
+    /// One provider in the stream list: a scraper, or every scraper of a
+    /// repository with Settings → Plugins → Group plugin providers by
+    /// repository.
+    struct ProviderGroup: Sendable {
+        let groupID: String
+        let displayName: String
+        let targets: [Target]
+    }
+
+    /// The id of a repository's group starts with this. It keeps the
+    /// `plugin:` prefix every plugin group has.
+    static let repositoryGroupPrefix = "plugin:repo:"
+
+    /// The provider groups for `targets`, in their order. With grouping off
+    /// each scraper is its own group, as before the setting existed.
+    @MainActor
+    static func providerGroups(for targets: [Target]) -> [ProviderGroup] {
+        let grouped = ProfileSettings.current.object(forKey: SettingsKey.pluginsGroupByRepository) as? Bool ?? false
+        guard grouped else {
+            return targets.map { ProviderGroup(groupID: $0.groupID, displayName: $0.displayName, targets: [$0]) }
+        }
+        let names = Dictionary(
+            PluginStore.shared.repositories.map { ($0.manifestURL, $0.name) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        var order: [String] = []
+        var members: [String: [Target]] = [:]
+        for target in targets {
+            let repository = target.scraper.repositoryURL
+            if members[repository] == nil { order.append(repository) }
+            members[repository, default: []].append(target)
+        }
+        return order.map { repository in
+            let name = names[repository]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return ProviderGroup(
+                groupID: repositoryGroupPrefix + repository.lowercased(),
+                displayName: name.isEmpty ? (URL(string: repository)?.host ?? repository) : name,
+                targets: members[repository] ?? []
+            )
+        }
+    }
+
+    /// Runs every scraper of a provider group and returns them as one group.
+    /// A group of one scraper is that scraper's own group, unchanged.
+    static func fetchGroup(
+        _ providerGroup: ProviderGroup,
+        type: String,
+        videoID: String,
+        onPartial: (@Sendable (AddonStreamGroup) async -> Void)? = nil
+    ) async -> AddonStreamGroup {
+        if providerGroup.targets.count == 1, let only = providerGroup.targets.first, only.groupID == providerGroup.groupID {
+            return await fetchGroup(target: only, type: type, videoID: videoID, onPartial: onPartial)
+        }
+        let merged = PluginRepositoryStreams(count: providerGroup.targets.count)
+        @Sendable func group(loading: Bool) -> AddonStreamGroup {
+            let streams = merged.streams()
+            return AddonStreamGroup(
+                addonId: providerGroup.groupID,
+                displayName: providerGroup.displayName,
+                streams: streams,
+                isLoading: loading,
+                // An error shows only when no scraper of the repository had a stream.
+                error: loading || !streams.isEmpty ? nil : merged.firstError()
+            )
+        }
+        await withTaskGroup(of: Void.self) { tasks in
+            for (index, target) in providerGroup.targets.enumerated() {
+                tasks.addTask {
+                    var memberPartial: (@Sendable (AddonStreamGroup) async -> Void)?
+                    if let onPartial {
+                        memberPartial = { partial in
+                            guard merged.set(partial.streams, at: index, finished: false, error: nil) else { return }
+                            await onPartial(group(loading: true))
+                        }
+                    }
+                    let finished = await fetchGroup(target: target, type: type, videoID: videoID, onPartial: memberPartial)
+                    _ = merged.set(finished.streams, at: index, finished: true, error: finished.error)
+                    // The other scrapers of the repository are still searching.
+                    if !merged.allFinished { await onPartial?(group(loading: true)) }
+                }
+            }
+        }
+        return group(loading: false)
+    }
+
     /// The identifiers one stream request hands a plugin.
     struct Request: Equatable {
         /// First argument, as Android passes it: the TMDB id when TMDB is set
@@ -298,6 +383,51 @@ enum PluginStreamDiscovery {
 }
 
 /// The streams a plugin emitted so far (``PluginStreamDiscovery/fetchGroup``).
+/// The streams of a repository's scrapers while they search, one slot per
+/// scraper, in the scrapers' order.
+final class PluginRepositoryStreams: @unchecked Sendable {
+    private let lock = NSLock()
+    private var slots: [[NuvioStream]]
+    private var finished: [Bool]
+    private var errors: [String?]
+
+    init(count: Int) {
+        slots = Array(repeating: [], count: count)
+        finished = Array(repeating: false, count: count)
+        errors = Array(repeating: nil, count: count)
+    }
+
+    /// False when the scraper has already finished: a late partial list
+    /// must not replace its final one.
+    func set(_ streams: [NuvioStream], at index: Int, finished isFinished: Bool, error: String?) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard slots.indices.contains(index), !finished[index] else { return false }
+        slots[index] = streams
+        finished[index] = isFinished
+        errors[index] = error
+        return true
+    }
+
+    var allFinished: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return !finished.contains(false)
+    }
+
+    func streams() -> [NuvioStream] {
+        lock.lock()
+        defer { lock.unlock() }
+        return slots.flatMap { $0 }
+    }
+
+    func firstError() -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return errors.compactMap { $0 }.first
+    }
+}
+
 final class PluginPartialStreams: @unchecked Sendable {
     private let lock = NSLock()
     private var streams: [NuvioStream] = []

@@ -15,6 +15,11 @@ enum SubtitleAutoSyncSettings {
         let value = settings.integer(forKey: SettingsKey.subtitleAutoSyncToleranceMs)
         return toleranceChoicesMs.contains(value) ? value : 0
     }
+
+    /// Auto Sync Search: Thorough. Off (Quick) is the default.
+    static func isThorough(in settings: UserDefaults) -> Bool {
+        settings.object(forKey: SettingsKey.subtitleAutoSyncThorough) as? Bool ?? false
+    }
 }
 
 /// Why a subtitle keeps its own timing.
@@ -231,7 +236,10 @@ actor SubtitleAutoSync {
         let started = Date()
         pruneCacheOnce()
         var report = SubtitleAutoSyncReport(source: source.description)
+        // A Thorough search has its own cache entry, so switching to it is
+        // not answered with a Quick result.
         let key = Self.cacheKey(fileKey: source.fileKey, subtitleURL: subtitle.url)
+            + (SubtitleAutoSyncSettings.isThorough(in: ProfileSettings.current) ? "t" : "")
         let tolerance = max(Double(toleranceMs) / 1000, SubtitleAutoSyncSettings.minimumCorrection)
         if useCache, let cached = Self.cachedOutcome(key: key, tolerance: tolerance) {
             report.fromCache = true
@@ -301,11 +309,16 @@ actor SubtitleAutoSync {
 
         var match: (reference: MatroskaSubtitleTrack, alignment: SubtitleSyncAlignment, fit: SubtitleSyncFit)?
         var verdict = SubtitleSyncVerdict.tooFewLines
+        // Quick stops at the first confident reference. Thorough compares
+        // every reference and keeps the confident one that covers most lines.
+        let thorough = SubtitleAutoSyncSettings.isThorough(in: ProfileSettings.current)
         for candidate in candidates {
             let alignment = SubtitleSyncAligner.align(target: cues, reference: candidate.cues)
             report.attempts.append(Self.describe(alignment, reference: candidate))
             if alignment.verdict == .confident, let fit = alignment.fit {
+                if let best = match, best.fit.coverage >= fit.coverage { continue }
                 match = (candidate.track, alignment, fit)
+                if thorough { continue }
                 break
             }
             verdict = Self.stronger(verdict, alignment.verdict)

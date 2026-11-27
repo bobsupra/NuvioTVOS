@@ -88,6 +88,7 @@ struct PlayerControls: View {
     @AppStorage(SettingsKey.playerShowAudio) private var playerShowAudio = true
     @AppStorage(SettingsKey.playerShowSpeed) private var playerShowSpeed = true
     @AppStorage(SettingsKey.playerShowFinishTime) private var playerShowFinishTime = true
+    @AppStorage(SettingsKey.streamBadgesInPlayer) private var streamBadgesInPlayer = false
     @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
     @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
 
@@ -1265,6 +1266,12 @@ struct PlayerControls: View {
                 .font(.system(size: 38, weight: .bold))
                 .foregroundColor(.white)
                 .lineLimit(1)
+
+            // Settings → Streams → Show in player.
+            if streamBadgesInPlayer, let filename = viewModel.playerBadgeFilename {
+                PlayerStreamBadgeStrip(filename: filename)
+                    .padding(.top, 6)
+            }
         }
     }
 
@@ -2822,7 +2829,8 @@ private struct PlayerTimelineBar: View {
 
     /// The name of the chapter at `seconds`, if the file has chapters.
     private func chapterName(at seconds: Double) -> String? {
-        guard let index = PlaybackChapters.index(at: seconds, in: chapters) else { return nil }
+        guard PlaybackChapters.showsChapterTitle(in: ProfileSettings.current),
+              let index = PlaybackChapters.index(at: seconds, in: chapters) else { return nil }
         return PlaybackChapters.displayName(chapters[index], index: index)
     }
 
@@ -2862,7 +2870,10 @@ private struct PlayerTimelineBar: View {
                 let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
                 let originalX = min(max(w * originalProgress, 0), w)
                 let bottomOfTrack = geo.size.height / 2 + h / 2
-                let markers = PlaybackChapters.markers(chapters, duration: clock.duration)
+                // No chapter marks when that is off in Settings → Player Interface.
+                let markers = PlaybackChapters.showsChapters(in: ProfileSettings.current)
+                    ? PlaybackChapters.markers(chapters, duration: clock.duration)
+                    : []
                 // The opening and the ending, colored unless that is off in Settings → Player.
                 let segments = PlaybackChapters.showsSegmentsOnTimeline(in: ProfileSettings.current)
                     ? PlaybackChapters.timelineSegments(skipSegments, duration: clock.duration).map {
@@ -3507,7 +3518,19 @@ private func subtitlePanelOptions(for viewModel: PlayerViewModel) -> [SubtitlePa
         ))
     }
 
-    return options
+    // Settings → Subtitles → Show Only Preferred Languages. The subtitle in
+    // use always stays listed. With no preferred language set (System), or
+    // none of them among the tracks, the whole list stays so a subtitle can
+    // still be picked.
+    guard ProfileSettings.current.object(forKey: SettingsKey.subtitleOnlyPreferredLanguages) as? Bool ?? false else {
+        return options
+    }
+    let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
+    func isPreferred(_ option: SubtitlePanelOption) -> Bool {
+        preferredLanguages.contains { SubtitleLanguagePreferences.matches(option.language, target: $0) }
+    }
+    guard options.contains(where: isPreferred) else { return options }
+    return options.filter { $0.isSelected || isPreferred($0) }
 }
 
 struct PlayerSettingsPanel: View {

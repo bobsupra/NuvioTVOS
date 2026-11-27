@@ -13474,6 +13474,7 @@ enum ProfileSettings {
     private static let previousTrailerSoundMigrationKey = "nuvio.tv.profile.settings.trailerSound.v1"
     private static let trailerSoundMigrationKey = "nuvio.tv.profile.settings.trailerSound.v2"
     private static let trailerSoundLegacyFallbackKey = "nuvio.tv.profile.settings.trailerSound.legacyFallback"
+    private static let nextEpisodeCountdownCleanupKey = "nuvio.tv.profile.settings.nextEpisodeCountdownCleanup.v1"
     static let settingsChangedNotification = Notification.Name("nuvio.tv.profile.settings.changed")
     /// Posted on the main thread after the active profile changes to another one
     /// (or to none), so state kept across profiles can be reset.
@@ -13611,6 +13612,8 @@ enum ProfileSettings {
         _ = SimklAuthStore.state(in: suite, profileScope: id, tokenStorage: SimklKeychainTokenStorage())
         _ = WeTrakrAuthStore.state(in: suite, profileScope: id, tokenStorage: WeTrakrKeychainTokenStorage())
         migrateTrailerSoundIfNeeded(in: suite)
+        SettingsBackground.migrateRemovedChoices(in: suite)
+        clearMisimportedNextEpisodeCountdownIfNeeded(in: suite)
         AISubtitleKeyStore.migrateLegacyKey(from: suite, profileScope: id)
         if needsSeed {
             AISubtitleKeyStore.migrateLegacyKey(from: .standard, profileScope: id)
@@ -13645,6 +13648,32 @@ enum ProfileSettings {
             store.set(true, forKey: trailerSoundLegacyFallbackKey)
         }
         store.set(true, forKey: trailerSoundMigrationKey)
+    }
+
+    /// The choices of the Next Episode countdown row that older builds had.
+    private static let nextEpisodeCountdownRowChoices: Set<Int> = [5, 10, 15, 20, 30]
+
+    /// Whether a stored Next Episode countdown is one the old Settings row
+    /// could have saved. Anything else came from the account sync, which
+    /// used to copy the other apps' add-on wait into this key.
+    static func isNextEpisodeCountdownRowValue(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber,
+              CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue == Double(number.intValue) else { return false }
+        return nextEpisodeCountdownRowChoices.contains(number.intValue)
+    }
+
+    /// Runs once per profile. Removes a stored Next Episode countdown that
+    /// the old Settings row could not have saved, so the default applies
+    /// again. A value the row could have saved is kept: it cannot be told
+    /// apart from the viewer's own choice.
+    static func clearMisimportedNextEpisodeCountdownIfNeeded(in store: UserDefaults) {
+        guard !store.bool(forKey: nextEpisodeCountdownCleanupKey) else { return }
+        if let stored = store.object(forKey: SettingsKey.autoPlayNextCountdown),
+           !isNextEpisodeCountdownRowValue(stored) {
+            store.removeObject(forKey: SettingsKey.autoPlayNextCountdown)
+        }
+        store.set(true, forKey: nextEpisodeCountdownCleanupKey)
     }
 
     /// A legacy account payload may arrive after profile activation. Import it

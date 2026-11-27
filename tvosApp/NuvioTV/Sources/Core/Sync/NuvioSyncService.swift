@@ -421,6 +421,15 @@ final class NuvioSyncManager: ObservableObject {
         scheduleHomeCatalogPush()
     }
 
+    /// Marks Show Catalog Type as changed on this Apple TV, so the next
+    /// catalog push sends it.
+    static let showCatalogTypePendingKey = "nuvio.tv.sync.showCatalogTypePending"
+
+    func noteShowCatalogTypeChangedLocally() {
+        ProfileSettings.current.set(true, forKey: Self.showCatalogTypePendingKey)
+        noteHomeCatalogSettingsChangedLocally()
+    }
+
     /// Debounces Home layout edits so moving a row several times only sends the
     /// final order. The initial account pull must finish first; otherwise a
     /// local snapshot could replace remote settings that tvOS has not loaded.
@@ -454,13 +463,23 @@ final class NuvioSyncManager: ObservableObject {
               let key = currentSyncKey(),
               completedInitialPullKeys.contains(key) else { return }
         let items = TVHomeCatalogOrder.syncItems()
+        // Sent only after the row was changed on this Apple TV. Any other
+        // catalog push leaves the account's value alone, so it cannot put
+        // back a value another device has since changed.
+        let settings = ProfileSettings.current
+        let showCatalogTypePending = settings.bool(forKey: Self.showCatalogTypePendingKey)
+        let showCatalogType = showCatalogTypePending
+            ? settings.object(forKey: SettingsKey.homeCatalogShowType) as? Bool
+            : nil
         do {
             try ensureStillSyncing()
             try await client.pushHomeCatalogSettings(
                 session: target.session,
                 remoteProfileId: target.remoteProfileId,
-                items: items
+                items: items,
+                showCatalogType: showCatalogType
             )
+            if showCatalogTypePending { settings.removeObject(forKey: Self.showCatalogTypePendingKey) }
             Self.catalogSettingsSyncDiagnostic = "pushed \(items.count) item(s)"
         } catch is CancellationError {
             return
@@ -2804,7 +2823,9 @@ enum ContinueWatchingSyncMapper {
         upNextFromFurthestEpisode: Bool,
         showUnairedNextUp: Bool,
         continueWatchingSort: String?,
-        existingPayload: String?
+        useEpisodeThumbnails: Bool? = nil,
+        existingPayload: String?,
+        mobilePayload: String? = nil
     ) -> String {
         var existingDict: [String: Any] = [:]
         if let payload = existingPayload?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -2816,13 +2837,14 @@ enum ContinueWatchingSyncMapper {
 
         let resolvedIsVisible = isVisible ?? (existingDict["isVisible"] as? Bool ?? true)
         let style = existingDict["style"] as? String ?? "Card"
-        let useEpisodeThumbnails = existingDict["use_episode_thumbnails_in_cw"] as? Bool ?? true
+        let useEpisodeThumbnails = useEpisodeThumbnails
+            ?? (existingDict["use_episode_thumbnails_in_cw"] as? Bool ?? true)
         let blurNextUp = existingDict["blur_continue_watching_next_up"] as? Bool ?? false
         let localDismissed = ContinueWatchingDismissStore.keysForExport(profileId: localProfileId)
         let showResumePromptOnLaunch = existingDict["showResumePromptOnLaunch"] as? Bool ?? true
         let sortMode = sortModeToWire(continueWatchingSort)
 
-        let payloadDict: [String: Any] = [
+        var payloadDict: [String: Any] = [
             "isVisible": resolvedIsVisible,
             "style": style,
             "upNextFromFurthestEpisode": upNextFromFurthestEpisode,
@@ -2833,6 +2855,15 @@ enum ContinueWatchingSyncMapper {
             "showResumePromptOnLaunch": showResumePromptOnLaunch,
             "sort_mode": sortMode
         ]
+        // The Apple TV keeps its own On Select choice, because its default
+        // differs from the other apps'. Theirs is passed through unchanged.
+        // This row is shared with Android TV, so its own value comes first
+        // and the mobile row's only fills a gap.
+        let mobileDict = mobilePayload?.data(using: .utf8)
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) } as? [String: Any]
+        if let clickAction = existingDict["click_action"] ?? mobileDict?["click_action"] {
+            payloadDict["click_action"] = clickAction
+        }
 
         if let data = try? JSONSerialization.data(withJSONObject: payloadDict, options: [.sortedKeys]),
            let jsonString = String(data: data, encoding: .utf8) {
@@ -2863,6 +2894,17 @@ enum ContinueWatchingSyncMapper {
         let dismissedKeys = (dict["dismissedNextUpKeys"] as? [String]).map { Set($0) }
 
         return (isVisible, upNext, showUnaired, sortMode, dismissedKeys)
+    }
+
+    /// "Prefer Episode Thumbnails in Continue Watching" from the account's
+    /// payload, or nil when it has none.
+    static func useEpisodeThumbnails(from remote: Any?) -> Bool? {
+        if let jsonString = remote as? String,
+           let data = jsonString.data(using: .utf8),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            return parsed["use_episode_thumbnails_in_cw"] as? Bool
+        }
+        return (remote as? [String: Any])?["use_episode_thumbnails_in_cw"] as? Bool
     }
 }
 
@@ -2922,7 +2964,11 @@ enum PlayerSettingsSyncMapper {
         ("secondary_preferred_subtitle_language", SettingsKey.subtitleLanguageSecondary),
         ("subtitle_use_forced_subtitles", SettingsKey.forcedSubtitles),
         ("stream_auto_play_next_episode_enabled", SettingsKey.autoPlayNext),
-        ("stream_auto_play_timeout_seconds", SettingsKey.autoPlayNextCountdown),
+        // "stream_auto_play_timeout_seconds" is not read. On the other apps
+        // it is how long auto-select waits for add-ons, with a default of 3,
+        // and the Apple TV's own wait (Stream Selection Timeout) defaults to
+        // a different rule, so it stays in the Apple TV's own settings. It
+        // used to be read into the Next Episode countdown, which it is not.
         ("stream_auto_play_prefer_binge_group", SettingsKey.streamAutoPlayPreferBingeGroup),
         ("stream_auto_play_reuse_binge_group", SettingsKey.streamAutoPlayReuseBingeGroup),
         ("stream_cached_only", SettingsKey.cachedOnlyStreams),
@@ -2954,7 +3000,9 @@ enum PlayerSettingsSyncMapper {
         (SettingsKey.subtitleLanguageSecondary, "secondary_preferred_subtitle_language"),
         (SettingsKey.forcedSubtitles, "subtitle_use_forced_subtitles"),
         (SettingsKey.autoPlayNext, "stream_auto_play_next_episode_enabled"),
-        (SettingsKey.autoPlayNextCountdown, "stream_auto_play_timeout_seconds"),
+        // The Next Episode countdown is not sent as
+        // "stream_auto_play_timeout_seconds": see the note above. The
+        // account's value for that key is carried over as it is.
         (SettingsKey.streamAutoPlayPreferBingeGroup, "stream_auto_play_prefer_binge_group"),
         (SettingsKey.streamAutoPlayReuseBingeGroup, "stream_auto_play_reuse_binge_group"),
         (SettingsKey.cachedOnlyStreams, "stream_cached_only"),
@@ -3108,6 +3156,9 @@ enum ThemeSettingsSyncMapper {
     static let featureKey = "theme_settings"
 
     static func themeToWire(_ theme: String?) -> String? {
+        // A custom accent exists only on the Apple TV. Nothing is sent for
+        // it, so the account keeps the theme it has.
+        if let theme, SettingsAccent.isCustom(theme) { return nil }
         guard let theme = theme?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !theme.isEmpty else {
             return nil
         }
@@ -3174,7 +3225,11 @@ enum ThemeSettingsSyncMapper {
         let defaults = ProfileSettings.store(for: localProfileId)
 
         let rawTheme = (remote["selectedTheme"] as? [String: Any])?["value"] as? String ?? remote["selectedTheme"] as? String
-        if let localTheme = wireToTheme(rawTheme) {
+        // The account never holds this Apple TV's custom accent (see
+        // `themeToWire`), so its theme does not replace one. Picking a
+        // built-in accent here follows the account again.
+        let hasCustomAccent = SettingsAccent.isCustom(defaults.string(forKey: SettingsKey.theme) ?? "")
+        if !hasCustomAccent, let localTheme = wireToTheme(rawTheme) {
             defaults.set(localTheme, forKey: SettingsKey.theme)
         }
 
@@ -3439,7 +3494,8 @@ final class NuvioAPIClient {
     func pushHomeCatalogSettings(
         session: AuthSession,
         remoteProfileId: Int,
-        items: [[String: Any]]
+        items: [[String: Any]],
+        showCatalogType: Bool? = nil
     ) async throws {
         // Match Android's shared-payload merge: catalog edits replace only the
         // items while preserving standalone Home settings owned by other apps.
@@ -3453,6 +3509,11 @@ final class NuvioAPIClient {
             local: items,
             remote: remoteItems
         )
+        // The pull applies this field, so the local choice has to be sent
+        // or the next pull puts the old value back.
+        if let showCatalogType {
+            settingsJSON["show_catalog_type"] = showCatalogType
+        }
         try await rpcVoid(
             "sync_push_home_catalog_settings",
             session: session,
@@ -3963,11 +4024,12 @@ final class NuvioAPIClient {
         )
         features[Self.playerSettingsFeature] = playerPayload
 
-        let existingCW = (features[Self.continueWatchingSettingsFeature] as? String)
-            ?? (latestMobileSettingsJSON["features"] as? [String: Any])?[Self.continueWatchingSettingsFeature] as? String
+        let mobileCW = (latestMobileSettingsJSON["features"] as? [String: Any])?[Self.continueWatchingSettingsFeature] as? String
+        let existingCW = (features[Self.continueWatchingSettingsFeature] as? String) ?? mobileCW
         let cwPayload = exportContinueWatchingSettings(
             localProfileId: localProfileId,
-            existingPayload: existingCW
+            existingPayload: existingCW,
+            mobilePayload: mobileCW
         )
         features[Self.continueWatchingSettingsFeature] = cwPayload
 
@@ -4623,6 +4685,9 @@ final class NuvioAPIClient {
                   let encoded = Self.encodeSettingValue(value) else {
                 return
             }
+            // A custom accent stays on this Apple TV. An older build would
+            // read it as an unknown theme and send it on as the account's.
+            if key == SettingsKey.theme, SettingsAccent.isCustomStorageValue(value) { return }
             exported[key] = encoded
         }
         return exported
@@ -4654,6 +4719,18 @@ final class NuvioAPIClient {
             guard key != SettingsKey.streamBadgeRules else { return }
             guard let encoded = remote[key] as? [String: Any],
                   let value = Self.decodeSettingValue(encoded) else {
+                return
+            }
+            // The account may still hold a countdown that was copied from the
+            // other apps' add-on wait. It is not brought back.
+            if key == SettingsKey.autoPlayNextCountdown,
+               !ProfileSettings.isNextEpisodeCountdownRowValue(value) {
+                return
+            }
+            // The custom accent is not sent, so the stored theme is an older
+            // one. It does not replace the custom accent chosen here.
+            if key == SettingsKey.theme,
+               SettingsAccent.isCustomStorageValue(defaults.object(forKey: key)) {
                 return
             }
             defaults.set(value, forKey: key)
@@ -5004,20 +5081,25 @@ final class NuvioAPIClient {
 
     private func exportContinueWatchingSettings(
         localProfileId: String,
-        existingPayload: String?
+        existingPayload: String?,
+        mobilePayload: String? = nil
     ) -> String {
         let defaults = ProfileSettings.store(for: localProfileId)
         let isVisible = defaults.object(forKey: SettingsKey.continueWatchingVisible) as? Bool ?? true
         let upNext = defaults.object(forKey: SettingsKey.upNextFromFurthestEpisode) as? Bool ?? true
         let showUnaired = defaults.object(forKey: SettingsKey.showUnairedNextUp) as? Bool ?? true
         let sort = defaults.string(forKey: SettingsKey.continueWatchingSort)
+        // Nil keeps the account's value until the row is first used here.
+        let useEpisodeThumbnails = defaults.object(forKey: SettingsKey.continueWatchingEpisodeThumbnails) as? Bool
         return ContinueWatchingSyncMapper.exportPayload(
             localProfileId: localProfileId,
             isVisible: isVisible,
             upNextFromFurthestEpisode: upNext,
             showUnairedNextUp: showUnaired,
             continueWatchingSort: sort,
-            existingPayload: existingPayload
+            useEpisodeThumbnails: useEpisodeThumbnails,
+            existingPayload: existingPayload,
+            mobilePayload: mobilePayload
         )
     }
 
@@ -5036,6 +5118,13 @@ final class NuvioAPIClient {
         }
         if let showUnaired {
             defaults.set(showUnaired, forKey: SettingsKey.showUnairedNextUp)
+        }
+        // Only once the row has been used on this Apple TV. Until then the
+        // cards keep the episode still they always showed, whatever another
+        // device stored.
+        if defaults.object(forKey: SettingsKey.continueWatchingEpisodeThumbnails) != nil,
+           let useEpisodeThumbnails = ContinueWatchingSyncMapper.useEpisodeThumbnails(from: remote) {
+            defaults.set(useEpisodeThumbnails, forKey: SettingsKey.continueWatchingEpisodeThumbnails)
         }
         if let sortMode {
             let currentLocal = defaults.string(forKey: SettingsKey.continueWatchingSort)
