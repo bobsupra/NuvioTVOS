@@ -1000,7 +1000,14 @@ private struct CollectionFolderHomeStyleRow: View {
             )
             .clipped()
             .offset(x: -edgeInset)
-            .animation(rowSmoothFocus && !rowFastNavigation ? TVHomeLayout.scrollAnimation : nil, value: landscapeFocusedId)
+            .animation(
+                TVHomeLayout.backdropRowAnimation(
+                    expanding: landscapeFocusedId != nil,
+                    smooth: rowSmoothFocus,
+                    fast: rowFastNavigation
+                ),
+                value: landscapeFocusedId
+            )
         }
         .frame(height: stripHeight)
     }

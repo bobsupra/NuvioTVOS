@@ -24,6 +24,27 @@ enum TVHomeLayout {
 
     /// Horizontal strip motion preserving momentum across continuous remote presses.
     static let scrollAnimation = Animation.interactiveSpring(response: 0.24, dampingFraction: 0.86, blendDuration: 0.18)
+    /// A focused card growing into its backdrop, and the cards beside it making room.
+    /// The card and the row use the same curve, so the gap between them stays even.
+    static let backdropExpandAnimation = Animation.spring(response: 0.42, dampingFraction: 1.0)
+    /// The backdrop shrinking back to a poster as focus moves on: quicker than the
+    /// expansion, so it doesn't trail behind the move.
+    static let backdropCollapseAnimation = Animation.spring(response: 0.26, dampingFraction: 1.0)
+
+    /// The curve for a backdrop change, by its direction.
+    static func backdropAnimation(expanding: Bool) -> Animation {
+        expanding ? backdropExpandAnimation : backdropCollapseAnimation
+    }
+
+    /// A row's curve for a backdrop change. With Smooth Focus on, the expansion animates
+    /// even with Fast Horizontal Navigation: it starts only once focus has rested, so it
+    /// doesn't slow a move. The collapse comes with a focus move, so Fast Horizontal
+    /// Navigation keeps it instant.
+    static func backdropRowAnimation(expanding: Bool, smooth: Bool, fast: Bool) -> Animation? {
+        guard smooth else { return nil }
+        if expanding { return backdropExpandAnimation }
+        return fast ? nil : backdropCollapseAnimation
+    }
     /// Gliding horizontal strip motion that mimics native momentum with smooth fluid deceleration.
     static let horizontalGlideAnimation = Animation.interactiveSpring(response: 0.34, dampingFraction: 0.90, blendDuration: 0.24)
     /// Gliding vertical row transition preserving momentum with smooth, bounce-free settle.
@@ -916,6 +937,7 @@ struct TVCatalogRow: View {
             layoutMode: rowHomeLayout,
             showPosterLabels: rowPosterLabels,
             smoothFocusAnimations: rowCardFocusAnimations,
+            expandsWithAnimation: rowSmoothFocus && !suppressFocusAnimations,
             focusHighlighterEnabled: rowFocusHighlighter,
             retainFocusAppearance: retainFocusAppearanceForCardKey == cardKey,
             allowsFocus: restrictFocusToCardKey == nil || restrictFocusToCardKey == cardKey,
@@ -963,8 +985,12 @@ struct TVCatalogRow: View {
             .padding(.trailing, trailingRoom)
             .padding(.vertical, TVHomeLayout.stripVerticalPadding)
             .animation(
-                rowCardFocusAnimations && restrictFocusToCardKey == nil
-                    ? TVHomeLayout.scrollAnimation : nil,
+                restrictFocusToCardKey == nil
+                    ? TVHomeLayout.backdropRowAnimation(
+                        expanding: landscapeFocusedId != nil,
+                        smooth: smoothFocus && !suppressFocusAnimations,
+                        fast: fastNavigation
+                    ) : nil,
                 value: landscapeFocusedId
             )
             .background {
