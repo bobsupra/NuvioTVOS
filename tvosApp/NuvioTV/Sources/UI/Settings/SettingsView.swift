@@ -263,6 +263,8 @@ enum SettingsKey {
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
     static let detailsActionsBelowInfo = "nuvio.tv.settings.layout.detailsActionsBelowInfo"
+    /// Details action row: only the focused button is white and shows its title.
+    static let detailsFocusedButtonTitle = "nuvio.tv.settings.layout.detailsFocusedButtonTitle"
     /// Settings → Layout → Details Page → IMDb Parental Guide.
     static let detailsShowParentalGuide = "nuvio.tv.settings.layout.detailsShowParentalGuide"
     /// JSON `[String]` of Details page section IDs in the user's preferred order.
@@ -535,7 +537,7 @@ enum SettingsKey {
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp, continueWatchingEpisodeRatings, continueWatchingBlurNextUp,
         showCalendarTab, showSurpriseMeTab, surpriseMeUseTMDB, surpriseMeUseTrackers, surpriseMeContent, surpriseMeAIProvider, surpriseMeAIModel, aiCatalogMovies, aiCatalogSeries, aiCatalogAnimeMovies, aiCatalogAnimeSeries, showWatchPartyTab, useTopNavigation, homeCalendarToday, calendarFilter, calendarHideSpoilers, calendarCheckAvailability, calendarTvmazeTimes, calendarAniList, calendarAniListPlanning,
         cardCornerRadius, cardSize, liquidGlassCards,
-        hideUnreleased, showFullDates, detailsActionsBelowInfo, detailsShowParentalGuide,
+        hideUnreleased, showFullDates, detailsActionsBelowInfo, detailsFocusedButtonTitle, detailsShowParentalGuide,
         detailsSectionOrder, detailsSectionDisabled,
         blurUnwatchedEpisodes, hideUnwatchedEpisodeDescriptions, hideUnwatchedEpisodeTitles, revealNextEpisodeSpoilers,
         traktConnected, traktClientID, traktClientSecret, traktRedirectURI,
@@ -4815,6 +4817,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
+    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var detailsFocusedButtonTitle = DetailsActionButtonLook.focusedButtonTitleByDefault
     @AppStorage(SettingsKey.detailsShowParentalGuide) private var detailsShowParentalGuide = false
     @State private var showingHomeCatalogOrderSettings = false
     @State private var showingCollectionsSettings = false
@@ -5299,6 +5302,19 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "Place the Play and action button row below the movie information and synopsis"
                     ),
                     isOn: $detailsActionsBelowInfo,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_details_focused_button_title",
+                        fallback: "Focused Button Title"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_details_focused_button_title_subtitle",
+                        fallback: "Only the focused action button is white and shows its title. The others show their icon."
+                    ),
+                    isOn: $detailsFocusedButtonTitle,
                     accentColor: accentColor
                 )
 
