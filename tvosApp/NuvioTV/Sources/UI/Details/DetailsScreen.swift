@@ -7505,7 +7505,7 @@ private struct TvDetailsActionRow: View {
     /// Moving focus shrinks one button to its icon and widens the next to show its title.
     static let focusAnimation: Animation = .easeOut(duration: 0.2)
 
-    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var focusedButtonTitle = false
+    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var focusedButtonTitle = DetailsActionButtonLook.focusedButtonTitleByDefault
 
     var body: some View {
         HStack(spacing: 26) {
@@ -8075,7 +8075,7 @@ private struct TvDetailsActionButton: View {
     var longPressAction: (() -> Void)? = nil
     var onBack: (() -> Void)? = nil
 
-    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var focusedButtonTitle = false
+    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var focusedButtonTitle = DetailsActionButtonLook.focusedButtonTitleByDefault
     @State private var didTriggerHold = false
     private var isFocused: Bool { focus.wrappedValue == tag }
 
@@ -8161,6 +8161,9 @@ private struct TvDetailsActionButton: View {
 
 /// When a Details action button shows its title and is white.
 enum DetailsActionButtonLook {
+    /// Settings → Details Page → Focused Button Title starts on.
+    static let focusedButtonTitleByDefault = true
+
     /// With Settings → Details Page → Focused Button Title on, the focused button shows its
     /// title and the others only their icon, and while focus is elsewhere on the page Play
     /// shows its title ("Next S3 E8"). Off, Play shows its title and the others their icon.

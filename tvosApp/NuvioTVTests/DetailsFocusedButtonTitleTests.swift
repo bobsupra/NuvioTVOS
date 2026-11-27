@@ -8,6 +8,10 @@ final class DetailsFocusedButtonTitleTests: XCTestCase {
         XCTAssertFalse(SettingsKey.deviceLocal.contains(SettingsKey.detailsFocusedButtonTitle))
     }
 
+    func testFocusedButtonTitleIsOnByDefault() {
+        XCTAssertTrue(DetailsActionButtonLook.focusedButtonTitleByDefault)
+    }
+
     func testOffPlayAndListButtonsShowTheirTitleAndPlayStaysWhite() {
         for focused in [false, true] {
             XCTAssertTrue(look(isPrimary: true, isFocused: false, rowHasFocus: focused, on: false).title)

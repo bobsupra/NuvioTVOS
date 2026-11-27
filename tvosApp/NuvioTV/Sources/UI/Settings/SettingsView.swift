@@ -4817,7 +4817,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
     @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
     @AppStorage(SettingsKey.detailsActionsBelowInfo) private var detailsActionsBelowInfo = false
-    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var detailsFocusedButtonTitle = false
+    @AppStorage(SettingsKey.detailsFocusedButtonTitle) private var detailsFocusedButtonTitle = DetailsActionButtonLook.focusedButtonTitleByDefault
     @AppStorage(SettingsKey.detailsShowParentalGuide) private var detailsShowParentalGuide = false
     @State private var showingHomeCatalogOrderSettings = false
     @State private var showingCollectionsSettings = false
