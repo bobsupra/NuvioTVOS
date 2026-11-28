@@ -7444,8 +7444,14 @@ private struct TVHomeSettingsSnapshot: Equatable {
             smoothFocus: bool(SettingsKey.smoothFocus, true),
             homeLayout: string(SettingsKey.homeLayout, "Modern"),
             useTopNavigation: bool(SettingsKey.useTopNavigation, false),
-            gridRows: defaults.object(forKey: SettingsKey.gridRows) as? Int ?? TVHomeGridLayout.defaultRows,
-            gridItemsPerRow: defaults.object(forKey: SettingsKey.gridItemsPerRow) as? Int ?? TVHomeGridLayout.defaultItemsPerRow,
+            gridRows: TVHomeLayout.effectiveGridRows(
+                defaults.object(forKey: SettingsKey.gridRows) as? Int ?? TVHomeGridLayout.defaultRows,
+                layout: string(SettingsKey.homeLayout, "Modern")
+            ),
+            gridItemsPerRow: TVHomeLayout.effectiveGridItemsPerRow(
+                defaults.object(forKey: SettingsKey.gridItemsPerRow) as? Int ?? TVHomeGridLayout.defaultItemsPerRow,
+                layout: string(SettingsKey.homeLayout, "Modern")
+            ),
             heroCatalogsData: defaults.data(forKey: SettingsKey.heroCatalogs) ?? Data(),
             posterLabels: bool(SettingsKey.posterLabels, false),
             catalogAddonNames: bool(SettingsKey.catalogAddonNames, true),
@@ -7496,8 +7502,10 @@ private struct TVHomeSettingsObserver: View {
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.useTopNavigation) private var useTopNavigation = false
-    @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
-    @AppStorage(SettingsKey.gridItemsPerRow) private var gridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
+    @AppStorage(SettingsKey.gridRows) private var storedGridRows = TVHomeGridLayout.defaultRows
+    @AppStorage(SettingsKey.gridItemsPerRow) private var storedGridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
+    private var gridRows: Int { TVHomeLayout.effectiveGridRows(storedGridRows, layout: homeLayout) }
+    private var gridItemsPerRow: Int { TVHomeLayout.effectiveGridItemsPerRow(storedGridItemsPerRow, layout: homeLayout) }
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
@@ -7642,6 +7650,8 @@ struct TVHomeView: View {
     private var useTopNavigation: Bool { homeSettings.useTopNavigation }
     private var gridRows: Int { homeSettings.gridRows }
     private var gridItemsPerRow: Int { homeSettings.gridItemsPerRow }
+    /// Grid View or Desktop: the hero slideshow above grid-style catalogs.
+    private var isGridLayout: Bool { TVHomeLayout.isGrid(homeLayout) }
     private var heroCatalogsData: Data { homeSettings.heroCatalogsData }
     private var posterLabels: Bool { homeSettings.posterLabels }
     private var catalogAddonNames: Bool { homeSettings.catalogAddonNames }
@@ -7765,6 +7775,9 @@ struct TVHomeView: View {
     @State private var browsingSection: TVHomeSection?
     @State private var browsePresentationGeneration = 0
     @State private var gridHeroIndex = 0
+    /// Grid View hero titles taken from Home's collections when no catalog row
+    /// can supply them, as the desktop app does.
+    @State private var collectionHeroItems: [NuvioMeta] = []
     @State private var didRequestInitialGridHeroFocus = false
     /// The Grid hero owns its own focus state, so `focusedCardID` goes nil while
     /// it is focused. Home still holds focus then, and arming the focus restore
@@ -7835,7 +7848,7 @@ struct TVHomeView: View {
     /// redraws that row, not all of Home: a change of `focusedCardID` redrew Home on every move,
     /// though its body doesn't read it. Grid View keeps Home's.
     private var usesRowFocus: Bool {
-        homeLayout != "Grid View"
+        !isGridLayout
     }
 
     /// The card holding focus: what the rows reported, or (Grid View) Home's focus state.
@@ -7931,7 +7944,7 @@ struct TVHomeView: View {
             GeometryReader { proxy in
                 if fullscreenHeroBackdrop {
                     CrossfadingBackdrop(
-                        url: showsLoading || homeLayout == "Grid View" ? nil : homeBackdropURL,
+                        url: showsLoading || isGridLayout ? nil : homeBackdropURL,
                         placeholder: backdropColor,
                         alignment: focusedCollectionFolder != nil ? .topTrailing : .center
                     )
@@ -7946,7 +7959,7 @@ struct TVHomeView: View {
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
                         CrossfadingBackdrop(
-                            url: showsLoading || homeLayout == "Grid View" ? nil : homeBackdropURL,
+                            url: showsLoading || isGridLayout ? nil : homeBackdropURL,
                             placeholder: backdropColor,
                             alignment: .topTrailing
                         )
@@ -8051,7 +8064,7 @@ struct TVHomeView: View {
                 } else {
                     // Header Hero Meta block (static, outside the rows). Folder
                     // focus swaps poster meta for emoji + folder title (browse-style).
-                    if heroEnabled && homeLayout != "Grid View" {
+                    if heroEnabled && !isGridLayout {
                         if let folder = focusedCollectionFolder {
                             TVCollectionFolderHeroView(folder: folder)
                                 .equatable()
@@ -8080,7 +8093,7 @@ struct TVHomeView: View {
                             0,
                             (UIScreen.main.bounds.width - proxy.size.width) / 2
                         )
-                        if homeLayout == "Grid View" {
+                        if isGridLayout {
                             // Grid Home has no row strip to hold open, so a
                             // skeleton there would just be an empty heading.
                             // This proxy is laid out inside the horizontal safe
@@ -9122,6 +9135,7 @@ struct TVHomeView: View {
                                 playTitleFromHome(id: selectedMeta.id, type: selectedMeta.type)
                             },
                             backdropBleed: heroBleed,
+                            parallax: homeLayout == "Desktop",
                             onFocusChange: { isFocused in
                                 isGridHeroFocused = isFocused
                                 if isFocused {
@@ -9370,6 +9384,10 @@ struct TVHomeView: View {
                         )
                     }
                 }
+                .coordinateSpace(name: TVGridHeroSlideshowView.scrollSpace)
+                .task(id: collectionHeroRequestKey) {
+                    await loadCollectionHero(key: collectionHeroRequestKey)
+                }
                 .onChange(of: isGridHeroFocused) { wasFocused, isFocused in
                     if isFocused {
                         let animation = (isFastScrolling || fastNavigation)
@@ -9397,7 +9415,14 @@ struct TVHomeView: View {
                                 ? TVHomeLayout.fastVerticalScrollAnimation
                                 : TVHomeLayout.verticalScrollAnimation
                             withAnimation(animation) {
-                                verticalScrollProxy.scrollTo(sectionID, anchor: .top)
+                                // Desktop keeps the hero showing above the first row, as on
+                                // desktop. The row sits a little below the middle rather than
+                                // at the bottom edge, so the next row is on screen too and
+                                // Down has somewhere to go.
+                                verticalScrollProxy.scrollTo(
+                                    sectionID,
+                                    anchor: homeLayout == "Desktop" ? UnitPoint(x: 0.5, y: 0.62) : .top
+                                )
                             }
                         }
                     }
@@ -9450,7 +9475,7 @@ struct TVHomeView: View {
                 keys = section.collectionFolders.map {
                     TVHomeCardIdentity.folderKey(rowID: section.id, folder: $0)
                 }
-            } else if homeLayout == "Grid View",
+            } else if isGridLayout,
                       section.id != TVHomeSection.continueWatchingId,
                       section.id != TVHomeSection.upcomingId,
                       section.id != TVHomeSection.calendarTodayId {
@@ -9497,7 +9522,7 @@ struct TVHomeView: View {
               let section = visibleSections.first(where: { $0.id == row.id }),
               !section.isLoadingPlaceholder else { return nil }
 
-        let isGridCatalog = homeLayout == "Grid View"
+        let isGridCatalog = isGridLayout
             && section.collectionFolders.isEmpty
             && section.id != TVHomeSection.continueWatchingId
             && section.id != TVHomeSection.upcomingId
@@ -10021,7 +10046,7 @@ struct TVHomeView: View {
     }
 
     private var profileGateStartupFocusTarget: TVHomeProfileFocusTarget? {
-        if homeLayout == "Grid View", heroEnabled, !gridHeroItems.isEmpty {
+        if isGridLayout, heroEnabled, !gridHeroItems.isEmpty {
             return .gridHero
         }
         for (index, section) in visibleSections.enumerated() {
@@ -10212,7 +10237,7 @@ struct TVHomeView: View {
     // MARK: - Back Navigation (Two-Step Exit Command)
 
     private var currentBackAction: TVHomeBackAction {
-        let hasHero = (homeLayout == "Grid View" && heroEnabled && !gridHeroItems.isEmpty)
+        let hasHero = (isGridLayout && heroEnabled && !gridHeroItems.isEmpty)
 
         let currentSection: TVHomeSection? = {
             if let focusedCardID = currentFocusedCardID,
@@ -10927,7 +10952,7 @@ struct TVHomeView: View {
             if let cardIndex = section.collectionFolders.firstIndex(where: { TVHomeCardIdentity.folderKey(rowID: section.id, folder: $0) == focusKey }) {
                 return (sectionIndex, section.id, cardIndex)
             }
-            if homeLayout == "Grid View",
+            if isGridLayout,
                section.collectionFolders.isEmpty,
                section.id != TVHomeSection.continueWatchingId,
                section.id != TVHomeSection.upcomingId,
@@ -10967,7 +10992,7 @@ struct TVHomeView: View {
     }
 
     private func retargetOutOfPreviewGridFocusIfNeeded(in sections: [TVHomeSection]) {
-        guard homeLayout == "Grid View",
+        guard isGridLayout,
               !TVHomeGridLayout.showsAllItems(itemsPerRow: gridItemsPerRow),
               let focusKey = initialFocusCardKey else { return }
         for section in sections {
@@ -11065,7 +11090,7 @@ struct TVHomeView: View {
             focusedSectionId = location.sectionID
             rowScrollStore.setIndex(location.cardIndex, for: location.sectionID)
         }
-        let isGridCatalogSection = homeLayout == "Grid View"
+        let isGridCatalogSection = isGridLayout
             && targetSection.collectionFolders.isEmpty
             && targetSection.id != TVHomeSection.continueWatchingId
             && targetSection.id != TVHomeSection.upcomingId
@@ -11404,7 +11429,67 @@ struct TVHomeView: View {
                 if result.count == TVHomeGridLayout.heroPageLimit { return result }
             }
         }
-        return result
+        return result.isEmpty ? collectionHeroItems : result
+    }
+
+    /// Identifies the collections the fallback hero is built from; nil when the
+    /// catalog rows supply the hero or Grid View isn't showing it.
+    private var collectionHeroRequestKey: String? {
+        guard isGridLayout, heroEnabled else { return nil }
+        let sections = visibleSections
+        let hasCatalogHero = sections.contains {
+            $0.id != TVHomeSection.continueWatchingId && $0.id != TVHomeSection.upcomingId
+                && $0.id != TVHomeSection.calendarTodayId && $0.collectionFolders.isEmpty
+                && !$0.items.isEmpty
+        }
+        guard !hasCatalogHero else { return nil }
+        let folderIDs = sections.flatMap(\.collectionFolders).map(\.id)
+        guard !folderIDs.isEmpty else { return nil }
+        return "\(contentIdentity.profileId)|\(contentIdentity.catalogRevision)|" + folderIDs.joined(separator: ",")
+    }
+
+    /// The desktop app's collection hero: the first sources of Home's
+    /// collections, the first titles of each, merged in turn, without
+    /// duplicates, in a fixed shuffled order for this set of collections.
+    private func loadCollectionHero(key: String?) async {
+        guard let key else {
+            if !collectionHeroItems.isEmpty { collectionHeroItems = [] }
+            return
+        }
+        let sources = Array(visibleSections
+            .flatMap(\.collectionFolders)
+            .flatMap(\.sources)
+            .prefix(TVHomeGridLayout.collectionHeroSourceLimit))
+        let profileID = contentIdentity.profileId
+        let resolver = CollectionSourceResolver(
+            repository: repository,
+            settings: ProfileSettings.store(for: profileID)
+        )
+        let results: [[NuvioMeta]] = await withTaskGroup(of: (Int, [NuvioMeta]).self) { group in
+            for (index, source) in sources.enumerated() {
+                group.addTask {
+                    let page = try? await resolver.browse(source, cursor: 0)
+                    return (index, Array((page?.items ?? []).prefix(TVHomeGridLayout.collectionHeroSourceItemLimit)))
+                }
+            }
+            var byIndex: [Int: [NuvioMeta]] = [:]
+            for await (index, items) in group { byIndex[index] = items }
+            return sources.indices.map { byIndex[$0] ?? [] }
+        }
+        guard !Task.isCancelled, collectionHeroRequestKey == key else { return }
+        var merged: [NuvioMeta] = []
+        var seen: Set<String> = []
+        let longest = results.map(\.count).max() ?? 0
+        for position in 0..<longest {
+            for items in results where position < items.count {
+                if seen.insert(items[position].homeTitleIdentity).inserted {
+                    merged.append(items[position])
+                }
+            }
+        }
+        var generator = TVHomeSeededGenerator(seed: UInt64(truncatingIfNeeded: key.hashValueStable))
+        merged.shuffle(using: &generator)
+        collectionHeroItems = Array(merged.prefix(TVHomeGridLayout.heroPageLimit))
     }
 
     private func landscapeFocusedId(for sectionId: String) -> String? {
@@ -17756,8 +17841,17 @@ private struct TVGridHeroSlideshowView: View {
     let onInitialFocusRequested: () -> Void
     let onPlay: (NuvioMeta) -> Void
     var backdropBleed: CGFloat = 0
+    /// Desktop: the art moves at about a third of the page's speed as Home
+    /// scrolls, and stays inside the hero, as the desktop app's hero does.
+    var parallax: Bool = false
     var onFocusChange: ((Bool) -> Void)? = nil
     let onSelect: (NuvioMeta) -> Void
+
+    static let scrollSpace = "home-grid-scroll"
+    /// NuvioDesktop's DESKTOP_HERO_SCROLL_PARALLAX: the art keeps 38% of the
+    /// scroll, so it is shifted back by the other 62%.
+    private static let parallaxHold: CGFloat = 0.62
+    @State private var scrolledBy: CGFloat = 0
 
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -17953,6 +18047,7 @@ private struct TVGridHeroSlideshowView: View {
                 placeholder: background,
                 alignment: .top
             )
+            .offset(y: parallax ? scrolledBy * Self.parallaxHold : 0)
 
             #if os(tvOS)
             let previewIdentity = currentTrailerPreviewIdentity ?? trailerPreviewIdentity(for: item)
@@ -17992,6 +18087,7 @@ private struct TVGridHeroSlideshowView: View {
                     }
                 )
                 .id(previewIdentity)
+                .offset(y: parallax ? scrolledBy * Self.parallaxHold : 0)
                 .task(id: "\(previewIdentity)|\(activeTrailerPreviewIdentity == previewIdentity)|\(readyTrailerPreviewIdentity == previewIdentity)") {
                     await enforceTrailerRenderReadinessTimeout(for: previewIdentity)
                 }
@@ -18058,7 +18154,29 @@ private struct TVGridHeroSlideshowView: View {
             if let activeItem {
                 artLayer(activeItem)
                     .frame(height: 1080, alignment: .top)
+                    // Keeps the lagging art inside its own area; the bleed past
+                    // the screen edges stays.
+                    .mask {
+                        if parallax {
+                            Rectangle().padding(.horizontal, -backdropBleed - 200)
+                        } else {
+                            Rectangle().padding(-2000)
+                        }
+                    }
             }
+        }
+        .background {
+            if parallax {
+                GeometryReader { proxy in
+                    Color.clear.preference(
+                        key: TVGridHeroScrollOffsetKey.self,
+                        value: proxy.frame(in: .named(Self.scrollSpace)).minY
+                    )
+                }
+            }
+        }
+        .onPreferenceChange(TVGridHeroScrollOffsetKey.self) { minY in
+            scrolledBy = max(0, -minY)
         }
         .onAppear {
             updateLibraryStatus()
@@ -19005,4 +19123,11 @@ extension String {
         }
         return lines.joined(separator: "\n")
     }
+}
+
+
+/// The Grid View hero's top edge in the Home scroll view, for its parallax.
+private struct TVGridHeroScrollOffsetKey: PreferenceKey {
+    static let defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }

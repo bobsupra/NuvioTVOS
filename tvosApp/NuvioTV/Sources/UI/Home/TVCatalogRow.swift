@@ -10,6 +10,15 @@ import Foundation
 
 /// Shared Home vertical rhythm for catalog *and* collection folder rows.
 enum TVHomeLayout {
+    /// Grid View and Desktop share the hero slideshow and grid catalog code.
+    static func isGrid(_ layout: String) -> Bool { layout == "Grid View" || layout == "Desktop" }
+    /// Desktop: one row per catalog with every title, as the desktop app's Home.
+    static func effectiveGridRows(_ stored: Int, layout: String) -> Int {
+        layout == "Desktop" ? 1 : stored
+    }
+    static func effectiveGridItemsPerRow(_ stored: Int, layout: String) -> Int {
+        layout == "Desktop" ? TVHomeGridLayout.seeAllItemsPerRow : stored
+    }
     static let sectionSpacing: CGFloat = 28
     /// Keep the first catalog heading close to the hero description.
     static let heroBottomPadding: CGFloat = 20
@@ -1243,6 +1252,9 @@ enum TVHomeGridLayout {
     static let itemSpacing: CGFloat = 28
     static let sectionSpacing: CGFloat = 54
     static let heroPageLimit = 7
+    /// The desktop app's collection hero limits: sources read, titles per source.
+    static let collectionHeroSourceLimit = 6
+    static let collectionHeroSourceItemLimit = 8
     static let seeAllID = "__see_all__"
     /// Inset inside tvOS's 80pt safe area (80 + 61 = 141pt from screen edges) to center the 7-column grid symmetrically.
     static let horizontalPadding: CGFloat = 61
@@ -1293,8 +1305,11 @@ struct TVHomeCatalogGridSection: View {
     let onSeeAll: () -> Void
 
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
-    @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
-    @AppStorage(SettingsKey.gridItemsPerRow) private var gridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
+    @AppStorage(SettingsKey.gridRows) private var storedGridRows = TVHomeGridLayout.defaultRows
+    @AppStorage(SettingsKey.gridItemsPerRow) private var storedGridItemsPerRow = TVHomeGridLayout.defaultItemsPerRow
+    @AppStorage(SettingsKey.homeLayout) private var gridHomeLayout = "Modern"
+    private var gridRows: Int { TVHomeLayout.effectiveGridRows(storedGridRows, layout: gridHomeLayout) }
+    private var gridItemsPerRow: Int { TVHomeLayout.effectiveGridItemsPerRow(storedGridItemsPerRow, layout: gridHomeLayout) }
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
 
     private var previewItems: [NuvioMeta] {
@@ -2418,5 +2433,27 @@ private struct DissolveFrameReporter: ViewModifier {
         } else {
             content
         }
+    }
+}
+
+/// A repeatable random order: the same seed gives the same shuffle.
+struct TVHomeSeededGenerator: RandomNumberGenerator {
+    private var state: UInt64
+    init(seed: UInt64) { state = seed == 0 ? 0x9E3779B97F4A7C15 : seed }
+    mutating func next() -> UInt64 {
+        state &+= 0x9E3779B97F4A7C15
+        var z = state
+        z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+        z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+        return z ^ (z >> 31)
+    }
+}
+
+extension String {
+    /// FNV-1a: stable across launches, unlike `hashValue`.
+    var hashValueStable: UInt64 {
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in utf8 { hash = (hash ^ UInt64(byte)) &* 0x100000001b3 }
+        return hash
     }
 }

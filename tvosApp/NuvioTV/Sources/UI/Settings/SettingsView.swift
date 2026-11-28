@@ -3961,7 +3961,7 @@ private struct HomeLayoutLivePreview: View {
                             .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
                     }
 
-                    if layout == "Grid View" {
+                    if TVHomeLayout.isGrid(layout) {
                         gridViewSection
                             .transition(.opacity)
                     } else if layout == "Compact" {
@@ -4831,7 +4831,7 @@ private struct LayoutDiscoverySettingsView: View {
     @State private var detailsSectionsActiveCount = TVDetailsSectionOrder.activeSectionCount()
 
     /// Classic was never a distinct layout (behaved like Modern).
-    private let layouts = ["Modern", "Grid View", "Compact"]
+    private let layouts = ["Modern", "Grid View", "Compact", "Desktop"]
     // Search is the only screen that currently hosts the full Discover surface.
     // Do not offer Home/Library as dead selections that merely hide Discover.
     private let discoverLocations = ["Search", "Off"]
@@ -4855,8 +4855,8 @@ private struct LayoutDiscoverySettingsView: View {
                     posterLabels: posterLabels,
                     catalogAddonNames: catalogAddonNames,
                     landscapePosters: landscapePosters,
-                    gridRows: gridRows,
-                    gridItemsPerRow: gridItemsPerRow,
+                    gridRows: TVHomeLayout.effectiveGridRows(gridRows, layout: homeLayout),
+                    gridItemsPerRow: TVHomeLayout.effectiveGridItemsPerRow(gridItemsPerRow, layout: homeLayout),
                     accentColor: accentColor
                 )
 
@@ -4864,7 +4864,7 @@ private struct LayoutDiscoverySettingsView: View {
                     title: L10n.string("tvos_layout_layout", fallback: "Layout"),
                     subtitle: L10n.string(
                         "tvos_layout_layout_subtitle",
-                        fallback: "Modern and Compact use rows; Grid View shows each catalog in a poster grid"
+                        fallback: "Modern and Compact use rows; Grid View shows each catalog in a poster grid; Desktop scrolls a featured slideshow away above one row per catalog, like the desktop app"
                     ),
                     selection: $homeLayout,
                     options: layouts,
@@ -4885,12 +4885,15 @@ private struct LayoutDiscoverySettingsView: View {
                     accentColor: accentColor
                 )
 
-                if homeLayout == "Grid View" {
+                if TVHomeLayout.isGrid(homeLayout) {
                     HeroCatalogSelectionRow(
                         selectionData: $heroCatalogsData,
                         accentColor: accentColor
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+
+                if homeLayout == "Grid View" {
 
                     SettingsStepperRow(
                         title: L10n.string(
