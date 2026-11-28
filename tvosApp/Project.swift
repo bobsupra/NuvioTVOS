@@ -189,7 +189,7 @@ let appTarget: Target = .target(
             "FRAMEWORK_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "LD_RUNPATH_SEARCH_PATHS": ["$(inherited)", "@executable_path/Frameworks"],
-            "OTHER_LDFLAGS": ["$(inherited)", "-ObjC", "-lc++", "-framework", "SystemConfiguration"],
+            "OTHER_LDFLAGS": ["$(inherited)", "-ObjC", "-lc++", "-lz", "-framework", "SystemConfiguration"],
             "SWIFT_OBJC_BRIDGING_HEADER": "NuvioTV/NuvioTV-Bridging-Header.h",
             "VERSIONING_SYSTEM": "apple-generic",
         ],

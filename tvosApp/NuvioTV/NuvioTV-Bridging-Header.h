@@ -3,3 +3,5 @@
 //
 #import "TorrentEngine.h"
 #import "AIOCrashNotes.h"
+// zlib's CRC32, for the yEnc checksum of Usenet articles (UsenetCRC32).
+#include <zlib.h>

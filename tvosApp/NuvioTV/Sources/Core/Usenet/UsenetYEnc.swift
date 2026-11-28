@@ -6,46 +6,41 @@
 
 import Foundation
 
+/// CRC32 (IEEE), the checksum yEnc puts on every article. Computed by the system's zlib,
+/// which uses the CPU's CRC instructions: tens of GB/s on an Apple TV, where a table lookup
+/// per byte manages under 300 MB/s.
 struct UsenetCRC32: Sendable {
-    // Precomputed lookup table (256 entries), built once.
-    private static let table: [UInt32] = {
-        (0..<256).map { i -> UInt32 in
-            var c = UInt32(i)
-            for _ in 0..<8 {
-                c = (c & 1) != 0 ? (0xEDB8_8320 ^ (c >> 1)) : (c >> 1)
-            }
-            return c
-        }
-    }()
-
-    private var state: UInt32 = 0xFFFF_FFFF
+    /// zlib's running value: 0 before any bytes.
+    private var state: UInt = 0
 
     init() {}
 
     /// Feed more bytes into the running checksum.
     mutating func update<S: Sequence>(_ bytes: S) where S.Element == UInt8 {
-        var c = state
-        let table = Self.table
-        for b in bytes {
-            c = table[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8)
-        }
-        state = c
+        let array = Array(bytes)
+        array.withUnsafeBytes { update(raw: $0) }
     }
 
     mutating func update(_ data: Data) {
-        data.withUnsafeBytes { raw in
-            Self.table.withUnsafeBufferPointer { table in
-                var c = state
-                for b in raw {
-                    c = table[Int((c ^ UInt32(b)) & 0xFF)] ^ (c >> 8)
-                }
-                state = c
-            }
+        data.withUnsafeBytes { update(raw: $0) }
+    }
+
+    private mutating func update(raw: UnsafeRawBufferPointer) {
+        guard var bytes = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+        var remaining = raw.count
+        var crc = state
+        // zlib takes 32-bit lengths.
+        while remaining > 0 {
+            let chunk = min(remaining, 1 << 30)
+            crc = crc32(crc, bytes, uInt(chunk))
+            bytes += chunk
+            remaining -= chunk
         }
+        state = crc
     }
 
     /// The current checksum value.
-    var checksum: UInt32 { state ^ 0xFFFF_FFFF }
+    var checksum: UInt32 { UInt32(truncatingIfNeeded: state) }
 
     /// One-shot convenience.
     static func checksum(of data: Data) -> UInt32 {

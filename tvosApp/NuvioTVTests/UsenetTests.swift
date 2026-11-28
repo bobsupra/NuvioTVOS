@@ -71,6 +71,32 @@ final class UsenetCoreTests: XCTestCase {
         XCTAssertEqual(UsenetCRC32.checksum(of: Data("123456789".utf8)), 0xCBF4_3926)
     }
 
+    func testCRC32MatchesTheBitwiseOneInPieces() {
+        // The checksum bit by bit, as the yEnc spec defines it.
+        func reference(_ bytes: [UInt8]) -> UInt32 {
+            var crc: UInt32 = 0xFFFF_FFFF
+            for byte in bytes {
+                crc ^= UInt32(byte)
+                for _ in 0..<8 { crc = (crc & 1) != 0 ? (crc >> 1) ^ 0xEDB8_8320 : crc >> 1 }
+            }
+            return crc ^ 0xFFFF_FFFF
+        }
+        var generator = SystemRandomNumberGenerator()
+        let bytes = (0..<750_000).map { _ in UInt8.random(in: 0...255, using: &generator) }
+        let expected = reference(bytes)
+        XCTAssertEqual(UsenetCRC32.checksum(of: Data(bytes)), expected)
+
+        // Fed in pieces, as Data and as a sequence.
+        var pieces = UsenetCRC32()
+        pieces.update(Data(bytes[..<1]))
+        pieces.update(bytes[1..<300_001])
+        pieces.update(Data(bytes[300_001...]))
+        XCTAssertEqual(pieces.checksum, expected)
+
+        XCTAssertEqual(UsenetCRC32.checksum(of: Data()), 0)
+        XCTAssertEqual(UsenetCRC32().checksum, 0)
+    }
+
     func testYEncRoundTripSinglePart() throws {
         let payload = Data((0..<1000).map { UInt8($0 % 256) })
         let segment = try UsenetYEnc.decode(bodyLines: UsenetFixture.yEncLines(payload, name: "movie.mkv"))
