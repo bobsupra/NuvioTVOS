@@ -5494,7 +5494,8 @@ struct TvDetailsContent: View {
                         cast: meta.cast,
                         director: meta.director,
                         writer: meta.writer,
-                        people: uiState.people
+                        people: uiState.people,
+                        focusRequestID: focusRequestItemID(for: .cast)
                     ),
                     entryLocked: focusedDetailsSection != .cast
                 ))
@@ -7099,6 +7100,9 @@ private struct TvDetailsCastSnapshot: Equatable {
     let director: [String]?
     let writer: [String]?
     let people: [TmdbPersonMetadata]
+    /// The card a focus restore is aiming at. Part of the key so the row redraws when the
+    /// restore ends; otherwise its other cards stay disabled after Back from a person's page.
+    let focusRequestID: String?
 }
 
 private struct TvDetailsEpisodesSnapshotKey: Equatable {
