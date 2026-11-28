@@ -59,6 +59,28 @@ enum PlayerControlsVerticalNavigationPolicy {
     }
 }
 
+enum PlayerControlsStartupFocusPolicy {
+    /// Where focus starts once playback has started: the timeline, or the first transport
+    /// button of a live stream. Before that the timeline can't take focus, so controls shown
+    /// while the stream starts get "…" (`.settings`).
+    static func initialFocus(isLiveStream: Bool, transportFocusOrder: [PlayerControlFocus]) -> PlayerControlFocus {
+        isLiveStream ? (transportFocusOrder.first ?? .settings) : .timeline
+    }
+
+    /// When playback starts with focus still resting on that "…", it moves to `initialFocus`.
+    /// nil leaves focus where it is.
+    static func focusAfterPlaybackStarts(
+        currentFocus: PlayerControlFocus?,
+        isLiveStream: Bool,
+        transportFocusOrder: [PlayerControlFocus],
+        canMoveFocus: Bool
+    ) -> PlayerControlFocus? {
+        guard canMoveFocus, currentFocus == .settings else { return nil }
+        let target = initialFocus(isLiveStream: isLiveStream, transportFocusOrder: transportFocusOrder)
+        return target == .settings ? nil : target
+    }
+}
+
 // Keep each PlayerView layer in a named property so the ZStack order stays explicit.
 extension PlayerView {
     var arePlaybackControlsVisible: Bool {

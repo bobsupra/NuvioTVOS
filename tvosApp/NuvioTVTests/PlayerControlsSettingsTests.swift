@@ -772,6 +772,56 @@ final class PlayerControlsSettingsTests: XCTestCase {
     }
 
     @MainActor
+    func testStartupFocusMovesFromSettingsOnceThePlaybackStarts() {
+        let order: [PlayerControlFocus] = [.episodes, .subtitles, .settings]
+        XCTAssertEqual(
+            PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                currentFocus: .settings, isLiveStream: false, transportFocusOrder: order, canMoveFocus: true
+            ),
+            .timeline,
+            "Focus the controls got before the timeline could take it must move to the timeline"
+        )
+        XCTAssertEqual(
+            PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                currentFocus: .settings, isLiveStream: true, transportFocusOrder: order, canMoveFocus: true
+            ),
+            .episodes,
+            "A live stream starts on its first transport button"
+        )
+        XCTAssertNil(
+            PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                currentFocus: .settings, isLiveStream: true, transportFocusOrder: [.settings], canMoveFocus: true
+            ),
+            "With only \"…\" in a live stream's row there is nowhere else to go"
+        )
+        XCTAssertNil(
+            PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                currentFocus: .episodes, isLiveStream: false, transportFocusOrder: order, canMoveFocus: true
+            ),
+            "Focus on another control stays where it is"
+        )
+        XCTAssertNil(
+            PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                currentFocus: nil, isLiveStream: false, transportFocusOrder: order, canMoveFocus: true
+            )
+        )
+        XCTAssertNil(
+            PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                currentFocus: .settings, isLiveStream: false, transportFocusOrder: order, canMoveFocus: false
+            ),
+            "A menu, panel, prompt or overlay keeps focus where it is"
+        )
+        XCTAssertEqual(
+            PlayerControlsStartupFocusPolicy.initialFocus(isLiveStream: false, transportFocusOrder: order),
+            .timeline
+        )
+        XCTAssertEqual(
+            PlayerControlsStartupFocusPolicy.initialFocus(isLiveStream: true, transportFocusOrder: []),
+            .settings
+        )
+    }
+
+    @MainActor
     func testVerticalNavigationFromTimelineAndSkipSegment() {
         XCTAssertEqual(
             PlayerControlsVerticalNavigationPolicy.timelineUpTarget(transportFocusOrder: [.episodes, .subtitles, .settings]),
