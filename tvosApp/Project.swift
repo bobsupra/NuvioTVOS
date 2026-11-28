@@ -137,7 +137,11 @@ let appTarget: Target = .target(
     // NuvioTV/AppDelegate.swift is deliberately NOT globbed. It carries
     // @UIApplicationMain while NuvioTVApp.swift carries @main; compiling both
     // is a duplicate-entry-point error. The pbxproj excluded it the same way.
-    sources: ["NuvioTV/Sources/**/*.swift"],
+    sources: [
+        "NuvioTV/Sources/**/*.swift",
+        // node-yencode's yEnc decoder (NEON), for UsenetYEnc: NuvioTV/YEnc/README.md.
+        .glob("NuvioTV/YEnc/*.cc", compilerFlags: "-Wno-unused-function"),
+    ],
     resources: [
         "NuvioTV/Images.xcassets",
         "NuvioTV/Resources/AppLanguageCatalog.json",
@@ -190,6 +194,9 @@ let appTarget: Target = .target(
             "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "LD_RUNPATH_SEARCH_PATHS": ["$(inherited)", "@executable_path/Frameworks"],
             "OTHER_LDFLAGS": ["$(inherited)", "-ObjC", "-lc++", "-lz", "-framework", "SystemConfiguration"],
+            // The yEnc decoder in NuvioTV/YEnc is ARM64 only (its x86 SIMD files are not
+            // vendored); an x86_64 simulator build decodes in Swift (UsenetYEnc).
+            "EXCLUDED_SOURCE_FILE_NAMES[arch=x86_64]": "NuvioYEnc.cc platform.cc decoder.cc decoder_neon64.cc",
             "SWIFT_OBJC_BRIDGING_HEADER": "NuvioTV/NuvioTV-Bridging-Header.h",
             "VERSIONING_SYSTEM": "apple-generic",
         ],

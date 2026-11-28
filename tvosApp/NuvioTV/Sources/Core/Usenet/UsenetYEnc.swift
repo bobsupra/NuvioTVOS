@@ -101,11 +101,28 @@ enum UsenetYEnc {
     /// Decode one article body as it came off the wire (CRLF lines, dot-stuffed,
     /// without the terminating "." line) in a single pass: no per-line objects.
     static func decode(body: Data, unstuffDots: Bool = true) throws -> UsenetYEncSegment {
+        #if arch(arm64)
+        // node-yencode's NEON decoder undoes the dot stuffing itself, so it only takes bodies
+        // straight off the wire.
+        if unstuffDots, let segment = decodeWithNEON(body) {
+            // It reads an escape split across two lines differently (as SABnzbd and NZBGet do),
+            // so an article that fails its CRC gets a second look a byte at a time.
+            if segment.crcMatches == false,
+               let portable = try? decodePortable(body: body, unstuffDots: true),
+               portable.crcMatches == true {
+                return portable
+            }
+            return segment
+        }
+        #endif
+        return try decodePortable(body: body, unstuffDots: unstuffDots)
+    }
+
+    /// A byte at a time: every body shape, on every architecture.
+    static func decodePortable(body: Data, unstuffDots: Bool = true) throws -> UsenetYEncSegment {
         var header = UsenetYEncHeader()
         var sawBegin = false
-        var declaredPartSize: Int?
-        var pcrc: UInt32?
-        var fileCRC: UInt32?
+        var trailer: [String: String] = [:]
 
         let out: [UInt8] = body.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> [UInt8] in
             guard let rawBase = raw.baseAddress, raw.count > 0 else { return [] }
@@ -139,10 +156,7 @@ enum UsenetYEnc {
                             continue lines
                         }
                         if isKeyword(line, "=yend") {
-                            let attrs = attributes(of: line, keyword: "=yend")
-                            declaredPartSize = attrs["size"].flatMap { Int($0) }
-                            pcrc = attrs["pcrc32"].flatMap { UInt32($0, radix: 16) }
-                            fileCRC = attrs["crc32"].flatMap { UInt32($0, radix: 16) }
+                            trailer = attributes(of: line, keyword: "=yend")
                             break lines
                         }
                     }
@@ -168,8 +182,86 @@ enum UsenetYEnc {
         }
 
         guard sawBegin else { throw UsenetYEncError.missingBeginHeader }
+        return segment(data: Data(out), header: header, trailer: trailer)
+    }
 
-        let outData = Data(out)
+    #if arch(arm64)
+    /// True when `decode(body:)` decodes with NEON, as it does on every Apple TV.
+    static var usesNEON: Bool { nuvio_yenc_uses_neon() != 0 }
+
+    /// node-yencode's decoder (YEnc/NuvioYEnc.h): several GB/s on an Apple TV, where
+    /// `decodePortable` manages about 650 MB/s. nil when the body is not the usual shape
+    /// (=ybegin first, CRLF lines, =yend last); `decodePortable` takes those.
+    static func decodeWithNEON(_ body: Data) -> UsenetYEncSegment? {
+        var header = UsenetYEncHeader()
+        var sawBegin = false
+        var trailerLine: Data?
+        var output = Data(count: body.count)
+
+        let decodedCount: Int? = body.withUnsafeBytes { (raw: UnsafeRawBufferPointer) -> Int? in
+            guard let rawBase = raw.baseAddress, raw.count > 0 else { return nil }
+            let base = rawBase.assumingMemoryBound(to: UInt8.self)
+            let n = raw.count
+
+            /// The line starting at `start`, without its CRLF, and where the next one starts.
+            func line(at start: Int) -> (line: Data, next: Int) {
+                var end = n
+                if let newline = memchr(rawBase + start, 0x0A, n - start) {
+                    end = rawBase.distance(to: UnsafeRawPointer(newline))
+                }
+                let next = min(end + 1, n)
+                if end > start, base[end - 1] == 0x0D { end -= 1 }
+                return (Data(bytes: base + start, count: end - start), next)
+            }
+
+            // The =ybegin and =ypart lines, in Swift. An empty part has its =yend right after.
+            var i = 0
+            while i + 1 < n, base[i] == 0x3D, base[i + 1] == 0x79 {
+                let (text, next) = line(at: i)
+                i = next
+                if isKeyword(text, "=ybegin") {
+                    parseBegin(text, into: &header)
+                    sawBegin = true
+                } else if isKeyword(text, "=ypart") {
+                    parsePart(text, into: &header)
+                } else if isKeyword(text, "=yend") {
+                    guard sawBegin else { return nil }
+                    trailerLine = text
+                    return 0
+                } else {
+                    return nil
+                }
+            }
+            guard sawBegin, i < n else { return nil }
+
+            // The data, until the "\r\n=y" that starts the =yend line.
+            var consumed = 0
+            var ended: Int32 = 0
+            let count = output.withUnsafeMutableBytes { (out: UnsafeMutableRawBufferPointer) -> Int in
+                guard let target = out.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return 0 }
+                return nuvio_yenc_decode(base + i, n - i, target, &consumed, &ended)
+            }
+            guard ended == 1, consumed >= 2 else { return nil }
+            let (text, _) = line(at: i + consumed - 2)
+            guard isKeyword(text, "=yend") else { return nil }
+            trailerLine = text
+            return count
+        }
+
+        guard let decodedCount, let trailerLine else { return nil }
+        output.count = decodedCount
+        return segment(data: output, header: header,
+                       trailer: attributes(of: trailerLine, keyword: "=yend"))
+    }
+    #endif
+
+    /// The segment for an article's decoded data, its =ybegin/=ypart header and its =yend
+    /// attributes.
+    private static func segment(data outData: Data, header: UsenetYEncHeader,
+                                trailer: [String: String]) -> UsenetYEncSegment {
+        let declaredPartSize = trailer["size"].flatMap { Int($0) }
+        let pcrc = trailer["pcrc32"].flatMap { UInt32($0, radix: 16) }
+        let fileCRC = trailer["crc32"].flatMap { UInt32($0, radix: 16) }
         var crc = UsenetCRC32()
         crc.update(outData)
         let computed = crc.checksum
