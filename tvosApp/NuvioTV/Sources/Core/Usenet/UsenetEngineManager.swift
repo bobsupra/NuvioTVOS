@@ -19,6 +19,8 @@ struct UsenetStreamStats: Equatable, Sendable {
     var diskFreeBytes: Int64 = -1
     var cacheHitRate: Double?
     var missingArticles = 0
+    /// Articles no server had an intact copy of (bad CRC), played as they came.
+    var damagedArticles = 0
     var fallbackArticles = 0
     /// Connections closed and opened again (idle too long, or dropped).
     var reconnects = 0
@@ -56,6 +58,7 @@ struct UsenetStreamStats: Equatable, Sendable {
         var parts = ["ahead \(bufferedFormatted)"]
         if let cacheHitRate { parts.append("hit \(Int((cacheHitRate * 100).rounded()))%") }
         parts.append("missing \(missingArticles)")
+        if damagedArticles > 0 { parts.append("damaged \(damagedArticles)") }
         if fallbackArticles > 0 { parts.append("backup \(fallbackArticles)") }
         if reconnects > 0 { parts.append("reconnect \(reconnects)") }
         return parts.joined(separator: " · ")
@@ -335,6 +338,7 @@ final class UsenetEngineManager: ObservableObject {
                 stats.diskBudgetBytes = sessionStats.diskBudgetBytes
                 stats.diskFreeBytes = sessionStats.diskFreeBytes
                 stats.missingArticles = sessionStats.missingArticles
+                stats.damagedArticles = sessionStats.damagedArticles
                 stats.cacheHitRate = lookups > 0 ? Double(sessionStats.cacheHits) / Double(lookups) : nil
                 if stats != self.activeStats { self.activeStats = stats }
                 // Twice a second: the seek bar draws the read-ahead from these, and a seek
