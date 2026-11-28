@@ -697,6 +697,25 @@ final class UsenetSourceTests: XCTestCase {
         XCTAssertFalse(UsenetHealthCheck.isPlayable(.init(checked: 12, missing: 1, tailMissing: true)))
     }
 
+    func testFailoverFromUsenetTriesUsenetFirst() {
+        let usenetURL = UsenetStreamSpec(nzbURL: URL(string: "https://i.example/a.nzb")!).url.absoluteString
+        let otherUsenetURL = UsenetStreamSpec(nzbURL: URL(string: "https://i.example/b.nzb")!).url.absoluteString
+        let ranked = [
+            NuvioStream(url: "https://debrid.example/1.mkv", name: "Debrid 2160p", description: nil, addonName: "A"),
+            NuvioStream(url: usenetURL, name: "Usenet 1080p", description: nil, addonName: "U"),
+            NuvioStream(url: nil, name: "P2P 1080p", description: nil, addonName: "T", infoHash: String(repeating: "a", count: 40), fileIdx: 0),
+            NuvioStream(url: otherUsenetURL, name: "Usenet 720p", description: nil, addonName: "U"),
+        ]
+        XCTAssertEqual(UsenetEngineManager.usenetFirst(ranked).map(\.name),
+                       ["Usenet 1080p", "Usenet 720p", "Debrid 2160p", "P2P 1080p"])
+        let noUsenet = [ranked[0], ranked[2]]
+        XCTAssertEqual(UsenetEngineManager.usenetFirst(noUsenet).map(\.name), noUsenet.map(\.name))
+
+        XCTAssertTrue(UsenetEngineManager.includesUsenet(["http://127.0.0.1:52001/usenet/token/video.mkv"]))
+        XCTAssertTrue(UsenetEngineManager.includesUsenet([usenetURL]))
+        XCTAssertFalse(UsenetEngineManager.includesUsenet(["https://debrid.example/1.mkv", "http://127.0.0.1:52002/torrent/x"]))
+    }
+
     func testReleaseProblemsAllowFallback() {
         XCTAssertTrue(UsenetEngineManager.isReleaseProblem(UsenetError.releaseIncomplete))
         XCTAssertTrue(UsenetEngineManager.isReleaseProblem(UsenetError.archiveCompressed("a.mkv")))

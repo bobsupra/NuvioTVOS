@@ -281,6 +281,20 @@ final class UsenetEngineManager: ObservableObject {
         sourceByPlaybackURL[playback] = canonical
     }
 
+    /// A Usenet stream is among the ones that failed (its local playback URL, or its source).
+    nonisolated static func includesUsenet(_ failedURLs: Set<String>) -> Bool {
+        failedURLs.contains { UsenetStreamSpec.isUsenetURL($0) || UsenetStreamServer.isStreamURL(URL(string: $0)) }
+    }
+
+    /// The order to try sources in after a Usenet stream failed: the other Usenet streams first,
+    /// as ranked, then the rest. Someone playing Usenet wants Usenet again, not whatever ranks
+    /// first overall (a torrent, a debrid link).
+    nonisolated static func usenetFirst(_ streams: [NuvioStream]) -> [NuvioStream] {
+        let usenet = streams.filter { UsenetStreamSpec.isUsenetURL($0.directURL) }
+        guard !usenet.isEmpty else { return streams }
+        return usenet + streams.filter { !UsenetStreamSpec.isUsenetURL($0.directURL) }
+    }
+
     /// Failover excludes the local playback URLs that failed; each Usenet
     /// start gets a new one, so match them back to the add-on stream.
     nonisolated static func isExcluded(sourceURL: String, excludedPlaybackURLs: Set<String>) -> Bool {
