@@ -839,6 +839,34 @@ struct ExternalPlaybackSession: Codable, Equatable {
     var startPosition: Double? = nil
 }
 
+/// Choose Profile on Return doesn't ask on the first return within `window`
+/// of Nuvio opening an external player: that return continues the same
+/// viewing. The time is kept in the standard defaults, so it also counts when
+/// tvOS closed Nuvio while the player was up.
+enum ExternalPlayerReturn {
+    static let key = "nuvio.tv.device.externalPlayerOpenedAt"
+    /// Long enough for a long film. A return later than this asks again.
+    static let window: TimeInterval = 6 * 60 * 60
+
+    static func markOpened(at date: Date = Date(), defaults: UserDefaults = .standard) {
+        defaults.set(date, forKey: key)
+    }
+
+    /// Forgets the time, for a player that didn't open after all.
+    static func clear(defaults: UserDefaults = .standard) {
+        defaults.removeObject(forKey: key)
+    }
+
+    /// Whether this return follows an external player Nuvio opened within
+    /// `window`. Only the first return after opening one counts.
+    static func consumeRecentReturn(now: Date = Date(), defaults: UserDefaults = .standard) -> Bool {
+        guard let opened = defaults.object(forKey: key) as? Date else { return false }
+        clear(defaults: defaults)
+        let elapsed = now.timeIntervalSince(opened)
+        return elapsed >= 0 && elapsed < window
+    }
+}
+
 enum ExternalPlaybackSessionStore {
     private static let key = "nuvio.tv.externalPlaybackSession.v1"
 

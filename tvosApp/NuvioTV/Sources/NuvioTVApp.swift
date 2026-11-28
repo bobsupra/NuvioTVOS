@@ -1053,8 +1053,10 @@ struct ContentView: View {
                 // Choose Profile on Return keeps the stop: tvOS often closes
                 // Nuvio while it is in the background, so coming back is
                 // often a fresh launch.
-                let autoSelectLast = Self.remembersLastProfile
-                    && !Self.requiresProfileSelectionOnEveryReturn
+                // Asked before Remember Last Profile is read, so a launch
+                // always uses up the return an external player left.
+                let asksOnReturn = Self.asksWhoIsWatchingOnReturn()
+                let autoSelectLast = Self.remembersLastProfile && !asksOnReturn
                 // Signed in with the startup pull still running, so real
                 // profiles are expected to land shortly and the local
                 // placeholder must not be mistaken for the account.
@@ -1165,6 +1167,14 @@ struct ContentView: View {
             ?? true
     }
 
+    /// Choose Profile on Return, except on the first return after an external
+    /// player that Nuvio opened. A call uses that return up, so call it once
+    /// per launch or return.
+    private static func asksWhoIsWatchingOnReturn() -> Bool {
+        let fromExternalPlayer = ExternalPlayerReturn.consumeRecentReturn()
+        return requiresProfileSelectionOnEveryReturn && !fromExternalPlayer
+    }
+
     private static var requiresProfileSelectionOnEveryReturn: Bool {
         (UserDefaults.standard.object(forKey: SettingsKey.profileRequireSelectionAfterBackground) as? Bool)
             ?? (ProfileSettings.current.object(forKey: SettingsKey.profileRequireSelectionAfterBackground) as? Bool)
@@ -1182,7 +1192,7 @@ struct ContentView: View {
         if case .login = activeScreen { return }
 
         let autoSelectLast = Self.remembersLastProfile
-        let requireSelectionOnEveryReturn = Self.requiresProfileSelectionOnEveryReturn
+        let requireSelectionOnEveryReturn = Self.asksWhoIsWatchingOnReturn()
         let shouldRequireSelection: Bool
         if requireSelectionOnEveryReturn {
             shouldRequireSelection = true
@@ -2432,7 +2442,12 @@ struct ContentView: View {
             if let externalSession {
                 ExternalPlaybackSessionStore.save(externalSession)
             }
-            UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
+            ExternalPlayerReturn.markOpened()
+            UIApplication.shared.open(launchURL, options: [:]) { opened in
+                // Nuvio stays in front when the player doesn't open, so its
+                // next return isn't from the player.
+                if !opened { ExternalPlayerReturn.clear() }
+            }
             return
         }
 
