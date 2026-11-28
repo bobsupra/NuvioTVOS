@@ -6201,6 +6201,13 @@ private struct TVMainTabView: View {
             liveTVLoadedCache.clear()
             refreshCollectionDestinations()
         }
+        // A title the last launch left playing (killed or crashed) gets its missing Trakt pause.
+        .task(id: activeProfile?.id) {
+            guard activeProfile != nil else { return }
+            try? await Task.sleep(for: .seconds(8))
+            guard !Task.isCancelled else { return }
+            await TraktOpenPlaybackRecovery.recoverIfNeeded()
+        }
         .task(id: collectionDestinations.map(\.revision)) {
             await collectionSidebarArtwork.load(collectionDestinations)
         }
