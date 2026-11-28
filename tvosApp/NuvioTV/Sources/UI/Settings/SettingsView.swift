@@ -371,6 +371,7 @@ enum SettingsKey {
     static let plexLocalRowEnabled = "nuvio.tv.settings.integrations.plexLocalRowEnabled"
 
     static let trueHDSpatialAudio = "nuvio.tv.settings.playback.trueHDSpatialAudio"
+    static let trueHDSpatialAudioLayout = "nuvio.tv.settings.playback.trueHDSpatialAudioLayout"
     static let preferDualLayerDolbyVision = "nuvio.tv.settings.playback.preferDualLayerDolbyVision"
     static let dualLayerRoute = "nuvio.tv.settings.playback.dualLayerRoute"
     static let foldsDolbyVisionFEL = "nuvio.tv.settings.playback.foldsDolbyVisionFEL"
@@ -381,6 +382,7 @@ enum SettingsKey {
     static let preserveSubwooferBassInStereo = "nuvio.tv.settings.playback.preserveSubwooferBassInStereo"
     static let loudnessNormalizer = "nuvio.tv.settings.playback.loudnessNormalizer"
     static let loudnessTargetPreset = "nuvio.tv.settings.playback.loudnessTargetPreset"
+    static let binauralAudio = "nuvio.tv.settings.playback.binauralAudio"
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
     static let trickplayServer = "nuvio.tv.settings.playback.trickplayServer"
     static let externalPlayer = "nuvio.tv.settings.playback.externalPlayer"
@@ -574,7 +576,7 @@ enum SettingsKey {
         smbServers, smbLibraryIndex, smbLocalRowEnabled,
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
         plexServers, plexAccountName, plexLocalRowEnabled,
-        playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, dualLayerRoute, foldsDolbyVisionFEL, preferHDR10Plus, lowResUpscaling, upscaleScaler, losslessAudioBridge, preserveSubwooferBassInStereo, loudnessNormalizer, loudnessTargetPreset, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
+        playerEngine, trueHDSpatialAudio, trueHDSpatialAudioLayout, preferDualLayerDolbyVision, dualLayerRoute, foldsDolbyVisionFEL, preferHDR10Plus, lowResUpscaling, upscaleScaler, losslessAudioBridge, preserveSubwooferBassInStereo, loudnessNormalizer, loudnessTargetPreset, binauralAudio, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamNuvioBadges, streamBadgePlacement,
         streamListTextScale, streamListCardSize, streamListWidth, streamListNameLines, streamListDescriptionLines, streamListEpisodeHeader, streamListExpandFocused, streamListHideFileSize,
@@ -13893,11 +13895,13 @@ private struct PlaybackSettingsView: View {
 private struct AudioVideoProcessingSettingsSection: View {
     let accentColor: Color
 
-    @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = false
+    @AppStorage(SettingsKey.trueHDSpatialAudio) private var trueHDSpatialAudio = true
+    @AppStorage(SettingsKey.trueHDSpatialAudioLayout) private var trueHDSpatialAudioLayout = SpatialAudioSettings.defaultLayout.rawValue
     @AppStorage(SettingsKey.losslessAudioBridge) private var losslessAudioBridge = false
     @AppStorage(SettingsKey.preserveSubwooferBassInStereo) private var preserveSubwooferBassInStereo = false
     @AppStorage(SettingsKey.loudnessNormalizer) private var loudnessNormalizer = false
     @AppStorage(SettingsKey.loudnessTargetPreset) private var loudnessTargetPreset = "standard"
+    @AppStorage(SettingsKey.binauralAudio) private var binauralAudio = "headphones"
     @AppStorage(SettingsKey.preferDualLayerDolbyVision) private var preferDualLayerDolbyVision = false
     @AppStorage(SettingsKey.dualLayerRoute) private var dualLayerRoute = "softwareHost"
     @AppStorage(SettingsKey.foldsDolbyVisionFEL) private var foldsDolbyVisionFEL = false
@@ -13906,9 +13910,11 @@ private struct AudioVideoProcessingSettingsSection: View {
     @AppStorage(SettingsKey.hybridDiskCacheEnabled) private var hybridDiskCacheEnabled = false
     @AppStorage(SettingsKey.hybridDiskCacheLimitGB) private var hybridDiskCacheLimitGB = 20
 
+    private let spatialAudioOptions = ["off"] + SpatialSpeakerLayout.allCases.map(\.rawValue)
     private let dualLayerRoutes = ["softwareHost", "avPlayerOutput"]
     private let upscaleScalers = ["smart", "lineArt", "automatic", "off"]
     private let loudnessTargetPresets = ["standard", "night", "boost"]
+    private let binauralAudioModes = ["off", "headphones", "always"]
     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
 
     var body: some View {
@@ -13920,14 +13926,35 @@ private struct AudioVideoProcessingSettingsSection: View {
                     fallback: "Spatial audio, lossless audio bridge, bass downmixing, and loudness normalization"
                 )
             ) {
-                SettingsToggleRow(
+                SettingsOptionRow(
                     title: L10n.string("tvos_settings_truehd_spatial_audio", fallback: "Atmos & DTS:X Spatial Audio (Beta)"),
                     subtitle: L10n.string(
                         "tvos_settings_truehd_spatial_audio_subtitle",
-                        fallback: "Render TrueHD Atmos and DTS:X to 9.1.6 using lossy APAC. Requires tvOS 26+ and AetherEngine; applies to the next playback."
+                        fallback: "AetherEngine only. Renders TrueHD Atmos and DTS:X heights to your speaker layout (lossless 24-bit LPCM over HDMI/direct routes, APAC over AirPlay). Requires tvOS 26+; applies to the next playback."
                     ),
-                    isOn: $trueHDSpatialAudio,
-                    accentColor: accentColor
+                    selection: Binding(
+                        get: {
+                            guard trueHDSpatialAudio else { return "off" }
+                            return SpatialSpeakerLayout(rawValue: trueHDSpatialAudioLayout)?.rawValue
+                                ?? SpatialAudioSettings.defaultLayout.rawValue
+                        },
+                        set: { newValue in
+                            if newValue == "off" {
+                                trueHDSpatialAudio = false
+                            } else {
+                                trueHDSpatialAudioLayout = newValue
+                                trueHDSpatialAudio = true
+                            }
+                        }
+                    ),
+                    options: spatialAudioOptions,
+                    accentColor: accentColor,
+                    optionLabel: { option in
+                        if option == "off" {
+                            return L10n.string("tvos_settings_upscale_off", fallback: "Off")
+                        }
+                        return option
+                    }
                 )
                 .settingsEntryAnchor()
                 .disabled(!SpatialAudioSettings.isSupported)
@@ -13994,6 +14021,30 @@ private struct AudioVideoProcessingSettingsSection: View {
                         }
                     )
                 }
+
+                SettingsOptionRow(
+                    title: L10n.string(
+                        "tvos_settings_binaural_audio",
+                        fallback: "Binaural Headphone Audio (Experimental)"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_binaural_audio_subtitle",
+                        fallback: "AetherEngine only. Renders 5.1, 7.1, and Atmos/DTS:X into 2-channel binaural HRTF stereo for headphones. Headphones Only activates automatically when Bluetooth or wired headphones are connected."
+                    ),
+                    selection: $binauralAudio,
+                    options: binauralAudioModes,
+                    accentColor: accentColor,
+                    optionLabel: { mode in
+                        switch mode {
+                        case "headphones":
+                            return L10n.string("tvos_settings_binaural_headphones", fallback: "Headphones Only")
+                        case "always":
+                            return L10n.string("tvos_settings_binaural_always", fallback: "Always On")
+                        default:
+                            return L10n.string("tvos_settings_upscale_off", fallback: "Off")
+                        }
+                    }
+                )
             }
 
             SettingsGroup(

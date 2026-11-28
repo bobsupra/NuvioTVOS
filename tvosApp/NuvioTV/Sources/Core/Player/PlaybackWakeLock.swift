@@ -63,14 +63,18 @@ enum PlaybackWakeLock {
     private static var reassertTimer: Timer?
 
     /// Reappearing views for the same session reuse its existing hold.
-    static func acquire(ownerID: UUID) {
+    /// AetherEngine owns its own serialized `AVAudioSession` setup and post-play-gate
+    /// activation, so Aether sessions pass `activatesAudioSession: false` to avoid racing it.
+    static func acquire(ownerID: UUID, activatesAudioSession: Bool = true) {
         let wasEmpty = owners.isEmpty
         owners.insert(ownerID)
         if wasEmpty {
             preventsIdle = true
         }
         apply()
-        activateAudioSession()
+        if activatesAudioSession {
+            activateAudioSession()
+        }
         startReassertTimerIfNeeded()
     }
 

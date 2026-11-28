@@ -37,7 +37,10 @@ extension PlayerView {
                             viewModel.resolvePlaybackStream = resolvePlaybackStream
                             viewModel.onWatchPartySourceChanged = onWatchPartySourceChanged
                             configureEpisodeControls()
-                            PlaybackWakeLock.acquire(ownerID: viewModel.sessionCoordinator.wakeLockOwnerID)
+                            PlaybackWakeLock.acquire(
+                                ownerID: viewModel.sessionCoordinator.wakeLockOwnerID,
+                                activatesAudioSession: viewModel.activeEngineKind != .aether
+                            )
                             syncPlaybackWakeLock()
                             focusRemoteInput()
                             // Preserve active episode/source, subtitle task, resolver, benchmark and poller.
@@ -78,7 +81,10 @@ extension PlayerView {
                 )
                 // load() may adopt the retained PiP coordinator. Acquire for
                 // that session so restoring fullscreen cannot add another hold.
-                PlaybackWakeLock.acquire(ownerID: viewModel.sessionCoordinator.wakeLockOwnerID)
+                PlaybackWakeLock.acquire(
+                    ownerID: viewModel.sessionCoordinator.wakeLockOwnerID,
+                    activatesAudioSession: viewModel.activeEngineKind != .aether
+                )
                 syncPlaybackWakeLock()
                 if !isStandalonePlaybackSession {
                     viewModel.fetchExternalSubtitles(
@@ -114,7 +120,10 @@ extension PlayerView {
                         return
                     }
                     configureEpisodeControls()
-                    PlaybackWakeLock.acquire(ownerID: viewModel.sessionCoordinator.wakeLockOwnerID)
+                    PlaybackWakeLock.acquire(
+                        ownerID: viewModel.sessionCoordinator.wakeLockOwnerID,
+                        activatesAudioSession: viewModel.activeEngineKind != .aether
+                    )
                     syncPlaybackWakeLock()
                 } catch {
                     return

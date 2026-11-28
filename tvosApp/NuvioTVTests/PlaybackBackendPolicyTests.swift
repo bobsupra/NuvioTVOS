@@ -3316,7 +3316,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(model.subtitles.first(where: { $0.isSelected })?.id, "3")
         XCTAssertFalse(model.isExternalSubtitleSelected(fullAddon))
 
-        // 3. If no forced track exists while an early external full subtitle is still pending, forced policy clears the pending external selection and keeps subtitles off.
+        // 3. If no forced track exists while an early external full subtitle is still pending (or off already appears selected mid-load), forced policy clears pending external selection, locks preference, and keeps subtitles off instead of falling back to full.
         let noForcedCoordinator = PlaybackSessionCoordinator(
             aetherControllerFactory: { nil },
             engineSettingProvider: { "MPVKit" },
@@ -3334,11 +3334,15 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         noForcedCoordinator.mpvController.audioTracks = [
             PlaybackTrackInfo(index: 0, id: 1, type: "audio", title: "English", lang: "eng", selected: true, externalFilename: "")
         ]
+        noForcedModel.syncTracks()
+        XCTAssertFalse(noForcedModel.didApplySubtitlePreference)
+
         noForcedCoordinator.mpvController.subtitleTracks = [
             PlaybackTrackInfo(index: 0, id: 2, type: "sub", title: "English", lang: "eng", selected: false, externalFilename: "", isForced: false)
         ]
         noForcedModel.syncTracks()
 
+        XCTAssertTrue(noForcedModel.didApplySubtitlePreference)
         XCTAssertEqual(noForcedModel.subtitles.first(where: { $0.isSelected })?.id, "off")
         XCTAssertFalse(noForcedModel.hasSelectedExternalSubtitle)
     }

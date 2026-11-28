@@ -4712,6 +4712,17 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
             .store(in: &cancellables)
 
+        NotificationCenter.default.publisher(for: AVAudioSession.routeChangeNotification)
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self,
+                      !self.isAwaitingEngineLoad,
+                      self.activePlaybackRequest != nil,
+                      Self.resolvedBinauralMode(ProfileSettings.current.string(forKey: SettingsKey.binauralAudio)) == "headphones" else { return }
+                self.engine.setAudioShaping(self.currentAudioShaping())
+            }
+            .store(in: &cancellables)
+
         engine.clock.objectWillChange
             .receive(on: DispatchQueue.main)
             .sink { [weak self] _ in
@@ -5817,10 +5828,55 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let activeDialogue = dialogue ?? currentDialogueMode
         let activeReduceLoud = reduceLoud ?? currentReduceLoud
         let loudnessNormalizer = ProfileSettings.current.bool(forKey: SettingsKey.loudnessNormalizer)
-        let loudnessPreset = ProfileSettings.current.string(forKey: SettingsKey.loudnessTargetPreset) ?? "standard"
+        let loudnessPreset = ProfileSettings.current.string(forKey: SettingsKey.loudnessTargetPreset)
+        let preserveSubwooferBass = ProfileSettings.current.bool(forKey: SettingsKey.preserveSubwooferBassInStereo)
+        let binauralMode = ProfileSettings.current.string(forKey: SettingsKey.binauralAudio)
+        let isHeadphoneRoute = PlaybackSystemMonitor.isHeadphoneAudioRouteActive
+        return Self.resolvedAudioShaping(
+            dialogue: activeDialogue,
+            reduceLoud: activeReduceLoud,
+            loudnessNormalizer: loudnessNormalizer,
+            loudnessPreset: loudnessPreset,
+            preserveSubwooferBassInStereo: preserveSubwooferBass,
+            binauralMode: binauralMode,
+            isHeadphoneRoute: isHeadphoneRoute
+        )
+    }
+
+    nonisolated static let defaultBinauralMode = "headphones"
+
+    nonisolated static func resolvedBinauralMode(_ mode: String?) -> String {
+        switch mode {
+        case "off", "headphones", "always":
+            return mode!
+        default:
+            return defaultBinauralMode
+        }
+    }
+
+    nonisolated static func isBinauralAudioEnabled(mode: String?, isHeadphoneRoute: Bool) -> Bool {
+        switch resolvedBinauralMode(mode) {
+        case "always":
+            return true
+        case "headphones":
+            return isHeadphoneRoute
+        default:
+            return false
+        }
+    }
+
+    nonisolated static func resolvedAudioShaping(
+        dialogue: EnhanceDialogueMode,
+        reduceLoud: Bool,
+        loudnessNormalizer: Bool,
+        loudnessPreset: String?,
+        preserveSubwooferBassInStereo: Bool,
+        binauralMode: String?,
+        isHeadphoneRoute: Bool
+    ) -> AudioShaping {
         let targetLUFS: Double?
         if loudnessNormalizer {
-            switch loudnessPreset {
+            switch loudnessPreset ?? "standard" {
             case "night": targetLUFS = -20.0
             case "boost": targetLUFS = -16.0
             default: targetLUFS = -24.0
@@ -5829,24 +5885,27 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             targetLUFS = nil
         }
 
-        let preserveSubwooferBass = ProfileSettings.current.bool(forKey: SettingsKey.preserveSubwooferBassInStereo)
-        let lfeMixDB: Double? = preserveSubwooferBass ? 0.0 : nil
-        let maxChannels: Int? = preserveSubwooferBass ? 2 : nil
+        let binaural = isBinauralAudioEnabled(mode: binauralMode, isHeadphoneRoute: isHeadphoneRoute)
+        // Leave all channels (including rendered Atmos/DTS:X heights) intact so AUSpatialMixer
+        // can virtualize them instead of pre-folding to 2.0 via maxChannels = 2.
+        let lfeMixDB: Double? = (!binaural && preserveSubwooferBassInStereo) ? 0.0 : nil
+        let maxChannels: Int? = (!binaural && preserveSubwooferBassInStereo) ? 2 : nil
 
-        var dialogueGainDB: Double = 0
-        switch activeDialogue {
+        let dialogueGainDB: Double
+        switch dialogue {
         case .off: dialogueGainDB = 0
         case .enhance: dialogueGainDB = 3.0
         case .boost: dialogueGainDB = 6.0
         }
-        let compressor: AudioShaping.Compressor? = activeReduceLoud ? .night : nil
+        let compressor: AudioShaping.Compressor? = reduceLoud ? .night : nil
 
         return AudioShaping(
             maxChannels: maxChannels,
             dialogueGainDB: dialogueGainDB,
             compressor: compressor,
             loudnessTargetLUFS: targetLUFS,
-            lfeMixDB: lfeMixDB
+            lfeMixDB: lfeMixDB,
+            binaural: binaural
         )
     }
 

@@ -12,19 +12,42 @@ final class SpatialAudioSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.preserveSubwooferBassInStereo))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.loudnessNormalizer))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.loudnessTargetPreset))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.binauralAudio))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trueHDSpatialAudioLayout))
     }
 
-    func testExistingProfilesRemainOffUntilEnabledAndCanDisableAgain() {
+    func testDefaultsTo916OnSupportedOSAndCanBeDisabled() {
         let name = "SpatialAudioSettingsTests.\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: name)!
         defer { defaults.removePersistentDomain(forName: name) }
 
-        XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .off)
-        defaults.set(true, forKey: SettingsKey.trueHDSpatialAudio)
         XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .render(.l916))
         // A preference synced from a newer Apple TV must not activate spatial rendering on an older OS.
         XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: false), .off)
         defaults.set(false, forKey: SettingsKey.trueHDSpatialAudio)
+        XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .off)
+        defaults.set(true, forKey: SettingsKey.trueHDSpatialAudio)
+        XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .render(.l916))
+    }
+
+    func testSpeakerLayoutSelectionAndInvalidFallback() {
+        let name = "SpatialAudioSettingsTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: name)!
+        defer { defaults.removePersistentDomain(forName: name) }
+
+        defaults.set(true, forKey: SettingsKey.trueHDSpatialAudio)
+        for layout in SpatialSpeakerLayout.allCases {
+            defaults.set(layout.rawValue, forKey: SettingsKey.trueHDSpatialAudioLayout)
+            XCTAssertEqual(SpatialAudioSettings.layout(defaults: defaults), layout)
+            XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .render(layout))
+        }
+
+        defaults.set("invalid", forKey: SettingsKey.trueHDSpatialAudioLayout)
+        XCTAssertEqual(SpatialAudioSettings.layout(defaults: defaults), .l916)
+        XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .render(.l916))
+
+        defaults.set(false, forKey: SettingsKey.trueHDSpatialAudio)
+        defaults.set(SpatialSpeakerLayout.l714.rawValue, forKey: SettingsKey.trueHDSpatialAudioLayout)
         XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .off)
     }
 
@@ -110,5 +133,42 @@ final class SpatialAudioSettingsTests: XCTestCase {
         )
         XCTAssertFalse(lowResDisabled.upscalesLowResolutionVideo)
         XCTAssertFalse(lowResDisabled.upscalesFullHDVideo)
+    }
+
+    func testBinauralAudioSettingModesAndAudioShapingPrecedence() {
+        XCTAssertTrue(AetherPlaybackController.isBinauralAudioEnabled(mode: nil, isHeadphoneRoute: true))
+        XCTAssertFalse(AetherPlaybackController.isBinauralAudioEnabled(mode: nil, isHeadphoneRoute: false))
+        XCTAssertFalse(AetherPlaybackController.isBinauralAudioEnabled(mode: "off", isHeadphoneRoute: true))
+        XCTAssertFalse(AetherPlaybackController.isBinauralAudioEnabled(mode: "headphones", isHeadphoneRoute: false))
+        XCTAssertTrue(AetherPlaybackController.isBinauralAudioEnabled(mode: "headphones", isHeadphoneRoute: true))
+        XCTAssertTrue(AetherPlaybackController.isBinauralAudioEnabled(mode: "always", isHeadphoneRoute: false))
+
+        let hdmiBinauralHeadphones = AetherPlaybackController.resolvedAudioShaping(
+            dialogue: .off,
+            reduceLoud: false,
+            loudnessNormalizer: false,
+            loudnessPreset: nil,
+            preserveSubwooferBassInStereo: true,
+            binauralMode: "headphones",
+            isHeadphoneRoute: false
+        )
+        XCTAssertFalse(hdmiBinauralHeadphones.binaural)
+        XCTAssertEqual(hdmiBinauralHeadphones.maxChannels, 2)
+        XCTAssertEqual(hdmiBinauralHeadphones.lfeMixDB, 0.0)
+
+        let activeBinaural = AetherPlaybackController.resolvedAudioShaping(
+            dialogue: .enhance,
+            reduceLoud: false,
+            loudnessNormalizer: true,
+            loudnessPreset: "night",
+            preserveSubwooferBassInStereo: true,
+            binauralMode: "headphones",
+            isHeadphoneRoute: true
+        )
+        XCTAssertTrue(activeBinaural.binaural)
+        XCTAssertNil(activeBinaural.maxChannels)
+        XCTAssertNil(activeBinaural.lfeMixDB)
+        XCTAssertEqual(activeBinaural.dialogueGainDB, 3.0)
+        XCTAssertEqual(activeBinaural.loudnessTargetLUFS, -20.0)
     }
 }

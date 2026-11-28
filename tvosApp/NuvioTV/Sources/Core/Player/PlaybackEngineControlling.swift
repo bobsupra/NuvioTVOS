@@ -432,6 +432,17 @@ enum PlaybackSystemMonitor {
         return "HDMI · 0 changes"
     }
 
+    /// Returns true when the active AVAudioSession output route is wired or Bluetooth headphones.
+    static var isHeadphoneAudioRouteActive: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs.contains { output in
+            let portType = output.portType
+            return portType == .headphones
+                || portType == .bluetoothA2DP
+                || portType == .bluetoothLE
+                || portType == .bluetoothHFP
+        }
+    }
+
     /// Clean, user-facing active audio route title (e.g. "HomePod", "TV Speakers", "AirPods").
     static func currentAudioOutputTitle() -> String {
         let route = AVAudioSession.sharedInstance().currentRoute

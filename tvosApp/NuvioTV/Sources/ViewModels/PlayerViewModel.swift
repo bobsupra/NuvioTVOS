@@ -7420,12 +7420,12 @@ class PlayerViewModel: ObservableObject {
         switch policy {
         case .off:
             guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
-            let hadPendingExternal = pendingSelectedExternalSubtitleURL != nil
             pendingSelectedExternalSubtitleURL = nil
             didApplySubtitlePreference = true
-            if hadPendingExternal || !off.isSelected {
-                selectSubtitle(off, persist: false)
-            }
+            // Always send the off selection to the backend so Aether marks
+            // hostExplicitSubtitleAction and MPV locks sid=no before load
+            // completes its own auto-selection pass.
+            selectSubtitle(off, persist: false)
             return
 
         case .forced(let language):
@@ -7490,12 +7490,12 @@ class PlayerViewModel: ObservableObject {
             guard subtitles.contains(where: { $0.id != "off" }) else { return }
 
             guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
-            let hadPendingExternal = pendingSelectedExternalSubtitleURL != nil
             pendingSelectedExternalSubtitleURL = nil
             didApplySubtitlePreference = true
-            if hadPendingExternal || !off.isSelected {
-                selectSubtitle(off, persist: false)
-            }
+            // Always send the off selection to the backend even when Off appears
+            // selected mid-load; otherwise Aether's end-of-load preferred-subtitle
+            // pass (or MPV slang/sub-add) later activates a full subtitle track.
+            selectSubtitle(off, persist: false)
             return
 
         case .preferredLanguages(let preferredLanguages):
