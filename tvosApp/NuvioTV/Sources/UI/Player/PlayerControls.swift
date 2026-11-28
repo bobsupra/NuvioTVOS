@@ -247,6 +247,21 @@ struct PlayerControls: View {
                 }
             }
         }
+        // Controls that appeared while the stream was starting got "…" (the timeline can't take
+        // focus yet). Once playback starts, that focus moves on to the timeline instead of
+        // staying on "…"; the handlers above set it before this flag flips.
+        .onChange(of: didReportPlaybackStarted) { _, started in
+            guard started else { return }
+            DispatchQueue.main.async {
+                guard let target = PlayerControlsStartupFocusPolicy.focusAfterPlaybackStarts(
+                    currentFocus: focusedControl,
+                    isLiveStream: viewModel.isLiveStream,
+                    transportFocusOrder: transportFocusOrder,
+                    canMoveFocus: canMoveFocusAfterPlaybackStarts
+                ) else { return }
+                focusedControl = target
+            }
+        }
         .onChange(of: viewModel.showControls) { _, isVisible in
             if !isVisible {
                 closeQuickMenu(restoreFocus: false)
@@ -1063,7 +1078,10 @@ struct PlayerControls: View {
 
     private var initialFocusControl: PlayerControlFocus {
         guard didReportPlaybackStarted else { return .settings }
-        return viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .timeline
+        return PlayerControlsStartupFocusPolicy.initialFocus(
+            isLiveStream: viewModel.isLiveStream,
+            transportFocusOrder: transportFocusOrder
+        )
     }
 
     /// Transport + timeline are focusable whenever chrome is up. Do not gate on
@@ -1081,6 +1099,15 @@ struct PlayerControls: View {
             && !viewModel.isSceneDetailVisible
             && !viewModel.postPlayState.isVisible
             && viewModel.sidePanel == nil
+    }
+
+    private var canMoveFocusAfterPlaybackStarts: Bool {
+        controlsInteractable
+            && activeQuickMenu == nil
+            && requestedFocus == nil
+            && !viewModel.controlsAutoHideSuspended
+            && !isSkipSegmentFocused
+            && !isNextEpisodeFocused
     }
 
     private var canRestoreFocusAfterNextEpisode: Bool {
