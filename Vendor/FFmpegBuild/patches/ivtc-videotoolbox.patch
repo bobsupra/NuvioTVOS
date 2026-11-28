@@ -1,5 +1,5 @@
 diff --git a/configure b/configure
-index 6be807a..ec6008d 100755
+index 6be807a9f7..ec6008debf 100755
 --- a/configure
 +++ b/configure
 @@ -4111,6 +4111,7 @@ coreimagesrc_filter_deps="coreimage appkit"
@@ -19,7 +19,7 @@ index 6be807a..ec6008d 100755
  flip_vulkan_filter_deps="vulkan spirv_library"
  flite_filter_deps="libflite threads"
 diff --git a/libavfilter/Makefile b/libavfilter/Makefile
-index 0b6e4c3..b82a64c 100644
+index 0b6e4c32e0..b82a64c6a6 100644
 --- a/libavfilter/Makefile
 +++ b/libavfilter/Makefile
 @@ -275,6 +275,9 @@ OBJS-$(CONFIG_DCTDNOIZ_FILTER)               += vf_dctdnoiz.o
@@ -43,7 +43,7 @@ index 0b6e4c3..b82a64c 100644
  OBJS-$(CONFIG_FILLBORDERS_FILTER)            += vf_fillborders.o
  OBJS-$(CONFIG_FIND_RECT_FILTER)              += vf_find_rect.o lavfutils.o
 diff --git a/libavfilter/allfilters.c b/libavfilter/allfilters.c
-index 1f62658..26a2194 100644
+index 1f62658d1f..26a21947ba 100644
 --- a/libavfilter/allfilters.c
 +++ b/libavfilter/allfilters.c
 @@ -248,6 +248,7 @@ extern const FFFilter ff_vf_dctdnoiz;
@@ -64,7 +64,7 @@ index 1f62658..26a2194 100644
  extern const FFFilter ff_vf_find_rect;
 diff --git a/libavfilter/metal/vf_decimate_videotoolbox.metal b/libavfilter/metal/vf_decimate_videotoolbox.metal
 new file mode 100644
-index 0000000..7ca60df
+index 0000000000..7ca60dfa7d
 --- /dev/null
 +++ b/libavfilter/metal/vf_decimate_videotoolbox.metal
 @@ -0,0 +1,69 @@
@@ -139,7 +139,7 @@ index 0000000..7ca60df
 +}
 diff --git a/libavfilter/metal/vf_fieldmatch_videotoolbox.metal b/libavfilter/metal/vf_fieldmatch_videotoolbox.metal
 new file mode 100644
-index 0000000..cbeee54
+index 0000000000..cbeee54745
 --- /dev/null
 +++ b/libavfilter/metal/vf_fieldmatch_videotoolbox.metal
 @@ -0,0 +1,336 @@
@@ -481,7 +481,7 @@ index 0000000..cbeee54
 +}
 diff --git a/libavfilter/vf_decimate_videotoolbox.m b/libavfilter/vf_decimate_videotoolbox.m
 new file mode 100644
-index 0000000..7bf3899
+index 0000000000..7bf3899c17
 --- /dev/null
 +++ b/libavfilter/vf_decimate_videotoolbox.m
 @@ -0,0 +1,655 @@
@@ -1142,10 +1142,10 @@ index 0000000..7bf3899
 +};
 diff --git a/libavfilter/vf_fieldmatch_videotoolbox.m b/libavfilter/vf_fieldmatch_videotoolbox.m
 new file mode 100644
-index 0000000..20d69a0
+index 0000000000..599b7c3787
 --- /dev/null
 +++ b/libavfilter/vf_fieldmatch_videotoolbox.m
-@@ -0,0 +1,1041 @@
+@@ -0,0 +1,1044 @@
 +/*
 + * Field matching for VideoToolbox frames, using Metal compute.
 + *
@@ -1724,6 +1724,9 @@ index 0000000..20d69a0
 +        av_frame_free(&dst);
 +        return AVERROR_EXTERNAL;
 +    }
++    // The pool hands out the same pixel buffer again, and propagation only adds
++    // keys, so an earlier frame's color tags would survive on an untagged one.
++    CVBufferRemoveAllAttachments((CVPixelBufferRef)dst->data[3]);
 +    CVBufferPropagateAttachments((CVPixelBufferRef)fm->src->data[3], (CVPixelBufferRef)dst->data[3]);
 +    *out = dst;
 +    return 0;

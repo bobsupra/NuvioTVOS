@@ -79,12 +79,29 @@ discard_stale_source() {
     fi
 }
 
+FFMPEG_PATCH_STAMP="${BUILD_DIR}/ffmpeg-src.patched"
+
+ffmpeg_patch_stamp() {
+    # Everything that decides how the FFmpeg tree gets patched: the patch files, build.sh
+    # (the smaller patches are inline here) and the DTS:X switch.
+    { cat "${SCRIPT_DIR}/build.sh" "${SCRIPT_DIR}"/patches/*(N); echo "dtsx ${DTSX_HEIGHTS}"; } \
+        | shasum -a 256 | cut -d' ' -f1
+}
+
 fetch_ffmpeg() {
     discard_stale_source "${FFMPEG_SRC}" "${FFMPEG_VERSION}"
+    # The patch functions skip a patch whose marker is already in the tree, so a tree patched
+    # by another revision of a patch would silently keep that revision. Only a tree patched
+    # by exactly these inputs is reused.
+    if [[ -d "${FFMPEG_SRC}" && "$(cat "${FFMPEG_PATCH_STAMP}" 2>/dev/null)" != "$(ffmpeg_patch_stamp)" ]]; then
+        echo "→ ${FFMPEG_SRC:t} was patched by other patches or another build.sh: discarding and re-cloning"
+        rm -rf "${FFMPEG_SRC}"
+    fi
     if [[ -d "${FFMPEG_SRC}" ]]; then
         echo "→ FFmpeg source already exists, skipping clone"
         return
     fi
+    rm -f "${FFMPEG_PATCH_STAMP}"
     echo "→ Cloning FFmpeg ${FFMPEG_VERSION}..."
     git clone --depth 1 --branch "${FFMPEG_VERSION}" "${FFMPEG_REPO}" "${FFMPEG_SRC}"
 }
@@ -97,11 +114,12 @@ patch_ffmpeg_yadif_videotoolbox() {
     # the older autorelease fix: commandBuffer / computeCommandEncoder are +0 under FFmpeg's
     # non-ARC build and upstream released them by hand, which crashed host apps whose GCD
     # queues pop their pool at session teardown (EXC_BAD_ACCESS in
-    # AutoreleasePoolPage::releaseUntil). n8.1.3 has both; master has the pool since FFmpeg
-    # PR 23850 but still submits per plane.
+    # AutoreleasePoolPage::releaseUntil). Since 3.19.2 the patch is FFmpeg PR 26244 as
+    # reviewed upstream, ported to n8.1.3, which also clears a reused output buffer's
+    # attachments and drops the field attachments.
     local F="${FFMPEG_SRC}/libavfilter/vf_yadif_videotoolbox.m"
     local P="${SCRIPT_DIR}/patches/yadif-videotoolbox-one-submission.patch"
-    grep -q "encode_plane" "${F}" && return
+    grep -q "filter_planes" "${F}" && return
     # A tree patched by an older build carries the inline perl edit that came before this patch.
     if grep -q "See FFmpegBuild build.sh patch_ffmpeg\." "${F}"; then
         git -C "${FFMPEG_SRC}" checkout -- libavfilter/vf_yadif_videotoolbox.m
@@ -1672,7 +1690,8 @@ patch_ffmpeg_bwdif_videotoolbox() {
     # bwdif's options and a Metal kernel doing bwdifdsp.c's integer arithmetic on integer samples
     # held in floats (exact up to 10 bits; deeper formats are refused). Its output equals CPU bwdif
     # frame for frame (framemd5, NV12 and P010, both modes, both parities). It submits each
-    # frame once, like the yadif_videotoolbox patch.
+    # frame once, like the yadif_videotoolbox patch. Since 3.19.2 the patch is FFmpeg PR 26276
+    # as reviewed upstream, ported to n8.1.3 (without its docs and FATE tests).
     local P="${SCRIPT_DIR}/patches/bwdif-videotoolbox.patch"
     if [[ -f "${FFMPEG_SRC}/libavfilter/vf_bwdif_videotoolbox.m" ]]; then
         return
@@ -1691,7 +1710,9 @@ patch_ffmpeg_vc1_frame_threads() {
     # the pattern of the MPEG-4 Part 2 decoder. update_thread_context copies what one picture hands
     # the next, a reference picture reports its finished macroblock rows, and every read of a
     # reference picture waits for the rows it touches. Output equals single-threaded decoding
-    # (FATE vc1 / wmv3-drm / mss2 at 1 to 16 threads, frame hashes across seeks).
+    # (FATE vc1 / wmv3-drm / mss2 at 1 to 16 threads, frame hashes across seeks). The patch is FFmpeg
+    # PR 26273 after its fifth review round, ported to n8.1.3 (without its LoongArch fix and FATE
+    # tests).
     local P="${SCRIPT_DIR}/patches/vc1-frame-threads.patch"
     if grep -q "vc1_update_thread_context" "${FFMPEG_SRC}/libavcodec/vc1dec.c"; then
         return
@@ -1749,6 +1770,7 @@ patch_ffmpeg_mov_lazy_frag_index
 patch_ffmpeg_bwdif_videotoolbox
 patch_ffmpeg_vc1_frame_threads
 patch_ffmpeg_ivtc_videotoolbox
+ffmpeg_patch_stamp > "${FFMPEG_PATCH_STAMP}"
 fetch_dav1d
 fetch_zimg
 fetch_zvbi
