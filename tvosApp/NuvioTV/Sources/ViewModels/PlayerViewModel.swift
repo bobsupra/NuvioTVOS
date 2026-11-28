@@ -9365,6 +9365,18 @@ class PlayerViewModel: ObservableObject {
             scrobbleSources: activeSources,
             notify: force && primarySource != .nuvioSync
         )
+        // Note what's playing, so a session cut off by a kill or crash gets its pause on the next launch.
+        if activeSources.contains(.trakt), action != .pause, action != .stop {
+            TraktOpenPlaybackRecovery.update(
+                meta: meta,
+                position: playbackTime.current,
+                duration: playbackTime.duration,
+                season: episodeNumbers?.season,
+                episode: episodeNumbers?.episode,
+                profileID: profileID,
+                force: action == .start
+            )
+        }
 
         if activeSources == [.simkl],
            didStartTraktScrobble,
@@ -9397,7 +9409,7 @@ class PlayerViewModel: ObservableObject {
             guard !Task.isCancelled else { return }
             guard ProfileSettings.isActiveStore(store),
                   Self.isCurrentPlaybackProfile(profileID) else { return }
-            _ = await TraktProgressService.reportPlayback(
+            let sent = await TraktProgressService.reportPlayback(
                 meta: meta,
                 position: playbackTime.current,
                 duration: playbackTime.duration,
@@ -9411,6 +9423,9 @@ class PlayerViewModel: ObservableObject {
                 profileId: profileID,
                 isPeriodicHeartbeat: reportPolicy.isPeriodicHeartbeat
             )
+            if sent, reportPolicy.action == .pause || reportPolicy.action == .stop {
+                TraktOpenPlaybackRecovery.clear(metaID: meta.id)
+            }
         }
     }
 
