@@ -332,6 +332,8 @@ enum UsenetSniff {
         case par2
         case sevenZip
         case zip
+        /// A disc image: UDF (Blu-ray, DVD) or ISO 9660, recognised at 32 KiB in.
+        case discImage
         case unknown
     }
 
@@ -346,7 +348,22 @@ enum UsenetSniff {
         if UsenetPar2.isPar2(data) { return .par2 }
         if b.starts(with: [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C]) { return .sevenZip }
         if b.starts(with: [0x50, 0x4B, 0x03, 0x04]) { return .zip }
+        if isDiscImage(data) { return .discImage }
         return .unknown
+    }
+}
+
+extension UsenetSniff {
+    /// The volume recognition sequence of a disc image, from sector 16 (32 KiB in): `CD001`
+    /// (ISO 9660), `BEA01`, `NSR02`, `NSR03` (UDF).
+    static func isDiscImage(_ data: Data) -> Bool {
+        let identifiers = ["CD001", "BEA01", "NSR02", "NSR03"].map { Data($0.utf8) }
+        for sector in 16..<20 {
+            let start = data.startIndex + sector * 2048 + 1
+            guard start + 5 <= data.endIndex else { break }
+            if identifiers.contains(data.subdata(in: start..<(start + 5))) { return true }
+        }
+        return false
     }
 }
 
