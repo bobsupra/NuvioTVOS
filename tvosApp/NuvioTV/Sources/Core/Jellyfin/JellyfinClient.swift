@@ -32,6 +32,7 @@ struct JellyfinMediaItem: Codable, Equatable {
     let imdbId: String?
     let tmdbId: Int?
     let primaryImageTag: String?
+    var primaryImageAspectRatio: Double? = nil
     let backdropImageTag: String?
     let cast: [String]?
     let directors: [String]?
@@ -61,7 +62,7 @@ struct JellyfinClient {
     private let session: URLSession
 
     private static let deviceId = "NuvioTV-AppleTV"
-    private static let itemFields = "Overview,ProductionYear,PremiereDate,CommunityRating,OfficialRating,Genres,RunTimeTicks,ProviderIds,MediaSources,ParentIndexNumber,IndexNumber,SeriesId,People"
+    private static let itemFields = "Overview,ProductionYear,PremiereDate,CommunityRating,OfficialRating,Genres,RunTimeTicks,ProviderIds,MediaSources,ParentIndexNumber,IndexNumber,SeriesId,People,PrimaryImageAspectRatio"
 
     init(baseURL: URL, accessToken: String, session: URLSession = .shared) {
         self.baseURL = baseURL
@@ -216,12 +217,13 @@ struct JellyfinClient {
             let SeriesId: String?
             let People: [Person]?
             let ImageTags: ImageTags?
+            let PrimaryImageAspectRatio: Double?
             let BackdropImageTags: [String]?
 
             enum CodingKeys: String, CodingKey {
                 case Id, Name, Overview, ProductionYear, PremiereDate, CommunityRating, OfficialRating
                 case Genres, RunTimeTicks, ProviderIds, MediaSources, ParentIndexNumber, IndexNumber
-                case SeriesId, People, ImageTags, BackdropImageTags
+                case SeriesId, People, ImageTags, PrimaryImageAspectRatio, BackdropImageTags
                 case ItemType = "Type"
             }
             let ItemType: String?
@@ -268,7 +270,7 @@ struct JellyfinClient {
             normalizedType = rawType
         }
 
-        return JellyfinMediaItem(
+        var mapped = JellyfinMediaItem(
             id: item.Id,
             name: item.Name,
             type: normalizedType,
@@ -282,6 +284,7 @@ struct JellyfinClient {
             imdbId: item.ProviderIds?.Imdb,
             tmdbId: item.ProviderIds?.Tmdb.flatMap(Int.init),
             primaryImageTag: item.ImageTags?.Primary,
+            primaryImageAspectRatio: item.PrimaryImageAspectRatio,
             backdropImageTag: item.BackdropImageTags?.first,
             cast: item.People?.filter { $0.PersonType == "Actor" }.map(\.Name),
             directors: item.People?.filter { $0.PersonType == "Director" }.map(\.Name),
@@ -291,6 +294,8 @@ struct JellyfinClient {
             container: item.MediaSources?.first?.Container,
             sizeBytes: item.MediaSources?.first?.Size
         )
+        mapped.primaryImageAspectRatio = item.PrimaryImageAspectRatio
+        return mapped
     }
 
     /// Every movie, series, and episode under one library, with every field
@@ -302,9 +307,10 @@ struct JellyfinClient {
     func items(
         userId: String,
         libraryId: String,
+        includeItemTypes: String = "Movie,Series,Episode",
         onPageFetched: ((Int) -> Void)? = nil
     ) async throws -> [JellyfinMediaItem] {
-        try await fetchItems(userId: userId, libraryId: libraryId, startingAt: 0, seenItemIDs: []) { page in
+        try await fetchItems(userId: userId, libraryId: libraryId, includeItemTypes: includeItemTypes, startingAt: 0, seenItemIDs: []) { page in
             onPageFetched?(page.nextStartIndex)
         }
     }
@@ -315,16 +321,54 @@ struct JellyfinClient {
     func items(
         userId: String,
         libraryId: String,
+        includeItemTypes: String = "Movie,Series,Episode",
         startingAt: Int,
         seenItemIDs: Set<String> = [],
         onPageFetched: ((JellyfinItemsPage) throws -> Void)? = nil
     ) async throws -> [JellyfinMediaItem] {
-        try await fetchItems(userId: userId, libraryId: libraryId, startingAt: startingAt, seenItemIDs: seenItemIDs, onPageFetched: onPageFetched)
+        try await fetchItems(userId: userId, libraryId: libraryId, includeItemTypes: includeItemTypes, startingAt: startingAt, seenItemIDs: seenItemIDs, onPageFetched: onPageFetched)
+    }
+
+    /// One page of immediate children for an opened BoxSet. Unlike library
+    /// sync, this deliberately does not recurse into every descendant folder.
+    func itemsPage(
+        userId: String,
+        parentId: String,
+        includeItemTypes: String,
+        recursive: Bool = false,
+        startingAt: Int = 0,
+        limit: Int = 100
+    ) async throws -> JellyfinItemsPage {
+        let startIndex = max(0, startingAt)
+        let safeLimit = min(max(1, limit), 100)
+        let (data, response) = try await get("Users/\(userId)/Items", query: [
+            "ParentId": parentId,
+            "Recursive": recursive ? "true" : "false",
+            "IncludeItemTypes": includeItemTypes,
+            "Fields": Self.itemFields,
+            "EnableImages": "true",
+            "StartIndex": String(startIndex),
+            "Limit": String(safeLimit)
+        ])
+        try Self.validate(response, data: data)
+
+        let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
+        if let reportedStartIndex = payload.StartIndex, reportedStartIndex != startIndex {
+            throw ClientError(message: "The server returned a library page for the wrong offset")
+        }
+        let items = payload.Items.map { Self.mapMediaItem($0) }
+        return JellyfinItemsPage(
+            items: items,
+            startIndex: startIndex,
+            nextStartIndex: startIndex + payload.Items.count,
+            totalRecordCount: payload.TotalRecordCount
+        )
     }
 
     private func fetchItems(
         userId: String,
         libraryId: String,
+        includeItemTypes: String,
         startingAt initialStartIndex: Int,
         seenItemIDs initialSeenItemIDs: Set<String>,
         onPageFetched: ((JellyfinItemsPage) throws -> Void)?
@@ -336,30 +380,22 @@ struct JellyfinClient {
 
         for _ in 0..<500 {
             try Task.checkCancellation()
-
-            let (data, response) = try await get("Users/\(userId)/Items", query: [
-                "ParentId": libraryId,
-                "Recursive": "true",
-                "IncludeItemTypes": "Movie,Series,Episode",
-                "Fields": Self.itemFields,
-                "EnableImages": "true",
-                "StartIndex": String(startIndex),
-                "Limit": String(pageSize)
-            ])
-            try Self.validate(response, data: data)
-
-            let payload = try JSONDecoder().decode(ItemsPayload.self, from: data)
-            if let reportedStartIndex = payload.StartIndex, reportedStartIndex != startIndex {
-                throw ClientError(message: "The server returned a library page for the wrong offset")
-            }
-            if payload.Items.isEmpty {
+            let responsePage = try await itemsPage(
+                userId: userId,
+                parentId: libraryId,
+                includeItemTypes: includeItemTypes,
+                recursive: true,
+                startingAt: startIndex,
+                limit: pageSize
+            )
+            if responsePage.items.isEmpty {
                 return allItems
             }
 
-            let pageItems = payload.Items.compactMap { item -> JellyfinMediaItem? in
-                guard !seenIds.contains(item.Id) else { return nil }
-                seenIds.insert(item.Id)
-                return Self.mapMediaItem(item)
+            let pageItems = responsePage.items.filter { item in
+                guard !seenIds.contains(item.id) else { return false }
+                seenIds.insert(item.id)
+                return true
             }
 
             guard !pageItems.isEmpty else {
@@ -367,16 +403,16 @@ struct JellyfinClient {
             }
 
             allItems.append(contentsOf: pageItems)
-            let nextStartIndex = startIndex + payload.Items.count
+            let nextStartIndex = responsePage.nextStartIndex
             try onPageFetched?(JellyfinItemsPage(
                 items: pageItems,
-                startIndex: startIndex,
+                startIndex: responsePage.startIndex,
                 nextStartIndex: nextStartIndex,
-                totalRecordCount: payload.TotalRecordCount
+                totalRecordCount: responsePage.totalRecordCount
             ))
             startIndex = nextStartIndex
 
-            if let total = payload.TotalRecordCount, startIndex >= total {
+            if let total = responsePage.totalRecordCount, startIndex >= total {
                 return allItems
             }
         }

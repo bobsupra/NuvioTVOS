@@ -6084,6 +6084,7 @@ private struct TVMainTabView: View {
                 profiles: profiles,
                 activeProfileId: displayedProfile?.id,
                 needsAttention: sessionNeedsReauthentication,
+                backgroundColor: Color.nuvioBackground(amoled: amoled, body: bodyColor),
                 onSelect: { selectedTab = $0 },
                 onProfile: {
                     guard !isProfileFocusPending else { return }
@@ -6154,6 +6155,10 @@ private struct TVMainTabView: View {
         }
     }
 
+    private var topBarItemsSignature: String {
+        "\(selectedTab.rawValue)|\(showWatchPartyTab)|\(nativeIPTVEnabled)|\(showCalendarTab)|\(showSurpriseMeTab)|\(sessionNeedsReauthentication)|\(collectionDestinations.count)"
+    }
+
     private var tabs: some View {
         tabShell
         .background(
@@ -6167,7 +6172,8 @@ private struct TVMainTabView: View {
                 title: profileTabTitle,
                 avatar: profileTabAvatar.image,
                 avatarSymbol: ProfileAvatarCatalog.symbolName(for: displayedProfile?.avatarId),
-                needsReauth: sessionNeedsReauthentication
+                needsReauth: sessionNeedsReauthentication,
+                tabItemsSignature: topBarItemsSignature
             )
         )
         .background(NativeTopBarClock(enabled: useTopNavigation))
@@ -6259,6 +6265,7 @@ private struct TVNuvioRail: View {
     let profiles: [Profile]
     let activeProfileId: String?
     let needsAttention: Bool
+    let backgroundColor: Color
     let onSelect: (TVTab) -> Void
     /// Opens the full who's-watching screen.
     let onProfile: () -> Void
@@ -6272,8 +6279,8 @@ private struct TVNuvioRail: View {
     @State private var showsProfiles = false
     @FocusState private var entryStripFocused: Bool
 
-    static let collapsedWidth: CGFloat = 128
-    static let expandedWidth: CGFloat = 360
+    static let collapsedWidth: CGFloat = 96
+    static let expandedWidth: CGFloat = 340
     /// The desktop sidebar's timing: 200 ms, fast out, slow in.
     static let motion = Animation.timingCurve(0.4, 0, 0.2, 1, duration: 0.2)
 
@@ -6299,14 +6306,14 @@ private struct TVNuvioRail: View {
                 if profiles.count > 1 { showsProfiles.toggle() } else { onProfile() }
             } label: {
                 TVNuvioRailRow(isFocused: avatarFocused, isExpanded: isExpanded, label: profileName, labelIsProminent: true) {
-                    ProfileAvatarView(avatarId: avatarId, size: 56, isFocused: false, showsFocusOutline: false)
+                    ProfileAvatarView(avatarId: avatarId, size: 46, isFocused: false, showsFocusOutline: false)
                 }
             }
             .buttonStyle(TVNuvioRailButtonStyle())
             .focused(focus, equals: .profile)
             .focusEffectDisabledIfAvailable()
             .accessibilityLabel(TVTab.profile.title)
-            .padding(.top, 64)
+            .padding(.top, 56)
 
             if showsProfiles {
                 VStack(alignment: .leading, spacing: 4) {
@@ -6321,9 +6328,9 @@ private struct TVNuvioRail: View {
                                 isExpanded: isExpanded,
                                 label: ProfileDisplayName.resolve(profile: profile, settingsName: ""),
                                 labelIsProminent: isActive,
-                                iconSize: 44
+                                iconSize: 38
                             ) {
-                                ProfileAvatarView(avatarId: profile.avatarId, size: 40, isFocused: false, showsFocusOutline: false)
+                                ProfileAvatarView(avatarId: profile.avatarId, size: 34, isFocused: false, showsFocusOutline: false)
                                     .opacity(isActive || profileFocus.wrappedValue == profile.id ? 1 : 0.7)
                             }
                         }
@@ -6334,29 +6341,29 @@ private struct TVNuvioRail: View {
                         .accessibilityAddTraits(isActive ? .isSelected : [])
                     }
                 }
-                .padding(.leading, 10)
+                .padding(.leading, 7)
                 .padding(.top, 8)
                 .transition(.opacity)
             }
 
             Spacer(minLength: 0)
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 8) {
                 ForEach(tabs) { tab in
                     let isFocused = focus.wrappedValue == tab
                     let isSelected = tab == selection
                     Button { onSelect(tab) } label: {
                         TVNuvioRailRow(isFocused: isFocused, isExpanded: isExpanded, label: tab.title, labelIsProminent: isSelected) {
                             Image(systemName: Self.filledSymbol(tab.symbol))
-                                .font(.system(size: 28, weight: .semibold))
+                                .font(.system(size: 24, weight: .semibold))
                                 .foregroundStyle(isSelected ? Color.black : Color.white.opacity(isFocused ? 1 : 0.62))
-                                .frame(width: 64, height: 64)
+                                .frame(width: 52, height: 52)
                                 .background(
-                                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                                    RoundedRectangle(cornerRadius: 15, style: .continuous)
                                         .fill(isSelected ? Color.white : Color.clear)
                                 )
                                 .overlay(alignment: .topTrailing) {
                                     if tab == .settings && needsAttention {
-                                        Circle().fill(Color.orange).frame(width: 14, height: 14).offset(x: 3, y: -3)
+                                        Circle().fill(Color.orange).frame(width: 12, height: 12).offset(x: 2, y: -2)
                                     }
                                 }
                         }
@@ -6370,7 +6377,7 @@ private struct TVNuvioRail: View {
             }
             Spacer(minLength: 0)
             // Balances the profile row so the sections sit at the screen's centre.
-            Color.clear.frame(height: showsProfiles ? 0 : 144)
+            Color.clear.frame(height: showsProfiles ? 0 : 128)
         }
         // tvOS only moves Left onto a row that is level with the focused
         // item, so from the top of a page it would not reach the sidebar. This
@@ -6379,7 +6386,7 @@ private struct TVNuvioRail: View {
         .disabled(isDisabled)
         .background(alignment: .leading) {
             Color.clear
-                .frame(width: 80)
+                .frame(width: 64)
                 .frame(maxHeight: .infinity)
                 .contentShape(Rectangle())
                 .focusable(!hasFocus && !isDisabled)
@@ -6392,12 +6399,12 @@ private struct TVNuvioRail: View {
             cameFromContent = false
             DispatchQueue.main.async { focus.wrappedValue = landingTab }
         }
-        .padding(.leading, 24)
+        .padding(.leading, 16)
         .frame(width: isExpanded ? Self.expandedWidth : Self.collapsedWidth, alignment: .leading)
         .frame(maxHeight: .infinity)
         // A solid panel with a hard edge, as on desktop: the page never shows
         // through the labels.
-        .background(Color.black)
+        .background(backgroundColor)
         .animation(Self.motion, value: isExpanded)
         .animation(Self.motion, value: showsProfiles)
         .focusSection()
@@ -6433,10 +6440,10 @@ private struct TVNuvioRailRow<Icon: View>: View {
     let isExpanded: Bool
     let label: String
     let labelIsProminent: Bool
-    var iconSize: CGFloat = 64
+    var iconSize: CGFloat = 52
     @ViewBuilder let icon: () -> Icon
 
-    private var slot: CGFloat { iconSize + 16 }
+    private var slot: CGFloat { iconSize + 12 }
 
     var body: some View {
         // The row's own frame is only the icon slot. tvOS looks for the next
@@ -6444,22 +6451,22 @@ private struct TVNuvioRailRow<Icon: View>: View {
         // sidebar would make Right skip everything the sidebar covers. The
         // platter and the label are drawn outside that frame.
         icon().frame(width: iconSize, height: iconSize)
-            .padding(8)
+            .padding(6)
             .background(alignment: .leading) {
                 // Closed, the platter is no wider than the icon, so a ring
                 // marks the focused row.
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
                     .fill(Color.white.opacity(isFocused ? 0.14 : 0))
                     .overlay(
-                        RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        RoundedRectangle(cornerRadius: 20, style: .continuous)
                             .strokeBorder(Color.white.opacity(isFocused && !isExpanded ? 0.9 : 0), lineWidth: 3)
                     )
-                    .frame(width: isExpanded ? TVNuvioRail.expandedWidth - 48 : slot)
+                    .frame(width: isExpanded ? TVNuvioRail.expandedWidth - 32 : slot)
             }
             .overlay(alignment: .leading) {
                 if isExpanded {
                     Text(label)
-                        .font(.system(size: iconSize < 64 ? 25 : 29, weight: .semibold))
+                        .font(.system(size: iconSize < 52 ? 24 : 28, weight: .semibold))
                         .foregroundStyle(Color.white.opacity(isFocused || labelIsProminent ? 1 : 0.6))
                         .lineLimit(1)
                         .fixedSize()
@@ -13629,7 +13636,7 @@ struct TVHomeView: View {
             return
         }
 
-        let indexedTitles = JellyfinLibraryIndex.shared.titles()
+        let indexedTitles = JellyfinLibraryIndex.shared.titles(includeBoxSets: true)
         guard !indexedTitles.isEmpty else {
             focusWork.cachedVisibleSections = nil
             jellyfinSections = []
@@ -13680,8 +13687,9 @@ struct TVHomeView: View {
         episodeTitleTemplate: String,
         locale: Locale
     ) -> [TVHomeSection] {
-        let firstTitleByID = jellyfinFirstTitleByID(indexedTitles)
-        let legacyTitles = indexedTitles.filter { $0.libraryID == nil || $0.libraryName == nil }
+        let playableTitles = indexedTitles.filter { $0.type != "boxset" }
+        let firstTitleByID = jellyfinFirstTitleByID(playableTitles)
+        let legacyTitles = playableTitles.filter { $0.libraryID == nil || $0.libraryName == nil }
         var sections: [TVHomeSection] = []
         let legacyMetas = jellyfinMetas(
             legacyTitles,
@@ -13716,18 +13724,28 @@ struct TVHomeView: View {
             guard !Task.isCancelled else { return [] }
             guard let titles = groupedTitles[key],
                   let libraryName = titles.first?.libraryName else { continue }
+            let playableTitles = titles.filter { $0.type != "boxset" }
+            let boxSetTitles = titles.filter { $0.type == "boxset" }
             let metas = jellyfinMetas(
-                titles,
+                playableTitles,
                 firstTitleByID: firstTitleByID,
                 serverAccessByID: serverAccessByID,
                 episodeTitleTemplate: episodeTitleTemplate,
                 locale: locale
             )
-            guard !metas.isEmpty else { continue }
+            let sectionID = TVHomeSection.jellyfinLibraryId(serverID: key.serverID, libraryID: key.libraryID)
+            let folders = jellyfinFolders(
+                boxSetTitles,
+                collectionID: sectionID,
+                serverAccessByID: serverAccessByID
+            )
+            guard !metas.isEmpty || !folders.isEmpty else { continue }
             sections.append(TVHomeSection(
-                id: TVHomeSection.jellyfinLibraryId(serverID: key.serverID, libraryID: key.libraryID),
+                id: sectionID,
                 title: libraryName,
-                items: metas
+                items: metas,
+                posterShape: metas.isEmpty ? folders.first?.tileShape.rawValue : nil,
+                collectionFolders: folders
             ))
         }
         return sections
@@ -13749,8 +13767,48 @@ struct TVHomeView: View {
                 for: matchingTitle,
                 requestedContentId: $0.contentId,
                 serverAccessByID: serverAccessByID,
+                artworkTitle: $0,
                 episodeTitleTemplate: episodeTitleTemplate,
                 locale: locale
+            )
+        }
+    }
+
+    nonisolated private static func jellyfinFolders(
+        _ titles: [JellyfinIndexedTitle],
+        collectionID: String,
+        serverAccessByID: [String: JellyfinServerAccess]
+    ) -> [TVCollectionFolderItem] {
+        titles.sorted {
+            if $0.collectionOrder != $1.collectionOrder {
+                return ($0.collectionOrder ?? Int.max) < ($1.collectionOrder ?? Int.max)
+            }
+            if $0.name != $1.name { return $0.name < $1.name }
+            return $0.contentId < $1.contentId
+        }.compactMap { title in
+            guard let meta = JellyfinLibraryIndex.meta(
+                for: title,
+                requestedContentId: title.contentId,
+                serverAccessByID: serverAccessByID,
+                artworkTitle: title
+            ) else { return nil }
+            let shape = CollectionTileShape.fromAspectRatio(title.primaryImageAspectRatio)
+            let folder = NuvioCollectionFolder(
+                id: title.itemId,
+                title: title.name,
+                coverImageUrl: meta.posterUrl,
+                heroBackdropUrl: meta.backgroundUrl,
+                tileShape: shape
+            )
+            let source = NuvioCollectionSource(
+                provider: "jellyfin",
+                jellyfinServerID: title.serverID,
+                jellyfinItemID: title.itemId
+            )
+            return TVCollectionFolderItem(
+                collectionId: collectionID,
+                folder: folder,
+                sources: [source]
             )
         }
     }
@@ -13759,7 +13817,7 @@ struct TVHomeView: View {
     /// IDs and raw Jellyfin item IDs while allowing Home to reuse one index.
     nonisolated static func jellyfinFirstTitleByID(_ titles: [JellyfinIndexedTitle]) -> [String: JellyfinIndexedTitle] {
         var firstTitleByID: [String: JellyfinIndexedTitle] = [:]
-        for title in titles {
+        for title in titles where title.type != "boxset" {
             if firstTitleByID[title.contentId] == nil {
                 firstTitleByID[title.contentId] = title
             }

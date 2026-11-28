@@ -27,6 +27,7 @@ struct NativeTopBarProfilePlaceholder: View {
     let avatar: UIImage?
     let avatarSymbol: String
     let needsReauth: Bool
+    var tabItemsSignature: String = ""
 
     var body: some View {
         NativeTopBarProfileMarker(
@@ -34,7 +35,8 @@ struct NativeTopBarProfilePlaceholder: View {
             title: title,
             avatar: avatar,
             avatarSymbol: avatarSymbol,
-            needsReauth: needsReauth
+            needsReauth: needsReauth,
+            tabItemsSignature: tabItemsSignature
         )
         .frame(width: 0, height: 0)
         .allowsHitTesting(false)
@@ -59,14 +61,27 @@ enum TVTabBarAppearanceConfigurator {
 
         if let items = tabBar.items {
             for item in items {
+                if item.standardAppearance != nil {
+                    item.standardAppearance = appearance
+                }
+                if item.scrollEdgeAppearance != nil {
+                    item.scrollEdgeAppearance = appearance
+                }
                 if let image = item.image, image.renderingMode != .alwaysTemplate {
-                    item.image = image.withRenderingMode(.alwaysTemplate)
+                    item.image = templateImage(from: image)
                 }
                 if let selected = item.selectedImage, selected.renderingMode != .alwaysTemplate {
-                    item.selectedImage = selected.withRenderingMode(.alwaysTemplate)
+                    item.selectedImage = templateImage(from: selected)
                 }
             }
         }
+    }
+
+    private static func templateImage(from image: UIImage) -> UIImage {
+        let base = image.isSymbolImage
+            ? (image.applyingSymbolConfiguration(.preferringMonochrome()) ?? image)
+            : image
+        return base.withRenderingMode(.alwaysTemplate)
     }
 }
 
@@ -76,6 +91,7 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
     let avatar: UIImage?
     let avatarSymbol: String
     let needsReauth: Bool
+    let tabItemsSignature: String
 
     func makeUIView(context: Context) -> Marker { Marker() }
 
@@ -85,7 +101,8 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
             title: title,
             avatar: avatar,
             avatarSymbol: avatarSymbol,
-            needsReauth: needsReauth
+            needsReauth: needsReauth,
+            tabItemsSignature: tabItemsSignature
         )
     }
 
@@ -109,6 +126,9 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
         private let avatarImageView = UIImageView()
         private let nameLabel = UILabel()
         private weak var accessory: UIView?
+        private weak var observedTabBar: UITabBar?
+        private var tabItemsObservation: NSKeyValueObservation?
+        private var lastTabItemsSignature = ""
         private var wantsPlaceholder = false
         private var retryGeneration = 0
         private var isRetrying = false
@@ -156,7 +176,14 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
             scheduleAttach()
         }
 
-        func configure(enabled: Bool, title: String, avatar: UIImage?, avatarSymbol: String, needsReauth: Bool) {
+        func configure(
+            enabled: Bool,
+            title: String,
+            avatar: UIImage?,
+            avatarSymbol: String,
+            needsReauth: Bool,
+            tabItemsSignature: String
+        ) {
             nameLabel.text = title
             if needsReauth {
                 avatarImageView.image = UIImage(systemName: "person.crop.circle.badge.exclamationmark")
@@ -170,7 +197,13 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
                 wantsPlaceholder = enabled
                 if !enabled { removePlaceholder(); return }
             }
-            if enabled && !isAttached { scheduleAttach() }
+            let signatureChanged = lastTabItemsSignature != tabItemsSignature
+            lastTabItemsSignature = tabItemsSignature
+            if enabled && !isAttached {
+                scheduleAttach()
+            } else if enabled && signatureChanged {
+                refreshTabBarAppearanceDeferred()
+            }
         }
 
         private var isAttached: Bool {
@@ -195,8 +228,32 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
 
         func removePlaceholder() {
             retryGeneration += 1
+            tabItemsObservation = nil
+            observedTabBar = nil
             container.removeFromSuperview()
             accessory = nil
+        }
+
+        private func observeTabBarItemsIfNeeded(for bar: UITabBar) {
+            guard observedTabBar !== bar else { return }
+            observedTabBar = bar
+            tabItemsObservation = bar.observe(\.items, options: [.new]) { [weak bar] _, _ in
+                guard let bar else { return }
+                DispatchQueue.main.async {
+                    TVTabBarAppearanceConfigurator.configure(tabBar: bar)
+                }
+            }
+        }
+
+        private func refreshTabBarAppearanceDeferred() {
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.wantsPlaceholder, let window = self.window, let root = window.rootViewController else { return }
+                let bars = NativeTopBarClockMarker.Marker.visibleTabBars(in: root, window: window)
+                if bars.count == 1, let bar = bars.first {
+                    TVTabBarAppearanceConfigurator.configure(tabBar: bar)
+                    self.observeTabBarItemsIfNeeded(for: bar)
+                }
+            }
         }
 
         private func scheduleAttach() {
@@ -213,6 +270,7 @@ private struct NativeTopBarProfileMarker: UIViewRepresentable {
             let bars = NativeTopBarClockMarker.Marker.visibleTabBars(in: root, window: window)
             if bars.count == 1, let bar = bars.first {
                 TVTabBarAppearanceConfigurator.configure(tabBar: bar)
+                observeTabBarItemsIfNeeded(for: bar)
                 let target = bar.leadingAccessoryView
                 if container.superview !== target || container.window == nil {
                     container.removeFromSuperview()

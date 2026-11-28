@@ -62,9 +62,12 @@ struct JellyfinIndexedTitle: Codable, Equatable, Sendable {
     let imdbId: String?
     let tmdbId: Int?
     let primaryImageTag: String?
+    var primaryImageAspectRatio: Double? = nil
     let backdropImageTag: String?
     let cast: [String]?
     let directors: [String]?
+    /// Stable server result order for BoxSet cards in their collection view.
+    var collectionOrder: Int? = nil
     var items: [JellyfinIndexedItem]
 }
 
@@ -90,6 +93,7 @@ final class JellyfinLibraryIndex: ObservableObject {
     }
 
     @Published private(set) var titlesByServerID: [String: [JellyfinIndexedTitle]] = [:]
+    private var onDemandTitlesByServerID: [String: [JellyfinIndexedTitle]] = [:]
 
     enum IndexError: LocalizedError {
         case persistenceFailed
@@ -104,20 +108,34 @@ final class JellyfinLibraryIndex: ObservableObject {
 
     private init() {
         titlesByServerID = Self.load()
+        onDemandTitlesByServerID = Self.loadOnDemand()
     }
 
     func reload() {
         titlesByServerID = Self.load()
+        onDemandTitlesByServerID = Self.loadOnDemand()
     }
 
     /// All indexed titles across every server, ordered by
     /// `JellyfinServerStore.servers` when possible — same fallback rationale
     /// as `SMBLibraryIndex.titles()`.
-    func titles() -> [JellyfinIndexedTitle] {
+    func titles(includeBoxSets: Bool = false) -> [JellyfinIndexedTitle] {
         let orderedServerIDs = JellyfinServerStore.shared.servers.map(\.id)
         let ordered = orderedServerIDs.flatMap { titlesByServerID[$0] ?? [] }
         let knownIDs = Set(orderedServerIDs)
         let unordered = titlesByServerID
+            .filter { !knownIDs.contains($0.key) }
+            .values
+            .flatMap { $0 }
+        let all = ordered + unordered
+        return includeBoxSets ? all : all.filter { $0.type != "boxset" }
+    }
+
+    private func onDemandTitles() -> [JellyfinIndexedTitle] {
+        let orderedServerIDs = JellyfinServerStore.shared.servers.map(\.id)
+        let ordered = orderedServerIDs.flatMap { onDemandTitlesByServerID[$0] ?? [] }
+        let knownIDs = Set(orderedServerIDs)
+        let unordered = onDemandTitlesByServerID
             .filter { !knownIDs.contains($0.key) }
             .values
             .flatMap { $0 }
@@ -146,7 +164,7 @@ final class JellyfinLibraryIndex: ObservableObject {
             return nil
         }()
 
-        return titles().filter { title in
+        return (titles() + onDemandTitles()).filter { title in
             if title.contentId == trimmed || title.contentId == contentId {
                 return true
             }
@@ -172,11 +190,14 @@ final class JellyfinLibraryIndex: ObservableObject {
     /// only metadata Home or Details ever show for a Jellyfin-sourced id.
     /// `nil` only when the title isn't indexed or its server has since been
     /// removed (so there's nowhere to point an image URL).
-    func meta(forContentId contentId: String) -> NuvioMeta? {
-        guard let title = titles().first(where: { $0.contentId == contentId || $0.itemId == contentId }) else {
+    func meta(forContentId contentId: String) async -> NuvioMeta? {
+        guard let title = (titles() + onDemandTitles()).first(where: {
+            $0.contentId == contentId || $0.itemId == contentId
+        }) else {
             return nil
         }
-        return meta(for: title, requestedContentId: contentId)
+        let detailTitle = await titleWithEpisodesForDetailsIfNeeded(title)
+        return meta(for: detailTitle, requestedContentId: contentId)
     }
 
     /// Builds metadata from an already indexed title without searching the
@@ -215,12 +236,14 @@ final class JellyfinLibraryIndex: ObservableObject {
         for title: JellyfinIndexedTitle,
         requestedContentId: String,
         serverAccessByID: [String: JellyfinServerAccess],
+        artworkTitle: JellyfinIndexedTitle? = nil,
         episodeTitleTemplate: String = "Episode %d",
         locale: Locale = .current
     ) -> NuvioMeta? {
         guard let access = serverAccessByID[title.serverID] else { return nil }
         let baseURL = access.baseURL
         let token = access.accessToken
+        let artwork = artworkTitle ?? title
 
         func imageURL(itemId: String, type: String, tag: String?) -> String? {
             guard let tag else { return nil }
@@ -250,8 +273,8 @@ final class JellyfinLibraryIndex: ObservableObject {
             id: title.contentId,
             name: title.name,
             description: title.overview,
-            posterUrl: imageURL(itemId: title.itemId, type: "Primary", tag: title.primaryImageTag),
-            backgroundUrl: imageURL(itemId: title.itemId, type: "Backdrop", tag: title.backdropImageTag),
+            posterUrl: imageURL(itemId: artwork.itemId, type: "Primary", tag: artwork.primaryImageTag),
+            backgroundUrl: imageURL(itemId: artwork.itemId, type: "Backdrop", tag: artwork.backdropImageTag),
             logoUrl: nil,
             imdbId: title.imdbId,
             tmdbId: title.tmdbId,
@@ -270,8 +293,93 @@ final class JellyfinLibraryIndex: ObservableObject {
             status: nil,
             videos: videos,
             trailerYtIds: nil,
-            externalRatings: nil
+            externalRatings: nil,
+            posterShape: artwork.primaryImageAspectRatio.map {
+                CollectionTileShape.fromAspectRatio($0).rawValue
+            }
         )
+    }
+
+    /// Adds summaries returned when a collection folder is opened. They live
+    /// in a separate profile-scoped store so Home's synced library rows do not
+    /// gain duplicate cards for folder-only items.
+    func storeOnDemandTitles(_ incoming: [JellyfinIndexedTitle], forServerID serverID: String) throws {
+        let syncedIDs = Set((titlesByServerID[serverID] ?? []).map(\.contentId))
+        var updated = onDemandTitlesByServerID[serverID] ?? []
+        for title in incoming where title.serverID == serverID && !syncedIDs.contains(title.contentId) {
+            if let index = updated.firstIndex(where: { $0.contentId == title.contentId }) {
+                let existing = updated[index]
+                var replacement = title
+                if replacement.items.isEmpty && !existing.items.isEmpty {
+                    replacement.items = existing.items
+                }
+                updated[index] = replacement
+            } else {
+                updated.append(title)
+            }
+        }
+        var updatedByServer = onDemandTitlesByServerID
+        updatedByServer[serverID] = updated
+        guard persistOnDemand(updatedByServer) else {
+            throw IndexError.persistenceFailed
+        }
+        onDemandTitlesByServerID = updatedByServer
+    }
+
+    private func titleWithEpisodesForDetailsIfNeeded(_ title: JellyfinIndexedTitle) async -> JellyfinIndexedTitle {
+        guard title.type == "series", title.items.isEmpty else { return title }
+        let profileID = ProfileSettings.activeProfileID ?? "default"
+        guard let server = JellyfinServerStore.shared.server(id: title.serverID),
+              let baseURL = server.baseURL,
+              !server.userId.isEmpty else { return title }
+        let token = JellyfinCredentialStore.token(forServerID: server.id)
+        guard !token.isEmpty else { return title }
+
+        let fetched: [JellyfinMediaItem]
+        do {
+            fetched = try await JellyfinClient(baseURL: baseURL, accessToken: token)
+                .episodes(seriesId: title.itemId, userId: server.userId)
+        } catch {
+            return title
+        }
+        guard (ProfileSettings.activeProfileID ?? "default") == profileID,
+              let currentServer = JellyfinServerStore.shared.server(id: title.serverID),
+              currentServer.baseURLString == server.baseURLString,
+              currentServer.userId == server.userId else { return title }
+
+        var updated = title
+        updated.items = fetched.compactMap { episode in
+            guard let season = episode.parentIndexNumber,
+                  let episodeNumber = episode.indexNumber else { return nil }
+            return JellyfinIndexedItem(
+                itemId: episode.id,
+                container: episode.container,
+                size: episode.sizeBytes,
+                season: season,
+                episode: episodeNumber,
+                episodeName: episode.name,
+                episodeOverview: episode.overview,
+                episodePremiereDate: episode.premiereDate,
+                episodeImageTag: episode.primaryImageTag
+            )
+        }
+        guard !updated.items.isEmpty else { return title }
+
+        if var synced = titlesByServerID[server.id],
+           let index = synced.firstIndex(where: { $0.contentId == title.contentId }) {
+            synced[index] = updated
+            var updatedByServer = titlesByServerID
+            updatedByServer[server.id] = synced
+            guard persist(updatedByServer) else { return title }
+            titlesByServerID = updatedByServer
+        } else {
+            do {
+                try storeOnDemandTitles([updated], forServerID: server.id)
+            } catch {
+                return title
+            }
+        }
+        return updated
     }
 
     nonisolated private static func formattedRuntime(ticks: Int64) -> String {
@@ -295,18 +403,27 @@ final class JellyfinLibraryIndex: ObservableObject {
     func removeAll(forServerID serverID: String) {
         var updatedTitles = titlesByServerID
         updatedTitles.removeValue(forKey: serverID)
-        guard persist(updatedTitles) else {
+        var updatedOnDemand = onDemandTitlesByServerID
+        updatedOnDemand.removeValue(forKey: serverID)
+        guard persist(updatedTitles), persistOnDemand(updatedOnDemand) else {
             print("Nuvio Jellyfin library index write failed")
             return
         }
         titlesByServerID = updatedTitles
+        onDemandTitlesByServerID = updatedOnDemand
         NotificationCenter.default.post(name: Self.changedNotification, object: nil)
     }
 
     private static let storageDirectoryName = "jellyfinLibraryIndex"
+    private static let onDemandStorageDirectoryName = "jellyfinBrowseIndex"
     private static var storageKey: String {
         let profileId = ProfileSettings.activeProfileID ?? "default"
         return "jellyfinLibraryIndex.\(profileId)"
+    }
+
+    private static var onDemandStorageKey: String {
+        let profileId = ProfileSettings.activeProfileID ?? "default"
+        return "jellyfinBrowseIndex.\(profileId)"
     }
 
     private func persist(_ titles: [String: [JellyfinIndexedTitle]]) -> Bool {
@@ -316,6 +433,14 @@ final class JellyfinLibraryIndex: ObservableObject {
         }
         ProfileSettings.current.removeObject(forKey: SettingsKey.jellyfinLibraryIndex)
         UserDefaults.standard.removeObject(forKey: SettingsKey.jellyfinLibraryIndex)
+        return true
+    }
+
+    private func persistOnDemand(_ titles: [String: [JellyfinIndexedTitle]]) -> Bool {
+        guard let data = try? JSONEncoder().encode(titles),
+              LargePayloadStore.write(data, key: Self.onDemandStorageKey, directory: Self.onDemandStorageDirectoryName) else {
+            return false
+        }
         return true
     }
 
@@ -335,6 +460,14 @@ final class JellyfinLibraryIndex: ObservableObject {
             return legacy
         }()
         guard let data,
+              let decoded = try? JSONDecoder().decode([String: [JellyfinIndexedTitle]].self, from: data) else {
+            return [:]
+        }
+        return decoded
+    }
+
+    private static func loadOnDemand() -> [String: [JellyfinIndexedTitle]] {
+        guard let data = LargePayloadStore.read(key: onDemandStorageKey, directory: onDemandStorageDirectoryName),
               let decoded = try? JSONDecoder().decode([String: [JellyfinIndexedTitle]].self, from: data) else {
             return [:]
         }

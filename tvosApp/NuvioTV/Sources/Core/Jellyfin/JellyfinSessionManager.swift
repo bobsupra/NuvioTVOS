@@ -437,8 +437,8 @@ final class JellyfinSessionManager: ObservableObject {
             if case .syncing = syncState(for: server.id) {
                 continue
             }
-            // A server just added: its movie and TV libraries, so the Library's
-            // Servers tab fills without a trip to Settings.
+            // A server just added: its movie, TV, and BoxSet libraries, so the
+            // Library's Servers tab fills without a trip to Settings.
             if Self.picksVideoLibrariesOnFirstSync(server) {
                 let video = Self.videoLibraryIDs(libraries)
                 guard !video.isEmpty else { continue }
@@ -463,9 +463,12 @@ final class JellyfinSessionManager: ObservableObject {
         server.selectedLibraryIDs.isEmpty && server.lastSyncDate == nil
     }
 
-    /// The movie and TV libraries.
+    /// The playable media libraries and BoxSet collections.
     nonisolated static func videoLibraryIDs(_ libraries: [JellyfinLibrary]) -> [String] {
-        libraries.filter { $0.collectionType == "movies" || $0.collectionType == "tvshows" }.map(\.id)
+        libraries.filter {
+            guard let type = $0.collectionType?.lowercased() else { return false }
+            return type == "movies" || type == "tvshows" || type == "boxsets"
+        }.map(\.id)
     }
 
     /// Nothing indexed on this Apple TV for a server that never synced, or that
@@ -583,7 +586,10 @@ final class JellyfinSessionManager: ObservableObject {
                 for library in selectedLibraries {
                     try Task.checkCancellation()
                     guard self.isCurrentSync(server, generation: generation, profileID: profileID) else { return }
-                    let itemEntity = "items:\(library.id)"
+                    let isBoxSetLibrary = library.collectionType?.caseInsensitiveCompare("boxsets") == .orderedSame
+                    // Keep BoxSet pages separate from a pre-existing movie/TV
+                    // checkpoint for this same library id.
+                    let itemEntity = isBoxSetLibrary ? "boxsets:\(library.id)" : "items:\(library.id)"
                     self.publishSyncProgress(
                         serverID: server.id,
                         server: server,
@@ -609,6 +615,7 @@ final class JellyfinSessionManager: ObservableObject {
                         _ = try await client.items(
                             userId: server.userId,
                             libraryId: library.id,
+                            includeItemTypes: isBoxSetLibrary ? "BoxSet" : "Movie,Series,Episode",
                             startingAt: checkpoint.nextStartIndex(for: itemEntity),
                             seenItemIDs: savedItemIDs
                         ) { [weak self] page in

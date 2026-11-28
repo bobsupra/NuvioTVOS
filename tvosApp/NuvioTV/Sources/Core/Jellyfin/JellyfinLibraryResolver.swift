@@ -21,7 +21,8 @@ enum JellyfinLibraryResolver {
         _ items: [JellyfinMediaItem],
         serverID: String,
         libraryID: String? = nil,
-        libraryName: String? = nil
+        libraryName: String? = nil,
+        includeSeriesWithoutEpisodes: Bool = false
     ) -> JellyfinLibraryResolution {
         var titlesByContentId: [String: JellyfinIndexedTitle] = [:]
         var seriesItemIdByJellyfinId: [String: String] = [:]
@@ -30,7 +31,7 @@ enum JellyfinLibraryResolver {
         for item in items where item.type == "Series" {
             let contentId = JellyfinLibraryIndex.contentId(serverID: serverID, itemId: item.id)
             seriesItemIdByJellyfinId[item.id] = contentId
-            titlesByContentId[contentId] = JellyfinIndexedTitle(
+            var title = JellyfinIndexedTitle(
                 contentId: contentId,
                 serverID: serverID,
                 libraryID: libraryID,
@@ -53,11 +54,13 @@ enum JellyfinLibraryResolver {
                 directors: item.directors,
                 items: []
             )
+            title.primaryImageAspectRatio = item.primaryImageAspectRatio
+            titlesByContentId[contentId] = title
         }
 
         for item in items where item.type == "Movie" {
             let contentId = JellyfinLibraryIndex.contentId(serverID: serverID, itemId: item.id)
-            titlesByContentId[contentId] = JellyfinIndexedTitle(
+            var title = JellyfinIndexedTitle(
                 contentId: contentId,
                 serverID: serverID,
                 libraryID: libraryID,
@@ -82,6 +85,38 @@ enum JellyfinLibraryResolver {
                     JellyfinIndexedItem(itemId: item.id, container: item.container, size: item.sizeBytes)
                 ]
             )
+            title.primaryImageAspectRatio = item.primaryImageAspectRatio
+            titlesByContentId[contentId] = title
+        }
+
+        for (order, item) in items.enumerated() where item.type == "BoxSet" {
+            let contentId = JellyfinLibraryIndex.contentId(serverID: serverID, itemId: item.id)
+            var title = JellyfinIndexedTitle(
+                contentId: contentId,
+                serverID: serverID,
+                libraryID: libraryID,
+                libraryName: libraryName,
+                itemId: item.id,
+                type: "boxset",
+                name: item.name,
+                overview: item.overview,
+                year: item.productionYear,
+                genres: item.genres,
+                communityRating: item.communityRating,
+                officialRating: item.officialRating,
+                premiereDate: item.premiereDate,
+                runTimeTicks: item.runTimeTicks,
+                imdbId: item.imdbId,
+                tmdbId: item.tmdbId,
+                primaryImageTag: item.primaryImageTag,
+                backdropImageTag: item.backdropImageTag,
+                cast: item.cast,
+                directors: item.directors,
+                items: []
+            )
+            title.primaryImageAspectRatio = item.primaryImageAspectRatio
+            title.collectionOrder = order
+            titlesByContentId[contentId] = title
         }
 
         for item in items where item.type == "Episode" {
@@ -106,7 +141,11 @@ enum JellyfinLibraryResolver {
         // A series with no episodes yet resolved (all orphaned, or the
         // library genuinely has none) isn't worth a Home card with no
         // playable file.
-        let titles = titlesByContentId.values.filter { $0.type == "movie" || !$0.items.isEmpty }
+        let titles = titlesByContentId.values.filter {
+            $0.type == "movie"
+                || $0.type == "boxset"
+                || ($0.type == "series" && (includeSeriesWithoutEpisodes || !$0.items.isEmpty))
+        }
 
         return JellyfinLibraryResolution(titles: Array(titles), unmatched: unmatched, completedAt: Date())
     }
