@@ -1617,11 +1617,15 @@ struct DetailsScreen: View {
             let candidates = [stream] + usenetAlternates(after: stream, in: alternatePool)
             Task { @MainActor in
                 var lastError: Error = UsenetError.noPlayableFile
-                for candidate in candidates {
+                for (position, candidate) in candidates.enumerated() {
                     guard let raw = candidate.directURL, let url = URL(string: raw),
                           let spec = UsenetStreamSpec(url: url) else { continue }
                     do {
-                        let localURL = try await UsenetEngineManager.shared.startStream(spec)
+                        // The pick itself is always tried; the alternates pass by another
+                        // indexer's copy of an upload that failed already.
+                        let localURL = try await UsenetEngineManager.shared.startStream(
+                            spec, skippingFailedUploads: position > 0
+                        )
                         guard PlaybackStartupTiming.isActive(token: startupToken) else {
                             await UsenetEngineManager.shared.stopActiveStream(for: localURL)
                             return
