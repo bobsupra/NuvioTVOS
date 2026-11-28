@@ -1389,10 +1389,11 @@ It does nothing in these cases. Every refusal is logged, so a picker that does n
 - night-mode compression (`compressor`; `AudioShaping.Compressor.night` is the engine's preset). With `ratio: 1` it is a plain gain of `makeupGainDB` into the limiter.
 - a loudness target (`loudnessTargetLUFS`, clamped to `AudioShaping.loudnessTargetRange`, -36 to -12 LUFS). It raises a quiet source to that programme loudness, by at most `AudioShaping.maxLoudnessGainDB` (18 dB), and never lowers one (AE#1036).
 - an LFE level for a fold that drops the LFE (`lfeMixDB`, clamped to `AudioShaping.lfeMixRange`, -20 to +10 dB; nil drops it). It only acts together with a `maxChannels` cap that folds the LFE away, so `AudioShaping(maxChannels: 2, lfeMixDB: 0)` is the stereo downmix for a 2.1 system. On its own it is not active shaping (AE#1044).
+- binaural rendering for headphones (`binaural`). A source above two channels is rendered to two-channel stereo through Apple's `AUSpatialMixer` instead of being folded, each channel placed as a virtual speaker. Mono and stereo sources stay as they are, and a `maxChannels` of 1 wins. Set on its own, without any other shaping field, it keeps `objectAudioRendering`, and the rendered TrueHD Atmos or DTS:X bed, heights included, is what goes binaural. See [Binaural for headphones](formats.md#binaural-for-headphones).
 
 Values are clamped, and read back clamped. The default shapes nothing and leaves every route as it was.
 
-- **Active shaping needs PCM.** While it is on, a stream-copied track (Atmos and every lossless bitstream included) is decoded and bridged, and shaping takes precedence over `objectAudioRendering`. Turning it off goes back to stream copy.
+- **Active shaping needs PCM.** While it is on, a stream-copied track (Atmos and every lossless bitstream included) is decoded and bridged, and shaping takes precedence over `objectAudioRendering`, except for `binaural` on its own. Turning it off goes back to stream copy.
 - **Every change is the session-preserving reload** (`reloadAtCurrentPosition`), because it changes which pipeline the session runs. Changes that arrive during that rebuild are folded into it, as with `setAudioDelay(_:)`. The exception is a change between two inactive values (an `lfeMixDB` without a cap): it is stored, and nothing is rebuilt.
 - **`$audioShapingState`** publishes an `AudioShapingState`: `.off` (nothing asked, or the rebuild that carries a new value is still on the way), `.applied`, or `.unavailable` (AVPlayer owns the audio on `.remoteBypass` and the native audio-only host, or the session plays no audio).
 
@@ -2494,7 +2495,7 @@ Measured with `aetherctl play --host-calls stopreopen@25` on a 1080p MKV from an
 
 **When it is reused.** Only when all of these hold. Anything else deletes the kept session, and the load runs as it does today.
 
-- The URL is the same, and the `LoadOptions` are equal apart from `sourceDiagnosticsContext`. A different signature in a signed URL is a different source.
+- The URL is the same, and the `LoadOptions` are equal apart from `sourceDiagnosticsContext` and `progressiveSegmentDelivery`. A different signature in a signed URL is a different source.
 - What the engine derives on top (display capabilities, the audio stream, the Dolby Vision handling, the audio delay and shaping) is the same.
 - The source gives the same segment plan.
 
@@ -2575,7 +2576,7 @@ A "tuning field" is one that `reloadAtCurrentPosition(applying:)` can correct on
 | `sessionCacheHardLimitBytes` | nil | Opt-in per-session disk cap for resident plus staging bytes on VOD loopback. See [Whole-session segment storage admission](#whole-session-segment-storage-admission). |
 | `sessionCacheFreeReserveBytes` | 0 | Opt-in free-volume reserve checked before segment writes; independent of the hard cap and also available to live sessions. See [Whole-session segment storage admission](#whole-session-segment-storage-admission). |
 | `retainsSessionCacheAfterStop` | false | Keep the segment cache after `stop()` and reuse it when the same source loads again, so a Resume serves from disk what the last session fetched. One kept session per process. See [Keeping the segment cache across a stop](#keeping-the-segment-cache-across-a-stop). |
-| `progressiveSegmentDelivery` | false | Serve each VOD loopback segment while it is being written. VOD only; ignored on live, `nativeRemoteHLS` and the software path. See note 2. |
+| `progressiveSegmentDelivery` | true | Serve each VOD loopback segment while it is being written. VOD only; ignored on live, `nativeRemoteHLS` and the software path. See note 2. |
 | `softwarePacketCacheStorage` | `.automatic` | `SoftwarePacketCacheStorage` picks where seekable software VOD stores compressed packets. The choice survives session reloads. See note 3. |
 | `generatesBackgroundScrubPreviews` | true | Build the sparse scrub-still ladder while the source is idle. Correctable through `reloadAtCurrentPosition(applying:)`. See note 4. |
 
@@ -2583,6 +2584,7 @@ A "tuning field" is one that `reloadAtCurrentPosition(applying:)` can correct on
 2. **`progressiveSegmentDelivery`.** The muxer flushes a fragment about every half second, and the loopback server sends each one as it lands. So AVPlayer shows and starts on a segment's first fragments instead of waiting for the whole cut.
    - On a source fast enough to cut segments before AVPlayer asks, it changes nothing.
    - On a slow link it removes a whole segment's download from startup, and from a seek outside the buffer.
+   - It is on by default since AE#1129. A file whose first keyframe interval was 10.7 s started after 5.8 s without it and 2.8 s with it, at 25 Mbit/s. Set it to false to serve each segment only once it is cut.
    - A segment the producer abandons (restart, failed cut) ends its connection without the final chunk, so AVPlayer asks for it again.
 3. **`softwarePacketCacheStorage`.**
    - `automatic` keeps the defaults: purgeable memory on tvOS, disk on other platforms.

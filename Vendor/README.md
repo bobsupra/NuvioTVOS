@@ -1,8 +1,8 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.66.0)
+## AetherEngine (pin 7.76.0)
 
-Local pin of [AetherEngine 7.66.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.66.0), upstream commit `8e74bbb5cfde75287305c535c243c1ef9d96549c`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, two enabled default traits (`DualLayerDolbyVision` and `DolbyVisionStillReshaping`, with `TrueHDObjectAudio`, `DTSXObjectAudio`, and `DolbyVisionFelCurves` remaining optional / off by default to prevent startup latency, FFT regression stalls, and data-wait buffering regressions on high-bitrate streams), local FFmpeg path dependency, and host integration patches are retained. The 7.66.0 upgrade incorporates:
+Local pin of [AetherEngine 7.76.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.76.0). Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, five enabled default traits (`TrueHDObjectAudio`, `DTSXObjectAudio`, `DualLayerDolbyVision`, `DolbyVisionFelCurves`, and `DolbyVisionStillReshaping`), local FFmpeg path dependency, and host integration patches are retained. Recent upstream upgrades incorporate:
 - Progressive range streaming (`ProgressiveRangeStream`) for HTTP disc/ISO reads (#1007).
 - Line-art upscale shader network for animation (`LineArtShaderSource`, `FrameChain`, `LoadOptions.upscaleScaler = .lineArt` #1039).
 - AVKit native audio track selection menu integration (`AetherEngine+AudioMenu.swift`).
@@ -21,9 +21,9 @@ Retain the local spatial-bridge patch that reports persistent APAC encoding fail
 
 Nuvio also retains its supplemental-codecs guard for non-Dolby-Vision displays, including the upstream Profile 7 to Profile 8.1 conversion. Explicit host DV assertions still enable the guarded route. The tagged API, architecture, and format docs are included for upstream documentation-consistency tests.
 
-## FFmpegBuild 3.15.0 (namespaced upstream)
+## FFmpegBuild 3.19.3 (namespaced upstream)
 
-Local pin of [FFmpegBuild 3.15.0](https://github.com/superuser404notfound/FFmpegBuild/tree/3.15.0), upstream commit `d445e6daa180db73f12d47606a00c914f682e278`. The upstream release ships the nine dynamic frameworks and SwiftPM targets under the `AetherLib*` namespace so they can embed next to MPVKit’s `Libav*` stack in the same app binary. The umbrella product is `AetherFFmpegBuild`.
+Local pin of [FFmpegBuild 3.19.3](https://github.com/superuser404notfound/FFmpegBuild/tree/3.19.3). The upstream release ships the nine dynamic frameworks and SwiftPM targets under the `AetherLib*` namespace so they can embed next to MPVKit’s `Libav*` stack in the same app binary. The umbrella product is `AetherFFmpegBuild`.
 
 | Upstream module | Nuvio module / framework |
 |---|---|
@@ -46,4 +46,4 @@ Local pin of [FFmpegBuild 3.15.0](https://github.com/superuser404notfound/FFmpeg
 
 Keep the AetherEngine patch surface minimal so rebases stay manageable.
 
-The Nuvio host offers an off-by-default setting for TrueHD Atmos and DTS:X spatial rendering to 9.1.6 (.render(.l916), delivering multichannel LPCM for direct routes such as AirPods Pro and HDMI, and APAC over AirPlay). LibTrueHD remains pinned to 3.2.0. DTS:X standard-presentation heights come from FFmpegBuild's patched `dca` decoder; object presentations continue to use the ordinary audio bridge. Spatial rendering requires tvOS 26 or later and a supported 48 kHz VOD source. TrueHD uses the source's channel presentation split into a speaker bed. The engine retains its ordinary audio bridge for other content, including ordinary DTS-HD MA.
+The Nuvio host enables TrueHD Atmos and DTS:X spatial rendering by default on tvOS 26+ using the user's chosen `SpatialSpeakerLayout` (default `9.1.6`, delivering multichannel 24-bit LPCM for direct routes such as AirPods Pro and HDMI, and APAC over AirPlay), and defaults `AudioShaping.binaural` headphone virtualization to `Headphones Only`. LibTrueHD remains pinned to 3.2.0. DTS:X standard-presentation heights come from FFmpegBuild's patched `dca` decoder; object presentations continue to use the ordinary audio bridge. Spatial rendering requires tvOS 26 or later and a supported 48 kHz VOD source. TrueHD uses the source's channel presentation split into a speaker bed. The engine retains its ordinary audio bridge for other content, including ordinary DTS-HD MA.

@@ -122,7 +122,7 @@ final class DTSXObjectAudioDecoder: ObjectAudioDecoding {
         // An option the decoder does not know stays in the dictionary: an FFmpegBuild without the patch.
         let unknown = av_dict_get(options, "x_heights", nil, 0) != nil
         av_dict_free(&options)
-        var parser = parserInit(AV_CODEC_ID_DTS)
+        let parser = parserInit(AV_CODEC_ID_DTS)
         var packet = av_packet_alloc()
         var frame = av_frame_alloc()
         guard opened >= 0, !unknown, let parser, let packet, let frame else {

@@ -404,14 +404,72 @@ struct LiveAudioProgressTests {
         engine.setRate(2)
 
         // Act - consume the finite source through the ordinary Live route.
+        let log = EngineLogCapture()
+        defer { log.end() }
         engine.play()
-        try await waitFor { engine.state == .ended || engine.errorInfo != nil }
+        // Under the suite's 3 minute limit with room for the load, so a hang reports its state.
+        let finished = try await waitFor(upTo: .seconds(120)) {
+            engine.state == .ended || engine.errorInfo != nil
+        }
+        if !finished {
+            // The capture hears every engine in the process, so the tail can hold other suites' lines.
+            let tail = log.matching("[SWHost]").suffix(12) + log.matching("[AudioOutput]").suffix(6)
+            Issue.record("""
+                no end after 120 s: state=\(engine.state) time=\(engine.currentTime) \
+                rebuffering=\(host.isRebuffering) clockRate=\(String(describing: host.clockRateForTesting)) \
+                parked=\(host.parkedVideoCountForTesting) \
+                queued=\(String(describing: host.directLiveReadAheadForTesting?.packets.queuedPacketCount)) \
+                handedOver=\(host.videoRendererForTesting.takeCadence().handedOver)
+                engine log tail (process-wide):
+                \(tail.joined(separator: "\n"))
+                """)
+            return
+        }
 
         // Assert - reaching EOF in the producer did not discard the consumer's tail.
         #expect(engine.errorInfo == nil)
         #expect(engine.state == .ended)
         #expect(engine.currentTime > 30)
         #expect(host.videoRendererForTesting.takeCadence().handedOver > 100)
+    }
+
+    /// The end of a finite source does not wait for a parked tail that lies wholly behind the clock.
+    ///
+    /// This pins the exit, not the cause: on CI a clock that did not start again left the layer full and
+    /// the end waiting without limit, which this machine does not reproduce. A renderer that stops taking
+    /// frames leaves the same parked tail, here behind a clock that runs past it.
+    @Test
+    func test_finiteLive_rendererStopsTakingFrames_endsPastTheParkedTail() async throws {
+        // Arrange - the 32 s source, with a renderer that can be closed for good.
+        let engine = try AetherEngine()
+        defer { engine.stop() }
+        let closed = ProbeTestBox(false)
+        engine.softwareHostLoadedForTesting = { host in
+            host.videoRendererForTesting.readyForMoreMediaDataForTesting = { !closed.value }
+        }
+        try await engine.load(
+            source: .custom(
+                ProbeRecordingReader(data: try LongGOPTransportStreamFixture.data()),
+                formatHint: "mpegts"
+            ),
+            options: LoadOptions(isLive: true, autoplay: false, preferredDecodePath: .software)
+        )
+        let host = try #require(engine.softwareHost)
+        engine.setRate(2)
+        let log = EngineLogCapture()
+        defer { log.end() }
+
+        // Act - close the renderer with about 240 of the 800 frames to go, under the 256-packet park cap,
+        // so the source is still read to its end (as on CI, which stopped at 540 handed over, 255 parked).
+        engine.play()
+        try await waitFor { host.videoRendererForTesting.takeCadence().handedOver >= 560 }
+        closed.update { $0 = true }
+        try await waitFor { engine.state == .ended || engine.errorInfo != nil }
+
+        // Assert - the end came, with the clock past the content, and freed what it could not hand over.
+        #expect(engine.errorInfo == nil)
+        #expect(engine.currentTime > 30)
+        #expect(!log.matching("parked video packets lie behind the clock").isEmpty)
     }
 
     /// A declared AAC track with no packets cannot leave the clock unarmed at a full video gate.

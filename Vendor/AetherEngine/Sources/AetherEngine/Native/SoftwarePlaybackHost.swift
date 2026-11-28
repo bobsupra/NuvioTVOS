@@ -519,6 +519,7 @@ final class SoftwarePlaybackHost {
         case .decodedEAC3JOC(let layout): return "E-AC-3 JOC → PCM \(layout.rawValue) (system decoder)"
         case .apac(let layout): return "APAC \(layout.rawValue)"
         case .pcmBed(let layout): return "LPCM Bed \(layout.rawValue)"
+        case .binauralBed(let layout): return "Binaural \(layout.rawValue)"
         }
     }
     var shouldActivateSoftwareAtmosOutput: Bool {
@@ -690,7 +691,8 @@ final class SoftwarePlaybackHost {
         audioTimeBaseSeconds = timeBaseSeconds
         audioRoute = made.route
         audioRouteTakesAtmosActivator = made.route.takesAtmosOutputActivator
-        audioShapingApplied = audioShaping.isActive && made.route == .pcm
+        audioShapingApplied = audioShaping.isActive(forSourceChannels: stream.pointee.codecpar.pointee.ch_layout.nb_channels)
+            && made.route.carriesShaping
         selection.replace(streamIndex: index, decoder: made.producer, timeBaseSeconds: timeBaseSeconds)
         outgoing?.close()
         let clock = audioOutput?.currentTimeSeconds ?? .nan
@@ -1237,7 +1239,7 @@ final class SoftwarePlaybackHost {
         switch route {
         case .pcm: return .decoded
         case .compressedEAC3JOC: return .streamCopy
-        case .apac, .pcmBed, .decodedEAC3JOC: return .bridged
+        case .apac, .pcmBed, .binauralBed, .decodedEAC3JOC: return .bridged
         }
     }
 
@@ -1836,7 +1838,8 @@ final class SoftwarePlaybackHost {
                 // A stop() can land on the suspension above, as on the ones below.
                 guard !stopRequested else { made.producer.close(); return }
                 self.audioDecoder = made.producer
-                self.audioShapingApplied = audioShaping.isActive && made.route == .pcm
+                self.audioShapingApplied = audioShaping.isActive(forSourceChannels: acp.pointee.ch_layout.nb_channels)
+                    && made.route.carriesShaping
                 self.audioRoute = made.route
                 self.audioRouteTakesAtmosActivator = made.route.takesAtmosOutputActivator
                 self.audioStreamIndex = resolvedAudioIdx
@@ -1876,6 +1879,7 @@ final class SoftwarePlaybackHost {
         // #112: split-PES PGS streams (MPEG-TS) need display-set reassembly in the packet
         // store; the tap sink consults this per packet.
         self.splitDisplaySetSubtitleStreamIndices = dem.splitDisplaySetSubtitleStreamIndices()
+        subtitleHeaderEventSink?(dem.subtitleTrackInfos())
 
         // AudioOutput owns the AVSampleBufferRenderSynchronizer (master clock). Created unconditionally: video-only previously got no clock (frozen frame, currentTime=0). Layer attached in play() after the engine hangs it in the view hierarchy (attaching free-floating fails FigVideoQueueRemote -12080 on tvOS 26+).
         let audioOutput = AudioOutput()
@@ -2139,6 +2143,9 @@ final class SoftwarePlaybackHost {
     /// the packet pointer never escapes the demux thread. The trailing Bool marks packets of
     /// split-PES PGS streams (MPEG-TS) that need display-set reassembly in the store.
     nonisolated(unsafe) var subtitleTapSink: (@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?
+    /// AE#1127: handed the subtitle tracks once at load, before the demux loop starts, so the events a
+    /// muxer left in a track's header reach the session's packet store.
+    nonisolated(unsafe) var subtitleHeaderEventSink: (@Sendable ([TrackInfo]) -> Void)?
 
     /// #112 rework: embedded subtitle stream indices + time bases, captured at load before the
     /// demux loop starts (the SW host applies no stream discard, so these packets already flow).
@@ -3998,6 +4005,9 @@ final class SoftwarePlaybackHost {
                 ) {
                 case .pauseForRebuffer:
                     rebuffering = true
+                    // Clock first, flag second: `isRebuffering` reaches the main actor on its own hop,
+                    // and a reader there must never see the flag over a clock that still runs.
+                    aOut.pause()
                     noteRebuffering(true)
                     resumePlacement = nil
                     let resumesAt = cushion.map { ", resumes at \(String(format: "%.1f", $0))s ahead" } ?? ""
@@ -4006,16 +4016,15 @@ final class SoftwarePlaybackHost {
                         + "(lead=\(String(format: "%.2f", lead))s\(resumesAt))",
                         category: .swPlayback
                     )
-                    aOut.pause()
                 case .resume:
                     rebuffering = false
+                    aOut.setRate(currentRate())
                     noteRebuffering(false)
                     EngineLog.emit(
                         "[SWHost] rebuffered: resuming clock (lead=\(String(format: "%.2f", lead))s "
                         + "ahead=\(String(format: "%.2f", ahead))s)",
                         category: .swPlayback
                     )
-                    aOut.setRate(currentRate())
                     // A source that paused comes back one of two ways: it skips what it missed and
                     // continues near real time, or it hands the whole backlog over at once. The
                     // second leaves the picture the length of the pause behind the newest media,
@@ -4602,13 +4611,13 @@ final class SoftwarePlaybackHost {
         func releaseRebufferHold(_ why: String) {
             syncRebufferingState()
             guard rebuffering else { return }
-            setRebuffering(false)
-            EngineLog.emit("[SWHost] releasing rebuffer hold: \(why)", category: .swPlayback)
             if isPlaying() {
                 audioOutput?.setRate(currentRate())
             } else {
                 audioOutput?.pause()
             }
+            setRebuffering(false)
+            EngineLog.emit("[SWHost] releasing rebuffer hold: \(why)", category: .swPlayback)
         }
 
         // #337 on the decoupled path. The lockstep gate arms the clock off the packet it is
@@ -4632,12 +4641,41 @@ final class SoftwarePlaybackHost {
             armFromVideoPacket(head, aOut)
         }
 
+        /// The newest timestamp among the parked packets, in source seconds; B-frames park out of
+        /// presentation order, so the FIFO's last packet is not necessarily it. nil when any packet has
+        /// none, since that one could be the newest.
+        func newestParkedVideoSeconds() -> Double? {
+            guard videoTimeBaseSeconds > 0, !parkedVideo.isEmpty else { return nil }
+            var newest = Int64.min
+            for p in parkedVideo {
+                guard p.pointee.pts != Int64.min else { return nil }
+                newest = max(newest, p.pointee.pts)
+            }
+            return Double(newest) * videoTimeBaseSeconds
+        }
+
+        /// What made the end-of-media drain stop on a late tail, for the log line at the end.
+        var lateParkedTail: (count: Int, newest: Double, clock: Double)?
+
+        /// Direct Live only: its AE#1121 rebuffer can leave the clock stopped at the end, and only a running
+        /// timebase drains the layer. Not while paused, which waits for play as before, and not for VOD,
+        /// whose slow decoder still hands its late tail over.
+        func endMayFreeLateParkedTail() -> Bool {
+            guard directLiveSource != nil, isPlaying(), clockArmed(),
+                  let newest = newestParkedVideoSeconds(), let clock = audioOutput?.currentTimeSeconds,
+                  SoftwareEndOfMediaClock.parkedTailIsBehindClock(newestParkedSeconds: newest, clockSeconds: clock)
+            else { return false }
+            lateParkedTail = (parkedVideo.count, newest, clock)
+            return true
+        }
+
         enum ParkWait {
             /// Hold the read until audio is back under its lead target / the FIFO under its cap.
             case readGate
             /// Retain the already-read packet until its allocation fits, without dropping it.
             case packetCapacity(Int)
-            /// Feed the whole parked tail out (seam flush, end of media).
+            /// Feed the parked tail out at end of media, until it is empty or, on direct Live while
+            /// playing, all of it is behind the clock (`endMayFreeLateParkedTail`).
             case drainAll
         }
 
@@ -4664,7 +4702,7 @@ final class SoftwarePlaybackHost {
                         )
                     } ?? false
                 case .drainAll:
-                    return !parkedVideo.isEmpty
+                    return !parkedVideo.isEmpty && !endMayFreeLateParkedTail()
                 }
             }
             while stillWaiting(), !stopRequested(), !backgroundAudioOnly() {
@@ -4734,21 +4772,22 @@ final class SoftwarePlaybackHost {
             }
             switch action {
             case .pauseForRebuffer:
+                // Clock first, flag second, as in the DVR feeder: the flag hops to the main actor.
+                aOut.pause()
                 setRebuffering(true)
                 EngineLog.emit(
                     "[SWHost] audio lead exhausted (\(String(format: "%.2f", lead))s); "
                     + "pausing clock for rebuffer",
                     category: .swPlayback
                 )
-                aOut.pause()
             case .resume:
+                aOut.setRate(currentRate())
                 setRebuffering(false)
                 EngineLog.emit(
                     "[SWHost] rebuffered to \(String(format: "%.2f", lead))s audio lead; "
                     + "resuming clock",
                     category: .swPlayback
                 )
-                aOut.setRate(currentRate())
             case .none:
                 break
             }
@@ -4946,8 +4985,16 @@ diagAudioPtsSec = .nan
                     }
                 }
                 releaseRebufferHold("end of media, nothing left to rebuffer from")
+                lateParkedTail = nil
                 waitForRenderer(.drainAll)
                 guard admitsRead(genBeforeRead) else { return !stopRequested() }
+                if let late = lateParkedTail {
+                    EngineLog.emit(
+                        "[SWHost] end of media: \(late.count) parked video packets lie behind the clock "
+                        + "(newest \(String(format: "%.3f", late.newest))s, clock \(String(format: "%.3f", late.clock))s); "
+                        + "freeing them instead of waiting for the renderer",
+                        category: .swPlayback)
+                }
                 freeParkedVideo()
                 // The dual-layer decoder's flush drops what its sessions and the GPU still hold,
                 // which here is the last frames of the stream: hand those over first.

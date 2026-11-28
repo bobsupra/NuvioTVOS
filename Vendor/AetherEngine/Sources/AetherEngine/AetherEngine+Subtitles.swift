@@ -593,14 +593,12 @@ extension AetherEngine {
             guard subtitlePacketStore(for: channel) === store,
                   subtitleDrainTargets[channel] == streamIndex,
                   subtitleDrainDecoders[channel] === job.decoder else { continue }
-            let plan = job.plan
             let isReset = job.isReset
             let usesASSCursorReplay = job.usesASSCursorReplay
             let window = job.window
             let coverageStart = job.coverageStart
             let retained = job.retained
             let entries = job.entries
-            let batchEnd = job.batchEnd
             let decodeEnd = job.decodeEnd
             let gapHold = job.gapHold
             // #271: bind the channel's cue array ONCE for the whole batch. `subtitleCues` is
@@ -2581,7 +2579,7 @@ extension AetherEngine {
                 guard let waited = await SideReaderLoop.yieldLink(
                     link, valveGrantedUntil: &valveGrantedUntil,
                     inAnchorGrace: { DispatchTime.now() < anchorGraceUntil },
-                    playhead: { await MainActor.run { [weak self] in self?.sourceTime } })
+                    playhead: { [weak self] in await MainActor.run { [weak self] in self?.sourceTime } })
                 else { break readLoop }
                 if let fresh = waited.playhead { playheadSnapshot = fresh }
                 if waited.tookValve {
@@ -3460,8 +3458,8 @@ extension AetherEngine {
         let provider = remoteHLSSubtitleProxy?.provider
         let ordinal = provider?.ordinal(forExternalID: id)
         if let provider, let ordinal { provider.prioritizeFill(ordinal: ordinal) }
-        Task { @MainActor in
-            self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+        Task { @MainActor [weak self] in
+            self?.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
             var snapshots: [RemoteHLSMediaSelection.LegibleOption] = []
             for option in group.options {
@@ -3498,7 +3496,7 @@ extension AetherEngine {
                 if let shown = item.currentMediaSelection.selectedMediaOption(in: group), shown != option {
                     item.select(nil, in: group)
                 }
-                self.isLoadingSubtitles = true
+                self?.isLoadingSubtitles = true
                 EngineLog.emit(
                     "[AetherEngine] AE#984: injected rendition \"\(name)\" waits for its sidecar before "
                     + "AVPlayer sees it", category: .engine)
@@ -3506,7 +3504,7 @@ extension AetherEngine {
                 let outcome = await Self.awaitInjectedRenditionSettled(
                     serve: { provider.renditionServe(ordinal: ordinal) }, isCurrent: isCurrent)
                 guard outcome != .superseded else { return }
-                self.isLoadingSubtitles = false
+                self?.isLoadingSubtitles = false
                 let waitedSeconds = String(format: "%.1f", Date().timeIntervalSince(began))
                 if outcome == .failed {
                     // Nothing to draw, and selecting it would hand AVPlayer an empty file it keeps for

@@ -23,6 +23,7 @@ extension SoftwarePlaybackHost {
             EngineLog.emit("[SWHost] audio: DTS:X rendering is off for this load (rendersDTSXObjectAudio false)",
                            category: .swPlayback)
         }
+        let shapes = audioShaping.isActive(forSourceChannels: par.pointee.ch_layout.nb_channels)
         func pcm() throws -> (producer: any SoftwareAudioProducing, route: SoftwareAtmosRoute) {
             let decoder = AudioDecoder()
             decoder.shaping = audioShaping
@@ -30,7 +31,11 @@ extension SoftwarePlaybackHost {
             decoder.setAudioProcessing(audioProcessingSettings)
             return (decoder, .pcm)
         }
-        if audioShaping.isActive {
+        // Binaural on its own lets TrueHD Atmos and DTS:X keep the object render, whose bed then goes
+        // binaural with its heights. Every other codec, and any other shaping, takes the PCM decode.
+        let binauralObjects = audioShaping.isBinauralOnly && rendering != .off && !isLive
+            && (par.pointee.codec_id == AV_CODEC_ID_TRUEHD || par.pointee.codec_id == AV_CODEC_ID_DTS)
+        if shapes, !binauralObjects {
             EngineLog.emit("[SWHost] audio: AE#923 shaping (\(audioShaping.summary)) keeps the track on the PCM decode",
                            category: .swPlayback)
             return try pcm()
@@ -124,10 +129,14 @@ extension SoftwarePlaybackHost {
             guard #available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *) else { return try pcm() }
             let format: SpatialBedFormat = route == .pcmBed(layout) ? .lpcm : .apac
             let producer = await makeAPACProducer(
-                demuxer: dem, stream: stream, streamIndex: streamIndex, layout: layout, format: format)
+                demuxer: dem, stream: stream, streamIndex: streamIndex, layout: layout, format: format,
+                binaural: binauralObjects)
             if let settled = try Self.settleAPACProducer(producer, stopped: stopRequested || Task.isCancelled) {
-                return (settled, route)
+                return (settled, binauralObjects ? .binauralBed(layout) : route)
             }
+            return try pcm()
+        case .binauralBed:
+            // `route` never returns it; the case above turns a rendered bed into one.
             return try pcm()
         }
     }
@@ -196,7 +205,7 @@ extension SoftwarePlaybackHost {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
     private func makeAPACProducer(
         demuxer dem: Demuxer, stream: UnsafeMutablePointer<AVStream>, streamIndex: Int32,
-        layout: SpatialSpeakerLayout, format: SpatialBedFormat
+        layout: SpatialSpeakerLayout, format: SpatialBedFormat, binaural: Bool
     ) async -> (any SoftwareAudioProducing)? {
         // `nil` after a stop() is as good as any other nil: the caller checks the stop before it
         // touches the stream again. Nothing here reads `stream` once the verdict has been awaited
@@ -236,13 +245,14 @@ extension SoftwarePlaybackHost {
                 #endif
             }
             let bridge = try SpatialAudioBridge(
-                srcTimeBase: stream.pointee.time_base, layout: layout, decoder: decoder, format: format)
+                srcTimeBase: stream.pointee.time_base, layout: layout, decoder: decoder, format: format,
+                binaural: binaural)
             bridge.onDecoderProducedNothing = { stats in
                 EngineLog.emit("[SWHost] ERROR: \(source.name) object decoder produced nothing: \(stats.summary)",
                                category: .swPlayback)
             }
             EngineLog.emit("[SWHost] audio: \(source.name) rendered into \(layout.rawValue) as "
-                           + "\(format == .lpcm ? "PCM" : "APAC") for the renderer",
+                           + (binaural ? "binaural stereo PCM" : format == .lpcm ? "PCM" : "APAC") + " for the renderer",
                            category: .swPlayback)
             return SoftwareAPACProducer(bridge: bridge, stream: stream)
         } catch {
@@ -256,7 +266,7 @@ extension SoftwarePlaybackHost {
     @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
     private func makeAPACProducer(
         demuxer dem: Demuxer, stream: UnsafeMutablePointer<AVStream>, streamIndex: Int32,
-        layout: SpatialSpeakerLayout, format: SpatialBedFormat
+        layout: SpatialSpeakerLayout, format: SpatialBedFormat, binaural: Bool
     ) async -> (any SoftwareAudioProducing)? {
         EngineLog.emit("[SWHost] audio: built without an object-audio trait; PCM decode", category: .swPlayback)
         return nil
