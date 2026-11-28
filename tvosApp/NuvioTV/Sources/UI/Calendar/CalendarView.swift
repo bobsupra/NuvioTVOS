@@ -554,6 +554,10 @@ final class CalendarStatusHolder: ObservableObject {
 struct CalendarView: View {
     let onOpenEntry: (CalendarEntry) -> Void
     let onOpenSettings: () -> Void
+    /// A title opened from the calendar covers it (Details, the player).
+    var isCovered = false
+    /// Counts Details closing, which can end after the cover is already gone.
+    var detailsClosedGeneration: UInt = 0
 
     @ObservedObject private var model = CalendarViewModel.shared
     @StateObject private var statusHolder = CalendarStatusHolder()
@@ -578,6 +582,8 @@ struct CalendarView: View {
     @State private var showingSuggestions = false
     @State private var showingOptions = false
     @State private var didFocusToday = false
+    /// Where the focus was when a title opened, to return there when it closes.
+    @State private var returnFocus: CalendarFocus?
     @FocusState private var focus: CalendarFocus?
 
     private var today: CalendarDay { CalendarDay(date: Date()) }
@@ -709,7 +715,7 @@ struct CalendarView: View {
                 hideSpoilers: hideSpoilers,
                 status: status,
                 focus: $focus,
-                onOpen: onOpenEntry
+                onOpen: openEntry
             )
             .frame(width: 610)
         }
@@ -732,6 +738,40 @@ struct CalendarView: View {
         // event, which may differ from selectedDay after scrolling the list.
         // Other areas leave the Menu button to the native sidebar.
         .onExitCommand(perform: isFocusInPanel ? { returnFromDayPanel(in: shown) } : nil)
+        .onChange(of: isCovered) { _, covered in
+            if !covered { restoreFocusAfterTitle(in: shown) }
+        }
+        .onChange(of: detailsClosedGeneration) { _, _ in
+            restoreFocusAfterTitle(in: shown)
+        }
+    }
+
+    private func openEntry(_ entry: CalendarEntry) {
+        returnFocus = focus ?? .entry(entry.id)
+        onOpenEntry(entry)
+    }
+
+    /// Back from a title opened here: the focus returns to the event (or the day) it was
+    /// opened from. Without this the focus engine picks the screen's first button, the
+    /// previous-month arrow.
+    private func restoreFocusAfterTitle(in result: CalendarResult) {
+        guard !isCovered, let target = returnFocus else { return }
+        returnFocus = nil
+        var resolved = target
+        // The calendar may have reloaded behind the title: an event gone takes its day.
+        if case .entry(let entryID) = target {
+            let sections = result.days.filter { $0.date.isSameMonth(as: displayedMonth) }
+            if !sections.contains(where: { $0.entries.contains(where: { $0.id == entryID }) }) {
+                resolved = .day(selectedDay)
+            }
+        }
+        // After the focus engine's own pass, and once more if it took the focus back.
+        DispatchQueue.main.async {
+            focus = resolved
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                if focus != resolved, !isCovered { focus = resolved }
+            }
+        }
     }
 
     private func returnFromDayPanel(in result: CalendarResult) {
