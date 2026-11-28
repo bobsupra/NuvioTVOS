@@ -1165,6 +1165,8 @@ private final class FakeNNTPServer: @unchecked Sendable {
             queue.asyncAfter(deadline: .now() + 0.05) {
                 self.send("222 0 body follows\r\nfake article line\r\n.\r\n", on: connection)
             }
+        } else if line.hasPrefix("STAT") {
+            send("430 No such article\r\n", on: connection)
         } else {
             send("500 What?\r\n", on: connection)
         }
@@ -1329,6 +1331,48 @@ final class UsenetPoolTests: XCTestCase {
 
         // Only a server saying the article is gone makes a hole that counts as damage.
         XCTAssertEqual(results, Array(repeating: .rejected, count: 3))
+    }
+
+    func testConnectionsOpenedAheadServeTheFirstFetches() async throws {
+        let server = FakeNNTPServer(allowed: 10, refusal: .login)
+        let port = try await server.start()
+        let pool = pool(port: port, login: true, connections: 3)
+
+        let opened = await pool.connectAhead(count: 4)
+        let idle = await pool.idleConnections
+        let acceptedAhead = server.counts.accepted
+        let results = await fetchAll(6, from: pool)
+        let stats = await pool.stats()
+        await pool.shutdown()
+        server.stop()
+
+        XCTAssertEqual(opened, 3, "never more than the server's connections")
+        XCTAssertEqual(idle, 3, "logged in and waiting")
+        XCTAssertEqual(acceptedAhead, 3)
+        XCTAssertEqual(results, Array(repeating: .body, count: 6))
+        XCTAssertEqual(server.counts.accepted, 3, "the fetches use the connections opened ahead, no new ones")
+        XCTAssertEqual(stats.openConnections, 3)
+    }
+
+    func testIdleConnectionsAreKeptAliveAndDeadOnesClosed() async throws {
+        let server = FakeNNTPServer(allowed: 10, refusal: .greeting)
+        let port = try await server.start()
+        let pool = pool(port: port, login: false, connections: 2)
+
+        await pool.connectAhead(count: 2)
+        let droppedWhileUp = await pool.keepIdleAlive(after: .zero)
+        let idleWhileUp = await pool.idleConnections
+        server.stop()
+        try await Task.sleep(for: .milliseconds(200))
+        let droppedWhenDown = await pool.keepIdleAlive(after: .zero)
+        let stats = await pool.stats()
+        await pool.shutdown()
+
+        XCTAssertEqual(droppedWhileUp, 0)
+        XCTAssertEqual(idleWhileUp, 2, "a connection the server answered waits idle again")
+        XCTAssertEqual(server.counts.accepted, 2, "keeping connections alive opens no new ones")
+        XCTAssertEqual(droppedWhenDown, 2, "a connection the server closed is closed too")
+        XCTAssertEqual(stats.openConnections, 0, "and its slot is free for a new one")
     }
 
     func testIdleConnectionsPastTheLimitAreNotUsedAgain() {

@@ -116,7 +116,10 @@ final class UsenetEngineManager: ObservableObject {
             throw UsenetError.noServers
         }
 
-        let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: UsenetSettings.speedLimitMbps())
+        let speedLimit = UsenetSettings.speedLimitMbps()
+        // The connections the stream list opened ahead for these servers, when there are.
+        let pool = await takeConnectedAhead(servers: servers, speedLimitMbps: speedLimit)
+            ?? UsenetConnectionPool(servers: servers, speedLimitMbps: speedLimit)
         do {
             let nzb = try await Self.loadNZB(spec.nzbURL)
             let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
@@ -185,6 +188,97 @@ final class UsenetEngineManager: ObservableObject {
     func stopAll() async {
         generation &+= 1
         await stopCurrent()
+    }
+
+    // MARK: - Connected ahead
+
+    /// A pool with connections opened before Play, for the stream about to start.
+    private struct ConnectedAhead {
+        let servers: [UsenetServerConfig]
+        let speedLimitMbps: Int
+        let pool: UsenetConnectionPool
+        /// When it closes, unless a stream takes it or the stream list asks again.
+        var until: Date
+    }
+
+    private var connectedAhead: ConnectedAhead?
+    private var connectedAheadKeeper: Task<Void, Never>?
+
+    /// Connections opened ahead, to the first server: the ones a start needs first.
+    static let connectAheadCount = 4
+    /// How long they stay after the stream list last showed Usenet streams.
+    static let connectAheadLifetime: TimeInterval = 5 * 60
+    /// Providers drop connections idle for a minute or more (`UsenetConnectionPool.maxIdle`):
+    /// one idle this long asks the server something, checked this often.
+    static let keepAliveAfter: Duration = .seconds(25)
+    static let keepAliveCheckEvery: Duration = .seconds(10)
+
+    /// The stream list shows Usenet streams: opens a few connections to their first server
+    /// ahead and keeps them alive, so playing one skips connecting, TLS and the login (about
+    /// 0.2 s each). Nothing while a stream plays: it holds its own connections.
+    func connectAhead(for spec: UsenetStreamSpec) {
+        guard !isStreaming else { return }
+        let servers = UsenetSettings.servers(for: spec)
+        guard let first = servers.first else { return }
+        let speedLimit = UsenetSettings.speedLimitMbps()
+        let until = Date().addingTimeInterval(Self.connectAheadLifetime)
+        if var ready = connectedAhead, ready.servers == servers, ready.speedLimitMbps == speedLimit {
+            ready.until = until
+            connectedAhead = ready
+            return
+        }
+        if let old = connectedAhead { Task { await old.pool.shutdown() } }
+        let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: speedLimit)
+        connectedAhead = ConnectedAhead(servers: servers, speedLimitMbps: speedLimit, pool: pool, until: until)
+        let count = min(Self.connectAheadCount, first.maxConnections)
+        let host = first.host
+        Task {
+            let opened = await pool.connectAhead(count: count)
+            usenetLog.info("usenet: \(host, privacy: .public) connected ahead, \(opened) of \(count) connection(s)")
+        }
+        startConnectedAheadKeeper()
+    }
+
+    /// Keeps the connections opened ahead alive until a stream takes them, and closes them
+    /// once `connectAheadLifetime` passed without one.
+    private func startConnectedAheadKeeper() {
+        guard connectedAheadKeeper == nil else { return }
+        connectedAheadKeeper = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: Self.keepAliveCheckEvery)
+                guard let self, !Task.isCancelled else { return }
+                guard let ready = self.connectedAhead else {
+                    self.connectedAheadKeeper = nil
+                    return
+                }
+                if Date() > ready.until {
+                    self.connectedAhead = nil
+                    self.connectedAheadKeeper = nil
+                    await ready.pool.shutdown()
+                    return
+                }
+                let dropped = await ready.pool.keepIdleAlive(after: Self.keepAliveAfter)
+                if dropped > 0 {
+                    usenetLog.info("usenet: \(dropped) connection(s) opened ahead were closed by the server")
+                }
+            }
+        }
+    }
+
+    /// The pool connected ahead when it is for exactly these servers and speed limit, for the
+    /// stream starting. One for other servers is closed.
+    private func takeConnectedAhead(servers: [UsenetServerConfig], speedLimitMbps: Int) async -> UsenetConnectionPool? {
+        guard let ready = connectedAhead else { return nil }
+        connectedAhead = nil
+        connectedAheadKeeper?.cancel()
+        connectedAheadKeeper = nil
+        guard ready.servers == servers, ready.speedLimitMbps == speedLimitMbps else {
+            await ready.pool.shutdown()
+            return nil
+        }
+        let idle = await ready.pool.idleConnections
+        usenetLog.info("usenet: starting with \(idle) connection(s) opened ahead")
+        return ready.pool
     }
 
     /// Errors where another release of the same title may well work, so the
