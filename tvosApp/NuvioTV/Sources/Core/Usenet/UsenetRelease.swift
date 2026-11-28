@@ -16,6 +16,7 @@ struct UsenetStreamSource: Sendable {
         case plain
         case split
         case rar
+        case sevenZip = "7z"
     }
 
     var name: String
@@ -24,8 +25,19 @@ struct UsenetStreamSource: Sendable {
     var extents: [UsenetExtent]
     /// Decoded first article of each volume (it gives the volume's layout).
     var firstArticles: [UsenetYEncSegment]
+    /// A file stored encrypted in a password-protected RAR set: its stored bytes are
+    /// decrypted as they are read.
+    var cipher: UsenetRarCipher? = nil
 
-    var totalSize: Int64 { extents.reduce(0) { $0 + $1.length } }
+    /// The bytes the extents hold: the file's own, or for an encrypted file the encrypted
+    /// ones, padded to whole blocks.
+    var storedSize: Int64 { extents.reduce(0) { $0 + $1.length } }
+
+    /// The size of the played file.
+    var totalSize: Int64 {
+        guard let cipher else { return storedSize }
+        return min(storedSize, max(0, cipher.plainSize))
+    }
 
     /// Where each extent starts in the played file.
     var extentStarts: [Int64] {
@@ -36,6 +48,26 @@ struct UsenetStreamSource: Sendable {
             running += extent.length
         }
         return starts
+    }
+
+    /// Ranges of a file this source maps (`ranges`, in its order) as extents of its volumes.
+    static func compose(_ ranges: [Range<Int64>], through extents: [UsenetExtent]) -> [UsenetExtent] {
+        let starts = UsenetStreamSource(name: "", kind: .plain, volumes: [], extents: extents, firstArticles: []).extentStarts
+        var out: [UsenetExtent] = []
+        for range in ranges {
+            var position = range.lowerBound
+            while position < range.upperBound, let place = locate(position, extents: extents, starts: starts) {
+                let extent = extents[place.extent]
+                let take = min(range.upperBound - position, starts[place.extent] + extent.length - position)
+                if let last = out.last, last.volume == extent.volume, last.offset + last.length == place.volumeOffset {
+                    out[out.count - 1].length += take
+                } else {
+                    out.append(UsenetExtent(volume: extent.volume, offset: place.volumeOffset, length: take))
+                }
+                position += take
+            }
+        }
+        return out
     }
 
     /// The extent holding `offset` and the matching offset inside its volume.
@@ -52,6 +84,22 @@ struct UsenetStreamSource: Sendable {
     }
 }
 
+/// Where a file stored in a RAR set sits, and how it is decrypted when the set is password
+/// protected.
+struct UsenetRarMapping: Sendable {
+    var extents: [UsenetExtent]
+    var cipher: UsenetRarCipher?
+}
+
+/// A 7z archive's volumes and file list.
+struct UsenetSevenZipDetail: Sendable {
+    /// First article of each volume.
+    var heads: [UsenetYEncSegment]
+    /// Each volume's place in the archive.
+    var volumes: [UsenetExtent]
+    var entries: [UsenetSevenZip.Entry]
+}
+
 /// A multi-file RAR set with every volume's headers read, in volume order.
 struct UsenetRarSetDetail: Sendable {
     var parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)]
@@ -64,7 +112,9 @@ enum UsenetFileRole: Equatable, Sendable {
     /// A raw split of a video (`movie.mkv.001`, `.002`, …).
     case split
     case par2
-    /// An archive format that can't be streamed (7z, zip, iso).
+    /// A 7z archive, or a volume of one (`movie.7z`, `movie.7z.001`, …).
+    case sevenZip
+    /// An archive format that can't be streamed (zip, iso).
     case unsupportedArchive
     case sidecar
     /// No telling from the name: obfuscated, or an extension nobody uses.
@@ -77,6 +127,11 @@ struct UsenetPlayableEntry: Equatable, Sendable {
         case plain(Int)
         case split([Int])
         case rar([Int])
+        /// A file of a RAR set stored inside the RAR set of these NZB files: its volumes are
+        /// files of the outer set, by name, in order.
+        case nestedRar([Int], volumes: [String])
+        /// A file stored in the 7z archive these NZB files are the volumes of.
+        case sevenZip([Int], file: String)
     }
 
     var name: String
@@ -108,7 +163,7 @@ struct UsenetReleaseResolver {
         // 1. Obfuscated files: their first article tells what they are. Only
         //    worth it when the named files aren't already the bulk of the release.
         let unknown = files.indices.filter { roles[$0] == .unknown && !files[$0].segments.isEmpty }
-        let namedBytes = files.indices.filter { [UsenetFileRole.video, .rar, .split].contains(roles[$0]) }
+        let namedBytes = files.indices.filter { [UsenetFileRole.video, .rar, .split, .sevenZip].contains(roles[$0]) }
             .reduce(0) { $0 + files[$1].encodedBytes }
         let unknownBytes = unknown.reduce(0) { $0 + files[$1].encodedBytes }
         if !unknown.isEmpty, namedBytes == 0 || unknownBytes > namedBytes {
@@ -138,7 +193,9 @@ struct UsenetReleaseResolver {
                     obfuscatedRar.insert(index)
                 case .par2:
                     roles[index] = .par2
-                case .sevenZip, .zip:
+                case .sevenZip:
+                    roles[index] = .sevenZip
+                case .zip:
                     roles[index] = .unsupportedArchive
                 case .unknown:
                     break
@@ -155,6 +212,12 @@ struct UsenetReleaseResolver {
                 heads: &heads, details: &rarDetails
             )
         }
+        var sevenZipDetails: [[Int]: UsenetSevenZipDetail] = [:]
+        var archiveProblem: UsenetError?
+        for set in Self.sevenZipSets(names: names, roles: roles) {
+            entries += try await sevenZipEntries(set, name: names[set[0]], heads: &heads,
+                                                 details: &sevenZipDetails, problem: &archiveProblem)
+        }
         entries.sort { $0.order < $1.order }
 
         guard let chosen = Self.choose(entries, mustInclude: mustInclude, fileIdx: fileIdx) else {
@@ -162,6 +225,7 @@ struct UsenetReleaseResolver {
                 // A pack without the wanted episode: never play another one instead.
                 throw UsenetError.fileNotInPack
             }
+            if let archiveProblem { throw archiveProblem }
             if let archive = files.indices.first(where: { roles[$0] == .unsupportedArchive }) {
                 throw UsenetError.archiveNotSupported(names[archive])
             }
@@ -195,24 +259,268 @@ struct UsenetReleaseResolver {
             } else {
                 let volumeHeads = try await requireHeads(indices, heads: &heads)
                 for (index, head) in zip(indices, volumeHeads) {
-                    guard let volume = UsenetRar.parseVolume(head.data) else { throw UsenetError.releaseIncomplete }
+                    guard let volume = UsenetRar.parseVolume(head.data, password: nzb.password) else { throw UsenetError.releaseIncomplete }
                     parsed.append((index, head, volume))
                 }
                 if indices.allSatisfy(obfuscatedRar.contains) {
                     parsed = Self.orderObfuscated(parsed)
                 }
             }
-            let extents = try Self.rarExtents(parsed.map { $0.volume }, innerName: chosen.name)
-            let used = Set(extents.map(\.volume))
-            let kept = parsed.indices.filter(used.contains)
-            let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
-            return UsenetStreamSource(
-                name: chosen.name, kind: .rar,
-                volumes: kept.map { files[parsed[$0].index] },
-                extents: extents.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
-                firstArticles: kept.map { parsed[$0].head }
-            )
+            let mapping = try Self.rarMapping(parsed.map { $0.volume }, innerName: chosen.name, password: nzb.password)
+            return try rarSource(chosen.name, mapping: mapping, parsed: parsed)
+        case .nestedRar(let indices, let innerNames):
+            guard let parsed = rarDetails[indices]?.parsed, !parsed.isEmpty else { throw UsenetError.noPlayableFile }
+            let outer = parsed.map(\.volume)
+            let inner = try await innerVolumes(innerNames, outer: outer, parsed: parsed)
+            let mapping = try Self.nestedMapping(outer: outer, innerNames: innerNames, inner: inner,
+                                                 innerName: chosen.name, password: nzb.password)
+            usenetLog.notice("usenet: RAR set inside a RAR set, \(innerNames.count) inner volumes")
+            return try rarSource(chosen.name, mapping: mapping, parsed: parsed)
+        case .sevenZip(let indices, let fileName):
+            guard let detail = sevenZipDetails[indices] else { throw UsenetError.noPlayableFile }
+            return try sevenZipSource(fileName, indices: indices, detail: detail)
         }
+    }
+
+    // MARK: - 7z
+
+    /// 7z archives, by name: `x.7z` alone, or its volumes `x.7z.001`, `x.7z.002`, … in order. An
+    /// obfuscated archive recognised by its bytes stands alone.
+    static func sevenZipSets(names: [String], roles: [UsenetFileRole]) -> [[Int]] {
+        var sets: [String: [(index: Int, number: Int)]] = [:]
+        for index in names.indices where roles[index] == .sevenZip {
+            let lower = names[index].lowercased()
+            let ext = (lower as NSString).pathExtension
+            if ext == "7z" {
+                sets[lower, default: []].append((index, 0))
+            } else if ext.count == 3, let number = Int(ext), (lower as NSString).deletingPathExtension.hasSuffix(".7z") {
+                sets[(lower as NSString).deletingPathExtension, default: []].append((index, number))
+            } else {
+                sets["\u{0}\(index)", default: []].append((index, 0))
+            }
+        }
+        return sets.values.map { $0.sorted { $0.number < $1.number }.map(\.index) }
+            .sorted { ($0.first ?? 0) < ($1.first ?? 0) }
+    }
+
+    /// The videos stored in one 7z archive (its volumes `set`): its file list, read from the
+    /// archive's end. What keeps a video from playing (compressed, a password) is kept in
+    /// `problem` for when nothing else plays.
+    private func sevenZipEntries(_ set: [Int], name: String, heads: inout [Int: UsenetYEncSegment],
+                                 details: inout [[Int]: UsenetSevenZipDetail], problem: inout UsenetError?) async throws -> [UsenetPlayableEntry] {
+        let volumeHeads = try await requireHeads(set, heads: &heads)
+        let volumes = volumeHeads.enumerated().map { UsenetExtent(volume: $0.offset, offset: 0, length: Self.fileSize($0.element)) }
+        let archiveSize = volumes.reduce(0) { $0 + $1.length }
+        let entries: [UsenetSevenZip.Entry]
+        do {
+            let next = try UsenetSevenZip.nextHeader(volumeHeads[0].data)
+            guard next.offset + Int64(next.size) <= archiveSize else { throw UsenetError.releaseIncomplete }
+            let read: UsenetSevenZip.Reader = { offset, length in
+                try await self.archiveBytes(set, heads: volumeHeads, volumes: volumes, offset: offset, length: length)
+            }
+            let header = try await read(next.offset, next.size)
+            entries = try await UsenetSevenZip.entries(header: header, password: nzb.password, read: read)
+        } catch let failure as UsenetSevenZip.Failure {
+            switch failure {
+            case .needsPassword: problem = problem ?? .archiveEncrypted
+            case .wrongPassword: problem = problem ?? .wrongPassword
+            case .notSevenZip, .damaged: problem = problem ?? .releaseIncomplete
+            case .unsupported: problem = problem ?? .archiveNotSupported(name)
+            }
+            usenetLog.notice("usenet: 7z file list unreadable: \(String(describing: failure), privacy: .public)")
+            return []
+        }
+        details[set] = UsenetSevenZipDetail(heads: volumeHeads, volumes: volumes, entries: entries)
+
+        let baseOrder = (set.min() ?? 0) * 1000
+        var playable: [UsenetPlayableEntry] = []
+        for entry in entries where !entry.isDirectory && entry.size > 0 && Self.isVideoName(entry.name) {
+            switch entry.method {
+            case .stored:
+                break
+            case .encrypted:
+                // Encrypted files are decrypted from their folder's start: a file further into a
+                // solid folder would need everything before it.
+                guard entry.offsetInFolder == 0, !(nzb.password ?? "").isEmpty else {
+                    problem = problem ?? .archiveEncrypted
+                    continue
+                }
+            case .compressed:
+                problem = problem ?? .archiveCompressed(entry.name)
+                continue
+            }
+            playable.append(UsenetPlayableEntry(name: entry.name, source: .sevenZip(set, file: entry.name),
+                                                size: Int(clamping: entry.size), order: baseOrder + playable.count))
+        }
+        usenetLog.notice("usenet: 7z archive of \(set.count) volume(s) holds \(playable.count) playable videos")
+        return playable
+    }
+
+    /// The stream of a file stored in a 7z archive.
+    private func sevenZipSource(_ fileName: String, indices: [Int], detail: UsenetSevenZipDetail) throws -> UsenetStreamSource {
+        guard let entry = detail.entries.first(where: { $0.name == fileName && !$0.isDirectory }) else {
+            throw UsenetError.noPlayableFile
+        }
+        let start = entry.packStart + entry.offsetInFolder
+        var storedLength = entry.size
+        var cipher: UsenetRarCipher?
+        if case .encrypted(let properties) = entry.method {
+            guard let password = nzb.password, !password.isEmpty else { throw UsenetError.archiveEncrypted }
+            do {
+                cipher = try UsenetSevenZip.cipher(properties: properties, password: password, plainSize: entry.size)
+            } catch {
+                throw UsenetError.archiveEncrypted
+            }
+            // The whole folder: the file padded to AES blocks.
+            storedLength = entry.packSize
+        }
+        let mapped = UsenetStreamSource.compose([start..<(start + storedLength)], through: detail.volumes)
+        guard mapped.reduce(0, { $0 + $1.length }) == storedLength else { throw UsenetError.releaseIncomplete }
+        if let cipher, let first = mapped.first,
+           let head = Self.plainHead(of: detail.heads[first.volume], from: first, cipher: cipher),
+           Self.passwordLooksWrong(name: fileName, plainHead: head) {
+            throw UsenetError.wrongPassword
+        }
+        let used = Set(mapped.map(\.volume))
+        let kept = detail.heads.indices.filter(used.contains)
+        let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
+        return UsenetStreamSource(
+            name: fileName, kind: .sevenZip,
+            volumes: kept.map { nzb.files[indices[$0]] },
+            extents: mapped.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
+            firstArticles: kept.map { detail.heads[$0] },
+            cipher: cipher
+        )
+    }
+
+    /// `length` bytes of a 7z archive (its volumes joined) from `offset`.
+    private func archiveBytes(_ set: [Int], heads: [UsenetYEncSegment], volumes: [UsenetExtent],
+                              offset: Int64, length: Int) async throws -> Data {
+        var out = Data()
+        for piece in UsenetStreamSource.compose([offset..<(offset + Int64(length))], through: volumes) {
+            guard let bytes = try await volumeBytes(nzb.files[set[piece.volume]], head: heads[piece.volume],
+                                                    at: piece.offset, length: Int(piece.length)),
+                  bytes.count == Int(piece.length) else { throw UsenetError.releaseIncomplete }
+            out.append(bytes)
+        }
+        return out
+    }
+
+    /// The stream of a file mapped onto the volumes of a RAR set (`parsed`, in volume order).
+    private func rarSource(_ name: String, mapping: UsenetRarMapping,
+                           parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)]) throws -> UsenetStreamSource {
+        let files = nzb.files
+        let extents = mapping.extents
+        let used = Set(extents.map(\.volume))
+        let kept = parsed.indices.filter(used.contains)
+        let remap = Dictionary(uniqueKeysWithValues: kept.enumerated().map { ($0.element, $0.offset) })
+        if let cipher = mapping.cipher {
+            if !cipher.passwordChecked, let first = extents.first,
+               let head = Self.plainHead(of: parsed[first.volume].head, from: first, cipher: cipher),
+               Self.passwordLooksWrong(name: name, plainHead: head) {
+                throw UsenetError.wrongPassword
+            }
+            usenetLog.notice("usenet: encrypted RAR, opened with the NZB's password")
+        }
+        return UsenetStreamSource(
+            name: name, kind: .rar,
+            volumes: kept.map { files[parsed[$0].index] },
+            extents: extents.map { UsenetExtent(volume: remap[$0.volume]!, offset: $0.offset, length: $0.length) },
+            firstArticles: kept.map { parsed[$0].head },
+            cipher: mapping.cipher
+        )
+    }
+
+    // MARK: - RAR inside RAR
+
+    /// The inner volumes' headers, from the first bytes of each one in the outer set, read in
+    /// parallel.
+    private func innerVolumes(_ names: [String], outer: [UsenetRarVolume],
+                              parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)]) async throws -> [UsenetRarVolume] {
+        let password = nzb.password
+        let placed = try names.map { try Self.rarMapping(outer, innerName: $0, password: password).extents }
+        return try await withThrowingTaskGroup(of: (Int, UsenetRarVolume?).self, returning: [UsenetRarVolume].self) { group in
+            var result = [UsenetRarVolume?](repeating: nil, count: names.count)
+            var pending = names.indices.makeIterator()
+            for _ in 0..<8 {
+                guard let index = pending.next() else { break }
+                group.addTask {
+                    let bytes = try await self.storedBytes(placed[index], parsed: parsed, length: Self.innerHeaderBytes)
+                    return (index, UsenetRar.parseVolume(bytes, password: password))
+                }
+            }
+            while let finished = try await group.next() {
+                result[finished.0] = finished.1
+                if let index = pending.next() {
+                    group.addTask {
+                        let bytes = try await self.storedBytes(placed[index], parsed: parsed, length: Self.innerHeaderBytes)
+                        return (index, UsenetRar.parseVolume(bytes, password: password))
+                    }
+                }
+            }
+            return try result.map { volume in
+                guard let volume else { throw UsenetError.releaseIncomplete }
+                return volume
+            }
+        }
+    }
+
+    /// An inner volume's headers fit in its first bytes (a scene volume's take a few hundred).
+    static let innerHeaderBytes = 32 * 1024
+
+    /// The first `length` bytes of a file stored in a RAR set (at `extents` of its volumes).
+    private func storedBytes(_ extents: [UsenetExtent], parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)],
+                             length: Int) async throws -> Data {
+        var out = Data()
+        for extent in extents where out.count < length {
+            let wanted = Int(min(Int64(length - out.count), extent.length))
+            let volume = parsed[extent.volume]
+            guard let bytes = try await volumeBytes(nzb.files[volume.index], head: volume.head, at: extent.offset, length: wanted),
+                  !bytes.isEmpty else { break }
+            out.append(bytes)
+            if bytes.count < wanted { break }
+        }
+        return out
+    }
+
+    /// The RAR sets among the files of an outer set, each in volume order.
+    static func innerRarSets(_ names: [String]) -> [[String]] {
+        var sets: [String: [(name: String, number: Int)]] = [:]
+        var order: [String] = []
+        for name in names where role(ofName: name) == .rar {
+            guard let key = rarVolumeKey(name) else { continue }
+            if sets[key.set] == nil { order.append(key.set) }
+            sets[key.set, default: []].append((name, key.number))
+        }
+        return order.compactMap { sets[$0]?.sorted { $0.number < $1.number }.map(\.name) }
+    }
+
+    /// A file of a RAR set stored inside another RAR set (`outer`, whose files `innerNames` are
+    /// the inner set's volumes `inner`): where its bytes sit in the outer volumes.
+    static func nestedMapping(outer: [UsenetRarVolume], innerNames: [String], inner: [UsenetRarVolume],
+                              innerName: String, password: String?) throws -> UsenetRarMapping {
+        let mapping = try rarMapping(inner, innerName: innerName, password: password)
+        var placed: [Int: [UsenetExtent]] = [:]
+        var extents: [UsenetExtent] = []
+        for extent in mapping.extents {
+            guard innerNames.indices.contains(extent.volume) else { throw UsenetError.releaseIncomplete }
+            if placed[extent.volume] == nil {
+                let volume = try rarMapping(outer, innerName: innerNames[extent.volume], password: password)
+                // An encrypted outer set would need decrypting before the inner one is read.
+                guard volume.cipher == nil else { throw UsenetError.archiveEncrypted }
+                placed[extent.volume] = volume.extents
+            }
+            let pieces = UsenetStreamSource.compose([extent.offset..<(extent.offset + extent.length)], through: placed[extent.volume] ?? [])
+            guard pieces.reduce(0, { $0 + $1.length }) == extent.length else { throw UsenetError.releaseIncomplete }
+            for piece in pieces {
+                if let last = extents.last, last.volume == piece.volume, last.offset + last.length == piece.offset {
+                    extents[extents.count - 1].length += piece.length
+                } else {
+                    extents.append(piece)
+                }
+            }
+        }
+        return UsenetRarMapping(extents: extents, cipher: mapping.cipher)
     }
 
     // MARK: - Names and roles
@@ -232,11 +540,13 @@ struct UsenetReleaseResolver {
         if ext.count == 3, Int(ext) != nil {
             let inner = ((lower as NSString).deletingPathExtension as NSString).pathExtension
             if UsenetFile.videoExtensions.contains(inner) { return .split }
-            if ["7z", "zip"].contains(inner) { return .unsupportedArchive }
+            if inner == "7z" { return .sevenZip }
+            if inner == "zip" { return .unsupportedArchive }
             if inner == "rar" { return .rar }
             return .unknown
         }
-        if ["7z", "zip", "iso", "img"].contains(ext) { return .unsupportedArchive }
+        if ext == "7z" { return .sevenZip }
+        if ["zip", "iso", "img"].contains(ext) { return .unsupportedArchive }
         if sidecarExtensions.contains(ext) { return .sidecar }
         return .unknown
     }
@@ -324,15 +634,25 @@ struct UsenetReleaseResolver {
 
     /// Where a stored file's bytes sit across the volumes of its set.
     static func rarExtents(_ volumes: [UsenetRarVolume], innerName: String) throws -> [UsenetExtent] {
+        try rarMapping(volumes, innerName: innerName, password: nil).extents
+    }
+
+    /// Where a stored file's bytes sit across the volumes of its set, and the key they are
+    /// decrypted with when the set is password protected (`password`: the NZB's).
+    static func rarMapping(_ volumes: [UsenetRarVolume], innerName: String, password: String?) throws -> UsenetRarMapping {
         guard !volumes.isEmpty else { throw UsenetError.noPlayableFile }
-        if volumes.contains(where: \.headersEncrypted) { throw UsenetError.archiveEncrypted }
+        if volumes.contains(where: \.headersEncrypted) {
+            throw volumes.contains(where: \.passwordRejected) ? UsenetError.wrongPassword : UsenetError.archiveEncrypted
+        }
         // In a multi-file set the wanted file can start in any volume.
         let startsHere: (UsenetRarEntry) -> Bool = { $0.name == innerName && !$0.continuesFromPrevious }
         guard let startVolume = volumes.firstIndex(where: { $0.entries.contains(where: startsHere) }),
               let firstEntry = volumes[startVolume].entries.first(where: startsHere) else {
             throw UsenetError.noPlayableFile
         }
-        if firstEntry.isEncrypted { throw UsenetError.archiveEncrypted }
+        if firstEntry.isEncrypted, (password?.isEmpty ?? true) || firstEntry.encryption == nil {
+            throw UsenetError.archiveEncrypted
+        }
         guard firstEntry.isStored else { throw UsenetError.archiveCompressed(innerName) }
 
         var extents = [UsenetExtent(volume: startVolume, offset: firstEntry.dataOffset, length: firstEntry.packedSize)]
@@ -342,7 +662,7 @@ struct UsenetReleaseResolver {
             guard let part = volumes[volume].entries.first(where: { $0.name == innerName && $0.continuesFromPrevious }) else {
                 throw UsenetError.releaseIncomplete
             }
-            if part.isEncrypted { throw UsenetError.archiveEncrypted }
+            if part.isEncrypted != firstEntry.isEncrypted { throw UsenetError.archiveEncrypted }
             extents.append(UsenetExtent(volume: volume, offset: part.dataOffset, length: part.packedSize))
             continues = part.continuesInNext
             volume += 1
@@ -352,7 +672,32 @@ struct UsenetReleaseResolver {
             // Volumes are missing from the NZB.
             throw UsenetError.releaseIncomplete
         }
-        return extents.filter { $0.length > 0 }
+        var cipher: UsenetRarCipher?
+        if firstEntry.isEncrypted, let password, let encryption = firstEntry.encryption {
+            let plainSize = firstEntry.unpackedSize >= 0 ? firstEntry.unpackedSize : total
+            cipher = try UsenetRarCrypto.cipher(for: encryption, password: password, plainSize: plainSize)
+        }
+        return UsenetRarMapping(extents: extents.filter { $0.length > 0 }, cipher: cipher)
+    }
+
+    /// The first plain bytes of an encrypted file, when the first article of its first volume
+    /// holds them.
+    static func plainHead(of article: UsenetYEncSegment, from extent: UsenetExtent, cipher: UsenetRarCipher) -> Data? {
+        let begin = Int64(article.fileOffset)
+        let from = extent.offset - begin
+        let length = Int(min(extent.length, 1024, Int64(article.data.count) - from)) / 16 * 16
+        guard from >= 0, length >= 16 else { return nil }
+        let start = article.data.startIndex + Int(from)
+        let stored = article.data.subdata(in: start..<(start + length))
+        return UsenetRarCrypto.plain(stored, storedStart: 0, previous: nil, cipher: cipher, offset: 0, length: length)
+    }
+
+    /// A video that doesn't start the way its kind does: the archive's password (which RAR 4
+    /// can't check) decrypted it into noise.
+    static func passwordLooksWrong(name: String, plainHead: Data) -> Bool {
+        let sniffable = ["mkv", "webm", "mp4", "m4v", "avi", "ts", "m2ts"]
+        guard sniffable.contains((name as NSString).pathExtension.lowercased()), plainHead.count >= 400 else { return false }
+        return UsenetSniff.kind(of: plainHead) == .unknown
     }
 
     /// Stremio examples write `fileMustInclude` like a JavaScript literal,
@@ -423,18 +768,20 @@ struct UsenetReleaseResolver {
         var leader = first
         if heads[first] != nil, set.count > 1 {
             let volumes = set.compactMap { index in
-                heads[index].map(\.data).flatMap(UsenetRar.parseVolume).map { (index, $0) }
+                heads[index].flatMap { UsenetRar.parseVolume($0.data, password: nzb.password) }.map { (index, $0) }
             }
             if let firstVolume = volumes.first(where: { $0.1.isFirstVolume == true || $0.1.volumeNumber == 0 }) {
                 leader = firstVolume.0
             }
         }
         guard let head = try await requireHeads([leader], heads: &heads).first,
-              let volume = UsenetRar.parseVolume(head.data) else { return [] }
+              let volume = UsenetRar.parseVolume(head.data, password: nzb.password) else { return [] }
 
         let listed = volume.entries.filter { !$0.isDirectory && !$0.continuesFromPrevious }
             .reduce(Int64(0)) { $0 + max(0, $1.unpackedSize) }
-        let isMultiFile = Self.isMultiFileSet(listedBytes: listed, encodedSetBytes: setBytes)
+        // A set holding another RAR set's volumes is always listed: they are found by name.
+        let wrapsRar = volume.entries.contains { !$0.isDirectory && Self.role(ofName: $0.name) == .rar }
+        let isMultiFile = (Self.isMultiFileSet(listedBytes: listed, encodedSetBytes: setBytes) || wrapsRar)
             && !volume.headersEncrypted
 
         if !isMultiFile {
@@ -446,25 +793,64 @@ struct UsenetReleaseResolver {
         let volumeHeads = try await requireHeads(set, heads: &heads)
         var parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)] = []
         for (index, volumeHead) in zip(set, volumeHeads) {
-            guard let parsedVolume = UsenetRar.parseVolume(volumeHead.data) else { throw UsenetError.releaseIncomplete }
+            guard let parsedVolume = UsenetRar.parseVolume(volumeHead.data, password: nzb.password) else { throw UsenetError.releaseIncomplete }
             parsed.append((index, volumeHead, parsedVolume))
         }
         if obfuscated { parsed = Self.orderObfuscated(parsed) }
-        for k in parsed.indices {
-            parsed[k].volume = try await completeHeaders(parsed[k].volume, file: files[parsed[k].index], head: parsed[k].head)
-        }
+        parsed = try await completeAllHeaders(parsed, files: files)
         details[set] = UsenetRarSetDetail(parsed: parsed)
 
-        let starts = parsed.flatMap { $0.volume.entries }
-            .filter { !$0.isDirectory && !$0.continuesFromPrevious && Self.isVideoName($0.name) }
+        let stored = parsed.flatMap { $0.volume.entries }.filter { !$0.isDirectory && !$0.continuesFromPrevious }
+        let starts = stored.filter { Self.isVideoName($0.name) }
         usenetLog.notice("usenet: RAR set holds \(starts.count) videos")
-        return starts.enumerated().map { number, entry in
+        var entries = starts.enumerated().map { number, entry in
             UsenetPlayableEntry(
                 name: entry.name, source: .rar(set),
                 size: Int(clamping: max(0, entry.unpackedSize)),
                 order: baseOrder + number
             )
         }
+        // RAR sets stored inside this one: the videos their first volume lists.
+        let outer = parsed.map(\.volume)
+        for innerNames in Self.innerRarSets(stored.map(\.name)) {
+            guard let firstName = innerNames.first,
+                  let extents = try? Self.rarMapping(outer, innerName: firstName, password: nzb.password).extents,
+                  let bytes = try? await storedBytes(extents, parsed: parsed, length: Self.innerHeaderBytes),
+                  let inner = UsenetRar.parseVolume(bytes, password: nzb.password) else { continue }
+            let videos = inner.entries.filter { !$0.isDirectory && !$0.continuesFromPrevious && Self.isVideoName($0.name) }
+            usenetLog.notice("usenet: RAR set inside the set, \(innerNames.count) volumes, \(videos.count) videos")
+            for video in videos {
+                entries.append(UsenetPlayableEntry(
+                    name: video.name, source: .nestedRar(set, volumes: innerNames),
+                    size: Int(clamping: max(0, video.unpackedSize)),
+                    order: baseOrder + entries.count
+                ))
+            }
+        }
+        return entries
+    }
+
+    /// Reads every volume's remaining headers, several volumes at a time.
+    private func completeAllHeaders(_ parsed: [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)],
+                                    files: [UsenetFile]) async throws -> [(index: Int, head: UsenetYEncSegment, volume: UsenetRarVolume)] {
+        var result = parsed
+        let completed = try await withThrowingTaskGroup(of: (Int, UsenetRarVolume).self, returning: [Int: UsenetRarVolume].self) { group in
+            var done: [Int: UsenetRarVolume] = [:]
+            var pending = parsed.indices.makeIterator()
+            for _ in 0..<8 {
+                guard let k = pending.next() else { break }
+                group.addTask { (k, try await self.completeHeaders(parsed[k].volume, file: files[parsed[k].index], head: parsed[k].head)) }
+            }
+            while let finished = try await group.next() {
+                done[finished.0] = finished.1
+                if let k = pending.next() {
+                    group.addTask { (k, try await self.completeHeaders(parsed[k].volume, file: files[parsed[k].index], head: parsed[k].head)) }
+                }
+            }
+            return done
+        }
+        for (k, volume) in completed { result[k].volume = volume }
+        return result
     }
 
     /// A first file under 85 % of the set means more files follow it
@@ -712,6 +1098,203 @@ enum UsenetNZBCache {
         for entry in entries where total > maxBytes {
             try? fileManager.removeItem(at: entry.url)
             total -= entry.size
+        }
+    }
+}
+
+// MARK: - Looking inside the archive when a stream is checked
+
+/// What a check found inside a release's archive (the first article of its first volume, or a
+/// small 7z's file list): whether the video in it could play.
+enum UsenetArchiveFinding: String, Sendable, Equatable, Codable {
+    /// A stored video (with the NZB's password opening it where it needs one): it would play.
+    case stored
+    /// RAR volumes stored inside the RAR set: they play, not looked into further.
+    case nested
+    case compressed
+    case needsPassword
+    case wrongPassword
+    case noVideo
+    case unsupported
+    case damaged
+
+    /// The video can't play from this release.
+    var blocksPlayback: Bool {
+        switch self {
+        case .stored, .nested: return false
+        default: return true
+        }
+    }
+}
+
+extension UsenetReleaseResolver {
+    /// The most volumes of a 7z archive a check reads: its file list sits at the archive's end,
+    /// and every volume's first article is read to find it.
+    static let lookSevenZipVolumes = 3
+
+    /// Looks inside the release's archive the way playback would, reading only the first
+    /// article of its first RAR volume (or a 7z of up to `lookSevenZipVolumes` volumes). A nil
+    /// finding: nothing to look into (a video that isn't packed) or more than a check reads.
+    /// `detail` says what it saw, for the log.
+    func lookInsideArchive() async throws -> (finding: UsenetArchiveFinding?, detail: String) {
+        let files = nzb.files
+        let names = files.map(\.name)
+        let roles = names.map(Self.role(ofName:))
+        func bytesOf(_ indices: [Int]) -> Int { indices.reduce(0) { $0 + files[$1].encodedBytes } }
+        func roleBytes(_ wanted: [UsenetFileRole]) -> Int {
+            bytesOf(files.indices.filter { wanted.contains(roles[$0]) })
+        }
+        let plainBytes = roleBytes([.video, .split])
+        let rarBytes = roleBytes([.rar])
+        let sevenZipBytes = roleBytes([.sevenZip])
+        let unsupportedBytes = roleBytes([.unsupportedArchive])
+        let unknown = files.indices.filter { roles[$0] == .unknown && !files[$0].segments.isEmpty }
+        let unknownBytes = bytesOf(unknown)
+        var heads: [Int: UsenetYEncSegment] = [:]
+
+        if rarBytes > 0, rarBytes >= max(plainBytes, sevenZipBytes, unknownBytes) {
+            let sets = Self.rarSets(names: names, roles: roles, obfuscated: [])
+            guard let set = sets.max(by: { bytesOf($0) < bytesOf($1) }), let leader = set.first else {
+                return (nil, "no RAR set")
+            }
+            let head: UsenetYEncSegment
+            do {
+                head = try await requireHeads([leader], heads: &heads)[0]
+            } catch UsenetError.firstSegmentUnavailable {
+                return (nil, "the first volume's first article is missing")
+            }
+            return Self.rarFinding(head: head, password: nzb.password, mustInclude: mustInclude,
+                                   setBytes: bytesOf(set), anyVolume: false, label: names[leader])
+        }
+        if sevenZipBytes > 0, sevenZipBytes >= max(plainBytes, unknownBytes) {
+            let sets = Self.sevenZipSets(names: names, roles: roles)
+            guard let set = sets.max(by: { bytesOf($0) < bytesOf($1) }) else { return (nil, "no 7z archive") }
+            return try await sevenZipFinding(set, name: names[set[0]], heads: &heads)
+        }
+        if unsupportedBytes > max(plainBytes, unknownBytes) {
+            return (.unsupported, "an archive that can't be streamed (zip, iso)")
+        }
+        if !unknown.isEmpty, unknownBytes > plainBytes {
+            // Obfuscated: the first file's first article tells what the release is.
+            let lead = unknown[0]
+            guard let head = try await fetchHeads([lead])[lead] else {
+                return (nil, "obfuscated, its first article is missing")
+            }
+            switch UsenetSniff.kind(of: head.data) {
+            case .video:
+                return (nil, "obfuscated video, not packed")
+            case .rar:
+                return Self.rarFinding(head: head, password: nzb.password, mustInclude: mustInclude,
+                                       setBytes: unknownBytes, anyVolume: true, label: "obfuscated volume")
+            case .sevenZip:
+                guard unknown.count == 1 else { return (nil, "obfuscated 7z of several volumes, not read by a check") }
+                return try await sevenZipFinding([lead], name: names[lead], heads: &heads)
+            case .zip:
+                return (.unsupported, "an obfuscated zip archive")
+            case .par2, .unknown:
+                return (nil, "obfuscated, its first file tells nothing")
+            }
+        }
+        return (nil, "a video, not packed")
+    }
+
+    /// The video a RAR volume's first article lists, and whether it could play. `anyVolume`: an
+    /// obfuscated volume that may not be the first, so files continued from an earlier one count
+    /// too.
+    static func rarFinding(head: UsenetYEncSegment, password: String?, mustInclude: String?,
+                           setBytes: Int, anyVolume: Bool, label: String) -> (finding: UsenetArchiveFinding?, detail: String) {
+        guard let volume = UsenetRar.parseVolume(head.data, password: password) else {
+            return (.damaged, "\(label): RAR headers unreadable")
+        }
+        let format = volume.format == .rar5 ? "RAR 5" : "RAR 4"
+        if volume.headersEncrypted {
+            return volume.passwordRejected
+                ? (.wrongPassword, "\(format), encrypted headers, the NZB's password rejected")
+                : (.needsPassword, "\(format), encrypted headers, no password in the NZB")
+        }
+        let listed = volume.entries.filter { !$0.isDirectory && (anyVolume || !$0.continuesFromPrevious) }
+        let videos = listed.filter { isVideoName($0.name) }
+        guard !videos.isEmpty else {
+            if listed.contains(where: { role(ofName: $0.name) == .rar }) {
+                return (.nested, "\(format), RAR volumes stored inside")
+            }
+            let listedBytes = listed.reduce(Int64(0)) { $0 + max(0, $1.unpackedSize) }
+            if isMultiFileSet(listedBytes: listedBytes, encodedSetBytes: setBytes) {
+                return (nil, "\(format), several files, the first one no video: not looked further")
+            }
+            let sample = listed.prefix(3).map(\.name).joined(separator: ", ")
+            return (.noVideo, "\(format), \(listed.count) files, no video (\(sample))")
+        }
+        let entry = chosenVideo(videos, mustInclude: mustInclude)
+        if entry.isEncrypted, (password ?? "").isEmpty || entry.encryption == nil {
+            return (.needsPassword, "\(format), \(entry.name) encrypted, no password in the NZB")
+        }
+        guard entry.isStored else { return (.compressed, "\(format), \(entry.name) compressed") }
+        guard entry.isEncrypted, let encryption = entry.encryption, let password else {
+            return (.stored, "\(format), \(entry.name) stored")
+        }
+        do {
+            let plainSize = entry.unpackedSize >= 0 ? entry.unpackedSize : entry.packedSize
+            let cipher = try UsenetRarCrypto.cipher(for: encryption, password: password, plainSize: plainSize)
+            // Its first bytes decrypt only from where the file starts (not from a later volume).
+            if !entry.continuesFromPrevious,
+               let plain = plainHead(of: head, from: UsenetExtent(volume: 0, offset: entry.dataOffset, length: entry.packedSize), cipher: cipher),
+               passwordLooksWrong(name: entry.name, plainHead: plain) {
+                return (.wrongPassword, "\(format), \(entry.name): the NZB's password decrypts it into noise")
+            }
+            return (.stored, "\(format), \(entry.name) stored, encrypted, the NZB's password works")
+        } catch UsenetError.wrongPassword {
+            return (.wrongPassword, "\(format), \(entry.name): the NZB's password fails RAR's check")
+        } catch {
+            return (.damaged, "\(format), \(entry.name): its encryption unreadable")
+        }
+    }
+
+    /// The episode's video (`mustInclude`) when it is among them, else the largest.
+    private static func chosenVideo(_ videos: [UsenetRarEntry], mustInclude: String?) -> UsenetRarEntry {
+        if let mustInclude, !mustInclude.isEmpty,
+           let regex = try? NSRegularExpression(pattern: mustInclude, options: [.caseInsensitive]),
+           let match = videos.first(where: {
+               regex.firstMatch(in: $0.name, range: NSRange($0.name.startIndex..., in: $0.name)) != nil
+           }) {
+            return match
+        }
+        return videos.max { $0.unpackedSize < $1.unpackedSize } ?? videos[0]
+    }
+
+    /// A 7z archive of up to `lookSevenZipVolumes` volumes: its file list, read from its end.
+    private func sevenZipFinding(_ set: [Int], name: String,
+                                 heads: inout [Int: UsenetYEncSegment]) async throws -> (finding: UsenetArchiveFinding?, detail: String) {
+        guard set.count <= Self.lookSevenZipVolumes else {
+            return (nil, "7z of \(set.count) volumes, its file list not read by a check")
+        }
+        var details: [[Int]: UsenetSevenZipDetail] = [:]
+        var problem: UsenetError?
+        let entries: [UsenetPlayableEntry]
+        do {
+            entries = try await sevenZipEntries(set, name: name, heads: &heads, details: &details, problem: &problem)
+        } catch UsenetError.firstSegmentUnavailable, UsenetError.releaseIncomplete {
+            return (nil, "7z, an article its file list needs is missing")
+        }
+        if let chosen = Self.choose(entries, mustInclude: mustInclude, fileIdx: nil), let detail = details[set] {
+            do {
+                _ = try sevenZipSource(chosen.name, indices: set, detail: detail)
+                return (.stored, "7z, \(chosen.name) stored")
+            } catch UsenetError.wrongPassword {
+                return (.wrongPassword, "7z, \(chosen.name): the NZB's password decrypts it into noise")
+            } catch UsenetError.archiveEncrypted {
+                return (.needsPassword, "7z, \(chosen.name) encrypted")
+            } catch {
+                return (.damaged, "7z, \(chosen.name): \(error.localizedDescription)")
+            }
+        }
+        switch problem {
+        case .archiveEncrypted?: return (.needsPassword, "7z, encrypted, no password in the NZB")
+        case .wrongPassword?: return (.wrongPassword, "7z, the NZB's password rejected")
+        case .archiveCompressed(let file)?: return (.compressed, "7z, \(file) compressed")
+        case .archiveNotSupported?: return (.unsupported, "7z, a method a stream can't read")
+        case .releaseIncomplete?: return (.damaged, "7z, its file list unreadable")
+        default: return (.noVideo, "7z, no video in it")
         }
     }
 }

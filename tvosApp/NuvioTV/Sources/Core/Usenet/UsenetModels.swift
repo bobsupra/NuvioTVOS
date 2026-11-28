@@ -123,6 +123,8 @@ enum UsenetError: LocalizedError, Equatable {
     case serverRejected(String)
     case archiveCompressed(String)
     case archiveEncrypted
+    /// The NZB's password doesn't open the archive.
+    case wrongPassword
     case releaseIncomplete
     case fileNotInPack
 
@@ -137,7 +139,7 @@ enum UsenetError: LocalizedError, Equatable {
         case .noPlayableFile:
             return L10n.string("usenet_error_no_file", fallback: "The NZB has no video file to play.")
         case .archiveNotSupported(let name):
-            return L10n.format("usenet_error_archive", fallback: "%@ is packed in a 7z/zip archive, which can't be streamed.", name)
+            return L10n.format("usenet_error_archive", fallback: "%@ is packed in an archive that can't be streamed.", name)
         case .firstSegmentUnavailable:
             return L10n.string("usenet_error_first_segment", fallback: "The release is incomplete on your Usenet servers.")
         case .serverRejected(let message):
@@ -146,6 +148,8 @@ enum UsenetError: LocalizedError, Equatable {
             return L10n.format("usenet_error_archive_compressed", fallback: "%@ is compressed inside its archive and can't be streamed.", name)
         case .archiveEncrypted:
             return L10n.string("usenet_error_archive_encrypted", fallback: "The release is password protected.")
+        case .wrongPassword:
+            return L10n.string("usenet_error_wrong_password", fallback: "The password in the NZB doesn't open this release.")
         case .releaseIncomplete:
             return L10n.string("usenet_error_incomplete", fallback: "Parts of this release are missing on your Usenet servers.")
         case .fileNotInPack:

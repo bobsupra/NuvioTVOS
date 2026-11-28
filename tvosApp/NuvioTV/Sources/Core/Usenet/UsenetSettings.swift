@@ -66,6 +66,23 @@ enum UsenetSettings {
         store.set(speedLimitOptions.contains(value) ? value : 0, forKey: speedLimitKey)
     }
 
+    /// Check Availability on Usenet: how many of the stream list's Usenet streams are checked
+    /// by themselves when it opens (`UsenetAvailabilityChecker`). Off by default: each check
+    /// downloads the stream's NZB, which counts against the indexer's API and download
+    /// limits. Kept on this device only.
+    static let autoCheckKey = "nuvio.tv.settings.integrations.usenetAutoCheck"
+    /// 0: off, -1: all of them.
+    static let autoCheckOptions = [0, 3, 5, 10, -1]
+
+    static func autoCheckCount(store: UserDefaults = ProfileSettings.current) -> Int {
+        let value = store.integer(forKey: autoCheckKey)
+        return autoCheckOptions.contains(value) ? value : 0
+    }
+
+    static func setAutoCheckCount(_ value: Int, store: UserDefaults = ProfileSettings.current) {
+        store.set(autoCheckOptions.contains(value) ? value : 0, forKey: autoCheckKey)
+    }
+
     static func servers(store: UserDefaults = ProfileSettings.current) -> [UsenetSavedServer] {
         guard let data = store.data(forKey: serversKey),
               let servers = try? JSONDecoder().decode([UsenetSavedServer].self, from: data) else { return [] }

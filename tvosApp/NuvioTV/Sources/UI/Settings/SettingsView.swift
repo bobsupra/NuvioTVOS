@@ -24495,6 +24495,7 @@ private struct SettingsChoiceRow: View {
     let options: [String]
     var optionLabels: [String: String]? = nil
     let accentColor: Color
+    var subtitleLineLimit: Int = 2
 
     @FocusState private var isFocused: Bool
     @State private var showOptions = false
@@ -24502,7 +24503,7 @@ private struct SettingsChoiceRow: View {
     var body: some View {
         Button { showOptions = true } label: {
             SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
-                SettingsRowText(title: title, subtitle: subtitle)
+                SettingsRowText(title: title, subtitle: subtitle, subtitleLineLimit: subtitleLineLimit)
 
                 Spacer(minLength: 24)
 
@@ -25397,6 +25398,7 @@ private struct UsenetSettingsSection: View {
     @State private var profile = UsenetSettings.profile().rawValue
     @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
     @State private var speedLimit = String(UsenetSettings.speedLimitMbps())
+    @State private var autoCheck = String(UsenetSettings.autoCheckCount())
     @State private var syncToAccount = UsenetSettings.syncChoice() ?? false
 
     var body: some View {
@@ -25446,6 +25448,27 @@ private struct UsenetSettingsSection: View {
 
             UsenetDiskReadAheadRows(accentColor: accentColor)
 
+            SettingsChoiceRow(
+                title: L10n.string("usenet_auto_check_title", fallback: "Check Availability on Usenet"),
+                subtitle: L10n.string(
+                    "usenet_auto_check_subtitle",
+                    fallback: "When the stream list opens, the first Usenet streams are checked on your servers and each card shows the result. Every check downloads the stream's NZB, which counts against your indexer's API and download limits, so a premium indexer account is recommended."
+                ),
+                selection: $autoCheck,
+                options: UsenetSettings.autoCheckOptions.map(String.init),
+                optionLabels: Dictionary(uniqueKeysWithValues: UsenetSettings.autoCheckOptions.map { count -> (String, String) in
+                    let label: String
+                    switch count {
+                    case 0: label = L10n.string("usenet_auto_check_off", fallback: "Off")
+                    case -1: label = L10n.string("usenet_auto_check_all", fallback: "All")
+                    default: label = L10n.format("usenet_auto_check_first", fallback: "First %d", count)
+                    }
+                    return (String(count), label)
+                }),
+                accentColor: accentColor,
+                subtitleLineLimit: 4
+            )
+
             SettingsToggleRow(
                 title: L10n.string("usenet_prefer_own_title", fallback: "Always Use My Servers"),
                 subtitle: L10n.string("usenet_prefer_own_subtitle", fallback: "Ignore servers an add-on sends with its streams. When off, yours are the fallback."),
@@ -25479,6 +25502,9 @@ private struct UsenetSettingsSection: View {
         }
         .onChange(of: speedLimit) { _, value in
             UsenetSettings.setSpeedLimitMbps(Int(value) ?? 0)
+        }
+        .onChange(of: autoCheck) { _, value in
+            UsenetSettings.setAutoCheckCount(Int(value) ?? 0)
         }
         .onReceive(NotificationCenter.default.publisher(for: .usenetServersChanged)) { _ in
             model.reload()

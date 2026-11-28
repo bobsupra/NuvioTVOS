@@ -136,6 +136,8 @@ actor UsenetStreamSession {
     private let extentStarts: [Int64]
     private let articleCount: Int
     let totalSize: Int64
+    /// What the extents hold: `totalSize`, or for an encrypted file its stored bytes.
+    private let storedSize: Int64
 
     private var cache: [Int: Data] = [:]
     private var cacheOrder: [Int] = []
@@ -226,6 +228,7 @@ actor UsenetStreamSession {
         self.articleCount = running
         self.extentStarts = source.extentStarts
         self.totalSize = source.totalSize
+        self.storedSize = source.storedSize
     }
 
     /// Keeps the first articles that hold the start and the end of the file,
@@ -256,8 +259,19 @@ actor UsenetStreamSession {
     /// Up to `maxLength` bytes starting at `offset`, never crossing an article
     /// or extent boundary. Side reads (the player's index lookups at the end of
     /// the file) pass `updatesPlayhead: false` so they don't move the read-ahead.
+    /// An encrypted file is decrypted on the way (it may then end at the next block).
     func read(offset: Int64, maxLength: Int, updatesPlayhead: Bool = true) async throws -> Data {
-        guard offset < totalSize,
+        guard let cipher = source.cipher else {
+            return try await storedRead(offset: offset, maxLength: maxLength, updatesPlayhead: updatesPlayhead)
+        }
+        return try await UsenetRarCrypto.plainRead(offset: offset, maxLength: maxLength, cipher: cipher, storedSize: storedSize) {
+            try await self.storedRead(offset: $0, maxLength: $1, updatesPlayhead: updatesPlayhead && $2)
+        }
+    }
+
+    /// The stored bytes the extents hold.
+    private func storedRead(offset: Int64, maxLength: Int, updatesPlayhead: Bool) async throws -> Data {
+        guard offset < storedSize,
               let place = UsenetStreamSource.locate(offset, extents: source.extents, starts: extentStarts) else { return Data() }
         let extent = source.extents[place.extent]
         let volume = extent.volume
@@ -367,7 +381,16 @@ actor UsenetStreamSession {
 
     /// Like `read`, for a seek preview.
     func previewRead(offset: Int64, maxLength: Int) async throws -> Data {
-        guard !previewStopped, offset < totalSize,
+        guard let cipher = source.cipher else {
+            return try await storedPreviewRead(offset: offset, maxLength: maxLength)
+        }
+        return try await UsenetRarCrypto.plainRead(offset: offset, maxLength: maxLength, cipher: cipher, storedSize: storedSize) {
+            offset, length, _ in try await self.storedPreviewRead(offset: offset, maxLength: length)
+        }
+    }
+
+    private func storedPreviewRead(offset: Int64, maxLength: Int) async throws -> Data {
+        guard !previewStopped, offset < storedSize,
               let place = UsenetStreamSource.locate(offset, extents: source.extents, starts: extentStarts) else { return Data() }
         let extent = source.extents[place.extent]
         let volume = extent.volume
