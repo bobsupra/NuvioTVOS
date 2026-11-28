@@ -1101,3 +1101,200 @@ enum UsenetNZBCache {
         }
     }
 }
+
+// MARK: - Looking inside the archive when a stream is checked
+
+/// What a check found inside a release's archive (the first article of its first volume, or a
+/// small 7z's file list): whether the video in it could play.
+enum UsenetArchiveFinding: String, Sendable, Equatable, Codable {
+    /// A stored video (with the NZB's password opening it where it needs one): it would play.
+    case stored
+    /// RAR volumes stored inside the RAR set: they play, not looked into further.
+    case nested
+    case compressed
+    case needsPassword
+    case wrongPassword
+    case noVideo
+    case unsupported
+    case damaged
+
+    /// The video can't play from this release.
+    var blocksPlayback: Bool {
+        switch self {
+        case .stored, .nested: return false
+        default: return true
+        }
+    }
+}
+
+extension UsenetReleaseResolver {
+    /// The most volumes of a 7z archive a check reads: its file list sits at the archive's end,
+    /// and every volume's first article is read to find it.
+    static let lookSevenZipVolumes = 3
+
+    /// Looks inside the release's archive the way playback would, reading only the first
+    /// article of its first RAR volume (or a 7z of up to `lookSevenZipVolumes` volumes). A nil
+    /// finding: nothing to look into (a video that isn't packed) or more than a check reads.
+    /// `detail` says what it saw, for the log.
+    func lookInsideArchive() async throws -> (finding: UsenetArchiveFinding?, detail: String) {
+        let files = nzb.files
+        let names = files.map(\.name)
+        let roles = names.map(Self.role(ofName:))
+        func bytesOf(_ indices: [Int]) -> Int { indices.reduce(0) { $0 + files[$1].encodedBytes } }
+        func roleBytes(_ wanted: [UsenetFileRole]) -> Int {
+            bytesOf(files.indices.filter { wanted.contains(roles[$0]) })
+        }
+        let plainBytes = roleBytes([.video, .split])
+        let rarBytes = roleBytes([.rar])
+        let sevenZipBytes = roleBytes([.sevenZip])
+        let unsupportedBytes = roleBytes([.unsupportedArchive])
+        let unknown = files.indices.filter { roles[$0] == .unknown && !files[$0].segments.isEmpty }
+        let unknownBytes = bytesOf(unknown)
+        var heads: [Int: UsenetYEncSegment] = [:]
+
+        if rarBytes > 0, rarBytes >= max(plainBytes, sevenZipBytes, unknownBytes) {
+            let sets = Self.rarSets(names: names, roles: roles, obfuscated: [])
+            guard let set = sets.max(by: { bytesOf($0) < bytesOf($1) }), let leader = set.first else {
+                return (nil, "no RAR set")
+            }
+            let head: UsenetYEncSegment
+            do {
+                head = try await requireHeads([leader], heads: &heads)[0]
+            } catch UsenetError.firstSegmentUnavailable {
+                return (nil, "the first volume's first article is missing")
+            }
+            return Self.rarFinding(head: head, password: nzb.password, mustInclude: mustInclude,
+                                   setBytes: bytesOf(set), anyVolume: false, label: names[leader])
+        }
+        if sevenZipBytes > 0, sevenZipBytes >= max(plainBytes, unknownBytes) {
+            let sets = Self.sevenZipSets(names: names, roles: roles)
+            guard let set = sets.max(by: { bytesOf($0) < bytesOf($1) }) else { return (nil, "no 7z archive") }
+            return try await sevenZipFinding(set, name: names[set[0]], heads: &heads)
+        }
+        if unsupportedBytes > max(plainBytes, unknownBytes) {
+            return (.unsupported, "an archive that can't be streamed (zip, iso)")
+        }
+        if !unknown.isEmpty, unknownBytes > plainBytes {
+            // Obfuscated: the first file's first article tells what the release is.
+            let lead = unknown[0]
+            guard let head = try await fetchHeads([lead])[lead] else {
+                return (nil, "obfuscated, its first article is missing")
+            }
+            switch UsenetSniff.kind(of: head.data) {
+            case .video:
+                return (nil, "obfuscated video, not packed")
+            case .rar:
+                return Self.rarFinding(head: head, password: nzb.password, mustInclude: mustInclude,
+                                       setBytes: unknownBytes, anyVolume: true, label: "obfuscated volume")
+            case .sevenZip:
+                guard unknown.count == 1 else { return (nil, "obfuscated 7z of several volumes, not read by a check") }
+                return try await sevenZipFinding([lead], name: names[lead], heads: &heads)
+            case .zip:
+                return (.unsupported, "an obfuscated zip archive")
+            case .par2, .unknown:
+                return (nil, "obfuscated, its first file tells nothing")
+            }
+        }
+        return (nil, "a video, not packed")
+    }
+
+    /// The video a RAR volume's first article lists, and whether it could play. `anyVolume`: an
+    /// obfuscated volume that may not be the first, so files continued from an earlier one count
+    /// too.
+    static func rarFinding(head: UsenetYEncSegment, password: String?, mustInclude: String?,
+                           setBytes: Int, anyVolume: Bool, label: String) -> (finding: UsenetArchiveFinding?, detail: String) {
+        guard let volume = UsenetRar.parseVolume(head.data, password: password) else {
+            return (.damaged, "\(label): RAR headers unreadable")
+        }
+        let format = volume.format == .rar5 ? "RAR 5" : "RAR 4"
+        if volume.headersEncrypted {
+            return volume.passwordRejected
+                ? (.wrongPassword, "\(format), encrypted headers, the NZB's password rejected")
+                : (.needsPassword, "\(format), encrypted headers, no password in the NZB")
+        }
+        let listed = volume.entries.filter { !$0.isDirectory && (anyVolume || !$0.continuesFromPrevious) }
+        let videos = listed.filter { isVideoName($0.name) }
+        guard !videos.isEmpty else {
+            if listed.contains(where: { role(ofName: $0.name) == .rar }) {
+                return (.nested, "\(format), RAR volumes stored inside")
+            }
+            let listedBytes = listed.reduce(Int64(0)) { $0 + max(0, $1.unpackedSize) }
+            if isMultiFileSet(listedBytes: listedBytes, encodedSetBytes: setBytes) {
+                return (nil, "\(format), several files, the first one no video: not looked further")
+            }
+            let sample = listed.prefix(3).map(\.name).joined(separator: ", ")
+            return (.noVideo, "\(format), \(listed.count) files, no video (\(sample))")
+        }
+        let entry = chosenVideo(videos, mustInclude: mustInclude)
+        if entry.isEncrypted, (password ?? "").isEmpty || entry.encryption == nil {
+            return (.needsPassword, "\(format), \(entry.name) encrypted, no password in the NZB")
+        }
+        guard entry.isStored else { return (.compressed, "\(format), \(entry.name) compressed") }
+        guard entry.isEncrypted, let encryption = entry.encryption, let password else {
+            return (.stored, "\(format), \(entry.name) stored")
+        }
+        do {
+            let plainSize = entry.unpackedSize >= 0 ? entry.unpackedSize : entry.packedSize
+            let cipher = try UsenetRarCrypto.cipher(for: encryption, password: password, plainSize: plainSize)
+            // Its first bytes decrypt only from where the file starts (not from a later volume).
+            if !entry.continuesFromPrevious,
+               let plain = plainHead(of: head, from: UsenetExtent(volume: 0, offset: entry.dataOffset, length: entry.packedSize), cipher: cipher),
+               passwordLooksWrong(name: entry.name, plainHead: plain) {
+                return (.wrongPassword, "\(format), \(entry.name): the NZB's password decrypts it into noise")
+            }
+            return (.stored, "\(format), \(entry.name) stored, encrypted, the NZB's password works")
+        } catch UsenetError.wrongPassword {
+            return (.wrongPassword, "\(format), \(entry.name): the NZB's password fails RAR's check")
+        } catch {
+            return (.damaged, "\(format), \(entry.name): its encryption unreadable")
+        }
+    }
+
+    /// The episode's video (`mustInclude`) when it is among them, else the largest.
+    private static func chosenVideo(_ videos: [UsenetRarEntry], mustInclude: String?) -> UsenetRarEntry {
+        if let mustInclude, !mustInclude.isEmpty,
+           let regex = try? NSRegularExpression(pattern: mustInclude, options: [.caseInsensitive]),
+           let match = videos.first(where: {
+               regex.firstMatch(in: $0.name, range: NSRange($0.name.startIndex..., in: $0.name)) != nil
+           }) {
+            return match
+        }
+        return videos.max { $0.unpackedSize < $1.unpackedSize } ?? videos[0]
+    }
+
+    /// A 7z archive of up to `lookSevenZipVolumes` volumes: its file list, read from its end.
+    private func sevenZipFinding(_ set: [Int], name: String,
+                                 heads: inout [Int: UsenetYEncSegment]) async throws -> (finding: UsenetArchiveFinding?, detail: String) {
+        guard set.count <= Self.lookSevenZipVolumes else {
+            return (nil, "7z of \(set.count) volumes, its file list not read by a check")
+        }
+        var details: [[Int]: UsenetSevenZipDetail] = [:]
+        var problem: UsenetError?
+        let entries: [UsenetPlayableEntry]
+        do {
+            entries = try await sevenZipEntries(set, name: name, heads: &heads, details: &details, problem: &problem)
+        } catch UsenetError.firstSegmentUnavailable, UsenetError.releaseIncomplete {
+            return (nil, "7z, an article its file list needs is missing")
+        }
+        if let chosen = Self.choose(entries, mustInclude: mustInclude, fileIdx: nil), let detail = details[set] {
+            do {
+                _ = try sevenZipSource(chosen.name, indices: set, detail: detail)
+                return (.stored, "7z, \(chosen.name) stored")
+            } catch UsenetError.wrongPassword {
+                return (.wrongPassword, "7z, \(chosen.name): the NZB's password decrypts it into noise")
+            } catch UsenetError.archiveEncrypted {
+                return (.needsPassword, "7z, \(chosen.name) encrypted")
+            } catch {
+                return (.damaged, "7z, \(chosen.name): \(error.localizedDescription)")
+            }
+        }
+        switch problem {
+        case .archiveEncrypted?: return (.needsPassword, "7z, encrypted, no password in the NZB")
+        case .wrongPassword?: return (.wrongPassword, "7z, the NZB's password rejected")
+        case .archiveCompressed(let file)?: return (.compressed, "7z, \(file) compressed")
+        case .archiveNotSupported?: return (.unsupported, "7z, a method a stream can't read")
+        case .releaseIncomplete?: return (.damaged, "7z, its file list unreadable")
+        default: return (.noVideo, "7z, no video in it")
+        }
+    }
+}

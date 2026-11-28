@@ -42,6 +42,10 @@ struct UsenetAvailabilityReport: Sendable, Equatable, Codable {
     /// It played on these servers lately (its first seconds came): an available release
     /// whether or not anything was sampled.
     var played = false
+    /// What a look inside the release's archive found (`UsenetReleaseResolver.lookInsideArchive`):
+    /// one whose video can't play is incomplete. nil when it didn't look, and in reports saved
+    /// before there was this.
+    var archive: UsenetArchiveFinding? = nil
 
     /// Damage this long a run stops playback (`UsenetStreamSession.damageConsecutiveMissing`).
     static let nzbGapsLimit = 3
@@ -49,7 +53,7 @@ struct UsenetAvailabilityReport: Sendable, Equatable, Codable {
     var verdict: Verdict {
         let health = UsenetHealthCheck.Result(checked: checked, missing: missing, tailMissing: tailMissing)
         if playbackProblem != nil || !UsenetHealthCheck.isPlayable(health)
-            || missingVolumes > 0 || nzbGaps >= Self.nzbGapsLimit {
+            || missingVolumes > 0 || nzbGaps >= Self.nzbGapsLimit || archive?.blocksPlayback == true {
             return .incomplete
         }
         return missing > 0 || nzbGaps > 0 ? .partial : .available
@@ -409,7 +413,9 @@ final class UsenetAvailabilityChecker: ObservableObject {
             if report.played {
                 usenetLog.notice("usenet: remembered as played on these servers")
             } else {
-                let reason = report.playbackProblem?.rawValue ?? "\(report.missing)/\(report.checked) sampled articles missing"
+                let reason = report.playbackProblem?.rawValue
+                    ?? report.archive.flatMap { $0.blocksPlayback ? "archive: \($0.rawValue)" : nil }
+                    ?? "\(report.missing)/\(report.checked) sampled articles missing"
                 usenetLog.notice("usenet: remembered as incomplete (\(reason, privacy: .public))")
             }
             let entry = Remembered(report: report, at: Date(), servers: serversDigest(spec))
@@ -531,9 +537,21 @@ final class UsenetAvailabilityChecker: ObservableObject {
         let loaded = clock.now
         let plan = UsenetAvailability.plan(for: nzb, mustInclude: spec.fileMustInclude)
         guard !plan.samples.isEmpty else { throw UsenetError.noPlayableFile }
-        let report = try await UsenetAvailability.ask(plan, pool: pool)
+        var report = try await UsenetAvailability.ask(plan, pool: pool)
         let done = clock.now
         let name = nzb.title ?? UsenetAvailability.contentFiles(of: nzb, mustInclude: spec.fileMustInclude).first?.name ?? "release"
+        // A release whose articles are there gets a look inside its archive: the first article of
+        // its first volume says whether the video in it would play.
+        if report.verdict != .incomplete {
+            let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
+            do {
+                let look = try await resolver.lookInsideArchive()
+                report.archive = look.finding
+                usenetLog.notice("usenet: archive \(look.finding?.rawValue ?? "not looked into", privacy: .public) — \(look.detail, privacy: .public); \(Self.milliseconds(clock.now - done)) ms")
+            } catch {
+                usenetLog.error("usenet: archive look failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
         usenetLog.notice("usenet: check \(name, privacy: .public) — \(report.verdict.rawValue, privacy: .public), \(report.missing)/\(report.checked) sampled articles missing (\(report.downloaded) downloaded), NZB gaps \(report.nzbGaps), missing volumes \(report.missingVolumes); NZB \(Self.milliseconds(loaded - started)) ms, servers \(Self.milliseconds(done - loaded)) ms")
         return report
     }

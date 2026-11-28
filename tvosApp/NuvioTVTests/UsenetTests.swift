@@ -1346,3 +1346,82 @@ final class UsenetPoolTests: XCTestCase {
         XCTAssertEqual(UsenetConnectionPool.maxIdle, .seconds(60))
     }
 }
+
+// MARK: - Looking inside the archive (availability check)
+
+final class UsenetArchiveLookTests: XCTestCase {
+    private func head(_ data: Data) -> UsenetYEncSegment {
+        UsenetYEncSegment(data: data, header: UsenetYEncHeader(), declaredPartSize: nil, declaredCRC: nil,
+                          computedCRC: 0, crcMatches: nil, fileOffset: 0)
+    }
+
+    private func finding(_ data: Data, password: String? = nil, setBytes: Int = 5_200) -> UsenetArchiveFinding? {
+        UsenetReleaseResolver.rarFinding(head: head(data), password: password, mustInclude: nil,
+                                         setBytes: setBytes, anyVolume: false, label: "x.part01.rar").finding
+    }
+
+    func testAStoredVideoWouldPlay() {
+        let rar4 = FormatFixture.rar4(name: "Movie.2024.mkv", packed: 5_000, unpacked: 5_000, firstVolume: true, dataBytes: 500)
+        XCTAssertEqual(finding(rar4.data), .stored)
+        let rar5 = FormatFixture.rar5(name: "Movie.2024.mkv", unpacked: 5_000, volume: 0, continuesFromPrevious: false,
+                                      continuesInNext: true, dataBytes: 500)
+        XCTAssertEqual(finding(rar5.data), .stored)
+        XCTAssertFalse(UsenetArchiveFinding.stored.blocksPlayback)
+    }
+
+    func testACompressedVideoWontPlay() {
+        let rar4 = FormatFixture.rar4(name: "Movie.mkv", packed: 3_000, unpacked: 5_000, method: 0x33, firstVolume: true, dataBytes: 500)
+        XCTAssertEqual(finding(rar4.data), .compressed)
+        let rar5 = FormatFixture.rar5(name: "Movie.mkv", unpacked: 5_000, volume: 0, continuesFromPrevious: false,
+                                      continuesInNext: true, method: 3, dataBytes: 500)
+        XCTAssertEqual(finding(rar5.data), .compressed)
+        XCTAssertTrue(UsenetArchiveFinding.compressed.blocksPlayback)
+    }
+
+    func testAnEncryptedVideoWithoutAPasswordWontPlay() {
+        let rar4 = FormatFixture.rar4(name: "Movie.mkv", packed: 5_000, unpacked: 5_000, fileFlags: 0x04, firstVolume: true, dataBytes: 500)
+        XCTAssertEqual(finding(rar4.data), .needsPassword)
+        let rar5 = FormatFixture.rar5(name: "Movie.mkv", unpacked: 5_000, volume: 0, continuesFromPrevious: false,
+                                      continuesInNext: true, encrypted: true, dataBytes: 500)
+        XCTAssertEqual(finding(rar5.data), .needsPassword)
+    }
+
+    func testRarVolumesInsideAreLeftToPlayback() {
+        let nested = FormatFixture.rar4(name: "Movie.part01.rar", packed: 5_000, unpacked: 5_000, firstVolume: true, dataBytes: 500)
+        XCTAssertEqual(finding(nested.data), .nested)
+        XCTAssertFalse(UsenetArchiveFinding.nested.blocksPlayback)
+    }
+
+    func testAnArchiveWithoutAVideoWontPlay() {
+        let text = FormatFixture.rar4(name: "readme.txt", packed: 5_000, unpacked: 5_000, firstVolume: true, dataBytes: 500)
+        XCTAssertEqual(finding(text.data, setBytes: 5_100), .noVideo)
+        // A first file far smaller than the set: more files follow, one of them may be the video.
+        XCTAssertNil(finding(text.data, setBytes: 500_000))
+    }
+
+    func testUnreadableHeadersAreDamaged() {
+        XCTAssertEqual(finding(Data(repeating: 0x41, count: 2_000)), .damaged)
+    }
+
+    func testTheFindingDecidesTheVerdict() {
+        var report = UsenetAvailabilityReport(checked: 12, missing: 0, tailMissing: false, nzbGaps: 0, missingVolumes: 0)
+        report.archive = .stored
+        XCTAssertEqual(report.verdict, .available)
+        report.archive = .nested
+        XCTAssertEqual(report.verdict, .available)
+        for blocking: UsenetArchiveFinding in [.compressed, .needsPassword, .wrongPassword, .noVideo, .unsupported, .damaged] {
+            report.archive = blocking
+            XCTAssertEqual(report.verdict, .incomplete, blocking.rawValue)
+        }
+    }
+
+    func testAReportSavedBeforeTheArchiveLookStillLoads() throws {
+        let saved = Data(#"{"checked":12,"missing":0,"tailMissing":false,"nzbGaps":0,"missingVolumes":0,"downloaded":2,"played":false}"#.utf8)
+        let report = try JSONDecoder().decode(UsenetAvailabilityReport.self, from: saved)
+        XCTAssertNil(report.archive)
+        var looked = report
+        looked.archive = .compressed
+        let data = try JSONEncoder().encode(looked)
+        XCTAssertEqual(try JSONDecoder().decode(UsenetAvailabilityReport.self, from: data), looked)
+    }
+}

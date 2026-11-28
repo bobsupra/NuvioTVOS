@@ -14858,6 +14858,9 @@ private struct TvStreamAvailabilityLine: View {
             case nil:
                 break
             }
+            if let archive = report.archive, let text = Self.text(archive) {
+                return text
+            }
             if report.missingVolumes > 0 {
                 return L10n.format("usenet_check_incomplete_volumes", fallback: "Incomplete: %d archive volumes missing from the NZB", report.missingVolumes)
             }
@@ -14868,6 +14871,26 @@ private struct TvStreamAvailabilityLine: View {
                 return L10n.format("usenet_check_incomplete", fallback: "Incomplete: %d of %d sampled articles missing", report.missing, report.checked)
             }
             return L10n.format("usenet_check_incomplete_nzb", fallback: "Incomplete: the NZB lacks %d articles", report.nzbGaps)
+        }
+    }
+
+    /// Why the video in the archive won't play; nil when it would.
+    static func text(_ archive: UsenetArchiveFinding) -> String? {
+        switch archive {
+        case .stored, .nested:
+            return nil
+        case .compressed:
+            return L10n.string("usenet_check_archive_compressed", fallback: "Won't play: the video is compressed in its archive")
+        case .needsPassword:
+            return L10n.string("usenet_check_archive_password", fallback: "Won't play: the archive needs a password the NZB lacks")
+        case .wrongPassword:
+            return L10n.string("usenet_check_archive_wrong_password", fallback: "Won't play: the NZB's password doesn't open the archive")
+        case .noVideo:
+            return L10n.string("usenet_check_archive_no_video", fallback: "Won't play: no video in the archive")
+        case .unsupported:
+            return L10n.string("usenet_check_archive_unsupported", fallback: "Won't play: an archive that can't be streamed")
+        case .damaged:
+            return L10n.string("usenet_check_archive_damaged", fallback: "Won't play: the archive's headers are unreadable")
         }
     }
 }
