@@ -372,6 +372,105 @@ actor UsenetConnectionPool {
         }
     }
 
+    // MARK: - Connected ahead
+
+    /// Opens up to `count` connections to the first server before anything asks for an
+    /// article (connecting, TLS and the login), within its limit, and leaves them idle for
+    /// the fetches to come. A fetch already waiting gets one straight away. Returns how many
+    /// opened.
+    @discardableResult
+    func connectAhead(count: Int) async -> Int {
+        guard !closed, let index = servers.indices.first else { return 0 }
+        let wanted = min(count, servers[index].limit - servers[index].open)
+        guard wanted > 0 else { return 0 }
+        servers[index].open += wanted
+        let config = servers[index].config
+        let connections = await withTaskGroup(of: UsenetNNTPConnection?.self,
+                                              returning: [UsenetNNTPConnection?].self) { group in
+            for _ in 0..<wanted {
+                group.addTask {
+                    let connection = UsenetNNTPConnection(config: config)
+                    do {
+                        try await connection.open()
+                        return connection
+                    } catch {
+                        await connection.close()
+                        return nil
+                    }
+                }
+            }
+            var all: [UsenetNNTPConnection?] = []
+            for await connection in group { all.append(connection) }
+            return all
+        }
+        var opened = 0
+        for candidate in connections {
+            guard let connection = candidate else {
+                // Its slot is free again; shutdown() already zeroed the count.
+                if !closed {
+                    servers[index].open = max(0, servers[index].open - 1)
+                    wakeOne(index)
+                }
+                continue
+            }
+            guard !closed else {
+                Task { await connection.close() }
+                continue
+            }
+            handOver(connection, to: index)
+            opened += 1
+        }
+        return opened
+    }
+
+    /// Keeps idle connections a provider would drop as unused: each one idle for longer than
+    /// `after` asks about an article that doesn't exist (`STAT`, nothing downloaded) and waits
+    /// again from now. One that fails is closed and its slot freed. Returns how many closed.
+    @discardableResult
+    func keepIdleAlive(after: Duration) async -> Int {
+        guard !closed else { return 0 }
+        var dropped = 0
+        for index in servers.indices {
+            let now = ContinuousClock.now
+            let due = servers[index].idle.filter { now - $0.since > after }
+            guard !due.isEmpty else { continue }
+            servers[index].idle.removeAll { entry in due.contains { $0.connection === entry.connection } }
+            for entry in due {
+                let probe = "nuvio-keepalive-\(UInt32.random(in: 0...UInt32.max))@invalid"
+                do {
+                    _ = try await entry.connection.stat(messageID: probe)
+                    guard !closed else {
+                        Task { await entry.connection.close() }
+                        continue
+                    }
+                    handOver(entry.connection, to: index)
+                } catch {
+                    dropped += 1
+                    Task { await entry.connection.close() }
+                    // Its slot is free again; shutdown() already zeroed the count.
+                    if !closed {
+                        servers[index].open = max(0, servers[index].open - 1)
+                        wakeOne(index)
+                    }
+                }
+            }
+        }
+        return dropped
+    }
+
+    /// Connections open and waiting unused.
+    var idleConnections: Int { servers.reduce(0) { $0 + $1.idle.count } }
+
+    /// A connection no fetch holds (opened ahead, or kept alive): to the first fetch waiting,
+    /// else the idle list. Not `release`, which takes back a connection from a fetch.
+    private func handOver(_ connection: UsenetNNTPConnection, to index: Int) {
+        if let waiter = servers[index].waiters.popFirst() {
+            waiter.resume(returning: connection)
+        } else {
+            servers[index].idle.append(IdleConnection(connection: connection, since: .now))
+        }
+    }
+
     // MARK: - Connections
 
     /// `onConnected` runs as soon as the fetch has a connection or a slot to
