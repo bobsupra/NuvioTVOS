@@ -608,8 +608,9 @@ enum AddonRatingsService {
 
         // If no IMDb rating from addons, enrich via SeriesGraph (the same backend used by Android TV)
         var combined = addonRatings
+        // Only for sources on in Settings → Ratings, as for the hero's ratings.
         if !combined.contains(where: { $0.source.lowercased() == "imdb" }),
-           isSourceEnabled("imdb", defaults: defaults) {
+           isHeroRatingSourceEnabled(MdbListDetailsService.providerIMDb, defaults: defaults) {
             if let sgRating = await SeriesGraphRatingsService.shared.rating(forEpisodeIdentifier: askedId, session: session) {
                 combined.append(
                     NuvioExternalRating(
@@ -623,7 +624,7 @@ enum AddonRatingsService {
 
         // If no TMDB rating from addons, enrich via TMDB
         if !combined.contains(where: { $0.source.lowercased() == "tmdb" }),
-           isSourceEnabled("tmdb", defaults: defaults) {
+           isHeroRatingSourceEnabled(MdbListDetailsService.providerTMDB, defaults: defaults) {
             if let tmdbScore = await fetchTmdbEpisodeRating(forEpisodeIdentifier: askedId, session: session, defaults: defaults) {
                 combined.append(NuvioExternalRating(source: MdbListDetailsService.providerTMDB, value: tmdbScore, max: 10))
             }
@@ -1311,6 +1312,15 @@ enum AddonRatingsService {
             filtered = filtered.filter { normalizedSourceKey($0.source) == "imdb" }
         }
         return !filtered.isEmpty
+    }
+
+    /// The ratings an episode card shows: those of the sources on in Settings → Ratings, as for
+    /// the hero's ratings (an add-on or a cache can still hold others).
+    static func episodeCardRatings(
+        _ ratings: [NuvioExternalRating],
+        defaults: UserDefaults = ProfileSettings.current
+    ) -> [NuvioExternalRating] {
+        ratings.filter { isHeroRatingSourceEnabled($0.source, defaults: defaults) }
     }
 
     static func filteredAndOrderedHeroRatings(

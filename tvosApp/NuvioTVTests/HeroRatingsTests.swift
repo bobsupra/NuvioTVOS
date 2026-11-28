@@ -114,6 +114,24 @@ final class HeroRatingsTests: XCTestCase {
         XCTAssertFalse(episodeSourceOff.contains { $0.source == MALEpisodeRatings.source })
     }
 
+    func testEpisodeCardsShowOnlySourcesSwitchedOn() {
+        let defaults = isolatedDefaults()
+        let ratings = [
+            NuvioExternalRating(source: "tmdb", value: 7.4, max: 10),
+            NuvioExternalRating(source: "imdb", value: 8.1, max: 10),
+        ]
+        XCTAssertEqual(AddonRatingsService.episodeCardRatings(ratings, defaults: defaults).map(\.source), ["tmdb", "imdb"])
+
+        // Settings → Ratings → TMDB off: the cards drop it too, as the hero does.
+        defaults.set(false, forKey: SettingsKey.mdbListUseTmdb)
+        XCTAssertEqual(AddonRatingsService.episodeCardRatings(ratings, defaults: defaults).map(\.source), ["imdb"])
+        XCTAssertFalse(AddonRatingsService.isHeroRatingSourceEnabled(MdbListDetailsService.providerTMDB, defaults: defaults))
+
+        defaults.set(false, forKey: SettingsKey.mdbListUseImdb)
+        XCTAssertTrue(AddonRatingsService.episodeCardRatings(ratings, defaults: defaults).isEmpty)
+        XCTAssertFalse(AddonRatingsService.isHeroRatingSourceEnabled(MdbListDetailsService.providerIMDb, defaults: defaults))
+    }
+
     func testEpisodeRatingsFallBackToScopedTitleProvidersWhenNoEpisodeScoreIsEnabled() {
         let defaults = isolatedDefaults()
         AddonRatingsService.setRatingOrder(["tmdb", "imdb"], defaults: defaults)
