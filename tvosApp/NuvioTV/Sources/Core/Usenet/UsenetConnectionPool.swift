@@ -141,12 +141,18 @@ actor UsenetConnectionPool {
 
     /// Connections across all servers, the limit for concurrent fetches.
     nonisolated let totalConnections: Int
+    /// The first server's connections for this stream as they stand: its setting, lowered when
+    /// it turns one away and by the one seek previews hold. Every article is asked for there
+    /// first (later servers only fill in what it lacks), so the read-ahead keeps to these.
+    nonisolated var primaryConnections: Int { primaryLimit.value }
+    private nonisolated let primaryLimit: UsenetLimitBox
     /// The speed cap in Mbit/s, 0 for none.
     nonisolated let speedLimitMbps: Int
 
     init(servers: [UsenetServerConfig], speedLimitMbps: Int = 0) {
         self.servers = servers.map { ServerState(config: $0) }
         self.totalConnections = max(1, servers.reduce(0) { $0 + $1.maxConnections })
+        self.primaryLimit = UsenetLimitBox(max(1, servers.first?.maxConnections ?? 1))
         self.speedLimitMbps = max(0, speedLimitMbps)
         self.limiter = UsenetRateLimiter(megabitsPerSecond: speedLimitMbps)
     }
@@ -348,7 +354,7 @@ actor UsenetConnectionPool {
             throw CancellationError()
         }
         servers[index].open = max(0, servers[index].open - 1)
-        servers[index].limit = max(1, servers[index].limit - 1)
+        setLimit(index, max(1, servers[index].limit - 1))
         return connection
     }
 
@@ -405,7 +411,7 @@ actor UsenetConnectionPool {
                             let configured = servers[index].config.maxConnections
                             usenetLog.info("usenet: \(host, privacy: .public) turned away a connection, using \(limit) of \(configured)")
                         }
-                        servers[index].limit = limit
+                        setLimit(index, limit)
                         continue
                     }
                     wakeOne(index)
@@ -439,6 +445,11 @@ actor UsenetConnectionPool {
     /// failure, such as a wrong password: nil. Refusals at the greeting
     /// arrive before the accepted connections finish logging in, so "open"
     /// counts those too.
+    private func setLimit(_ index: Int, _ limit: Int) {
+        servers[index].limit = limit
+        if index == servers.startIndex { primaryLimit.value = limit }
+    }
+
     static func limitAfterRefusal(_ error: Error, open: Int, limit: Int) -> Int? {
         guard open > 0, let error = error as? UsenetNNTPError else { return nil }
         switch error {
@@ -525,5 +536,18 @@ actor UsenetConnectionPool {
         default:
             return L10n.string("usenet_error_generic", fallback: "The Usenet server returned an error.")
         }
+    }
+}
+
+/// A connection count other actors read without waiting for the pool.
+final class UsenetLimitBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Int
+
+    init(_ value: Int) { stored = value }
+
+    var value: Int {
+        get { lock.lock(); defer { lock.unlock() }; return stored }
+        set { lock.lock(); stored = newValue; lock.unlock() }
     }
 }

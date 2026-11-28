@@ -775,9 +775,10 @@ actor UsenetStreamSession {
         scanFrom = min(scanFrom, index)
     }
 
-    /// Prefetch slots: all connections but one, so a demand read after a seek
-    /// isn't stuck behind read-ahead.
-    private var prefetchSlots: Int { max(1, pool.totalConnections - 1) }
+    /// Prefetch slots: all the first server's connections but one, so a demand read after a
+    /// seek isn't stuck behind read-ahead. Every article goes to the first server first, so a
+    /// backup server's connections would only queue more read-ahead there.
+    private var prefetchSlots: Int { max(1, pool.primaryConnections - 1) }
 
     /// Read-ahead this close to the playhead is needed in a moment, so the
     /// speed cap never holds it back: `nextSeconds` of video once the bitrate
