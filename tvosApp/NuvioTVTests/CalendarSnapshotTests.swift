@@ -115,6 +115,19 @@ final class CalendarSnapshotTests: XCTestCase {
         var old = snapshot(age: 60)
         old.version = CalendarSnapshot.currentVersion + 1
         XCTAssertFalse(old.isUsable(settings: "a", now: now))
+        // A few days old is still shown while a new one loads.
+        XCTAssertTrue(snapshot(age: 3 * 24 * 3600).isUsable(settings: "a", now: now))
+    }
+
+    func testASnapshotFromOtherShowsIsShownButNotCurrent() {
+        let snapshot = CalendarSnapshot(
+            settings: "a", sources: "watched:tt77|progress:tt88", day: sampleDay, loadedAt: Date(), result: sample()
+        )
+        XCTAssertTrue(snapshot.isUsable(settings: "a", now: Date()))
+        XCTAssertTrue(snapshot.hasSources("watched:tt77|progress:tt88"))
+        XCTAssertFalse(snapshot.hasSources("watched:tt77|progress:"))
+        let text = String(decoding: (try? JSONEncoder().encode(snapshot)) ?? Data(), as: UTF8.self)
+        XCTAssertFalse(text.contains("tt77"))
     }
 
     func testAnOlderSaveDoesNotReplaceANewerOne() async throws {

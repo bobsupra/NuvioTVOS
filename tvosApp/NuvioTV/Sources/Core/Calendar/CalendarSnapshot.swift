@@ -3,22 +3,31 @@ import Foundation
 
 /// The last calendar, kept on disk so the Calendar tab and Home's Today row
 /// open with it at once while a newer one loads.
+///
+/// It is shown whenever it was made for the same profile and settings, also
+/// when the followed and watched shows changed since or it is a few days old:
+/// a new one then loads behind it. Those sources are often not known yet right
+/// after launch (Continue Watching still loading), and requiring them to match
+/// sent the first visit after every start through a whole load.
 struct CalendarSnapshot: Codable, Sendable {
-    static let currentVersion = 1
+    static let currentVersion = 2
     /// Older calendars are not shown at all; the new one loads from scratch.
-    static let maxAge: TimeInterval = 24 * 60 * 60
+    static let maxAge: TimeInterval = 7 * 24 * 60 * 60
 
     var version = CalendarSnapshot.currentVersion
     /// SHA-256 of the settings the calendar was made with. They include the
     /// TMDB key, so they are never written as they are.
     let settingsDigest: String
+    /// SHA-256 of the shows it was made from (follows, watched, in progress).
+    let sourcesDigest: String
     /// The day the calendar was made on.
     let day: CalendarDay
     let loadedAt: Date
     let result: CalendarResult
 
-    init(settings: String, day: CalendarDay, loadedAt: Date, result: CalendarResult) {
+    init(settings: String, sources: String = "", day: CalendarDay, loadedAt: Date, result: CalendarResult) {
         self.settingsDigest = Self.digest(settings)
+        self.sourcesDigest = Self.digest(sources)
         self.day = day
         self.loadedAt = loadedAt
         self.result = result
@@ -28,13 +37,18 @@ struct CalendarSnapshot: Codable, Sendable {
         SHA256.hash(data: Data(settings.utf8)).map { String(format: "%02x", $0) }.joined()
     }
 
-    /// Made with these settings, recently, and not in the future (a clock
-    /// set back).
+    /// Made with these settings, within `maxAge`, and not in the future (a
+    /// clock set back): fine to show while a new one loads.
     func isUsable(settings: String, now: Date) -> Bool {
         version == Self.currentVersion
             && settingsDigest == Self.digest(settings)
             && now.timeIntervalSince(loadedAt) < Self.maxAge
             && loadedAt.timeIntervalSince(now) < 5 * 60
+    }
+
+    /// Made from these shows: it is the current calendar, not only one to show.
+    func hasSources(_ sources: String) -> Bool {
+        sourcesDigest == Self.digest(sources)
     }
 }
 
