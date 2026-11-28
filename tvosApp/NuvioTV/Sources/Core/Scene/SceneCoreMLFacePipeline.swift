@@ -70,6 +70,10 @@ actor SceneCoreMLFacePipeline: FaceEmbeddingModelProtocol {
         // YuNet and SFace are small models that run in ~15-25ms on CPU without GPU contention.
         configuration.computeUnits = .cpuOnly
 
+        let removedBytes = SceneModelCacheCleanup.removeCopiesFromEarlierInstalls()
+        if removedBytes > 0 {
+            print("[ActorRecognition] Removed \(removedBytes / 1_000_000) MB of compiled models from earlier installs")
+        }
         let yuNet = try Self.loadModel(named: "YuNet", from: bundle, configuration: configuration)
         let sFace = try Self.loadModel(named: "SFace", from: bundle, configuration: configuration)
         try Self.validateYuNet(yuNet)
