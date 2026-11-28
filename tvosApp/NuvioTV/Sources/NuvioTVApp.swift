@@ -5773,7 +5773,9 @@ private struct TVMainTabView: View {
     private var calendarTabContent: some View {
         CalendarView(
             onOpenEntry: { entry in onOpenCalendarEntry?(entry) },
-            onOpenSettings: { selectedTab = .settings }
+            onOpenSettings: { selectedTab = .settings },
+            isCovered: isFullScreenOverlayPresented,
+            detailsClosedGeneration: detailsDidDisappearGeneration
         )
             .id(activeProfile?.id ?? "none")
     }
