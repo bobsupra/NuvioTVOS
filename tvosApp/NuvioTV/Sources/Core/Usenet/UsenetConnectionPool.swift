@@ -417,7 +417,7 @@ actor UsenetConnectionPool {
                 Task { await connection.close() }
                 continue
             }
-            release(connection, to: index)
+            handOver(connection, to: index)
             opened += 1
         }
         return opened
@@ -439,13 +439,18 @@ actor UsenetConnectionPool {
                 let probe = "nuvio-keepalive-\(UInt32.random(in: 0...UInt32.max))@invalid"
                 do {
                     _ = try await entry.connection.stat(messageID: probe)
-                    release(entry.connection, to: index)
+                    guard !closed else {
+                        Task { await entry.connection.close() }
+                        continue
+                    }
+                    handOver(entry.connection, to: index)
                 } catch {
                     dropped += 1
-                    if closed {
-                        Task { await entry.connection.close() }
-                    } else {
-                        discard(entry.connection, from: index)
+                    Task { await entry.connection.close() }
+                    // Its slot is free again; shutdown() already zeroed the count.
+                    if !closed {
+                        servers[index].open = max(0, servers[index].open - 1)
+                        wakeOne(index)
                     }
                 }
             }
@@ -455,6 +460,16 @@ actor UsenetConnectionPool {
 
     /// Connections open and waiting unused.
     var idleConnections: Int { servers.reduce(0) { $0 + $1.idle.count } }
+
+    /// A connection no fetch holds (opened ahead, or kept alive): to the first fetch waiting,
+    /// else the idle list. Not `release`, which takes back a connection from a fetch.
+    private func handOver(_ connection: UsenetNNTPConnection, to index: Int) {
+        if let waiter = servers[index].waiters.popFirst() {
+            waiter.resume(returning: connection)
+        } else {
+            servers[index].idle.append(IdleConnection(connection: connection, since: .now))
+        }
+    }
 
     // MARK: - Connections
 
