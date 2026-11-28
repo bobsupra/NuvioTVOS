@@ -24444,6 +24444,7 @@ private struct SettingsChoiceRow: View {
     let options: [String]
     var optionLabels: [String: String]? = nil
     let accentColor: Color
+    var subtitleLineLimit: Int = 2
 
     @FocusState private var isFocused: Bool
     @State private var showOptions = false
@@ -24451,7 +24452,7 @@ private struct SettingsChoiceRow: View {
     var body: some View {
         Button { showOptions = true } label: {
             SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
-                SettingsRowText(title: title, subtitle: subtitle)
+                SettingsRowText(title: title, subtitle: subtitle, subtitleLineLimit: subtitleLineLimit)
 
                 Spacer(minLength: 24)
 
@@ -25346,6 +25347,7 @@ private struct UsenetSettingsSection: View {
     @State private var profile = UsenetSettings.profile().rawValue
     @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
     @State private var speedLimit = String(UsenetSettings.speedLimitMbps())
+    @State private var pipeline = String(UsenetSettings.pipelineDepth())
     @State private var syncToAccount = UsenetSettings.syncChoice() ?? false
 
     var body: some View {
@@ -25393,6 +25395,21 @@ private struct UsenetSettingsSection: View {
                 accentColor: accentColor
             )
 
+            SettingsChoiceRow(
+                title: L10n.string("usenet_pipeline_title", fallback: "Requests per Connection"),
+                subtitle: L10n.string(
+                    "usenet_pipeline_subtitle",
+                    fallback: "Read-ahead asks each connection for several articles at once instead of waiting for the server between them. Helps with few connections or a distant server; what the player waits for always comes first."
+                ),
+                selection: $pipeline,
+                options: UsenetSettings.pipelineOptions.map(String.init),
+                optionLabels: Dictionary(uniqueKeysWithValues: UsenetSettings.pipelineOptions.map {
+                    (String($0), $0 == 1 ? L10n.string("usenet_pipeline_off", fallback: "Off") : "\($0)")
+                }),
+                accentColor: accentColor,
+                subtitleLineLimit: 4
+            )
+
             UsenetDiskReadAheadRows(accentColor: accentColor)
 
             SettingsToggleRow(
@@ -25428,6 +25445,9 @@ private struct UsenetSettingsSection: View {
         }
         .onChange(of: speedLimit) { _, value in
             UsenetSettings.setSpeedLimitMbps(Int(value) ?? 0)
+        }
+        .onChange(of: pipeline) { _, value in
+            UsenetSettings.setPipelineDepth(Int(value) ?? 1)
         }
         .onReceive(NotificationCenter.default.publisher(for: .usenetServersChanged)) { _ in
             model.reload()
