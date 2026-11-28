@@ -18623,6 +18623,9 @@ private struct CachedHeroLogo: View {
     var logoMaxHeight: CGFloat = 136
 
     @State private var image: UIImage?
+    /// The part of `image` that is logo, without its transparent margins.
+    @State private var visibleRect: CGRect?
+    @State private var outgoingVisibleRect: CGRect?
     @State private var loadedURL: String?
     @State private var outgoingImage: UIImage?
     @State private var outgoingOpacity = 0.0
@@ -18632,30 +18635,55 @@ private struct CachedHeroLogo: View {
         image != nil || outgoingImage != nil
     }
 
+    private static let logoMaxWidth: CGFloat = 520
+
+    /// `image` offset so that its `visible` part fills a frame of the size HeroLogoLayout
+    /// gives that shape.
+    @ViewBuilder
+    private func logo(_ image: UIImage, visible: CGRect?) -> some View {
+        let whole = CGRect(origin: .zero, size: image.size)
+        let shown = visible.flatMap { $0.isEmpty ? nil : $0 } ?? whole
+        if shown.width > 0, shown.height > 0 {
+            let size = HeroLogoLayout.size(
+                aspect: shown.width / shown.height,
+                maxWidth: Self.logoMaxWidth,
+                maxHeight: logoMaxHeight
+            )
+            let scale = size.width / shown.width
+            Image(uiImage: image)
+                .resizable()
+                .frame(width: whole.width * scale, height: whole.height * scale)
+                .offset(x: -shown.minX * scale, y: -shown.minY * scale)
+                // No clip needed: the image outside the visible part is transparent.
+                .frame(width: size.width, height: size.height, alignment: .topLeading)
+        } else {
+            Image(uiImage: image)
+                .resizable()
+                .scaledToFit()
+        }
+    }
+
     var body: some View {
-        // Size to the logo's intrinsic aspect (capped at 520×136) instead of a
-        // fixed 114pt slot. A short/wide wordmark centered in a tall frame left
-        // a dead band under the title before the first catalog row; text
-        // fallback must not reserve that slot either.
+        // Each logo is trimmed of its transparent margins and drawn at the same visual
+        // area within 520×logoMaxHeight (HeroLogoLayout), so logos from different
+        // sources match in size and share one baseline and left edge. The frame is the
+        // logo's own size, so a short wordmark leaves no dead band under the title
+        // before the first catalog row; text fallback must not reserve that slot either.
         Group {
             if showsLogoImage {
                 VStack(alignment: .leading, spacing: 10) {
                     ZStack(alignment: .bottomLeading) {
                         if let outgoingImage {
-                            Image(uiImage: outgoingImage)
-                                .resizable()
-                                .scaledToFit()
+                            logo(outgoingImage, visible: outgoingVisibleRect)
                                 .opacity(outgoingOpacity)
                         }
                         if let image {
-                            Image(uiImage: image)
-                                .resizable()
-                                .scaledToFit()
+                            logo(image, visible: visibleRect)
                                 .opacity(imageOpacity)
                                 .id(loadedURL)
                         }
                     }
-                    .frame(maxWidth: 520, maxHeight: logoMaxHeight, alignment: .bottomLeading)
+                    .frame(maxWidth: Self.logoMaxWidth, maxHeight: logoMaxHeight, alignment: .bottomLeading)
 
                     if let nameBelow, !nameBelow.isEmpty {
                         // Whole, on up to two lines; a very long name gets a smaller font
@@ -18691,13 +18719,16 @@ private struct CachedHeroLogo: View {
                 outgoingOpacity = 0
                 return
             }
+            let visible = await HeroLogoLayout.visibleRect(of: loaded, for: url)
             guard !Task.isCancelled else { return }
             let previousImage = image
             if previousImage != nil {
                 outgoingImage = previousImage
+                outgoingVisibleRect = visibleRect
                 outgoingOpacity = 1
             }
             image = loaded
+            visibleRect = visible
             loadedURL = url
             imageOpacity = previousImage == nil ? 1 : 0
 
