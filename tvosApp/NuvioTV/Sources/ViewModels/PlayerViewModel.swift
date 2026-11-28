@@ -2608,9 +2608,10 @@ class PlayerViewModel: ObservableObject {
 
         guard preResolvedNextEpisodeId != next.id, preResolvedNextEpisodeTask == nil else { return }
         // The Usenet engine plays one stream at a time: starting the next episode's Usenet
-        // stream ahead would stop the one playing now (a rewind then found no source and the
-        // player switched to another). The next episode is resolved when it actually begins.
-        guard !UsenetStreamServer.isStreamURL(activeStreamURL.flatMap { URL(string: $0) }) else { return }
+        // stream ahead would stop the one playing now. While Usenet plays, a Usenet stream for
+        // the next episode is only got ready (NZB, file, release check, over the playing
+        // stream's connections) and started when the episode begins.
+        let preparesUsenetAhead = UsenetStreamServer.isStreamURL(currentStreamURL)
 
         let episodeId = next.id
         preResolvedNextEpisodeId = episodeId
@@ -2618,14 +2619,17 @@ class PlayerViewModel: ObservableObject {
 
         preResolvedNextEpisodeTask = Task { @MainActor [weak self] in
             guard let self else { return nil }
-            let prepared = await resolver(next, nil)
+            let prepared = preparesUsenetAhead
+                ? await UsenetPreparation.$isAhead.withValue(true) { await resolver(next, nil) }
+                : await resolver(next, nil)
             guard !Task.isCancelled,
                   self.preResolvedNextEpisodeId == episodeId,
                   self.nextEpisode?.id == episodeId else {
                 return nil
             }
             self.preResolvedNextStream = prepared
-            if let prepared {
+            // A Usenet stream got ready ahead has no local URL to warm until it starts.
+            if let prepared, UsenetStreamSpec(url: prepared.url) == nil {
                 let token = UUID()
                 self.preResolvedStreamWarmToken = token
                 let profileID = ProfileSettings.activeProfileID ?? ""
@@ -3073,10 +3077,35 @@ class PlayerViewModel: ObservableObject {
                 self.status = .ended
                 return
             }
+            // Got ready ahead while Usenet played: start it now (its NZB, file and check are
+            // done), or resolve the episode afresh when that fails.
+            var ready = prepared
+            if let spec = UsenetStreamSpec(url: ready.url) {
+                if let localURL = try? await UsenetEngineManager.shared.startStream(spec) {
+                    ready.url = localURL
+                } else if let fresh = await resolver(next, startupToken) {
+                    ready = fresh
+                } else {
+                    usenetLog.error("usenet: the next episode's stream got ready ahead didn't start")
+                }
+                guard !Task.isCancelled, self.advanceGeneration == gen,
+                      self.pendingAdvanceResolutionGeneration == gen,
+                      UsenetStreamSpec(url: ready.url) == nil else {
+                    if self.clearPendingAdvanceResolution(generation: gen) {
+                        self.isAdvanceInFlight = false
+                        self.isAdvancingEpisode = false
+                        self.isAwaitingStreamStart = false
+                        self.lastAdvancedEpisodeId = nil
+                        self.status = .ended
+                    }
+                    self.cancelStartupBenchmark(token: startupToken)
+                    return
+                }
+            }
             guard self.clearPendingAdvanceResolution(generation: gen) else { return }
             if self.watchPartyPlayerBridge != nil {
                 guard let transition = self.onWatchPartyEpisodeResolved,
-                      await transition(next, prepared) else {
+                      await transition(next, ready) else {
                     self.cancelStartupBenchmark(token: startupToken)
                     self.isAdvanceInFlight = false
                     self.isAdvancingEpisode = false
@@ -3089,7 +3118,7 @@ class PlayerViewModel: ObservableObject {
                 }
                 return
             }
-            self.replaceStream(prepared: prepared, episode: next, resumeFrom: nil)
+            self.replaceStream(prepared: ready, episode: next, resumeFrom: nil)
         }
     }
 

@@ -942,7 +942,9 @@ extension SubtitleLanguagePreferences {
 /// seamless in-place advance. Built by the app layer's resolver (reusing the
 /// same add-on fetch + smart-stream selection the details screen uses).
 struct PreparedNextStream {
-    let url: URL
+    /// A `nuvio-usenet://` URL when the Usenet stream was only got ready ahead: the player
+    /// starts it (`UsenetEngineManager.startStream`) when it plays it.
+    var url: URL
     /// Stable torrent file identity for the resolved URL, when the resolver
     /// can prove the selected file index is unchanged.
     var cacheFileIdentity: PlaybackCacheFileIdentity? = nil
