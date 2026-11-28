@@ -8363,15 +8363,7 @@ private struct TvDetailsSummary: View {
     }
 
     private func normalizedCountry(_ raw: String?) -> String? {
-        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-            return nil
-        }
-        let firstPart = raw.split(separator: ",").first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? raw
-        if firstPart.count == 2, firstPart.range(of: "^[A-Za-z]{2}$", options: .regularExpression) != nil {
-            let code = firstPart.uppercased()
-            return Locale.current.localizedString(forRegionCode: code) ?? code
-        }
-        return firstPart
+        DetailsCountryLabel.text(for: raw)
     }
 
     private func normalizedLanguage(_ raw: String?) -> String? {
@@ -15087,6 +15079,22 @@ struct ErrorView: View {
             }
         }
         .padding(32)
+    }
+}
+
+/// The country in a title's info line. Metadata gives it as a two-letter code
+/// ("US"), a three-letter code ("usa") or a name, sometimes several separated
+/// by commas. The first one is shown, and a code is shown as its country's name.
+enum DetailsCountryLabel {
+    static func text(for raw: String?, locale: Locale = .current) -> String? {
+        let parts = (raw ?? "").split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let first = parts.first(where: { !$0.isEmpty }) else { return nil }
+        guard first.range(of: "^[A-Za-z]{2,3}$", options: .regularExpression) != nil else {
+            return first
+        }
+        let code = first.uppercased()
+        return locale.localizedString(forRegionCode: code) ?? code
     }
 }
 
