@@ -2378,6 +2378,7 @@ private struct IPTVSidebarView: View {
             }
         }
         .focusSection()
+        .defaultFocusIfAvailable($focusedTab, activeSidebarItem)
         .onChange(of: focusLiveTVRequestID) { _, _ in
             Task { @MainActor in
                 await Task.yield()
@@ -3955,7 +3956,6 @@ private final class IPTVInlineAetherPreviewController {
         activeChannelID = channelID
 
         rebindSurface()
-        PlaybackAudioSession.activateMoviePlayback()
 
         var didNotify = false
         readinessCancellable = engine.$hasFirstFrameReadyForDisplay
