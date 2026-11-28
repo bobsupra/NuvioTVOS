@@ -42,17 +42,30 @@ struct UsenetAvailabilityReport: Sendable, Equatable, Codable {
     /// It played on these servers lately (its first seconds came): an available release
     /// whether or not anything was sampled.
     var played = false
+    /// RAR volumes the NZB lists fewer articles of than most of their set, and how many
+    /// volumes that was judged on (`UsenetAvailability.shortVolumes(in:)`). nil when no set
+    /// has three volumes or more, and in reports saved before there was this.
+    var shortVolumes: Int? = nil
+    var judgedVolumes: Int? = nil
 
     /// Damage this long a run stops playback (`UsenetStreamSession.damageConsecutiveMissing`).
     static let nzbGapsLimit = 3
+    /// Shorter volumes in more than this share of those judged: a mixed or partly posted
+    /// upload, incomplete (the rule UsenetStreamer rejects a release by).
+    static let shortVolumesLimit = 0.2
+
+    var volumesLookIncomplete: Bool {
+        guard let short = shortVolumes, let judged = judgedVolumes, judged > 0 else { return false }
+        return Double(short) / Double(judged) > Self.shortVolumesLimit
+    }
 
     var verdict: Verdict {
         let health = UsenetHealthCheck.Result(checked: checked, missing: missing, tailMissing: tailMissing)
         if playbackProblem != nil || !UsenetHealthCheck.isPlayable(health)
-            || missingVolumes > 0 || nzbGaps >= Self.nzbGapsLimit {
+            || missingVolumes > 0 || nzbGaps >= Self.nzbGapsLimit || volumesLookIncomplete {
             return .incomplete
         }
-        return missing > 0 || nzbGaps > 0 ? .partial : .available
+        return missing > 0 || nzbGaps > 0 || (shortVolumes ?? 0) > 0 ? .partial : .available
     }
 }
 
@@ -70,6 +83,9 @@ enum UsenetAvailability {
         var tailMissingInNZB: Bool
         var nzbGaps: Int
         var missingVolumes: Int
+        /// `shortVolumes(in:)`.
+        var shortVolumes = 0
+        var judgedVolumes = 0
     }
 
     /// Articles of the sample downloaded rather than only asked about (about 1.5 MB).
@@ -98,12 +114,15 @@ enum UsenetAvailability {
            let lastNumber = last.segments.last?.number, lastNumber < declared {
             tailMissing = true
         }
+        let volumes = shortVolumes(in: files)
         return Plan(
             samples: samples,
             downloads: downloads,
             tailMissingInNZB: tailMissing,
             nzbGaps: files.reduce(0) { $0 + gaps(in: $1) },
-            missingVolumes: missingVolumes(in: files.map(\.name))
+            missingVolumes: missingVolumes(in: files.map(\.name)),
+            shortVolumes: volumes.short,
+            judgedVolumes: volumes.judged
         )
     }
 
@@ -195,6 +214,31 @@ enum UsenetAvailability {
         }
     }
 
+    /// RAR volumes the NZB lists fewer articles of than most volumes of their set: the volumes
+    /// of a set are the same size, so the same number of articles, unless the upload is mixed or
+    /// partly posted. Each set's last volume is left out (it is smaller), and sets of fewer than
+    /// three volumes. `judged` is how many volumes were compared.
+    static func shortVolumes(in files: [UsenetFile]) -> (short: Int, judged: Int) {
+        var sets: [String: [(index: Int, articles: Int)]] = [:]
+        for file in files {
+            guard let volume = volume(of: file.name) else { continue }
+            sets[volume.set, default: []].append((volume.index, file.segments.count))
+        }
+        var short = 0
+        var judged = 0
+        for volumes in sets.values where volumes.count >= 3 {
+            let compared = volumes.sorted { $0.index < $1.index }.dropLast()
+            var counts: [Int: Int] = [:]
+            for volume in compared { counts[volume.articles, default: 0] += 1 }
+            // The count most volumes have (the larger one on a tie).
+            guard let expected = counts.max(by: { ($0.value, $0.key) < ($1.value, $1.key) })?.key,
+                  expected > 0 else { continue }
+            judged += compared.count
+            short += compared.filter { $0.articles < expected }.count
+        }
+        return (short, judged)
+    }
+
     /// Asks the servers about the plan's articles, and downloads the ones it says to (any
     /// server that has one counts).
     static func ask(_ plan: Plan, pool: UsenetConnectionPool) async throws -> UsenetAvailabilityReport {
@@ -217,7 +261,7 @@ enum UsenetAvailability {
         }
         let missing = found.values.filter { !$0 }.count
         let tailMissing = plan.tailMissingInNZB || plan.samples.last.map { found[$0] == false } ?? false
-        return UsenetAvailabilityReport(
+        var report = UsenetAvailabilityReport(
             checked: found.count,
             missing: missing,
             tailMissing: tailMissing,
@@ -225,6 +269,11 @@ enum UsenetAvailability {
             missingVolumes: plan.missingVolumes,
             downloaded: plan.downloads.count
         )
+        if plan.judgedVolumes > 0 {
+            report.shortVolumes = plan.shortVolumes
+            report.judgedVolumes = plan.judgedVolumes
+        }
+        return report
     }
 }
 
@@ -534,7 +583,7 @@ final class UsenetAvailabilityChecker: ObservableObject {
         let report = try await UsenetAvailability.ask(plan, pool: pool)
         let done = clock.now
         let name = nzb.title ?? UsenetAvailability.contentFiles(of: nzb, mustInclude: spec.fileMustInclude).first?.name ?? "release"
-        usenetLog.notice("usenet: check \(name, privacy: .public) — \(report.verdict.rawValue, privacy: .public), \(report.missing)/\(report.checked) sampled articles missing (\(report.downloaded) downloaded), NZB gaps \(report.nzbGaps), missing volumes \(report.missingVolumes); NZB \(Self.milliseconds(loaded - started)) ms, servers \(Self.milliseconds(done - loaded)) ms")
+        usenetLog.notice("usenet: check \(name, privacy: .public) — \(report.verdict.rawValue, privacy: .public), \(report.missing)/\(report.checked) sampled articles missing (\(report.downloaded) downloaded), NZB gaps \(report.nzbGaps), missing volumes \(report.missingVolumes), short volumes \(report.shortVolumes ?? 0)/\(report.judgedVolumes ?? 0); NZB \(Self.milliseconds(loaded - started)) ms, servers \(Self.milliseconds(done - loaded)) ms")
         return report
     }
 

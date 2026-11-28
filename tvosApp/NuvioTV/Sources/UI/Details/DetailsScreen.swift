@@ -14848,6 +14848,9 @@ private struct TvStreamAvailabilityLine: View {
             if report.missing > 0 {
                 return L10n.format("usenet_check_partial", fallback: "Mostly available: %d of %d sampled articles missing", report.missing, report.checked)
             }
+            if report.nzbGaps == 0, let short = report.shortVolumes, short > 0 {
+                return L10n.format("usenet_check_partial_short_volumes", fallback: "Mostly available: %d archive volumes have fewer articles than the rest", short)
+            }
             return L10n.format("usenet_check_partial_nzb", fallback: "Mostly available: the NZB lacks %d articles", report.nzbGaps)
         case .incomplete:
             switch report.playbackProblem {
@@ -14860,6 +14863,9 @@ private struct TvStreamAvailabilityLine: View {
             }
             if report.missingVolumes > 0 {
                 return L10n.format("usenet_check_incomplete_volumes", fallback: "Incomplete: %d archive volumes missing from the NZB", report.missingVolumes)
+            }
+            if report.volumesLookIncomplete, let short = report.shortVolumes, let judged = report.judgedVolumes {
+                return L10n.format("usenet_check_incomplete_short_volumes", fallback: "Incomplete: %d of %d archive volumes have fewer articles than the rest", short, judged)
             }
             if report.tailMissing {
                 return L10n.string("usenet_check_incomplete_end", fallback: "Incomplete: the end of the release is missing")

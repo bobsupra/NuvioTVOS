@@ -65,6 +65,32 @@ final class UsenetAvailabilityTests: XCTestCase {
         XCTAssertEqual(files.map(\.name), ["Show.S01E02.mkv"])
     }
 
+    func testVolumesWithFewerArticlesThanTheirSetAreShort() {
+        // Five volumes of 50 articles and a smaller last one: the last is left out.
+        var files = (1...6).map { file("x.part0\($0).rar", segments: $0 == 6 ? 12 : 50) }
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: files).short, 0)
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: files).judged, 5)
+        files[2] = file("x.part03.rar", segments: 46)
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: files).short, 1)
+        // A longer volume is no hole.
+        files[3] = file("x.part04.rar", segments: 53)
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: files).short, 1)
+        // The old naming, and each set on its own.
+        let old = ["x.rar", "x.r00", "x.r01", "x.r02"].map { file($0, segments: $0 == "x.r01" ? 40 : 50) }
+        let other = (1...3).map { file("y.part\($0).rar", segments: 30) }
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: old + other).short, 1)
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: old + other).judged, 5)
+    }
+
+    func testSmallSetsAndObfuscatedFilesAreNotJudged() {
+        let pair = [file("x.part1.rar", segments: 50), file("x.part2.rar", segments: 20)]
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: pair).judged, 0)
+        let obfuscated = [file("9f2c1e", segments: 50), file("41ab07", segments: 20), file("77de10", segments: 50)]
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: obfuscated).judged, 0)
+        let plain = [file("movie.mkv", segments: 900)]
+        XCTAssertEqual(UsenetAvailability.shortVolumes(in: plain).judged, 0)
+    }
+
     // MARK: The plan
 
     func testThePlanSpreadsTheSamplesAndEndsOnTheLastArticle() {
@@ -78,6 +104,16 @@ final class UsenetAvailabilityTests: XCTestCase {
         XCTAssertFalse(plan.tailMissingInNZB)
         XCTAssertEqual(plan.nzbGaps, 0)
         XCTAssertEqual(plan.missingVolumes, 0)
+        XCTAssertEqual(plan.judgedVolumes, 0, "two volumes are too few to compare")
+    }
+
+    func testThePlanCountsShortVolumes() {
+        let plan = UsenetAvailability.plan(for: nzb([
+            file("x.part1.rar", segments: 40), file("x.part2.rar", segments: 31),
+            file("x.part3.rar", segments: 40), file("x.part4.rar", segments: 40), file("x.part5.rar", segments: 9),
+        ]))
+        XCTAssertEqual(plan.shortVolumes, 1)
+        XCTAssertEqual(plan.judgedVolumes, 4)
     }
 
     func testAShortReleaseIsAskedAboutWhole() {
@@ -125,6 +161,28 @@ final class UsenetAvailabilityTests: XCTestCase {
         XCTAssertEqual(report(gaps: UsenetAvailabilityReport.nzbGapsLimit).verdict, .incomplete)
     }
 
+    func testShortVolumesMakeItPartialAndManyIncomplete() {
+        var checked = report()
+        checked.shortVolumes = 1
+        checked.judgedVolumes = 10
+        XCTAssertEqual(checked.verdict, .partial)
+        checked.shortVolumes = 2
+        XCTAssertEqual(checked.verdict, .partial, "a fifth is still partial")
+        checked.shortVolumes = 3
+        XCTAssertTrue(checked.volumesLookIncomplete)
+        XCTAssertEqual(checked.verdict, .incomplete)
+        checked.shortVolumes = 0
+        XCTAssertEqual(checked.verdict, .available)
+    }
+
+    func testAReportSavedBeforeShortVolumesStillLoads() throws {
+        let saved = Data(#"{"checked":12,"missing":0,"tailMissing":false,"nzbGaps":0,"missingVolumes":0,"downloaded":2,"played":false}"#.utf8)
+        let report = try JSONDecoder().decode(UsenetAvailabilityReport.self, from: saved)
+        XCTAssertNil(report.shortVolumes)
+        XCTAssertNil(report.judgedVolumes)
+        XCTAssertEqual(report.verdict, .available)
+    }
+
     func testWhatPlaybackShowedMakesItIncomplete() {
         var played = report()
         played.playbackProblem = .damaged
@@ -136,6 +194,8 @@ final class UsenetAvailabilityTests: XCTestCase {
     func testAReportSurvivesBeingSaved() throws {
         var saved = report(missing: 3, tail: true, gaps: 1, volumes: 2)
         saved.downloaded = 2
+        saved.shortVolumes = 1
+        saved.judgedVolumes = 8
         saved.playbackProblem = .damaged
         let data = try JSONEncoder().encode(saved)
         XCTAssertEqual(try JSONDecoder().decode(UsenetAvailabilityReport.self, from: data), saved)
