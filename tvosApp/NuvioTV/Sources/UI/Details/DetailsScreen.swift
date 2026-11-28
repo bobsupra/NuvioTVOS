@@ -1491,7 +1491,9 @@ struct DetailsScreen: View {
         var seen = Set(chosenNZB.map { [$0] } ?? [])
         var result: [NuvioStream] = []
         for candidate in all[start...] where result.count < 2 {
+            // A stream a check found incomplete would fail too (UsenetAvailabilityChecker).
             guard candidate.unavailabilityReason == nil,
+                  !UsenetAvailabilityChecker.shared.isIncomplete(candidate),
                   let raw = candidate.directURL, let url = URL(string: raw),
                   let spec = UsenetStreamSpec(url: url),
                   seen.insert(spec.nzbURL).inserted else { continue }
@@ -12829,6 +12831,7 @@ private struct TvStreamPickerOverlay: View {
     @State private var ratingOrderRevision: UInt64 = 0
     @State private var showingP2PConsent = false
     @State private var pendingTorrentSelection: (stream: NuvioStream, player: ExternalPlayer?)? = nil
+    @ObservedObject private var usenetAvailability = UsenetAvailabilityChecker.shared
 
 
     private let filterAllKey = "filter::all"
@@ -13121,6 +13124,16 @@ private struct TvStreamPickerOverlay: View {
 
     private var activeSourceRows: [NuvioStream] {
         activeSourceRowsWithFocusIDs.map(\.stream)
+    }
+
+    /// The first Usenet streams the list shows (the selected add-on's, or all), checked on
+    /// the servers by themselves (Settings → Usenet → Check Availability on Usenet); none
+    /// while that is off.
+    private var usenetStreamsToCheck: [NuvioStream] {
+        let count = UsenetSettings.autoCheckCount()
+        guard count != 0 else { return [] }
+        let streams = activeSourceRows.filter { UsenetAvailabilityChecker.spec(for: $0) != nil }
+        return count < 0 ? streams : Array(streams.prefix(count))
     }
 
     private var activeSourceRowFocusIDs: [String] {
@@ -13592,6 +13605,14 @@ private struct TvStreamPickerOverlay: View {
         }
         .padding(.vertical, 4)
         .focusSection()
+        // Check Availability on Usenet: the first Usenet streams, again as the list changes
+        // (streams checked lately, or remembered incomplete, are skipped); each card then
+        // shows what was found.
+        .task(id: usenetStreamsToCheck.map(\.id)) {
+            let streams = usenetStreamsToCheck
+            guard !streams.isEmpty else { return }
+            usenetAvailability.check(streams)
+        }
     }
 
     private func sortMenuTitle(_ title: String, selected: Bool) -> String {
@@ -13681,7 +13702,8 @@ private struct TvStreamPickerOverlay: View {
                                     lastPlayedAt: lastPlayedAt,
                                     externalFocus: $focusedItem,
                                     action: { select(lastPlayedStream, player: nil) },
-                                    onSelectPlayer: { player in select(lastPlayedStream, player: player) }
+                                    onSelectPlayer: { player in select(lastPlayedStream, player: player) },
+                                    availability: usenetAvailability.state(for: lastPlayedStream)
                                 )
                                 .id(lastPlayedRowFocusID)
                             }
@@ -13746,7 +13768,8 @@ private struct TvStreamPickerOverlay: View {
                                         ? lastPlayedSourceMatch?.updatedAt : nil,
                                     externalFocus: $focusedItem,
                                     action: { select(stream, player: nil) },
-                                    onSelectPlayer: { player in select(stream, player: player) }
+                                    onSelectPlayer: { player in select(stream, player: player) },
+                                    availability: usenetAvailability.state(for: stream)
                                 )
                                 .id(rowFocusID)
                                 .onAppear {
@@ -14503,6 +14526,9 @@ private struct TvStreamCard: View {
     let externalFocus: FocusState<String?>.Binding
     let action: () -> Void
     var onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
+    /// A Usenet stream's check on the servers (`UsenetAvailabilityChecker`); nil for other
+    /// streams and before one.
+    var availability: UsenetAvailabilityChecker.State? = nil
 
     /// Local focus drives appearance only for this card, so focus moves do not
     /// push `isFocused` through the parent ForEach for every sibling.
@@ -14522,9 +14548,11 @@ private struct TvStreamCard: View {
         previewFocused: Bool = false,
         externalFocus: FocusState<String?>.Binding,
         action: @escaping () -> Void,
-        onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
+        onSelectPlayer: ((ExternalPlayer) -> Void)? = nil,
+        availability: UsenetAvailabilityChecker.State? = nil
     ) {
         self.stream = stream
+        self.availability = availability
         self.focusID = focusID ?? stream.id
         self.lastPlayedAt = lastPlayedAt
         self.style = style
@@ -14628,6 +14656,10 @@ private struct TvStreamCard: View {
                             .foregroundColor(.white.opacity(0.52))
                             .lineLimit(1)
                             .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        if let availability {
+                            TvStreamAvailabilityLine(state: availability, fontSize: style.detailFont(22))
                         }
 
                     }
@@ -14751,6 +14783,97 @@ private struct TvStreamCard: View {
             .frame(width: size, height: size)
         } else {
             fallback.frame(width: size, height: size)
+        }
+    }
+}
+
+/// A Usenet stream card's line for its check on the servers: under way, what was found,
+/// or why it couldn't be checked.
+private struct TvStreamAvailabilityLine: View {
+    let state: UsenetAvailabilityChecker.State
+    let fontSize: CGFloat
+
+    private static let green = Color(red: 0.33, green: 0.80, blue: 0.47)
+    private static let amber = Color(red: 0.98, green: 0.73, blue: 0.27)
+    private static let red = Color(red: 0.96, green: 0.38, blue: 0.36)
+
+    var body: some View {
+        HStack(spacing: 10) {
+            switch state {
+            case .queued, .checking:
+                ProgressView()
+                    .tint(.white)
+                    .scaleEffect(0.55)
+                    .frame(width: fontSize, height: fontSize)
+                Text(L10n.string("usenet_check_checking", fallback: "Checking on your Usenet servers…"))
+            case .checked(let report):
+                Image(systemName: Self.symbol(report.verdict))
+                    .foregroundColor(Self.color(report.verdict))
+                Text(Self.text(report))
+            case .failed(let message):
+                Image(systemName: "exclamationmark.circle")
+                    .foregroundColor(.white.opacity(0.6))
+                Text(L10n.format("usenet_check_failed", fallback: "Couldn't check: %@", message))
+            }
+        }
+        .font(.system(size: fontSize, weight: .medium))
+        .foregroundColor(.white.opacity(0.72))
+        .lineLimit(1)
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    private static func symbol(_ verdict: UsenetAvailabilityReport.Verdict) -> String {
+        switch verdict {
+        case .available: return "checkmark.circle.fill"
+        case .partial: return "exclamationmark.triangle.fill"
+        case .incomplete: return "xmark.octagon.fill"
+        }
+    }
+
+    private static func color(_ verdict: UsenetAvailabilityReport.Verdict) -> Color {
+        switch verdict {
+        case .available: return green
+        case .partial: return amber
+        case .incomplete: return red
+        }
+    }
+
+    static func text(_ report: UsenetAvailabilityReport) -> String {
+        switch report.verdict {
+        case .available where report.played:
+            return L10n.string("usenet_check_played", fallback: "Played on your Usenet servers lately")
+        case .available:
+            return L10n.string("usenet_check_available", fallback: "Available on your Usenet servers")
+        case .partial:
+            if report.missing > 0 {
+                return L10n.format("usenet_check_partial", fallback: "Mostly available: %d of %d sampled articles missing", report.missing, report.checked)
+            }
+            if report.nzbGaps == 0, let short = report.shortVolumes, short > 0 {
+                return L10n.format("usenet_check_partial_short_volumes", fallback: "Mostly available: %d archive volumes have fewer articles than the rest", short)
+            }
+            return L10n.format("usenet_check_partial_nzb", fallback: "Mostly available: the NZB lacks %d articles", report.nzbGaps)
+        case .incomplete:
+            switch report.playbackProblem {
+            case .wouldNotStart?:
+                return L10n.string("usenet_check_incomplete_start", fallback: "Incomplete: it wouldn't start on your servers")
+            case .damaged?:
+                return L10n.string("usenet_check_incomplete_damaged", fallback: "Incomplete: too damaged when it played")
+            case nil:
+                break
+            }
+            if report.missingVolumes > 0 {
+                return L10n.format("usenet_check_incomplete_volumes", fallback: "Incomplete: %d archive volumes missing from the NZB", report.missingVolumes)
+            }
+            if report.volumesLookIncomplete, let short = report.shortVolumes, let judged = report.judgedVolumes {
+                return L10n.format("usenet_check_incomplete_short_volumes", fallback: "Incomplete: %d of %d archive volumes have fewer articles than the rest", short, judged)
+            }
+            if report.tailMissing {
+                return L10n.string("usenet_check_incomplete_end", fallback: "Incomplete: the end of the release is missing")
+            }
+            if report.missing >= 2 {
+                return L10n.format("usenet_check_incomplete", fallback: "Incomplete: %d of %d sampled articles missing", report.missing, report.checked)
+            }
+            return L10n.format("usenet_check_incomplete_nzb", fallback: "Incomplete: the NZB lacks %d articles", report.nzbGaps)
         }
     }
 }

@@ -95,6 +95,8 @@ final class UsenetEngineManager: ObservableObject {
     private var pool: UsenetConnectionPool?
     private var statsTask: Task<Void, Never>?
     private(set) var activeStreamURL: URL?
+    /// The playing stream, for remembering it damaged.
+    private var activeSpec: UsenetStreamSpec?
     private var generation = 0
     /// The duration last passed to the session.
     private var reportedDuration: Double = 0
@@ -117,15 +119,17 @@ final class UsenetEngineManager: ObservableObject {
         }
 
         let pool = UsenetConnectionPool(servers: servers, speedLimitMbps: UsenetSettings.speedLimitMbps())
+        var health: UsenetHealthCheck.Result?
         do {
             let nzb = try await Self.loadNZB(spec.nzbURL)
             let resolver = UsenetReleaseResolver(nzb: nzb, pool: pool, mustInclude: spec.fileMustInclude, fileIdx: spec.fileIdx)
             let source = try await resolver.resolve()
             try Task.checkCancellation()
 
-            let health = try await UsenetHealthCheck.check(source, pool: pool)
-            usenetLog.notice("usenet: \(source.name, privacy: .public) [\(source.kind.rawValue, privacy: .public)] — \(source.volumes.count) file(s), \(health.missing)/\(health.checked) sampled articles missing")
-            guard UsenetHealthCheck.isPlayable(health) else { throw UsenetError.releaseIncomplete }
+            let checked = try await UsenetHealthCheck.check(source, pool: pool)
+            health = checked
+            usenetLog.notice("usenet: \(source.name, privacy: .public) [\(source.kind.rawValue, privacy: .public)] — \(source.volumes.count) file(s), \(checked.missing)/\(checked.checked) sampled articles missing")
+            guard UsenetHealthCheck.isPlayable(checked) else { throw UsenetError.releaseIncomplete }
 
             // Off the main thread: it clears what an earlier stream left on disk.
             let diskBytes = UsenetSettings.diskReadAheadBytes()
@@ -148,6 +152,7 @@ final class UsenetEngineManager: ObservableObject {
             self.server = server
             self.pool = pool
             self.activeStreamURL = url
+            self.activeSpec = spec
             activeStats = UsenetStreamStats(
                 totalConnections: pool.totalConnections,
                 configuredConnections: pool.totalConnections,
@@ -169,10 +174,26 @@ final class UsenetEngineManager: ObservableObject {
         } catch {
             await pool.shutdown()
             if (error as? UsenetError) == .nzbUnreadable { UsenetNZBCache.remove(spec.nzbURL) }
+            if let report = Self.startFailureReport(error, health: health) {
+                UsenetAvailabilityChecker.shared.recordPlayback(spec, report: report)
+            }
             lastError = error.localizedDescription
             usenetLog.error("usenet: start failed: \(error.localizedDescription, privacy: .public)")
             throw error
         }
+    }
+
+    /// What a start that failed for missing articles showed, for the stream list to remember:
+    /// the release check's numbers, or that it wouldn't start (its files' first articles gone).
+    nonisolated static func startFailureReport(_ error: Error, health: UsenetHealthCheck.Result?) -> UsenetAvailabilityReport? {
+        guard let usenet = error as? UsenetError,
+              usenet == .releaseIncomplete || usenet == .firstSegmentUnavailable else { return nil }
+        if let health, !UsenetHealthCheck.isPlayable(health) {
+            return UsenetAvailabilityReport(checked: health.checked, missing: health.missing,
+                                            tailMissing: health.tailMissing, nzbGaps: 0, missingVolumes: 0)
+        }
+        return UsenetAvailabilityReport(checked: 0, missing: 0, tailMissing: false, nzbGaps: 0,
+                                        missingVolumes: 0, playbackProblem: .wouldNotStart)
     }
 
     /// A delayed player exit only stops its own stream, never a newer one.
@@ -207,6 +228,7 @@ final class UsenetEngineManager: ObservableObject {
         self.server = nil
         self.pool = nil
         activeStreamURL = nil
+        activeSpec = nil
         reportedDuration = 0
         isStreaming = false
         activeStats = UsenetStreamStats()
@@ -221,6 +243,9 @@ final class UsenetEngineManager: ObservableObject {
     func reportDuration(_ duration: Double, playbackURL: String?) {
         guard let session, let activeStreamURL, playbackURL == activeStreamURL.absoluteString,
               duration.isFinite, duration > 60, abs(duration - reportedDuration) > 1 else { return }
+        // The first time: the player opened the file and read its length, so the release
+        // plays on these servers.
+        if reportedDuration == 0, let activeSpec { UsenetAvailabilityChecker.shared.recordPlayed(activeSpec) }
         reportedDuration = duration
         Task { await session.setDuration(duration) }
     }
@@ -229,6 +254,11 @@ final class UsenetEngineManager: ObservableObject {
         guard generation == self.generation else { return }
         damagedGeneration = generation
         if let activeStreamURL { damagedStreamURL = activeStreamURL }
+        if let activeSpec {
+            UsenetAvailabilityChecker.shared.recordPlayback(activeSpec, report: UsenetAvailabilityReport(
+                checked: 0, missing: 0, tailMissing: false, nzbGaps: 0, missingVolumes: 0, playbackProblem: .damaged
+            ))
+        }
     }
 
     // MARK: - Which add-on stream a playback URL came from
